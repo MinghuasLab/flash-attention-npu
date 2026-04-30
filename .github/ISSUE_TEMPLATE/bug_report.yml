@@ -1,0 +1,37 @@
+name: Bug Report
+description: Report an issue you encountered in this project
+title: "[BUG]: "
+labels: ["bug report"]
+assignees: []
+body:
+  - type: textarea
+    id: your-environment
+    attributes:
+      label: Your Environment
+      description: Please provide details about your environment.
+    validations:
+      required: true
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Bug Description
+      description: Describe the bug.
+      placeholder: Please provide a clear summary of the issue you encountered.
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: How to Reproduce
+      description: How did this bug happen?
+      placeholder: Step-by-step instructions to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context or screenshots about this bug here.
+      placeholder: e.g., links to related issues, design mockups, or code examples.
+    validations:
+      required: false

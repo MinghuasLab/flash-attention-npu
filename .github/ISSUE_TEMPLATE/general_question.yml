@@ -1,0 +1,22 @@
+name: General Question
+description: Ask a general question about this project
+title: "[QST]: "
+labels: ["question"]
+assignees: []
+body:
+  - type: textarea
+    id: question-description
+    attributes:
+      label: Describe your question
+      description: Please describe your question as clearly as possible.
+      placeholder: I would like to know how to... / I am confused about...
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other context, code examples, or references here.
+      placeholder: e.g., specific use cases, related documentation links, or screenshots.
+    validations:
+      required: false
