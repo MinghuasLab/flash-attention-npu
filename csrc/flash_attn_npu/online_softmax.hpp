@@ -15,6 +15,10 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
+
+#ifndef INFINITY
+#define INFINITY (__builtin_inff())
+#endif
  
 namespace Catlass::Epilogue::Block {
 
@@ -42,6 +46,7 @@ public:
 
     static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
 
+    static constexpr uint32_t BYTE_SIZE_IN_BIT = 8;
     static constexpr uint32_t BLOCK_SIZE_IN_BYTE = 32;
     static constexpr uint32_t REPEAT_SIZE_IN_BYTE = 256;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
@@ -58,6 +63,7 @@ public:
     static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
+    static constexpr float CONST_NEG_INF = -INFINITY;
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
@@ -66,7 +72,6 @@ public:
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
@@ -77,14 +82,15 @@ public:
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
 
-        constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK8_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 16 * UB_UINT8_VECTOR_SIZE;
 
         scaleValue = scaleValue_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
         maskUbTensor16 = resource.ubBuf.template GetBufferByByte<half>(MASK16_UB_TENSOR_OFFSET);
-        maskUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(MASK32_UB_TENSOR_OFFSET);
+        maskUbTensor8 = resource.ubBuf.template GetBufferByByte<uint8_t>(MASK8_UB_TENSOR_OFFSET);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
@@ -481,52 +487,50 @@ public:
     }
 
     __aicore__ inline
-    void ApplyMask(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound, uint32_t maskColumnRound,
-        uint32_t addMaskUbOffset)
+    void CompareMask(uint32_t rowNumCurLoop, uint32_t columnNumRound, uint32_t maskColumnRound, uint32_t selMaskColumnRound)
     {
-        AscendC::Muls<float, false>(
-            maskUbTensor32,
-            maskUbTensor32,
-            (float)-3e38,
-            (uint64_t)0,
-            CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
-            AscendC::UnaryRepeatParams(1, 1, 8, 8));
-        AscendC::PipeBarrier<PIPE_V>();
         if (maskColumnRound == columnNumRound) {
-            AscendC::Add<float, false>(
-                lsUbTensor[sUbOffset],
-                lsUbTensor[sUbOffset],
-                maskUbTensor32,
-                (uint64_t)0,
-                CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::CompareScalar<half, uint8_t>(
+                maskUbTensor8,
+                maskUbTensor16,
+                static_cast<half>(0),
+                AscendC::CMPMODE::EQ,
+                RoundUp(rowNumCurLoop * maskColumnRound, HALF_VECTOR_SIZE));
+            AscendC::PipeBarrier<PIPE_V>();
         } else {
-            uint32_t loop = maskColumnRound / FLOAT_VECTOR_SIZE;
-            for (uint32_t i = 0; i < loop; i++) {
-                AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
-                    lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
-                    maskUbTensor32[i * FLOAT_VECTOR_SIZE],
-                    (uint64_t)0,
-                    rowNumCurLoop,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 1,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        maskColumnRound / FLOAT_BLOCK_SIZE));
+            for (uint32_t row = 0; row < rowNumCurLoop; row++) {
+                AscendC::CompareScalar<half, uint8_t>(
+                    maskUbTensor8[row * selMaskColumnRound / BYTE_SIZE_IN_BIT],
+                    maskUbTensor16[row * maskColumnRound],
+                    static_cast<half>(0),
+                    AscendC::CMPMODE::EQ,
+                    RoundUp(maskColumnRound, HALF_VECTOR_SIZE));
+                AscendC::PipeBarrier<PIPE_V>();
             }
-            if (maskColumnRound % FLOAT_VECTOR_SIZE > 0) {
-                SetVecMask(maskColumnRound % FLOAT_VECTOR_SIZE);
-                AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
-                    lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
-                    maskUbTensor32[loop * FLOAT_VECTOR_SIZE],
-                    (uint64_t)0,
-                    rowNumCurLoop,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 1,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        maskColumnRound / FLOAT_BLOCK_SIZE));
-                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        }
+    }
+
+    __aicore__ inline
+    void ApplyMask(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound, uint32_t maskColumnRound,
+        uint32_t selMaskColumnRound, uint32_t addMaskUbOffset)
+    {
+        if (maskColumnRound == columnNumRound) {
+            AscendC::Select<float, uint8_t>(
+                lsUbTensor[sUbOffset],
+                maskUbTensor8,
+                lsUbTensor[sUbOffset],
+                CONST_NEG_INF,
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                rowNumCurLoop * maskColumnRound);
+        } else {
+            for (uint32_t row = 0; row < rowNumCurLoop; row++) {
+                AscendC::Select<float, uint8_t>(
+                    lsUbTensor[sUbOffset][addMaskUbOffset + row * columnNumRound],
+                    maskUbTensor8[row * selMaskColumnRound / BYTE_SIZE_IN_BIT],
+                    lsUbTensor[sUbOffset][addMaskUbOffset + row * columnNumRound],
+                    CONST_NEG_INF,
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                    maskColumnRound);
             }
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -657,35 +661,43 @@ public:
     }
 
     __aicore__ inline
+    void SelectMask(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound, uint32_t maskColumnRound,
+        uint32_t selMaskColumnRound, uint32_t addMaskUbOffset)
+    {
+        if (maskColumnRound == columnNumRound) {
+            AscendC::Select<float, uint8_t>(
+                lsUbTensor[sUbOffset],
+                maskUbTensor8,
+                lsUbTensor[sUbOffset],
+                static_cast<float>(0),
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                rowNumCurLoop * maskColumnRound);
+        } else {
+            for (uint32_t row = 0; row < rowNumCurLoop; row++) {
+                AscendC::Select<float, uint8_t>(
+                    lsUbTensor[sUbOffset][addMaskUbOffset + row * columnNumRound],
+                    maskUbTensor8[row * selMaskColumnRound / BYTE_SIZE_IN_BIT],
+                    lsUbTensor[sUbOffset][addMaskUbOffset + row * columnNumRound],
+                    static_cast<float>(0),
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                    maskColumnRound);
+            }
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline
     void CalcLocalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoopRound, uint32_t columnNum, uint32_t columnNumRound,
         uint32_t rowOffset)
     {
-        // *** ll = rowsum(ls32)
-        if (columnNum == 512) {
-            RowsumSPECTILE512(
-                lsUbTensor[sUbOffset],
-                llUbTensor[rowOffset],
-                tvUbTensor,
-                rowNumCurLoopRound,
-                columnNum,
-                columnNumRound);
-        } else if (columnNum == 256) {
-            RowsumSPECTILE256(
-                lsUbTensor[sUbOffset],
-                llUbTensor[rowOffset],
-                tvUbTensor,
-                rowNumCurLoopRound,
-                columnNum,
-                columnNumRound);
-        } else {
-            RowsumTAILTILE(
-                lsUbTensor[sUbOffset],
-                llUbTensor[rowOffset],
-                tvUbTensor,
-                rowNumCurLoopRound,
-                columnNum,
-                columnNumRound);
-        }
+        // *** ll = rowsum(ls32){
+        RowsumTAILTILE(
+            lsUbTensor[sUbOffset],
+            llUbTensor[rowOffset],
+            tvUbTensor,
+            rowNumCurLoopRound,
+            columnNum,
+            columnNumRound);
     }
 
     __aicore__ inline
@@ -764,7 +776,8 @@ public:
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod)
+        uint32_t curStackTileMod, uint32_t maskColumnRound,
+        uint32_t selMaskColumnRound, uint32_t addMaskUbOffset)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -779,6 +792,9 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             }
         }
+        if constexpr (doTriUMask) {
+            ApplyMask(sUbOffset, rowNumCurLoop, columnNumRound, maskColumnRound, selMaskColumnRound, addMaskUbOffset);
+        }
         CalcLocalRowMax(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
         UpdateGlobalRowMax(
             rowNumCurLoop, rowNumCurLoopRound,
@@ -788,6 +804,9 @@ public:
             isFirstStackTile);
 
         CalcExp(sUbOffset, rowNumCurLoop, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
+        if constexpr (doTriUMask) {
+            SelectMask(sUbOffset, rowNumCurLoop, columnNumRound, maskColumnRound, selMaskColumnRound, addMaskUbOffset);
+        }
         if constexpr (!doTriUMask) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
         }
@@ -879,7 +898,10 @@ public:
                     (delayedRowLoopIdx == rowLoopNum - 1),
                     columnNumRound,
                     pingpongFlag,
-                    curStackTileMod);
+                    curStackTileMod,
+                    0,
+                    0,
+                    0);
             }
         }
     }
@@ -987,17 +1009,14 @@ public:
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowNumCurLoop = (delayedRowLoopIdx == rowLoopNum - 1) ?
                     (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
+                uint32_t selMaskColumnRound = RoundUp(maskColumnRound, BLOCK_SIZE_IN_BYTE * BYTE_SIZE_IN_BIT);
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
-                UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
+                CompareMask(rowNumCurLoop, columnNumRound, maskColumnRound, selMaskColumnRound);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                ApplyMask(
-                    (pingpongFlag * MAX_UB_S_ELEM_NUM),
-                    rowNumCurLoop, columnNumRound,
-                    maskColumnRound, addMaskUbOffset);
                 // next loop mask load
                 if (rowLoopIdx < rowLoopNum) {
                     uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
@@ -1035,7 +1054,10 @@ public:
                     (delayedRowLoopIdx == rowLoopNum - 1),
                     columnNumRound,
                     pingpongFlag,
-                    curStackTileMod);
+                    curStackTileMod,
+                    maskColumnRound,
+                    selMaskColumnRound,
+                    addMaskUbOffset);
             }
         }
     }
@@ -1045,8 +1067,8 @@ private:
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;
+    AscendC::LocalTensor<uint8_t> maskUbTensor8;
     AscendC::LocalTensor<half> maskUbTensor16;
-    AscendC::LocalTensor<float> maskUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> gmUbTensor;

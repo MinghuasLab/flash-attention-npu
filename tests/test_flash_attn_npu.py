@@ -25,11 +25,14 @@ def group_matmul(head, kv_head, left, right, high_prec = 1):
 
 def softmax1( 
     qk_result,
+    sub_mask,
     is_first,
     gm,
     interm_dtype = torch.float16
     ):
     sim = qk_result.to(interm_dtype)
+    if sub_mask is not None:
+        sim.masked_fill_(sub_mask.unsqueeze(0), -torch.inf)
     lm = torch.max(sim, dim=-1, keepdims=True)[0]
     if is_first:
         hm = lm
@@ -40,6 +43,8 @@ def softmax1(
     gm = hm
     sim_sub = sim - hm
     sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    if sub_mask is not None:
+        sim_sub.masked_fill_(sub_mask.unsqueeze(0), 0)
     row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
     return sim_sub, row_sum, dm, gm
 
@@ -112,15 +117,13 @@ def ref_flash_attention(
         sub_key = key[:, :, kv_start: kv_start + sub_len]
         sub_mask = None
         if mask is not None:
-            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
+            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len]
         sub_value = value[:, kv_start: kv_start + sub_len, :]
         qk_result = qkMM1(query, sub_key).to(interm_dtype)
         qk_result = qk_result * scale
-        if mask is not None:
-            qk_result += sub_mask
         if kv_start == 0:
             gm = None
-        p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype)
+        p_result, row_sum, dm, gm = softmax1(qk_result, sub_mask, kv_start == 0, gm, interm_dtype)
         p_result = p_result.to(data_type)
         if kv_start == 0:
             gm_high = None
