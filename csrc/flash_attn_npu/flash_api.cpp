@@ -157,7 +157,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     
     at::Tensor workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
-    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+        at::device(at::kPrivateUse1).dtype(at::kFloat));
     softmaxlse.fill_(std::numeric_limits<float>::infinity()); 
 
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
@@ -213,21 +214,29 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (is_bf16) {
         if (paged_KV) {
             if (is_causal) {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
         } else {
             if (is_causal) {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
@@ -235,21 +244,27 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     } else {
         if (paged_KV) {
             if (is_causal) {
-                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
         } else {
             if (is_causal) {
-                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
@@ -325,7 +340,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
 
     // init softmax lse
-    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+        at::device(at::kPrivateUse1).dtype(at::kFloat));
     softmaxlse.fill_(std::numeric_limits<float>::infinity()); 
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
 
@@ -407,21 +423,27 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     if (is_bf16) {
         if (is_causal) {
-            SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+            SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                     qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
         } else {
-            SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+            SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK,
+                FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                     qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
         }
     } else {
         if (is_causal) {
-            SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+            SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND,
+                Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                     qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
         } else {
-            SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+            SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND,
+                Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                     qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
         }
@@ -518,14 +540,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     
-    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size)); //B
-    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads)); //N
-    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k)); //S
-    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og)); //D
-    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og)); //vD
-    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));  //0
-    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size)); //128
-    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq)); //0
+    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
+    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
+    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
+    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
+    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
+    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
+    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
+    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
     tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
@@ -543,7 +565,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         4 * PRELANCH_NUM;
     int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
 
-    at::Tensor workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte)); // workspace
+    at::Tensor workspace_tensor = at::empty({workSpaceSize},
+        at::device(at::kPrivateUse1).dtype(at::kByte));
     at::Tensor softmaxlse = at::empty({T, num_heads}, at::device(at::kPrivateUse1).dtype(at::kFloat)); // lse
     softmaxlse.fill_(std::numeric_limits<float>::infinity()); 
 
@@ -591,24 +614,28 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (is_bf16) {
         if (paged_KV) {
             if (is_causal) {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK,
+                    FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
         } else {
             if (is_causal) {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK,
+                    FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
@@ -617,24 +644,28 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     } else {
         if (paged_KV) {
             if (is_causal) {
-                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             }
         } else {
             if (is_causal) {
-                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                    FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
             } else {
-                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(
                         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                         qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
@@ -728,7 +759,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 
     // alloc workspace
     uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
-    at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)},
+        at::device(at::kPrivateUse1).dtype(at::kByte));
 
     // alloc custom attn_mask
     at::Tensor mask_gpu_tensor;
@@ -831,7 +863,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const float softcap,
         const bool deterministic,
         std::optional<at::Generator> gen_,
-        std::optional<at::Tensor> &rng_state) {
+        std::optional<at::Tensor> &rng_state)
+{
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();        
     
@@ -879,7 +912,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     // alloc workspace
     uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
-    at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)},
+        at::device(at::kPrivateUse1).dtype(at::kByte));
 
     // alloc custom attn_mask
     at::Tensor mask_gpu_tensor;

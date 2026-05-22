@@ -254,7 +254,8 @@ namespace Catlass::Gemm::Block
 
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(km, static_cast<uint32_t>(headdim)));
-                    LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(l1_m_size_, headdim);                                        
+                    LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(l1_m_size_,
+                        headdim);                                        
                     copyGmToL1A(*l1_a_tensor, gLeft, layoutAInL1, layoutTileA);
 
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
@@ -270,12 +271,13 @@ namespace Catlass::Gemm::Block
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1B);
                         auto layoutTileB = layoutB.GetTileLayout(MakeCoord(l1_k_size_, l1_n_size_));
                         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(l1_k_size_, l1_n_size_);
-                        copyGmToL1B(*l1_b_tensor, gRight[n_index * 128 * src_k_size_ * nheads_k], layoutBInL1, layoutTileB);
+                        copyGmToL1B(*l1_b_tensor, gRight[n_index * 128 * src_k_size_ * nheads_k], layoutBInL1,
+                            layoutTileB);
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
 
-                        cube1_base_matmul(l1_a_tensor, l1_b_tensor, &gOut, pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B,
-                            pingpongFlagC, l1_m_size_, l1_n_size_, upper_right_flag);
+                        cube1_base_matmul(l1_a_tensor, l1_b_tensor, &gOut, pingpongFlagL1A, pingpongFlagL0A,
+                            pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC, l1_m_size_, l1_n_size_, upper_right_flag);
 
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1B);
                         pingpongFlagL1B = 1 - pingpongFlagL1B;

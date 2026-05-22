@@ -91,7 +91,8 @@ public:
     static_assert(std::is_same_v<LayoutC, layout::RowMajor>, "LayoutC only support RowMajor yet!");
 
     __aicore__ inline
-    BlockMmad(Arch::Resource<ArchTag> &resource,uint32_t nDyn, uint32_t kDyn, uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0)
+    BlockMmad(Arch::Resource<ArchTag> &resource,uint32_t nDyn, uint32_t kDyn, uint32_t KVStackLen = 512,
+        uint32_t l1BufAddrStart = 0)
     {
         maxKVStackLen = KVStackLen;
         // Allocate L1 memory space
@@ -112,7 +113,8 @@ public:
     ~BlockMmad() {}
 
     __aicore__ inline
-    void resetBlockStart(){
+    void resetBlockStart()
+    {
         blockStartOffset = 0;
     }
 
@@ -137,9 +139,12 @@ public:
     }
 
     __aicore__ inline
-    void setBlockParam(uint32_t stackSeqTile, uint32_t &blockStart, uint32_t &blockEnd, uint32_t &curBlockTotalNum, uint32_t blockSize){
+    void setBlockParam(uint32_t stackSeqTile, uint32_t &blockStart, uint32_t &blockEnd, uint32_t &curBlockTotalNum,
+        uint32_t blockSize)
+    {
         if(stackSeqTile >= blockStart && blockSize != 0) {
-            blockEnd = ((stackSeqTile - blockStart) % blockSize == 0) ? blockSize : (stackSeqTile - blockStart) % blockSize;
+            blockEnd = ((stackSeqTile - blockStart) % blockSize == 0) ?
+                blockSize : (stackSeqTile - blockStart) % blockSize;
             curBlockTotalNum = (((stackSeqTile - blockStart) + blockSize - 1) / blockSize) + 1;
         } else {
             blockStart = stackSeqTile;
@@ -149,7 +154,8 @@ public:
     }
 
     __aicore__ inline
-    void updateBlockOffset(uint32_t nowLen, uint32_t &curBlockIdx, uint32_t blockSize){
+    void updateBlockOffset(uint32_t nowLen, uint32_t &curBlockIdx, uint32_t blockSize)
+    {
         if (blockStartOffset + nowLen == blockSize) {
             blockStartOffset = 0;
         } else {
@@ -183,7 +189,8 @@ public:
             uint32_t curBlockTotalNum = 0;
             setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
             while(curBlockIdx < curBlockTotalNum) {
-                uint32_t nowLen = (curBlockIdx < (curBlockTotalNum-1)) ? (blockSize - blockStartOffset) : (blockEnd - blockStartOffset);
+                uint32_t nowLen = (curBlockIdx < (curBlockTotalNum-1)) ? (blockSize - blockStartOffset) : (blockEnd -
+                    blockStartOffset);
                 uint32_t nowNIdx = nIdx * maxKVStackLen / blockSize + curBlockIdx;
                 getBlockShape(actualShape, nowLen);
                 getKVOffset(gBlockTable, gBOffset, blockStartOffset, nowNIdx, strideKV, blockSize);
@@ -241,7 +248,8 @@ public:
                         }
 
                         LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Actual, nL1Actual);
-                        MatrixCoord l1BTileCoord{kL1Idx * l1KDynamic + kL0Idx * L0TileShape::K, L0TileShape::N * nL1Idx};
+                        MatrixCoord l1BTileCoord{kL1Idx * l1KDynamic + kL0Idx * L0TileShape::K,
+                            L0TileShape::N * nL1Idx};
                         auto l1BTile = l1BTensor[layoutBInL1.GetOffset(l1BTileCoord)];
 
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);

@@ -657,8 +657,8 @@ namespace SplitFuse {
         using EpilogueRescaleO =
             Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, OType, OTmpType, OUpdateType, LseType>;
 
-        using FAInferKernel = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO, EpilogueInitOut,
-                                            PagedCacheFlag, maskCategory, inLayout>;
+        using FAInferKernel = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
+            EpilogueInitOut, PagedCacheFlag, maskCategory, inLayout>;
         FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
         FAInferKernel flashAttnInfer;
         flashAttnInfer(params);

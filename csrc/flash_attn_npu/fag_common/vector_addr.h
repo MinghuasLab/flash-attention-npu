@@ -51,7 +51,8 @@ public:
     __gm__ uint8_t *dout_gm_addr;
     __gm__ uint8_t *user_gm_addr;
 
-    __aicore__ uint64_t getSeqRealLength(int32_t sIdx, int32_t len, int32_t s_block_num, int32_t s_tail) {
+    __aicore__ uint64_t getSeqRealLength(int32_t sIdx, int32_t len, int32_t s_block_num, int32_t s_tail)
+    {
         if (s_tail == 0) {
             return len * 128;
         } else {
@@ -63,7 +64,8 @@ public:
         }
     }
     
-    __aicore__ int64_t getTotalLen(int32_t i) {
+    __aicore__ int64_t getTotalLen(int32_t i)
+    {
         int64_t cuTotalSeqQlen = 0;
         if (inputLayout == InputLayout::TND) {
             cuTotalSeqQlen = ((__gm__ int32_t *)cu_seq_qlen_addr)[i];
@@ -73,7 +75,9 @@ public:
         return cuTotalSeqQlen;
     }
 
-    __aicore__ uint64_t getLeftAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t qSeqlen, int32_t qSeqIdx, int32_t headdim) {
+    __aicore__ uint64_t getLeftAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t qSeqlen, int32_t qSeqIdx,
+        int32_t headdim)
+    {
         if (batchIdx == 0) {
             return (qSeqIdx * 128 * nheads + nheadsIdx) * headdim;
         } else {
@@ -81,15 +85,19 @@ public:
         }
     }
 
-    __aicore__ uint64_t getRightAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t kSeqlen, int32_t seqKIdx, int32_t headdim) {
+    __aicore__ uint64_t getRightAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t kSeqlen, int32_t seqKIdx,
+        int32_t headdim)
+    {
         if (batchIdx == 0) {
             return (seqKIdx * 128 * (nheads / g) + (nheadsIdx / g)) * headdim;
         } else {
-            return getTotalLen(batchIdx - 1) * (nheads / g) * headdim + (seqKIdx * 128 * (nheads / g) + (nheadsIdx / g)) * headdim;
+            return getTotalLen(batchIdx - 1) * (nheads / g) * headdim + (seqKIdx * 128 * (nheads / g) + (nheadsIdx /
+                g)) * headdim;
         }
     }
 
-    __aicore__ uint64_t getOutAddr(int32_t workspacePos) {
+    __aicore__ uint64_t getOutAddr(int32_t workspacePos)
+    {
         return workspacePos * 128 * 128;
     }
 
@@ -114,7 +122,8 @@ public:
         }
     }
 
-    __aicore__ int32_t addr_mapping(struct VecAddrInfo * vecAddrInfo) {
+    __aicore__ int32_t addr_mapping(struct VecAddrInfo * vecAddrInfo)
+    {
         globalVecAddr = vecAddrInfo;
         globalVecAddr->blockLength = 0;
 
@@ -204,7 +213,8 @@ public:
         return overFlag;
     }
 
-    __aicore__ int64_t getSeqLen(int32_t i) {
+    __aicore__ int64_t getSeqLen(int32_t i)
+    {
         int64_t cuSeqQlen;
         if (i == 0) {
             cuSeqQlen = ((__gm__ int32_t *)cu_seq_qlen_addr)[0];
@@ -216,7 +226,8 @@ public:
 
     __aicore__ void init(int32_t batchIn, int32_t nheadsIn, int32_t gIn, int32_t headDimIn, uint32_t coreIdx,
         uint32_t seq_q_len, uint32_t seq_k_len,
-        __gm__ uint8_t *cu_seq_qlen, __gm__ uint8_t *cu_seq_kvlen, uint32_t totalCoreNum) {
+        __gm__ uint8_t *cu_seq_qlen, __gm__ uint8_t *cu_seq_kvlen, uint32_t totalCoreNum)
+    {
         
         batch = batchIn;
         nheads = nheadsIn;

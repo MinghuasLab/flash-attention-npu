@@ -66,8 +66,8 @@ inline void AdjustToBasicBlockBaseM(uint32_t& baseM, const uint32_t srcM, const 
     }
 }
 
-void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint32_t dataTypeSize, const uint32_t localWorkSpaceSize,
-    SoftMaxTiling& softmaxTiling)
+void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint32_t dataTypeSize,
+    const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxTiling)
 {
     std::vector<uint32_t> retVec = GetLastAxisShapeND(srcShape);
     if (retVec.size() <= 1 || dataTypeSize == 0) {
@@ -109,8 +109,8 @@ void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint32_t dat
     softmaxTiling.tailReduceSize = tail * elementNumPerBlk;
 }
 
-void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const uint32_t dataTypeSize, const uint32_t localWorkSpaceSize,
-    SoftMaxTiling& softmaxGradTiling)
+void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const uint32_t dataTypeSize,
+    const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxGradTiling)
 {
     std::vector<uint32_t> retVec = GetLastAxisShapeND(srcShape);
     if (retVec.size() <= 1 || dataTypeSize == 0) {
@@ -160,7 +160,8 @@ void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const uint32_t 
     softmaxGradTiling.tailReduceSize = tail * elementNumPerBlk;
 }
 
-void printSoftmaxTilingData(SoftMaxTiling &softmaxTilingData) {
+void printSoftmaxTilingData(SoftMaxTiling &softmaxTilingData)
+{
     std::cout << "softmaxTilingData srcM:  " << softmaxTilingData.srcM << std::endl;
     std::cout << "softmaxTilingData srcK:  " << softmaxTilingData.srcK << std::endl;
     std::cout << "softmaxTilingData srcSize:  " << softmaxTilingData.srcSize << std::endl;

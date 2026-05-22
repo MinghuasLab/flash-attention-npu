@@ -44,7 +44,8 @@ public:
     using DispatchPolicy = EpilogueAtlasA2FAGSfmg;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
-    static constexpr InputLayout getLayout() {
+    static constexpr InputLayout getLayout()
+    {
         return std::integral_constant<InputLayout, inputLayout>::value;
     }
     

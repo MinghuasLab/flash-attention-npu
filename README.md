@@ -22,7 +22,7 @@ FlashAttention significantly improves training and inference efficiency for mode
   - torch_npu >= 2.1.0 (same version with PyTorch)
 - Python Dependencies
 ```bash
-pip install packaging psutil ninja
+pip install packaging psutil
 ```
 
 ### Installation 

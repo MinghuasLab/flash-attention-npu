@@ -63,7 +63,8 @@ struct SoftMaxShapeInfo {
 
 __aicore__ inline void CustomAlignedReduceSumNDImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                     const LocalTensor<float> &tmpTensor,
-                                                    const struct ReduceLastND &reduceParam, const uint32_t splitCount) {
+                                                    const struct ReduceLastND &reduceParam, const uint32_t splitCount)
+{
     SetMaskCount();
     SetVectorMask<float, MaskMode::COUNTER>(0, reduceParam.srcM * FLOAT_REPEAT_SIZE);
     BlockReduceSum<float, false>(tmpTensor, src, 1, MASK_PLACEHOLDER, 1, 1, reduceParam.srcK / FLOAT_NUM_PER_BLK);
@@ -91,7 +92,8 @@ __aicore__ inline void CustomAlignedReduceSumNDImpl(const LocalTensor<float> &ds
 
 __aicore__ inline void CustomReduceSumLastNDSplitImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                       const struct ReduceLastND &reduceParam, uint64_t mask,
-                                                      uint32_t dstRepStride, uint32_t splitNum) {
+                                                      uint32_t dstRepStride, uint32_t splitNum)
+{
     uint32_t range = reduceParam.srcM / MAX_REPEAT_TIMES;
     uint32_t tail = reduceParam.srcM % MAX_REPEAT_TIMES;
 
@@ -112,7 +114,8 @@ __aicore__ inline void CustomReduceSumLastNDSplitImpl(const LocalTensor<float> &
 
 
 __aicore__ inline void CustomSingleBlockBroadCastImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
-                                                      const struct ReduceLastND &reduceParam) {
+                                                      const struct ReduceLastND &reduceParam)
+{
     BrcbRepeatParams brcbParams;
     brcbParams.dstBlkStride = 1;
     brcbParams.dstRepStride = BRCB_BROADCAST_NUMBER;
@@ -152,7 +155,8 @@ __aicore__ inline void CustomSingleBlockBroadCastImpl(const LocalTensor<float> &
 
 __aicore__ inline void CustomReduceSumLastNDImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                  const LocalTensor<float> &tmpTensor,
-                                                 const struct ReduceLastND &reduceParam) {
+                                                 const struct ReduceLastND &reduceParam)
+{
     const uint32_t splitCount = reduceParam.originalSrcK / FLOAT_REPEAT_SIZE;
     const uint32_t tailSrcK = reduceParam.originalSrcK % FLOAT_REPEAT_SIZE;
     if (splitCount > 0) {
@@ -183,7 +187,8 @@ template<typename T, bool isBasicBlock = false>
 __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                                     const LocalTensor <T> &srcTensor,
                                                     const LocalTensor<float> &workLocal, const SoftMaxTiling &tiling,
-                                                    const LastAxisShapeND &originalSrcShape) {
+                                                    const LastAxisShapeND &originalSrcShape)
+{
     uint32_t elementNumPerBlk = ONE_BLK_SIZE / sizeof(T);
 
     ReduceLastND reduceSumParam = {tiling.splitM, originalSrcShape.k, tiling.splitM,
@@ -327,7 +332,8 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
 __aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize, const LastAxisShapeND &ndinfo,
                                                    SoftMaxTiling &softmaxTiling, const uint32_t elementNumPerBlk,
                                                    bool isFront = false, bool isBasicBlock = false,
-                                                   bool isDataFormatNZ = false) {
+                                                   bool isDataFormatNZ = false)
+{
     softmaxTiling.srcM = ndinfo.m;
     softmaxTiling.srcK = ndinfo.k;
     softmaxTiling.srcSize = ndinfo.m * ndinfo.k;
@@ -382,7 +388,8 @@ __aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize,
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                             const LocalTensor <T> &srcTensor, const LocalTensor<float> &workLocal,
-                                            const SoftMaxShapeInfo &softmaxShapeInfo) {
+                                            const SoftMaxShapeInfo &softmaxShapeInfo)
+{
     ShapeInfo srcShape = srcTensor.GetShapeInfo();
     uint32_t elementNumPerBlk = ONE_BLK_SIZE / sizeof(T);
     LastAxisShapeND srcNDinfo;
@@ -402,7 +409,8 @@ template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                             const LocalTensor <T> &srcTensor,
                                             const LocalTensor <uint8_t> &sharedTmpBuffer,
-                                            const SoftMaxShapeInfo &softmaxShapeInfo) {
+                                            const SoftMaxShapeInfo &softmaxShapeInfo)
+{
     auto workLocal = sharedTmpBuffer.ReinterpretCast<float>();
     SoftmaxGradFrontImpl<T, isBasicBlock>(dstTensor, gradTensor, srcTensor, workLocal,
                                           softmaxShapeInfo);
@@ -411,7 +419,8 @@ __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, co
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFront(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                         const LocalTensor <T> &srcTensor, const LocalTensor <uint8_t> &sharedTmpBuffer,
-                                        const SoftMaxShapeInfo &softmaxShapeInfo = {}) {
+                                        const SoftMaxShapeInfo &softmaxShapeInfo = {})
+{
 
     if ASCEND_IS_AIC{
                 return;
@@ -421,4 +430,4 @@ __aicore__ inline void SoftmaxGradFront(const LocalTensor <T> &dstTensor, const 
 }
 
 
-#endif //OPS_TRANSFORMER_SFMG_FLASH_ATTENTION_GRAD_CUSTOM_SFMG_H
+#endif // OPS_TRANSFORMER_SFMG_FLASH_ATTENTION_GRAD_CUSTOM_SFMG_H

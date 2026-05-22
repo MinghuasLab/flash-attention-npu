@@ -90,7 +90,8 @@ public:
     static_assert(std::is_same_v<LayoutC, layout::RowMajor>, "LayoutC only support RowMajor yet!");
 
     __aicore__ inline
-    BlockMmad(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn, uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0)
+    BlockMmad(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn, uint32_t KVStackLen = 512,
+        uint32_t l1BufAddrStart = 0)
     {   
         maxKVStackLen = KVStackLen;
         // Allocate L1 memory space
@@ -129,9 +130,12 @@ public:
     }
 
     __aicore__ inline
-    void setBlockParam(uint32_t stackSeqTile, uint32_t &blockStart, uint32_t &blockEnd, uint32_t &curBlockTotalNum, uint32_t blockSize){
+    void setBlockParam(uint32_t stackSeqTile, uint32_t &blockStart, uint32_t &blockEnd, uint32_t &curBlockTotalNum,
+        uint32_t blockSize)
+    {
         if(stackSeqTile >= blockStart && blockSize != 0) {
-            blockEnd = ((stackSeqTile - blockStart) % blockSize == 0) ? blockSize : (stackSeqTile - blockStart) % blockSize;
+            blockEnd = ((stackSeqTile - blockStart) % blockSize == 0) ?
+                blockSize : (stackSeqTile - blockStart) % blockSize;
             curBlockTotalNum = (((stackSeqTile - blockStart) + blockSize - 1) / blockSize) + 1;
         } else {
             curBlockTotalNum = 1;
@@ -151,8 +155,8 @@ public:
     }
 
     __aicore__ inline
-    void getBlockShape(GemmCoord &actualShape, uint32_t& blockStartOffset, uint32_t& l1NResDynamic, uint32_t& kvL1Len, uint32_t& nowLen, uint32_t& blockSize)
-
+    void getBlockShape(GemmCoord &actualShape, uint32_t& blockStartOffset, uint32_t& l1NResDynamic, uint32_t& kvL1Len,
+        uint32_t& nowLen, uint32_t& blockSize)
     {
         nowLen = (blockSize - blockStartOffset < l1NResDynamic - kvL1Len) ?
                 blockSize - blockStartOffset :
@@ -175,12 +179,14 @@ public:
     }
 
     __aicore__ inline
-    void resetBlockStart(){
+    void resetBlockStart()
+    {
         blockStartOffset = 0;
     }
 
     __aicore__ inline
-    void updateBlockOffset(uint32_t nowLen, uint32_t &curBlockIdx, uint32_t blockSize){
+    void updateBlockOffset(uint32_t nowLen, uint32_t &curBlockIdx, uint32_t blockSize)
+    {
         if(blockStartOffset + nowLen == blockSize){
             blockStartOffset = 0;
             curBlockIdx++;
@@ -212,7 +218,7 @@ public:
         uint32_t blockStart = 0;
         uint32_t blockEnd = 0;
         uint32_t curBlockTotalNum = 0;
-        if constexpr (PAGED_CACHE_FLAG_){
+        if constexpr (PAGED_CACHE_FLAG_) {
             blockStart = blockSize - blockStartOffset;
             setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
         }
@@ -221,7 +227,7 @@ public:
             uint32_t kActual = actualShape.k();
             uint32_t nActual = actualShape.n();
             LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
-            if constexpr (PAGED_CACHE_FLAG_){
+            if constexpr (PAGED_CACHE_FLAG_) {
                 uint32_t l1NResDynamic = (nL1Idx < (nL1Loop-1)) ? l1NDynamic : (stackSeqTile - nL1Idx * l1NDynamic);
                 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(embed, l1NResDynamic);
                 uint32_t kvL1Len = 0;

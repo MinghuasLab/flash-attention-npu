@@ -29,41 +29,41 @@ uint32_t GetQSBlockTile(int64_t kvSeqlen)
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-                at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
-                at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
-                std::optional<at::Tensor> k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-                std::optional<at::Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
-                std::optional<at::Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
-                std::optional<at::Tensor> out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-                std::optional<at::Tensor> cu_seqlens_q_,  // b+1
-                std::optional<at::Tensor> cu_seqlens_k_,  // b+1
-                std::optional<at::Tensor> cu_seqlens_k_new_,  // b+1
-                std::optional<at::Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-                std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
-                std::optional<int64_t> max_seqlen_q_,
-                // TODO: check if we need max_seqlen_k
-                std::optional<int64_t> max_seqlen_k_,
-                std::optional<at::Tensor> page_table_, // (b_k, max_num_pages_per_seq)
-                std::optional<at::Tensor> kv_batch_idx_, // b. indices to index into the KV cache
-                std::optional<at::Tensor> leftpad_k_, // b
-                std::optional<at::Tensor> rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<at::Tensor> rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<at::Tensor> seqlens_rotary_, // b
-                std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
-                std::optional<at::Tensor> k_descale_,  // (b, h_k)
-                std::optional<at::Tensor> v_descale_,  // (b, h_k)
-                std::optional<float> softmax_scale_,
-                bool is_causal,
-                int64_t window_size_left,
-                int64_t window_size_right,
-                int64_t attention_chunk,
-                float softcap,
-                bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
-                int64_t num_splits,
-                std::optional<bool> pack_gqa_,
-                int64_t sm_margin
-                )
+        at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
+        at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+        std::optional<at::Tensor> k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
+        std::optional<at::Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
+        std::optional<at::Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+        std::optional<at::Tensor> out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        std::optional<at::Tensor> cu_seqlens_q_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_,  // b+1
+        std::optional<at::Tensor> cu_seqlens_k_new_,  // b+1
+        std::optional<at::Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+        std::optional<int64_t> max_seqlen_q_,
+        // TODO: check if we need max_seqlen_k
+        std::optional<int64_t> max_seqlen_k_,
+        std::optional<at::Tensor> page_table_, // (b_k, max_num_pages_per_seq)
+        std::optional<at::Tensor> kv_batch_idx_, // b. indices to index into the KV cache
+        std::optional<at::Tensor> leftpad_k_, // b
+        std::optional<at::Tensor> rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<at::Tensor> rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        std::optional<at::Tensor> seqlens_rotary_, // b
+        std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
+        std::optional<at::Tensor> k_descale_,  // (b, h_k)
+        std::optional<at::Tensor> v_descale_,  // (b, h_k)
+        std::optional<float> softmax_scale_,
+        bool is_causal,
+        int64_t window_size_left,
+        int64_t window_size_right,
+        int64_t attention_chunk,
+        float softcap,
+        bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
+        int64_t num_splits,
+        std::optional<bool> pack_gqa_,
+        int64_t sm_margin
+        )
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -224,7 +224,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     
     at::Tensor workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
-    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    at::Tensor softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+        at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
         softmaxlse = at::empty({sizes[0], num_heads}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
@@ -298,44 +299,68 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         if (paged_KV) {
             if (is_causal) {
                 if (is_varlen_q) {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                                softmaxLseDevice,
                                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                                softmaxLseDevice,
                                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }
         } else {
             if (is_causal) {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }
@@ -344,44 +369,67 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         if (paged_KV) {
             if (is_causal) {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND,
+                        Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }
         } else {
             if (is_causal) {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
                 if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::TND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK,
+                        FaiKenel::inputLayout::BSND,
+                    Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice,
+                                softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }

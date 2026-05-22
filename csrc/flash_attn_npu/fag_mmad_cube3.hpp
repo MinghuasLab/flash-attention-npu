@@ -203,7 +203,8 @@ namespace Catlass::Gemm::Block
                             int32_t l0_b_buf_offset = (m_loop_index == 0) ? 0 : 128 * 128;
 
                             LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(m_remain, l1_k_size);
-                            copyL1ToL0B(l0_b_ping_tensor[l0_b_buf_offset], (*l1_b_buf_tensor)[l1_b_buf_offset], layoutBInL0, layoutBInL1);
+                            copyL1ToL0B(l0_b_ping_tensor[l0_b_buf_offset], (*l1_b_buf_tensor)[l1_b_buf_offset],
+                                layoutBInL0, layoutBInL1);
 
                             AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0B + 2);
                             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0B + 2);
@@ -249,7 +250,8 @@ namespace Catlass::Gemm::Block
                             uint32_t dstNzC0Stride = (m_loop_index == m_loop - 1) ? l1_m_block_size_align_tail : 128;
                             auto layoutTileA = layoutA.GetTileLayout(MakeCoord(real_n, real_m));
                             LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(real_n, real_m);
-                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(n_loop_index * m_loop + m_loop_index - skip_num) * SIZE_128 * SIZE_128], layoutAInL1, layoutTileA);
+                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(n_loop_index * m_loop + m_loop_index - skip_num) * SIZE_128 * SIZE_128],
+                                layoutAInL1, layoutTileA);
                         }
 
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
@@ -275,7 +277,8 @@ namespace Catlass::Gemm::Block
                             if (out_c) {
                                 unit_flag = 0b11;
                             }
-                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, real_n, l1_k_size, real_m, init_c, unit_flag);
+                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, real_n, l1_k_size, real_m,
+                                init_c, unit_flag);
                         }
 
                         if (out_c && n_loop_index == n_loop - 1) {
@@ -292,7 +295,8 @@ namespace Catlass::Gemm::Block
                             auto blockShape = MakeCoord(real_n, l1_k_size);
                             auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(blockShape);
                             LayoutC layoutC(real_n, l1_k_size, nheads_k * headdim);
-                            copyL0CToGm(gOut[n_loop_index * 128 * nheads_k * headdim], *l0_c_buf_tensor, layoutC, layoutInL0C, 3);
+                            copyL0CToGm(gOut[n_loop_index * 128 * nheads_k * headdim], *l0_c_buf_tensor, layoutC,
+                                layoutInL0C, 3);
                             AscendC::SetAtomicNone();
                         }
                         pingpongFlagL1A = 1 - pingpongFlagL1A;

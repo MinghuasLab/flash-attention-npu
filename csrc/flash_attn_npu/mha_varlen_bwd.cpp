@@ -176,7 +176,8 @@ public:
         }
 
         CubeAddr<maskType, inputLayout> cubeAddr;
-        cubeAddr.init(batch, nheads, g, headdim, GetBlockIdx(), seq_q_len, seq_k_len, actucal_seq_q_addr, actucal_seq_k_addr, mixCoreNum);
+        cubeAddr.init(batch, nheads, g, headdim, GetBlockIdx(), seq_q_len, seq_k_len, actucal_seq_q_addr,
+            actucal_seq_k_addr, mixCoreNum);
 
         uint32_t pingpongFlagL1A = 0;
         uint32_t pingpongFlagL1B = 0;
@@ -194,9 +195,11 @@ public:
             if (cubeAddrInfo[taskId % 2].blockLength > 0) {
                 SetFlag();
                 CubeAddrInfo addrs = cubeAddrInfo[taskId % 2];
-                blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.q), (__gm__ ElementB1 *)(params.k), (__gm__ float*)(params.workspace + mm2WorkspaceOffset), 
+                blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.q),
+                    (__gm__ ElementB1 *)(params.k), (__gm__ float*)(params.workspace + mm2WorkspaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
-                blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.dout), (__gm__ ElementB1*)(params.v), (__gm__ float*)(params.workspace + mm1WorkspaceOffset), 
+                blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.dout),
+                    (__gm__ ElementB1*)(params.v), (__gm__ float*)(params.workspace + mm1WorkspaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
                 AscendC::CrossCoreSetFlag<2, PIPE_FIX>(CUBE2VEC);
@@ -204,15 +207,21 @@ public:
             if (taskId > 0 && cubeAddrInfo[(taskId - 1) % 2].blockLength > 0) {
                 AscendC::WaitEvent(VEC2CUBE);
                 SetFlag();
-                blockMmadFAGCube2(cubeAddrInfo[(taskId - 1) % 2], (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB2*)(params.k), (__gm__ float*)(params.workspace + dqWorkSpaceOffset), 
+                blockMmadFAGCube2(cubeAddrInfo[(taskId - 1) % 2],
+                    (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB2*)(params.k),
+                    (__gm__ float*)(params.workspace + dqWorkSpaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B);
                 WaitFlag();
                 SetFlag();
-                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2], (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout), (__gm__ float*)(params.workspace + dvWorkSpaceOffset), 
+                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
+                    (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout),
+                    (__gm__ float*)(params.workspace + dvWorkSpaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
                 SetFlag();
-                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2], (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB3*)(params.q), (__gm__ float*)(params.workspace + dkWorkSpaceOffset), 
+                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
+                    (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB3*)(params.q),
+                    (__gm__ float*)(params.workspace + dkWorkSpaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
             }
@@ -254,13 +263,15 @@ public:
 
         struct VecAddrInfo vecAddrInfo;
         AscendC::TPipe pipePre;
-        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.workspace, params.tiling_data);
+        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.workspace,
+            params.tiling_data);
         epilogueFagPre();
         pipePre.Destroy();
 
         // vec SoftmaxGrad
         AscendC::TPipe pipeSoftmaxGrad;
-        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, actucal_seq_q_addr, params.workspace, batch, params.tiling_data);
+        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, actucal_seq_q_addr,
+            params.workspace, batch, params.tiling_data);
         epilogueFagSfmg();
         pipeSoftmaxGrad.Destroy();
 
@@ -272,7 +283,8 @@ public:
             params.atten_mask, actucal_seq_q_addr, actucal_seq_k_addr, params.workspace, batch, params.tiling_data);
 
         VectorAddr<maskType, inputLayout> vector_addr;
-        vector_addr.init(batch, nheads, g, headdim, GetBlockIdx() / 2, seq_q_len, seq_k_len, actucal_seq_q_addr, actucal_seq_k_addr, mixCoreNum);
+        vector_addr.init(batch, nheads, g, headdim, GetBlockIdx() / 2, seq_q_len, seq_k_len, actucal_seq_q_addr,
+            actucal_seq_k_addr, mixCoreNum);
         int32_t taskId = 0;
         bool running = true;
         while (running) {
@@ -294,7 +306,8 @@ public:
         
         // vector post process
         AscendC::TPipe pipePost;
-        EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace, params.tiling_data);
+        EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace,
+            params.tiling_data);
         epilogueFagPost();
         pipePost.Destroy(); 
 #endif
@@ -354,7 +367,6 @@ void FAG(uint64_t fftsAddr,
 {
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     
     #if defined(ENABLE_ASCENDC_DUMP)
         AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
@@ -374,7 +386,8 @@ void FAG(uint64_t fftsAddr,
     using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FAGCube1;
     using L1TileShapeCube1 = GemmShape<256, 128, 256>;
     using L0TileShapeCube1 = L1TileShapeCube1;
-    using BlockMmadFAGCube1 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube1, L1TileShapeCube1, L0TileShapeCube1, A1Type, B1Type, C1Type>;
+    using BlockMmadFAGCube1 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube1, L1TileShapeCube1, L0TileShapeCube1,
+        A1Type, B1Type, C1Type>;
 
     // Cube2 计算：左矩阵不转置，右矩阵不转置。实现 dQ = dS * K
     using ElementA2 = InputDtype;           // ds
@@ -391,7 +404,8 @@ void FAG(uint64_t fftsAddr,
     using L1TileShapeCube2 = GemmShape<128, 128, 128>;
     using L0TileShapeCube2 = L1TileShapeCube2;
 
-    using BlockMmadFAGCube2 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube2, L1TileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>;
+    using BlockMmadFAGCube2 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube2, L1TileShapeCube2, L0TileShapeCube2,
+        A2Type, B2Type, C2Type>;
 
     // Cube3 计算：左矩阵转置，右矩阵不转置。 实现 dK = dS^T * Q 和 dV = P^T * dOut
     using ElementA3 = InputDtype;              // ds和p
@@ -408,7 +422,8 @@ void FAG(uint64_t fftsAddr,
     using L1TileShapeCube3 = GemmShape<256, 128, 256>;
     using L0TileShapeCube3 = L1TileShapeCube3;
 
-    using BlockMmadFAGCube3 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube3, L1TileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>;
+    using BlockMmadFAGCube3 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube3, L1TileShapeCube3, L0TileShapeCube3,
+        A3Type, B3Type, C3Type>;
 
     // Epilogue
     using ElementVecDtype = InputDtype;
@@ -419,11 +434,13 @@ void FAG(uint64_t fftsAddr,
 
     // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
     using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg;
-    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>>;
+    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype,
+        std::integral_constant<InputLayout, inputLayout>>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
     using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp;
-    using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>>;
+    using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype,
+        std::integral_constant<InputLayout, inputLayout>>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
     using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
@@ -431,7 +448,8 @@ void FAG(uint64_t fftsAddr,
 
 
     // Kernel level
-    using FAGKernel = FAGKernel<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGOp, EpilogueFAGPost, maskType, inputLayout>;
+    using FAGKernel = FAGKernel<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
+        EpilogueFAGSfmg, EpilogueFAGOp, EpilogueFAGPost, maskType, inputLayout>;
     typename FAGKernel::Params params{
         q, k, v, dout,
         q_right, k_right, pse_shift,

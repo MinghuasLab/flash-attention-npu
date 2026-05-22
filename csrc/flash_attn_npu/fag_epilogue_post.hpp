@@ -106,7 +106,7 @@ public:
         ubBaseSize = ubSize / curPostCoexNode / POST_BUFFER_NUM;
         ubBaseSize = ubBaseSize / WORKSPACE_NUM_ALIGN * WORKSPACE_NUM_ALIGN; // align
 
-        //dq
+        // dq
         qPostBaseNum = ubBaseSize / sizeof(float);
         qPostBlockTotal = qSize;
 

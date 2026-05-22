@@ -61,7 +61,8 @@ namespace Catlass::Gemm::Block
         using CopyL1ToL0A = typename TileCopy_::CopyL1ToL0A;
         using CopyL1ToL0B = typename TileCopy_::CopyL1ToL0B;
         using CopyL0CToGm = typename TileCopy_::CopyL0CToGm;
-        using ElementAccumulator = typename Gemm::helper::ElementAccumulatorSelector<ElementA, ElementB>::ElementAccumulator;
+        using ElementAccumulator = typename Gemm::helper::ElementAccumulatorSelector<ElementA,
+            ElementB>::ElementAccumulator;
         using LayoutAInL1 = typename CopyL1ToL0A::LayoutSrc;
         using LayoutBInL1 = typename CopyL1ToL0B::LayoutSrc;
         using LayoutAInL0 = typename CopyL1ToL0A::LayoutDst;
@@ -183,19 +184,23 @@ namespace Catlass::Gemm::Block
                     LayoutB layoutB(headdim, n_remain, nheads_k * headdim);
 
                     // load right matrix gm (kx, headdim)-> L1B
-                    AscendC::LocalTensor<ElementB>* l1_b_buf_tensor = pingpongFlagL1B ? &l1_b_pong_tensor : &l1_b_ping_tensor;
+                    AscendC::LocalTensor<ElementB>* l1_b_buf_tensor = pingpongFlagL1B ?
+                        &l1_b_pong_tensor : &l1_b_ping_tensor;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1B);
 
-                    auto layoutTileB = layoutB.GetTileLayout(MakeCoord(static_cast<uint32_t>(n_remain), static_cast<uint32_t>(headdim)));
+                    auto layoutTileB = layoutB.GetTileLayout(MakeCoord(static_cast<uint32_t>(n_remain),
+                        static_cast<uint32_t>(headdim)));
                     LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(n_remain, headdim);
-                    copyGmToL1B(*l1_b_buf_tensor, gRight[n_loop_index * nheads_k * 128 * headdim], layoutBInL1, layoutTileB);
+                    copyGmToL1B(*l1_b_buf_tensor, gRight[n_loop_index * nheads_k * 128 * headdim], layoutBInL1,
+                        layoutTileB);
 
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
 
                     // Load Left_GM matrix A -> L1A
                     pingpongFlagL1A = 0;
                     for (uint32_t m_loop_index = 0; m_loop_index < m_loop; m_loop_index++) {
-                        AscendC::LocalTensor<ElementA>* l1_a_buf_tensor = pingpongFlagL1A ? &l1_a_pong_tensor : &l1_a_ping_tensor;
+                        AscendC::LocalTensor<ElementA>* l1_a_buf_tensor = pingpongFlagL1A ?
+                            &l1_a_pong_tensor : &l1_a_ping_tensor;
                         int32_t m_remain = (m_loop_index == m_loop - 1) ? l1_m_block_size_tail : 128;
                         int32_t m_remain_align = (m_loop_index == m_loop - 1) ? l1_m_block_size_align_tail : 128;
                         bool is_skip = false;
@@ -208,16 +213,19 @@ namespace Catlass::Gemm::Block
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
 
                         if (!is_skip) {
-                            auto layoutTileA = layoutA.GetTileLayout(MakeCoord(static_cast<uint32_t>(m_remain), static_cast<uint32_t>(n_remain)));
+                            auto layoutTileA = layoutA.GetTileLayout(MakeCoord(static_cast<uint32_t>(m_remain),
+                                static_cast<uint32_t>(n_remain)));
                             LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(m_remain, n_remain);
-                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(m_loop * n_loop_index + m_loop_index - skip_num) * 128 * 128], layoutAInL1, layoutTileA);
+                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(m_loop * n_loop_index + m_loop_index - skip_num) * 128 * 128],
+                                layoutAInL1, layoutTileA);
                         }
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
                         pingpongFlagL1A = 1 - pingpongFlagL1A;
                     }
 
                     // load L1B (n, headdim) -> L0B
-                    AscendC::LocalTensor<ElementB>* l0_b_buf_tensor = pingpongFlagL0B ? &l0_b_pong_tensor : &l0_b_ping_tensor;
+                    AscendC::LocalTensor<ElementB>* l0_b_buf_tensor = pingpongFlagL0B ?
+                        &l0_b_pong_tensor : &l0_b_ping_tensor;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(pingpongFlagL0B + 2 + FLAG_SHIFT);
 
@@ -233,9 +241,12 @@ namespace Catlass::Gemm::Block
 
                     // do m_loop times mad with l0B常驻
                     for (uint32_t m_loop_index = 0; m_loop_index < m_loop; m_loop_index++) {
-                        AscendC::LocalTensor<ElementA>* l1_a_buf_tensor = pingpongFlagL1A ? &l1_a_pong_tensor : &l1_a_ping_tensor;
-                        AscendC::LocalTensor<ElementA>* l0_a_buf_tensor = pingpongFlagL0A ? &l0_a_pong_tensor : &l0_a_ping_tensor;
-                        AscendC::LocalTensor<float>* l0_c_buf_tensor = m_loop_index ? &l0_c_pong_tensor : &l0_c_ping_tensor;
+                        AscendC::LocalTensor<ElementA>* l1_a_buf_tensor = pingpongFlagL1A ?
+                            &l1_a_pong_tensor : &l1_a_ping_tensor;
+                        AscendC::LocalTensor<ElementA>* l0_a_buf_tensor = pingpongFlagL0A ?
+                            &l0_a_pong_tensor : &l0_a_ping_tensor;
+                        AscendC::LocalTensor<float>* l0_c_buf_tensor = m_loop_index ?
+                            &l0_c_pong_tensor : &l0_c_ping_tensor;
 
                         int32_t m_remain = (m_loop_index == m_loop - 1) ? l1_m_block_size_tail : 128;
                         int32_t m_remain_align = (m_loop_index == m_loop - 1) ? l1_m_block_size_align_tail : 128;
@@ -257,23 +268,27 @@ namespace Catlass::Gemm::Block
 
                         // mad (m_remain, n_remain) x (n_remain, headdim)
                         bool last_k = false;
-                        last_k = (m_loop_index == 0 && upperRight) ? n_loop_index == n_loop - 2 : n_loop_index == n_loop - 1;
+                        last_k = (m_loop_index == 0 && upperRight) ?
+                            n_loop_index == n_loop - 2 : n_loop_index == n_loop - 1;
 
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0A);
                         if (!is_skip) {
                             uint16_t m_modify = (m_remain == 1) ? 2 : m_remain;
 
-                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, m_modify, headdim, n_remain, l0_c_init_flag, last_k ? 3 : 2);
+                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, m_modify, headdim, n_remain,
+                                l0_c_init_flag, last_k ? 3 : 2);
                         }
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(pingpongFlagL0A + FLAG_SHIFT);
 
                         // fixp in n_loop tail block
                         if (!is_skip && last_k) {
                             AscendC::SetAtomicType<float>();
-                            auto blockShape = MakeCoord(static_cast<uint32_t>(m_remain), static_cast<uint32_t>(headdim));
+                            auto blockShape = MakeCoord(static_cast<uint32_t>(m_remain),
+                                static_cast<uint32_t>(headdim));
                             auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(blockShape);
                             LayoutC layoutC(m_remain, headdim, nheads * headdim);
-                            copyL0CToGm((gOut)[m_loop_index * nheads * 128 * headdim], *l0_c_buf_tensor, layoutC, layoutInL0C, 3);
+                            copyL0CToGm((gOut)[m_loop_index * nheads * 128 * headdim], *l0_c_buf_tensor, layoutC,
+                                layoutInL0C, 3);
                             AscendC::SetAtomicNone();
                         }
                         pingpongFlagL1A = 1 - pingpongFlagL1A;

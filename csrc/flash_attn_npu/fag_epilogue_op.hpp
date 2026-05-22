@@ -44,7 +44,8 @@ public:
     using DispatchPolicy = EpilogueAtlasA2FAGOp;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
-    static constexpr InputLayout getLayout() {
+    static constexpr InputLayout getLayout()
+    {
         return std::integral_constant<InputLayout, inputLayout>::value;
     }
     AscendC::TPipe *pipe;
@@ -231,7 +232,8 @@ public:
     }
 
     CATLASS_DEVICE
-    void CopyInAttenMaskBool(LocalTensor<uint8_t> &dstTensor, int64_t attenMaskOffset, uint32_t s1Extend, uint32_t s2Extend)
+    void CopyInAttenMaskBool(LocalTensor<uint8_t> &dstTensor, int64_t attenMaskOffset, uint32_t s1Extend,
+        uint32_t s2Extend)
     {
         AscendC::DataCopyExtParams intriParams;
         intriParams.blockCount = s1Extend;
@@ -251,7 +253,8 @@ public:
         uint32_t s2MaskExtend = 128,
         uint8_t maskType = 0)
     {
-        LocalTensor<uint8_t> tmpUbBuffer = unifiedBuffer.GetWithOffset<uint8_t>(TMP_UB_SIZE / sizeof(uint8_t), TMP_UB_OFFSET);
+        LocalTensor<uint8_t> tmpUbBuffer = unifiedBuffer.GetWithOffset<uint8_t>(TMP_UB_SIZE / sizeof(uint8_t),
+            TMP_UB_OFFSET);
 
         float scalar;
         if constexpr (AscendC::IsSameType<float, float>::value) {
@@ -295,12 +298,14 @@ public:
 
     CATLASS_DEVICE
     void CalcSoftMax(LocalTensor<float>& dstTensor, LocalTensor<float>& src0Tensor, 
-                    LocalTensor<float>& src1Tensor, uint32_t s1Extend, uint32_t s2Extend, uint32_t s2ExtendAlign, const SoftMaxTiling& tiling)
+                     LocalTensor<float>& src1Tensor, uint32_t s1Extend, uint32_t s2Extend, uint32_t s2ExtendAlign,
+                     const SoftMaxTiling& tiling)
     {
         bool isBasicBlock = (s1Extend % 8 == 0) && (s2Extend % 64 == 0);
 
         if (isBasicBlock) {
-            AscendC::LocalTensor<uint8_t> sharedTmp = unifiedBuffer.GetWithOffset<uint8_t>(TMP_UB_SIZE / sizeof(uint8_t), TMP_UB_OFFSET);
+            AscendC::LocalTensor<uint8_t> sharedTmp = unifiedBuffer.GetWithOffset<uint8_t>(TMP_UB_SIZE /
+                sizeof(uint8_t), TMP_UB_OFFSET);
             uint32_t shapeArray1[2];
             shapeArray1[0] = s1Extend;
             shapeArray1[1] = s2Extend;
@@ -312,16 +317,18 @@ public:
             uint32_t sub_block_count = (s2Extend + cal_repeat_num - 1) / cal_repeat_num;
 
             for(uint32_t subIdx = 0; subIdx < sub_block_count; subIdx++) {
-                uint32_t subMaskCount = (subIdx == sub_block_count - 1) ? (s2Extend - subIdx * cal_repeat_num) : cal_repeat_num;
-                AscendC::Sub(dstTensor[subIdx * cal_repeat_num], src0Tensor[subIdx * cal_repeat_num], src1Tensor[64 * 8],
-                        subMaskCount, s1Extend,
-                        {static_cast<uint8_t>(1), static_cast<uint8_t>(1), 0,
-                        static_cast<uint8_t>(s2ExtendAlign / 8), static_cast<uint8_t>(s2ExtendAlign / 8), 1});
+                uint32_t subMaskCount = (subIdx == sub_block_count - 1) ? (s2Extend - subIdx *
+                    cal_repeat_num) : cal_repeat_num;
+                AscendC::Sub(dstTensor[subIdx * cal_repeat_num], src0Tensor[subIdx * cal_repeat_num],
+                    src1Tensor[64 * 8],
+                    subMaskCount, s1Extend,
+                    {static_cast<uint8_t>(1), static_cast<uint8_t>(1), 0,
+                    static_cast<uint8_t>(s2ExtendAlign / 8), static_cast<uint8_t>(s2ExtendAlign / 8), 1});
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Exp(dstTensor[subIdx * cal_repeat_num], dstTensor[subIdx * cal_repeat_num],
                     subMaskCount, s1Extend,
-                        {static_cast<uint8_t>(1), static_cast<uint8_t>(1),
-                        static_cast<uint8_t>(s2ExtendAlign / 8), static_cast<uint8_t>(s2ExtendAlign / 8)});
+                    {static_cast<uint8_t>(1), static_cast<uint8_t>(1),
+                    static_cast<uint8_t>(s2ExtendAlign / 8), static_cast<uint8_t>(s2ExtendAlign / 8)});
                 AscendC::PipeBarrier<PIPE_V>();
             }
         }
@@ -357,7 +364,8 @@ public:
         LocalTensor<uint8_t> attenMaskUbuint8 =
             unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
         if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
-            CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign, S2_CUBESIZE, 0);
+            CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
+                S2_CUBESIZE, 0);
         }
 
         ///////////////////////////////////////////////////////////////
@@ -365,13 +373,15 @@ public:
         ///////////////////////////////////////////////////////////////
         AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(float), DbBegin);
-        CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1Extend, s2Extend, s2ExtendAlign, softmaxTilingData);
+        CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1Extend, s2Extend, s2ExtendAlign,
+            softmaxTilingData);
         LocalTensor<float> vecDropBuffer = simpleSoftmaxResBuf;
 
         ///////////////////////////////////////////////////////////////
         // cast fp322bf16
         ///////////////////////////////////////////////////////////////
-        LocalTensor<ElementVecDtype> vecCopyOutBuffer = unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 / sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
+        LocalTensor<ElementVecDtype> vecCopyOutBuffer = unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 /
+            sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
         AscendC::PipeBarrier<PIPE_V>();
         Cast(vecCopyOutBuffer, vecDropBuffer, RoundMode::CAST_ROUND, s1Extend * s2ExtendAlign);
 
@@ -399,7 +409,8 @@ public:
         LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
         DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset], s1Extend * 8);
 
-        LocalTensor<float> vecClc1Buffer = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(float), ubBufferOffset + T1Begin);
+        LocalTensor<float> vecClc1Buffer = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(float),
+            ubBufferOffset + T1Begin);
         
         // copyIn cube result
         DataCopyPad(vecClc1Buffer, mm1WorkspaceGm[copyInOffset], copyInParam, {false, 0, 0, 0});
@@ -430,7 +441,8 @@ public:
         Mul(vecClc1Buffer, vecClc1Buffer, simpleSoftmaxResBuf, s1Extend * s2ExtendAlign);
 
         AscendC::PipeBarrier<PIPE_V>();
-        LocalTensor<ElementVecDtype> vecCopyOutBuffer = unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 / sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
+        LocalTensor<ElementVecDtype> vecCopyOutBuffer = unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 /
+            sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
         Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_ROUND, s1Extend * s2ExtendAlign);
 
         event_t mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
@@ -488,7 +500,7 @@ public:
             s2Extend = blockInfo.lengthx;
             s2ExtendAlign = (s2Extend + 15) / 16 * 16;
 
-            //offset
+            // offset
             int64_t globalSeqStart = 0;
             if constexpr (getLayout() == InputLayout::TND) {
                 globalSeqStart = (blockInfo.batchIdx > 0)
@@ -512,11 +524,12 @@ public:
                     sfmgOffset = seq_q * nheads_k * g * 8;
                 }
             }
-            sfmgOffset += ((blockInfo.nheadsKIdx * g + blockInfo.gIdx) * cuQSeqLen + blockInfo.SeqQIdx * S1_CUBESIZE + curSeqQIdx * s1VecSize) * 8;
+            sfmgOffset += ((blockInfo.nheadsKIdx * g + blockInfo.gIdx) * cuQSeqLen + blockInfo.SeqQIdx * S1_CUBESIZE +
+                curSeqQIdx * s1VecSize) * 8;
             
             // copyIn cube_workspace params
-            copyInOffset = 
-                cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset + curSeqQIdx * s1VecSize * s2CubeExtend;
+            copyInOffset = cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset + curSeqQIdx * s1VecSize *
+                s2CubeExtend;
             copyInParam = {
                 static_cast<uint16_t>(s1Extend),
                 static_cast<uint16_t>(s2ExtendAlign * sizeof(float)),
