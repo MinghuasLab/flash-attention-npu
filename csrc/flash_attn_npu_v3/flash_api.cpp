@@ -507,42 +507,6 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
         fagInfo.qSeqlenList = static_cast<int64_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
         fagInfo.kvSeqlenList = static_cast<int64_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
     }
-    std::cout << "[mha_bwd][fagInfo] "
-              << "layout=" << (is_varlen_q ? "TND" : "BSND")
-              << ", batch=" << fagInfo.batch
-              << ", qSeqlen=" << fagInfo.qSeqlen
-              << ", kvSeqlen=" << fagInfo.kvSeqlen
-              << ", qHeadNum=" << fagInfo.qHeadNum
-              << ", kvHeadNum=" << fagInfo.kvHeadNum
-              << ", qkHeadDim=" << fagInfo.qkHeadDim
-              << ", vHeadDim=" << fagInfo.vHeadDim
-              << ", maskType=" << fagInfo.maskType
-              << ", deterministic=" << fagInfo.isDeterministic
-              << ", windowL=" << fagInfo.window_size_left
-              << ", windowR=" << fagInfo.window_size_right
-              << std::endl;
-    if (is_varlen_q) {
-        auto *cu_q_ptr = static_cast<int64_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr());
-        auto *cu_k_ptr = static_cast<int64_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr());
-        const int64_t print_n = std::min<int64_t>(batch_size + 1, 8);
-        std::cout << "[mha_bwd][fagInfo] cu_seqlens_q(B+1) first " << print_n << ": ";
-        for (int64_t i = 0; i < print_n; ++i) {
-            std::cout << cu_q_ptr[i] << (i + 1 == print_n ? '\n' : ' ');
-        }
-        std::cout << "[mha_bwd][fagInfo] cu_seqlens_k(B+1) first " << print_n << ": ";
-        for (int64_t i = 0; i < print_n; ++i) {
-            std::cout << cu_k_ptr[i] << (i + 1 == print_n ? '\n' : ' ');
-        }
-        const int64_t print_b = std::min<int64_t>(batch_size, 8);
-        std::cout << "[mha_bwd][fagInfo] qSeqlenList(B, no leading 0) first " << print_b << ": ";
-        for (int64_t i = 0; i < print_b; ++i) {
-            std::cout << fagInfo.qSeqlenList[i] << (i + 1 == print_b ? '\n' : ' ');
-        }
-        std::cout << "[mha_bwd][fagInfo] kvSeqlenList(B, no leading 0) first " << print_b << ": ";
-        for (int64_t i = 0; i < print_b; ++i) {
-            std::cout << fagInfo.kvSeqlenList[i] << (i + 1 == print_b ? '\n' : ' ');
-        }
-    }
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     uint64_t ubSize = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
@@ -612,31 +576,6 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
         }
     }
     auto softMaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_lse_kernel.storage().data()));
-
-    {
-        const bool same_tensor = softmax_lse_kernel.is_same(softmax_lse);
-        std::cout << "[mha_bwd][softmax_lse] pre_kernel varlen=" << (is_varlen_q ? 1 : 0)
-                  << " same_tensor_as_input=" << (same_tensor ? 1 : 0);
-        std::cout << " input_sizes=[";
-        for (int64_t d = 0; d < softmax_lse.dim(); ++d) {
-            std::cout << (d ? ", " : "") << softmax_lse.size(d);
-        }
-        std::cout << "] kernel_sizes=[";
-        for (int64_t d = 0; d < softmax_lse_kernel.dim(); ++d) {
-            std::cout << (d ? ", " : "") << softmax_lse_kernel.size(d);
-        }
-        std::cout << "] input_ptr=" << softmax_lse.data_ptr()
-                  << " kernel_ptr=" << softmax_lse_kernel.data_ptr() << std::endl;
-        at::Tensor lse_pre = softmax_lse_kernel.to(at::kCPU).contiguous();
-        const float *pp = lse_pre.data_ptr<float>();
-        const int64_t tot_pre = lse_pre.numel();
-        const int64_t npre = std::min<int64_t>(16, tot_pre);
-        std::cout << "[mha_bwd][softmax_lse] pre_kernel numel=" << tot_pre << " first" << npre << ":";
-        for (int64_t i = 0; i < npre; ++i) {
-            std::cout << " " << pp[i];
-        }
-        std::cout << std::endl;
-    }
 
     auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));
@@ -807,14 +746,6 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
                 vmax = std::max(vmax, v);
             }
         }
-        std::cout << "[mha_bwd][softmax_lse] post_kernel aclrtSynchronizeStream=" << static_cast<int>(sync_st)
-                  << " numel=" << tot << " ptr=" << softmax_lse_kernel.data_ptr() << " first" << nshow << ":";
-        for (int64_t i = 0; i < nshow; ++i) {
-            std::cout << " " << lp[i];
-        }
-        std::cout << " finite_min=" << (ninf + nnan < tot ? std::to_string(vmin) : std::string("n/a"))
-                  << " finite_max=" << (ninf + nnan < tot ? std::to_string(vmax) : std::string("n/a"))
-                  << " count_inf_or_nonfinite=" << ninf << " count_nan=" << nnan << std::endl;
     }
 
     auto opts = q.options();

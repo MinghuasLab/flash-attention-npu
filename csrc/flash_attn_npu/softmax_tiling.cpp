@@ -159,22 +159,3 @@ void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const uint32_t 
     softmaxGradTiling.tailSplitSize = tail * srcK;
     softmaxGradTiling.tailReduceSize = tail * elementNumPerBlk;
 }
-
-void printSoftmaxTilingData(SoftMaxTiling &softmaxTilingData) {
-    std::cout << "softmaxTilingData srcM:  " << softmaxTilingData.srcM << std::endl;
-    std::cout << "softmaxTilingData srcK:  " << softmaxTilingData.srcK << std::endl;
-    std::cout << "softmaxTilingData srcSize:  " << softmaxTilingData.srcSize << std::endl;
-    std::cout << "softmaxTilingData outMaxK:  " << softmaxTilingData.outMaxK << std::endl;
-    std::cout << "softmaxTilingData outMaxM:  " << softmaxTilingData.outMaxM << std::endl;
-    std::cout << "softmaxTilingData: outMaxSize  " << softmaxTilingData.outMaxSize << std::endl;
-    std::cout << "softmaxTilingData: splitM  " << softmaxTilingData.splitM << std::endl;
-    std::cout << "softmaxTilingData: splitK  " << softmaxTilingData.splitK << std::endl;
-    std::cout << "softmaxTilingData: splitSize  " << softmaxTilingData.splitSize << std::endl;
-    std::cout << "softmaxTilingData: reduceM  " << softmaxTilingData.reduceM << std::endl;
-    std::cout << "softmaxTilingData: reduceK  " << softmaxTilingData.reduceK << std::endl;
-    std::cout << "softmaxTilingData: reduceSize  " << softmaxTilingData.reduceSize << std::endl;
-    std::cout << "softmaxTilingData: rangeM  " << softmaxTilingData.rangeM << std::endl;
-    std::cout << "softmaxTilingData: tailM  " << softmaxTilingData.tailM << std::endl;
-    std::cout << "softmaxTilingData: tailSplitSize  " << softmaxTilingData.tailSplitSize << std::endl;
-    std::cout << "softmaxTilingData: tailReduceSize  " << softmaxTilingData.tailReduceSize << std::endl;
-}
