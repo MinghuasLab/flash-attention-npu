@@ -14,6 +14,7 @@
 #include "fag_epilogue_sfmg.hpp"
 #include "fag_epilogue_op.hpp"
 #include "fag_epilogue_post.hpp"
+#include "kernel_common_fag.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "fag_mmad_cube1.hpp"
@@ -254,13 +255,13 @@ public:
 
         struct VecAddrInfo vecAddrInfo;
         AscendC::TPipe pipePre;
-        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.workspace, params.tiling_data);
+        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, nullptr, params.workspace, params.tiling_data);
         epilogueFagPre();
         pipePre.Destroy();
 
         // vec SoftmaxGrad
         AscendC::TPipe pipeSoftmaxGrad;
-        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, actucal_seq_q_addr, params.workspace, batch, params.tiling_data);
+        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, actucal_seq_q_addr, params.workspace, params.tiling_data);
         epilogueFagSfmg();
         pipeSoftmaxGrad.Destroy();
 
@@ -415,19 +416,19 @@ void FAG(uint64_t fftsAddr,
 
     // VEC_Pre ：dQ/dOut/dV的workspace清零
     using EpilogueAtlasA2FAGPre = Catlass::Epilogue::EpilogueAtlasA2FAGPre;
-    using EpilogueFAGPre = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, ElementVecDtype>;
+    using EpilogueFAGPre = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
-    using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg;
-    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>>;
+    using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<static_cast<uint32_t>(inputLayout)>;
+    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
     using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp;
-    using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>>;
+    using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>, FAGv2TilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
     using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
-    using EpilogueFAGPost = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype>;
+    using EpilogueFAGPost = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, FAGv2TilingData>;
 
 
     // Kernel level

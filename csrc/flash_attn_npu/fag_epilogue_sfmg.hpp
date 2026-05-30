@@ -9,13 +9,12 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
-#include "catlass/epilogue/dispatch_policy.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fag_block.h"
 #include "kernel_operator.h"
-#include "fag_common/common_header.h"
+#include "kernel_common_fag.hpp"
 #include "fag_sfmg.h"
 
 using AscendC::CopyRepeatParams;
@@ -32,70 +31,85 @@ using AscendC::TQue;
 namespace Catlass::Epilogue::Block {
 
 template <
-    typename ElementVecDtype,
-    InputLayout inputLayout
+    class ElementVecDtype,
+    uint32_t INPUT_LAYOUT_,
+    class TilingData
 >
 class BlockEpilogue<
-    EpilogueAtlasA2FAGSfmg,
+    EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT_>,
     ElementVecDtype,
-    std::integral_constant<InputLayout, inputLayout>>
+    TilingData
+>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2FAGSfmg;
+    using DispatchPolicy = EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
-    static constexpr InputLayout getLayout() {
-        return std::integral_constant<InputLayout, inputLayout>::value;
-    }
-    
+    static constexpr uint32_t INPUT_LAYOUT = INPUT_LAYOUT_;
 
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *dout, __gm__ uint8_t *out,
-    __gm__ uint8_t *cu_seq_qlen, __gm__ uint8_t *workspace, int32_t batchIn, __gm__ uint8_t * tiling_in)
+    __gm__ uint8_t *cu_seq_qlen, __gm__ uint8_t *workspace, __gm__ uint8_t * tiling_in)
     {
-        batch = batchIn;
         cBlockIdx = GetBlockIdx();
         pipe = pipe_in;
 
-        AscendC::GlobalTensor<uint64_t> tilingData;
-        tilingData.SetGlobalBuffer((__gm__ uint64_t *)tiling_in);
-        batch = tilingData.GetValue(TILING_B);
-        total_q = tilingData.GetValue(TILING_T1);
-        nheads_k = tilingData.GetValue(TILING_N2);
-        if constexpr (getLayout() == InputLayout::BSND) {
-            seq_q = total_q / batch;
-        } else {
-            seq_q = 0;
-        }
-        g = tilingData.GetValue(TILING_G);
-        headdim = tilingData.GetValue(TILING_D);
-
-        int64_t sfmgWorkspaceOffset = tilingData.GetValue(TILING_SFMG_WORKSPACE_OFFSET);
-        int64_t mm1WorkspaceOffset = tilingData.GetValue(TILING_MM1_WORKSPACE_OFFSET);
-        int64_t mm2WorkspaceOffset = tilingData.GetValue(TILING_MM2_WORKSPACE_OFFSET);
-        nheads = nheads_k * g;
+        __gm__ TilingData *tilingData = reinterpret_cast<__gm__ TilingData *>(tiling_in);
+        batch = tilingData->batch;
+        total_q = tilingData->t1;
+        g = tilingData->g;
+        headdim = tilingData->qkHeadDim;
+        uint32_t coreNum = tilingData->coreNum;
         dAlign = (headdim + 15) / 16 * 16;
         cu_seq_qlen_addr = cu_seq_qlen;
 
-        n_stride = (nheads - 1) * headdim * sizeof(ElementVecDtype);
-
-        AscendC::GlobalTensor<uint32_t> tilingDataU32;
-        tilingDataU32.SetGlobalBuffer((__gm__ uint32_t *)tiling_in);;
-        uint32_t coreNum = tilingDataU32.GetValue(TILING_CORE_NUM * CONST_2);
+        if constexpr (std::is_same_v<TilingData, FAGv2TilingData>) {
+            nheads_k = tilingData->kvHeadNum;
+            nheads = nheads_k * g;
+            if constexpr (INPUT_LAYOUT == BSND) {
+                seq_q = total_q / batch;
+            } else {
+                seq_q = 0;
+            }
+            n_stride = (nheads - 1) * headdim * sizeof(ElementVecDtype);
+        } else {
+            nheads = tilingData->qHeadNum;
+            nheads_k = tilingData->kvHeadNum;
+            if constexpr (INPUT_LAYOUT == BSND) {
+                seq_q = tilingData->qSeqlen;
+            } else {
+                seq_q = 0;
+            }
+            if constexpr(INPUT_LAYOUT == TND) {
+                n_stride = (nheads * headdim - headdim) * sizeof(ElementVecDtype);
+            } else if constexpr(INPUT_LAYOUT == BSND){
+                n_stride = (nheads * headdim - headdim) * sizeof(ElementVecDtype);
+            }
+        }
 
         // 计算 buffer 大小
-        constexpr static uint32_t inputBufferLen = 24 * 1024; // castBuffer 24K*2=48K
-        constexpr static uint32_t castBufferLen = 48 * 1024; // castBuffer 48K*2=96K
+        constexpr static uint32_t inputBufferLen = 24 * 1024;
+        constexpr static uint32_t castBufferLen = 48 * 1024;
         uint32_t outputBufferLen = (castBufferLen + dAlign - 1) / dAlign * 8;
         uint32_t tempBufferLen = 40 * 1024 - outputBufferLen;
 
         // 计算单核的计算量
-        int64_t normalAxisSize = total_q * nheads;
+        int64_t normalAxisSize = 0;
+        if constexpr (INPUT_LAYOUT == TND) {
+            normalAxisSize = total_q * nheads;
+        } else {
+            normalAxisSize = batch * nheads * seq_q;
+        }
+
         normalCoreSize = (normalAxisSize + coreNum -1) / coreNum;
         usedCoreNum = (normalAxisSize + normalCoreSize -1) / normalCoreSize;
 
         // 计算单loop的计算量及loop次数
-        singleLoopNBurstNum = inputBufferLen / sizeof(float) / dAlign;
+        if constexpr (std::is_same_v<TilingData, FAGv2TilingData>) {
+            singleLoopNBurstNum = inputBufferLen / sizeof(float) / dAlign;
+        } else {
+            singleLoopNBurstNum = inputBufferLen / sizeof(ElementVecDtype) / dAlign;
+        }
         normalCoreLoopTimes = (normalCoreSize + singleLoopNBurstNum -1) / singleLoopNBurstNum;
         normalCoreLastLoopNBurstNum = normalCoreSize - (normalCoreLoopTimes - 1) * singleLoopNBurstNum;
 
@@ -114,7 +128,7 @@ public:
         // 初始化 GM
         doutGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dout);
         outGm.SetGlobalBuffer((__gm__ ElementVecDtype *)out);
-        sfmgWorkspaceGm.SetGlobalBuffer((__gm__ float *)workspace + sfmgWorkspaceOffset / sizeof(float));
+        sfmgWorkspaceGm.SetGlobalBuffer((__gm__ float *)workspace + tilingData->sfmgPreBeginAddr / sizeof(float));
     }
 
     CATLASS_DEVICE
@@ -125,7 +139,7 @@ public:
     CATLASS_DEVICE
     void InitIndex(int64_t startIdx, int64_t& curS, GM_ADDR seqS)
     {
-        if constexpr (getLayout() == InputLayout::TND) {
+        if constexpr (INPUT_LAYOUT == TND) {
             int64_t totalLen = 0;
             for (int64_t bDimIdx = bIdx; bDimIdx < batch; bDimIdx++) {
                 totalLen = nheads * ((__gm__ int32_t *)seqS)[bDimIdx] * headdim;
@@ -153,13 +167,12 @@ public:
     void DoCopyIn(int64_t curS, int64_t curNBurst, int64_t dstOffset, GM_ADDR seqS)
     {
         int64_t srcOffset = 0;
-        if constexpr (getLayout() == InputLayout::TND) {
+        if constexpr (INPUT_LAYOUT == TND) {
             int64_t bOffset = bIdx == 0 ? 0 : nheads * ((__gm__ int32_t *)seqS)[bIdx - 1] * headdim;
             srcOffset = bOffset + (sIdx * nheads + nIdx) * headdim;
-        } else if constexpr (getLayout() == InputLayout::BSND) {
-            srcOffset = bIdx * (seq_q * nheads * headdim) + sIdx * (nheads * headdim) + nIdx * headdim;
+            } else if constexpr (INPUT_LAYOUT == BSND) {
+                srcOffset = bIdx * (seq_q * nheads * headdim) + sIdx * (nheads * headdim) + nIdx * headdim;
         }
-
         DataCopyPad(input1Buf[dstOffset], doutGm[srcOffset],
                     {static_cast<uint16_t>(curNBurst), static_cast<uint32_t>(headdim * sizeof(ElementVecDtype)),
                     static_cast<uint32_t>(n_stride), 0, 0},
@@ -187,7 +200,7 @@ public:
                     nIdx = 0;
                     if (bIdx < batch - 1) { // 需要借B
                         bIdx += 1;
-                        if constexpr (getLayout() == InputLayout::TND) {
+                        if constexpr (INPUT_LAYOUT == TND) {
                             curS = ((__gm__ int32_t *)seqS)[bIdx] - ((__gm__ int32_t *)seqS)[bIdx - 1];
                         } else {
                             curS = seq_q;
@@ -354,7 +367,6 @@ protected:
 
     SoftMaxTiling softmaxGradTilingData;
 };
-    
 }
 
 #endif // CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_FAG_SFMG_HPP

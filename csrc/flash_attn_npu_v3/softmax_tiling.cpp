@@ -1,9 +1,3 @@
-/**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Modified by Minghua Shen, 2026
- */
-
 #include <vector>
 #include <iomanip>
 

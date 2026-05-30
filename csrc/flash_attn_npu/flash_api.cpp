@@ -723,7 +723,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     fagInfo.queryShape_2 = headdim;
     fagInfo.scaleValue = 1.0 / sqrt(headdim);
     FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
-    // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
     // alloc workspace
@@ -874,7 +873,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     fagInfo.queryShape_2 = headdim;
     fagInfo.scaleValue = 1.0 / sqrt(headdim);
     FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
-    // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
     // alloc workspace
