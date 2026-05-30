@@ -259,7 +259,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@_torch_custom_op_wrapper("flash_attn_3_C::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn_3_C::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -286,7 +286,12 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    softmax_d, *rest = flash_attn_npu_3.bwd(
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = flash_attn_npu_3.bwd(
         dout,
         q,
         k,
