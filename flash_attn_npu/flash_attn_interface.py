@@ -16,32 +16,6 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
-def _get_block_size_n(device, head_dim, is_dropout, is_causal):
-    # This should match the block sizes in the CUDA kernel
-    assert head_dim <= 256
-    major, minor = torch.cuda.get_device_capability(device)
-    is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
-    is_sm80 = major == 8 and minor == 0
-    is_sm90 = major == 9 and minor == 0
-    if head_dim <= 32:
-        return 128
-    if head_dim <= 64:
-        return 128 if not is_dropout else 64
-    elif head_dim <= 96:
-        return 64
-    elif head_dim <= 128:
-        if is_sm8x:
-            return 64 if (not is_dropout and is_causal) else 32
-        else:
-            return 64 if not is_dropout else 32
-    elif head_dim <= 192:
-        return 64
-    elif head_dim <= 224:
-        return 64
-    elif head_dim <= 256:
-        return 64
-
-
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -69,7 +43,7 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn_npu::_flash_attn_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_forward", mutates_args=(), device_types="npu")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -102,7 +76,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -135,7 +109,7 @@ def _flash_attn_forward_fake(
 _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu::_flash_attn_varlen_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_varlen_forward", mutates_args=(), device_types="npu")
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -186,7 +160,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_varlen_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_varlen_forward")
 def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -227,7 +201,7 @@ def _flash_attn_varlen_forward_fake(
 _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -279,7 +253,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -319,7 +293,7 @@ def _flash_attn_backward_fake(
 _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -383,7 +357,7 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_varlen_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_varlen_backward")
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,

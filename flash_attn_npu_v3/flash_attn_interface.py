@@ -60,7 +60,7 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
-@_torch_custom_op_wrapper("flash_attn_3_C::_flash_attn_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_3::_flash_attn_forward", mutates_args=(), device_types="npu")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -154,7 +154,7 @@ def _flash_attn_forward(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@_torch_register_fake_wrapper("flash_attn_3_C::_flash_attn_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_3::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -259,7 +259,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@_torch_custom_op_wrapper("flash_attn_3_C::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn_npu_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -313,7 +313,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_3_C::_flash_attn_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_3::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -369,30 +369,9 @@ def _flash_attn_backward_fake(
     head_size_v = v.size(-1)
     head_size_rounded = round_up_headdim(max(head_size, head_size_v))
 
-    # Hopper gpus uses cuda compute capabilities 9.0
-    cap = torch.cuda.get_device_capability(q.device)
-    arch = cap[0] * 10 + cap[1]
-
     is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
 
-    if head_size_rounded <= 64:
-        kBlockM_sm90 = 96 if (is_causal and softcap > 0.0) else 128
-    elif head_size_rounded <= 96:
-        kBlockM_sm90 = 64
-    elif head_size_rounded <= 128:
-        kBlockM_sm90 = 64 if (is_causal or is_local or softcap > 0.0) else 80
-    else:
-        kBlockM_sm90 = 64
-
-    kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
-    kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
-
-    if arch >= 90:
-        kBlockM = kBlockM_sm90
-    elif arch == 86 or arch == 89:
-        kBlockM = kBlockM_sm86
-    else:
-        kBlockM = kBlockM_sm80
+    kBlockM = 128
 
     num_heads = q.shape[-2]
     seqlen_q_rounded = round_multiple(seqlen_q, kBlockM)
