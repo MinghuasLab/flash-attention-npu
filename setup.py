@@ -38,6 +38,15 @@ BASE_WHEEL_URL = (
 # SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
+# FLASH_ATTN_BUILD_VERSION selects which API generations to build:
+#   "v2"   build flash_attn_npu_2          (910B/C only;)
+#   "v3"   build BOTH v3 backends into one wheel:
+#            flash_attn_npu_3       (Ascend 910B/C, csrc/)
+#            flash_attn_npu_950_3   (Ascend 950,    csrc_AscendC950/)
+#          Runtime dispatch in flash_attn_npu_v3/__init__.py picks the
+#          matching backend per host via torch_npu.npu.get_device_name(),
+#          so a single wheel runs on both 910 and 950.
+#   "all"  build v2 + both v3 backends.
 BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
 
 def get_platform():
@@ -54,6 +63,23 @@ class BishengBuildExt(build_ext):
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
         if not os.path.exists(ascend_home):
             raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
+
+        is_950 = ext.name.startswith("flash_attn_npu_950_")
+        npu_arch = "dav-3510" if is_950 else "dav-2201"
+        catlass_inc = (
+            f"-I{this_dir}/csrc_AscendC950/catlass/include"
+            if is_950
+            else f"-I{this_dir}/csrc/catlass/include"
+        )
+        extra_includes = []
+        extra_defines = []
+        if is_950:
+            extra_includes.append(
+                f"-I{this_dir}/csrc_AscendC950/flash_attn_npu_v3"
+            )
+            extra_defines.append("-DCATLASS_ARCH=3510")
+        else:
+            extra_defines.append("-DCATLASS_ARCH=2201")
 
         asc_include_paths = [
             os.path.join(ascend_home, "compiler/tikcpp/include"),
@@ -85,12 +111,12 @@ class BishengBuildExt(build_ext):
             "bisheng",
             "-O2",
             "-x", "asc",
-            "--npu-arch=dav-2201",
+            f"--npu-arch={npu_arch}",
             *(["--cce-auto-infer-kernel-type=false"] if parse(torch_npu.utils.get_cann_version()) >= parse("9.0.0") else []),
             "-shared",
             "-fPIC",
+            *extra_defines,
             "-std=c++17",
-            "-DCATLASS_ARCH=2201",
             abi_flag,
             *[f"-I{p}" for p in asc_include_paths],
             f"-I{python_include}",
@@ -104,7 +130,8 @@ class BishengBuildExt(build_ext):
             f"-I{ascend_home}/include/experiment/msprof",
             f"-I{torch_package_path}/include",
             f"-I{torch_package_path}/include/torch/csrc/api/include",
-            f"-I{this_dir}/csrc/catlass/include",
+            catlass_inc,
+            *extra_includes,
             *[f"-L{p}" for p in asc_lib_paths],
             f"-L{torch_lib}",
             f"-L{torch_npu_lib}",
@@ -135,15 +162,30 @@ class BishengBuildExt(build_ext):
 ext_modules = []
 
 if os.path.isdir(".git"):
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/catlass"], check=True)
+    submodules = []
+    if BUILD_VERSION in ("v2", "v3", "all"):
+        submodules.append("csrc/catlass")
+    if BUILD_VERSION in ("v3", "all"):
+        submodules.append("csrc_AscendC950/catlass")
+    if submodules:
+        subprocess.run(
+            ["git", "submodule", "update", "--init", *submodules], check=True
+        )
 else:
-    assert (
-        os.path.exists("csrc/catlass/include/catlass/catlass.hpp")
-    ), "csrc/catlass is missing, please use source distribution or git clone"
+    if BUILD_VERSION in ("v2", "v3", "all"):
+        assert os.path.exists(
+            "csrc/catlass/include/catlass/catlass.hpp"
+        ), "csrc/catlass is missing, please use source distribution or git clone"
+    if BUILD_VERSION in ("v3", "all"):
+        assert os.path.exists(
+            "csrc_AscendC950/catlass/include/catlass/catlass.hpp"
+        ), "csrc_AscendC950/catlass is missing, please use source distribution or git clone"
 
 source_files = glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "flash_api.cpp"), recursive=True)
 source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fag_general_host.cpp"), recursive=True)
 source_files_v3 = glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu_v3", "flash_api.cpp"), recursive=True)
+source_files_950_v3 = glob.glob(os.path.join(this_dir, "csrc_AscendC950/flash_attn_npu_v3", "flash_api.cpp"), recursive=True)
+source_files_950_v3 += glob.glob(os.path.join(this_dir, "csrc_AscendC950/flash_attn_npu_v3", "fai_host_api.cpp"),recursive=True)
 
 if not SKIP_NPU_BUILD:
     if BUILD_VERSION in ("v2", "all"):
@@ -157,6 +199,16 @@ if not SKIP_NPU_BUILD:
         ext_modules.append(Extension(
             name="flash_attn_npu_3",
             sources=source_files_v3,
+            language="c++",
+        ))
+
+        if not source_files_950_v3:
+            raise RuntimeError(
+                "FLASH_ATTN_BUILD_VERSION=v3 requires csrc_AscendC950/flash_attn_npu_v3/flash_api.cpp;"
+            )
+        ext_modules.append(Extension(
+            name="flash_attn_npu_950_3",
+            sources=source_files_950_v3,
             language="c++",
         ))
 
@@ -228,6 +280,7 @@ setup(
         exclude=(
             "build",
             "csrc",
+            "csrc_AscendC950",
             "include",
             "tests",
             "dist",

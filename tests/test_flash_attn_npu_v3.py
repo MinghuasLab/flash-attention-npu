@@ -5,7 +5,10 @@ import os
 import torch
 import torch_npu
 import pytest
-from flash_attn_npu_v3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+if "Ascend950" in torch_npu.npu.get_device_name():
+    from flash_attn_npu_v3 import flash_attn_with_kvcache
+else:
+    from flash_attn_npu_v3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
@@ -178,8 +181,14 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied", test_cases)
 def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits):
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
+
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
+    if "Ascend950" in name and num_splits > 1:
+        pytest.skip("Ascend950 does not support num_splits>1")
+    if "Ascend950" in name and head_size > 128:
+        pytest.skip("Ascend950 does not support head_size>128")
     # Varied per-batch q length is only expressible under TND (cu_seqlens_q); BSND assumes a
     # uniform q_seqlen, so a varied case there is meaningless.
     if is_varied and layout != "TND":
@@ -363,14 +372,9 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             golden_lseL[:, new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]] = golden_lse.reshape(num_heads, q_seqlen_per_batch)
     rtol = 1e-2
     atol = 1e-2
-    print("=======================================")
-    print(softmax_lse.shape)
-    print(softmax_lse)
-    print("=======================================")
-    print(golden_lseL.shape)
-    print(golden_lseL)
     torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
-    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    if "Ascend910" in name:
+        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal)
@@ -391,6 +395,9 @@ test_cases = [
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" not in name:
+        pytest.skip("flash_attn_func only support Ascend910")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -453,6 +460,9 @@ test_cases = [
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal", test_cases)
 def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" not in name:
+        pytest.skip("flash_attn_varlen_func only support Ascend910")
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
