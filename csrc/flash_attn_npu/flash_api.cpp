@@ -753,12 +753,12 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     fagInfo.keyShape_1 = nheads_k;
     fagInfo.queryShape_2 = headdim;
     fagInfo.scaleValue = 1.0 / sqrt(headdim);
-    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
+    uint64_t workspaceSize = 0;
+    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()), workspaceSize);
     // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
     // alloc workspace
-    uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
     at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
 
@@ -906,12 +906,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     fagInfo.keyShape_1 = nheads_k;
     fagInfo.queryShape_2 = headdim;
     fagInfo.scaleValue = 1.0 / sqrt(headdim);
-    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
+    uint64_t workspaceSize = 0;
+    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()), workspaceSize);
     // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
     // alloc workspace
-    uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
     at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
 

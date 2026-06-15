@@ -98,7 +98,7 @@ void printFAGTilingData(int64_t *tilingHost)
         std::endl;
 }
 
-int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *tilingHost)
+int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *tilingHost, uint64_t& workspaceSize)
 {
     float *tilingHostFp = reinterpret_cast<float *>(tilingHost);
     tilingHostFp[TILING_SCALE_VALUE * CONST_2] = fagInfo.scaleValue;
@@ -195,6 +195,7 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     tilingHost[TILING_DS_WORKSPACE_OFFSET] = workspaceOffset;
     workspaceOffset = 
         (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceSize = workspaceOffset;
     return 0;
 }
 
