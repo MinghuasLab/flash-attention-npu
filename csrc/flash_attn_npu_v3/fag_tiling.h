@@ -39,13 +39,18 @@ constexpr float HALF = 0.5f;
 
 enum class MaskType {
     NO_MASK = 0,
-    MASK_SPEC = 1,
-    MASK_CAUSUAL = 2
+    MASK_CAUSUAL = 1,
+    MASK_BAND = 2
 };
 
 enum SparseMode {
-    NO_MASK = 0,     // 未传入attenmask，不做mask操作
-    LEFT_UP_CAUSAL,  // 左上角点划分的三角部分
+    NO_MASK = 0,           // 未传入 atten mask，全量注意力
+    CAUSAL = 3,            // right-down causal mask, using 2048 compress triu
+    BAND = 4,              // window_size 滑动窗口带状稀疏
+};
+
+enum AttenShapeType {
+    ATTEN_MASK_SHAPE_TYPE_SS
 };
 
 enum AttenDataType {
@@ -55,10 +60,12 @@ enum AttenDataType {
 
 enum AttenMaskCompressMode {
     NO_COMPRESS_MODE = 0,
-    LEFT_UP_CAUSAL_MODE = 1,
-    RIGHT_DOWN_CAUSAL_MODE = 2,
-    BAND_EQUAL_S_MODE = 3
+    CAUSAL_COMPRESS_MODE = 1,
+    RIGHT_DOWN_CAUSAL_COMPRESS_MODE = 2,
+    BAND_COMPRESS_MODE = 3
 };
+
+constexpr int64_t ATTEN_MASK_COMPRESS_DIM = 2048;
 
 struct FAGInfo {
     float scaleValue;

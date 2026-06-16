@@ -532,8 +532,31 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     fagInfo.scaleValue =
         softmax_scale_.has_value() ? static_cast<float>(softmax_scale_.value()) : 1.0f / sqrt(static_cast<float>(qk_headdim));
     fagInfo.keepProb = 1.0f;
-    fagInfo.maskType = is_causal ? static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL)
-                                 : static_cast<int32_t>(FAGTiling::MaskType::NO_MASK);
+    if (window_size_left >= max_seqlen_k - 1) {
+        window_size_left = -1;
+    }
+    if (window_size_right >= max_seqlen_q - 1) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const bool has_attn_mask = is_causal || is_local;
+    if (is_causal) {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = 0;
+    } else if (is_local) {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_BAND);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = window_size_right;
+    } else {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::NO_MASK);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = window_size_right;
+    }
     fagInfo.batch = batch_size;
     fagInfo.qSeqlen = max_seqlen_q;
     fagInfo.qHeadNum = nheads;
@@ -541,8 +564,6 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     fagInfo.kvSeqlen = max_seqlen_k;
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;
-    fagInfo.window_size_left = window_size_left;
-    fagInfo.window_size_right = window_size_right;
     fagInfo.isDeterministic = deterministic;
     // Tiling uses FAG layout constants (BSND=2, TND=3), not kernel inputLayout enum (BSND=0, TND=1).
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
@@ -575,10 +596,11 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
 
     // alloc custom attn_mask
     at::Tensor mask_gpu_tensor;
-    if (is_causal) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+    if (has_attn_mask) {
+        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
+        mask_gpu_tensor = at::triu(
+            at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
+            .to(at::Device(at::kPrivateUse1));
     }
     
     uint64_t fftsAddr{0};
@@ -590,7 +612,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
     auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
     uint8_t *attenMaskDevice = nullptr;
-    if (is_causal) {
+    if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
     }
     at::Tensor softmax_lse_kernel = softmax_lse;
@@ -645,7 +667,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     auto launch_fag = [&](auto layout_tag) {
         constexpr uint32_t kInputLayout = decltype(layout_tag)::value;
         if (is_bf16) {
-            if (is_causal) {
+            if (has_attn_mask) {
                 if (deterministic) {
                     switch (qk_headdim_kernel) {
                         case 64:
@@ -767,7 +789,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
                 }
             }
         } else {
-            if (is_causal) {
+            if (has_attn_mask) {
                 if (deterministic) {
                     switch (qk_headdim_kernel) {
                         case 64:

@@ -21,6 +21,7 @@
 #include "../flash_attn_npu/fag_epilogue_pre.hpp"
 #include "fag_common/mmad_fag_sdp.hpp"
 #include "fag_common/mmad_fag_dqkv.hpp"
+#include "fag_tiling.h"
 #include "kernel_operator.h"
 
 using namespace Catlass;
@@ -60,6 +61,7 @@ template <
     class EpilogueFAGPost_,
     class EpilogueFAGDtmAdd_,
     const uint32_t INPUT_LAYOUT,
+    const bool IS_ATTEN_MASK,
     const uint32_t IS_DTM
 >
 class FlashAttentionScoreGrad {
@@ -134,6 +136,7 @@ public:
         s2Token = fagTilingData->s2Token;
         actualCalcS1Token = s1Token;
         actualCalcS2Token = s2Token;
+        sparseMode = fagTilingData->sparseMode;
 
         // split info
         s1Outer = fagTilingData->s1Outer;
@@ -212,6 +215,18 @@ public:
         return;
     }
 
+    __aicore__ inline void UpdateToken(int64_t bIdx)
+    {
+        if constexpr (IS_ATTEN_MASK != ENABLE) {
+            return;
+        }
+        int32_t actualS1Len = 0;
+        int32_t actualS2Len = 0;
+        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
+        actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
+        actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
+    }
+
     __aicore__ inline void UpdateIndex()
     {
         s1oDimIdx = 0;
@@ -267,6 +282,7 @@ public:
         int32_t actualSeqQlen = s1;
         int32_t actualSeqKvlen = s2;
         if constexpr(INPUT_LAYOUT == TND) {
+            UpdateToken(bDimIdx);
             GetSeqQlenKvlenByBidx(bDimIdx, actualSeqQlen, actualSeqKvlen);
             s1Outer = (actualSeqQlen + s1CvInner - 1) / s1CvInner;
             s2Outer = (actualSeqKvlen + s2CvInner - 1) / s2CvInner;
@@ -277,6 +293,7 @@ public:
         kvOutIdx = kvOutBase + n2DimIdx * s2Outer + s2oCvDimIdx;
 
         int64_t s1IdxUp = s2oCvDimIdx * s2CvInner - actualCalcS2Token;
+        int64_t s1IdxDown = (s2oCvDimIdx + 1) * s2CvInner + actualCalcS1Token;
 
         // s2token 保护: 1、sparse场景，基本块无效。2、s1==0 or s2==0 场景，无基本块。跳过
         if (s1IdxUp >= actualSeqQlen || actualSeqKvlen == 0) {
@@ -289,7 +306,6 @@ public:
         int64_t s1oIdxUp = s1IdxUp / s1CvInner;
         s1oIdxUp = s1oIdxUp > 0 ? s1oIdxUp : 0;
 
-        int64_t s1IdxDown = (s2oCvDimIdx + 1) * s2CvInner + actualCalcS1Token;
         s1IdxDown = s1IdxDown > actualSeqQlen ? actualSeqQlen : s1IdxDown;
         int64_t s1oIdxDown = (s1IdxDown + s1CvInner - 1) / s1CvInner - 1;
 
@@ -318,8 +334,8 @@ public:
             int64_t s2RightIdx = dbParam.s1oIdx * s1CvInner + dbParam.s1CvExtend + actualCalcS2Token;
             s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
             s2RightIdx = (s2RightIdx + 7) / 8 * 8;
-            dbParam.s2CvExtend = s2RightIdx > (dbParam.s2oIdx * s2CvInner + dbParam.s2CvExtend) ? dbParam.s2CvExtend :
-                                s2RightIdx - dbParam.s2oIdx * s2CvInner;
+            dbParam.s2CvExtend = s2RightIdx > (dbParam.s2oIdx * s2CvInner + dbParam.s2CvExtend) ?
+                                dbParam.s2CvExtend : s2RightIdx - dbParam.s2oIdx * s2CvInner;
             dbParam.s2CvExtend = dbParam.s2CvExtend > 0 ? dbParam.s2CvExtend : 0;
             dbParam.s1CvExtendAlign = (dbParam.s1CvExtend + 15) / 16 * 16;
             dbParam.s2CvExtendAlign = (dbParam.s2CvExtend + 15) / 16 * 16;
@@ -391,6 +407,7 @@ public:
         dbParam.s2Stride = 0;
 
         if constexpr (INPUT_LAYOUT == TND) {
+            UpdateToken(dbParam.bIdx);
             GetSeqQlenKvlenByBidx(dbParam.bIdx, dbParam.actualS1Len, dbParam.actualS2Len);
             dbParam.aTensorOffsetCv = 0;
             dbParam.bTensorOffsetCv = 0;
@@ -889,6 +906,7 @@ private:
     int64_t s2Token;
     int64_t actualCalcS1Token;
     int64_t actualCalcS2Token;
+    uint32_t sparseMode;
 
     uint32_t pingpongIdx = 1;
 
@@ -1084,7 +1102,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using EpilogueFAGDtmAdd = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGDtmAdd>;
 
     // Kernel level
-    using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_DTM>;
+    using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
     FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
 
     // call kernel
