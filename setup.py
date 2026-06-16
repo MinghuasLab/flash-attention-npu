@@ -235,7 +235,7 @@ setup(
     ),
     author="Minghua Shen",
     author_email="shenmh6@mail.sysu.edu.cn",
-    description="High-performance FlashAttention implementation for Ascend NPU",
+    description="High-performance FlashAttention Implementation for Ascend NPU",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/MinghuasLab/flash-attention-npu",
