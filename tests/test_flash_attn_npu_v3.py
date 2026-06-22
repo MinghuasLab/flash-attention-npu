@@ -5,7 +5,7 @@ import os
 import torch
 import torch_npu
 import pytest
-from flash_attn_npu_v3 import flash_attn_with_kvcache
+from flash_attn_npu_v3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
@@ -333,3 +333,134 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     atol = 1e-2
     torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
     torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+test_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal)
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False),
+]
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal", test_cases)
+def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal):
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    scale = 1.0 / (head_size ** 0.5)
+    window_size_left = -1
+    window_size_right = -1
+    softcap = 0.0
+
+    ret = flash_attn_func(
+        query,
+        key_cache,
+        value_cache,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=[window_size_left, window_size_right],
+        softcap=softcap,
+        return_attn_probs=return_attn_probs)
+    if not return_attn_probs:
+        out_out = ret
+    else:
+        out_out, softmax_lse = ret
+
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, q_seqlen, num_heads), dtype=torch.float32)
+    atten_mask = None
+    if is_causal:
+        atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+    for i in range(batch_size):
+        key_cache_per_batch = key_cache.detach().cpu()[i]
+        value_cache_per_batch = value_cache.detach().cpu()[i]
+        query_cpu = query.detach().cpu()[i]
+        if is_causal:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type)
+        else:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type)
+        out = output.reshape(q_seqlen, num_heads, head_size)
+        golden_out[i:i+1] = out
+        golden_lseL[i:i+1] = torch.transpose(golden_lse.reshape(num_heads, q_seqlen), 0, 1)
+    rtol = 1e-2
+    atol = 1e-2
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    if return_attn_probs:
+        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+test_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal)
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True),
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal", test_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal):
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size * q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    actual_seq_len = torch.tensor([q_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
+    actual_kv_len = torch.tensor([kv_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
+
+    max_seqlen_q = q_seqlen
+    max_seqlen_k = kv_seqlen
+    scale = 1.0 / (head_size ** 0.5)
+    window_size_left = -1
+    window_size_right = -1
+    softcap = 0.0
+
+    output_npu = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        actual_seq_len,
+        actual_kv_len,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=(window_size_left, window_size_right),
+        softcap=softcap,
+    )
+    golden_out = torch.empty((batch_size * q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size * q_seqlen, num_heads), dtype=torch.float32)
+    atten_mask = None
+    if is_causal:
+        atten_mask = (torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1)).to(torch.bool)
+    for i in range(1, batch_size + 1):
+        key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
+        value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
+        query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
+        if is_causal:
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type)
+        else:
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type)
+        out = output.reshape(q_seqlen, num_heads, head_size)
+        golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
+        golden_lseL[(i - 1) * q_seqlen : i * q_seqlen] = torch.transpose(golden_lse.reshape(num_heads, q_seqlen), 0, 1)
+    rtol = 1e-2
+    atol = 1e-2
+    torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)

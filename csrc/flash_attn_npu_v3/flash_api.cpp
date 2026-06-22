@@ -507,6 +507,19 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    // If seqused_k_ was not provided, derive seqlens_k from tensor shapes or cu_seqlens_k
+    if (!seqused_k_.has_value()) {
+        if (is_varlen_kv) {
+            seqlens_k = cu_seqlens_k.slice(0, 1, cu_seqlens_k.size(0))
+                      - cu_seqlens_k.slice(0, 0, cu_seqlens_k.size(0) - 1);
+            seqlens_k = seqlens_k.to(torch::kInt32);
+        } else {
+            int64_t seqlen_k_val = k.size(1);
+            seqlens_k = at::full({batch_size}, seqlen_k_val,
+                                 at::dtype(torch::kInt32).device(k.device()));
+        }
+    }
+
     at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
     int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
     int32_t* cu_seqlen_q_cpu = nullptr;
