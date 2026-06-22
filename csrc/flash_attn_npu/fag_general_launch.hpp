@@ -28,251 +28,255 @@ inline void LaunchFAGGeneralKernel(
     uint8_t *tilingDevice)
 {
     constexpr uint32_t kInputLayout = LayoutTag::value;
-    if (is_bf16) {
-        if (is_causal) {
-            if (deterministic) {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
+    auto fag_general_call = [=]() -> int {
+        if (is_bf16) {
+            if (is_causal) {
+                if (deterministic) {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
+                } else {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
                 }
             } else {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
+                if (deterministic) {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
+                } else {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
                 }
             }
         } else {
-            if (deterministic) {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
+            if (is_causal) {
+                if (deterministic) {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
+                } else {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
                 }
             } else {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, bfloat16_t, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
+                if (deterministic) {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
+                } else {
+                    switch (qk_headdim_kernel) {
+                        case 64:
+                            ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 128:
+                            ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 192:
+                            ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        case 256:
+                            ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
+                                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
+                                cuSeqQlenDevice, cuSeqKvlenDevice,
+                                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
+                            break;
+                        default:
+                            break;
+                    }
                 }
             }
         }
-    } else {
-        if (is_causal) {
-            if (deterministic) {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 1, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
-                }
-            } else {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 1, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
-                }
-            }
-        } else {
-            if (deterministic) {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 0, 0, 1><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
-                }
-            } else {
-                switch (qk_headdim_kernel) {
-                    case 64:
-                        ::FAGGeneral<DTemplateType::Aligned64, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 128:
-                        ::FAGGeneral<DTemplateType::Aligned128, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 192:
-                        ::FAGGeneral<DTemplateType::Aligned192, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    case 256:
-                        ::FAGGeneral<DTemplateType::Aligned256, half, kInputLayout, 0, 0, 0><<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice, nullptr, attenMaskDevice, softMaxLseDevice,
-                            cuSeqQlenDevice, cuSeqKvlenDevice,
-                            dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);
-                        break;
-                    default:
-                        break;
-                }
-            }
-        }
-    }
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag", fag_general_call);
 }
 
 #endif

@@ -529,31 +529,13 @@ public:
     CATLASS_DEVICE
     void CopyInSoftMax(LocalTensor<float> &dstTensor, uint32_t s1Extend, uint32_t softMaxOffset)
     {
-        if constexpr (INPUT_LAYOUT == TND) {
-            AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset],
-                {1, static_cast<uint16_t>(s1Extend * 4), 0, 0}, {false, 0, 0, 0});
-        } else { // BSN
-            int64_t nheads = n2 * g;
-            int64_t lseRepeatTimes = (s1Extend + 7) / 8 * 8;
-            AscendC::DataCopyExtParams lseCopyParam;
-            lseCopyParam.blockCount = s1Extend;
-            lseCopyParam.blockLen = sizeof(float);
-            lseCopyParam.srcStride = (nheads - 1) * sizeof(float);
-            lseCopyParam.dstStride = 0;
-            lseCopyParam.rsv = 0;
-            AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset], lseCopyParam, {false, 0, 0, 0});
-        }
+        AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset],
+            {1, static_cast<uint16_t>(s1Extend * 4), 0, 0}, {false, 0, 0, 0});
 
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-        if constexpr (INPUT_LAYOUT == TND) {
-            AscendC::Brcb(dstTensor[s1Extend * 8], dstTensor, static_cast<uint8_t>((s1Extend+7)/8), {1, 8});
-        } else {
-            for (uint32_t i = 0; i < s1Extend; i++) { // bsn
-                AscendC::Brcb(dstTensor[s1Extend * 8 + i * 8], dstTensor[i * 8], 1, {1, 8});
-            }
-        }
+        AscendC::Brcb(dstTensor[s1Extend * 8], dstTensor, static_cast<uint8_t>((s1Extend+7)/8), {1, 8});
     }
 
     CATLASS_DEVICE
@@ -634,7 +616,7 @@ public:
             softMaxOffset += ((dbParam.n2Idx * g + dbParam.gIdx) * dbParam.actualS1Len +
                             dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
         } else {
-            softMaxOffset = ((dbParam.bIdx * s1 + dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize) * n2 + dbParam.n2Idx) * g + dbParam.gIdx; // bsn
+            softMaxOffset = ((dbParam.bIdx * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * s1 + dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize; // bns
         }
         CopyInSoftMax(vecInBuffer3, s1ExtendSubGraph, softMaxOffset);
 
@@ -1068,6 +1050,7 @@ public:
     int64_t headdim;
     int64_t seq_q;
     int64_t seq_k;
+    int64_t total_q;
 
     float scaleValue;
 
@@ -1088,7 +1071,7 @@ public:
     int32_t curSeqKIdx;
 
     int32_t sfmgOffset = 0;
-    int32_t lseOffset = 0;
+    int64_t lseOffset = 0;
 
     int64_t copyInOffset = 0;
     int64_t copyOutOffset = 0;
@@ -1124,6 +1107,7 @@ public:
         nheads_k = tilingData->kvHeadNum;
         g = tilingData->g;
         headdim = tilingData->qkHeadDim;
+        total_q = tilingData->t1;
         seq_q = tilingData->t1 / b;
         seq_k = tilingData->t2 / b;
 
@@ -1230,20 +1214,14 @@ public:
     CATLASS_DEVICE
     void CopyInSoftMax(LocalTensor<float> &dstTensor, uint32_t s1Extend, uint32_t softMaxOffset)
     {
-        int64_t nheads = nheads_k * g;
-        AscendC::DataCopyExtParams lseCopyParam;
-        lseCopyParam.blockCount = s1Extend;
-        lseCopyParam.blockLen = sizeof(float);
-        lseCopyParam.srcStride = (nheads - 1) * sizeof(float);
-        lseCopyParam.dstStride = 0;
-        lseCopyParam.rsv = 0;
-        AscendC::DataCopyPad(dstTensor, rowLseGm[softMaxOffset], lseCopyParam, {false, 0, 0, 0});
+        // NT (nheads, total_q): contiguous read for fixed head into packed UB dst[0..s1Extend-1]
+        AscendC::DataCopyPad(dstTensor, rowLseGm[softMaxOffset],
+            {1, static_cast<uint16_t>(s1Extend * sizeof(float)), 0, 0}, {false, 0, 0, 0});
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-        for (uint32_t i = 0; i < s1Extend; i++) {
-            AscendC::Brcb(dstTensor[64 * 8 + i * 8], dstTensor[i * 8], 1, {1, 8});
-        }
+        // single Brcb: packed src dst[k] -> broadcast block dst[64*8 + k*8]
+        AscendC::Brcb(dstTensor[64 * 8], dstTensor, static_cast<uint8_t>((s1Extend + 7) / 8), {1, 8});
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(dstTensor, 1.0f, s1Extend * 8);
     }
@@ -1466,7 +1444,7 @@ public:
             int64_t seqOffsetInBlock = blockInfo.SeqQIdx * S1_CUBESIZE + curSeqQIdx * s1VecSize;
             int64_t nheads = nheads_k * g;
             int64_t headIdx = blockInfo.nheadsKIdx * g + blockInfo.gIdx;
-            lseOffset = (globalSeqStart + seqOffsetInBlock) * nheads + headIdx;
+            lseOffset = headIdx * total_q + globalSeqStart + seqOffsetInBlock;
 
             sfmgOffset = 0;
             if (blockInfo.batchIdx > 0) {
@@ -1478,7 +1456,7 @@ public:
             }
             sfmgOffset += ((blockInfo.nheadsKIdx * g + blockInfo.gIdx) * cuQSeqLen + blockInfo.SeqQIdx * S1_CUBESIZE +
                 curSeqQIdx * s1VecSize) * 8;
-            
+
             // copyIn cube_workspace params
             copyInOffset = cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset + curSeqQIdx * s1VecSize *
                 s2CubeExtend;
