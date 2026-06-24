@@ -136,7 +136,6 @@ public:
         s2Token = fagTilingData->s2Token;
         actualCalcS1Token = s1Token;
         actualCalcS2Token = s2Token;
-        sparseMode = fagTilingData->sparseMode;
 
         // split info
         s1Outer = fagTilingData->s1Outer;
@@ -906,7 +905,6 @@ private:
     int64_t s2Token;
     int64_t actualCalcS1Token;
     int64_t actualCalcS2Token;
-    uint32_t sparseMode;
 
     uint32_t pingpongIdx = 1;
 

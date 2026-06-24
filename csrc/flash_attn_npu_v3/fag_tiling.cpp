@@ -22,7 +22,7 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
     // calculate ratio of all mask
     float realS1 = 0;
     float realS2 = 0;
-    if (fagTilingData.sparseMode == NO_MASK) {
+    if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK)) {
         if (fagTilingData.s1Token >= 0 && fagTilingData.s2Token >= 0) {
             realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? static_cast<float>(fagTilingData.qkHeadDim) :
                                                              static_cast<float>(fagTilingData.s1Token);
@@ -36,13 +36,13 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
             realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? fagTilingData.qkHeadDim : fagTilingData.s1Token;
             return (realS1 + fagTilingData.s2Token) / static_cast<float>(fagTilingData.qkHeadDim);
         }
-    } else if (fagTilingData.sparseMode == CAUSAL) {
+    } else if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL)) {
         if (fagTilingData.qkHeadDim >= fagTilingData.vHeadDim) {
             return 1 - static_cast<float>(HALF * fagTilingData.vHeadDim) / static_cast<float>(fagTilingData.qkHeadDim);
         } else {
             return static_cast<float>(HALF * fagTilingData.qkHeadDim) / static_cast<float>(fagTilingData.vHeadDim);
         }
-    } else if (fagTilingData.sparseMode == BAND) {
+    } else if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND)) {
         if (fagTilingData.s1Token >= 0 && fagTilingData.s2Token >= 0) {
             realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? static_cast<float>(fagTilingData.qkHeadDim) :
                                                              static_cast<float>(fagTilingData.s1Token);
@@ -132,13 +132,14 @@ bool SetSparseParams(const FAGTilingData &fagTilingData)
     if (fagTilingData.layoutType == TND) {
         return true;
     }
-    return fagTilingData.sparseMode != NO_MASK;
+    return fagTilingData.maskType != static_cast<uint32_t>(MaskType::NO_MASK);
 }
 
 static void ProcessTokensInfo(FAGTilingData &fagTilingData)
 {
     if (fagTilingData.layoutType != TND &&
-        (fagTilingData.sparseMode == CAUSAL || fagTilingData.sparseMode == BAND)) {
+        (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) ||
+         fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND))) {
         fagTilingData.s1Token += fagTilingData.qSeqlen - fagTilingData.kvSeqlen;
         fagTilingData.s2Token += fagTilingData.kvSeqlen - fagTilingData.qSeqlen;
     }
@@ -357,6 +358,8 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
         fagTilingData.t2 = actualSeqKvlenTensor[kvSeqShapeSize- 1];
         fagTilingData.qSeqlen = *std::max_element(fagTilingData.actualSeqQlen.begin(), fagTilingData.actualSeqQlen.end());
         fagTilingData.kvSeqlen = *std::max_element(fagTilingData.actualSeqKvlen.begin(), fagTilingData.actualSeqKvlen.end());
+    } else {
+        fagTilingData.layoutType = BSND;
     }
 
     fagTilingData.s1Align = (fagTilingData.qSeqlen + INPUT_ALIGN - 1) / INPUT_ALIGN * INPUT_ALIGN;
@@ -370,28 +373,16 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
 
     if (fagInfo.maskType == static_cast<int32_t>(MaskType::NO_MASK)) {
         fagTilingData.attenMaskOptional = EMPTY_TENSOR;
-        fagTilingData.sparseMode = NO_MASK;
         fagTilingData.s1Token = INT32_MAX;
         fagTilingData.s2Token = INT32_MAX;
     } else if (fagInfo.maskType == static_cast<int32_t>(MaskType::MASK_CAUSUAL)) {
         fagTilingData.attenMaskOptional = NORMAL_TENSOR;
-        fagTilingData.sparseMode = CAUSAL;
-        fagTilingData.attenMaskShapeType = ATTEN_MASK_SHAPE_TYPE_SS;
-        fagTilingData.attenMaskDtype = ATTEN_MASK_TYPE_U8_BOOL;
-        fagTilingData.attenMaskCompressMode = (fagTilingData.qSeqlen == fagTilingData.kvSeqlen) ?
-            CAUSAL_COMPRESS_MODE : RIGHT_DOWN_CAUSAL_COMPRESS_MODE;
-        fagTilingData.attenMaskS1Size = ATTEN_MASK_COMPRESS_DIM;
-        fagTilingData.attenMaskS2Size = ATTEN_MASK_COMPRESS_DIM;
+        fagTilingData.attenMaskCompressMode = CAUSAL_COMPRESS_MODE;
         fagTilingData.s1Token = INT32_MAX;
         fagTilingData.s2Token = 0;
     } else if (fagInfo.maskType == static_cast<int32_t>(MaskType::MASK_BAND)) {
         fagTilingData.attenMaskOptional = NORMAL_TENSOR;
-        fagTilingData.sparseMode = BAND;
-        fagTilingData.attenMaskShapeType = ATTEN_MASK_SHAPE_TYPE_SS;
-        fagTilingData.attenMaskDtype = ATTEN_MASK_TYPE_U8_BOOL;
         fagTilingData.attenMaskCompressMode = BAND_COMPRESS_MODE;
-        fagTilingData.attenMaskS1Size = ATTEN_MASK_COMPRESS_DIM;
-        fagTilingData.attenMaskS2Size = ATTEN_MASK_COMPRESS_DIM;
         fagTilingData.s1Token = (fagInfo.window_size_left < 0) ? INT32_MAX : fagInfo.window_size_left;
         fagTilingData.s2Token = (fagInfo.window_size_right < 0) ? INT32_MAX : fagInfo.window_size_right;
     }

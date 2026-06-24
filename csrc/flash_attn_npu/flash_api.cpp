@@ -1124,13 +1124,27 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     uint32_t nheads_k = ksizes[1];
     uint32_t headdim = qsizes[2];
 
-    if (!seqlens_q.equal(seqlens_k)) {
+    int local_window_size_left = window_size_left;
+    int local_window_size_right = window_size_right;
+    if (local_window_size_left >= max_seqlen_k - 1) {
+        local_window_size_left = -1;
+    }
+    if (local_window_size_right >= max_seqlen_q - 1) {
+        local_window_size_right = -1;
+    }
+    if (is_causal) {
+        local_window_size_right = 0;
+    }
+    const bool local_is_causal = local_window_size_left < 0 && local_window_size_right == 0;
+    const bool is_local = (local_window_size_left >= 0 || local_window_size_right >= 0) && !local_is_causal;
+
+    if (!seqlens_q.equal(seqlens_k) || is_local) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(
             dout, q, k, v, out, softmax_lse, dq, dk, dv,
             seqlens_q, seqlens_k,
             max_seqlen_q, max_seqlen_k,
-            scale, is_causal, window_size_left, window_size_right, deterministic);
+            scale, local_is_causal, local_window_size_left, local_window_size_right, deterministic);
     }
 
     // tiling args set

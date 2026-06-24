@@ -43,26 +43,10 @@ enum class MaskType {
     MASK_BAND = 2
 };
 
-enum SparseMode {
-    NO_MASK = 0,           // 未传入 atten mask，全量注意力
-    CAUSAL = 3,            // right-down causal mask, using 2048 compress triu
-    BAND = 4,              // window_size 滑动窗口带状稀疏
-};
-
-enum AttenShapeType {
-    ATTEN_MASK_SHAPE_TYPE_SS
-};
-
-enum AttenDataType {
-    ATTEN_MASK_TYPE_SAME = 0,   // 0 表示 AttenMask 数据类型与 qkv 一致
-    ATTEN_MASK_TYPE_U8_BOOL = 1 // 1 表示 AttenMask 数据类型为 u8 bool
-};
-
 enum AttenMaskCompressMode {
     NO_COMPRESS_MODE = 0,
     CAUSAL_COMPRESS_MODE = 1,
-    RIGHT_DOWN_CAUSAL_COMPRESS_MODE = 2,
-    BAND_COMPRESS_MODE = 3
+    BAND_COMPRESS_MODE = 2
 };
 
 constexpr int64_t ATTEN_MASK_COMPRESS_DIM = 2048;

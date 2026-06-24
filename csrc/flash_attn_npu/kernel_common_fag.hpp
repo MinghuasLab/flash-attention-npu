@@ -35,11 +35,7 @@ struct FAGTilingData {
     int64_t sumS1S2Product = 0;
 
     uint32_t attenMaskOptional;
-    uint32_t attenMaskShapeType = 0;
-    uint32_t attenMaskDtype = 0;
     uint32_t attenMaskCompressMode = 0;
-    int64_t attenMaskS1Size = 0;
-    int64_t attenMaskS2Size = 0;
     uint32_t layoutType;
     float scaleValue;
     float keepProb;
@@ -59,7 +55,6 @@ struct FAGTilingData {
     int64_t dropMaskSize;
 
     uint32_t baseMN;
-    uint32_t sparseMode;
     uint32_t maskType = 0;
 
     std::vector<int32_t> actualSeqQlen;

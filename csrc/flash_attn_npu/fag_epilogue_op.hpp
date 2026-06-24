@@ -30,8 +30,7 @@ using AscendC::TQue;
 
 namespace Catlass::Epilogue::Block {
 constexpr int64_t CAUSAL_COMPRESS_MODE = 1;
-constexpr int64_t RIGHT_DOWN_CAUSAL_COMPRESS_MODE = 2;
-constexpr int64_t BAND_COMPRESS_MODE = 3;
+constexpr int64_t BAND_COMPRESS_MODE = 2;
 
 template <
     class OutputType_,
@@ -110,7 +109,6 @@ public:
     int64_t s2Token;
     int64_t actualCalcS1Token;
     int64_t actualCalcS2Token;
-    uint32_t sparseMode;
     bool dropBitMode;
 
     int64_t b;
@@ -265,13 +263,12 @@ public:
         dAlign = (d + 15) / 16 * 16;
         value_dAlign = (value_d + 15) / 16 * 16;
 
-        attenMaskDimS2 = tilingData->attenMaskS2Size > 0 ? tilingData->attenMaskS2Size : 2048;
+        attenMaskDimS2 = 2048;
 
         s1Token = tilingData->s1Token;
         s2Token = tilingData->s2Token;
         actualCalcS1Token = s1Token;
         actualCalcS2Token = s2Token;
-        sparseMode = tilingData->sparseMode;
 
         s1Outer = tilingData->s1Outer;
         s1CvInner = tilingData->s1CvInner;
@@ -435,26 +432,30 @@ public:
     }
 
     CATLASS_DEVICE
+    int64_t GetCausalDelta(int64_t causal_delta, DBParams &dbParam)
+    {
+        if constexpr (INPUT_LAYOUT == TND) {
+            int32_t actualS1Len = 0;
+            int32_t actualS2Len = 0;
+            GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
+            return causal_delta - actualS1Len + actualS2Len;
+        } else {
+            return causal_delta - s1 + s2;
+        }
+    }
+
+    CATLASS_DEVICE
     void CalcAttenBandMode(int64_t causal_delta, DBParams &dbParam)
     {
         AttenBandMode = AttenMaskCompress::All;
-        if (compressMode != CAUSAL_COMPRESS_MODE &&
-            compressMode != RIGHT_DOWN_CAUSAL_COMPRESS_MODE &&
-            compressMode != BAND_COMPRESS_MODE) {
+        if (compressMode != CAUSAL_COMPRESS_MODE && compressMode != BAND_COMPRESS_MODE) {
             return;
         }
 
         int64_t next_delta = causal_delta;
         int64_t pre_delta = causal_delta - INT32_MAX - 1;
-        if (compressMode == RIGHT_DOWN_CAUSAL_COMPRESS_MODE) {
-            if constexpr (INPUT_LAYOUT == TND) {
-                int32_t actualS1Len = 0;
-                int32_t actualS2Len = 0;
-                GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
-                next_delta = causal_delta - actualS1Len + actualS2Len;
-            } else {
-                next_delta = causal_delta - s1 + s2;
-            }
+        if (compressMode == CAUSAL_COMPRESS_MODE) {
+            next_delta = GetCausalDelta(causal_delta, dbParam);
         } else if (compressMode == BAND_COMPRESS_MODE) {
             next_delta = causal_delta + actualCalcS2Token;
             pre_delta = causal_delta - actualCalcS1Token - 1;
@@ -474,24 +475,16 @@ public:
         }
     }
 
-    __aicore__ inline void CalcAttenMaskOffsetWithSparseModeForUnpad(
+    __aicore__ inline void CalcAttenMaskOffsetWithCompressModeForUnpad(
         int64_t &attenMaskOffset, int64_t &attenMaskOffset2,
         uint32_t s1VSize, uint32_t s2VSize, int64_t curS1Idx,
         uint32_t s2VBegin, bool &canSimplify, DBParams &dbParam)
     {
-        int32_t actualS1Len;
-        int32_t actualS2Len;
         int64_t causal_delta =
             static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize) - static_cast<int64_t>(s2VBegin);
         CalcAttenBandMode(causal_delta, dbParam);
-        if (compressMode == CAUSAL_COMPRESS_MODE) { // causal s1==s2
-            CalcAttenMaskOffset(attenMaskOffset, causal_delta, s1VSize, s2VSize);
-            return;
-        }
-
-        if (compressMode == RIGHT_DOWN_CAUSAL_COMPRESS_MODE) { // causal s1!=s2
-            GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
-            causal_delta = causal_delta - actualS1Len + actualS2Len;
+        if (compressMode == CAUSAL_COMPRESS_MODE) {
+            causal_delta = GetCausalDelta(causal_delta, dbParam);
             CalcAttenMaskOffset(attenMaskOffset, causal_delta, s1VSize, s2VSize);
             return;
         }
@@ -509,7 +502,7 @@ public:
     }
 
     CATLASS_DEVICE
-    void CalcAttenMaskOffsetWithSparseMode(int64_t &attenMaskOffset,
+    void CalcAttenMaskOffsetWithCompressMode(int64_t &attenMaskOffset,
         int64_t &attenMaskOffset2, uint32_t s1VSize, uint32_t s2VSize, int64_t curS1Idx, uint32_t s2VBegin,
         bool &canSimplify, DBParams &dbParam)
     {
@@ -517,12 +510,7 @@ public:
             static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize) - static_cast<int64_t>(s2VBegin);
         CalcAttenBandMode(causal_delta, dbParam);
         if (compressMode == CAUSAL_COMPRESS_MODE) {
-            CalcAttenMaskOffset(attenMaskOffset, causal_delta, s1VSize, s2VSize);
-            return;
-        }
-
-        if (compressMode == RIGHT_DOWN_CAUSAL_COMPRESS_MODE) {
-            causal_delta = causal_delta - s1 + s2;
+            causal_delta = GetCausalDelta(causal_delta, dbParam);
             CalcAttenMaskOffset(attenMaskOffset, causal_delta, s1VSize, s2VSize);
             return;
         }
@@ -658,10 +646,10 @@ public:
             int64_t attenMaskOffset = 0;
             if constexpr(INPUT_LAYOUT == TND) {
                 UpdateToken(dbParam.bIdx);
-                CalcAttenMaskOffsetWithSparseModeForUnpad(attenMaskOffset, attenMaskOffsetPre, s1ExtendSubGraph, s2Extend,
+                CalcAttenMaskOffsetWithCompressModeForUnpad(attenMaskOffset, attenMaskOffsetPre, s1ExtendSubGraph, s2Extend,
                                                         curS1Idx, s2VBegin, prefixCompressCanSimplify, dbParam);
             } else {
-                CalcAttenMaskOffsetWithSparseMode(attenMaskOffset, attenMaskOffsetPre, s1ExtendSubGraph, s2Extend, curS1Idx,
+                CalcAttenMaskOffsetWithCompressMode(attenMaskOffset, attenMaskOffsetPre, s1ExtendSubGraph, s2Extend, curS1Idx,
                                                 s2VBegin, prefixCompressCanSimplify, dbParam);
             }
             // uint8_t
@@ -697,7 +685,6 @@ public:
         ///////////////////////////////////////////////////////////////
         // attenMask
         ///////////////////////////////////////////////////////////////
-        // attenMaskOffset     attenMaskShapeType  0--111S1S2        1--B11S1S2         2--BN2GS1S2
         if constexpr (IS_ATTEN_MASK == ENABLE) {
             AscendC::PipeBarrier<PIPE_V>();
 

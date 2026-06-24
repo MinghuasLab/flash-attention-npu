@@ -66,8 +66,31 @@ std::vector<at::Tensor> launch_fag_general(
     FAGTiling::FAGInfo fagInfo;
     fagInfo.scaleValue = softmax_scale;
     fagInfo.keepProb = 1.0f;
-    fagInfo.maskType = is_causal ? static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL)
-                                 : static_cast<int32_t>(FAGTiling::MaskType::NO_MASK);
+    if (window_size_left >= max_seqlen_k - 1) {
+        window_size_left = -1;
+    }
+    if (window_size_right >= max_seqlen_q - 1) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const bool has_attn_mask = is_causal || is_local;
+    if (is_causal) {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = 0;
+    } else if (is_local) {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_BAND);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = window_size_right;
+    } else {
+        fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::NO_MASK);
+        fagInfo.window_size_left = window_size_left;
+        fagInfo.window_size_right = window_size_right;
+    }
     fagInfo.batch = batch_size;
     fagInfo.qSeqlen = max_seqlen_q;
     fagInfo.qHeadNum = nheads;
@@ -75,8 +98,6 @@ std::vector<at::Tensor> launch_fag_general(
     fagInfo.kvSeqlen = max_seqlen_k;
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;
-    fagInfo.window_size_left = window_size_left;
-    fagInfo.window_size_right = window_size_right;
     fagInfo.isDeterministic = deterministic;
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
 
@@ -93,7 +114,8 @@ std::vector<at::Tensor> launch_fag_general(
     uint64_t ubSize = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
-    FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    int64_t tilingStatus = FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    TORCH_CHECK(tilingStatus == 0, "launch_fag_general: GetFAGTilingParam failed.");
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
@@ -105,10 +127,11 @@ std::vector<at::Tensor> launch_fag_general(
         at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
     at::Tensor mask_gpu_tensor;
-    if (is_causal) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+    if (has_attn_mask) {
+        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
+        mask_gpu_tensor = at::triu(
+            at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
+            .to(at::Device(at::kPrivateUse1));
     }
 
     uint64_t fftsAddr{0};
@@ -120,7 +143,7 @@ std::vector<at::Tensor> launch_fag_general(
     auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
     auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
     uint8_t *attenMaskDevice = nullptr;
-    if (is_causal) {
+    if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
     }
 
@@ -170,12 +193,12 @@ std::vector<at::Tensor> launch_fag_general(
 
     if (is_varlen_q) {
         LaunchFAGGeneralKernel<std::integral_constant<uint32_t, static_cast<uint32_t>(TND)>>(
-            is_bf16, is_causal, deterministic, qk_headdim_kernel, blockDim, aclStream, fftsAddr,
+            is_bf16, has_attn_mask, deterministic, qk_headdim_kernel, blockDim, aclStream, fftsAddr,
             dOutDevice, qDevice, kDevice, vDevice, outDevice, attenMaskDevice, softMaxLseDevice,
             cuSeqQlenDevice, cuSeqKvlenDevice, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice);
     } else {
         LaunchFAGGeneralKernel<std::integral_constant<uint32_t, static_cast<uint32_t>(BSND)>>(
-            is_bf16, is_causal, deterministic, qk_headdim_kernel, blockDim, aclStream, fftsAddr,
+            is_bf16, has_attn_mask, deterministic, qk_headdim_kernel, blockDim, aclStream, fftsAddr,
             dOutDevice, qDevice, kDevice, vDevice, outDevice, attenMaskDevice, softMaxLseDevice,
             cuSeqQlenDevice, cuSeqKvlenDevice, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice);
     }
