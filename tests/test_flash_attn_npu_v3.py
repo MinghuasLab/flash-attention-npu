@@ -140,7 +140,7 @@ def ref_flash_attention(
     return go.to(data_type), lse
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout)
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND"),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND"),
     (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, "TND"),
@@ -153,10 +153,17 @@ test_cases = [
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "TND"),
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "BSND"),
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "BSND"),
+    # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, "TND"),
+    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, "TND"),
 ]
 
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout):
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits):
+    # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
+    if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
+        pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     q_min_range = -1.0
     q_max_range = 1.0
     kv_min_range = -1.0
@@ -206,7 +213,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     window_size_right = -1
     is_rotary_interleaved = False
     softcap = 0
-    num_splits = 0
     kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
     rotary_cos = None
     rotary_sin = None

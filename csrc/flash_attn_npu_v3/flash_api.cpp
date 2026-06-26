@@ -62,6 +62,7 @@ struct SplitContext {
     int32_t* seqlens_k_cpu;
     bool is_varlen_q;
     uint32_t blockDim;
+    int32_t num_splits;
 };
 
 BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx) {
@@ -327,11 +328,159 @@ void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize,
     tiling->set_splitLseTotalSize(currentLseTaskOffset * SIZE_OF_32BIT);
     tiling->set_splitOTotalSize(currentOTaskOffset * SIZE_OF_32BIT);
 }
+uint32_t countForceSplitSegments(uint32_t groupSize, const SplitContext& ctx) {
+    uint32_t totalSegs = 0;
+    uint32_t nsplit = static_cast<uint32_t>(ctx.num_splits);
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        BatchParams p = getBatchParams(b, groupSize, ctx);
+        uint32_t curKSBlockNum = p.curKSBlockNum;
+        if (curKSBlockNum == 0) { continue; }
+        uint32_t blocksPerSplit = (curKSBlockNum + nsplit - 1) / nsplit;
+        if (blocksPerSplit == 0) { blocksPerSplit = 1; }
+        uint32_t actualSplits = (curKSBlockNum + blocksPerSplit - 1) / blocksPerSplit;
+        totalSegs += p.curQNBlockNum * p.curQSBlockNum * actualSplits;
+    }
+    return totalSegs;
+}
+
+void fillCoreInfoForceSplit(FAInferTilingData* tiling, uint32_t groupSize,
+                            const SplitContext& ctx) {
+    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
+        tiling->coreInfo[coreIdx].startBIdx = 0;
+        tiling->coreInfo[coreIdx].startN1Idx = 0;
+        tiling->coreInfo[coreIdx].startS1Idx = 0;
+        tiling->coreInfo[coreIdx].startS2Idx = 0;
+        tiling->coreInfo[coreIdx].endBIdx = 0;
+        tiling->coreInfo[coreIdx].endN1Idx = 0;
+        tiling->coreInfo[coreIdx].endS1Idx = 0;
+        tiling->coreInfo[coreIdx].endS2Idx = 0;
+    }
+
+    uint32_t nsplit = static_cast<uint32_t>(ctx.num_splits);
+    uint32_t coreIdx = 0;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        BatchParams p = getBatchParams(b, groupSize, ctx);
+        uint32_t curKSBlockNum = p.curKSBlockNum;
+        if (curKSBlockNum == 0) { continue; }
+        uint32_t blocksPerSplit = (curKSBlockNum + nsplit - 1) / nsplit;
+        if (blocksPerSplit == 0) { blocksPerSplit = 1; }
+        for (uint32_t n1 = 0; n1 < p.curQNBlockNum; n1++) {
+            for (uint32_t s1 = 0; s1 < p.curQSBlockNum; s1++) {
+                for (uint32_t segStart = 0; segStart < curKSBlockNum; segStart += blocksPerSplit) {
+                    uint32_t segEnd = std::min(segStart + blocksPerSplit, curKSBlockNum);
+                    if (coreIdx >= ctx.blockDim) { break; }
+                    tiling->coreInfo[coreIdx].startBIdx = b;
+                    tiling->coreInfo[coreIdx].endBIdx = b;
+                    tiling->coreInfo[coreIdx].startN1Idx = static_cast<int>(n1);
+                    tiling->coreInfo[coreIdx].endN1Idx = static_cast<int>(n1);
+                    tiling->coreInfo[coreIdx].startS1Idx = static_cast<int>(s1);
+                    tiling->coreInfo[coreIdx].endS1Idx = static_cast<int>(s1);
+                    tiling->coreInfo[coreIdx].startS2Idx = static_cast<int>(segStart);
+                    tiling->coreInfo[coreIdx].endS2Idx = static_cast<int>(segEnd);
+                    coreIdx++;
+                }
+            }
+        }
+    }
+    tiling->set_needCoreNum(coreIdx);
+}
+
+void fillCoreInfoNoSplit(FAInferTilingData* tiling, uint32_t groupSize,
+                         const SplitContext& ctx) {
+    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
+        tiling->coreInfo[coreIdx].startBIdx = 0;
+        tiling->coreInfo[coreIdx].startN1Idx = 0;
+        tiling->coreInfo[coreIdx].startS1Idx = 0;
+        tiling->coreInfo[coreIdx].startS2Idx = 0;
+        tiling->coreInfo[coreIdx].endBIdx = 0;
+        tiling->coreInfo[coreIdx].endN1Idx = 0;
+        tiling->coreInfo[coreIdx].endS1Idx = 0;
+        tiling->coreInfo[coreIdx].endS2Idx = 0;
+    }
+
+    uint32_t totalTasks = 0;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        BatchParams p = getBatchParams(b, groupSize, ctx);
+        totalTasks += p.curQNBlockNum * p.curQSBlockNum;
+    }
+    if (totalTasks == 0) { tiling->set_needCoreNum(0); return; }
+
+    uint32_t tasksPerCore = (totalTasks + ctx.blockDim - 1) / ctx.blockDim;
+
+    auto locate = [&](uint32_t gidx, int32_t& B, int32_t& N1, int32_t& S1, uint32_t& ksBlk) {
+        uint32_t acc = 0;
+        for (int32_t b = 0; b < ctx.batch_size; b++) {
+            BatchParams p = getBatchParams(b, groupSize, ctx);
+            uint32_t cnt = p.curQNBlockNum * p.curQSBlockNum;
+            if (cnt == 0) { continue; }
+            if (gidx < acc + cnt) {
+                uint32_t local = gidx - acc;
+                B = b;
+                N1 = static_cast<int32_t>(local / p.curQSBlockNum);
+                S1 = static_cast<int32_t>(local % p.curQSBlockNum);
+                ksBlk = p.curKSBlockNum;
+                return;
+            }
+            acc += cnt;
+        }
+        B = ctx.batch_size - 1;
+        BatchParams p = getBatchParams(B, groupSize, ctx);
+        N1 = static_cast<int32_t>(p.curQNBlockNum) - 1;
+        S1 = static_cast<int32_t>(p.curQSBlockNum) - 1;
+        ksBlk = p.curKSBlockNum;
+    };
+
+    uint32_t usedCores = 0;
+    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
+        uint32_t taskLo = coreIdx * tasksPerCore;
+        if (taskLo >= totalTasks) { break; }
+        uint32_t taskHi = std::min(taskLo + tasksPerCore, totalTasks);
+
+        int32_t b0, n0, s0; uint32_t ks0;
+        int32_t b1, n1, s1; uint32_t ks1;
+        locate(taskLo, b0, n0, s0, ks0);
+        locate(taskHi - 1, b1, n1, s1, ks1);
+
+        tiling->coreInfo[coreIdx].startBIdx = b0;
+        tiling->coreInfo[coreIdx].startN1Idx = n0;
+        tiling->coreInfo[coreIdx].startS1Idx = s0;
+        tiling->coreInfo[coreIdx].startS2Idx = 0;                         // whole-KV start
+        tiling->coreInfo[coreIdx].endBIdx = b1;
+        tiling->coreInfo[coreIdx].endN1Idx = n1;
+        tiling->coreInfo[coreIdx].endS1Idx = s1;
+        tiling->coreInfo[coreIdx].endS2Idx = static_cast<int32_t>(ks1);   // whole-KV end -> no split
+        usedCores = coreIdx + 1;
+    }
+    tiling->set_needCoreNum(usedCores);
+}
 
 void splitBN2S1GS2(FAInferTilingData* tiling, const SplitContext& ctx) {
     uint64_t totalTaskNum = 0;
     uint32_t groupSize = ctx.num_heads / ctx.num_heads_k;
 
+    //   num_splits==1 -> each task is one whole-KV segment (no split, see below).
+    //   num_splits>1  -> each task's KV is actively split into num_splits segments.
+    if (ctx.num_splits >= 1) {
+        uint32_t totalSegs = countForceSplitSegments(groupSize, ctx);
+        uint32_t coreCap = std::min(ctx.blockDim, static_cast<uint32_t>(25));
+        if (totalSegs > 0 && totalSegs <= coreCap) {
+            // Fits one-segment-per-core. For num_splits==1, blocksPerSplit==curKSBlockNum,
+            // so each task is a single whole-KV segment -> isSplitKV=false -> not split.
+            fillCoreInfoForceSplit(tiling, groupSize, ctx);
+            fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
+            return;
+        }
+        if (ctx.num_splits == 1) {
+            // Tasks exceed cores: a core must serially handle multiple tasks. Use the
+            // whole-task layout so NO task's KV is ever split (the guarantee num_splits==1
+            // must hold even when #tasks > #cores).
+            fillCoreInfoNoSplit(tiling, groupSize, ctx);
+            fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
+            return;
+        }
+    }
+
+    // num_splits==0 (auto), or num_splits>1 overflow: default core-balanced split.
     for (int32_t batchIdx = 0; batchIdx < ctx.batch_size; batchIdx++) {
         BatchParams p = getBatchParams(batchIdx, groupSize, ctx);
         totalTaskNum += static_cast<uint64_t>(ctx.num_heads) * p.qSeqlen * p.kvSeqlen;
@@ -447,7 +596,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right");
     TORCH_CHECK(attention_chunk == 0, "NPU FlashAttention does not support attention_chunk");
     TORCH_CHECK(!scheduler_metadata_.has_value(), "NPU FlashAttention does not support scheduler_metadata");
-    TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
+                "NPU FlashAttention supports num_splits in [0, ", blockDim,
+                "] (0 = auto; upper bound = number of AI cores). ");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "NPU FlashAttention does not support pack_gqa");
 
     if (is_varlen_kv) {
@@ -587,6 +738,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
     bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
         (maxKVSeqlenCalc >= 1024);
+    TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
+                "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
     bool flashDecodeFlag = paged_KV && is_varlen_q &&
         (maxQSeqlenCalc * groupSize <= 128) && (maxQSeqlenCalc <= 16) &&
         (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) && (isLongSeq || isShortSeq);
@@ -601,6 +754,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     splitCtx.seqlens_k_cpu = seqlens_k_cpu;
     splitCtx.is_varlen_q = is_varlen_q;
     splitCtx.blockDim = blockDim;
+    splitCtx.num_splits = static_cast<int32_t>(num_splits);
+    tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
     if (flashDecodeFlag) {
         splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
         auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();

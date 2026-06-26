@@ -58,6 +58,7 @@ struct FAInferTilingData {
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
     uint32_t needCoreNum;
+    uint32_t numSplits;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
 
@@ -87,6 +88,7 @@ struct FAInferTilingData {
     uint64_t get_splitOTotalSize() const { return splitOTotalSize; }
     uint32_t get_totalSplitNodeNum() const { return totalSplitNodeNum; }
     uint32_t get_needCoreNum() const { return needCoreNum; }
+    uint32_t get_numSplits() const { return numSplits; }
 
     void set_numHeads(uint32_t value) { numHeads = value; }
     void set_embeddingSize(uint32_t value) { embeddingSize = value; }
@@ -114,6 +116,7 @@ struct FAInferTilingData {
     void set_splitOTotalSize(uint64_t value) { splitOTotalSize = value; }
     void set_totalSplitNodeNum(uint32_t value) { totalSplitNodeNum = value; }
     void set_needCoreNum(uint32_t value) { needCoreNum = value; }
+    void set_numSplits(uint32_t value) { numSplits = value; }
 };
 
 #endif
