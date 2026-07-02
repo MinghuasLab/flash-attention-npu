@@ -1,0 +1,64 @@
+name: Installation Issue
+description: Report errors encountered while building or installing flash-attention-npu.
+title: "[INSTALL]: "
+labels: ["installation"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: >
+        #### Before submitting an issue, please make sure the issue hasn't been already open or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I have followed every step in the README installation section.
+          required: true
+        - label: I have sourced the CANN environment (`source /usr/local/Ascend/cann/set_env.sh`).
+          required: true
+        - label: I have redacted any sensitive information from logs.
+          required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Provide detailed environment information.
+      value: |
+        - Device (e.g., Ascend 910B):
+        - CANN version:
+        - PyTorch version:
+        - torch_npu version:
+        - Python version:
+        - flash_attn_npu version:
+        - etc.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: How did you install flash_attn_npu?
+      description: |
+        Paste the full command you are trying to execute.
+      value: |
+        ```sh
+        pip install flash_attn_npu --no-build-isolation
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error output
+      description: Paste the error / build log. Redact any sensitive content.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context that is relevant.
+    validations:
+      required: false

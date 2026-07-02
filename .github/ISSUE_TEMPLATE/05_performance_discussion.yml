@@ -1,0 +1,34 @@
+name: Performance Discussion
+description: Propose ideas or discuss potential performance improvements for flash-attention-npu.
+title: "[PERF]: "
+labels: ["performance"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: >
+        #### Thanks for helping improve performance! Before submitting an issue, please make sure a similar discussion has not already been opened or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+
+  - type: textarea
+    id: current_issue
+    attributes:
+      label: Current Performance Issue
+      description: Describe the current performance bottleneck, limitation, or optimization opportunity.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe your idea for improving performance.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Add any relevant benchmark results, references, figures, or other supporting information.
+    validations:
+      required: false

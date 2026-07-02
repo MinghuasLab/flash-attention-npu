@@ -1,0 +1,6 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/MinghuasLab/flash-attention-npu/discussions
+    about: For usage questions, ideas, and general discussions, please use GitHub Discussions.

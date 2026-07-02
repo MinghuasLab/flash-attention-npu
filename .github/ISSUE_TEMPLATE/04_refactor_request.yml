@@ -1,0 +1,48 @@
+name: Refactor Request
+description: Propose a refactor to improve code or documentation quality.
+title: "[REFACTOR]: "
+labels: ["refactor"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: >
+        #### Thanks for helping improve maintainability! Before submitting an issue, please make sure the issue hasn't been already open or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+  - type: textarea
+    id: target
+    attributes:
+      label: Scope
+      description: Which file(s), module(s), or doc section(s) does this target?
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current state & problem
+      description: What does it look like currently, and why is that a problem (readability, duplication, performance, correctness risk)?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the target design and the key steps to get there.
+    validations:
+      required: true
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Are you willing to submit a PR?
+      options:
+        - "Yes, I can submit a PR"
+        - "Maybe — I'd need guidance"
+        - "No, just proposing"
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context that is relevant.
+    validations:
+      required: false
