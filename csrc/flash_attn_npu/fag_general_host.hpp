@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 #include <optional>
 #include <vector>
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 
 // Launch general-purpose FAG (FlashAttentionGrad) kernel (BSND or TND).
 std::vector<at::Tensor> launch_fag_general(

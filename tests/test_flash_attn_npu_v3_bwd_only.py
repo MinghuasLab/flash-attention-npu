@@ -25,6 +25,8 @@ import torch_npu
 
 from flash_attn_npu_v3.flash_attn_interface import _flash_attn_backward
 
+_CANN_LSE_MASKED_MAX = -1e30
+
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
@@ -101,24 +103,34 @@ def resolve_fa_bwd_window(sparse_mode, pre_tocken, next_tocken):
         return True, -1, 0
     return False, -1, -1
 
+def _apply_cann_masked_lse_sentinel(plane_lse, x_max_plane):
+    """RIGHT_DOWN 因果 seq_q>seq_k 时，前缀 query 行 x_max=-FLT_MAX，LSE 应置 +inf。"""
+    masked = x_max_plane.to(torch.float32) < _CANN_LSE_MASKED_MAX
+    return torch.where(masked, torch.full_like(plane_lse, float("inf")), plane_lse)
 
 def lse_from_golden_max_sum(x_max, x_sum, layout):
-    """TND: NT8 -> TN; BSND: BNS8/BNS -> BNS."""
+    """
+    Golden npu_fusion_attention 的 x_max/x_sum 布局约定：
+      TND: shape (total_q, nheads, 8) 但物理排布为 NT（即 stride 按 NT 排列），
+           取 plane[...,0] 再 reshape 为 NT (nheads, total_q) 以匹配 flash_api kernel 的期望。
+      BSND: shape (batch, nheads, seq_q, 8) 即 BNS8，物理排布为 BNS -> bwd 需要 BNS contiguous
+    全 mask 行：x_max=-FLT_MAX/x_sum=+FLT_MAX，LSE 置 +inf（勿用 x_max+log(x_sum) 原值）。
+    """
     lse = x_max.to(torch.float32) + torch.log(x_sum.to(torch.float32).clamp_min(1e-20))
     if layout == "tnd":
         if lse.dim() != 3:
             raise ValueError(
-                f"TND 期望 x_max/x_sum 为 NT8 (N,T,8)，实际 dim={lse.dim()} shape={tuple(lse.shape)}"
+                f"TND 期望 x_max/x_sum 为 TN8 (total_q,nheads,8)，"
+                f"实际 dim={lse.dim()} shape={tuple(lse.shape)}"
             )
-        lse = lse[..., 0].transpose(0, 1)
+        plane = _apply_cann_masked_lse_sentinel(lse[..., 0], x_max[..., 0])
+        lse = plane.reshape(plane.shape[1], plane.shape[0])
     else:
         if lse.dim() == 4:
-            lse = lse[..., 0]
-        elif lse.dim() == 3:
-            pass
+            lse = _apply_cann_masked_lse_sentinel(lse[..., 0], x_max[..., 0])
         else:
             raise ValueError(
-                f"BSND 期望 x_max/x_sum 为 BNS8 或 BNS，实际 dim={lse.dim()} shape={tuple(lse.shape)}"
+                f"BSND 期望 x_max/x_sum 为 BNS8，实际 dim={lse.dim()} shape={tuple(lse.shape)}"
             )
     return lse.contiguous()
 
@@ -161,7 +173,7 @@ def _compare_grad(name, fa_grad, golden_grad):
     return result
 
 
-def test_tnd_bwd_only_npu(nheads, nheads_k, headdim, list_seq, sparse_mode=0):
+def test_tnd_bwd_only_npu(nheads, nheads_k, headdim, list_seq, list_seq_k, sparse_mode=0):
     """
     TND 变长：仅测 FA bwd，out / softmax_lse 来自 golden 前向。
 
@@ -173,7 +185,7 @@ def test_tnd_bwd_only_npu(nheads, nheads_k, headdim, list_seq, sparse_mode=0):
     """
     scale = 1 / (headdim ** 0.5)
     seqlens_list_q = np.array(list_seq)
-    seqlens_list_k = np.array(list_seq)
+    seqlens_list_k = np.array(list_seq_k)
 
     max_seqlen_q = int(np.max(seqlens_list_q))
     max_seqlen_k = int(np.max(seqlens_list_k))
@@ -395,6 +407,7 @@ def run_single_from_argv():
             params["nheads_k"],
             params["headdim"],
             params["list_seq"],
+            params["list_seq_k"],
             params.get("sparse_mode", 0),
         )
         print("SINGLE_TND_RESULT_JSON:", json.dumps(result, sort_keys=True))
@@ -435,13 +448,14 @@ run_single_from_argv()
 
 # --- 单次用例（与 test_flash_attn_npu_v3_bwd.py 一致，改参数后取消注释）---
 
-# test_tnd_bwd_only_npu(3, 3, 128, [512, 33, 1111])
+test_tnd_bwd_only_npu(16, 1, 128, [512, 33, 1111], [512, 44, 2222], 3)
 # test_tnd_bwd_only_npu(3, 3, 128, [512, 33, 1111], sparse_mode=3)
+# test_tnd_bwd_only_npu(3, 3, 128, [512, 33, 1111], [512, 44, 2222], sparse_mode=3)
 # test_tnd_bwd_only_npu(28, 7, 256, [550, 1498, 400, 147, 557, 2028, 889, 1057])
 # test_tnd_bwd_only_npu(8, 2, 128, [1204])
 
 # test_bsnd_bwd_only_npu(2, 2, 256, 17, 9025, 3840)
-# test_bsnd_bwd_only_npu(2, 2, 256, 17, 9025, 3840, sparse_mode=3)
+test_bsnd_bwd_only_npu(16, 4, 128, 1, 999, 777, sparse_mode=3)
 # test_bsnd_bwd_only_npu(10, 10, 64, 10, 61, 61)
 # test_bsnd_bwd_only_npu(32, 8, 256, 26, 9453, 7285)
 # test_bsnd_bwd_only_npu(9, 3, 64, 3, 2228, 8109)
@@ -456,8 +470,8 @@ run_single_from_argv()
 
 
 # --- TND 批跑：随机 nheads / headdim / 变长 list_seq ---
-RUN_TND_BATCH = True
-# RUN_TND_BATCH = False
+# RUN_TND_BATCH = True
+RUN_TND_BATCH = False
 total_runs_tnd = 1
 tnd_batch_seed = BATCH_CASE_SEED
 TND_BATCH_SPARSE_MODE = 4
@@ -474,11 +488,13 @@ if RUN_TND_BATCH:
         headdim = 64 * param_rng.randint(1, 4)
         num_batches = param_rng.randint(1, 50)
         list_seq = [param_rng.randint(1, 10000) for _ in range(num_batches)]
+        list_seq_k = [param_rng.randint(1, 10000) for _ in range(num_batches)]
         run_params = {
             "nheads": nheads,
             "nheads_k": nheads_k,
             "headdim": headdim,
             "list_seq": list_seq,
+            "list_seq_k": list_seq_k,
             "total_q": int(sum(list_seq)),
             "max_seqlen": max(list_seq),
             "sparse_mode": TND_BATCH_SPARSE_MODE,
