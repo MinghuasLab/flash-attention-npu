@@ -1,0 +1,151 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Modified by Minghua Shen, 2026
+ */
+
+#include "aicpu_api.h"
+#include "fa_metadata_args.h"
+#include "fa_split.h"
+#include "tilingdata.h"
+#include <cstdint>
+
+namespace {
+constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t N_SPLIT_HELPER = 2;
+
+inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (b == 0) ? 0 : (a + b - 1) / b;
+}
+
+inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
+{
+    uint32_t qNBlockTile = (qSeqlen != 0)
+        ? (Q_TILE_CEIL / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER
+        : Q_TILE_CEIL;
+    qNBlockTile = qNBlockTile < groupSize ? qNBlockTile : groupSize;
+    qNBlockTile = qNBlockTile < 1u ? 1u : qNBlockTile;
+    return qNBlockTile;
+}
+}
+
+__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+{
+    FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
+    const bool causal = metaArgs->maskType != 0;
+    FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
+        metaArgs->metaOutAddr + fa_metadata::TilingOffset(causal));
+    const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
+    const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
+
+    uint8_t *tilingBytes = reinterpret_cast<uint8_t *>(tilingData);
+    for (uint64_t i = 0; i < sizeof(FAInferTilingData); ++i) {
+        tilingBytes[i] = 0;
+    }
+
+    tilingData->batch = metaArgs->batch;
+    tilingData->numHeads = metaArgs->numHeads;
+    tilingData->kvHeads = metaArgs->numHeadsK;
+    tilingData->embeddingSize = metaArgs->embeddingSize;
+    tilingData->embeddingSizeV = metaArgs->embeddingSizeV;
+    tilingData->numBlocks = metaArgs->numBlocks;
+    tilingData->blockSize = metaArgs->blockSize;
+    tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
+    tilingData->maskType = metaArgs->maskType;
+    tilingData->scaleValue = metaArgs->scaleValue;
+    tilingData->maxQSeqlen = metaArgs->maxQSeqlen;
+    tilingData->numSplits = metaArgs->numSplits > 0u ? metaArgs->numSplits : 1u;
+
+    uint32_t maxKvSeqlen = 0;
+    if (seqlensK != nullptr) {
+        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+            uint32_t kvLen = metaArgs->isVarlenKv != 0
+                ? static_cast<uint32_t>(seqlensK[batchIdx + 1] - seqlensK[batchIdx])
+                : static_cast<uint32_t>(seqlensK[batchIdx]);
+            if (kvLen > maxKvSeqlen) {
+                maxKvSeqlen = kvLen;
+            }
+        }
+    }
+    tilingData->maxKvSeqlen = maxKvSeqlen;
+
+    const uint64_t blockDim = static_cast<uint64_t>(metaArgs->blockDim);
+    tilingData->mm1OutSize = fa_metadata::Mm1OutSize(blockDim);
+    tilingData->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);
+    tilingData->mm2OutSize = fa_metadata::Mm2OutSize(blockDim);
+    tilingData->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
+    tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+
+    const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
+    uint32_t totalTaskNum = 0;
+    uint32_t firstBatchTaskNum = 0;
+    for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+        uint32_t qSeqlen = metaArgs->maxQSeqlen;
+        if (metaArgs->isVarlen != 0) {
+            qSeqlen = static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+        }
+        const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
+        const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+        const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
+        const uint32_t curQSBlockTile = Q_TILE_CEIL;
+        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
+        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        if (batchIdx == 0) {
+            firstBatchTaskNum = curTaskNum;
+        }
+        totalTaskNum += curTaskNum;
+    }
+    tilingData->firstBatchTaskNum = firstBatchTaskNum;
+    tilingData->totalTaskNum = totalTaskNum;
+
+    {
+        uint32_t maxQ = 0;
+        uint32_t minQ = 0xFFFFFFFFu;
+        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+            uint32_t qLen = metaArgs->maxQSeqlen;
+            if (metaArgs->isVarlen != 0) {
+                qLen = static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+            }
+            if (qLen > maxQ) maxQ = qLen;
+            if (qLen < minQ) minQ = qLen;
+        }
+        const uint32_t bd = metaArgs->blockDim;
+        const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
+        const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
+        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
+        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+            (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
+            (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+        tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
+        if (fdFlag) {
+            fa_split::SplitContext ctx;
+            ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
+            ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
+            ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
+            ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
+            ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
+            ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
+            ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
+            ctx.is_varlen_q = metaArgs->isVarlen != 0;
+            ctx.blockDim = bd;
+            ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
+            fa_split::splitBN2S1GS2(tilingData, ctx);
+            tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
+                + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
+        }
+    }
+
+    if (causal) {
+        int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
+        const uint32_t maskDim = fa_metadata::MASK_DIM;
+        for (uint32_t row = 0; row < maskDim; ++row) {
+            int8_t *maskRow = maskBase + static_cast<uint64_t>(row) * maskDim;
+            for (uint32_t col = 0; col < maskDim; ++col) {
+                maskRow[col] = (col > row) ? static_cast<int8_t>(1) : static_cast<int8_t>(0);
+            }
+        }
+    }
+
+    AscendC::DataStoreBarrier();
+    return 0;
+}

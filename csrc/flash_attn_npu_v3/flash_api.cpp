@@ -15,480 +15,32 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "fag_tiling.cpp"
 #include "fag_kernel.cpp"
+#include "fa_metadata_args.h"
+#include "fa_split.h"
+#include <cmath>
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
+extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
+
+#define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
+
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args)
 {
-    uint32_t qRowNumCeil = Q_TILE_CEIL;
-    uint32_t qNBlockTile = (qSeqlen != 0) ?
-        (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-    qNBlockTile = std::min(qNBlockTile, groupSize);
-    qNBlockTile = std::max(qNBlockTile, static_cast<uint32_t>(1));
-    return qNBlockTile;
+    const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
+    at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
+
+    aclrtStream aicpuStream = c10_npu::getNPUStreamFromPool().stream(false);
+    static thread_local FAMetadataArgs metaArgs;
+    metaArgs = args;
+
+    ComputeFAMetadata<<<1, nullptr, aicpuStream>>>(&metaArgs, sizeof(metaArgs));
+    ACL_CHECK(aclrtSynchronizeStream(aicpuStream));
+    return meta;
 }
 
-uint32_t GetQSBlockTile(int64_t kvSeqlen)
-{
-    uint32_t qSBlockTile = Q_TILE_CEIL;
-    return qSBlockTile;
-}
 
-uint32_t GetKSBlockTile(uint32_t kvSeqlen)
-{
-    uint32_t kSBlockTile = MAX_KV_STACK_LEN;
-    return kSBlockTile;
-}
-
-struct BatchParams {
-    uint32_t qSeqlen;
-    uint32_t kvSeqlen;
-    uint32_t curQNBlockTile;
-    uint32_t qNBlockNumPerGroup;
-    uint32_t curQNBlockNum;
-    uint32_t curQSBlockTile;
-    uint32_t curQSBlockNum;
-    uint32_t curKSBlockTile;
-    uint32_t curKSBlockNum;
-};
-
-struct SplitContext {
-    int32_t batch_size;
-    int32_t num_heads;
-    int32_t num_heads_k;
-    int32_t seqlen_q;
-    int32_t head_size_v;
-    int32_t* cu_seqlen_q_cpu;
-    int32_t* seqlens_k_cpu;
-    bool is_varlen_q;
-    uint32_t blockDim;
-    int32_t num_splits;
-};
-
-BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx) {
-    BatchParams p;
-    if (ctx.is_varlen_q) {
-        p.qSeqlen = static_cast<uint32_t>(ctx.cu_seqlen_q_cpu[bIdx + 1] - ctx.cu_seqlen_q_cpu[bIdx]);
-    } else {
-        p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
-    }
-    p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx]);
-    p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
-    p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;
-    p.curQNBlockNum = p.qNBlockNumPerGroup * ctx.num_heads_k;
-    p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen);
-    p.curQSBlockNum = (p.qSeqlen + p.curQSBlockTile - 1) / p.curQSBlockTile;
-    p.curKSBlockTile = GetKSBlockTile(p.kvSeqlen);
-    p.curKSBlockNum = (p.kvSeqlen + p.curKSBlockTile - 1) / p.curKSBlockTile;
-    return p;
-}
-
-void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize,
-                                uint64_t perCoreTaskNum, const SplitContext& ctx) {
-    int32_t nowBIdx = 0;
-    int32_t nowN1Idx = 0;
-    int32_t nowS1Idx = 0;
-    int32_t nowS2Idx = 0;
-
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        tiling->coreInfo[coreIdx].startBIdx = 0;
-        tiling->coreInfo[coreIdx].startN1Idx = 0;
-        tiling->coreInfo[coreIdx].startS1Idx = 0;
-        tiling->coreInfo[coreIdx].startS2Idx = 0;
-        tiling->coreInfo[coreIdx].endBIdx = 0;
-        tiling->coreInfo[coreIdx].endN1Idx = 0;
-        tiling->coreInfo[coreIdx].endS1Idx = 0;
-        tiling->coreInfo[coreIdx].endS2Idx = 0;
-    }
-
-    auto finishBatch = [&](uint32_t coreIdx) {
-        BatchParams p = getBatchParams(ctx.batch_size - 1, groupSize, ctx);
-        tiling->coreInfo[coreIdx].endBIdx = ctx.batch_size - 1;
-        tiling->coreInfo[coreIdx].endN1Idx = p.curQNBlockNum - 1;
-        tiling->coreInfo[coreIdx].endS1Idx = p.curQSBlockNum - 1;
-        tiling->coreInfo[coreIdx].endS2Idx = p.curKSBlockNum;
-        tiling->set_needCoreNum(coreIdx + 1);
-    };
-
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        int32_t resTaskNum = static_cast<int32_t>(perCoreTaskNum);
-        tiling->coreInfo[coreIdx].startBIdx = nowBIdx;
-        tiling->coreInfo[coreIdx].startN1Idx = nowN1Idx;
-        tiling->coreInfo[coreIdx].startS1Idx = nowS1Idx;
-        tiling->coreInfo[coreIdx].startS2Idx = nowS2Idx;
-
-        BatchParams p = getBatchParams(nowBIdx, groupSize, ctx);
-
-        auto advanceCounters = [&]() {
-            if (nowS2Idx == static_cast<int32_t>(p.curKSBlockNum)) { nowS1Idx++; nowS2Idx = 0; }
-            if (nowS1Idx == static_cast<int32_t>(p.curQSBlockNum)) { nowN1Idx++; nowS1Idx = 0; nowS2Idx = 0; }
-            if (nowN1Idx == static_cast<int32_t>(p.curQNBlockNum)) { nowBIdx++; nowN1Idx = 0; nowS1Idx = 0; nowS2Idx = 0; }
-        };
-
-        while (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) && resTaskNum > 0) {
-            p = getBatchParams(nowBIdx, groupSize, ctx);
-            uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
-            uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
-                ? p.curKSBlockTile
-                : (p.kvSeqlen - nowS2Idx * p.curKSBlockTile);
-            uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
-            resTaskNum -= static_cast<int32_t>(singleS2Task);
-            nowS2Idx += 1;
-        }
-
-        if (resTaskNum <= 0) {
-            tiling->coreInfo[coreIdx].endBIdx = nowBIdx;
-            tiling->coreInfo[coreIdx].endN1Idx = nowN1Idx;
-            tiling->coreInfo[coreIdx].endS1Idx = nowS1Idx;
-            tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx;
-        }
-
-        advanceCounters();
-        if (nowBIdx < ctx.batch_size && resTaskNum <= 0) continue;
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
-
-        while (nowBIdx < ctx.batch_size && resTaskNum > 0) {
-            p = getBatchParams(nowBIdx, groupSize, ctx);
-            uint32_t remainingQ = p.qSeqlen * (ctx.num_heads - p.curQNBlockTile * nowN1Idx) - nowS1Idx * p.curQSBlockTile;
-            uint32_t remainingKV = p.kvSeqlen;
-            uint32_t remainingInBatch = remainingQ * remainingKV;
-
-            if (resTaskNum >= static_cast<int32_t>(remainingInBatch)) {
-                resTaskNum -= remainingInBatch;
-                nowBIdx++; nowN1Idx = 0; nowS1Idx = 0; nowS2Idx = 0;
-            } else {
-                break;
-            }
-        }
-
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
-        p = getBatchParams(nowBIdx, groupSize, ctx);
-
-        while (nowN1Idx < static_cast<int32_t>(p.curQNBlockNum) && resTaskNum > 0) {
-            uint32_t remainingQ = p.qSeqlen * p.curQNBlockTile - nowS1Idx * p.curQSBlockTile;
-            uint32_t remainingInN1 = remainingQ * p.kvSeqlen;
-            if (resTaskNum >= static_cast<int32_t>(remainingInN1)) {
-                resTaskNum -= remainingInN1;
-                nowN1Idx++; nowS1Idx = 0; nowS2Idx = 0;
-            } else {
-                break;
-            }
-        }
-
-        advanceCounters();
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
-        p = getBatchParams(nowBIdx, groupSize, ctx);
-
-        while (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) && resTaskNum > 0) {
-            uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
-            uint64_t remainingInS1 = static_cast<uint64_t>(remainingQ) * p.kvSeqlen;
-            if (resTaskNum >= static_cast<int64_t>(remainingInS1)) {
-                resTaskNum -= static_cast<int32_t>(remainingInS1);
-                nowS1Idx++; nowS2Idx = 0;
-            } else {
-                break;
-            }
-        }
-
-        advanceCounters();
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
-        p = getBatchParams(nowBIdx, groupSize, ctx);
-
-        while (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) && resTaskNum > 0) {
-            uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
-            uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
-                ? p.curKSBlockTile
-                : (p.kvSeqlen - nowS2Idx * p.curKSBlockTile);
-            uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
-            resTaskNum -= static_cast<int32_t>(singleS2Task);
-            nowS2Idx += 1;
-        }
-
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
-
-        tiling->coreInfo[coreIdx].endBIdx = nowBIdx;
-        tiling->coreInfo[coreIdx].endN1Idx = nowN1Idx;
-        tiling->coreInfo[coreIdx].endS1Idx = nowS1Idx;
-        tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx;
-
-        advanceCounters();
-    }
-}
-
-void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize,
-                                 const SplitContext& ctx) {
-    constexpr uint32_t SIZE_OF_32BIT = 4;
-
-    for (uint32_t splitIdx = 0; splitIdx < ctx.blockDim + 1; splitIdx++) {
-        tiling->splitInfo[splitIdx].batchIdx = 0;
-        tiling->splitInfo[splitIdx].headStartIdx = 0;
-        tiling->splitInfo[splitIdx].headEndIdx = 0;
-        tiling->splitInfo[splitIdx].qStartIdx = 0;
-        tiling->splitInfo[splitIdx].qEndIdx = 0;
-        tiling->splitInfo[splitIdx].splitNum = 0;
-        tiling->splitInfo[splitIdx].lseTaskOffset = 0;
-        tiling->splitInfo[splitIdx].oTaskOffset = 0;
-    }
-
-    int64_t currentLseTaskOffset = 0;
-    int64_t currentOTaskOffset = 0;
-    int32_t splitIdx = -1;
-    int32_t prevBIdx = -1;
-    int32_t prevN1Idx = -1;
-    int32_t prevS1Idx = -1;
-
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        int32_t startBIdx = tiling->coreInfo[coreIdx].startBIdx;
-        int32_t startN1Idx = tiling->coreInfo[coreIdx].startN1Idx;
-        int32_t startS1Idx = tiling->coreInfo[coreIdx].startS1Idx;
-        int32_t startS2Idx = tiling->coreInfo[coreIdx].startS2Idx;
-        int32_t endBIdx = tiling->coreInfo[coreIdx].endBIdx;
-        int32_t endN1Idx = tiling->coreInfo[coreIdx].endN1Idx;
-        int32_t endS1Idx = tiling->coreInfo[coreIdx].endS1Idx;
-        int32_t endS2Idx = tiling->coreInfo[coreIdx].endS2Idx;
-
-        tiling->coreInfo[coreIdx].firstSplitKVTaskLseOffset = 0;
-        tiling->coreInfo[coreIdx].firstSplitKVTaskOOffset = 0;
-
-        bool foundFirstSplitKV = false;
-        for (int BIdx = startBIdx; BIdx <= endBIdx; BIdx++) {
-            BatchParams p = getBatchParams(BIdx, groupSize, ctx);
-
-            int curStartN1 = (BIdx == startBIdx) ? startN1Idx : 0;
-            int curEndN1 = (BIdx == endBIdx) ? endN1Idx : static_cast<int>(p.curQNBlockNum) - 1;
-
-            for (int N1Idx = curStartN1; N1Idx <= curEndN1; N1Idx++) {
-                int curStartS1 = (BIdx == startBIdx && N1Idx == startN1Idx) ? startS1Idx : 0;
-                int curEndS1 = (BIdx == endBIdx && N1Idx == endN1Idx) ? endS1Idx : static_cast<int>(p.curQSBlockNum) - 1;
-
-                for (int S1Idx = curStartS1; S1Idx <= curEndS1; S1Idx++) {
-                    int curStartS2 = (BIdx == startBIdx && N1Idx == startN1Idx && S1Idx == startS1Idx) ? startS2Idx : 0;
-                    int curEndS2 = (BIdx == endBIdx && N1Idx == endN1Idx && S1Idx == endS1Idx) ? endS2Idx : static_cast<int>(p.curKSBlockNum);
-
-                    int coveredS2 = curEndS2 - curStartS2;
-                    bool isSplitKV = (coveredS2 > 0 && coveredS2 < static_cast<int>(p.curKSBlockNum));
-
-                    int64_t tmpLseOffset = currentLseTaskOffset;
-                    int64_t tmpOOffset = currentOTaskOffset;
-
-                    uint32_t N1IdxPerGroup = N1Idx % p.qNBlockNumPerGroup;
-                    uint32_t kvHeadIdx = N1Idx / p.qNBlockNumPerGroup;
-                    uint32_t currentHeadStart = kvHeadIdx * groupSize + N1IdxPerGroup * p.curQNBlockTile;
-                    uint32_t currentHeadEnd = std::min(currentHeadStart + p.curQNBlockTile, (kvHeadIdx + 1) * groupSize);
-
-                    uint32_t currentQStart = S1Idx * p.curQSBlockTile;
-                    uint32_t currentQEnd = std::min(currentQStart + p.curQSBlockTile, p.qSeqlen);
-
-                    uint32_t headLen = currentHeadEnd - currentHeadStart;
-                    uint32_t qLen = currentQEnd - currentQStart;
-
-                    if (isSplitKV) {
-                        if (BIdx != prevBIdx || N1Idx != prevN1Idx || S1Idx != prevS1Idx) {
-                            splitIdx++;
-                            if (splitIdx < static_cast<int32_t>(ctx.blockDim) + 1) {
-                                tiling->splitInfo[splitIdx].batchIdx = BIdx;
-                                tiling->splitInfo[splitIdx].splitNum = 0;
-                                tiling->splitInfo[splitIdx].headStartIdx = currentHeadStart;
-                                tiling->splitInfo[splitIdx].headEndIdx = currentHeadEnd;
-                                tiling->splitInfo[splitIdx].qStartIdx = currentQStart;
-                                tiling->splitInfo[splitIdx].qEndIdx = currentQEnd;
-                                tiling->splitInfo[splitIdx].lseTaskOffset = currentLseTaskOffset;
-                                tiling->splitInfo[splitIdx].oTaskOffset = currentOTaskOffset;
-                            }
-                            prevBIdx = BIdx;
-                            prevN1Idx = N1Idx;
-                            prevS1Idx = S1Idx;
-                        }
-                        if (splitIdx >= 0 && splitIdx < static_cast<int32_t>(ctx.blockDim) + 1) {
-                            tiling->splitInfo[splitIdx].splitNum++;
-                            currentLseTaskOffset += static_cast<int64_t>(headLen) * qLen;
-                            currentOTaskOffset += static_cast<int64_t>(headLen) * qLen * ctx.head_size_v;
-                        }
-
-                        if (!foundFirstSplitKV) {
-                            foundFirstSplitKV = true;
-                            tiling->coreInfo[coreIdx].firstSplitKVTaskLseOffset = tmpLseOffset;
-                            tiling->coreInfo[coreIdx].firstSplitKVTaskOOffset = tmpOOffset;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    uint32_t actualSplitNum = (splitIdx + 1 > static_cast<int32_t>(ctx.blockDim))
-        ? ctx.blockDim : static_cast<uint32_t>(splitIdx + 1);
-    tiling->set_totalSplitNodeNum(actualSplitNum);
-    tiling->set_splitLseTotalSize(currentLseTaskOffset * SIZE_OF_32BIT);
-    tiling->set_splitOTotalSize(currentOTaskOffset * SIZE_OF_32BIT);
-}
-uint32_t countForceSplitSegments(uint32_t groupSize, const SplitContext& ctx) {
-    uint32_t totalSegs = 0;
-    uint32_t nsplit = static_cast<uint32_t>(ctx.num_splits);
-    for (int32_t b = 0; b < ctx.batch_size; b++) {
-        BatchParams p = getBatchParams(b, groupSize, ctx);
-        uint32_t curKSBlockNum = p.curKSBlockNum;
-        if (curKSBlockNum == 0) { continue; }
-        uint32_t blocksPerSplit = (curKSBlockNum + nsplit - 1) / nsplit;
-        if (blocksPerSplit == 0) { blocksPerSplit = 1; }
-        uint32_t actualSplits = (curKSBlockNum + blocksPerSplit - 1) / blocksPerSplit;
-        totalSegs += p.curQNBlockNum * p.curQSBlockNum * actualSplits;
-    }
-    return totalSegs;
-}
-
-void fillCoreInfoForceSplit(FAInferTilingData* tiling, uint32_t groupSize,
-                            const SplitContext& ctx) {
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        tiling->coreInfo[coreIdx].startBIdx = 0;
-        tiling->coreInfo[coreIdx].startN1Idx = 0;
-        tiling->coreInfo[coreIdx].startS1Idx = 0;
-        tiling->coreInfo[coreIdx].startS2Idx = 0;
-        tiling->coreInfo[coreIdx].endBIdx = 0;
-        tiling->coreInfo[coreIdx].endN1Idx = 0;
-        tiling->coreInfo[coreIdx].endS1Idx = 0;
-        tiling->coreInfo[coreIdx].endS2Idx = 0;
-    }
-
-    uint32_t nsplit = static_cast<uint32_t>(ctx.num_splits);
-    uint32_t coreIdx = 0;
-    for (int32_t b = 0; b < ctx.batch_size; b++) {
-        BatchParams p = getBatchParams(b, groupSize, ctx);
-        uint32_t curKSBlockNum = p.curKSBlockNum;
-        if (curKSBlockNum == 0) { continue; }
-        uint32_t blocksPerSplit = (curKSBlockNum + nsplit - 1) / nsplit;
-        if (blocksPerSplit == 0) { blocksPerSplit = 1; }
-        for (uint32_t n1 = 0; n1 < p.curQNBlockNum; n1++) {
-            for (uint32_t s1 = 0; s1 < p.curQSBlockNum; s1++) {
-                for (uint32_t segStart = 0; segStart < curKSBlockNum; segStart += blocksPerSplit) {
-                    uint32_t segEnd = std::min(segStart + blocksPerSplit, curKSBlockNum);
-                    if (coreIdx >= ctx.blockDim) { break; }
-                    tiling->coreInfo[coreIdx].startBIdx = b;
-                    tiling->coreInfo[coreIdx].endBIdx = b;
-                    tiling->coreInfo[coreIdx].startN1Idx = static_cast<int>(n1);
-                    tiling->coreInfo[coreIdx].endN1Idx = static_cast<int>(n1);
-                    tiling->coreInfo[coreIdx].startS1Idx = static_cast<int>(s1);
-                    tiling->coreInfo[coreIdx].endS1Idx = static_cast<int>(s1);
-                    tiling->coreInfo[coreIdx].startS2Idx = static_cast<int>(segStart);
-                    tiling->coreInfo[coreIdx].endS2Idx = static_cast<int>(segEnd);
-                    coreIdx++;
-                }
-            }
-        }
-    }
-    tiling->set_needCoreNum(coreIdx);
-}
-
-void fillCoreInfoNoSplit(FAInferTilingData* tiling, uint32_t groupSize,
-                         const SplitContext& ctx) {
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        tiling->coreInfo[coreIdx].startBIdx = 0;
-        tiling->coreInfo[coreIdx].startN1Idx = 0;
-        tiling->coreInfo[coreIdx].startS1Idx = 0;
-        tiling->coreInfo[coreIdx].startS2Idx = 0;
-        tiling->coreInfo[coreIdx].endBIdx = 0;
-        tiling->coreInfo[coreIdx].endN1Idx = 0;
-        tiling->coreInfo[coreIdx].endS1Idx = 0;
-        tiling->coreInfo[coreIdx].endS2Idx = 0;
-    }
-
-    uint32_t totalTasks = 0;
-    for (int32_t b = 0; b < ctx.batch_size; b++) {
-        BatchParams p = getBatchParams(b, groupSize, ctx);
-        totalTasks += p.curQNBlockNum * p.curQSBlockNum;
-    }
-    if (totalTasks == 0) { tiling->set_needCoreNum(0); return; }
-
-    uint32_t tasksPerCore = (totalTasks + ctx.blockDim - 1) / ctx.blockDim;
-
-    auto locate = [&](uint32_t gidx, int32_t& B, int32_t& N1, int32_t& S1, uint32_t& ksBlk) {
-        uint32_t acc = 0;
-        for (int32_t b = 0; b < ctx.batch_size; b++) {
-            BatchParams p = getBatchParams(b, groupSize, ctx);
-            uint32_t cnt = p.curQNBlockNum * p.curQSBlockNum;
-            if (cnt == 0) { continue; }
-            if (gidx < acc + cnt) {
-                uint32_t local = gidx - acc;
-                B = b;
-                N1 = static_cast<int32_t>(local / p.curQSBlockNum);
-                S1 = static_cast<int32_t>(local % p.curQSBlockNum);
-                ksBlk = p.curKSBlockNum;
-                return;
-            }
-            acc += cnt;
-        }
-        B = ctx.batch_size - 1;
-        BatchParams p = getBatchParams(B, groupSize, ctx);
-        N1 = static_cast<int32_t>(p.curQNBlockNum) - 1;
-        S1 = static_cast<int32_t>(p.curQSBlockNum) - 1;
-        ksBlk = p.curKSBlockNum;
-    };
-
-    uint32_t usedCores = 0;
-    for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
-        uint32_t taskLo = coreIdx * tasksPerCore;
-        if (taskLo >= totalTasks) { break; }
-        uint32_t taskHi = std::min(taskLo + tasksPerCore, totalTasks);
-
-        int32_t b0, n0, s0; uint32_t ks0;
-        int32_t b1, n1, s1; uint32_t ks1;
-        locate(taskLo, b0, n0, s0, ks0);
-        locate(taskHi - 1, b1, n1, s1, ks1);
-
-        tiling->coreInfo[coreIdx].startBIdx = b0;
-        tiling->coreInfo[coreIdx].startN1Idx = n0;
-        tiling->coreInfo[coreIdx].startS1Idx = s0;
-        tiling->coreInfo[coreIdx].startS2Idx = 0;                         // whole-KV start
-        tiling->coreInfo[coreIdx].endBIdx = b1;
-        tiling->coreInfo[coreIdx].endN1Idx = n1;
-        tiling->coreInfo[coreIdx].endS1Idx = s1;
-        tiling->coreInfo[coreIdx].endS2Idx = static_cast<int32_t>(ks1);   // whole-KV end -> no split
-        usedCores = coreIdx + 1;
-    }
-    tiling->set_needCoreNum(usedCores);
-}
-
-void splitBN2S1GS2(FAInferTilingData* tiling, const SplitContext& ctx) {
-    uint64_t totalTaskNum = 0;
-    uint32_t groupSize = ctx.num_heads / ctx.num_heads_k;
-
-    //   num_splits==1 -> each task is one whole-KV segment (no split, see below).
-    //   num_splits>1  -> each task's KV is actively split into num_splits segments.
-    if (ctx.num_splits >= 1) {
-        uint32_t totalSegs = countForceSplitSegments(groupSize, ctx);
-        uint32_t coreCap = std::min(ctx.blockDim, static_cast<uint32_t>(25));
-        if (totalSegs > 0 && totalSegs <= coreCap) {
-            // Fits one-segment-per-core. For num_splits==1, blocksPerSplit==curKSBlockNum,
-            // so each task is a single whole-KV segment -> isSplitKV=false -> not split.
-            fillCoreInfoForceSplit(tiling, groupSize, ctx);
-            fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
-            return;
-        }
-        if (ctx.num_splits == 1) {
-            // Tasks exceed cores: a core must serially handle multiple tasks. Use the
-            // whole-task layout so NO task's KV is ever split (the guarantee num_splits==1
-            // must hold even when #tasks > #cores).
-            fillCoreInfoNoSplit(tiling, groupSize, ctx);
-            fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
-            return;
-        }
-    }
-
-    // num_splits==0 (auto), or num_splits>1 overflow: default core-balanced split.
-    for (int32_t batchIdx = 0; batchIdx < ctx.batch_size; batchIdx++) {
-        BatchParams p = getBatchParams(batchIdx, groupSize, ctx);
-        totalTaskNum += static_cast<uint64_t>(ctx.num_heads) * p.qSeqlen * p.kvSeqlen;
-    }
-    uint64_t perCoreTaskNum = (totalTaskNum + ctx.blockDim - 1) / ctx.blockDim;
-    fillCoreInfoForFlashDecode(tiling, groupSize, perCoreTaskNum, ctx);
-    fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
-}
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
@@ -542,10 +94,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor k must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor v must have contiguous last dimension");
-    at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
-
-    FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
-    std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t launchBlockDim = blockDim;
     at::Tensor seqlens_k, block_table, out;
@@ -595,7 +143,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left");
     TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right");
     TORCH_CHECK(attention_chunk == 0, "NPU FlashAttention does not support attention_chunk");
-    TORCH_CHECK(!scheduler_metadata_.has_value(), "NPU FlashAttention does not support scheduler_metadata");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "NPU FlashAttention supports num_splits in [0, ", blockDim,
                 "] (0 = auto; upper bound = number of AI cores). ");
@@ -671,132 +218,170 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
     }
 
-    at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
-    int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
-    int32_t* cu_seqlen_q_cpu = nullptr;
-    at::Tensor cu_seqlen_q_cpu_tensor;
-    if (is_varlen_q) {
-        cu_seqlen_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
-        cu_seqlen_q_cpu = static_cast<int32_t *>(cu_seqlen_q_cpu_tensor.data_ptr());
-    }
-    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
-    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
-    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
-    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
-    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
-    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
-    tiling_cpu_ptr->set_scaleValue(softmax_scale);
-    tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
-    int32_t max_kv_seqlen = 0;
-    for (int32_t i = 0; i < batch_size; i++) {
-        max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
-    }
-    tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
+    at::Tensor workspace_tensor;
+    at::Tensor mask_gpu_tensor;
+    at::Tensor tiling_gpu_tensor;
+    uint8_t *tilingDevice = nullptr;
+    uint8_t *maskDevice = nullptr;
+    bool flashDecodeFlag = false;
 
-    uint32_t totalTaskNum = 0;
-    uint32_t groupSize = num_heads / num_heads_k;
-    for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-        uint64_t qSeqlen = seqlen_q;
-        if (is_varlen_q) {
-            qSeqlen = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
-        }
-        uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
-        uint64_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
-        uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-        uint64_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
-        uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
-        if (batchIdx == 0) {
-            tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
-        }
-        totalTaskNum += curTaskNum;
-    }
-    tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
-
-    int64_t maxQSeqlenCalc = 0;
-    int64_t minQSeqlenCalc = std::numeric_limits<int64_t>::max();
-    int64_t maxKVSeqlenCalc = 0;
-    for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-        int64_t qSeqlenVal = seqlen_q;
-        int64_t kvSeqlenVal = *(seqlens_k_cpu + batchIdx);
-        if (is_varlen_q) {
-            qSeqlenVal = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
-            if (is_varlen_kv) {
-                kvSeqlenVal = *(seqlens_k_cpu + batchIdx + 1) - *(seqlens_k_cpu + batchIdx);
-            }
-        }
-        maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
-        minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
-        maxKVSeqlenCalc = std::max(maxKVSeqlenCalc, kvSeqlenVal);
-    }
-    uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
-    bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
-        (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
-    bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
-        (maxKVSeqlenCalc >= 1024);
-    TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
-                "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
-    bool flashDecodeFlag = paged_KV && is_varlen_q &&
-        (maxQSeqlenCalc * groupSize <= 128) && (maxQSeqlenCalc <= 16) &&
-        (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) && (isLongSeq || isShortSeq);
-
-    SplitContext splitCtx;
-    splitCtx.batch_size = batch_size;
-    splitCtx.num_heads = num_heads;
-    splitCtx.num_heads_k = num_heads_k;
-    splitCtx.seqlen_q = seqlen_q;
-    splitCtx.head_size_v = head_size_og;
-    splitCtx.cu_seqlen_q_cpu = cu_seqlen_q_cpu;
-    splitCtx.seqlens_k_cpu = seqlens_k_cpu;
-    splitCtx.is_varlen_q = is_varlen_q;
-    splitCtx.blockDim = blockDim;
-    splitCtx.num_splits = static_cast<int32_t>(num_splits);
-    tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
-    if (flashDecodeFlag) {
-        splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
-        auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
-        if (needCoreNum != 0) {
-            launchBlockDim = needCoreNum;
-        }
-    }
-
-    uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-    uint64_t PRELANCH_NUM = 3;
-    uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        2 * PRELANCH_NUM;
-    uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
-    uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
-    int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize
-        + UpdateSize + splitLseTotalSize + splitOTotalSize);
-
-    at::Tensor workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
     at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
-    tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
-    tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
-    tiling_cpu_ptr->set_UpdateSize(UpdateSize);
-    tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
-    at::Tensor mask_gpu_tensor;
-    if (is_causal) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+
+    if (scheduler_metadata_.has_value()) {
+        TORCH_CHECK(c10_npu::npuSynchronizeDevice(), "c10_npu::npuSynchronizeDevice failed");
+        auto schedMd = scheduler_metadata_.value();
+        TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
+        TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
+        TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1, "scheduler_metadata must be an NPU tensor");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(is_causal),
+                    "scheduler_metadata buffer is too small for this call's causal flag");
+        auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
+        tilingDevice = metaBase + fa_metadata::TilingOffset(is_causal);
+        maskDevice = is_causal ? metaBase : nullptr;
+        int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
+        int64_t wsSplit = 0;
+        if (paged_KV && is_varlen_q) {
+            int64_t maxKvUpper = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
+            int64_t kvSegUpper = maxKvUpper / 512 + 1;
+            int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
+            wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
+        }
+        workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        launchBlockDim = blockDim;
+    } else {
+        at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
+        FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
+        std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
+
+        at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
+        int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
+        int32_t* cu_seqlen_q_cpu = nullptr;
+        at::Tensor cu_seqlen_q_cpu_tensor;
+        if (is_varlen_q) {
+            cu_seqlen_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
+            cu_seqlen_q_cpu = static_cast<int32_t *>(cu_seqlen_q_cpu_tensor.data_ptr());
+        }
+        tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
+        tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
+        tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
+        tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
+        tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
+        tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
+        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+        int32_t max_kv_seqlen = 0;
+        for (int32_t i = 0; i < batch_size; i++) {
+            max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
+        }
+        tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
+
+        uint32_t totalTaskNum = 0;
+        uint32_t groupSize = num_heads / num_heads_k;
+        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+            uint64_t qSeqlen = seqlen_q;
+            if (is_varlen_q) {
+                qSeqlen = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
+            }
+            uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
+            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (batchIdx == 0) {
+                tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+            }
+            totalTaskNum += curTaskNum;
+        }
+        tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
+
+        int64_t maxQSeqlenCalc = 0;
+        int64_t minQSeqlenCalc = std::numeric_limits<int64_t>::max();
+        int64_t maxKVSeqlenCalc = 0;
+        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+            int64_t qSeqlenVal = seqlen_q;
+            int64_t kvSeqlenVal = *(seqlens_k_cpu + batchIdx);
+            if (is_varlen_q) {
+                qSeqlenVal = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
+                if (is_varlen_kv) {
+                    kvSeqlenVal = *(seqlens_k_cpu + batchIdx + 1) - *(seqlens_k_cpu + batchIdx);
+                }
+            }
+            maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
+            minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
+            maxKVSeqlenCalc = std::max(maxKVSeqlenCalc, kvSeqlenVal);
+        }
+        uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
+        bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
+            (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
+        bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
+            (maxKVSeqlenCalc >= 1024);
+        TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
+                    "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
+        flashDecodeFlag = paged_KV && is_varlen_q &&
+            (maxQSeqlenCalc * groupSize <= 128) && (maxQSeqlenCalc <= 16) &&
+            (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) && (isLongSeq || isShortSeq);
+        tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
+        tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
+
+        fa_split::SplitContext splitCtx;
+        splitCtx.batch_size = batch_size;
+        splitCtx.num_heads = num_heads;
+        splitCtx.num_heads_k = num_heads_k;
+        splitCtx.seqlen_q = seqlen_q;
+        splitCtx.head_size_v = head_size_og;
+        splitCtx.cu_seqlen_q_cpu = cu_seqlen_q_cpu;
+        splitCtx.seqlens_k_cpu = seqlens_k_cpu;
+        splitCtx.is_varlen_q = is_varlen_q;
+        splitCtx.blockDim = blockDim;
+        splitCtx.num_splits = static_cast<int32_t>(num_splits);
+        if (flashDecodeFlag) {
+            fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
+            auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
+            if (needCoreNum != 0) {
+                launchBlockDim = needCoreNum;
+            }
+        }
+
+        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
+        uint64_t PRELANCH_NUM = 3;
+        uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            2 * PRELANCH_NUM;
+        uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
+        uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
+        int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize
+            + UpdateSize + splitLseTotalSize + splitOTotalSize);
+
+        workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
+        tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
+        tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
+        tiling_cpu_ptr->set_UpdateSize(UpdateSize);
+        tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+        if (is_causal) {
+            at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+            mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        }
+        tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
+        maskDevice = is_causal ? static_cast<uint8_t *>(mask_gpu_tensor.data_ptr()) : nullptr;
     }
-    at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+
     at::Tensor seqlenk_gpu_tensor;
     at::Tensor seqlenq_gpu_tensor;
     if (is_varlen_q) {
@@ -816,72 +401,55 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     auto kDevice = static_cast<uint8_t *>(k.data_ptr());
     auto vDevice = static_cast<uint8_t *>(v.data_ptr());
     uint8_t * blockTableDevice = nullptr;
-    uint8_t * maskDevice = nullptr;
     if (paged_KV) {
         blockTableDevice = static_cast<uint8_t *>(block_table.data_ptr());
-    }
-    if (is_causal) {
-        maskDevice = static_cast<uint8_t *>(mask_gpu_tensor.data_ptr());
     }
     auto oDevice = static_cast<uint8_t *>(out.data_ptr());
     auto qSeqDevice = static_cast<uint8_t *>(seqlenq_gpu_tensor.data_ptr());
     auto kvSeqDevice = static_cast<uint8_t *>(seqlenk_gpu_tensor.data_ptr());
     auto workspaceDevice = static_cast<uint8_t *>(workspace_tensor.data_ptr());
-    auto tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
     auto softmaxLseDevice = static_cast<uint8_t *>(softmaxlse.data_ptr());
     if (is_bf16) {
         if (paged_KV) {
             if (is_causal) {
                 if (is_varlen_q) {
-                    if (flashDecodeFlag) {
-                        SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
-                if (is_varlen_q) { 
-                    if (flashDecodeFlag) {
-                        SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }
         } else {
             if (is_causal) {
-                if (is_varlen_q) { 
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
-                if (is_varlen_q) { 
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
@@ -890,56 +458,44 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     } else {
         if (paged_KV) {
             if (is_causal) {
-                if (is_varlen_q) { 
-                    if (flashDecodeFlag) {
-                        SplitFuse::FAInfer<half, half, float, true, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<half, half, float, true, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
                 } else {
-                    SplitFuse::FAInfer<half, half, float, true, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
-                if (is_varlen_q) { 
-                    if (flashDecodeFlag) {
-                        SplitFuse::FAInfer<half, half, float, true, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<half, half, float, true, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
                 } else {
-                    SplitFuse::FAInfer<half, half, float, true, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             }
         } else {
             if (is_causal) {
-                if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, false, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, false, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
             } else {
-                if (is_varlen_q) { 
-                    SplitFuse::FAInfer<half, half, float, false, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                if (is_varlen_q) {
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::TND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 } else {
-                    SplitFuse::FAInfer<half, half, float, false, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
+                    SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<launchBlockDim, nullptr, aclStream>>>(
                             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
                             qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
                 }
@@ -947,6 +503,73 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
     }
     return {out, softmaxlse, out_accum, softmax_lse_accum};
+}
+
+at::Tensor get_scheduler_metadata(
+        int64_t batch_size,
+        int64_t max_seqlen_q,
+        int64_t max_seqlen_k,
+        int64_t num_heads_q,
+        int64_t num_heads_kv,
+        int64_t headdim,
+        int64_t headdim_v,
+        pybind11::object qkv_dtype,
+        at::Tensor cache_seqlens,
+        std::optional<at::Tensor> cu_seqlens_q,
+        std::optional<at::Tensor> cu_seqlens_k,
+        std::optional<at::Tensor> cu_seqlens_k_new,
+        std::optional<at::Tensor> seqused_q,
+        std::optional<at::Tensor> cache_leftpad,
+        std::optional<int64_t> page_size,
+        int64_t max_seqlen_k_new,
+        bool causal,
+        int64_t window_size_left,
+        int64_t window_size_right,
+        int64_t attention_chunk,
+        bool has_softcap,
+        int64_t num_splits,
+        std::optional<bool> pack_gqa,
+        int64_t sm_margin)
+{
+    const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
+    const bool is_varlen_q = cu_seqlens_q.has_value();
+    void *cuSeqlensQDev = nullptr;
+    if (is_varlen_q) {
+        auto cu_q = cu_seqlens_q.value();
+        TORCH_CHECK(cu_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+        cuSeqlensQDev = cu_q.data_ptr();
+    }
+    TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
+    const bool is_varlen_kv = cu_seqlens_k.has_value();
+    const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
+    const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
+                "NPU FlashAttention supports num_splits in [0, ", blockDim,
+                "] (0 = auto; upper bound = number of AI cores). ");
+    TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && is_varlen_q),
+                "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
+    FAMetadataArgs args;
+    args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cuSeqlensQDev) : 0ULL;
+    args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
+    args.metaOutAddr = 0;  // set by GetSchedulerMetadataImpl
+    args.batch = static_cast<uint32_t>(batch_size);
+    args.numHeads = static_cast<uint32_t>(num_heads_q);
+    args.numHeadsK = static_cast<uint32_t>(num_heads_kv);
+    args.embeddingSize = static_cast<uint32_t>(headdim);
+    args.embeddingSizeV = static_cast<uint32_t>(headdim_v);
+    args.numBlocks = 0;
+    args.blockSize = ps;
+    args.maxNumBlocksPerBatch = page_size.has_value()
+        ? ((static_cast<uint32_t>(max_seqlen_k) + ps - 1) / ps) : 0;
+    args.maxQSeqlen = static_cast<uint32_t>(max_seqlen_q);
+    args.maskType = causal ? 1U : 0U;
+    args.blockDim = blockDim;
+    args.isVarlen = is_varlen_q ? 1U : 0U;
+    args.isVarlenKv = is_varlen_kv ? 1U : 0U;
+    args.pagedKV = page_size.has_value() ? 1U : 0U;
+    args.numSplits = static_cast<uint32_t>(num_splits);
+    args.scaleValue = 1.0f / std::sqrt(static_cast<float>(headdim));
+    return GetSchedulerMetadataImpl(args);
 }
 
 std::vector<at::Tensor>
@@ -1462,4 +1085,5 @@ PYBIND11_MODULE(flash_attn_npu_3, m)
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");
     m.def("bwd", &mha_bwd, "Backward pass");
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling + mask) on AICPU");
 }

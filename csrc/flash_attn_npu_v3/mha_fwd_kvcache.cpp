@@ -38,8 +38,7 @@ namespace SplitFuse {
         bool PAGED_CACHE_FLAG,
         FaiKenel::MaskType MASK_TYPE = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout INPUT_LAYOUT = FaiKenel::inputLayout::BSND,
-        class CombineScale = void,
-        bool IS_FD = false>
+        class CombineScale = void>
     class FAInferKernel {
     public:
         using ArchTag = typename BlockMmadQK::ArchTag;
@@ -114,11 +113,12 @@ namespace SplitFuse {
             maskType = fATilingData->maskType;
             scaleValue = fATilingData->scaleValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
+            flashDecodeFlag = fATilingData->flashDecodeFlag;
 
             // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
             uint64_t Lsesize = 0;
             uint64_t Losize = 0;
-            if constexpr (IS_FD) {
+            if (flashDecodeFlag != 0U) {
                 Lsesize = fATilingData->splitLseTotalSize;
                 Losize = fATilingData->splitOTotalSize;
             }
@@ -144,7 +144,7 @@ namespace SplitFuse {
 
             AscendC::GlobalTensor<ElementLse> gLseFD;
             AscendC::GlobalTensor<ElementLse> gOFD;
-            if constexpr (IS_FD) {
+            if (flashDecodeFlag != 0U) {
                 gLseFD.SetGlobalBuffer((__gm__ ElementLse *)(params.workSpace));
                 gOFD.SetGlobalBuffer((__gm__ ElementLse *)(params.workSpace + Lsesize));
             }
@@ -239,7 +239,7 @@ namespace SplitFuse {
                 totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));
             }
 
-            if constexpr (IS_FD) {
+            if (flashDecodeFlag != 0U) {
                 uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
                 uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
                 uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
@@ -401,7 +401,7 @@ namespace SplitFuse {
 #endif
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            if constexpr (IS_FD) {
+            if (flashDecodeFlag != 0U) {
                 AscendC::SyncAll();
 #ifdef __DAV_C220_VEC__
                 CombineScale combineScale;
@@ -543,7 +543,7 @@ namespace SplitFuse {
 
             uint32_t kvStart = 0;
             uint32_t kvEnd = kvSLoopNumTotal;
-            if constexpr (IS_FD) {
+            if (flashDecodeFlag != 0U) {
                 kvStart = (uint32_t)stS2IdxNow;
                 kvEnd = (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) ?
                     kvSLoopNumTotal : (uint32_t)enS2IdxNow;
@@ -619,7 +619,7 @@ namespace SplitFuse {
                         uint32_t triDown = noSkipKvS;
                         bool doTriUMask = triUp < kvSEndIdx - 1;
                         if (doTriUMask) {
-                            if constexpr (IS_FD) {
+                            if (flashDecodeFlag != 0U) {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -662,7 +662,7 @@ namespace SplitFuse {
                             uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
                             Arch::CrossCoreWaitFlag(qkReady);
                             int32_t lastNoMaskStackId;
-                            if constexpr (IS_FD) {
+                            if (flashDecodeFlag != 0U) {
                                 lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
@@ -693,7 +693,7 @@ namespace SplitFuse {
                         }
                     } else {
                         Arch::CrossCoreWaitFlag(qkReady);
-                        if constexpr (IS_FD) {
+                        if (flashDecodeFlag != 0U) {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
@@ -786,7 +786,7 @@ namespace SplitFuse {
                     uint64_t gmOffsetUpdate = (uint64_t)(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
                     Arch::CrossCoreWaitFlag(pvReady);
 
-                    if constexpr (IS_FD) {
+                    if (flashDecodeFlag != 0U) {
                         LayoutLse layoutgmLse(qSBlockSize, qNBlockSize);
                         LayoutLse layoutgmLo(qSBlockSize, embed * qNBlockSize);
                         typename EpilogueRescaleO::SplitKVParams splitParams;
@@ -853,6 +853,7 @@ namespace SplitFuse {
         float    scaleValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
+        uint32_t flashDecodeFlag;
 
         uint64_t strideQ;
         uint64_t strideO;
@@ -880,7 +881,6 @@ namespace SplitFuse {
         typename InputDtypeKv = half,
         typename IntermCalcPrec = float,
         bool PagedCacheFlag = false,
-        bool IS_FD = false,
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
         Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
@@ -953,14 +953,11 @@ namespace SplitFuse {
             Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, OType, OTmpType, OUpdateType, LseType>;
 
 
-        using SplitInfoType = std::conditional_t<IS_FD, splitNode[25], void>;
-        using CombineScale = std::conditional_t<IS_FD,
-            Epilogue::Block::CombineScale<OType, LseType, SplitInfoType>, void>;
-        using FAInferKernelType = std::conditional_t<IS_FD,
+        using SplitInfoType = splitNode[25];
+        using CombineScale = Epilogue::Block::CombineScale<OType, LseType, SplitInfoType>;
+        using FAInferKernelType =
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
-                          PagedCacheFlag, maskCategory, inLayout, CombineScale, IS_FD>,
-            FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
-                          PagedCacheFlag, maskCategory, inLayout>>;
+                          PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
         FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
         FAInferKernelType flashAttnInfer;

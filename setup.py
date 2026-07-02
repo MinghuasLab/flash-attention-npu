@@ -107,6 +107,48 @@ class BishengBuildExt(build_ext):
         torch_abi = torch._C._GLIBCXX_USE_CXX11_ABI
         abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
 
+        aicpu_objects = []
+        if ext.name == "flash_attn_npu_3":
+            v3_dir = os.path.join(this_dir, "csrc", "flash_attn_npu_v3")
+            aicpu_src = os.path.join(v3_dir, "fa_metadata.aicpu")
+            aicpu_obj = os.path.join(os.path.dirname(ext_fullpath), "fa_metadata.o")
+            aicpu_inc = os.path.join(ascend_home, "aarch64-linux/asc/include/aicpu_api")
+            aicpu_lib = os.path.join(ascend_home, "aarch64-linux/lib64/device/lib64")
+            hcc = os.path.join(ascend_home, "toolkit/toolchain/hcc")
+            hcc_isys = os.path.join(hcc, "aarch64-target-linux-gnu/include")
+            hcc_cpp = os.path.join(hcc_isys, "c++/7.3.0")
+            aicpu_cmd = [
+                "bisheng",
+                "-O2",
+                "-std=c++17",
+                "-fvisibility=default",
+                "-fvisibility-inlines-hidden",
+                "-D_GLIBCXX_USE_CXX11_ABI=0",
+                "-D_FORTIFY_SOURCE=2",
+                "-D_GNU_SOURCE",
+                f"-I{aicpu_inc}",
+                f"-I{v3_dir}",  # tilingdata.h
+                f"--cce-aicpu-L{aicpu_lib}",
+                "--cce-aicpu-laicpu_api",
+                f"--cce-aicpu-toolkit-path={os.path.join(hcc, 'bin')}",
+                f"--cce-aicpu-sysroot={os.path.join(hcc, 'sysroot')}",
+                "-isystem", hcc_isys,
+                "-isystem", hcc_cpp,
+                "-isystem", os.path.join(hcc_cpp, "aarch64-target-linux-gnu"),
+                "-isystem", os.path.join(hcc_cpp, "backward"),
+                "-c",
+                "-o", aicpu_obj,
+                "-x", "aicpu", aicpu_src,
+            ]
+            print(" ".join(aicpu_cmd))
+            try:
+                result = subprocess.run(aicpu_cmd, capture_output=True, text=True, check=True)
+                print(f"AICPU compilation successful! output: {result.stdout}")
+            except subprocess.CalledProcessError as e:
+                print(f"AICPU compilation failed! Error output: {e.stderr}")
+                raise e
+            aicpu_objects.append(aicpu_obj)
+
         compile_cmd = [
             "bisheng",
             "-O2",
@@ -142,6 +184,7 @@ class BishengBuildExt(build_ext):
             "-ltiling_api",
             "-lplatform",
             *ext.sources,
+            *(["-x", "none", *aicpu_objects] if aicpu_objects else []),
             "-o", ext_fullpath,
         ]
 
