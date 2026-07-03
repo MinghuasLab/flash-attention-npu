@@ -54,6 +54,7 @@ public:
     static constexpr uint32_t FLOAT_ELENUM_PER_LINE = 128;
     static constexpr uint32_t MULTIPLIER = 2;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
+    static constexpr float LSE_OUT_INI = std::numeric_limits<float>::infinity();
     static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
     static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
@@ -120,6 +121,60 @@ public:
             AscendC::SetVectorMask<int8_t>(mask, (uint64_t)-1);
         } else {
             AscendC::SetVectorMask<int8_t>(0x0, mask);
+        }
+    }
+
+    __aicore__ inline
+    void InvalidLineLSEProcess(
+        uint32_t qNThisSubBlock, int32_t delStartRow, uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
+        uint32_t totalRowNum, int32_t delEndRow, uint32_t qSeqlen, uint32_t qSThisSubBlock)
+    {
+        uint32_t qNSubBlockStartOffset = qNThisSubBlock == 0U ? qSBlockIdx * VECTOR_SIZE + inRowOffsetThisSubBlock : qSBlockIdx * VECTOR_SIZE;
+        uint32_t qNSubBlockEnbdOffset = totalRowNum + qNSubBlockStartOffset;
+        if (qNThisSubBlock == 0U && delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow) {
+            uint32_t start = qNSubBlockStartOffset > delStartRow ? 0 : (delStartRow - qNSubBlockStartOffset);
+            uint32_t end = totalRowNum;
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(
+                tvUbTensor[start * FLOAT_BLOCK_SIZE],
+                LSE_OUT_INI,
+                (end - start) * FLOAT_BLOCK_SIZE
+            );
+        }
+        if (qNThisSubBlock == 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
+            uint32_t rowStart = qNSubBlockStartOffset;
+            uint32_t start = 0;
+            uint32_t end = rowStart + totalRowNum >= delEndRow ? (delEndRow - rowStart) : totalRowNum;
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(
+                tvUbTensor[start * FLOAT_BLOCK_SIZE],
+                LSE_OUT_INI,
+                (end - start) * FLOAT_BLOCK_SIZE
+            );
+        }
+        if (qNThisSubBlock != 0U && delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow) {
+            uint32_t start = delStartRow - qNSubBlockStartOffset;
+            uint32_t end = qSThisSubBlock;
+            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Duplicate(
+                    tvUbTensor[(qNIdx * qSThisSubBlock + start) * FLOAT_BLOCK_SIZE],
+                    LSE_OUT_INI,
+                    (end - start) * FLOAT_BLOCK_SIZE
+                );
+            }
+        }
+        if (qNThisSubBlock != 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
+            uint32_t start = 0;
+            uint32_t end = qNSubBlockEnbdOffset >= delEndRow ? (delEndRow - qNSubBlockStartOffset) : totalRowNum;
+            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Duplicate(
+                    tvUbTensor[(qNIdx * qSThisSubBlock + start) * FLOAT_BLOCK_SIZE],
+                    LSE_OUT_INI,
+                    (end - start) * FLOAT_BLOCK_SIZE
+                );
+            }
         }
     }
 
@@ -210,7 +265,9 @@ public:
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
         uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
         uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
-        const SplitKVParams &splitParams)
+        const SplitKVParams &splitParams,
+        uint32_t rowOffsetCurLoop, int32_t delStartRow, int32_t delEndRow, uint32_t qSeqlen,
+        uint32_t qSBlockIdx, uint32_t rowNum, uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
@@ -346,6 +403,86 @@ public:
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
+            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop ;
+            uint32_t innerGOUbOffset = 0;
+            uint32_t subBlockStart = (curQNBlockTile == 1U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+            if (delStartRow != 0) {
+                if (proTokenNum != 0U && subBlockStart + proTokenNum >= delStartRow) {
+                    uint32_t start = subBlockStart >= delStartRow ? 0 : delStartRow - subBlockStart;
+                    uint32_t end = proTokenNum;
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate<ElementOutput>(
+                        goUbTensor16[innerGOUbOffset + start * embed],
+                        static_cast<ElementOutput>(0),
+                        (end - start) * embed
+                    );
+                    innerGOUbOffset += proTokenNum * embed;
+                }
+                if (subBlockStart + qSThisSubBlock >= delStartRow) {
+                    for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
+                        uint32_t start = subBlockStart >= delStartRow ? 0 : delStartRow - subBlockStart;
+                        uint32_t end = qSThisSubBlock;
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Duplicate<ElementOutput>(
+                            goUbTensor16[innerGOUbOffset + start  * embed],
+                            static_cast<ElementOutput>(0),
+                            (end - start) * embed
+                        );
+                        innerGOUbOffset += qSThisSubBlock * embed;
+                    }
+                }
+                if (epiTokenNum != 0U && subBlockStart + epiTokenNum >= delStartRow) {
+                    uint32_t start = subBlockStart >= delStartRow ? 0 : delStartRow - subBlockStart;
+                    uint32_t end = epiTokenNum;
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate<ElementOutput>(
+                        goUbTensor16[innerGOUbOffset + start * embed],
+                        static_cast<ElementOutput>(0),
+                        (end - start) * embed
+                    );
+                }
+            }
+            if (delEndRow != qSeqlen) {
+                if (proTokenNum != 0U && subBlockStart < delEndRow) {
+                    uint32_t start = curQNBlockTile == 1U ? rowStart : 0;
+                    uint32_t end = (subBlockStart + proTokenNum >= delEndRow) ?
+                                                    (curQNBlockTile == 1U ? delEndRow : delEndRow - subBlockStart)
+                                                            : subBlockStart + proTokenNum;
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate<ElementOutput>(
+                        goUbTensor16[innerGOUbOffset],
+                        static_cast<ElementOutput>(0),
+                        (end - start) * embed
+                    );
+                    innerGOUbOffset += proTokenNum * embed;
+                }
+                if (subBlockStart < delEndRow) {
+                    for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
+                        uint32_t start = curQNBlockTile == 1U ? subBlockStart : proTokenNum;
+                        uint32_t end = (subBlockStart + qSThisSubBlock >= delEndRow) ?
+                                            (curQNBlockTile == 1U ? delEndRow : delEndRow - subBlockStart)
+                                                         : start + qSThisSubBlock;
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Duplicate<ElementOutput>(
+                            goUbTensor16[innerGOUbOffset],
+                            static_cast<ElementOutput>(0),
+                            (end - start) * embed
+                        );
+                        innerGOUbOffset += qSThisSubBlock * embed;
+                    }
+                }
+                if (epiTokenNum != 0U && subBlockStart < delEndRow) {
+                    uint32_t start = curQNBlockTile == 1U ? subBlockStart : proTokenNum + integralHeadNum * qSThisSubBlock + subBlockStart;
+                    uint32_t end = curQNBlockTile == 1U ? (subBlockStart + epiTokenNum >= delEndRow ? delEndRow : subBlockStart + epiTokenNum) :
+                                            (epiTokenNum >= delEndRow ? start + delEndRow: start + epiTokenNum);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate<ElementOutput>(
+                        goUbTensor16[innerGOUbOffset],
+                        static_cast<ElementOutput>(0),
+                        (end - start) * embed
+                    );
+                }
+            }
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -392,6 +529,8 @@ public:
                         lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
+                    InvalidLineLSEProcess(qNThisSubBlock, delStartRow, qSBlockIdx,
+                            inRowOffsetThisSubBlock, totalRowNum, delEndRow, qSeqlen, qSThisSubBlock);
                     if (!splitParams.isSplitkv) {
                         AscendC::PipeBarrier<PIPE_V>();
                     }
@@ -499,7 +638,9 @@ public:
         GemmCoord actualBlockShape,
         uint32_t qSBlockSize, uint32_t qNBlockSize,
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
-        const SplitKVParams& splitParams = SplitKVParams())
+        const SplitKVParams& splitParams = SplitKVParams(),
+        int32_t delStartRow = 0, int32_t delEndRow = 0, uint32_t qSeqlen = 0,
+        uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
@@ -621,7 +762,15 @@ public:
                     proTokenNum,
                     epiTokenNum,
                     integralHeadNum,
-                    blockParams);
+                    blockParams,
+                    rowOffsetCurLoop,
+                    delStartRow,
+                    delEndRow,
+                    qSeqlen,
+                    qSBlockIdx,
+                    rowNum,
+                    inRowOffsetThisSubBlock,
+                    curQNBlockTile);
             }
         }
     }
