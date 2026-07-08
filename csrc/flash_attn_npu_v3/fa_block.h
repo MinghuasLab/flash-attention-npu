@@ -28,6 +28,12 @@ namespace Catlass::Epilogue {
         using IntermPrec = SM_DTYPE_;
         static constexpr LseModeT LSE_MODE = LSE_MODE_;
     };
+
+    template <LseModeT LSE_MODE_>
+    struct EpilogueAtlasA2InitOutWhenZero {
+        using ArchTag = Arch::AtlasA2;
+        static constexpr LseModeT LSE_MODE = LSE_MODE_;
+    };
 }
 
 namespace Catlass::Gemm {

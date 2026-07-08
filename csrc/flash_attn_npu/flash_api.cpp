@@ -417,8 +417,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(!rotary_cos_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(!rotary_sin_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(softcap == 0.0f, "NPU FlashAttention does not support softcap");
-    TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left");
-    TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right");
     TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
 
     if (k_.has_value()) {
@@ -468,7 +466,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     int32_t max_kv_seqlen = 0;
@@ -476,6 +473,25 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
     }
     tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
+
+    // causal=true is the same as causal=false when seqlen_q == 1 (decode).
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
+        is_causal = false;
+    }
+
+    bool is_local = false;
+    const bool causal_flag = is_causal;
+    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen - 1) {
+        window_size_left = -1;
+    }
+    if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
+        window_size_right = -1;
+    }
+    if (causal_flag) {
+        window_size_right = 0;
+    }
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
 
     uint32_t totalTaskNum = 0;
     uint32_t groupSize = num_heads / num_heads_k;
@@ -549,7 +565,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
 
     at::Tensor mask_gpu_tensor;
-    if (is_causal) {
+    if (is_local) {
+        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+    } else if (is_causal) {
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
+    }
+    if (is_causal || is_local) {
         at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -566,7 +589,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (paged_KV) {
         blockTableDevice = static_cast<uint8_t *>(block_table.data_ptr());
     }
-    if (is_causal) {
+    if (is_causal || is_local) {
         maskDevice = static_cast<uint8_t *>(mask_gpu_tensor.data_ptr());
     }
     auto oDevice = static_cast<uint8_t *>(out.data_ptr());
@@ -584,6 +607,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     fwd_args.is_bf16 = is_bf16;
     fwd_args.paged_KV = paged_KV;
     fwd_args.is_causal = is_causal;
+    fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
@@ -629,8 +653,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
     TORCH_CHECK(softcap == 0.0, "NPU FlashAttention does not support softcap.");
     TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
-    TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left.");
-    TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right.");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -647,6 +669,25 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(head_size <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    // causal=true is the same as causal=false when seqlen_q == 1 (decode).
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
+        is_causal = false;
+    }
+
+    bool is_local = false;
+    const bool causal_flag = is_causal;
+    if (seqlen_k > 0 && window_size_left >= seqlen_k - 1) {
+        window_size_left = -1;
+    }
+    if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
+        window_size_right = -1;
+    }
+    if (causal_flag) {
+        window_size_right = 0;
+    }
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+
     // init output tensors
     at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
     auto opts = q.options().device(at::kPrivateUse1);
@@ -656,10 +697,10 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
 
-    // init mask 
+    // init mask
     at::Tensor mask_gpu_tensor;
     uint8_t * maskDevice = nullptr;
-    if (is_causal) {
+    if (is_causal || is_local) {
         at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -705,7 +746,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(0));
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(128));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(0));
-    tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
+    if (is_local) {
+        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+    } else if (is_causal) {
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
+    }
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
@@ -738,8 +785,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.data_ptr()));
     auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.data_ptr()));
     auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.data_ptr()));
-    at::Tensor seqlenq_gpu_tensor = at::full({batch_size}, seqlen_q).to(at::Device(at::kPrivateUse1)).to(at::kInt); 
-    at::Tensor seqlenk_gpu_tensor = at::full({batch_size}, seqlen_k).to(at::Device(at::kPrivateUse1)).to(at::kInt); 
+    at::Tensor seqlenq_gpu_tensor = at::full({batch_size}, seqlen_q).to(at::Device(at::kPrivateUse1)).to(at::kInt);
+    at::Tensor seqlenk_gpu_tensor = at::full({batch_size}, seqlen_k).to(at::Device(at::kPrivateUse1)).to(at::kInt);
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
     auto qSeqDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenq_gpu_tensor.data_ptr()));
     auto kvSeqDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.data_ptr()));
@@ -758,6 +805,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.is_bf16 = is_bf16;
     fwd_args.paged_KV = false;
     fwd_args.is_causal = is_causal;
+    fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
@@ -805,7 +853,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
     std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
-    
+
     bool is_bf16 = q.dtype() == torch::kBFloat16;
     bool is_fp16 = q.dtype() == torch::kFloat16;
     const bool paged_KV = block_table_.has_value();
@@ -820,8 +868,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(!zero_tensors, "NPU FlashAttention does not support zero_tensors.");
     TORCH_CHECK(softcap == 0.0, "NPU FlashAttention does not support softcap.");
     TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
-    TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left.");
-    TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right.");
     TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -864,7 +910,26 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    
+
+    // causal=true is the same as causal=false when max_seqlen_q == 1 (decode).
+    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) {
+        is_causal = false;
+    }
+
+    bool is_local = false;
+    const bool causal_flag = is_causal;
+    if (max_seqlen_k > 0 && window_size_left >= max_seqlen_k - 1) {
+        window_size_left = -1;
+    }
+    if (max_seqlen_q > 0 && window_size_right >= max_seqlen_q - 1) {
+        window_size_right = -1;
+    }
+    if (causal_flag) {
+        window_size_right = 0;
+    }
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+
     tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
     tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
     tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
@@ -873,13 +938,19 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
+    if (is_local) {
+        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+    } else if (is_causal) {
+        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
+    }
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
-    
+
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
     uint64_t PRELANCH_NUM = 3;
-    
+
     uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
         4 * PRELANCH_NUM;
     uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
@@ -894,8 +965,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         at::device(at::kPrivateUse1).dtype(at::kByte));
     // LSE output is head-major NT: {num_heads, T} (matches v3).
     at::Tensor softmaxlse = at::empty({num_heads, T}, at::device(at::kPrivateUse1).dtype(at::kFloat)); // lse
-    softmaxlse.fill_(std::numeric_limits<float>::infinity()); 
-
+    softmaxlse.fill_(std::numeric_limits<float>::infinity());
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
     tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
     tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
@@ -925,10 +995,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
     tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
-    
+
     // attention mask
     at::Tensor mask_gpu_tensor;
-    if (is_causal) {
+    if (is_causal || is_local) {
         at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -940,16 +1010,16 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.data_ptr()));
     auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.data_ptr()));
     auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.data_ptr()));
-    
+
     uint8_t * blockTableDevice = nullptr;
     uint8_t * maskDevice = nullptr;
     if (paged_KV) {
         blockTableDevice = static_cast<uint8_t *>(const_cast<void *>(block_table.data_ptr()));
     }
-    if (is_causal) {
+    if (is_causal || is_local) {
         maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.data_ptr()));
     }
-    
+
     auto oDevice = static_cast<uint8_t *>(const_cast<void *>(out.data_ptr()));
     auto qSeqDevice = static_cast<uint8_t *>(const_cast<void *>(cu_seqlens_q.data_ptr()));
     auto kvSeqDevice = static_cast<uint8_t *>(const_cast<void *>(cu_seqlens_k.data_ptr()));
@@ -965,6 +1035,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.is_bf16 = is_bf16;
     fwd_args.paged_KV = paged_KV;
     fwd_args.is_causal = is_causal;
+    fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
@@ -1098,7 +1169,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     }
     at::Tensor seqlenq_gpu_tensor = seqlens_q.to(at::Device(at::kPrivateUse1));
     at::Tensor seqlenk_gpu_tensor = seqlens_k.to(at::Device(at::kPrivateUse1));
-    
+
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);

@@ -23,7 +23,7 @@ def group_matmul(head, kv_head, left, right, high_prec = 1):
             score = torch.cat((score, group_score), 0)
     return score
 
-def softmax1( 
+def softmax1(
     qk_result,
     is_first,
     gm,
@@ -43,7 +43,7 @@ def softmax1(
     row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
     return sim_sub, row_sum, dm, gm
 
-def qkMM1( 
+def qkMM1(
     query,
     key
     ):
@@ -62,7 +62,7 @@ def qkMM1(
             result = result + result_split
     return result
 
-def pvMM2( 
+def pvMM2(
     p,
     value
     ):
@@ -73,7 +73,7 @@ def pvMM2(
     for pv_k_loop_idx in range(pv_k_loop):
         sub_k = 128 if pv_k_loop_idx != (pv_k_loop - 1) else (pv_k - pv_k_loop_idx * 128)
         partial_P = p[:, :, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k]
-        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :] 
+        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :]
         result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value, 0)
         if result is None:
             result = result_split
@@ -81,7 +81,7 @@ def pvMM2(
             result = result + result_split
     return result
 
-def ref_flash_attention( 
+def ref_flash_attention(
     query,
     key,
     value,
@@ -140,33 +140,38 @@ def ref_flash_attention(
     return go.to(data_type), lse
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False),
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right)
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -1, -1),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1),
     # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
-    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False),
-    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False),
-    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True),
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, -1, -1),
+    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0),  # Mistral-style causal SWA
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right):
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -194,8 +199,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         block_tables = None
     kv_seqlen_list = [kv_seqlen] * batch_size
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left = -1
-    window_size_right = -1
     is_rotary_interleaved = False
     softcap = 0
     num_splits = 0
@@ -205,6 +208,18 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     cache_batch_idx = None
     leftpad_k = None
     alibi_slopes = None
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    sparse_mode = 4 if is_local_golden else 0
+
     out_out, softmax_lse = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -227,11 +242,27 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
     golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
     atten_mask = None
-    if is_causal:
+
+    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+        preToken = kvSeqlen - qSeqlen - preToken
+        nextToken = kvSeqlen - qSeqlen + nextToken
+        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
+        for i in range(qSeqlen):
+            for j in range(kvSeqlen):
+                is_below_pretoken_line = (-i + j) < preToken
+                is_above_nexttoken_line = (-i + j) > nextToken
+                if is_below_pretoken_line or is_above_nexttoken_line:
+                    matrix[i][j] = 1
+        return torch.tensor(matrix, dtype=torch.bool)
+
+    if is_causal_golden:
         atten_mask = torch.triu(
             torch.ones(q_seqlen, kv_seqlen),
             diagonal=kv_seqlen - q_seqlen + 1,
         ).bool()
+    elif is_local_golden:
+        atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
+
     for i in range(batch_size):
         key_cache_per_batch = None
         value_cache_per_batch = None
@@ -254,11 +285,30 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             key_cache_per_batch = key_cache.detach().cpu()[i]
             value_cache_per_batch = value_cache.detach().cpu()[i]
         query_cpu = query.detach().cpu()[i]
-        if is_causal:
+        if is_causal_golden or is_local_golden:
             output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type)
         else:
             output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type)
         out = output.reshape(q_seqlen, num_heads, head_size)
+        if is_local_golden:
+            preTokens = window_size_left_golden
+            nextTokens = window_size_right_golden
+            preTokensChange = preTokens - kv_seqlen + q_seqlen
+            nextTokensChange = nextTokens + kv_seqlen - q_seqlen
+            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+            preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
+            actualSeq = q_seqlen
+            actualSeq -= nextTokensError
+            actualSeq -= preTokensError
+            if actualSeq != q_seqlen:
+                if nextTokensError != 0:
+                    actualSeq = q_seqlen - actualSeq
+                    out[ :actualSeq, :, :] = 0
+                    golden_lse[:, :actualSeq] = torch.inf
+                elif preTokensError != 0:
+                    actualSeq = actualSeq
+                    out[actualSeq:, :, :] = 0
+                    golden_lse[:, actualSeq:] = torch.inf
         golden_out[i:i+1] = out
         golden_lseL[i:i+1] = golden_lse.reshape(num_heads, q_seqlen)
     rtol = 1e-2
@@ -310,7 +360,7 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     softcap = 0
     num_splits = 0
     alibi_slopes = None
- 
+
     ret = flash_attn_func(
         query,
         key_cache,

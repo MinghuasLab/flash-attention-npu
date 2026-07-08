@@ -33,6 +33,7 @@ struct FwdLaunchArgs {
     bool is_bf16;
     bool paged_KV;
     bool is_causal;
+    bool is_local;              // sliding-window attention (MASK_SWA)
     bool flashDecodeFlag;       // only meaningful for the BSND (kvcache) path
     uint8_t *qDevice;
     uint8_t *kDevice;

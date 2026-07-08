@@ -155,8 +155,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(!k_descale_.has_value(), "NPU FlashAttention does not support k_descale");
     TORCH_CHECK(!v_descale_.has_value(), "NPU FlashAttention does not support v_descale");
     TORCH_CHECK(softcap == 0.0f, "NPU FlashAttention does not support softcap");
-    TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left");
-    TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right");
     TORCH_CHECK(attention_chunk == 0, "NPU FlashAttention does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "NPU FlashAttention supports num_splits in [0, ", blockDim,
@@ -196,7 +194,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         out = torch::empty_like(q);
     }
     const auto sizes = q.sizes();
-    
+
     int batch_size = 0;
     int seqlen_q = 0;
     int num_heads = 0;
@@ -239,6 +237,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     uint8_t *tilingDevice = nullptr;
     uint8_t *maskDevice = nullptr;
     bool flashDecodeFlag = false;
+    bool is_local = false;
 
     at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
@@ -288,7 +287,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
         tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
         tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
         tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
         int32_t max_kv_seqlen = 0;
@@ -296,6 +294,29 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
         }
         tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
+        // causal=true is the same as causal=false when seqlen_q == 1 (decode).
+        if (seqlen_q == 1) {
+            is_causal = false;
+        }
+        const bool causal_flag = is_causal;
+        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen - 1) {
+            window_size_left = -1;
+        }
+        if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
+            window_size_right = -1;
+        }
+        if (causal_flag) {
+            window_size_right = 0;
+        }
+        is_causal = (window_size_left < 0 && window_size_right == 0);
+        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        if (is_local) {
+            tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+            tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+        } else if (is_causal) {
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
+        }
 
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
@@ -387,14 +408,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
         tiling_cpu_ptr->set_UpdateSize(UpdateSize);
         tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
-        if (is_causal) {
+        if (is_causal || is_local) {
             at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
             mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
             mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
         }
         tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
-        maskDevice = is_causal ? static_cast<uint8_t *>(mask_gpu_tensor.data_ptr()) : nullptr;
+        maskDevice = (is_causal || is_local) ? static_cast<uint8_t *>(mask_gpu_tensor.data_ptr()) : nullptr;
     }
 
     at::Tensor seqlenk_gpu_tensor;
@@ -435,6 +456,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.is_bf16 = is_bf16;
     fwd_args.paged_KV = paged_KV;
     fwd_args.is_causal = is_causal;
+    fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
@@ -549,12 +571,12 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
-    uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();        
-    
+    uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+
     // input/output tensor
     at::Tensor dq, dk, dv;
     bool is_bf16 = q.dtype() == torch::kBFloat16;
-    
+
     if (dq_.has_value()) {
         dq = dq_.value();
     }  else {
@@ -685,7 +707,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
             at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
             .to(at::Device(at::kPrivateUse1));
     }
-    
+
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
@@ -746,7 +768,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
         cuSeqQlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenq_gpu_tensor.data_ptr()));
         cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.data_ptr()));
     }
-    
+
     // Backward FAGGeneral kernel launches live in
     // bwd_dispatch_<dtype>_<layout>.cpp. Layout is selected at runtime by
     // is_varlen_q (varlen => TND, else BSND); dtype, mask, deterministic, and

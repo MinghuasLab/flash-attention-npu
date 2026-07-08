@@ -9,7 +9,7 @@
 // explicitly instantiates one launch_fwd_impl<DType, IS_TND>, so the FAInfer
 // template instantiations land in separate (parallel-compiled) object files.
 //
-// The launch tree below reproduces the exact dtype x paged x causal x
+// The launch tree below reproduces the exact dtype x paged x mask x
 // flash-decode x layout combinations of the three original host functions
 // (mha_fwd_kvcache: BSND with FD; mha_fwd: BSND non-paged; mha_varlen_fwd: TND).
 // mha_fwd and mha_fwd_kvcache share the BSND path; mha_varlen_fwd uses TND.
@@ -37,6 +37,7 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     const uint64_t fftsAddr = a.fftsAddr;
     const bool paged_KV = a.paged_KV;
     const bool is_causal = a.is_causal;
+    const bool is_local = a.is_local;
     const bool flashDecodeFlag = a.flashDecodeFlag;
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
@@ -52,7 +53,13 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     (void)flashDecodeFlag;
 
     if (paged_KV) {
-        if (is_causal) {
+        if (is_local) {
+            SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_SWA,
+                LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                <<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+        } else if (is_causal) {
             // Flash-decode (8th template param = true) is a BSND-only path
             // (mha_fwd_kvcache); compiled out for TND so no FD+TND combo is
             // instantiated.
@@ -101,7 +108,13 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
             }
         }
     } else {
-        if (is_causal) {
+        if (is_local) {
+            SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_SWA,
+                LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY>
+                <<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                    qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+        } else if (is_causal) {
             SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_CAUSAL,
                 LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY>
                 <<<blockDim, nullptr, aclStream>>>(

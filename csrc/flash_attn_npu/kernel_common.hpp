@@ -24,6 +24,7 @@ namespace KernelCommon {
     constexpr uint32_t NUM_32 = 32;
     constexpr uint32_t NUM_128 = 128;
     constexpr uint32_t NUM_256 = 256;
+    constexpr int64_t SPARSE_MODE_INT_MAX = 2147483647;
 
     template <typename T>
     __aicore__ inline
@@ -50,7 +51,8 @@ namespace KernelCommon {
         enum class MaskType : uint32_t {
             NO_MASK = 0,
             MASK_CAUSAL = 1,
-            MASK_SPEC = 2
+            MASK_BAND = 2,
+            MASK_SWA = 4
         };
 
         enum class inputLayout : uint32_t {

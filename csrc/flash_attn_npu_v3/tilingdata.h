@@ -54,6 +54,8 @@ struct FAInferTilingData {
     uint64_t padding1;
     uint64_t padding2;
     uint32_t padding3;
+    int64_t windowSizeLeft = 0;
+    int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
@@ -105,6 +107,9 @@ struct FAInferTilingData {
     void set_firstBatchTaskNum(uint32_t value) { firstBatchTaskNum = value; }
     void set_totalTaskNum(uint32_t value) { totalTaskNum = value; }
     void set_maskType(uint32_t value) { maskType = value; }
+
+    void set_windowSizeLeft(int64_t value) { windowSizeLeft = value; }
+    void set_windowSizeRight(int64_t value) { windowSizeRight = value; }
     void set_mm1OutSize(uint64_t value) { mm1OutSize = value; }
     void set_smOnlineOutSize(uint64_t value) { smOnlineOutSize = value; }
     void set_mm2OutSize(uint64_t value) { mm2OutSize = value; }

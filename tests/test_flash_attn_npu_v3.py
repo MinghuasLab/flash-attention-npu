@@ -26,7 +26,7 @@ def group_matmul(head, kv_head, left, right, high_prec = 1):
             score = torch.cat((score, group_score), 0)
     return score
 
-def softmax1( 
+def softmax1(
     qk_result,
     is_first,
     gm,
@@ -46,7 +46,7 @@ def softmax1(
     row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
     return sim_sub, row_sum, dm, gm
 
-def qkMM1( 
+def qkMM1(
     query,
     key
     ):
@@ -65,7 +65,7 @@ def qkMM1(
             result = result + result_split
     return result
 
-def pvMM2( 
+def pvMM2(
     p,
     value
     ):
@@ -76,7 +76,7 @@ def pvMM2(
     for pv_k_loop_idx in range(pv_k_loop):
         sub_k = 128 if pv_k_loop_idx != (pv_k_loop - 1) else (pv_k - pv_k_loop_idx * 128)
         partial_P = p[:, :, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k]
-        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :] 
+        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :]
         result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value, 0)
         if result is None:
             result = result_split
@@ -84,7 +84,7 @@ def pvMM2(
             result = result + result_split
     return result
 
-def ref_flash_attention( 
+def ref_flash_attention(
     query,
     key,
     value,
@@ -144,42 +144,44 @@ def ref_flash_attention(
 
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode,
-    #  block_size, is_causal, layout, is_varied)
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, False, "BSND", False),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND", False),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND", False),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND", False),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "BSND", False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND", False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "TND", False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "BSND", False),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "BSND", False),
+    #  block_size, is_causal, layout, is_varied, window_size_left, window_size_right)
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND", False, -1, -1),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "BSND", False, -1, -1),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "BSND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "BSND", False, -1, -1),
     # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
-    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, "TND", False),
-    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, "TND", False),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, "TND", False),
-    # Varied-length (per-batch q in [1,q_seqlen], kv in [q,kv_seqlen]) under TND+paged.
-    # Drives a NON-uniform prevQSeqlenSum prefix -> stresses the TND LSE qPos/batchBase
-    # addressing and the FD CombineScale multi-segment reduce with uneven per-batch q/kv.
-    # is_varied is only meaningful under TND (BSND has no per-batch q length); guarded below.
-    (torch.bfloat16, 2, 1, 1, 16, 1024, 128, 1, 128, False, "TND", True),
-    (torch.bfloat16, 2, 6, 2, 16, 1024, 128, 1, 128, False, "TND", True),
-    (torch.bfloat16, 2, 6, 2, 16, 1024, 128, 1, 128, True, "TND", True),
-    (torch.bfloat16, 1, 64, 1, 2, 1024, 256, 1, 128, False, "TND", False),
-    (torch.bfloat16, 2, 1, 1, 16, 1024, 256, 1, 128, True, "TND", False),
-    (torch.bfloat16, 2, 1, 1, 16, 10240, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 2, 6, 2, 16, 10240, 128, 1, 128, False, "TND", False),
-    (torch.bfloat16, 6, 1, 1, 16, 10240, 128, 1, 128, False, "TND", False),
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 16, 1024, 128, 1, 128, False, "TND", True, -1, -1),
+    (torch.bfloat16, 2, 6, 2, 16, 1024, 128, 1, 128, False, "TND", True, -1, -1),
+    (torch.bfloat16, 2, 6, 2, 16, 1024, 128, 1, 128, True, "TND", True, -1, -1),
+    (torch.bfloat16, 1, 64, 1, 2, 1024, 256, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 16, 1024, 256, 1, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 1, 1, 16, 10240, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 6, 2, 16, 10240, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 6, 1, 1, 16, 10240, 128, 1, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, "BSND", False, 512, 0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, "TND", False, 512, 0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND", False, 0, 256),
+    (torch.float16, 2, 1, 1, 512, 512, 128, 1, 128, False, "TND", False, 508, -256),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND", False, -128, 1024),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, "TND", False, 64, 128),
 ]
 
 @pytest.mark.parametrize("num_splits", [0, 1, 2])
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits, window_size_left, window_size_right):
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
 
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
@@ -189,8 +191,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("Ascend950 does not support num_splits>1")
     if "Ascend950" in name and head_size > 128:
         pytest.skip("Ascend950 does not support head_size>128")
-    # Varied per-batch q length is only expressible under TND (cu_seqlens_q); BSND assumes a
-    # uniform q_seqlen, so a varied case there is meaningless.
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     q_min_range = -1.0
@@ -244,8 +244,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         q_seqlen_list = q_sequences
         kv_seqlen_list = kv_sequences
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left = -1
-    window_size_right = -1
     is_rotary_interleaved = False
     softcap = 0
     kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
@@ -256,20 +254,33 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     alibi_slopes = None
     new_q_seqlen_list = None
     new_kv_seqlen_list = None
+    new_q_seqlen_list_cpu = None
+    new_kv_seqlen_list_cpu = None
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
     if layout == "TND":
-        new_q_seqlen_list = [0]
+        new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
         for i in range(batch_size):
-            pre_seq_sum += q_seqlen_list[i]
-            new_q_seqlen_list.append(pre_seq_sum)
-        new_q_seqlen_list = torch.tensor(new_q_seqlen_list, dtype=torch.int32).npu()
+            pre_seq_sum += q_sequences[i]
+            new_q_seqlen_list_cpu.append(pre_seq_sum)
+        new_q_seqlen_list = torch.tensor(new_q_seqlen_list_cpu, dtype=torch.int32).npu()
         if cache_mode == 0:
-            new_kv_seqlen_list = [0]
+            new_kv_seqlen_list_cpu = [0]
             pre_seq_sum = 0
             for i in range(batch_size):
-                pre_seq_sum += kv_seqlen_list[i]
-                new_kv_seqlen_list.append(pre_seq_sum)
-            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list)
+                pre_seq_sum += kv_sequences[i]
+                new_kv_seqlen_list_cpu.append(pre_seq_sum)
+            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
+    cache_seqlens_for_api = new_kv_seqlen_list if (layout == "TND" and cache_mode == 0) else kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -279,7 +290,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         None,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
-        cache_seqlens=kv_seqlen_list,
+        cache_seqlens=cache_seqlens_for_api,
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=leftpad_k,
         page_table=block_tables,
@@ -302,6 +313,19 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         sm_margin=0,
         return_softmax_lse=True
     )
+
+    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+        preToken = kvSeqlen - qSeqlen - preToken
+        nextToken = kvSeqlen - qSeqlen + nextToken
+        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
+        for i in range(qSeqlen):
+            for j in range(kvSeqlen):
+                is_below_pretoken_line = (-i + j) < preToken
+                is_above_nexttoken_line = (-i + j) > nextToken
+                if is_below_pretoken_line or is_above_nexttoken_line:
+                    matrix[i][j] = 1
+        return torch.tensor(matrix, dtype=torch.bool)
+
     golden_out = None
     golden_out = None
     if layout == "BSND":
@@ -311,14 +335,19 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         golden_out = torch.empty((t_q_sum, num_heads, head_size), dtype=data_type)
         golden_lseL = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
     for i in range(batch_size):
-        q_seqlen_per_batch = q_seqlen_list[i]
-        kv_seqlen_per_batch = kv_seqlen_list[i]
+        q_seqlen_per_batch = q_sequences[i]
+        kv_seqlen_per_batch = kv_sequences[i]
         key_cache_per_batch = None
         value_cache_per_batch = None
         query_cpu_per_batch = None
         atten_mask = None
-        if is_causal:
-            atten_mask = torch.triu(torch.ones(q_seqlen_per_batch, kv_seqlen_per_batch), diagonal=(kv_seqlen_per_batch - q_seqlen_per_batch + 1)).bool()
+        if is_causal_golden:
+            atten_mask = torch.triu(
+                torch.ones(q_seqlen_per_batch, kv_seqlen_per_batch),
+                diagonal=(kv_seqlen_per_batch - q_seqlen_per_batch + 1),
+            ).bool()
+        elif is_local_golden:
+            atten_mask = create_binary_matrix(q_seqlen_per_batch, kv_seqlen_per_batch, window_size_left_golden, window_size_right_golden)
         if layout == "BSND":
             query_cpu_per_batch = query.detach().cpu()[i]
             if cache_mode == 1:
@@ -340,10 +369,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
                 key_cache_per_batch = key_cache.detach().cpu()[i]
                 value_cache_per_batch = value_cache.detach().cpu()[i]
         else:
-            query_cpu_per_batch = query.detach().cpu()[new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]]
+            query_cpu_per_batch = query.detach().cpu()[new_q_seqlen_list_cpu[i] : new_q_seqlen_list_cpu[i + 1]]
             if cache_mode == 0:
-                key_cache_per_batch = key_cache.detach().cpu()[new_kv_seqlen_list[i] : new_kv_seqlen_list[i + 1]]
-                value_cache_per_batch = value_cache.detach().cpu()[new_kv_seqlen_list[i] : new_kv_seqlen_list[i + 1]]
+                key_cache_per_batch = key_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
+                value_cache_per_batch = value_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
             else:
                 keys = []
                 values = []
@@ -359,11 +388,31 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
                     values.append(v)
                 key_cache_per_batch = torch.stack(keys, dim=0)
                 value_cache_per_batch = torch.stack(values, dim=0)
-        if is_causal:
+        if atten_mask is not None:
             output, golden_lse = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type)
         else:
             output, golden_lse = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, None, data_type)
         out = output.reshape(q_seqlen_per_batch, num_heads, head_size)
+        if is_local_golden:
+            preTokens = window_size_left_golden
+            nextTokens = window_size_right_golden
+            preTokensChange = preTokens - kv_seqlen_per_batch + q_seqlen_per_batch
+            nextTokensChange = nextTokens + kv_seqlen_per_batch - q_seqlen_per_batch
+            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+            preTokensError = (
+                q_seqlen_per_batch - kv_seqlen_per_batch - preTokensChange
+            ) if q_seqlen_per_batch > kv_seqlen_per_batch + preTokensChange else 0
+            actualSeq = q_seqlen_per_batch
+            actualSeq -= nextTokensError
+            actualSeq -= preTokensError
+            if actualSeq != q_seqlen_per_batch:
+                if nextTokensError != 0:
+                    actualSeq = q_seqlen_per_batch - actualSeq
+                    out[ :actualSeq, :, :] = 0
+                    golden_lse[:, :actualSeq] = torch.inf
+                elif preTokensError != 0:
+                    out[actualSeq:, :, :] = 0
+                    golden_lse[:, actualSeq:] = torch.inf
         if layout == "BSND":
             golden_out[i:i+1] = out
             golden_lseL[i:i+1] = golden_lse.reshape(1, num_heads, q_seqlen_per_batch)

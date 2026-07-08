@@ -10,8 +10,7 @@
 // fa_split (flashDecodeFlag only adjusts launchBlockDim / tiling, never a
 // template arg). So FAInfer here takes 7 template params
 // <DType, DType, float, PAGED, MASK, LAYOUT, OUT_ONLY>, and the per-(dtype,
-// layout) TU instantiates 4 variants (paged x causal). 4 TUs x 4 = 16, matching
-// the exact FAInfer set in main's flash_api.cpp.
+// layout) TU instantiates 6 variants (paged x {SWA, causal, no-mask}).
 
 #pragma once
 
@@ -55,6 +54,7 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     const uint64_t fftsAddr = a.fftsAddr;
     const bool paged_KV = a.paged_KV;
     const bool is_causal = a.is_causal;
+    const bool is_local = a.is_local;
     const bool flashDecodeFlag = a.flashDecodeFlag;
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
@@ -70,7 +70,13 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     (void)flashDecodeFlag;
 
     if (paged_KV) {
-        if (is_causal) {
+        if (is_local) {
+            if constexpr (IS_TND) {
+                FWD_LAUNCH(DType, true, MASK_SWA, TND);
+            } else {
+                FWD_LAUNCH(DType, true, MASK_SWA, BSND);
+            }
+        } else if (is_causal) {
             if constexpr (IS_TND) {
                 FWD_LAUNCH(DType, true, MASK_CAUSAL, TND);
             } else {
@@ -84,7 +90,13 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
             }
         }
     } else {
-        if (is_causal) {
+        if (is_local) {
+            if constexpr (IS_TND) {
+                FWD_LAUNCH(DType, false, MASK_SWA, TND);
+            } else {
+                FWD_LAUNCH(DType, false, MASK_SWA, BSND);
+            }
+        } else if (is_causal) {
             if constexpr (IS_TND) {
                 FWD_LAUNCH(DType, false, MASK_CAUSAL, TND);
             } else {

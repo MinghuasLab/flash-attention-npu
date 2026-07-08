@@ -182,9 +182,9 @@ public:
     }
 
     __aicore__ inline
-    void resetBlockStart()
+    void resetBlockStart(uint32_t kvStart, uint32_t pagedBlockSize)
     {
-        blockStartOffset = 0;
+        blockStartOffset = kvStart * maxKVStackLen % pagedBlockSize;
     }
 
     __aicore__ inline
