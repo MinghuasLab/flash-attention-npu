@@ -721,33 +721,20 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
         attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
     }
     at::Tensor softmax_lse_kernel = softmax_lse;
-    if (!is_varlen_q) {
+        if (!is_varlen_q) {
         TORCH_CHECK(softmax_lse.dim() == 3, "mha_bwd: softmax_lse for BSND must be a 3D tensor.");
-        // Kernel CopyInSoftMax expects BSN contiguous layout:
-        // softMaxOffset = ((b * s1 + s) * nheads + h)
-        if (softmax_lse.size(1) == nheads && softmax_lse.size(2) == max_seqlen_q) {
-            // Accept BHS input and convert to BSN.
-            softmax_lse_kernel = softmax_lse.transpose(1, 2).contiguous();
-        } else {
-            TORCH_CHECK(softmax_lse.size(1) == max_seqlen_q && softmax_lse.size(2) == nheads,
-                        "mha_bwd: softmax_lse must be BSN or BHS in BSND mode.");
-            if (!softmax_lse.is_contiguous()) {
-                softmax_lse_kernel = softmax_lse.contiguous();
-            }
+        TORCH_CHECK(softmax_lse.size(1) == nheads && softmax_lse.size(2) == max_seqlen_q,
+                    "mha_bwd: softmax_lse must be BNS in BSND mode.");
+        if (!softmax_lse.is_contiguous()) {
+            softmax_lse_kernel = softmax_lse.contiguous();
         }
     } else {
         TORCH_CHECK(softmax_lse.dim() == 2, "mha_bwd: softmax_lse for TND must be a 2D tensor.");
         const int64_t total_q = qsizes[0];
-        // TND bwd kernel expects softmax_lse in TN contiguous layout.
-        if (softmax_lse.size(0) == nheads && softmax_lse.size(1) == total_q) {
-            // Accept NT input and convert to TN.
-            softmax_lse_kernel = softmax_lse.transpose(0, 1).contiguous();
-        } else {
-            TORCH_CHECK(softmax_lse.size(0) == total_q && softmax_lse.size(1) == nheads,
-                        "mha_bwd: softmax_lse must be TN or NT in TND mode.");
-            if (!softmax_lse.is_contiguous()) {
-                softmax_lse_kernel = softmax_lse.contiguous();
-            }
+        TORCH_CHECK(softmax_lse.size(0) == nheads && softmax_lse.size(1) == total_q,
+                    "mha_bwd: softmax_lse must be NT in TND mode.");
+        if (!softmax_lse.is_contiguous()) {
+            softmax_lse_kernel = softmax_lse.contiguous();
         }
     }
     auto softMaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_lse_kernel.storage().data()));

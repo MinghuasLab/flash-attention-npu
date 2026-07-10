@@ -22,35 +22,27 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
     // calculate ratio of all mask
     float realS1 = 0;
     float realS2 = 0;
-    if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK)) {
+    if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK) ||
+        fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND)) {
         if (fagTilingData.s1Token >= 0 && fagTilingData.s2Token >= 0) {
-            realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? static_cast<float>(fagTilingData.qkHeadDim) :
-                                                             static_cast<float>(fagTilingData.s1Token);
-            realS2 = fagTilingData.s2Token >= fagTilingData.vHeadDim ? static_cast<float>(fagTilingData.vHeadDim) :
-                                                             static_cast<float>(fagTilingData.s2Token);
-            return (realS1 + realS2) / static_cast<float>(fagTilingData.qkHeadDim + fagTilingData.vHeadDim);
+            realS1 = fagTilingData.s1Token >= fagTilingData.qSeqlen ? static_cast<float>(fagTilingData.qSeqlen) :
+                                                                static_cast<float>(fagTilingData.s1Token);
+            realS2 = fagTilingData.s2Token >= fagTilingData.kvSeqlen ? static_cast<float>(fagTilingData.kvSeqlen) :
+                                                                static_cast<float>(fagTilingData.s2Token);
+            return (realS1 + realS2) / static_cast<float>(fagTilingData.qSeqlen + fagTilingData.kvSeqlen);
         } else if (fagTilingData.s1Token < 0 && fagTilingData.s2Token >= 0) {
-            realS2 = fagTilingData.s2Token >= fagTilingData.vHeadDim ? fagTilingData.vHeadDim : fagTilingData.s2Token;
-            return (realS2 + fagTilingData.s1Token) / static_cast<float>(fagTilingData.vHeadDim);
+            realS2 = fagTilingData.s2Token >= fagTilingData.kvSeqlen ? fagTilingData.kvSeqlen : fagTilingData.s2Token;
+            return (realS2 + fagTilingData.s1Token) / static_cast<float>(fagTilingData.kvSeqlen);
         } else {
-            realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? fagTilingData.qkHeadDim : fagTilingData.s1Token;
-            return (realS1 + fagTilingData.s2Token) / static_cast<float>(fagTilingData.qkHeadDim);
+            realS1 = fagTilingData.s1Token >= fagTilingData.qSeqlen ? fagTilingData.qSeqlen : fagTilingData.s1Token;
+            return (realS1 + fagTilingData.s2Token) / static_cast<float>(fagTilingData.qSeqlen);
         }
     } else if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL)) {
-        if (fagTilingData.qkHeadDim >= fagTilingData.vHeadDim) {
-            return 1 - static_cast<float>(HALF * fagTilingData.vHeadDim) / static_cast<float>(fagTilingData.qkHeadDim);
+        if (fagTilingData.qSeqlen >= fagTilingData.kvSeqlen) {
+            return 1 - static_cast<float>(HALF * fagTilingData.kvSeqlen) / static_cast<float>(fagTilingData.qSeqlen);
         } else {
-            return static_cast<float>(HALF * fagTilingData.qkHeadDim) / static_cast<float>(fagTilingData.vHeadDim);
+            return static_cast<float>(HALF * fagTilingData.qSeqlen) / static_cast<float>(fagTilingData.kvSeqlen);
         }
-    } else if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND)) {
-        if (fagTilingData.s1Token >= 0 && fagTilingData.s2Token >= 0) {
-            realS1 = fagTilingData.s1Token >= fagTilingData.qkHeadDim ? static_cast<float>(fagTilingData.qkHeadDim) :
-                                                             static_cast<float>(fagTilingData.s1Token);
-            realS2 = fagTilingData.s2Token >= fagTilingData.vHeadDim ? static_cast<float>(fagTilingData.vHeadDim) :
-                                                             static_cast<float>(fagTilingData.s2Token);
-            return (realS1 + realS2) / static_cast<float>(fagTilingData.qkHeadDim + fagTilingData.vHeadDim);
-        }
-        return 1.0f;
     } else {
         return 1.0f;
     }

@@ -1132,7 +1132,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     const bool local_is_causal = local_window_size_left < 0 && local_window_size_right == 0;
     const bool is_local = (local_window_size_left >= 0 || local_window_size_right >= 0) && !local_is_causal;
 
-    if (!seqlens_q.equal(seqlens_k) || is_local) {
+    if (!seqlens_q.equal(seqlens_k) || is_local || headdim != 128) { // varlen optimized kernel only supports headdim equal to 128
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(
             dout, q, k, v, out, softmax_lse, dq, dk, dv,
@@ -1170,6 +1170,15 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::Tensor seqlenq_gpu_tensor = seqlens_q.to(at::Device(at::kPrivateUse1));
     at::Tensor seqlenk_gpu_tensor = seqlens_k.to(at::Device(at::kPrivateUse1));
 
+    at::Tensor softmax_lse_kernel = softmax_lse;
+    TORCH_CHECK(softmax_lse.dim() == 2, "mha_varlen_bwd: softmax_lse for TND must be a 2D tensor.");
+    const int64_t total_q = qsizes[0];
+    TORCH_CHECK(softmax_lse.size(0) == nheads && softmax_lse.size(1) == total_q,
+                "mha_varlen_bwd: softmax_lse must be NT (nheads, total_q) in TND mode.");
+    if (!softmax_lse.is_contiguous()) {
+        softmax_lse_kernel = softmax_lse.contiguous();
+    }
+
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
@@ -1184,7 +1193,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     }
     auto cuSeqQlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenq_gpu_tensor.storage().data()));
     auto cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.storage().data()));
-    auto softMaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_lse.storage().data()));
+    auto softMaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_lse_kernel.storage().data()));
 
     auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));

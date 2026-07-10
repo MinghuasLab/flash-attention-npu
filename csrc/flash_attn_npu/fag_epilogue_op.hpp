@@ -121,6 +121,7 @@ public:
     int64_t dAlign;
     int64_t value_dAlign;
     int64_t attenMaskDimS2;
+    int64_t t1;
 
     uint32_t baseMN;
     uint32_t cubeBaseMN;
@@ -260,6 +261,7 @@ public:
         s2 = tilingData->kvSeqlen;
         d = tilingData->qkHeadDim;
         value_d = tilingData->vHeadDim;
+        t1 = tilingData->t1;
         dAlign = (d + 15) / 16 * 16;
         value_dAlign = (value_d + 15) / 16 * 16;
 
@@ -529,31 +531,13 @@ public:
     CATLASS_DEVICE
     void CopyInSoftMax(LocalTensor<float> &dstTensor, uint32_t s1Extend, uint32_t softMaxOffset)
     {
-        if constexpr (INPUT_LAYOUT == TND) {
-            AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset],
-                {1, static_cast<uint16_t>(s1Extend * 4), 0, 0}, {false, 0, 0, 0});
-        } else { // BSN
-            int64_t nheads = n2 * g;
-            int64_t lseRepeatTimes = (s1Extend + 7) / 8 * 8;
-            AscendC::DataCopyExtParams lseCopyParam;
-            lseCopyParam.blockCount = s1Extend;
-            lseCopyParam.blockLen = sizeof(float);
-            lseCopyParam.srcStride = (nheads - 1) * sizeof(float);
-            lseCopyParam.dstStride = 0;
-            lseCopyParam.rsv = 0;
-            AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset], lseCopyParam, {false, 0, 0, 0});
-        }
+        AscendC::DataCopyPad(dstTensor, softmaxLseGm[softMaxOffset],
+            {1, static_cast<uint16_t>(s1Extend * 4), 0, 0}, {false, 0, 0, 0});
 
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-        if constexpr (INPUT_LAYOUT == TND) {
-            AscendC::Brcb(dstTensor[s1Extend * 8], dstTensor, static_cast<uint8_t>((s1Extend+7)/8), {1, 8});
-        } else {
-            for (uint32_t i = 0; i < s1Extend; i++) { // bsn
-                AscendC::Brcb(dstTensor[s1Extend * 8 + i * 8], dstTensor[i * 8], 1, {1, 8});
-            }
-        }
+        AscendC::Brcb(dstTensor[s1Extend * 8], dstTensor, static_cast<uint8_t>((s1Extend + 7) / 8), {1, 8});
     }
 
     CATLASS_DEVICE
@@ -629,12 +613,11 @@ public:
         int64_t softMaxOffset = 0;
         if constexpr (INPUT_LAYOUT == TND) {
             if (dbParam.bIdx > 0) {
-                softMaxOffset = ((__gm__ int32_t *)actual_seq_qlen_addr)[dbParam.bIdx - 1] * n2 * g;
+                softMaxOffset = ((__gm__ int32_t *)actual_seq_qlen_addr)[dbParam.bIdx - 1];
             }
-            softMaxOffset += ((dbParam.n2Idx * g + dbParam.gIdx) * dbParam.actualS1Len +
-                            dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
+            softMaxOffset += (dbParam.n2Idx * g + dbParam.gIdx) * t1 + dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize;
         } else {
-            softMaxOffset = ((dbParam.bIdx * s1 + dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize) * n2 + dbParam.n2Idx) * g + dbParam.gIdx; // bsn
+            softMaxOffset = ((dbParam.bIdx * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * s1 + dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize; // bns
         }
         CopyInSoftMax(vecInBuffer3, s1ExtendSubGraph, softMaxOffset);
 
@@ -1068,6 +1051,7 @@ public:
     int64_t headdim;
     int64_t seq_q;
     int64_t seq_k;
+    int64_t t1;
 
     float scaleValue;
 
@@ -1124,7 +1108,8 @@ public:
         nheads_k = tilingData->kvHeadNum;
         g = tilingData->g;
         headdim = tilingData->qkHeadDim;
-        seq_q = tilingData->t1 / b;
+        t1 = tilingData->t1;
+        seq_q = t1 / b;
         seq_k = tilingData->t2 / b;
 
         int64_t sfmgWorkSpaceOffset = tilingData->sfmgPreBeginAddr;
@@ -1230,20 +1215,12 @@ public:
     CATLASS_DEVICE
     void CopyInSoftMax(LocalTensor<float> &dstTensor, uint32_t s1Extend, uint32_t softMaxOffset)
     {
-        int64_t nheads = nheads_k * g;
-        AscendC::DataCopyExtParams lseCopyParam;
-        lseCopyParam.blockCount = s1Extend;
-        lseCopyParam.blockLen = sizeof(float);
-        lseCopyParam.srcStride = (nheads - 1) * sizeof(float);
-        lseCopyParam.dstStride = 0;
-        lseCopyParam.rsv = 0;
-        AscendC::DataCopyPad(dstTensor, rowLseGm[softMaxOffset], lseCopyParam, {false, 0, 0, 0});
+        AscendC::DataCopyPad(dstTensor, rowLseGm[softMaxOffset],
+            {1, static_cast<uint16_t>(s1Extend * 4), 0, 0}, {false, 0, 0, 0});
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-        for (uint32_t i = 0; i < s1Extend; i++) {
-            AscendC::Brcb(dstTensor[64 * 8 + i * 8], dstTensor[i * 8], 1, {1, 8});
-        }
+        AscendC::Brcb(dstTensor[64 * 8], dstTensor, static_cast<uint8_t>((s1Extend + 7) / 8), {1, 8});
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(dstTensor, 1.0f, s1Extend * 8);
     }
@@ -1454,19 +1431,19 @@ public:
 
             // offset
             int64_t globalSeqStart = 0;
+            int64_t batchOffset = 0;
             if constexpr (getLayout() == InputLayout::TND) {
                 globalSeqStart = (blockInfo.batchIdx > 0)
                 ? ((__gm__ int32_t *)cu_seq_qlen_addr)[blockInfo.batchIdx - 1]
                 : 0;
+                batchOffset = t1;
             } else {
-                globalSeqStart = (blockInfo.batchIdx > 0)
-                ? seq_q
-                : 0;
+                globalSeqStart = blockInfo.batchIdx * nheads_k * g * seq_q;
+                batchOffset = seq_q;
             }
+            int64_t headIdx = (blockInfo.nheadsKIdx * g + blockInfo.gIdx) * batchOffset;
             int64_t seqOffsetInBlock = blockInfo.SeqQIdx * S1_CUBESIZE + curSeqQIdx * s1VecSize;
-            int64_t nheads = nheads_k * g;
-            int64_t headIdx = blockInfo.nheadsKIdx * g + blockInfo.gIdx;
-            lseOffset = (globalSeqStart + seqOffsetInBlock) * nheads + headIdx;
+            lseOffset = globalSeqStart + headIdx + seqOffsetInBlock;
 
             sfmgOffset = 0;
             if (blockInfo.batchIdx > 0) {
