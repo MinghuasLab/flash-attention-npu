@@ -2,16 +2,16 @@
 
 <!--
 Use the appropriate keyword for each related issue:
-  1) If this PR completely resolves an issue:
-    Fixes #123
-    Closes #123
+  1) If this PR completely resolves an issue, you can use:
+    Fixes #123, or
+    Closes #123, or
     Resolves #123
 
-  2) If this PR is related to an issue but should NOT close it:
-    Related to #123
+  2) If this PR is related to an issue but should NOT close it, you can use:
+    Related to #123, or
     Refs #123
 
-  3) If there is no related issue, write:
+Otherwise, if there is no related issue, write:
     None.
 -->
 
