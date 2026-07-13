@@ -6,7 +6,7 @@ import torch
 import torch_npu
 import pytest
 import numpy as np
-from flash_attn_npu import flash_attn_varlen_func, flash_attn_func
+from flash_attn_npu_v2 import flash_attn_varlen_func, flash_attn_func
 
 torch.npu.set_device(1)
 np.random.seed(3)

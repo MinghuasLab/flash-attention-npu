@@ -794,7 +794,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     return {dq, dk, dv, softmax_d};
 }
 
-PYBIND11_MODULE(flash_attn_npu_3, m)
+PYBIND11_MODULE(flash_attn_npu_arch22_v3, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");

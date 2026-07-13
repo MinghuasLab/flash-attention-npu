@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch_npu
 
-from flash_attn_npu_v3.flash_attn_interface import _flash_attn_backward
+from flash_attn_npu_v3.interface_arch22 import _flash_attn_backward
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:

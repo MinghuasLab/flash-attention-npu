@@ -9,7 +9,7 @@ import os
 
 # isort: off
 # We need to import the kernels after importing torch
-import flash_attn_npu_2
+import flash_attn_npu_arch22_v2
 # isort: on
 
 def maybe_contiguous(x):
@@ -43,7 +43,7 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_arch22_v2::_flash_attn_forward", mutates_args=(), device_types="npu")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -58,7 +58,7 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_npu_2.fwd(
+    out, softmax_lse, S_dmask, rng_state = flash_attn_npu_arch22_v2.fwd(
         q,
         k,
         v,
@@ -76,7 +76,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_arch22_v2::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -109,7 +109,7 @@ def _flash_attn_forward_fake(
 _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_varlen_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_arch22_v2::_flash_attn_varlen_forward", mutates_args=(), device_types="npu")
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -132,7 +132,7 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_npu_2.varlen_fwd(
+    out, softmax_lse, S_dmask, rng_state = flash_attn_npu_arch22_v2.varlen_fwd(
         q,
         k,
         v,
@@ -160,7 +160,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_varlen_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_arch22_v2::_flash_attn_varlen_forward")
 def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -201,7 +201,7 @@ def _flash_attn_varlen_forward_fake(
 _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_arch22_v2::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -229,7 +229,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_npu_2.bwd(
+    ) = flash_attn_npu_arch22_v2.bwd(
         dout,
         q,
         k,
@@ -253,7 +253,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_arch22_v2::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -293,7 +293,7 @@ def _flash_attn_backward_fake(
 _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn_npu_2::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_arch22_v2::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="npu")
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -326,7 +326,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_npu_2.varlen_bwd(
+    ) = flash_attn_npu_arch22_v2.varlen_bwd(
         dout,
         q,
         k,
@@ -357,7 +357,7 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn_npu_2::_flash_attn_varlen_backward")
+@_torch_register_fake_wrapper("flash_attn_npu_arch22_v2::_flash_attn_varlen_backward")
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1548,7 +1548,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = flash_attn_npu_2.fwd_kvcache(
+    out, softmax_lse = flash_attn_npu_arch22_v2.fwd_kvcache(
         q,
         k_cache,
         v_cache,

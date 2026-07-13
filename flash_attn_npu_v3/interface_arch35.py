@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 # isort: off
-import flash_attn_npu_950_3
+import flash_attn_npu_arch35_v3
 # isort: on
 
 if torch.__version__ >= "2.4.0":
@@ -39,7 +39,7 @@ def _maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 @_torch_custom_op_wrapper(
-    "flash_attn_npu_950_3_C::_flash_attn_forward", mutates_args=(), device_types="npu"
+    "flash_attn_npu_arch35_v3_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -89,7 +89,7 @@ def _flash_attn_forward(
     rotary_cos, rotary_sin = (_maybe_contiguous(x) for x in (rotary_cos, rotary_sin))
     seqlens_rotary = _maybe_contiguous(seqlens_rotary)
 
-    out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_950_3.fwd(
+    out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_arch35_v3.fwd(
         q, k, v,
         k_new, v_new, qv,
         out,
@@ -118,7 +118,7 @@ def _flash_attn_forward(
 
     return out_t, softmax_lse, out_accum, softmax_lse_accum
 
-@_torch_register_fake_wrapper("flash_attn_npu_950_3_C::_flash_attn_forward")
+@_torch_register_fake_wrapper("flash_attn_npu_arch35_v3_C::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q, k, v, k_new, v_new, qv,
     out,
