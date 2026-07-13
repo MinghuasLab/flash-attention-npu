@@ -466,7 +466,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    if (softcap > 0.0f) {
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
         tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
     } else {
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
@@ -608,6 +609,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -746,7 +748,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     } else if (is_causal) {
         tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
     }
-    if (softcap > 0.0f) {
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
         tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
     } else {
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
@@ -805,6 +808,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -937,7 +941,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     } else if (is_causal) {
         tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
     }
-    if (softcap > 0.0f) {
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
         tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
     } else {
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
@@ -1034,6 +1039,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;

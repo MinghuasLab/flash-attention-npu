@@ -22,15 +22,16 @@ template <
     class OutputType_,
     class InputType_,
     class MaskType_,
-    LseModeT LSE_MODE_>
+    LseModeT LSE_MODE_,
+    bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -949,7 +950,7 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                if (softcapValue > 0.0f) {
+                if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 SubCoreCompute<false>(
@@ -1079,7 +1080,7 @@ public:
                 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                if (softcapValue > 0.0f) {
+                if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 ApplyMask(
@@ -1261,7 +1262,7 @@ public:
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                    if (softcapValue > 0.0f) {
+                    if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
@@ -1291,7 +1292,7 @@ public:
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                    if (softcapValue > 0.0f) {
+                    if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
@@ -1300,7 +1301,7 @@ public:
                     OperateNextMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                    if (softcapValue > 0.0f) {
+                    if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundNext,

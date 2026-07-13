@@ -1016,7 +1016,8 @@ namespace SplitFuse {
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
         Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE,
-        bool IS_FD = false>
+        bool IS_FD = false,
+        bool HAS_SOFTCAP = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1064,7 +1065,7 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
