@@ -474,20 +474,14 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
 
-    // causal=true is the same as causal=false when seqlen_q == 1 (decode).
-    if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
-        is_causal = false;
-    }
-
     bool is_local = false;
-    const bool causal_flag = is_causal;
     if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen - 1) {
         window_size_left = -1;
     }
     if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
         window_size_right = -1;
     }
-    if (causal_flag) {
+    if (is_causal) {
         window_size_right = 0;
     }
     is_causal = (window_size_left < 0 && window_size_right == 0);
@@ -669,20 +663,14 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(head_size <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    // causal=true is the same as causal=false when seqlen_q == 1 (decode).
-    if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
-        is_causal = false;
-    }
-
     bool is_local = false;
-    const bool causal_flag = is_causal;
     if (seqlen_k > 0 && window_size_left >= seqlen_k - 1) {
         window_size_left = -1;
     }
     if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
         window_size_right = -1;
     }
-    if (causal_flag) {
+    if (is_causal) {
         window_size_right = 0;
     }
     is_causal = (window_size_left < 0 && window_size_right == 0);
@@ -911,20 +899,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    // causal=true is the same as causal=false when max_seqlen_q == 1 (decode).
-    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) {
-        is_causal = false;
-    }
-
     bool is_local = false;
-    const bool causal_flag = is_causal;
     if (max_seqlen_k > 0 && window_size_left >= max_seqlen_k - 1) {
         window_size_left = -1;
     }
     if (max_seqlen_q > 0 && window_size_right >= max_seqlen_q - 1) {
         window_size_right = -1;
     }
-    if (causal_flag) {
+    if (is_causal) {
         window_size_right = 0;
     }
     is_causal = (window_size_left < 0 && window_size_right == 0);

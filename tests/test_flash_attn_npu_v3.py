@@ -582,18 +582,31 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
 
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal)
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True),
-    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False),
-    (torch.float16, 7, 5, 1, 512, 512, 128, True),
-    (torch.float16, 7, 5, 1, 777, 888, 192, False),
-    (torch.float16, 7, 5, 1, 1777, 1888, 256, True),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True),
-    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True),
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right)
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1),
+    # SWA
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 512, 0),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 256, 128),
+    (torch.float16, 2, 4, 4, 256, 256, 128, False, 64, 128),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, False, 0, 256),
+    (torch.bfloat16, 2, 6, 2, 128, 256, 128, True, 127, 0),
+    (torch.bfloat16, 2, 4, 4, 128, 512, 128, True, 511, 0),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0),
+    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal", test_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right", test_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name:
         pytest.skip("flash_attn_varlen_func only support Ascend910")
@@ -610,9 +623,18 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     max_seqlen_q = q_seqlen
     max_seqlen_k = kv_seqlen
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left = -1
-    window_size_right = -1
     softcap = 0.0
+
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
 
     output_npu, softmax_lse = flash_attn_varlen_func(
         query,
@@ -631,17 +653,51 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_out = torch.empty((batch_size * q_seqlen, num_heads, head_size), dtype=data_type)
     golden_lseL = torch.empty((num_heads, batch_size * q_seqlen), dtype=torch.float32)
     atten_mask = None
-    if is_causal:
+
+    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+        preToken = kvSeqlen - qSeqlen - preToken
+        nextToken = kvSeqlen - qSeqlen + nextToken
+        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
+        for i in range(qSeqlen):
+            for j in range(kvSeqlen):
+                is_below_pretoken_line = (-i + j) < preToken
+                is_above_nexttoken_line = (-i + j) > nextToken
+                if is_below_pretoken_line or is_above_nexttoken_line:
+                    matrix[i][j] = 1
+        return torch.tensor(matrix, dtype=torch.bool)
+
+    if is_causal_golden:
         atten_mask = (torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1)).to(torch.bool)
+    elif is_local_golden:
+        atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
+
     for i in range(1, batch_size + 1):
         key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
         value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
         query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
-        if is_causal:
+        if is_causal_golden or is_local_golden:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type)
         else:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type)
         out = output.reshape(q_seqlen, num_heads, head_size)
+        if is_local_golden:
+            preTokens = window_size_left_golden
+            nextTokens = window_size_right_golden
+            preTokensChange = preTokens - kv_seqlen + q_seqlen
+            nextTokensChange = nextTokens + kv_seqlen - q_seqlen
+            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+            preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
+            actualSeq = q_seqlen
+            actualSeq -= nextTokensError
+            actualSeq -= preTokensError
+            if actualSeq != q_seqlen:
+                if nextTokensError != 0:
+                    actualSeq = q_seqlen - actualSeq
+                    out[ :actualSeq, :, :] = 0
+                    golden_lse[:, :actualSeq] = torch.inf
+                elif preTokensError != 0:
+                    out[actualSeq:, :, :] = 0
+                    golden_lse[:, actualSeq:] = torch.inf
         golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
         golden_lseL[:, (i - 1) * q_seqlen : i * q_seqlen] = golden_lse.reshape(num_heads, q_seqlen)
     rtol = 1e-2

@@ -294,18 +294,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
         }
         tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
-        // causal=true is the same as causal=false when seqlen_q == 1 (decode).
-        if (seqlen_q == 1) {
-            is_causal = false;
-        }
-        const bool causal_flag = is_causal;
         if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen - 1) {
             window_size_left = -1;
         }
         if (seqlen_q > 0 && window_size_right >= seqlen_q - 1) {
             window_size_right = -1;
         }
-        if (causal_flag) {
+        if (is_causal) {
             window_size_right = 0;
         }
         is_causal = (window_size_left < 0 && window_size_right == 0);

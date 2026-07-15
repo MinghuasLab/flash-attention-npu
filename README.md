@@ -547,7 +547,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | Causal Attention | ✅ | ✅ |
-| Sliding Window Attention | - | - |
+| Sliding Window Attention | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | Paged KV Cache | ✅ | ✅ |
 | Rotary Positional Embedding (RoPE) | - | - |
@@ -562,7 +562,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | Causal Attention | ✅ | ✅ |
-| Sliding Window Attention | - | - |
+| Sliding Window Attention | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | Backward Pass | ✅ | ✅ |
 | ALiBi | - | - |
@@ -576,7 +576,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | Causal Attention | ✅ | ✅ |
-| Sliding Window Attention | - | - |
+| Sliding Window Attention | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | Backward Pass | ✅ | ✅ |
 | Variable-length Sequences | ✅ | ✅ |
