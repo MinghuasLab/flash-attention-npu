@@ -1,6 +1,6 @@
 #include "fag_tiling.h"
-#include "../flash_attn_npu/softmax_tiling.cpp"
-#include "../flash_attn_npu/kernel_common_fag.hpp"
+#include "../flash_attn_npu_v2/softmax_tiling.cpp"
+#include "../flash_attn_npu_v2/kernel_common_fag.hpp"
 
 #include <cmath>
 #include <cstdio>

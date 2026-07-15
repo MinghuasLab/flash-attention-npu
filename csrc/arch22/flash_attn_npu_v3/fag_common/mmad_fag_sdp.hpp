@@ -5,7 +5,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/gemm_coord.hpp"
-#include "../../flash_attn_npu/fag_block.h"
+#include "../../flash_attn_npu_v2/fag_block.h"
 #include "catlass/gemm/helper.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"

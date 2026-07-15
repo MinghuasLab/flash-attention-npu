@@ -1,8 +1,4 @@
 [submodule "csrc/catlass"]
 	path = csrc/catlass
 	url = https://gitcode.com/cann/catlass.git
-	tag = v1.3.1-notla
-[submodule "csrc_AscendC950/catlass"]
-	path = csrc_AscendC950/catlass
-	url = https://gitcode.com/cann/catlass.git
-	branch = master
+	tag = v1.6.1

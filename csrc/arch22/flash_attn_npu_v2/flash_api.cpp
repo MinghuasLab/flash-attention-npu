@@ -1284,7 +1284,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         scale, is_causal, window_size_left, window_size_right, deterministic);
 }
 
-PYBIND11_MODULE(flash_attn_npu_2, m)
+PYBIND11_MODULE(flash_attn_npu_arch22_v2, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");

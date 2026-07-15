@@ -3,12 +3,12 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
-#include "../../flash_attn_npu/fag_block.h"
+#include "../../flash_attn_npu_v2/fag_block.h"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "kernel_operator.h"
-#include "../../flash_attn_npu/kernel_common_fag.hpp"
+#include "../../flash_attn_npu_v2/kernel_common_fag.hpp"
 
 using AscendC::CopyRepeatParams;
 using AscendC::DataCopyExtParams;
