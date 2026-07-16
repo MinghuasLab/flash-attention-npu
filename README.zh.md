@@ -533,7 +533,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ |
-| 滑动窗口注意力 | - | - |
+| 滑动窗口注意力 | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | 分页 KV 缓存 | ✅ | ✅ |
 | 旋转位置编码 (RoPE) | - | - |
@@ -548,7 +548,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ |
-| 滑动窗口注意力 | - | - |
+| 滑动窗口注意力 | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | 反向传播 | ✅ | ✅ |
 | ALiBi | - | - |
@@ -562,7 +562,7 @@ def flash_attn_varlen_func(
 | FP16 (float16) | ✅ | ✅ |
 | BF16 (bfloat16) | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ |
-| 滑动窗口注意力 | - | - |
+| 滑动窗口注意力 | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | 反向传播 | ✅ | ✅ |
 | 变长序列 | ✅ | ✅ |
