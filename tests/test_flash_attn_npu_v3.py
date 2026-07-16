@@ -162,7 +162,7 @@ test_cases = [
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "BSND", False, -1, -1, 0.0),
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "BSND", False, -1, -1, 0.0),
     # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
-        (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, "TND", False, -1, -1, 0.0),
     (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0),
     (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, "TND", False, -1, -1, 0.0),
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, "TND", False, -1, -1, 0.0),
@@ -264,7 +264,7 @@ test_cases = [
     (torch.bfloat16, 1, 10, 2, 10, 4096, 256, 1, 128, True, "TND", False, -1, -1, 0.0),
     (torch.bfloat16, 1, 8, 2, 8, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0),
     (torch.bfloat16, 1, 16, 2, 16, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0),
-
+    # Softcap
     (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 1, 128, False, "BSND", False, -1, -1, 30.0),
     (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 1, 128, True, "BSND", False, -1, -1, 50.0),
     (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 1, 128, False, "BSND", False, -1, -1, 50.0),
@@ -536,8 +536,11 @@ test_cases = [
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
     (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
     (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
+    # Softcap
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 50.0),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, 50.0)
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 50.0),
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
