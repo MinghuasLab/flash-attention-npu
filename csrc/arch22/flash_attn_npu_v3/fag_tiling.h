@@ -53,6 +53,7 @@ constexpr int64_t ATTEN_MASK_COMPRESS_DIM = 2048;
 
 struct FAGInfo {
     float scaleValue;
+    float softcapValue;
     float keepProb;
     int32_t maskType = 0;
     int32_t layout = 0;

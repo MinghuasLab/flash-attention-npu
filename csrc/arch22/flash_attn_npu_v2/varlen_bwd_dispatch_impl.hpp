@@ -42,6 +42,7 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
         const aclrtStream aclStream = a.aclStream;
         const uint64_t fftsAddr = a.fftsAddr;
         const bool is_causal = a.is_causal;
+        const bool is_softcap = a.is_softcap;
         uint8_t *qDevice = a.qDevice;
         uint8_t *kDevice = a.kDevice;
         uint8_t *vDevice = a.vDevice;
@@ -67,18 +68,34 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
         aclCheck(aclrtSynchronizeStream(aclStream));
         Adx::AdumpPrintWorkSpace(ptrDumpDevice, ALL_DUMPSIZE, aclStream, "device_fag");
         aclCheck(aclrtFree(ptrDumpDevice));
-#else
-        if (is_causal) {
-            FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND><<<blockDim, nullptr, aclStream>>>(
-                fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
-                attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
-        } else {
-            FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND><<<blockDim, nullptr, aclStream>>>(
-                fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
-                attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+#else      
+        if (is_softcap) {
+            if (is_causal) {
+                FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, true><<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+            } else {
+                FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, true><<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+            }
         }
+        else {
+            if (is_causal) {
+                FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, false><<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+            } else {
+                FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, false><<<blockDim, nullptr, aclStream>>>(
+                    fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+            }
+        }
+        
 #endif
         return 0;
     };

@@ -347,7 +347,8 @@ private:
 template <
     typename InputDtype = half,
     MaskType maskType = MaskType::NO_MASK,
-    InputLayout inputLayout = InputLayout::TND>
+    InputLayout inputLayout = InputLayout::TND,
+    bool HAS_SOFTCAP = false>
 __global__ __aicore__
 void FAGVarlenOpt(uint64_t fftsAddr,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR dout,
@@ -431,7 +432,7 @@ void FAGVarlenOpt(uint64_t fftsAddr,
     using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp;
+    using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp<HAS_SOFTCAP>;
     using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>, FAGv2TilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV

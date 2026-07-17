@@ -23,6 +23,7 @@ std::vector<at::Tensor> launch_fag_general(
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     float softmax_scale,
+    float softcap,
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,

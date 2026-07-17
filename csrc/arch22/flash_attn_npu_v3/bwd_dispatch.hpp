@@ -30,6 +30,7 @@ struct BwdLaunchArgs {
     aclrtStream aclStream;
     uint64_t fftsAddr;
     bool is_bf16;
+    bool is_softcap;
     bool has_attn_mask;
     bool deterministic;
     uint32_t qk_headdim_kernel;  // 64 / 128 / 192 / 256

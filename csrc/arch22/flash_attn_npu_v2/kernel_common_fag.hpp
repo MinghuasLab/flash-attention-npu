@@ -38,6 +38,7 @@ struct FAGTilingData {
     uint32_t attenMaskCompressMode = 0;
     uint32_t layoutType;
     float scaleValue;
+    float softcapValue;
     float keepProb;
 
     uint32_t dataTypeSize;
@@ -94,6 +95,7 @@ struct FAGv2TilingData {
     int64_t dsWorkSpaceOffset;
     uint32_t coreNum;
     float scaleValue;
+    float softcapValue;
     int64_t batch;
     int64_t t1;
     int64_t t2;

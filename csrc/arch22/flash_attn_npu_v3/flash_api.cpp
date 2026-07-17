@@ -597,10 +597,10 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
 
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!is_varlen_q || is_varlen_kv, "If cu_seqlens_q is provided in bwd, cu_seqlens_k must also be provided");
     TORCH_CHECK(!seqused_q_.has_value(), "mha_bwd does not support seqused_q yet.");
     TORCH_CHECK(!seqused_k_.has_value(), "mha_bwd does not support seqused_k yet.");
-    TORCH_CHECK(softcap == 0.0, "mha_bwd does not support softcap yet.");
     TORCH_CHECK(sm_margin == 0, "mha_bwd does not support sm_margin yet.");
 
     at::Tensor cu_seqlens_q;
@@ -638,6 +638,11 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     FAGTiling::FAGInfo fagInfo;
     fagInfo.scaleValue =
         softmax_scale_.has_value() ? static_cast<float>(softmax_scale_.value()) : 1.0f / sqrt(static_cast<float>(qk_headdim));
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        fagInfo.scaleValue = fagInfo.scaleValue / softcap;
+    }
+    fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
     if (window_size_left >= max_seqlen_k - 1) {
         window_size_left = -1;
@@ -768,6 +773,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     bwd_args.aclStream = aclStream;
     bwd_args.fftsAddr = fftsAddr;
     bwd_args.is_bf16 = is_bf16;
+    bwd_args.is_softcap = has_softcap;
     bwd_args.has_attn_mask = has_attn_mask;
     bwd_args.deterministic = deterministic;
     bwd_args.qk_headdim_kernel = qk_headdim_kernel;

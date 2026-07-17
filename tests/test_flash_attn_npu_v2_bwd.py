@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch_npu
 
-from flash_attn_npu_v2 import flash_attn_varlen_func, flash_attn_func
+from flash_attn_npu_v2 import flash_attn_func, flash_attn_varlen_func
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
@@ -42,8 +42,7 @@ def golden_tolerance(_data_type):
 def assert_grad_close(fa_grad, golden_grad, data_type, name=""):
     rtol, atol = golden_tolerance(data_type)
     torch.testing.assert_close(
-        fa_grad.cpu(), golden_grad.cpu(), rtol=rtol, atol=atol,
-        msg=f"{name} grad mismatch (rtol={rtol}, atol={atol})",
+        fa_grad.cpu(), golden_grad.cpu(), rtol=rtol, atol=atol
     )
 
 
@@ -75,7 +74,7 @@ def rand_inputs(shape, data_type, device):
 
 def run_bsnd_bwd(
     query, key, value, dout, data_type,
-    num_heads, kv_heads, scale, is_causal, window_size=(-1, -1),
+    num_heads, kv_heads, scale, softcap, is_causal, window_size=(-1, -1),
 ):
     q_ag = query.detach().clone().requires_grad_(True)
     k_ag = key.detach().clone().requires_grad_(True)
@@ -85,6 +84,7 @@ def run_bsnd_bwd(
         q_ag, k_ag, v_ag,
         dropout_p=DROPOUT_P,
         softmax_scale=scale,
+        softcap=softcap,
         causal=is_causal,
         window_size=window_size,
         return_attn_probs=True,
@@ -94,7 +94,7 @@ def run_bsnd_bwd(
 
     dq_golden, dk_golden, dv_golden = golden_bsnd_bwd_from_fwd(
         query, key, value, dout, out_fa.detach(), lse_fa.detach(),
-        num_heads, kv_heads, scale, DROPOUT_P,
+        num_heads, kv_heads, scale, softcap, DROPOUT_P,
         is_causal, window_size[0], window_size[1],
         gtype=GTYPE,
     )
@@ -106,7 +106,7 @@ def run_varlen_bwd(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     seqlens_q, seqlens_k,
-    scale, is_causal, window_size=(-1, -1),
+    scale, softcap, is_causal, window_size=(-1, -1),
 ):
     num_heads = query.shape[1]
     kv_heads = key.shape[1]
@@ -121,6 +121,7 @@ def run_varlen_bwd(
         max_seqlen_q, max_seqlen_k,
         dropout_p=DROPOUT_P,
         softmax_scale=scale,
+        softcap=softcap,
         causal=is_causal,
         window_size=window_size,
         return_attn_probs=True,
@@ -130,7 +131,7 @@ def run_varlen_bwd(
 
     dq_golden, dk_golden, dv_golden = golden_tnd_bwd_from_fwd(
         query, key, value, dout, out_fa.detach(), lse_fa.detach(),
-        num_heads, kv_heads, seqlens_q, seqlens_k, scale, DROPOUT_P,
+        num_heads, kv_heads, seqlens_q, seqlens_k, scale, softcap, DROPOUT_P,
         is_causal, window_size[0], window_size[1],
         gtype=GTYPE,
     )
@@ -144,23 +145,31 @@ def assert_bwd_results(data_type, dq_ag, dk_ag, dv_ag, dq_golden, dk_golden, dv_
 
 
 test_cases_bsnd = [
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, False),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, True),
-    (torch.float16, 7, 1, 1, 512, 512, 128, False),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False),
-    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, 0.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 0.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 0.0),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 0.0),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 30.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 30.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, 30.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 30.0),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 30.0),
 ]
 
 
 @pytest.mark.parametrize(
-    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
     test_cases_bsnd,
 )
 def test_fa_bsnd_bwd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap,
 ):
     query = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
     key = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
@@ -170,31 +179,39 @@ def test_fa_bsnd_bwd(
     scale = 1.0 / (head_size ** 0.5)
     results = run_bsnd_bwd(
         query, key, value, dout, data_type,
-        num_heads, kv_heads, scale, is_causal, (-1, -1),
+        num_heads, kv_heads, scale, softcap, is_causal, (-1, -1),
     )
     assert_bwd_results(*results)
 
 
 test_cases_bsnd_swa = [
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256),
-    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 0.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 30.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 30.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
 ]
 
 
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, "
-    "is_causal, window_size_left, window_size_right",
+    "is_causal, window_size_left, window_size_right, softcap",
     test_cases_bsnd_swa,
 )
 def test_fa_bsnd_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size_left, window_size_right,
+    is_causal, window_size_left, window_size_right, softcap
 ):
     query = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
     key = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
@@ -205,27 +222,33 @@ def test_fa_bsnd_bwd_swa(
     window_size = (window_size_left, window_size_right)
     results = run_bsnd_bwd(
         query, key, value, dout, data_type,
-        num_heads, kv_heads, scale, is_causal, window_size,
+        num_heads, kv_heads, scale, softcap, is_causal, window_size,
     )
     assert_bwd_results(*results)
 
 
 test_cases_varlen = [
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True),
-    (torch.float16, 1, 5, 1, 512, 512, 128, True),
-    (torch.float16, 1, 5, 1, 777, 888, 192, False),
-    (torch.float16, 1, 5, 1, 1777, 1888, 256, True),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True),
-    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 0.0),
+    (torch.float16, 1, 5, 1, 512, 512, 128, True, 0.0),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, 0.0),
+    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 0.0),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 0.0),
+    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 30.0),
+    (torch.float16, 1, 5, 1, 512, 512, 128, True, 30.0),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, 30.0),
+    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 30.0),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 30.0),
+    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 30.0),
 ]
 
 
 @pytest.mark.parametrize(
-    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
     test_cases_varlen,
 )
 def test_fa_varlen_bwd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap
 ):
     total_q = batch_size * q_seqlen
     total_k = batch_size * kv_seqlen
@@ -245,26 +268,29 @@ def test_fa_varlen_bwd(
         cu_seqlens_q, cu_seqlens_k,
         q_seqlen, kv_seqlen,
         seqlens_q, seqlens_k,
-        scale, is_causal, (-1, -1),
+        scale, softcap, is_causal, (-1, -1),
     )
     assert_bwd_results(*results)
 
 
 test_cases_varlen_swa = [
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0),
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256),
-    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 0.0),
+    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 0.0),
+     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 30.0),
+    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 30.0),
 ]
 
 
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, "
-    "is_causal, window_size_left, window_size_right",
+    "is_causal, window_size_left, window_size_right, softcap",
     test_cases_varlen_swa,
 )
 def test_fa_varlen_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size_left, window_size_right,
+    is_causal, window_size_left, window_size_right, softcap
 ):
     total_q = batch_size * q_seqlen
     total_k = batch_size * kv_seqlen
@@ -285,6 +311,6 @@ def test_fa_varlen_bwd_swa(
         cu_seqlens_q, cu_seqlens_k,
         q_seqlen, kv_seqlen,
         seqlens_q, seqlens_k,
-        scale, is_causal, window_size,
+        scale, softcap, is_causal, window_size,
     )
     assert_bwd_results(*results)

@@ -56,8 +56,10 @@ struct EpilogueAtlasA2FAGPre {
 };
 
 // For AtlasA2, MLAG Op
+template <bool HAS_SOFTCAP_>
 struct EpilogueAtlasA2FAGOp {
     using ArchTag = Arch::AtlasA2;
+    static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
 };
 
 // For AtlasA2, MLAG Sfmg
@@ -67,9 +69,11 @@ struct EpilogueAtlasA2FAGSfmg {
 };
 
 // For AtlasA2, MLAG Op
-template <uint32_t INPUT_LAYOUT_, bool IS_DROP_, bool IS_ATTEN_MASK_>
+template <uint32_t INPUT_LAYOUT_, bool IS_DROP_, bool IS_ATTEN_MASK_,
+bool HAS_SOFTCAP_>
 struct EpilogueAtlasA2SameAbVec {
     using ArchTag = Arch::AtlasA2;
+    static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
 };
 
 // For AtlasA2, MLAG Post

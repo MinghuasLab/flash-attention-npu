@@ -290,6 +290,7 @@ void DoPreSfmgTiling(FAGTilingData &fagTilingData)
 int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivNum, uint64_t ubSize, FAGTilingData &fagTilingData)
 {
     fagTilingData.scaleValue = fagInfo.scaleValue;
+    fagTilingData.softcapValue = fagInfo.softcapValue;
     fagTilingData.keepProb = fagInfo.keepProb;
     fagTilingData.batch = fagInfo.batch;
     fagTilingData.qSeqlen = fagInfo.qSeqlen;

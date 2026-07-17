@@ -18,6 +18,7 @@
 namespace FAGTiling {
 struct FAGInfo {
     float scaleValue;
+    float softcapValue;
 
     int64_t seqQShapeSize;
     int64_t queryShape_0;
@@ -67,6 +68,7 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     uint32_t coreNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t vectorCoreNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     fagV2TilingData->coreNum = vectorCoreNum;
+    fagV2TilingData->softcapValue = fagInfo.softcapValue;
     fagV2TilingData->scaleValue = fagInfo.scaleValue;
     fagV2TilingData->batch = fagInfo.seqQShapeSize;
     fagV2TilingData->t1 = fagInfo.queryShape_0;

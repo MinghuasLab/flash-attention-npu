@@ -46,35 +46,35 @@
 // All 17 FAGGeneral launch arguments are identical across every instantiation;
 // only the template parameters differ. Collapse the boilerplate into a macro so
 // the call sites cannot drift from each other.
-#define BWD_LAUNCH(DT, DTYPE, IS_MASK, IS_DTM)                                       \
-    do {                                                                             \
-        FAGGeneral<DT, DTYPE, kInputLayout, IS_MASK, 0, IS_DTM>                      \
-            <<<blockDim, nullptr, aclStream>>>(                                      \
-                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice,          \
-                nullptr, attenMaskDevice, softMaxLseDevice,                          \
-                cuSeqQlenDevice, cuSeqKvlenDevice,                                   \
-                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice); \
+#define BWD_LAUNCH(DT, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP)                                       \
+    do {                                                                                         \
+        FAGGeneral<DT, DTYPE, kInputLayout, IS_MASK, 0, IS_DTM, IS_SOFTCAP>                      \
+            <<<blockDim, nullptr, aclStream>>>(                                                  \
+                fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice,                      \
+                nullptr, attenMaskDevice, softMaxLseDevice,                                      \
+                cuSeqQlenDevice, cuSeqKvlenDevice,                                               \
+                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);           \
     } while (0)
 
 // Pick the headdim specialization at runtime.
-#define BWD_LAUNCH_HD(DTYPE, IS_MASK, IS_DTM)              \
-    do {                                                    \
-        switch (qk_headdim_kernel) {                        \
-            case 64:                                        \
-                BWD_LAUNCH(DTemplateType::Aligned64, DTYPE, IS_MASK, IS_DTM);  \
-                break;                                      \
-            case 128:                                       \
-                BWD_LAUNCH(DTemplateType::Aligned128, DTYPE, IS_MASK, IS_DTM); \
-                break;                                      \
-            case 192:                                       \
-                BWD_LAUNCH(DTemplateType::Aligned192, DTYPE, IS_MASK, IS_DTM); \
-                break;                                      \
-            case 256:                                       \
-                BWD_LAUNCH(DTemplateType::Aligned256, DTYPE, IS_MASK, IS_DTM); \
-                break;                                      \
-            default:                                        \
-                break;                                      \
-        }                                                   \
+#define BWD_LAUNCH_HD(DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP)                                  \
+    do {                                                                                   \
+        switch (qk_headdim_kernel) {                                                       \
+            case 64:                                                                       \
+                BWD_LAUNCH(DTemplateType::Aligned64, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP);  \
+                break;                                                                     \
+            case 128:                                                                      \
+                BWD_LAUNCH(DTemplateType::Aligned128, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
+                break;                                                                     \
+            case 192:                                                                      \
+                BWD_LAUNCH(DTemplateType::Aligned192, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
+                break;                                                                     \
+            case 256:                                                                      \
+                BWD_LAUNCH(DTemplateType::Aligned256, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
+                break;                                                                     \
+            default:                                                                       \
+                break;                                                                     \
+        }                                                                                  \
     } while (0)
 
 // Bind the BwdLaunchArgs fields to the names the launch macros expect, then run
@@ -87,6 +87,7 @@ void bwd_dispatch_run(const BwdLaunchArgs &a) {
     const uint32_t blockDim = a.blockDim;
     const aclrtStream aclStream = a.aclStream;
     const uint64_t fftsAddr = a.fftsAddr;
+    const bool is_softcap = a.is_softcap;
     const bool has_attn_mask = a.has_attn_mask;
     const bool deterministic = a.deterministic;
     const uint32_t qk_headdim_kernel = a.qk_headdim_kernel;
@@ -105,22 +106,39 @@ void bwd_dispatch_run(const BwdLaunchArgs &a) {
     uint8_t *workspaceDevice = a.workspaceDevice;
     uint8_t *tilingDevice = a.tilingDevice;
     (void)blockDim; (void)aclStream; (void)fftsAddr; (void)has_attn_mask;
-    (void)deterministic; (void)qk_headdim_kernel;
+    (void)deterministic; (void)is_softcap; (void)qk_headdim_kernel;
 
     auto launch_fag_general_kernel = [=]() -> int {
-        if (has_attn_mask) {
-            if (deterministic) {
-                BWD_LAUNCH_HD(DType, 1, 1);
+        if (is_softcap) {
+            if (has_attn_mask) {
+                if (deterministic) {
+                    BWD_LAUNCH_HD(DType, 1, 1, 1);
+                } else {
+                    BWD_LAUNCH_HD(DType, 1, 0, 1);
+                }
             } else {
-                BWD_LAUNCH_HD(DType, 1, 0);
+                if (deterministic) {
+                    BWD_LAUNCH_HD(DType, 0, 1, 1);
+                } else {
+                    BWD_LAUNCH_HD(DType, 0, 0, 1);
+                }
             }
         } else {
-            if (deterministic) {
-                BWD_LAUNCH_HD(DType, 0, 1);
+            if (has_attn_mask) {
+                if (deterministic) {
+                    BWD_LAUNCH_HD(DType, 1, 1, 0);
+                } else {
+                    BWD_LAUNCH_HD(DType, 1, 0, 0);
+                }
             } else {
-                BWD_LAUNCH_HD(DType, 0, 0);
+                if (deterministic) {
+                    BWD_LAUNCH_HD(DType, 0, 1, 0);
+                } else {
+                    BWD_LAUNCH_HD(DType, 0, 0, 0);
+                }
             }
         }
+        
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fag_general", launch_fag_general_kernel);

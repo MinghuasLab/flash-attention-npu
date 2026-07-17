@@ -30,6 +30,7 @@ std::vector<at::Tensor> launch_fag_general(
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     float softmax_scale,
+    float softcap,
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
@@ -67,7 +68,15 @@ std::vector<at::Tensor> launch_fag_general(
     uint32_t tilingSize = sizeof(FAGTilingData);
     at::Tensor tiling_cpu_tensor = at::empty({static_cast<long>(tilingSize)}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
-    fagInfo.scaleValue = softmax_scale;
+    
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        fagInfo.scaleValue = softmax_scale / softcap;
+    } else {
+        fagInfo.scaleValue = softmax_scale;
+    }
+    fagInfo.softcapValue = softcap;
+
     fagInfo.keepProb = 1.0f;
     if (window_size_left >= max_seqlen_k - 1) {
         window_size_left = -1;
@@ -195,6 +204,7 @@ std::vector<at::Tensor> launch_fag_general(
     gen_args.aclStream = aclStream;
     gen_args.fftsAddr = fftsAddr;
     gen_args.is_causal = has_attn_mask;
+    gen_args.is_softcap = has_softcap;
     gen_args.deterministic = deterministic;
     gen_args.qk_headdim_kernel = qk_headdim_kernel;
     gen_args.dOutDevice = dOutDevice;

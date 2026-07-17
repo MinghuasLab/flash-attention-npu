@@ -1114,6 +1114,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
+
     // parse shape args
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
@@ -1141,7 +1143,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
             dout, q, k, v, out, softmax_lse, dq, dk, dv,
             seqlens_q, seqlens_k,
             max_seqlen_q, max_seqlen_k,
-            scale, local_is_causal, local_window_size_left, local_window_size_right, deterministic);
+            scale, softcap, local_is_causal, local_window_size_left, local_window_size_right, deterministic);
     }
 
     // tiling args set
@@ -1155,7 +1157,13 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     fagInfo.queryShape_1 = nheads;
     fagInfo.keyShape_1 = nheads_k;
     fagInfo.queryShape_2 = headdim;
-    fagInfo.scaleValue = 1.0 / sqrt(headdim);
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        fagInfo.scaleValue = softmax_scale / softcap;
+    } else {
+        fagInfo.scaleValue = softmax_scale;
+    }
+    fagInfo.softcapValue = softcap;
     uint64_t workspaceSize = 0;
     FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()), workspaceSize);
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -1213,6 +1221,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     vb_args.fftsAddr = fftsAddr;
     vb_args.is_bf16 = is_bf16;
     vb_args.is_causal = is_causal;
+    vb_args.is_softcap = has_softcap;
     vb_args.qDevice = qDevice;
     vb_args.kDevice = kDevice;
     vb_args.vDevice = vDevice;
@@ -1276,6 +1285,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         dv = torch::empty_like(v);
     }
 
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
+
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
     float scale = softmax_scale > 0.f ? softmax_scale
@@ -1284,7 +1295,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         dout, q, k, v, out, softmax_lse, dq, dk, dv,
         std::nullopt, std::nullopt,
         qsizes[1], ksizes[1],
-        scale, is_causal, window_size_left, window_size_right, deterministic);
+        scale, softcap, is_causal, window_size_left, window_size_right, deterministic);
 }
 
 PYBIND11_MODULE(flash_attn_npu_arch22_v2, m)

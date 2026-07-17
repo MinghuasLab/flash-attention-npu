@@ -32,7 +32,8 @@ struct FagGeneralLaunchArgs {
     uint64_t fftsAddr;
     bool is_causal;
     bool deterministic;
-    uint32_t qk_headdim_kernel;   // 64 / 128 / 192 / 256
+    bool is_softcap;
+    uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256
     uint8_t *dOutDevice;
     uint8_t *qDevice;
     uint8_t *kDevice;

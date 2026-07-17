@@ -38,22 +38,24 @@ template <
     uint32_t INPUT_LAYOUT_,
     uint32_t IS_DROP_,
     uint32_t IS_ATTEN_MASK_,
-    class TilingData
+    class TilingData,
+    bool HAS_SOFTCAP_
 >
 class BlockEpilogue<
-    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_>,
+    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_>,
     OutputType_,
     InputType_,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_>;
+    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using T1 = InputType_;
     using T2 = OutputType_;
     static constexpr uint32_t INPUT_LAYOUT = INPUT_LAYOUT_;
     static constexpr bool IS_DROP = IS_DROP_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
+    static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
 
     AscendC::TPipe *pipe;
     TBuf<> unifiedBuffer;
@@ -105,6 +107,7 @@ public:
 
     float keepProb;
     float scaleValue;
+    float softcapValue;
     int64_t s1Token;
     int64_t s2Token;
     int64_t actualCalcS1Token;
@@ -186,6 +189,7 @@ public:
     constexpr static uint32_t PREFIX_COMPRESS_CAUSAL_S_SIZE = 2048;
     constexpr static uint32_t PREFIX_COMPRESS_ALL_MASK_S1_SIZE = 1024;
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
+    constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
@@ -291,6 +295,7 @@ public:
         }
         keepProb = tilingData->keepProb;
         scaleValue = tilingData->scaleValue;
+        softcapValue = tilingData->softcapValue;
         compressMode = tilingData->attenMaskCompressMode;
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
@@ -664,13 +669,33 @@ public:
 
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(vecClc2Buffer, vecClc2Buffer, (T2)scaleValue, s1ExtendSubGraph * s2ExtendAlign);
+        AscendC::PipeBarrier<PIPE_V>();
 
+        // recompute softcap
+        if constexpr (HAS_SOFTCAP) {
+            AscendC::Maxs(vecClc2Buffer, vecClc2Buffer, -8.8f, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Muls(vecClc2Buffer, vecClc2Buffer, -2.0f, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp(vecClc2Buffer, vecClc2Buffer, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, 1.0f, s1ExtendSubGraph * s2ExtendAlign);
+            // temp buffer for softcap
+            AscendC::LocalTensor<float> softcapBuffer = unifiedBuffer.GetWithOffset<float>(
+                cal_repeat_num, SOFTCAP_UB_OFFSET);
+            AscendC::Duplicate<float, false>(softcapBuffer, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0, 
+                    (s1ExtendSubGraph*s2ExtendAlign)/64, {1, 1, 1, 8, 0, 8});
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         ///////////////////////////////////////////////////////////////
         // attenMask
         ///////////////////////////////////////////////////////////////
         if constexpr (IS_ATTEN_MASK == ENABLE) {
-            AscendC::PipeBarrier<PIPE_V>();
-
             // uint8_t
             if (AttenBandMode == AttenMaskCompress::All || AttenBandMode == AttenMaskCompress::NextOnly) {
                 CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign);
@@ -688,9 +713,9 @@ public:
                 AscendC::WaitFlag<HardEvent::MTE2_V>(static_cast<int32_t>(vWaitMte2));
                 CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
             }
+            AscendC::PipeBarrier<PIPE_V>();
         }
 
-        AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(T2), DbBegin);
         CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1ExtendSubGraph, s2Extend, s2ExtendAlign, softmaxTilingData);
         LocalTensor<T2> vecDropBuffer = simpleSoftmaxResBuf;
@@ -787,6 +812,15 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3B);
         }
 
+        // Save S values before SubGrapA(i+1) MTE overwrites T2Begin
+        if constexpr (HAS_SOFTCAP) {
+            AscendC::LocalTensor<float> savedS = unifiedBuffer.GetWithOffset<float>(
+                32 * 1024 / sizeof(float), TMP_UB_OFFSET);
+            AscendC::LocalTensor<float> srcS = unifiedBuffer.GetWithOffset<float>(
+                32 * 1024 / sizeof(float), T2Begin);
+            AscendC::DataCopy(savedS, srcS, s1ExtendSubGraph * s2ExtendAlign);
+        }
+
         if (preS1Idx != curS1Idx) {
             preS1Idx = curS1Idx;
             LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
@@ -880,10 +914,29 @@ public:
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(32 * 1024 / sizeof(float), DbBegin);
 
         AscendC::Mul(vecClc1Buffer, vecClc1Buffer, simpleSoftmaxResBuf, s1ExtendSubGraph * s2ExtendAlign);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        if constexpr (HAS_SOFTCAP) {
+            // Use saved copy from TMP_UB_OFFSET (avoids race with SubGrapA MTE)
+            AscendC::LocalTensor<float> vecClc2Buffer =
+            unifiedBuffer.GetWithOffset<float>(32 * 1024 / sizeof(float), TMP_UB_OFFSET);
+            // avoid mask -INF
+            AscendC::Maxs(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(vecClc2Buffer, vecClc2Buffer, vecClc2Buffer, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            // softcap * (1 - (S/softcap)^2) = softcap * sech^2(x)
+            AscendC::Muls(vecClc2Buffer, vecClc2Buffer, -(1.0f/softcapValue), s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, softcapValue, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(vecClc1Buffer, vecClc1Buffer, vecClc2Buffer, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         LocalTensor<T1> vecCopyOutBuffer = vecClc1Buffer.template ReinterpretCast<T1>();
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_ROUND, s1ExtendSubGraph * s2ExtendAlign);
         }
 
@@ -985,16 +1038,18 @@ public:
 template <
     class ElementVecDtype,
     InputLayout inputLayout,
-    class TilingData>
+    class TilingData,
+    bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueAtlasA2FAGOp,
+    EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>,
     ElementVecDtype,
     std::integral_constant<InputLayout, inputLayout>,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2FAGOp;
+    using DispatchPolicy = EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
+    static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
 
     static constexpr InputLayout getLayout()
     {
@@ -1027,6 +1082,7 @@ public:
     constexpr static uint32_t T2BlockBegin = 66 * 1024;
 
     constexpr static uint32_t DbBegin = 74 * 1024;
+    constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
@@ -1054,6 +1110,7 @@ public:
     int64_t t1;
 
     float scaleValue;
+    float softcapValue;
 
     int32_t cubeBaseMN;
 
@@ -1119,6 +1176,7 @@ public:
         int64_t dsWorkSpaceOffset = tilingData->dsWorkSpaceOffset;
 
         scaleValue = tilingData->scaleValue;
+        softcapValue = tilingData->softcapValue;
         softmaxTilingData.srcM = tilingData->softmaxTilingData.srcM;
         softmaxTilingData.srcK = tilingData->softmaxTilingData.srcK;
         softmaxTilingData.srcSize = tilingData->softmaxTilingData.srcSize;
@@ -1288,19 +1346,40 @@ public:
 
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(vecClc2Buffer, vecClc2Buffer, scaleValue, s1Extend * s2ExtendAlign);
-
         AscendC::PipeBarrier<PIPE_V>();
+
+        // recompute softcap
+        if constexpr (HAS_SOFTCAP) {
+            AscendC::Maxs(vecClc2Buffer, vecClc2Buffer, -8.8f, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Muls(vecClc2Buffer, vecClc2Buffer, -2.0f, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp(vecClc2Buffer, vecClc2Buffer, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, 1.0f, s1Extend * s2ExtendAlign);
+
+            AscendC::LocalTensor<float> softcapBuffer = unifiedBuffer.GetWithOffset<float>(
+                cal_repeat_num, SOFTCAP_UB_OFFSET);
+            AscendC::Duplicate<float, false>(softcapBuffer, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0, s1Extend*s2ExtendAlign/64, {1, 1, 1, 8, 0, 8});
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         LocalTensor<uint8_t> attenMaskUbuint8 =
             unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
         if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
             CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
                 S2_CUBESIZE, 0);
+            AscendC::PipeBarrier<PIPE_V>();
         }
 
         ///////////////////////////////////////////////////////////////
         // simpleSoftMax
         ///////////////////////////////////////////////////////////////
-        AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(float), DbBegin);
         CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1Extend, s2Extend, s2ExtendAlign,
             softmaxTilingData);
@@ -1332,6 +1411,15 @@ public:
 
         if (curIdx > 0) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3B);
+        }
+
+        // Save S values before SubGrapA(i+1) MTE overwrites T2Begin
+        if constexpr (HAS_SOFTCAP) {
+            LocalTensor<float> savedS = unifiedBuffer.GetWithOffset<float>(
+                32 * 1024 / sizeof(float), TMP_UB_OFFSET);
+            LocalTensor<float> srcS = unifiedBuffer.GetWithOffset<float>(
+                32 * 1024 / sizeof(float), T2Begin);
+            AscendC::DataCopy(savedS, srcS, s1Extend * s2ExtendAlign);
         }
 
         // copyIn sfmg
@@ -1368,8 +1456,25 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(32 * 1024 / sizeof(float), DbBegin);
         Mul(vecClc1Buffer, vecClc1Buffer, simpleSoftmaxResBuf, s1Extend * s2ExtendAlign);
-
         AscendC::PipeBarrier<PIPE_V>();
+
+        if constexpr (HAS_SOFTCAP) {
+            // Use saved copy from TMP_UB_OFFSET (avoids race with SubGrapA MTE)
+            AscendC::LocalTensor<float> vecClc2Buffer =
+            unifiedBuffer.GetWithOffset<float>(32 * 1024 / sizeof(float), TMP_UB_OFFSET);
+            AscendC::Maxs(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(vecClc2Buffer, vecClc2Buffer, vecClc2Buffer, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            // softcap * (1 - (S/softcap)^2) = softcap * sech^2(x)
+            AscendC::Muls(vecClc2Buffer, vecClc2Buffer, -(1.0f/softcapValue), s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(vecClc2Buffer, vecClc2Buffer, softcapValue, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(vecClc1Buffer, vecClc1Buffer, vecClc2Buffer, s1Extend * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         LocalTensor<ElementVecDtype> vecCopyOutBuffer = unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 /
             sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
         Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_ROUND, s1Extend * s2ExtendAlign);

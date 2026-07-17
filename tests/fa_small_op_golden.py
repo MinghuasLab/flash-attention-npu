@@ -78,6 +78,16 @@ def _keep_prob(dropout_p):
     return 1.0 - dropout_p
 
 
+def _softcap_backward_factor(q, k, scale, softcap, compute_dtype, *, gtype=torch.float64):
+    if softcap <= 0.0:
+        return None
+    qb = q.to(compute_dtype)
+    kb = k.to(compute_dtype)
+    qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
+    tanh_qk = torch.tanh(qk.to(gtype) / softcap)
+    return 1.0 - tanh_qk * tanh_qk
+
+
 def sum_gqa_grad(dk_or_dv, nheads, nheads_k, batch, seq_k, headdim):
     if nheads == nheads_k:
         return dk_or_dv
@@ -96,6 +106,7 @@ def softmax_res_from_fa_lse_bsnd(
     k_bn,
     softmax_lse,
     scale,
+    softcap,
     is_causal,
     window_size_left,
     window_size_right,
@@ -110,6 +121,8 @@ def softmax_res_from_fa_lse_bsnd(
     qb = q_bn.to(compute_dtype)
     kb = k_bn.to(compute_dtype)
     qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
+    if softcap > 0.0:
+        qk = softcap * torch.tanh(qk / softcap)
     if atten_mask is not None and len(atten_mask.shape) != 0:
         qk = qk + atten_mask.to(torch.float32) * (-40000.0)
     lse = softmax_lse.to(torch.float32).to(gtype)
@@ -127,6 +140,7 @@ def softmax_res_from_fa_lse_tnd_slice(
     k_bn,
     softmax_lse_nt_slice,
     scale,
+    softcap,
     is_causal,
     window_size_left,
     window_size_right,
@@ -141,6 +155,8 @@ def softmax_res_from_fa_lse_tnd_slice(
     qb = q_bn.to(compute_dtype)
     kb = k_bn.to(compute_dtype)
     qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
+    if softcap > 0.0:
+        qk = softcap * torch.tanh(qk / softcap)
     if atten_mask is not None and len(atten_mask.shape) != 0:
         qk = qk + atten_mask.to(torch.float32) * (-40000.0)
     lse = softmax_lse_nt_slice.to(torch.float32).to(gtype).unsqueeze(0).unsqueeze(-1)
@@ -150,7 +166,7 @@ def softmax_res_from_fa_lse_tnd_slice(
     return softmax_res
 
 
-def tbackward_bsnd(dx, q, k, v, softmax_res, drop_mask, scale, dropout_p):
+def tbackward_bsnd(dx, q, k, v, softmax_res, drop_mask, scale, softcap, dropout_p):
     keep_prob = _keep_prob(dropout_p)
     dp = torch.matmul(dx, v.permute(0, 1, 3, 2))
     if drop_mask is None or len(drop_mask.shape) == 0:
@@ -161,12 +177,15 @@ def tbackward_bsnd(dx, q, k, v, softmax_res, drop_mask, scale, dropout_p):
         dp_drop = dp * drop_mask * (1.0 / keep_prob)
     dv = torch.matmul(drop_res, dx)
     softmax_grad_res = tsoftmax_grad(dp_drop, softmax_res) * scale
+    softcap_factor = _softcap_backward_factor(q, k, scale, softcap, q.dtype)
+    if softcap_factor is not None:
+        softmax_grad_res = softmax_grad_res * softcap_factor
     dq = torch.matmul(softmax_grad_res, k)
     dk = torch.matmul(softmax_grad_res.permute(0, 1, 3, 2), q)
     return dq, dk, dv
 
 
-def tbackward_tnd(dx, q, k, v, softmax_res, drop_mask, scale, dropout_p):
+def tbackward_tnd(dx, q, k, v, softmax_res, drop_mask, scale, softcap, dropout_p):
     keep_prob = _keep_prob(dropout_p)
     if drop_mask is None or len(drop_mask.shape) == 0:
         drop_res = softmax_res.permute(0, 1, 3, 2)
@@ -177,6 +196,9 @@ def tbackward_tnd(dx, q, k, v, softmax_res, drop_mask, scale, dropout_p):
         dp_drop = dp * drop_mask * (1.0 / keep_prob)
     dv = torch.matmul(drop_res, dx)
     softmax_grad_res = tsoftmax_grad(dp_drop, softmax_res) * scale
+    softcap_factor = _softcap_backward_factor(q, k, scale, softcap, q.dtype)
+    if softcap_factor is not None:
+        softmax_grad_res = softmax_grad_res * softcap_factor
     dq = torch.matmul(softmax_grad_res, k)
     dk = torch.matmul(softmax_grad_res.permute(0, 1, 3, 2), q)
     return dq, dk, dv
@@ -192,6 +214,7 @@ def golden_bsnd_bwd_from_fwd(
     nheads,
     nheads_k,
     scale,
+    softcap,
     dropout_p,
     is_causal,
     window_size_left,
@@ -222,6 +245,7 @@ def golden_bsnd_bwd_from_fwd(
         k_new,
         lse_cpu,
         scale,
+        softcap,
         is_causal,
         window_size_left,
         window_size_right,
@@ -230,7 +254,7 @@ def golden_bsnd_bwd_from_fwd(
     )
     drop_mask = torch.tensor(1)
     dq_bn, dk_bn, dv_bn = tbackward_bsnd(
-        dx_bn, q_bn, k_new, v_new, softmax_res, drop_mask, scale, dropout_p
+        dx_bn, q_bn, k_new, v_new, softmax_res, drop_mask, scale, softcap, dropout_p
     )
     dk_bn = sum_gqa_grad(dk_bn, nheads, nheads_k, batch, seq_k, headdim)
     dv_bn = sum_gqa_grad(dv_bn, nheads, nheads_k, batch, seq_k, headdim)
@@ -253,6 +277,7 @@ def golden_tnd_bwd_from_fwd(
     seqlens_q,
     seqlens_k,
     scale,
+    softcap,
     dropout_p,
     is_causal,
     window_size_left,
@@ -302,6 +327,7 @@ def golden_tnd_bwd_from_fwd(
             ki_new,
             lse_i,
             scale,
+            softcap,
             is_causal,
             window_size_left,
             window_size_right,
@@ -309,7 +335,7 @@ def golden_tnd_bwd_from_fwd(
             gtype=gtype,
         )
         dqi, dki, dvi = tbackward_tnd(
-            dxi, qi, ki_new, vi_new, softmax_res_i, drop_mask, scale, dropout_p
+            dxi, qi, ki_new, vi_new, softmax_res_i, drop_mask, scale, softcap, dropout_p
         )
         dki = sum_gqa_grad(dki, nheads, nheads_k, 1, sk, headdim)
         dvi = sum_gqa_grad(dvi, nheads, nheads_k, 1, sk, headdim)
