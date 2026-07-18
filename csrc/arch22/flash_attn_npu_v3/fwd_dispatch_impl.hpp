@@ -33,12 +33,12 @@
 #include "mha_fwd_kvcache.cpp"
 
 // 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT)                                     \
+#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT, SOFTCAP)                            \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED,                                 \
                        FaiKenel::MaskType::MASK, FaiKenel::inputLayout::LAYOUT,    \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY>                      \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>             \
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
-            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
             workspaceDevice, tilingDevice)
 
@@ -56,6 +56,7 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     const bool is_causal = a.is_causal;
     const bool is_local = a.is_local;
     const bool flashDecodeFlag = a.flashDecodeFlag;
+    const bool has_softcap = a.has_softcap;
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
     uint8_t *vDevice = a.vDevice;
@@ -72,41 +73,89 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     if (paged_KV) {
         if (is_local) {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, true, MASK_SWA, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, MASK_SWA, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, MASK_SWA, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, true, MASK_SWA, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, MASK_SWA, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, MASK_SWA, BSND, false);
+                }
             }
         } else if (is_causal) {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, true, MASK_CAUSAL, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, MASK_CAUSAL, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, MASK_CAUSAL, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, true, MASK_CAUSAL, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, MASK_CAUSAL, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, MASK_CAUSAL, BSND, false);
+                }
             }
         } else {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, true, NO_MASK, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, NO_MASK, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, NO_MASK, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, true, NO_MASK, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, true, NO_MASK, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, true, NO_MASK, BSND, false);
+                }
             }
         }
     } else {
         if (is_local) {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, false, MASK_SWA, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, MASK_SWA, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, MASK_SWA, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, false, MASK_SWA, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, MASK_SWA, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, MASK_SWA, BSND, false);
+                }
             }
         } else if (is_causal) {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, false, MASK_CAUSAL, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, MASK_CAUSAL, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, MASK_CAUSAL, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, false, MASK_CAUSAL, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, MASK_CAUSAL, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, MASK_CAUSAL, BSND, false);
+                }
             }
         } else {
             if constexpr (IS_TND) {
-                FWD_LAUNCH(DType, false, NO_MASK, TND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, NO_MASK, TND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, NO_MASK, TND, false);
+                }
             } else {
-                FWD_LAUNCH(DType, false, NO_MASK, BSND);
+                if (has_softcap) {
+                    FWD_LAUNCH(DType, false, NO_MASK, BSND, true);
+                } else {
+                    FWD_LAUNCH(DType, false, NO_MASK, BSND, false);
+                }
             }
         }
     }

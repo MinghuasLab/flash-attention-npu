@@ -154,7 +154,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(!q_descale_.has_value(), "NPU FlashAttention does not support q_descale");
     TORCH_CHECK(!k_descale_.has_value(), "NPU FlashAttention does not support k_descale");
     TORCH_CHECK(!v_descale_.has_value(), "NPU FlashAttention does not support v_descale");
-    TORCH_CHECK(softcap == 0.0f, "NPU FlashAttention does not support softcap");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(attention_chunk == 0, "NPU FlashAttention does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "NPU FlashAttention supports num_splits in [0, ", blockDim,
@@ -238,6 +238,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     uint8_t *maskDevice = nullptr;
     bool flashDecodeFlag = false;
     bool is_local = false;
+    bool has_softcap = (softcap > 0.0f);
 
     at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
@@ -287,7 +288,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
         tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
         tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        if (has_softcap) {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+        } else {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        }
+        tiling_cpu_ptr->set_softcapValue(softcap);
         tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
         int32_t max_kv_seqlen = 0;
         for (int32_t i = 0; i < batch_size; i++) {
@@ -453,6 +459,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;

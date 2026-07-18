@@ -416,7 +416,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(!rotary_sin_.has_value(), "NPU FlashAttention does not support rotary embedding");
-    TORCH_CHECK(softcap == 0.0f, "NPU FlashAttention does not support softcap");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
 
     if (k_.has_value()) {
@@ -466,7 +466,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+    } else {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    }
+    tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     int32_t max_kv_seqlen = 0;
     for (int32_t i = 0; i < batch_size; i++) {
@@ -603,6 +609,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -645,7 +652,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     // block unsupported params
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
     TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
-    TORCH_CHECK(softcap == 0.0, "NPU FlashAttention does not support softcap.");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -741,7 +748,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     } else if (is_causal) {
         tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
     }
-    tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+    } else {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    }
+    tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
     tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
@@ -795,6 +808,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -854,7 +868,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
     TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
     TORCH_CHECK(!zero_tensors, "NPU FlashAttention does not support zero_tensors.");
-    TORCH_CHECK(softcap == 0.0, "NPU FlashAttention does not support softcap.");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
     TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
@@ -927,7 +941,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     } else if (is_causal) {
         tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
     }
-    tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    bool has_softcap = (softcap > 0.0f);
+    if (has_softcap) {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+    } else {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    }
+    tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
 
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
@@ -1019,6 +1039,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.is_causal = is_causal;
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
+    fwd_args.has_softcap = has_softcap;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;

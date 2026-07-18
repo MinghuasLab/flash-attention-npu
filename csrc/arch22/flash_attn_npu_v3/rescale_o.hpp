@@ -86,8 +86,8 @@ public:
         // Allocate UB space
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 8 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
 
+        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
@@ -102,7 +102,7 @@ public:
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        lse32_ubuf_tensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
+        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
     }
 
     __aicore__ inline
@@ -141,7 +141,7 @@ public:
                 (end - start) * FLOAT_BLOCK_SIZE
             );
             AscendC::Duplicate(
-                lse32_ubuf_tensor[start],
+                lseUbTensor[start],
                 LSE_OUT_INI,
                 (end - start)
             );
@@ -157,7 +157,7 @@ public:
                 (end - start) * FLOAT_BLOCK_SIZE
             );
             AscendC::Duplicate(
-                lse32_ubuf_tensor[start],
+                lseUbTensor[start],
                 LSE_OUT_INI,
                 (end - start)
             );
@@ -519,15 +519,15 @@ public:
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
-                        lse32_ubuf_tensor,
+                        lseUbTensor,
                         glUbTensor,
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Add<float, false>(
-                        lse32_ubuf_tensor,
-                        lse32_ubuf_tensor,
+                        lseUbTensor,
+                        lseUbTensor,
                         gmUbTensor,
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -536,7 +536,7 @@ public:
                     // *** lse_block = expand_to_block(lse)
                     AscendC::Brcb(
                         tvUbTensor.ReinterpretCast<uint32_t>(),
-                        lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
+                        lseUbTensor.ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
                     InvalidLineLSEProcess(qNThisSubBlock, delStartRow, qSBlockIdx,
@@ -567,7 +567,7 @@ public:
                         if (qNThisSubBlock == 0U) {
                             // single head: its tokens are contiguous in BNS/NT -> plain lse32 burst.
                             AscendC::DataCopyPad(
-                                gLse, lse32_ubuf_tensor,
+                                gLse, lseUbTensor,
                                 AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
                         } else {
                             // multi-head: per-token gather (srcStride) + scatter (dstStride).
@@ -592,15 +592,15 @@ public:
                     if (isLastRowLoop) {
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
-                            lse32_ubuf_tensor,
+                            lseUbTensor,
                             glUbTensor,
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Add<float, false>(
-                            lse32_ubuf_tensor,
-                            lse32_ubuf_tensor,
+                            lseUbTensor,
+                            lseUbTensor,
                             gmUbTensor,
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -608,7 +608,7 @@ public:
 
                         AscendC::Brcb(
                             tvUbTensor.ReinterpretCast<uint32_t>(),
-                            lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
+                            lseUbTensor.ReinterpretCast<uint32_t>(),
                             CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                             AscendC::BrcbRepeatParams(1, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -802,7 +802,7 @@ private:
     AscendC::LocalTensor<ElementOutput> goUbTensor16;
     AscendC::LocalTensor<float> goUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor;
-    AscendC::LocalTensor<float> lse32_ubuf_tensor;
+    AscendC::LocalTensor<float> lseUbTensor;
 };
 
 }
