@@ -193,7 +193,7 @@ mha_fwd(at::Tensor q,
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
-    const int num_heads_k = static_cast<int>(k.size(2));
+    const int num_heads_k = static_cast<int>((is_varlen_q && !paged_KV) ? k.size(1) : k.size(2));
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -208,7 +208,7 @@ mha_fwd(at::Tensor q,
 
     // ============================================================
     // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
-    //    FAInferContext consumes int64 lists, so we widen on host.
+    //    FAInferContext consumes int32 lists, so we widen on host.
     // ============================================================
     at::Tensor cu_seqlen_q_cpu;
     if (is_varlen_q) {
@@ -306,9 +306,15 @@ mha_fwd(at::Tensor q,
     at::Tensor q_seq_i64 = is_varlen_q
         ? cu_seqlens_q
         : at::empty({batch_size}, i64_npu);
-    at::Tensor kv_seq_i64 = is_varlen_kv
-        ? cu_seqlens_k
-        : seqlens_k;
+    at::Tensor kv_seq_i64;
+    if (is_varlen_kv) {
+        kv_seq_i64 = cu_seqlens_k;
+    } else if (is_varlen_q && !paged_KV) {
+        kv_seq_i64 =
+        at::from_blob(const_cast<int32_t*>(ctx.kvSeqlenList), {batch_size + 1}, at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
+    } else {
+        kv_seq_i64 = seqlens_k;
+    }
     auto qSeqDev  = static_cast<uint8_t*>(q_seq_i64.data_ptr());
     auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
     auto blockTableDev = paged_KV

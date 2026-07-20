@@ -14,61 +14,63 @@
 
 namespace flash_attn_npu_950_v3 {
 struct SeqlenScratch {
-    std::vector<int64_t> q;   // Q seqlen list (cumulative for TND, per-batch for BSND)
-    std::vector<int64_t> kv;  // KV seqlen list (per-batch for paged/BSND, cumulative for TND+non-paged)
+    std::vector<int32_t> q;   // Q seqlen list (cumulative for TND, per-batch for BSND)
+    std::vector<int32_t> kv;  // KV seqlen list (per-batch for paged/BSND, cumulative for TND+non-paged)
 };
 
 // Decumulate `cu` (size = batch + 1, int32) into per-batch seqlen
-// (size = batch, int64). Used for varlen Q where PyTorch only hands us
+// (size = batch, int32). Used for varlen Q where PyTorch only hands us
 // the cumulative-sum form.
-inline std::vector<int64_t> decumulate_int32_to_int64(const at::Tensor& cu_int32_cpu,
-                                                     int batch_size)
+inline std::vector<int32_t> decumulate_int32(const at::Tensor& cu_int32_cpu,
+                                             int batch_size)
 {
     TORCH_CHECK(cu_int32_cpu.dtype() == at::kInt,
-                "decumulate_int32_to_int64: expected int32 tensor");
+                "decumulate_int32: expected int32 tensor");
     TORCH_CHECK(cu_int32_cpu.numel() == batch_size + 1,
-                "decumulate_int32_to_int64: expected ",
+                "decumulate_int32: expected ",
                 batch_size + 1, " elements, got ", cu_int32_cpu.numel());
     const int32_t* p = cu_int32_cpu.data_ptr<int32_t>();
-    std::vector<int64_t> out(batch_size);
+    std::vector<int32_t> out(batch_size);
     for (int i = 0; i < batch_size; ++i) {
-        out[i] = static_cast<int64_t>(p[i + 1] - p[i]);
+        out[i] = p[i + 1] - p[i];
     }
     return out;
 }
 
-// Widen seqused-style int32 tensor (size = batch) to int64.
-inline std::vector<int64_t> widen_int32_to_int64(const at::Tensor& int32_cpu,
-                                                 int batch_size)
+// Copy seqused-style int32 tensor (size = batch) into an int32 vector.
+// The 950 FAInferContext consumes int32 seqlen lists; seqused_k already
+// arrives as int32 from PyTorch, so no int32->int64 widening is needed.
+inline std::vector<int32_t> copy_int32_vec(const at::Tensor& int32_cpu,
+                                           int batch_size)
 {
     TORCH_CHECK(int32_cpu.dtype() == at::kInt,
-                "widen_int32_to_int64: expected int32 tensor");
+                "copy_int32_vec: expected int32 tensor");
     TORCH_CHECK(int32_cpu.numel() == batch_size,
-                "widen_int32_to_int64: expected ",
+                "copy_int32_vec: expected ",
                 batch_size, " elements, got ", int32_cpu.numel());
     const int32_t* p = int32_cpu.data_ptr<int32_t>();
-    std::vector<int64_t> out(batch_size);
+    std::vector<int32_t> out(batch_size);
     for (int i = 0; i < batch_size; ++i) {
-        out[i] = static_cast<int64_t>(p[i]);
+        out[i] = p[i];
     }
     return out;
 }
 
-// Widen cumulative cu_seqlens int32 tensor (size = batch + 1) to int64
-// WITHOUT decumulating. The 950 tiling code expects cumulative form for
-// TND layout (see FAInferTiling::FillSplitCoreTilingData).
-inline std::vector<int64_t> widen_cu_seqlens_int32_to_int64(const at::Tensor& cu_int32_cpu,
-                                                            int batch_size)
+// Copy cumulative cu_seqlens int32 tensor (size = batch + 1) into an int32
+// vector WITHOUT decumulating. The 950 tiling code expects cumulative form
+// for TND layout (see FAInferTiling::FillSplitCoreTilingData).
+inline std::vector<int32_t> copy_cu_seqlens_int32(const at::Tensor& cu_int32_cpu,
+                                                  int batch_size)
 {
     TORCH_CHECK(cu_int32_cpu.dtype() == at::kInt,
-                "widen_cu_seqlens_int32_to_int64: expected int32 tensor");
+                "copy_cu_seqlens_int32: expected int32 tensor");
     TORCH_CHECK(cu_int32_cpu.numel() == batch_size + 1,
-                "widen_cu_seqlens_int32_to_int64: expected ",
+                "copy_cu_seqlens_int32: expected ",
                 batch_size + 1, " elements, got ", cu_int32_cpu.numel());
     const int32_t* p = cu_int32_cpu.data_ptr<int32_t>();
-    std::vector<int64_t> out(batch_size + 1);
+    std::vector<int32_t> out(batch_size + 1);
     for (int i = 0; i < batch_size + 1; ++i) {
-        out[i] = static_cast<int64_t>(p[i]);
+        out[i] = p[i];
     }
     return out;
 }
@@ -76,9 +78,9 @@ inline std::vector<int64_t> widen_cu_seqlens_int32_to_int64(const at::Tensor& cu
 // Build cumulative seqlen list (batch+1 elements) from per-batch
 // seqlens. Used for kvSeqlenList in TND + non-paged mode where we only
 // have per-batch seqused_k but the tiling code expects cumulative form.
-inline std::vector<int64_t> cumulate_int64(const std::vector<int64_t>& per_batch)
+inline std::vector<int32_t> cumulate_int32(const std::vector<int32_t>& per_batch)
 {
-    std::vector<int64_t> out(per_batch.size() + 1);
+    std::vector<int32_t> out(per_batch.size() + 1);
     out[0] = 0;
     for (size_t i = 0; i < per_batch.size(); ++i) {
         out[i + 1] = out[i] + per_batch[i];
@@ -117,9 +119,9 @@ inline void fill_inference_context(
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr,
                     "fill_inference_context: varlen Q requires cu_seqlens_q");
         if (is_tnd) {
-            scratch.q = widen_cu_seqlens_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
+            scratch.q = copy_cu_seqlens_int32(*cu_seqlens_q_cpu_int32, batch_size);
         } else {
-            scratch.q = decumulate_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
+            scratch.q = decumulate_int32(*cu_seqlens_q_cpu_int32, batch_size);
         }
     } else {
         if (is_tnd) {
@@ -129,15 +131,15 @@ inline void fill_inference_context(
                 scratch.q[i + 1] = scratch.q[i] + seqlen_q;
             }
         } else {
-            scratch.q.assign(batch_size, static_cast<int64_t>(seqlen_q));
+            scratch.q.assign(batch_size, seqlen_q);
         }
     }
     TORCH_CHECK(seqused_k_cpu_int32 != nullptr,
                 "fill_inference_context: per-batch KV seqlen (seqused_k / cache_seqlens) is required");
-    auto kv_per_batch = widen_int32_to_int64(*seqused_k_cpu_int32, batch_size);
+    auto kv_per_batch = copy_int32_vec(*seqused_k_cpu_int32, batch_size);
 
     if (is_tnd && !paged_KV) {
-        scratch.kv = cumulate_int64(kv_per_batch);
+        scratch.kv = cumulate_int32(kv_per_batch);
     } else {
         scratch.kv = std::move(kv_per_batch);
     }

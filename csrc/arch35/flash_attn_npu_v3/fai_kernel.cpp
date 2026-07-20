@@ -219,6 +219,12 @@ public:
         int64_t qSeqlen = faiTilingData->maxQSeqlen;
         int64_t kvSeqlen = gActualKvseqlen.GetValue(curBatch);
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
+        if constexpr (qFormat == Format::TND) {
+            qSeqlen = static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
+        }
+        if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
+            kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        }
         for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum_; taskIdx += coreNum) {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;

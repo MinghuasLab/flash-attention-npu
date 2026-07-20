@@ -56,8 +56,8 @@ namespace optiling{
         int32_t sparseMode = 0;
         std::string cacheLayout = "nd";
         uint32_t maxNumBlocksPerBatch = 0;
-        const int64_t *qSeqlenList{nullptr};
-        const int64_t *kvSeqlenList{nullptr};
+        const int32_t *qSeqlenList{nullptr};
+        const int32_t *kvSeqlenList{nullptr};
         float scaleValue = 0.0;
         size_t* workspaces{nullptr};
         MaskType maskType = MaskType::MASK_SPEC;
