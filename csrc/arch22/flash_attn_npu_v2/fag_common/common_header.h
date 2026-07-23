@@ -12,9 +12,6 @@
 #include <type_traits>
 #include <cstdint>
 #include "kernel_operator.h"
-#include "kernel_event.h"
-#include "kernel_tensor.h"
-#include "kernel_macros.h"
 
 
 #define SET_FLAG(trigger, waiter, e) AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
