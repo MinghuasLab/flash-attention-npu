@@ -7,42 +7,50 @@
 #ifndef FAG_SFMG_H
 #define FAG_SFMG_H
 
-constexpr AscendC::RoundMode
-FLOAT2HALF_ROUND_MODE = AscendC::RoundMode::CAST_NONE;
-using AscendC::B16_BYTE_SIZE;
-using AscendC::B32_BYTE_SIZE;
-using AscendC::BRCB_BROADCAST_NUMBER;
+#include "kernel_operator.h"
+
+constexpr uint32_t ONE_BLK_SIZE = 32;
+constexpr uint32_t ONE_REPEAT_BYTE_SIZE = 256;
+constexpr uint8_t B16_BYTE_SIZE = 2;
+constexpr uint8_t B32_BYTE_SIZE = 4;
+constexpr int32_t ONE_BYTE_BIT_SIZE = 8;
+constexpr int32_t DEFAULT_BLK_NUM = 8;
+constexpr int32_t DEFAULT_BLK_STRIDE = 1;
+constexpr uint8_t DEFAULT_REPEAT_STRIDE = 8;
+constexpr int32_t DEFAULT_C0_SIZE = 32;
+constexpr int32_t DEFAULT_BLOCK_SIZE = 256;
+constexpr int32_t MAX_REPEAT_TIMES = 255;
+constexpr int32_t HALF_FACTOR = 2;
+constexpr uint32_t BRCB_BROADCAST_NUMBER = 8;
+constexpr uint64_t MASK_PLACEHOLDER = 0;
+
+constexpr uint32_t FLOAT_REPEAT_SIZE = ONE_REPEAT_BYTE_SIZE / B32_BYTE_SIZE;  // 64
+constexpr uint32_t FLOAT_NUM_PER_BLK = ONE_BLK_SIZE / B32_BYTE_SIZE;          // 8
+constexpr uint32_t HALF_REPEAT_STRIDE = DEFAULT_REPEAT_STRIDE / B16_BYTE_SIZE; // 4
+constexpr uint32_t SCALAR_STACK_DEPTH = 8;
+constexpr uint8_t SOFTMAX_BASIC_TILE_NUM = 8;
+constexpr uint8_t SOFTMAX_COMPUTE_DIM = 2;
+constexpr uint8_t SOFTMAXGRAD_COMPUTE_DIM = 3;
+
+template <typename T>
+__aicore__ inline constexpr T DivCeil(T a, T b)
+{
+    return (a + b - 1) / b;
+}
+
+constexpr AscendC::RoundMode FLOAT2HALF_ROUND_MODE = AscendC::RoundMode::CAST_NONE;
 using AscendC::BrcbRepeatParams;
-using AscendC::DEFAULT_BLK_NUM;
-using AscendC::DEFAULT_BLK_STRIDE;
-using AscendC::DEFAULT_BLOCK_SIZE;
-using AscendC::DEFAULT_C0_SIZE;
-using AscendC::DEFAULT_REPEAT_STRIDE;
-using AscendC::DivCeil;
-using AscendC::FLOAT_NUM_PER_BLK;
-using AscendC::FLOAT_REPEAT_SIZE;
-using AscendC::HALF_FACTOR;
-using AscendC::HALF_REPEAT_STRIDE;
 using AscendC::HardEvent;
-using AscendC::LastAxisShapeND;
 using AscendC::LocalTensor;
-using AscendC::MASK_PLACEHOLDER;
 using AscendC::MaskMode;
-using AscendC::MAX_REPEAT_TIMES;
-using AscendC::ONE_BLK_SIZE;
-using AscendC::ONE_BYTE_BIT_SIZE;
 using AscendC::PipeBarrier;
 using AscendC::ResetMask;
 using AscendC::RoundMode;
-using AscendC::SCALAR_STACK_DEPTH;
 using AscendC::SetFlag;
 using AscendC::SetMaskCount;
 using AscendC::SetMaskNorm;
 using AscendC::SetVectorMask;
 using AscendC::ShapeInfo;
-using AscendC::SOFTMAX_BASIC_TILE_NUM;
-using AscendC::SOFTMAX_COMPUTE_DIM;
-using AscendC::SOFTMAXGRAD_COMPUTE_DIM;
 using AscendC::WaitFlag;
 
 struct ReduceLastND {
@@ -183,11 +191,11 @@ __aicore__ inline void CustomReduceSumLastNDImpl(const LocalTensor<float> &dst, 
 }
 
 
-template<typename T, bool isBasicBlock = false>
+template<typename T, bool isBasicBlock = false, typename LastAxisND>
 __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                                     const LocalTensor <T> &srcTensor,
                                                     const LocalTensor<float> &workLocal, const SoftMaxTiling &tiling,
-                                                    const LastAxisShapeND &originalSrcShape)
+                                                    const LastAxisND &originalSrcShape)
 {
     uint32_t elementNumPerBlk = ONE_BLK_SIZE / sizeof(T);
 
@@ -328,8 +336,8 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
     }
 }
 
-
-__aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize, const LastAxisShapeND &ndinfo,
+template<typename LastAxisND>
+__aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize, const LastAxisND &ndinfo,
                                                    SoftMaxTiling &softmaxTiling, const uint32_t elementNumPerBlk,
                                                    bool isFront = false, bool isBasicBlock = false,
                                                    bool isDataFormatNZ = false)
@@ -392,11 +400,8 @@ __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, co
 {
     ShapeInfo srcShape = srcTensor.GetShapeInfo();
     uint32_t elementNumPerBlk = ONE_BLK_SIZE / sizeof(T);
-    LastAxisShapeND srcNDinfo;
-    LastAxisShapeND originalSrcShape;
-
-    srcNDinfo = GetLastAxisShapeND(srcShape);
-    originalSrcShape = GetLastAxisOriginShapeND(srcShape);
+    auto srcNDinfo = GetLastAxisShapeND(srcShape);
+    auto originalSrcShape = GetLastAxisOriginShapeND(srcShape);
 
     SoftMaxTiling newTiling{};
     CustomSoftMaxGradTilingFunc(workLocal.GetSize(), srcNDinfo, newTiling, elementNumPerBlk, true, isBasicBlock);
