@@ -239,11 +239,11 @@ mha_fwd(at::Tensor q,
 
     at::Tensor softmaxlse;
     if (is_varlen_q) {
-        // Match v4's varlen lse shape: {total_q, num_heads}
-        softmaxlse = at::empty({sizes[0], num_heads},
+        // Match v4's varlen lse shape: {num_heads, total_q}
+        softmaxlse = at::empty({num_heads, sizes[0]},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     } else {
-        softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+        softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
