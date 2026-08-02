@@ -10,7 +10,7 @@ from flash_attn_npu_3 import (
     flash_attn_with_kvcache,
     get_scheduler_metadata,
 )
-from tests.test_flash_attn_npu_v3 import ref_flash_attention
+from tests.test_flash_attn_npu_3 import ref_flash_attention
 
 
 RTOL = 1e-2

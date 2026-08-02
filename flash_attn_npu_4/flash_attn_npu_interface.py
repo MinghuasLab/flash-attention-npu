@@ -8,7 +8,7 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the kernels after importing torch
-from . import flash_attn_npu_4  # Registers operators with PyTorch
+import flash_attn_npu_4_910  # Registers operators with PyTorch
 
 # isort: on
 
@@ -32,7 +32,7 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-@_torch_custom_op_wrapper("flash_attn_npu_4::_flash_attn_forward", mutates_args=(), device_types="npu")
+@_torch_custom_op_wrapper("flash_attn_npu_4_910::_flash_attn_forward", mutates_args=(), device_types="npu")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -64,7 +64,7 @@ def _flash_attn_forward(
     ]
     seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
     page_table = maybe_contiguous(page_table)
-    out, softmax_lse = flash_attn_npu_4.fwd(
+    out, softmax_lse = flash_attn_npu_4_910.fwd(
         q,
         k,
         v,

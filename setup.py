@@ -40,20 +40,20 @@ BASE_WHEEL_URL = (
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
 # FLASH_ATTN_BUILD_VERSION selects which API generations to build:
-#   "v2"   build flash_attn_npu.flash_attn_npu     (910B/C only)
+#   "v2"   build flash_attn_npu_910     (910B/C only)
 #   "v3"   build the v3 backends selected by FLASH_ATTN_BUILD_NPU:
-#            flash_attn_npu_3.flash_attn_npu_3    (Ascend 910B/C, csrc/ascend910)
-#            flash_attn_npu_3_950                 (Ascend 950,    csrc/ascend950)
+#            flash_attn_npu_3_910         (Ascend 910B/C, csrc/ascend910)
+#            flash_attn_npu_3_950         (Ascend 950,    csrc/ascend950)
 #   "v4"   build the v4 backends selected by FLASH_ATTN_BUILD_NPU:
-#            flash_attn_npu_4.flash_attn_npu_4      (Ascend 910B/C, csrc/ascend910)
-#            flash_attn_npu_4_950                   (Ascend 950,    csrc/ascend950)
+#            flash_attn_npu_4_910         (Ascend 910B/C, csrc/ascend910)
+#            flash_attn_npu_4_950         (Ascend 950,    csrc/ascend950)
 #          Runtime dispatch in flash_attn_npu_4/__init__.py picks the
 #          matching backend per host via torch_npu.npu.get_device_name(),
 #          so a single wheel runs on both 910 and 950.
 #   "all"  build v2 + v3 + the v4 backends selected by FLASH_ATTN_BUILD_NPU.
 # FLASH_ATTN_BUILD_NPU selects which NPU hardware backends to build:
-#   "910"  only Ascend 910B/C backends (flash_attn_npu.flash_attn_npu,
-#          flash_attn_npu_3.flash_attn_npu_3, flash_attn_npu_4.flash_attn_npu_4)
+#   "910"  only Ascend 910B/C backends (flash_attn_npu_910,
+#          flash_attn_npu_3_910, flash_attn_npu_4_910)
 #   "950"  only the Ascend 950 backends (flash_attn_npu_3_950,
 #          flash_attn_npu_4_950)
 #   "all"  build every backend whose API generation is selected above
@@ -106,7 +106,7 @@ class BishengBuildExt(build_ext):
         if is_ascend950:
             version_dir = "flash_attn_npu_3"  # fallback
             for part in src_norm.split("/"):
-                if part in ("flash_attn_npu", "flash_attn_npu_3", "flash_attn_npu_4"):
+                if part in ("flash_attn_npu_3", "flash_attn_npu_4"):
                     version_dir = part
                     break
             extra_includes.append(
@@ -294,7 +294,7 @@ class BishengBuildExt(build_ext):
         # (host code, `bisheng -x aicpu`) and appended to that extension's link
         # set. Built after the parallel ASC compiles, before linking.
         for ext in self.extensions:
-            if ext.name == "flash_attn_npu_3.flash_attn_npu_3":
+            if ext.name == "flash_attn_npu_3_910":
                 ext_fullpath = self.get_ext_fullpath(ext.name)
                 aicpu_obj = self._build_aicpu_metadata(ext_fullpath)
                 if aicpu_obj is not None:
@@ -383,14 +383,14 @@ if not SKIP_NPU_BUILD:
         # Nested under the Python package so the extension name does not collide
         # with the flash_attn_npu package itself.
         ext_modules.append(Extension(
-            name="flash_attn_npu.flash_attn_npu",
+            name="flash_attn_npu_910",
             sources=src_ascend910_v2,
             language="c++",
         ))
 
     if BUILD_VERSION in ("v3", "all") and BUILD_NPU in ("910", "all"):
         ext_modules.append(Extension(
-            name="flash_attn_npu_3.flash_attn_npu_3",
+            name="flash_attn_npu_3_910",
             sources=src_ascend910_v3,
             language="c++",
         ))
@@ -412,7 +412,7 @@ if not SKIP_NPU_BUILD:
                 "FLASH_ATTN_BUILD_VERSION=v4 requires csrc/ascend910/flash_attn_npu_4/flash_api.cpp;"
             )
         ext_modules.append(Extension(
-            name="flash_attn_npu_4.flash_attn_npu_4",
+            name="flash_attn_npu_4_910",
             sources=src_ascend910_v4,
             language="c++",
         ))

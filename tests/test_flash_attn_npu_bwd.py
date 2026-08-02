@@ -7,8 +7,8 @@ FlashAttention v2 反向 pytest。
 - 被测：torch.autograd.grad（FlashAttnFunc / FlashAttnVarlenFunc）
 
 用法:
-  pytest tests/test_flash_attn_npu_v2_bwd.py -v
-  pytest tests/test_flash_attn_npu_v2_bwd.py -k swa -v
+  pytest tests/test_flash_attn_npu_2_bwd.py -v
+  pytest tests/test_flash_attn_npu_2_bwd.py -k swa -v
 """
 
 import gc

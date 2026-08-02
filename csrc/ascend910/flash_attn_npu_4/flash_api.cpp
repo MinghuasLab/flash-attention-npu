@@ -394,7 +394,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     return {out, softmaxlse};
 }
 
-PYBIND11_MODULE(flash_attn_npu_4, m)
+PYBIND11_MODULE(flash_attn_npu_4_910, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");

@@ -66,10 +66,10 @@ FLASH_ATTN_BUILD_VERSION=v4 python setup.py install
 pytest -q -s tests/test_flash_attn_npu.py
 
 # 测试 FlashAttention v3
-pytest -q -s tests/test_flash_attn_npu_v3.py
+pytest -q -s tests/test_flash_attn_npu_3.py
 
 # 测试 FlashAttention v4
-pytest -q -s tests/test_flash_attn_npu_v4.py
+pytest -q -s tests/test_flash_attn_npu_4.py
 ```
 
 ## 使用方法

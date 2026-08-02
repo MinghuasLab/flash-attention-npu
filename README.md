@@ -64,7 +64,7 @@ Run test scripts:
 pytest -q -s tests/test_flash_attn_npu.py
 
 # Test FlashAttention v3
-pytest -q -s tests/test_flash_attn_npu_v3.py
+pytest -q -s tests/test_flash_attn_npu_3.py
 ```
 
 ## Usage

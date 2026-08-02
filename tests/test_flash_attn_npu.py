@@ -88,7 +88,7 @@ def ref_flash_attention(
     scale,
     mask,
     data_type,
-    softcap,
+    softcap=0.0,
     ):
     inner_prec = 0
     interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
@@ -245,16 +245,32 @@ test_cases = [
     (torch.bfloat16, 1, 10, 2, 10, 4096, 256, 1, 128, True, -1, -1, 0.0),
     (torch.bfloat16, 1, 8, 2, 8, 2048, 128, 1, 128, False, -1, -1, 0.0),
     (torch.bfloat16, 1, 16, 2, 16, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    # Softcap
-    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 50.0),
-    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 50.0),
-    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 50.0),
-    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 50.0),
     (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 1, 128, False, -1, -1, 0.0),
     (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 0, 128, False, -1, -1, 0.0),
     (torch.bfloat16, 8, 1024, 16, 8, 640, 1, 1, 128, False, -1, -1, 0.0),
+    # Softcap
+    (torch.bfloat16, 8, 128, 32, 64, 2048, 128, 0, 128, True, -1, -1, 30.0), # g=4,Sq=64,qNBlockTile=2
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 30.0), # g=16, Sq=32,qNBlockTile=4
+    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 30.0), # g=8,decode, D=256
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 30.0), # FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 30.0), # FD decode, g=4,nT=8, D=256
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 30.0), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 30.0),# FD multi, g=16, Sq*g=128, nT=4
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 30.0),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
+    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 30.0),
+    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 30.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 30.0),
+    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 1, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 8, 1024, 16, 8, 640, 1, 1, 128, False, -1, -1, 30.0),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
@@ -425,12 +441,14 @@ test_cases = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
     (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
     # Softcap
     (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 50.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 30.0),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 50.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 30.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
@@ -518,9 +536,15 @@ test_cases = [
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0),
     # Softcap
     (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1,  30.0),
-    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 50.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 30.0),
     (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0),
-    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 50.0),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 30.0),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0),
+    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 30.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)

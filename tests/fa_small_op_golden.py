@@ -2,7 +2,7 @@
 """
 小算子 FlashAttention 反向标杆（传入 FA 前向 out/lse，仅算反传）。
 
-供 test_flash_attn_npu_v2_bwd.py / test_flash_attn_npu_v3_bwd.py 使用。
+供 test_flash_attn_npu_bwd.py / test_flash_attn_npu_3_bwd.py 使用。
 """
 
 import torch
