@@ -520,7 +520,6 @@ public:
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 1,
-                            /*lseFlag=*/true,
                             &gLse,
                             lseGmRowOffset,
                             /*lseGmRowStride=*/1);
@@ -531,7 +530,6 @@ public:
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 0,
-                            /*lseFlag=*/true,
                             &gLse,
                             lseGmRowOffset,
                             /*lseGmRowStride=*/1);
@@ -724,7 +722,8 @@ private:
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout,
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -785,8 +784,8 @@ CATLASS_GLOBAL void FAInfer(
         void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadPV = Gemm::Block::BlockMmadTla<
         DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
-    // rescale O
-    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
+    // rescale O — LSE write gated by compile-time lseMode (NONE / OUT_ONLY)
+    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleOT<lseMode>;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<
         ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
@@ -803,7 +802,8 @@ CATLASS_GLOBAL void FAInfer(
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout,
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -864,8 +864,8 @@ CATLASS_GLOBAL void FAInferDn(
         void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadPV = Gemm::Block::BlockMmadTla<
         DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
-    // rescale O
-    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
+    // rescale O — LSE write gated by compile-time lseMode (NONE / OUT_ONLY)
+    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleOT<lseMode>;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<
         ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<

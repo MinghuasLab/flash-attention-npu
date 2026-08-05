@@ -18,11 +18,13 @@
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
+#include "fa_block.h"
 #include <limits>
 
 namespace Catlass::Epilogue::Block {
 
 template <
+    LseModeT LSE_MODE_,
     class ElementO_,
     class ElementOTmp_,
     class ElementS_,
@@ -30,7 +32,7 @@ template <
     class OTmpSrcPos_ // the src TPosition of pv res, viable configurations: GM/L0C
 >
 class BlockEpilogue<
-    EpilogueFARescaleO,
+    EpilogueFARescaleOT<LSE_MODE_>,
     ElementO_,
     ElementOTmp_,
     ElementS_,
@@ -38,7 +40,7 @@ class BlockEpilogue<
     OTmpSrcPos_>
 {
 public:
-    using DispatchPolicy = EpilogueFARescaleO;
+    using DispatchPolicy = EpilogueFARescaleOT<LSE_MODE_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementO = ElementO_;
     using ElementOTmp = ElementOTmp_;
@@ -48,6 +50,7 @@ public:
 
     using CopyUbToGmO = typename TileCopy::CopyUbToGmO;
 
+    static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
     static constexpr uint32_t UB_OTMP_BUF_STAGES = 2;
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 32768;
     static constexpr uint32_t DM_UB_GLOBAL_ELEM_NUM = 64;
@@ -57,8 +60,7 @@ public:
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t RESCALE_SKIP_SCRATCH_OFFSET = 250 * 1024;
-    // Match arch22: fully-masked / zero-sum rows write -inf (not host +inf).
-    static constexpr float LSE_NEG_INF = -std::numeric_limits<float>::infinity();
+    static constexpr float LSE_OUT_INI = std::numeric_limits<float>::infinity();
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource, bool enableRescaleSkip_ = false)
@@ -117,7 +119,6 @@ public:
                         bool isLastKvSTile,
                         Arch::CrossCoreFlag pvReadyFlag,
                         uint32_t rowOffsetCurSubCore,
-                        bool lseFlag,
                         AscendC::GlobalTensor<float> *gLse,
                         int64_t lseGmRowOffset,
                         int64_t lseGmRowStride)
@@ -170,45 +171,45 @@ public:
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
         if (isLastKvSTile) {
             AscendC::PipeBarrier<PIPE_V>();
-            // Softmax LSE: lse = ln(gl) + gm, aligned with arch22 v2/v4 rescale_o.
-            // GM layout is head-major: BSND [B,H,S] / TND [H,total_q], so tokens of one
-            // head are contiguous (lseGmRowStride == 1) and are written as one burst.
-            if (lseFlag && rowNumCurSubCore > 0 && gLse != nullptr) {
-                uint32_t lseVecLoop = CeilDiv(rowNumCurSubCore, FLOAT_VECTOR_SIZE);
-                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-                AscendC::Ln<float, false>(
-                    lseUbTensor, glUbTensor32,
-                    (uint64_t)0, lseVecLoop,
-                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
+            // Softmax LSE: lse = ln(gl) + gm (aligned with arch22 OUT_ONLY path).
+            // GM layout: BSND [B,H,S] / TND [H,total_q] — tokens of one head are contiguous.
+            if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
+                if (rowNumCurSubCore > 0 && gLse != nullptr) {
+                    uint32_t lseVecLoop = CeilDiv(rowNumCurSubCore, FLOAT_VECTOR_SIZE);
+                    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+                    AscendC::Ln<float, false>(
+                        lseUbTensor, glUbTensor32,
+                        (uint64_t)0, lseVecLoop,
+                        AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                    AscendC::PipeBarrier<PIPE_V>();
 
-                AscendC::Add<float, false>(
-                    lseUbTensor, lseUbTensor, gmUbTensor,
-                    (uint64_t)0, lseVecLoop,
-                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+                    AscendC::Add<float, false>(
+                        lseUbTensor, lseUbTensor, gmUbTensor,
+                        (uint64_t)0, lseVecLoop,
+                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
 
-                // Fully-masked rows: gl == 0 → write -inf (design §8.4 / arch22 InvalidLine
-                // equivalent for the zero-sum case; SWA delStart/delEnd not needed yet —
-                // arch35 rejects window_size != (-1,-1)).
-                FixupZeroSumLse(rowNumCurSubCore);
+                    // Zero-sum rows → +inf (arch22 InvalidLine / LSE_OUT_INI).
+                    FixupZeroSumLse(rowNumCurSubCore);
 
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-                const int64_t lseGmOffset =
-                    lseGmRowOffset + static_cast<int64_t>(rowOffsetCurSubCore) * lseGmRowStride;
-                if (lseGmRowStride == 1) {
-                    // Match arch22 v2 single-head path: contiguous [H,S] / [H,total_q] burst.
-                    AscendC::DataCopyPad(
-                        (*gLse)[lseGmOffset],
-                        lseUbTensor,
-                        AscendC::DataCopyExtParams(
-                            1, rowNumCurSubCore * sizeof(float), 0, 0, 0));
-                } else {
-                    AscendC::DataCopyPad(
-                        (*gLse)[lseGmOffset],
-                        lseUbTensor,
-                        AscendC::DataCopyExtParams(
-                            rowNumCurSubCore, sizeof(float), 0, (lseGmRowStride - 1) * sizeof(float), 0));
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                    const int64_t lseGmOffset =
+                        lseGmRowOffset + static_cast<int64_t>(rowOffsetCurSubCore) * lseGmRowStride;
+                    if (lseGmRowStride == 1) {
+                        // Match arch22 single-head contiguous burst.
+                        AscendC::DataCopyPad(
+                            (*gLse)[lseGmOffset],
+                            lseUbTensor,
+                            AscendC::DataCopyExtParams(
+                                1, rowNumCurSubCore * sizeof(float), 0, 0, 0));
+                    } else {
+                        AscendC::DataCopyPad(
+                            (*gLse)[lseGmOffset],
+                            lseUbTensor,
+                            AscendC::DataCopyExtParams(
+                                rowNumCurSubCore, sizeof(float), 0,
+                                (lseGmRowStride - 1) * sizeof(float), 0));
+                    }
                 }
             }
 
@@ -327,7 +328,7 @@ public:
     }
 
     // Replace LSE for rows whose running sum gl is non-positive (fully masked).
-    // Matches design §8.4: lse = -inf when s == 0.
+    // Aligns with arch22 InvalidLineLSEProcess sentinel: +inf.
     __aicore__ inline
     void FixupZeroSumLse(uint32_t rowNum)
     {
@@ -336,7 +337,7 @@ public:
         for (uint32_t i = 0; i < rowNum; ++i) {
             float s = glUbTensor32.GetValue(i);
             if (s <= 0.0f) {
-                lseUbTensor.SetValue(i, LSE_NEG_INF);
+                lseUbTensor.SetValue(i, LSE_OUT_INI);
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
@@ -456,7 +457,6 @@ public:
                     bool isLastKvSTile,
                     Arch::CrossCoreFlag pvReadyFlag,
                     bool isDN,
-                    bool lseFlag = false,
                     AscendC::GlobalTensor<float> *gLse = nullptr,
                     int64_t lseGmRowOffset = 0,
                     int64_t lseGmRowStride = 0)
@@ -489,7 +489,6 @@ public:
                     isLastKvSTile,
                     pvReadyFlag,
                     rowOffsetCurSubCore,
-                    lseFlag,
                     gLse,
                     lseGmRowOffset,
                     lseGmRowStride);
@@ -502,7 +501,6 @@ public:
                     isLastKvSTile,
                     pvReadyFlag,
                     rowOffsetCurSubCore,
-                    lseFlag,
                     gLse,
                     lseGmRowOffset,
                     lseGmRowStride);
@@ -528,4 +526,4 @@ private:
     CopyUbToGmO copyUbToGmO;
 };
 }
-#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_LOCAL_HPP
+#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP_T

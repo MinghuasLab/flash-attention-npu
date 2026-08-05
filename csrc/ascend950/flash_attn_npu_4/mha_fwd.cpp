@@ -8,7 +8,7 @@
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
+ *   ✅ Softmax LSE always computed (Python return_lse only controls whether to return it)
  *   ❌ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
  *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
