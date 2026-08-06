@@ -23,15 +23,16 @@ template <
     class InputType_,
     class MaskType_,
     LseModeT LSE_MODE_,
-    bool HAS_SOFTCAP_>
+    bool HAS_SOFTCAP_,
+    bool RETURN_SOFTMAX_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -813,14 +814,35 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
+    __aicore__ inline
+    void CopyPretUbToGm(
+        AscendC::GlobalTensor<ElementOutput> gPret, uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum,
+        uint32_t columnNumRound, uint32_t qSOffset, uint32_t qSBlockSize, uint32_t maxKvSeqlen, uint64_t stridePret)
+    {
+        uint32_t rowsDone = 0;
+        uint64_t qNOffset = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSOffset);
+            for (uint32_t r = 0; r < rowsCurHead; r++) {
+                AscendC::DataCopyPad(
+                    gPret[qNOffset + static_cast<uint64_t>((qSOffset + r) * maxKvSeqlen)],
+                    lpUbTensor[sUbOffset][(rowsDone + r) * columnNumRound],
+                    AscendC::DataCopyExtParams(1, columnNum * sizeof(ElementOutput), 0, 0, 0));
+            }
+            rowsDone += rowsCurHead;
+            qSOffset = 0;
+            qNOffset += stridePret;
+        }
+    }
+
     template <bool doTriUMask>
     __aicore__ inline
     void SubCoreCompute(
-        AscendC::GlobalTensor<ElementOutput> gOutput, const LayoutOutput &layoutOutput,
-        uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
-        uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
-        uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
+        AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementOutput> gPret, uint64_t gmOffsetPret,
+        const LayoutOutput& layoutOutput, uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
+        uint32_t isFirstRowLoop, uint32_t isLastRowLoop, uint32_t columnNumRound, uint32_t pingpongFlag,
+        uint32_t curStackTileMod, uint32_t rowOffsetIoGm, uint32_t qSBlockSize, uint32_t maxKvSeqlen,
+        uint64_t stridePret, bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -859,6 +881,15 @@ public:
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
+
+        if constexpr (RETURN_SOFTMAX_) {
+            uint64_t qNOffset = static_cast<uint64_t>(rowOffsetIoGm / qSBlockSize) * stridePret;
+            uint32_t qSOffset = rowOffsetIoGm % qSBlockSize;
+            CopyPretUbToGm(
+                gPret[gmOffsetPret + qNOffset], sUbOffset, rowNumCurLoop, columnNum, columnNumRound, qSOffset,
+                qSBlockSize, maxKvSeqlen, stridePret);
+        }
+
         if constexpr (!doTriUMask) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
             if (isLastNoMaskStackTile && isLastRowLoop) {
@@ -875,11 +906,13 @@ public:
     }
 
     __aicore__ inline
-    void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
-        const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
-        uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, bool isSplitKV = false,
-        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
+    void operator()(
+        AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementOutput> gPret, uint64_t gmOffsetPret, const LayoutOutput& layoutOutput,
+        const LayoutInput& layoutInput, GemmCoord actualBlockShape, uint32_t isFirstStackTile,
+        uint32_t isLastNoMaskStackTile, uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod,
+        uint32_t maxKvSeqlen, uint64_t stridePret, bool isSplitKV = false, bool startsWithMaskTile = false,
+        bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -939,6 +972,8 @@ public:
                 }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
+                    gPret,
+                    gmOffsetPret,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
                     isFirstStackTile,
@@ -948,6 +983,10 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
+                    maxKvSeqlen,
+                    stridePret,
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
             }
@@ -955,11 +994,13 @@ public:
     }
 
     __aicore__ inline
-    void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
-        AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t triDown,
-        uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
+    void operator()(
+        AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementMask> gMask, AscendC::GlobalTensor<ElementOutput> gPret, uint64_t gmOffsetPret,
+        const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutInput& layoutMask,
+        GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize, uint32_t qNBlockSize,
+        uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t triDown, uint32_t kvSStartIdx,
+        uint32_t kvSEndIdx, uint32_t maxKvSeqlen, uint64_t stridePret, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1079,6 +1120,8 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 SubCoreCompute<true>(
                     gOutputCurLoop,
+                    gPret,
+                    gmOffsetPret,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
                     isFirstStackTile,
@@ -1088,6 +1131,10 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
+                    maxKvSeqlen,
+                    stridePret,
                     isSplitKV);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
@@ -1113,12 +1160,14 @@ public:
     }
 
     __aicore__ inline
-    void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
-        AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, bool doTriUPreMask,
-        bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
-        int32_t nextTokenEndLen)
+    void operator()(
+        AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementMask> gMask, AscendC::GlobalTensor<ElementOutput> gPret, uint64_t gmOffsetPret,
+        const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutInput& layoutMask,
+        GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize, uint32_t qNBlockSize,
+        uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, uint32_t maxKvSeqlen,
+        uint64_t stridePret, bool doTriUPreMask, bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen,
+        int32_t nextTokenStartLen, int32_t nextTokenEndLen)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1297,6 +1346,8 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 SubCoreCompute<true>(
                     gOutputCurLoop,
+                    gPret,
+                    gmOffsetPret,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
                     isFirstStackTile,
@@ -1306,6 +1357,10 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
+                    maxKvSeqlen,
+                    stridePret,
                     false,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
