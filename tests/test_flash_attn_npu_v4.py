@@ -631,8 +631,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(out_out.cpu(), golden_out_gpu.cpu(), rtol=rtol, atol=atol)
-    if "Ascend910" in name:
-        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
     print("\n--- Golden-GPU vs CANN ---")
     _, r_golden_fa = compare_rule(golden_out_gpu.cpu().float(), out_out.cpu().float())
     assert r_golden_fa, "Golden-GPU vs CANN check FAILED"

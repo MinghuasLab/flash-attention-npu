@@ -18,10 +18,13 @@
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
+#include "fa_block.h"
+#include <limits>
 
 namespace Catlass::Epilogue::Block {
 
 template <
+    LseModeT LSE_MODE_,
     class ElementO_,
     class ElementOTmp_,
     class ElementS_,
@@ -29,7 +32,7 @@ template <
     class OTmpSrcPos_ // the src TPosition of pv res, viable configurations: GM/L0C
 >
 class BlockEpilogue<
-    EpilogueFARescaleO,
+    EpilogueFARescaleOT<LSE_MODE_>,
     ElementO_,
     ElementOTmp_,
     ElementS_,
@@ -37,7 +40,7 @@ class BlockEpilogue<
     OTmpSrcPos_>
 {
 public:
-    using DispatchPolicy = EpilogueFARescaleO;
+    using DispatchPolicy = EpilogueFARescaleOT<LSE_MODE_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementO = ElementO_;
     using ElementOTmp = ElementOTmp_;
@@ -47,14 +50,17 @@ public:
 
     using CopyUbToGmO = typename TileCopy::CopyUbToGmO;
 
+    static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
     static constexpr uint32_t UB_OTMP_BUF_STAGES = 2;
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 32768;
     static constexpr uint32_t DM_UB_GLOBAL_ELEM_NUM = 64;
     static constexpr uint32_t RESCALE_ROW_MAX_ELEM_NUM = 64;
     static constexpr uint32_t RESCALE_COL_MAX_ELEM_NUM = 128;
     static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
+    static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t RESCALE_SKIP_SCRATCH_OFFSET = 250 * 1024;
+    static constexpr float LSE_OUT_INI = std::numeric_limits<float>::infinity();
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource, bool enableRescaleSkip_ = false)
@@ -67,6 +73,9 @@ public:
         constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET +  64 * sizeof(float);
+        // LSE UB buffer placed after RESCALE_SKIP_SCRATCH (250KB) + 256B scratch.
+        // 252KB keeps a 4KB safety margin to the 256KB UB ceiling.
+        constexpr uint32_t LSE_UB_TENSOR_OFFSET = RESCALE_SKIP_SCRATCH_OFFSET + 256;
 
         for (uint32_t i = 0; i < UB_OTMP_BUF_STAGES; i++) {
             loUbTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
@@ -75,8 +84,10 @@ public:
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(GO_UB_TENSOR_OFFSET);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(GO_UB_TENSOR_OFFSET);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
+        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
         redUbTensor = resource.ubBuf.template GetBufferByByte<float>(RESCALE_SKIP_SCRATCH_OFFSET);
+        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -106,7 +117,11 @@ public:
                         uint32_t ubOTmpBufId,
                         bool isFirstKvSTile,
                         bool isLastKvSTile,
-                        Arch::CrossCoreFlag pvReadyFlag)
+                        Arch::CrossCoreFlag pvReadyFlag,
+                        uint32_t rowOffsetCurSubCore,
+                        AscendC::GlobalTensor<float> *gLse,
+                        int64_t lseGmRowOffset,
+                        int64_t lseGmRowStride)
     {
         uint32_t rowNumCurSubCore = tla::get<0>(gOTensorTlaTile.shape());
         uint32_t colNumCurSubCore = tla::get<1>(gOTensorTlaTile.shape());
@@ -156,6 +171,48 @@ public:
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
         if (isLastKvSTile) {
             AscendC::PipeBarrier<PIPE_V>();
+            // Softmax LSE: lse = ln(gl) + gm
+            // GM layout: BSND [B,H,S] / TND [H,total_q] — tokens of one head are contiguous.
+            if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
+                if (rowNumCurSubCore > 0 && gLse != nullptr) {
+                    uint32_t lseVecLoop = CeilDiv(rowNumCurSubCore, FLOAT_VECTOR_SIZE);
+                    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+                    AscendC::Ln<float, false>(
+                        lseUbTensor, glUbTensor32,
+                        (uint64_t)0, lseVecLoop,
+                        AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                    AscendC::PipeBarrier<PIPE_V>();
+
+                    AscendC::Add<float, false>(
+                        lseUbTensor, lseUbTensor, gmUbTensor,
+                        (uint64_t)0, lseVecLoop,
+                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+
+                    // Zero-sum rows → +inf.
+                    FixupZeroSumLse(rowNumCurSubCore);
+
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                    const int64_t lseGmOffset =
+                        lseGmRowOffset + static_cast<int64_t>(rowOffsetCurSubCore) * lseGmRowStride;
+                    if (lseGmRowStride == 1) {
+                        // Match arch22 single-head contiguous burst.
+                        AscendC::DataCopyPad(
+                            (*gLse)[lseGmOffset],
+                            lseUbTensor,
+                            AscendC::DataCopyExtParams(
+                                1, rowNumCurSubCore * sizeof(float), 0, 0, 0));
+                    } else {
+                        AscendC::DataCopyPad(
+                            (*gLse)[lseGmOffset],
+                            lseUbTensor,
+                            AscendC::DataCopyExtParams(
+                                rowNumCurSubCore, sizeof(float), 0,
+                                (lseGmRowStride - 1) * sizeof(float), 0));
+                    }
+                }
+            }
+
             if (std::is_same<ElementO, bfloat16_t>::value) {
                 AscendC::Cast(
                     goUbTensor16, goUbTensor32,
@@ -270,6 +327,22 @@ public:
         }
     }
 
+    // Replace LSE for rows whose running sum gl is non-positive (fully masked).
+    __aicore__ inline
+    void FixupZeroSumLse(uint32_t rowNum)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        for (uint32_t i = 0; i < rowNum; ++i) {
+            float s = glUbTensor32.GetValue(i);
+            if (s <= 0.0f) {
+                lseUbTensor.SetValue(i, LSE_OUT_INI);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+    }
+
     __aicore__ inline
     bool DmAllOne(AscendC::LocalTensor<float> dm, uint32_t row)
     {
@@ -382,7 +455,10 @@ public:
                     bool isFirstKvSTile,
                     bool isLastKvSTile,
                     Arch::CrossCoreFlag pvReadyFlag,
-                    bool isDN)
+                    bool isDN,
+                    AscendC::GlobalTensor<float> *gLse = nullptr,
+                    int64_t lseGmRowOffset = 0,
+                    int64_t lseGmRowStride = 0)
     {
         uint32_t rowNumOri = actualOriShape[0];
         uint32_t colNumOri = actualOriShape[1];
@@ -410,7 +486,11 @@ public:
                     ubOTmpBufId,
                     isFirstKvSTile,
                     isLastKvSTile,
-                    pvReadyFlag);
+                    pvReadyFlag,
+                    rowOffsetCurSubCore,
+                    gLse,
+                    lseGmRowOffset,
+                    lseGmRowStride);
             } else if(colStrideCurSubCore == 64){
                 SubCoreCompute<64>(
                     gOTensorTlaTile,
@@ -418,7 +498,11 @@ public:
                     ubOTmpBufId,
                     isFirstKvSTile,
                     isLastKvSTile,
-                    pvReadyFlag);
+                    pvReadyFlag,
+                    rowOffsetCurSubCore,
+                    gLse,
+                    lseGmRowOffset,
+                    lseGmRowStride);
             }
         } else {
             Arch::CrossCoreWaitFlag<4, PIPE_V>(pvReadyFlag);
@@ -431,6 +515,8 @@ private:
     AscendC::LocalTensor<SMDtype> glUbTensor16;
     AscendC::LocalTensor<float> dmUbTensor32;
     AscendC::LocalTensor<float> glUbTensor32;
+    AscendC::LocalTensor<float> gmUbTensor;
+    AscendC::LocalTensor<float> lseUbTensor;
     AscendC::LocalTensor<float> redUbTensor;
     bool enableRescaleSkip{false};
     AscendC::LocalTensor<ElementO> goUbTensor16;
@@ -439,4 +525,4 @@ private:
     CopyUbToGmO copyUbToGmO;
 };
 }
-#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_LOCAL_HPP
+#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP_T

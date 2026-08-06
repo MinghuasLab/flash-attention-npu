@@ -199,6 +199,8 @@ public:
         // compute-skip. Set the threshold to 0.0f (and the flag to false) to fully disable.
         EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, 4.0f);
         EpilogueRescaleO epilogueRescaleO(resource, /*enableRescaleSkip=*/true);
+        AscendC::GlobalTensor<float> gLse;
+        gLse.SetGlobalBuffer((__gm__ float *)params.lse);
 #endif
 
         int64_t strideQ = 0;
@@ -228,6 +230,7 @@ public:
         int64_t kBOffset = 0;
         int64_t vBOffset = 0;
         int64_t oBOffset = 0;
+        int64_t lseBOffset = 0;
         int64_t blockBOffset = 0;
         uint32_t preTotalTaskNum = 0;
         uint32_t curBatch = 0;
@@ -238,6 +241,11 @@ public:
         }
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        }
+        // totalQ: total q tokens across all batches (TND only). Used as head stride for LSE layout [num_heads, total_q].
+        int64_t totalQ = 0;
+        if constexpr (qFormat == Format::TND) {
+            totalQ = static_cast<int64_t>(gActualQseqlen.GetValue(batch_));
         }
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
         for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum_; taskIdx += coreNum) {
@@ -252,6 +260,11 @@ public:
                     blockBOffset += static_cast<uint64_t>(maxNumBlocksPerBatch_); 
                 }
                 oBOffset += qSeqlen * strideO;
+                if constexpr (qFormat == Format::TND) {
+                    lseBOffset += qSeqlen;
+                } else {
+                    lseBOffset = static_cast<int64_t>(curBatch) * faiTilingData->maxQSeqlen * qHeads_;
+                }
                 
                 qSeqlen = faiTilingData->maxQSeqlen;
                 kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch));
@@ -488,20 +501,38 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = kvSTileIdxNow % (PRE_LAUNCH + 1);
+                    // LSE GM layout (aligned with arch22 flash_api / mha_fwd_kvcache):
+                    //   TND  -> [num_heads, total_q]:  index = h * totalQ + t
+                    //   BSND -> [batch, num_heads, seqlen_q]: index = b*H*S + h*S + s
+                    // Tokens of one head are contiguous → lseGmRowStride = 1.
+                    int64_t lseGmRowOffset;
+                    int64_t lseHeadStride;
+                    if constexpr (qFormat == Format::TND) {
+                        lseHeadStride = totalQ;
+                    } else {
+                        lseHeadStride = static_cast<int64_t>(faiTilingData->maxQSeqlen);
+                    }
+                    lseGmRowOffset = lseBOffset + qHeadIdx * lseHeadStride + qSOffset;
                     if constexpr (enableDN) {
                         epilogueRescaleO(
                             gmOTensorTla, actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
-                            pvReadyFlag, 1);
+                            pvReadyFlag, 1,
+                            &gLse,
+                            lseGmRowOffset,
+                            /*lseGmRowStride=*/1);
                     } else {
                         epilogueRescaleO(
                             gmOTensorTla, actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
-                            pvReadyFlag, 0);
+                            pvReadyFlag, 0,
+                            &gLse,
+                            lseGmRowOffset,
+                            /*lseGmRowStride=*/1);
                     }
 #endif
                 }
@@ -691,7 +722,8 @@ private:
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout,
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -752,8 +784,8 @@ CATLASS_GLOBAL void FAInfer(
         void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadPV = Gemm::Block::BlockMmadTla<
         DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
-    // rescale O
-    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
+    // rescale O — LSE write gated by compile-time lseMode (NONE / OUT_ONLY)
+    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleOT<lseMode>;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<
         ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
@@ -770,7 +802,8 @@ CATLASS_GLOBAL void FAInfer(
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout,
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -831,8 +864,8 @@ CATLASS_GLOBAL void FAInferDn(
         void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadPV = Gemm::Block::BlockMmadTla<
         DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
-    // rescale O
-    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
+    // rescale O — LSE write gated by compile-time lseMode (NONE / OUT_ONLY)
+    using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleOT<lseMode>;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<
         ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
