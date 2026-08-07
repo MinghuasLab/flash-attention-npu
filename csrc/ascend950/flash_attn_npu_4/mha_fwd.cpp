@@ -8,7 +8,7 @@
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
+ *   ✅ Softmax LSE always computed (Python return_lse only controls whether to return it)
  *   ❌ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
  *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
@@ -239,11 +239,11 @@ mha_fwd(at::Tensor q,
 
     at::Tensor softmaxlse;
     if (is_varlen_q) {
-        // Match v4's varlen lse shape: {total_q, num_heads}
-        softmaxlse = at::empty({sizes[0], num_heads},
+        // Match v4's varlen lse shape: {num_heads, total_q}
+        softmaxlse = at::empty({num_heads, sizes[0]},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     } else {
-        softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+        softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
     softmaxlse.fill_(std::numeric_limits<float>::infinity());

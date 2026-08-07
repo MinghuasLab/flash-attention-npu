@@ -33,13 +33,16 @@ namespace fai_host
     (((CL_) << 0) | ((DT) << 1) | ((MT) << 2) | ((SW) << 3) | \
      ((IP) << 4) | ((LO) << 5) | ((CM_) << 6) | ((PS_) << 7))
 
+// Match 910 FWD_LAUNCH: compile-time OUT_ONLY (LSE always written).
+// NONE remains a valid FAInfer / FAInferDn template default for future use.
 #define LAUNCH_CASE_DN(CL_, DT, MT, SW, IP, LO, CM_, PS_,                              \
                        T, AccT, QF, KVF, CachingMode, PageShapeType,                   \
                        MaskCat, CacheLay)                                              \
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                       \
         if (enableDN)                                                                  \
         {                                                                              \
-            FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
+            FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay,  \
+                      Catlass::Epilogue::LseModeT::OUT_ONLY>                           \
                 <<<blockDim, nullptr, stream>>>(                                        \
                     qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
                     oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
@@ -47,7 +50,8 @@ namespace fai_host
         }                                                                              \
         else                                                                           \
         {                                                                              \
-            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay>   \
+            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay,    \
+                    Catlass::Epilogue::LseModeT::OUT_ONLY>                             \
                 <<<blockDim, nullptr, stream>>>(                                        \
                     qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
                     oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
@@ -59,7 +63,8 @@ namespace fai_host
                     T, AccT, QF, KVF, CachingMode, PageShapeType,                \
                     MaskCat, CacheLay)                                           \
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                 \
-        FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
+        FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, \
+                Catlass::Epilogue::LseModeT::OUT_ONLY>                           \
             <<<blockDim, nullptr, stream>>>(                                     \
                 qDevice, kDevice, vDevice, maskDevice, blockTableDevice,         \
                 oDevice, lseDevice, qSeqDevice, kvSeqDevice,                     \
