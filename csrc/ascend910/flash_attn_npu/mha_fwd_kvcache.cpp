@@ -94,6 +94,7 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementP>& gP;
             AscendC::GlobalTensor<ElementOTmp>& gOTmp;
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
+            AscendC::GlobalTensor<ElementP>& gPret;
         };
 
         __aicore__ inline
@@ -122,6 +123,7 @@ namespace SplitFuse {
             scaleValue = fATilingData->scaleValue;
             softcapValue = fATilingData->softcapValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
+            maxKvSeqlen = fATilingData->maxKvSeqlen;
 
             // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
             uint64_t Lsesize = 0;
@@ -167,12 +169,15 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementOTmp> gOUpdate;
             gOUpdate.SetGlobalBuffer((__gm__ ElementOTmp *)(params.workSpace + Lsesize + Losize +
                 mm1OutSize + smOnlineOutSize + mm2OutSize));
+            
+            AscendC::GlobalTensor<ElementP> gPret;
+            gPret.SetGlobalBuffer((__gm__ ElementP *)(fATilingData->pDevice));
 
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gMask, gBlockTable,
                 gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate
+                gS, gP, gOTmp, gOUpdate, gPret
             };
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -238,6 +243,7 @@ namespace SplitFuse {
             strideO = static_cast<uint64_t>(qHeads * embedV);
             strideK = static_cast<uint64_t>(kvHeads * embed);
             strideV = static_cast<uint64_t>(kvHeads * embedV);
+            stridePret = static_cast<uint64_t>(maxQSeqlen * maxKvSeqlen);
             embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
             embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
             groupSize = qHeads / kvHeads;
@@ -460,6 +466,7 @@ namespace SplitFuse {
             auto& gP = globalTensors.gP;
             auto& gOTmp = globalTensors.gOTmp;
             auto& gOUpdate = globalTensors.gOUpdate;
+            auto& gPret = globalTensors.gPret;
 
             uint32_t qSeqlen = maxQSeqlen;
             uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
@@ -533,6 +540,9 @@ namespace SplitFuse {
             uint64_t gmOffsetLse = lseBOffset +
                 static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                 static_cast<uint64_t>(lseTokenOffset);
+
+            uint64_t gmOffsetPret = static_cast<uint64_t>(BIdx * qHeads + qNStartIdx) * stridePret +
+                                    static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * maxKvSeqlen;
 
             uint32_t qSBlockSize = (qSBlockIdx == (curQSBlockNum - 1U)) ?
                 (qSeqlen - qSBlockIdx * curQSBlockTile) : curQSBlockTile;
@@ -690,6 +700,8 @@ namespace SplitFuse {
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
                                     gMask,
+                                    gPret,
+                                    gmOffsetPret + kvSStartIdx,
                                     layOutP,
                                     layOutS,
                                     layOutMask,
@@ -703,12 +715,16 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
+                                    maxKvSeqlen,
+                                    stridePret,
                                     isSplitKV);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
                                     gMask,
+                                    gPret,
+                                    gmOffsetPret + kvSStartIdx,
                                     layOutP,
                                     layOutS,
                                     layOutMask,
@@ -722,6 +738,8 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
+                                    maxKvSeqlen,
+                                    stridePret,
                                     false);
                             }
                         } else {
@@ -733,6 +751,8 @@ namespace SplitFuse {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
+                                    gPret,
+                                    gmOffsetPret + kvSStartIdx,
                                     layOutP,
                                     layOutS,
                                     actualBlockShapeQK,
@@ -741,11 +761,15 @@ namespace SplitFuse {
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
+                                    maxKvSeqlen,
+                                    stridePret,
                                     isSplitKV);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
+                                    gPret,
+                                    gmOffsetPret + kvSStartIdx,
                                     layOutP,
                                     layOutS,
                                     actualBlockShapeQK,
@@ -754,6 +778,8 @@ namespace SplitFuse {
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
+                                    maxKvSeqlen,
+                                    stridePret,
                                     false);
                             }
                         }
@@ -778,6 +804,8 @@ namespace SplitFuse {
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
                                     gMask,
+                                    gPret,
+                                    gmOffsetPret + kvSStartIdx,
                                     layOutP,
                                     layOutS,
                                     layOutMask,
@@ -788,6 +816,8 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     qkReady,
                                     kvSStartIdx,
+                                    maxKvSeqlen,
+                                    stridePret,
                                     doTriUPreMask,
                                     doTriUNextMask,
                                     windowSizeLeftStartLen,
@@ -803,6 +833,8 @@ namespace SplitFuse {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
+                                gPret,
+                                gmOffsetPret + kvSStartIdx,
                                 layOutP,
                                 layOutS,
                                 actualBlockShapeQK,
@@ -811,6 +843,8 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
+                                maxKvSeqlen,
+                                stridePret,
                                 false,
                                 startsWithMaskTile,
                                 startsWithMaskThenNomaskFlag);
@@ -822,6 +856,8 @@ namespace SplitFuse {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
+                                gPret,
+                                gmOffsetPret + kvSStartIdx,
                                 layOutP,
                                 layOutS,
                                 actualBlockShapeQK,
@@ -830,11 +866,15 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
+                                maxKvSeqlen,
+                                stridePret,
                                 isSplitKV);
                         } else {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
+                                gPret,
+                                gmOffsetPret + kvSStartIdx,
                                 layOutP,
                                 layOutS,
                                 actualBlockShapeQK,
@@ -843,6 +883,8 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
+                                maxKvSeqlen,
+                                stridePret,
                                 false);
                         }
                     }
@@ -990,11 +1032,13 @@ namespace SplitFuse {
         float    softcapValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
+        uint32_t maxKvSeqlen;
 
         uint64_t strideQ;
         uint64_t strideO;
         uint64_t strideK;
         uint64_t strideV;
+        uint64_t stridePret;
         uint32_t embedRound;
         uint32_t embedRoundV;
         uint32_t groupSize;
@@ -1021,7 +1065,8 @@ namespace SplitFuse {
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
         Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE,
         bool IS_FD = false,
-        bool HAS_SOFTCAP = false>
+        bool HAS_SOFTCAP = false,
+        bool RETURN_SOFTMAX = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1069,7 +1114,8 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
+        using DispatchPolicyOnlineSoftmax =
+            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, RETURN_SOFTMAX>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
