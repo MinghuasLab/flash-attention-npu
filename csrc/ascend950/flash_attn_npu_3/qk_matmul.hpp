@@ -11,8 +11,8 @@
  * and it remains persistent until each k base tile is dealt
  * A full q*k^t base tile is loaded to UB from l0C, no workspace transit
  */
-#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP
-#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP
+#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -575,4 +575,4 @@ protected:
 ////////////////////////////////////////////////////////////////////
 
 }  // namespace Catlass::Gemm::Block
-#endif  // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP
+#endif  // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T

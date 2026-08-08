@@ -12,7 +12,7 @@ on:
         description: "测试文件 (tests/ 下的文件名, 如 test_flash_attn_npu_v3.py)"
         required: true
         type: choice
-        default: test_flash_attn_npu_v3.py
+        default: ALL
         options:
           - ALL
           - test_flash_attn_npu_v2.py
@@ -74,6 +74,7 @@ jobs:
       CI_TEST_DIRECT_FILE: ${{ github.event.inputs.test_file == 'ALL' && 'tests/' || format('tests/{0}', github.event.inputs.test_file) }}
       CI_TEST_DIRECT_FILTER: ${{ github.event.inputs.test_filter }}
       CI_TEST_WORKERS: ${{ github.event.inputs.workers }}
+      CI_MODE: full
       CI_REF: ${{ github.event.inputs.ref }}
     steps:
       - name: Check arch match

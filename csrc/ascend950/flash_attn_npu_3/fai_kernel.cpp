@@ -13,18 +13,28 @@
 #include "catlass/arch/arch.hpp"
 #include "catlass/layout/layout.hpp"
 
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
+#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
+#define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP
 #include "catlass/epilogue/block/block_epilogue.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
 
+#include "rescale_o.hpp"
+#include "online_softmax.hpp"
+#include "qk_matmul.hpp"
+#include "qk_matmul_DN.hpp"
+#include "pv_matmul.hpp"
 #include "fai_tilingdata.h"
 
 using namespace Catlass;

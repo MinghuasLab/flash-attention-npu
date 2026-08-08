@@ -11,8 +11,8 @@
  * and it remains persistent until each k base tile is dealt
  * A full q*k^t base tile is loaded to UB from l0C, no workspace transit
  */
-#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP
-#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP
+#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP_T
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP_T
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -473,9 +473,6 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                     copyL1ToL0B(l0BTensorTla, l1ATensorTlaTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
-                    if ((mL0Itr == mL0LoopNum - 1)  && (kL0Itr == kL0LoopNum - 1)) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
-                    }
                     auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileNAct, l0TileKAct);
                     auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
                     auto l1BTensorTlaTile = GetTile(l1BTensorTla,
@@ -484,6 +481,9 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
                     copyL1ToL0A(l0ATensorTla, l1BTensorTlaTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                    if ((mL0Itr == mL0LoopNum - 1)  && (kL0Itr == kL0LoopNum - 1)) {
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
+                    }
 
                     bool initMmad = (kL0Itr == 0);
                     uint32_t l0TileNAligned = RoundUp(l0TileNAct, 16);
@@ -568,4 +568,4 @@ protected:
 ////////////////////////////////////////////////////////////////////
 
 }  // namespace Catlass::Gemm::Block
-#endif // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP
+#endif // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP_T

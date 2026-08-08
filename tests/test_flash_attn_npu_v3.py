@@ -313,6 +313,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("Ascend950 does not support num_splits>1")
     if "Ascend950" in name and (head_size not in [64, 128]):
         pytest.skip("Ascend950 support head_size in 64,128")
+    if "Ascend950" in name and (window_size_right != -1 or window_size_left != -1):
+        pytest.skip("Ascend950 support SWA")
+    if "Ascend950" in name and (softcap != 0.0):
+        pytest.skip("Ascend950 support softcap")
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     q_min_range = -5.0
