@@ -19,7 +19,7 @@ namespace FAGTiling {
 struct FAGInfo {
     float scaleValue;
     float softcapValue;
-
+    int64_t alibiSlopesBatchStride;
     int64_t seqQShapeSize;
     int64_t queryShape_0;
     int64_t queryShape_1;
@@ -79,6 +79,7 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     fagV2TilingData->qSeqlen = fagV2TilingData->t1 / fagV2TilingData->batch;
     fagV2TilingData->qSize = qSize;
     fagV2TilingData->kvSize = kvSize;
+    fagV2TilingData->alibiSlopesBatchStride = fagInfo.alibiSlopesBatchStride;
 
     // TODO set workspace offset 
     constexpr size_t WORKSPACE_RSV_BYTE = 16 * 1024 * 1024;

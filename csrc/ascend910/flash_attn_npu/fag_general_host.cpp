@@ -34,7 +34,9 @@ std::vector<at::Tensor> launch_fag_general(
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    bool deterministic)
+    bool deterministic,
+    uint8_t *alibi_slopes_ptr,           
+    int64_t alibi_slopes_batch_stride) 
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -112,6 +114,9 @@ std::vector<at::Tensor> launch_fag_general(
     fagInfo.vHeadDim = v_headdim;
     fagInfo.isDeterministic = deterministic;
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
+
+    bool has_alibi = alibi_slopes_ptr != nullptr;
+    fagInfo.alibiSlopesBatchStride = alibi_slopes_batch_stride;
 
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
@@ -205,6 +210,8 @@ std::vector<at::Tensor> launch_fag_general(
     gen_args.fftsAddr = fftsAddr;
     gen_args.is_causal = has_attn_mask;
     gen_args.is_softcap = has_softcap;
+    gen_args.has_alibi = has_alibi;
+    gen_args.alibiSlopesDevice = alibi_slopes_ptr;
     gen_args.deterministic = deterministic;
     gen_args.qk_headdim_kernel = qk_headdim_kernel;
     gen_args.dOutDevice = dOutDevice;

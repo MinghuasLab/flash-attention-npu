@@ -89,6 +89,7 @@ def ref_flash_attention(
     mask,
     data_type,
     softcap=0.0,
+    alibi_slopes=None,
     ):
     inner_prec = 0
     interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
@@ -119,6 +120,13 @@ def ref_flash_attention(
         qk_result = qk_result * scale
         if softcap > 0.0:
             qk_result = softcap * torch.tanh(qk_result / softcap)
+        if alibi_slopes is not None:
+            sk_chunk = qk_result.shape[2]
+            j_abs = kv_start + torch.arange(sk_chunk, dtype=torch.float32)
+            slopes = alibi_slopes.to(torch.float32).reshape(-1, 1, 1)  # [nheads, 1, 1]
+            i_abs = (context_len - qk_result.shape[1]) + torch.arange(qk_result.shape[1], dtype=torch.float32)
+            dist = torch.abs(i_abs.reshape(-1, 1) - j_abs.reshape(1, -1))  # [Sq, sk]
+            qk_result = qk_result + (-slopes) * dist.unsqueeze(0)  # [H,Sq,sk] + [H,1,1]*[1,Sq,sk] -> [H,Sq,sk]
         if mask is not None:
             qk_result += sub_mask
         if kv_start == 0:
@@ -142,151 +150,161 @@ def ref_flash_attention(
     lse = torch.squeeze((torch.log(gl) + gm), dim=-1).to(torch.float32)
     return go.to(data_type), lse
 
+def make_alibi_slopes(batch_size, num_heads):
+    _h = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    return _h.unsqueeze(0).repeat(batch_size, 1)
+
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap)
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -1, -1, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -1, -1, 0.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0, False),
     # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
-    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0),  # Mistral-style causal SWA
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 0.0),
-    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0, False),  # Mistral-style causal SWA
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 0.0, False),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 0.0, False),
     # SWA + large GQA decode: rowLoopNum>1 must not hang (EVENT_ID0 order in online_softmax)
-    (torch.float16, 1, 64, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0),
-    (torch.float16, 1, 128, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0),
-    (torch.float16, 1, 512, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0),
-    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, 0, 128, True, 64, 0, 0.0),
+    (torch.float16, 1, 64, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0, False),
+    (torch.float16, 1, 128, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0, False),
+    (torch.float16, 1, 512, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0, False),
+    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, 0, 128, True, 64, 0, 0.0, False),
     # Sq>>Sk + left window >= Sk-1 → infinite left; must use INT_MAX not numeric -1
-    (torch.float16, 16, 2, 2, 4096, 2, 128, 0, 128, False, 65, 412, 0.0),
+    (torch.float16, 16, 2, 2, 4096, 2, 128, 0, 128, False, 65, 412, 0.0, False),
     # D=4 + causal (SWA hang-repro / causal ADDR_MISALIGN probe)
-    (torch.float16, 1, 512, 1, 1, 1024, 4, 0, 128, True, 542, 647, 0.0),
-    (torch.float16, 1, 512, 1, 1, 1024, 4, 0, 128, True, -1, -1, 0.0),
+    (torch.float16, 1, 512, 1, 1, 1024, 4, 0, 128, True, 542, 647, 0.0, False),
+    (torch.float16, 1, 512, 1, 1, 1024, 4, 0, 128, True, -1, -1, 0.0, False),
     # finite left + large right (Sq<<right): GPU keeps right finite vs Sk
-    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, True, 826, 973, 0.0),
-    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, False, 826, 973, 0.0),
+    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, True, 826, 973, 0.0, False),
+    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, False, 826, 973, 0.0, False),
 
-    (torch.bfloat16, 1, 8, 2, 1, 512, 128, 0, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 4, 32, 8, 1, 2048, 128, 0, 128, False, -1, -1, 0.0), # g=4,decode, qNBlockTile=4
-    (torch.bfloat16, 8, 64, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0), # g=8,decode, qNBlockTile=8
-    (torch.bfloat16, 4, 64, 16, 16, 1024, 128, 0, 128, True, -1, -1, 0.0),# g=4,Sq=16,qNBlockTile=4
-    (torch.bfloat16, 8, 128, 16, 32, 2048, 128, 0, 128, False, -1, -1, 0.0),# g=8,Sq=32,qNBlockTile=4
-    (torch.bfloat16, 4, 64, 8, 64, 4096, 128, 0, 128, False, -1, -1, 0.0),# g=8,Sq=64,qNBlockTile=2
-    (torch.bfloat16, 8, 128, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0),# g=16, decode, qNBlockTile=16
-    (torch.bfloat16, 4, 32, 4, 16, 1024, 256, 0, 128, False, -1, -1, 0.0),# g=8,Sq=16,D=256
-    (torch.bfloat16, 8, 128, 32, 64, 2048, 128, 0, 128, True, -1, -1, 0.0), # g=4,Sq=64,qNBlockTile=2
-    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 0.0), # g=16, Sq=32,qNBlockTile=4
-    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 0.0), # g=8,decode, D=256
-    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=8,nT=4
-    (torch.bfloat16, 1, 64, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=16, nT=4
-    (torch.bfloat16, 1, 128, 4, 1, 2048, 128, 1, 128, True, -1, -1, 0.0), # FD decode, g=32, nT=4
-    (torch.bfloat16, 2, 32, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=8,nT=8
-    (torch.bfloat16, 2, 16, 2, 1, 2048, 128, 1, 128, True, -1, -1, 0.0),# FD decode, g=8,nT=4
-    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 0.0), # FD decode, g=4,nT=8, D=256
-    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD multi, g=8,Sq*g=32,nT=4
-    (torch.bfloat16, 2, 16, 2, 4, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD multi, g=8,Sq*g=32,nT=4
-    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 0.0),# FD multi, g=16, Sq*g=128, nT=4
-    (torch.bfloat16, 1, 32, 4, 16, 4096, 128, 1, 128, False, -1, -1, 0.0),# FD multi, g=8,Sq*g=128, nT=4
-
-    (torch.bfloat16, 1, 32, 4, 3, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD JSQ4 Sq=3,g=8,nT=4  [非2幂]
-    (torch.bfloat16, 2, 16, 2, 5, 4096, 128, 1, 128, True, -1, -1, 0.0),# FD JSQ4 Sq=5,g=8,nT=4  [非2幂]
-    (torch.bfloat16, 1, 64, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD JSQ4 Sq=7,g=16, nT=4  [非2幂]
-    (torch.bfloat16, 1, 32, 4, 11, 4096, 128, 1, 128, False, -1, -1, 0.0),# FD JSQ4 Sq=11, g=8,nT=4  [非2幂]
-    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 0.0),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
-    (torch.bfloat16, 2, 16, 2, 15, 2048, 128, 1, 128, True, -1, -1, 0.0), # FD JSQ4 Sq=15, g=8,nT=4  [非2幂]
-    (torch.bfloat16, 4, 32, 32, 1, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 8, 64, 64, 1, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 32, 32, 16, 1024, 128, 0, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 4, 64, 64, 32, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 8, 16, 16, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 32, 32, 1, 4096, 256, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 32, 8, 65, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 64, 16, 96, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 24, 2, 8, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 32, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 24, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 32, 2, 10, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 64, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 24, 2, 6, 2048, 256, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 48, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 48, 4, 8, 2048, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 4, 64, 4, 10, 4096, 128, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 64, 4, 2, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 32, 4, 2, 4096, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 64, 8, 4, 4096, 128, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 32, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 2, 16, 2, 8, 4096, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 32, 4, 13, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 32, 8, 16, 2048, 256, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 8, 2, 1, 512, 128, 0, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 32, 8, 1, 2048, 128, 0, 128, False, -1, -1, 0.0, False), # g=4,decode, qNBlockTile=4
+    (torch.bfloat16, 8, 64, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0, False), # g=8,decode, qNBlockTile=8
+    (torch.bfloat16, 4, 64, 16, 16, 1024, 128, 0, 128, True, -1, -1, 0.0, False),# g=4,Sq=16,qNBlockTile=4
+    (torch.bfloat16, 8, 128, 16, 32, 2048, 128, 0, 128, False, -1, -1, 0.0, False),# g=8,Sq=32,qNBlockTile=4
+    (torch.bfloat16, 4, 64, 8, 64, 4096, 128, 0, 128, False, -1, -1, 0.0, False),# g=8,Sq=64,qNBlockTile=2
+    (torch.bfloat16, 8, 128, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0, False),# g=16, decode, qNBlockTile=16
+    (torch.bfloat16, 4, 32, 4, 16, 1024, 256, 0, 128, False, -1, -1, 0.0, False),# g=8,Sq=16,D=256
+    (torch.bfloat16, 8, 128, 32, 64, 2048, 128, 0, 128, True, -1, -1, 0.0, False), # g=4,Sq=64,qNBlockTile=2
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 0.0, False), # g=16, Sq=32,qNBlockTile=4
+    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 0.0, False), # g=8,decode, D=256
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, False), # FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 64, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0, False), # FD decode, g=16, nT=4
+    (torch.bfloat16, 1, 128, 4, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False), # FD decode, g=32, nT=4
+    (torch.bfloat16, 2, 32, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0, False), # FD decode, g=8,nT=8
+    (torch.bfloat16, 2, 16, 2, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False),# FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 0.0, False), # FD decode, g=4,nT=8, D=256
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 0.0, False), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 2, 16, 2, 4, 4096, 128, 1, 128, False, -1, -1, 0.0, False), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 0.0, False),# FD multi, g=16, Sq*g=128, nT=4
+    (torch.bfloat16, 1, 32, 4, 16, 4096, 128, 1, 128, False, -1, -1, 0.0, False),# FD multi, g=8,Sq*g=128, nT=4
+    
+    (torch.bfloat16, 1, 32, 4, 3, 2048, 128, 1, 128, False, -1, -1, 0.0, False), # FD JSQ4 Sq=3,g=8,nT=4  [非2幂]
+    (torch.bfloat16, 2, 16, 2, 5, 4096, 128, 1, 128, True, -1, -1, 0.0, False),# FD JSQ4 Sq=5,g=8,nT=4  [非2幂]
+    (torch.bfloat16, 1, 64, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0, False), # FD JSQ4 Sq=7,g=16, nT=4  [非2幂]
+    (torch.bfloat16, 1, 32, 4, 11, 4096, 128, 1, 128, False, -1, -1, 0.0, False),# FD JSQ4 Sq=11, g=8,nT=4  [非2幂]
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 0.0, False),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
+    (torch.bfloat16, 2, 16, 2, 15, 2048, 128, 1, 128, True, -1, -1, 0.0, False), # FD JSQ4 Sq=15, g=8,nT=4  [非2幂]
+    (torch.bfloat16, 4, 32, 32, 1, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 8, 64, 64, 1, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 32, 32, 16, 1024, 128, 0, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 64, 64, 32, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 8, 16, 16, 8, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 32, 32, 1, 4096, 256, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 32, 8, 65, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 64, 16, 96, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 24, 2, 8, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 32, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 24, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 32, 2, 10, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 64, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 256, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 48, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 48, 4, 8, 2048, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 4, 64, 4, 10, 4096, 128, 0, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 64, 4, 2, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 32, 4, 2, 4096, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 64, 8, 4, 4096, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 32, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 16, 2, 8, 4096, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 32, 4, 13, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 32, 8, 16, 2048, 256, 1, 128, False, -1, -1, 0.0, False),
     # --- JSQ4/ODD ---
-    (torch.bfloat16, 1, 6, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 10, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 6, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 10, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 14, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 18, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 6, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 10, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 6, 2, 9, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 6, 2, 11, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 10, 2, 15, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 10, 2, 10, 4096, 256, 1, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 8, 2, 8, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 16, 2, 16, 2048, 128, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 1, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 0, 128, False, -1, -1, 0.0),
-    (torch.bfloat16, 8, 1024, 16, 8, 640, 1, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 6, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 10, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 6, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 10, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 14, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 18, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 6, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 10, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 6, 2, 9, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 6, 2, 11, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 10, 2, 15, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 10, 2, 10, 4096, 256, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 8, 2, 8, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 16, 2, 16, 2048, 128, 1, 128, False, -1, -1, 0.0, False),
     # Softcap
-    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 30.0), # g=16, Sq=32,qNBlockTile=4
-    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 30.0), # g=8,decode, D=256
-    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 30.0), # FD decode, g=8,nT=4
-    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 30.0), # FD decode, g=4,nT=8, D=256
-    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 30.0), # FD multi, g=8,Sq*g=32,nT=4
-    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 30.0),# FD multi, g=16, Sq*g=128, nT=4
-    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 30.0),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
-    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 30.0),
-    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 30.0),
-    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 30.0),
-    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 1, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 0, 128, False, -1, -1, 30.0),
-    (torch.bfloat16, 8, 1024, 16, 8, 640, 1, 1, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 30.0, False), # g=16, Sq=32,qNBlockTile=4
+    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 30.0, False), # g=8,decode, D=256
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 30.0, False), # FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 30.0, False), # FD decode, g=4,nT=8, D=256
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 30.0, False), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 30.0, False),# FD multi, g=16, Sq*g=128, nT=4
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 30.0, False),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
+    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 30.0, False),
+    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 30.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 30.0, False),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 30.0, False),
+    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 1, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 1, 3, 1, 128, 2048, 1, 0, 128, False, -1, -1, 30.0, False),
+    (torch.bfloat16, 8, 1024, 16, 8, 640, 1, 1, 128, False, -1, -1, 30.0, False),
+    # Alibi
+    (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True),
+    (torch.bfloat16, 2, 8, 8, 1024, 2077, 128, 0, 128, True, -1, -1, 0.0, True),
+    (torch.float16, 4, 8, 2, 257, 257, 128, 0, 128, False, -1, -1, 0.0, True),
+    (torch.bfloat16, 2, 10, 2, 256, 256, 128, 0, 128, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 1, 4, 4, 512, 1024, 128, 0, 128, False, -1, -1, 0.0, True),
+    (torch.float16, 2, 8, 2, 513, 513, 128, 0, 128, False, -1, -1, 30.0, True),
+    (torch.bfloat16, 4, 16, 4, 512, 512, 128, 0, 128, True, -1, -1, 50.0, True),
+    (torch.bfloat16, 1, 4, 2, 257, 257, 256, 0, 128, True, -1, -1, 30.0, True),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi):
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -321,7 +339,14 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rotary_sin = None
     cache_batch_idx = None
     leftpad_k = None
-    alibi_slopes = None
+
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
+    
     window_size_left_golden = window_size_left
     window_size_right_golden = window_size_right
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
@@ -413,10 +438,11 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             key_cache_per_batch = key_cache.detach().cpu()[i]
             value_cache_per_batch = value_cache.detach().cpu()[i]
         query_cpu = query.detach().cpu()[i]
+        slopes_i = alibi_slopes_cpu[i] if alibi_slopes_cpu is not None else None
         if is_causal_golden or is_local_golden:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap, slopes_i)
         else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap, slopes_i)
         out = output.reshape(q_seqlen, num_heads, head_size)
         if is_local_golden and atten_mask is not None:
             # Soft mask (-1e4) still yields finite garbage on fully-masked rows;
@@ -434,31 +460,42 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
 
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap, use_alibi)
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, 0.0, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 0.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0, False),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0, False),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0, False),
     # Softcap
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 30.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 30.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 30.0, False),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 30.0, False),
+    # Alibi
+    (torch.float16, 1, 4, 4, 512, 512, 128, True, False, 0.0, True),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0, True),
+    (torch.float16, 4, 4, 1, 513, 513, 128, False, False, 0.0, True),
+    (torch.bfloat16, 2, 10, 2, 256, 256, 128, False, True, 0.0, True),
+    (torch.float16, 1, 2, 2, 512, 1024, 128, False, False, 0.0, True),
+    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, 30.0, True),
+    (torch.float16, 2, 4, 2, 513, 513, 128, True, True, 50.0, True),
+    (torch.bfloat16, 1, 4, 4, 512, 512, 256, True, False, 30.0, True),
+    
 ]
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
-def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap, use_alibi", test_cases)
+def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap, use_alibi):
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -475,7 +512,12 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     window_size_left = -1
     window_size_right = -1
     num_splits = 0
-    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
 
     ret = flash_attn_func(
         query,
@@ -505,10 +547,11 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
         value_cache_per_batch = value_cache.detach().cpu()[i]
 
         query_cpu = query.detach().cpu()[i]
+        slopes_i = alibi_slopes_cpu[i] if alibi_slopes_cpu is not None else None
         if is_causal:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap, slopes_i)
         else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap, slopes_i)
         out = output.reshape(q_seqlen, num_heads, head_size)
         golden_out[i:i+1] = out
         golden_lseL[i:i+1] = golden_lse.reshape(num_heads, q_seqlen)
@@ -521,46 +564,55 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
 
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap)
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0),
-    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0),
-    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0),
-    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 0.0),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 0.0),
-    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0, False),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0, False),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0, False),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 0.0, False),
     # SWA
-    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 512, 0, 0.0),
-    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 256, 128, 0.0),
-    (torch.float16, 2, 4, 4, 256, 256, 128, False, 64, 128, 0.0),
-    (torch.bfloat16, 1, 1, 1, 512, 512, 128, False, 0, 256, 0.0),
-    (torch.bfloat16, 2, 6, 2, 128, 256, 128, True, 127, 0, 0.0),
-    (torch.bfloat16, 2, 4, 4, 128, 512, 128, True, 511, 0, 0.0),
-    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0),
-    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 0.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 512, 0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 256, 128, 0.0, False),
+    (torch.float16, 2, 4, 4, 256, 256, 128, False, 64, 128, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, False, 0, 256, 0.0, False),
+    (torch.bfloat16, 2, 6, 2, 128, 256, 128, True, 127, 0, 0.0, False),
+    (torch.bfloat16, 2, 4, 4, 128, 512, 128, True, 511, 0, 0.0, False),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0, False),
+    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 0.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0, False),
     # SWA + large GQA decode (EVENT_ID0 / rowLoopNum>1 hang regression)
-    (torch.float16, 1, 64, 1, 1, 1024, 128, True, 542, 647, 0.0),
-    (torch.float16, 1, 128, 1, 1, 1024, 128, True, 542, 647, 0.0),
-    (torch.float16, 1, 512, 1, 1, 1024, 128, True, 542, 647, 0.0),
-    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, True, 64, 0, 0.0),
+    (torch.float16, 1, 64, 1, 1, 1024, 128, True, 542, 647, 0.0, False),
+    (torch.float16, 1, 128, 1, 1, 1024, 128, True, 542, 647, 0.0, False),
+    (torch.float16, 1, 512, 1, 1, 1024, 128, True, 542, 647, 0.0, False),
+    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, True, 64, 0, 0.0, False),
     # Softcap
-    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1,  30.0),
-    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 30.0),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0),
-    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 30.0),
-    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0),
-    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 30.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1,  30.0, False),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0, False),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 30.0, False),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0, False),
+    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 30.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0, False),
+    # Alibi
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 2, 8, 8, 1024, 1024, 128, False, -1, -1, 0.0, True),
+    (torch.float16, 7, 10, 2, 777, 888, 192, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 128, False, -1, -1, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, False, -1, -1, 0.0, True),
+    (torch.float16, 4, 8, 2, 513, 513, 128, True, -1, -1, 30.0, True),
+    (torch.bfloat16, 2, 4, 4, 512, 512, 128, False, -1, -1, 50.0, True),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, False, -1, -1, 0.0, True),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, use_alibi", test_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, use_alibi):
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -575,7 +627,12 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     max_seqlen_k = kv_seqlen
     dropout_p = 0.0
     scale = 1.0 / (head_size ** 0.5)
-    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
     deterministic = False
     return_attn_probs = True
     block_table = None
@@ -640,10 +697,11 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
         value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
         query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
+        slopes_i = alibi_slopes_cpu[i - 1] if alibi_slopes_cpu is not None else None
         if is_causal_golden or is_local_golden:
-            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type, softcap, slopes_i)
         else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type, softcap)
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type, softcap, slopes_i)
         out = output.reshape(q_seqlen , num_heads, head_size)
         if is_local_golden and atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)

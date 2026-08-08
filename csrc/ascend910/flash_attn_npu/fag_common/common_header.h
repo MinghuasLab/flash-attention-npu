@@ -17,7 +17,7 @@
 #define SET_FLAG(trigger, waiter, e) AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
 #define WAIT_FLAG(trigger, waiter, e) AscendC::WaitFlag<AscendC::HardEvent::trigger##_##waiter>((e))
 
-const int32_t TILING_PARA_NUM = 35;
+const int32_t TILING_PARA_NUM = 36;
 const int32_t TILING_CORE_NUM = 3;
 const int32_t TILING_SCALE_VALUE = 4;
 const int32_t TILING_B = 5;
