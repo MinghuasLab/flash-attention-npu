@@ -102,6 +102,7 @@ public:
         GM_ADDR dq;
         GM_ADDR dk;
         GM_ADDR dv;
+        GM_ADDR alibi_slopes;
         GM_ADDR workspace;
         GM_ADDR tiling_data;
         GM_ADDR ptrDump;
@@ -118,14 +119,14 @@ public:
             GM_ADDR row_lse_, GM_ADDR row_in_, 
             GM_ADDR out_, GM_ADDR prefix_, GM_ADDR cu_seq_qlen_, 
             GM_ADDR cu_seq_kvlen_, GM_ADDR q_start_idx_, GM_ADDR kv_start_idx_, 
-            GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_, GM_ADDR workspace_, GM_ADDR tiling_data_, GM_ADDR ptrDump_
+            GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_, GM_ADDR workspace_, GM_ADDR tiling_data_, GM_ADDR ptrDump_
         ) : q(q_), k(k_), v(v_), dout(dout_),
             q_right(q_right_), k_right(k_right_), pse_shift(pse_shift_),
             drop_mask(drop_mask_), padding_mask(padding_mask_), atten_mask(atten_mask_),
             row_lse(row_lse_), row_in(row_in_), 
             out(out_), prefix(prefix_), cu_seq_qlen(cu_seq_qlen_), 
             cu_seq_kvlen(cu_seq_kvlen_), q_start_idx(q_start_idx_), kv_start_idx(kv_start_idx_), 
-            dq(dq_), dk(dk_), dv(dv_), workspace(workspace_), tiling_data(tiling_data_), ptrDump(ptrDump_)
+            dq(dq_), dk(dk_), dv(dv_), alibi_slopes(alibi_slopes_), workspace(workspace_), tiling_data(tiling_data_), ptrDump(ptrDump_)
         {
         }    
     };
@@ -274,7 +275,7 @@ public:
         // vector process
         AscendC::TPipe pipeVec;
         EpilogueFAGOp epilogueFagOp(resource, &pipeVec, params.row_lse,
-            params.atten_mask, actucal_seq_q_addr, actucal_seq_k_addr, params.workspace, batch, params.tiling_data);
+            params.atten_mask, actucal_seq_q_addr, actucal_seq_k_addr, params.alibi_slopes, params.workspace, batch, params.tiling_data);
 
         VectorAddr<maskType, inputLayout> vector_addr;
         vector_addr.init(batch, nheads, g, headdim, GetBlockIdx() / 2, seq_q_len, seq_k_len, actucal_seq_q_addr,
@@ -348,7 +349,8 @@ template <
     typename InputDtype = half,
     MaskType maskType = MaskType::NO_MASK,
     InputLayout inputLayout = InputLayout::TND,
-    bool HAS_SOFTCAP = false>
+    bool HAS_SOFTCAP = false,
+    bool HAS_ALIBI = false>
 __global__ __aicore__
 void FAGVarlenOpt(uint64_t fftsAddr,
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR dout,
@@ -357,7 +359,7 @@ void FAGVarlenOpt(uint64_t fftsAddr,
         GM_ADDR atten_mask, GM_ADDR row_lse, GM_ADDR row_in, 
         GM_ADDR out, GM_ADDR prefix, GM_ADDR cu_seq_qlen, 
         GM_ADDR cu_seq_kvlen, GM_ADDR q_start_idx, GM_ADDR kv_start_idx, 
-        GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
+        GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR alibi_slopes,
         GM_ADDR workspace, GM_ADDR tiling_data, GM_ADDR ptrDump)
 {
     // Set FFTS address
@@ -432,7 +434,7 @@ void FAGVarlenOpt(uint64_t fftsAddr,
     using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp<HAS_SOFTCAP>;
+    using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp<HAS_SOFTCAP, HAS_ALIBI>;
     using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>, FAGv2TilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
@@ -449,7 +451,7 @@ void FAGVarlenOpt(uint64_t fftsAddr,
         row_lse, row_in, 
         out, prefix, cu_seq_qlen, 
         cu_seq_kvlen, q_start_idx, kv_start_idx, 
-        dq, dk, dv, workspace, tiling_data, ptrDump};
+        dq, dk, dv, alibi_slopes, workspace, tiling_data, ptrDump};
 
     // call kernel
     FAGKernel fag;

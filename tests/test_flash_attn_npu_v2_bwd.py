@@ -72,9 +72,15 @@ def rand_inputs(shape, data_type, device):
     return (INPUT_LIMIT * (torch.rand(shape) - 0.5)).to(data_type).to(device)
 
 
+def make_alibi_slopes(batch_size, num_heads):
+    _h = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    return _h.unsqueeze(0).repeat(batch_size, 1)
+
+
 def run_bsnd_bwd(
     query, key, value, dout, data_type,
     num_heads, kv_heads, scale, softcap, is_causal, window_size=(-1, -1),
+    alibi_slopes=None,
 ):
     q_ag = query.detach().clone().requires_grad_(True)
     k_ag = key.detach().clone().requires_grad_(True)
@@ -87,6 +93,7 @@ def run_bsnd_bwd(
         softcap=softcap,
         causal=is_causal,
         window_size=window_size,
+        alibi_slopes=alibi_slopes,
         return_attn_probs=True,
     )
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
@@ -97,6 +104,7 @@ def run_bsnd_bwd(
         num_heads, kv_heads, scale, softcap, DROPOUT_P,
         is_causal, window_size[0], window_size[1],
         gtype=GTYPE,
+        alibi_slopes=alibi_slopes,
     )
     return data_type, dq_ag, dk_ag, dv_ag, dq_golden, dk_golden, dv_golden
 
@@ -107,6 +115,7 @@ def run_varlen_bwd(
     max_seqlen_q, max_seqlen_k,
     seqlens_q, seqlens_k,
     scale, softcap, is_causal, window_size=(-1, -1),
+    alibi_slopes=None,
 ):
     num_heads = query.shape[1]
     kv_heads = key.shape[1]
@@ -124,6 +133,7 @@ def run_varlen_bwd(
         softcap=softcap,
         causal=is_causal,
         window_size=window_size,
+        alibi_slopes=alibi_slopes,
         return_attn_probs=True,
     )
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
@@ -134,6 +144,7 @@ def run_varlen_bwd(
         num_heads, kv_heads, seqlens_q, seqlens_k, scale, softcap, DROPOUT_P,
         is_causal, window_size[0], window_size[1],
         gtype=GTYPE,
+        alibi_slopes=alibi_slopes,
     )
     return data_type, dq_ag, dk_ag, dv_ag, dq_golden, dk_golden, dv_golden
 
@@ -145,110 +156,142 @@ def assert_bwd_results(data_type, dq_ag, dk_ag, dv_ag, dq_golden, dk_golden, dv_
 
 
 test_cases_bsnd = [
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 0.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, 0.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 0.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 0.0),
-    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 0.0),
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 30.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 30.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, 30.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 30.0),
-    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 30.0),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 0.0, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 0.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, 0.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 0.0, False),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 0.0, False),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 0.0, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 30.0, False),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 30.0, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, 30.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 30.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0, False),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 30.0, False),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 30.0, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 0.0, True),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 0.0, True),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0.0, True),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 0.0, True),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 0.0, True),
+    (torch.float16, 8, 4, 2, 257, 257, 128, False, 0.0, True),
+    (torch.bfloat16, 1, 8, 2, 512, 1024, 128, False, 0.0, True),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 30.0, True),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0, True),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, 40.0, True),
+    (torch.bfloat16, 2, 4, 2, 257, 257, 256, True, 50.0, True),
 ]
 
 
 @pytest.mark.parametrize(
-    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi",
     test_cases_bsnd,
 )
 def test_fa_bsnd_bwd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap,
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi,
 ):
     query = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
     key = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
     value = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
     dout = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
+
+    alibi_slopes = make_alibi_slopes(batch_size, num_heads).npu() if use_alibi else None
 
     scale = 1.0 / (head_size ** 0.5)
     results = run_bsnd_bwd(
         query, key, value, dout, data_type,
         num_heads, kv_heads, scale, softcap, is_causal, (-1, -1),
+        alibi_slopes=alibi_slopes,
     )
     assert_bwd_results(*results)
 
 
 test_cases_bsnd_swa = [
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 0.0),
-    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 0.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 30.0),
-    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 30.0),
-    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 0.0, False),
+    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 30.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 30.0, False),
+    (torch.float16, 2, 2, 2, 512, 512, 128, False, 64, 128, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 30.0, False),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, 0, 256, 0.0, True),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0, True),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0, True),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 30.0, True),
+    (torch.float16, 2, 8, 2, 512, 512, 128, False, 64, 128, 0.0, True),
+    (torch.bfloat16, 1, 4, 2, 1024, 1024, 128, True, 512, 0, 30.0, True),
+    
 ]
 
 
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, "
-    "is_causal, window_size_left, window_size_right, softcap",
+    "is_causal, window_size_left, window_size_right, softcap, use_alibi",
     test_cases_bsnd_swa,
 )
 def test_fa_bsnd_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size_left, window_size_right, softcap
+    is_causal, window_size_left, window_size_right, softcap, use_alibi
 ):
     query = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
     key = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
     value = rand_inputs((batch_size, kv_seqlen, kv_heads, head_size), data_type, "npu")
     dout = rand_inputs((batch_size, q_seqlen, num_heads, head_size), data_type, "npu")
+
+    alibi_slopes = make_alibi_slopes(batch_size, num_heads).npu() if use_alibi else None
 
     scale = 1.0 / (head_size ** 0.5)
     window_size = (window_size_left, window_size_right)
     results = run_bsnd_bwd(
         query, key, value, dout, data_type,
         num_heads, kv_heads, scale, softcap, is_causal, window_size,
+        alibi_slopes=alibi_slopes,
     )
     assert_bwd_results(*results)
 
 
 test_cases_varlen = [
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 0.0),
-    (torch.float16, 1, 5, 1, 512, 512, 128, True, 0.0),
-    (torch.float16, 1, 5, 1, 777, 888, 192, False, 0.0),
-    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 0.0),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 0.0),
-    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 0.0),
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 30.0),
-    (torch.float16, 1, 5, 1, 512, 512, 128, True, 30.0),
-    (torch.float16, 1, 5, 1, 777, 888, 192, False, 30.0),
-    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 30.0),
-    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 30.0),
-    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 30.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 0.0, False),
+    (torch.float16, 1, 5, 1, 512, 512, 128, True, 0.0, False),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, 0.0, False),
+    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 0.0, False),
+    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 30.0, False),
+    (torch.float16, 1, 5, 1, 512, 512, 128, True, 30.0, False),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, 30.0, False),
+    (torch.float16, 1, 5, 1, 1777, 1888, 256, True, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, 30.0, False),
+    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True, 30.0, False),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 0.0, True),
+    (torch.float16, 3, 5, 1, 512, 512, 128, True, 0.0, True),
+    (torch.float16, 2, 5, 1, 777, 888, 192, False, 0.0, True),
+    (torch.float16, 4, 5, 1, 1777, 1888, 256, False, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 30.0, True),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, 30.0, True),
+    (torch.bfloat16, 1, 5, 1, 512, 512, 128, True, 30.0, True),
 ]
 
 
 @pytest.mark.parametrize(
-    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap",
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi",
     test_cases_varlen,
 )
 def test_fa_varlen_bwd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi
 ):
     total_q = batch_size * q_seqlen
     total_k = batch_size * kv_seqlen
@@ -256,6 +299,7 @@ def test_fa_varlen_bwd(
     key = rand_inputs((total_k, kv_heads, head_size), data_type, "npu")
     value = rand_inputs((total_k, kv_heads, head_size), data_type, "npu")
     dout = rand_inputs((total_q, num_heads, head_size), data_type, "npu")
+    alibi_slopes = make_alibi_slopes(batch_size, num_heads).npu() if use_alibi else None
 
     seqlens_q = [q_seqlen] * batch_size
     seqlens_k = [kv_seqlen] * batch_size
@@ -269,28 +313,34 @@ def test_fa_varlen_bwd(
         q_seqlen, kv_seqlen,
         seqlens_q, seqlens_k,
         scale, softcap, is_causal, (-1, -1),
+        alibi_slopes=alibi_slopes,
     )
     assert_bwd_results(*results)
 
 
 test_cases_varlen_swa = [
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 0.0),
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 0.0),
-    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 0.0),
-     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 30.0),
-    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 30.0),
-    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 30.0),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 0.0, False),
+    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 30.0, False),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 30.0, False),
+    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 30.0, False),
+    (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128, 30.0, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, True),
+    (torch.float16, 1, 4, 2, 512, 512, 128, False, 64, 128, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256, 30.0, True),
 ]
 
 
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, "
-    "is_causal, window_size_left, window_size_right, softcap",
+    "is_causal, window_size_left, window_size_right, softcap, use_alibi",
     test_cases_varlen_swa,
 )
 def test_fa_varlen_bwd_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size_left, window_size_right, softcap
+    is_causal, window_size_left, window_size_right, softcap, use_alibi
 ):
     total_q = batch_size * q_seqlen
     total_k = batch_size * kv_seqlen
@@ -298,6 +348,7 @@ def test_fa_varlen_bwd_swa(
     key = rand_inputs((total_k, kv_heads, head_size), data_type, "npu")
     value = rand_inputs((total_k, kv_heads, head_size), data_type, "npu")
     dout = rand_inputs((total_q, num_heads, head_size), data_type, "npu")
+    alibi_slopes = make_alibi_slopes(batch_size, num_heads).npu() if use_alibi else None
 
     seqlens_q = [q_seqlen] * batch_size
     seqlens_k = [kv_seqlen] * batch_size
@@ -312,5 +363,6 @@ def test_fa_varlen_bwd_swa(
         q_seqlen, kv_seqlen,
         seqlens_q, seqlens_k,
         scale, softcap, is_causal, window_size,
+        alibi_slopes=alibi_slopes,
     )
     assert_bwd_results(*results)

@@ -100,6 +100,15 @@ def sum_gqa_grad(dk_or_dv, nheads, nheads_k, batch, seq_k, headdim):
         ).reshape(batch, nheads_k, seq_k, headdim)
     )
 
+def _alibi_bias_2d(slope, seq_q, seq_k):
+    """ALiBi bias matrix [Sq, Sk]: -slope * |i_abs - j_abs|. 
+    """
+    alibi_diff_s = max(0, seq_k - seq_q)
+    i_abs = alibi_diff_s + torch.arange(seq_q, dtype=torch.float32)
+    j_abs = torch.arange(seq_k, dtype=torch.float32)
+    dist = torch.abs(i_abs.unsqueeze(1) - j_abs.unsqueeze(0))
+    bias = (-slope.to(torch.float32)) * dist
+    return bias
 
 def softmax_res_from_fa_lse_bsnd(
     q_bn,
@@ -113,6 +122,7 @@ def softmax_res_from_fa_lse_bsnd(
     compute_dtype,
     *,
     gtype=torch.float64,
+    alibi_slopes=None,
 ):
     """q_bn / k_bn: (B, N, S, D)。softmax_lse: FA BSND (B, N, S_q)。"""
     atten_mask = _resolve_atten_mask(
@@ -123,6 +133,18 @@ def softmax_res_from_fa_lse_bsnd(
     qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
     if softcap > 0.0:
         qk = softcap * torch.tanh(qk / softcap)
+    if alibi_slopes is not None:
+        seq_q, seq_k = q_bn.shape[2], k_bn.shape[2]
+        nheads = q_bn.shape[1]
+        nbatch = q_bn.shape[0]
+
+        slopes_2d = alibi_slopes.to(torch.float32).cpu()
+        if slopes_2d.dim() == 1:
+            slopes_2d = slopes_2d.unsqueeze(0).expand(nbatch, nheads)  # [H] -> [B,H]
+        for b in range(nbatch):
+            for h in range(nheads):
+                bias = _alibi_bias_2d(slopes_2d[b, h], seq_q, seq_k)   # [Sq, Sk]
+                qk[b, h] = qk[b, h] + bias.to(qk.dtype)
     if atten_mask is not None and len(atten_mask.shape) != 0:
         qk = qk + atten_mask.to(torch.float32) * (-40000.0)
     lse = softmax_lse.to(torch.float32).to(gtype)
@@ -147,6 +169,7 @@ def softmax_res_from_fa_lse_tnd_slice(
     compute_dtype,
     *,
     gtype=torch.float64,
+    alibi_slopes=None,
 ):
     """TND 单 batch 切片：FA varlen softmax_lse 切片 (N, S_q) NT。"""
     atten_mask = _resolve_atten_mask(
@@ -157,6 +180,16 @@ def softmax_res_from_fa_lse_tnd_slice(
     qk = torch.matmul(qb, kb.permute(0, 1, 3, 2)).to(torch.float32).mul(scale)
     if softcap > 0.0:
         qk = softcap * torch.tanh(qk / softcap)
+    if alibi_slopes is not None:
+        seq_q, seq_k = q_bn.shape[2], k_bn.shape[2]
+        nheads = q_bn.shape[1]
+
+        slopes_2d = alibi_slopes.to(torch.float32).cpu()
+        if slopes_2d.dim() == 1:
+            slopes_2d = slopes_2d.unsqueeze(0)  # [H] -> [1, H]
+        for h in range(nheads):
+            bias = _alibi_bias_2d(slopes_2d[0, h], seq_q, seq_k)   # [Sq, Sk]
+            qk[:, h] = qk[:, h] + bias.unsqueeze(0).to(qk.dtype)
     if atten_mask is not None and len(atten_mask.shape) != 0:
         qk = qk + atten_mask.to(torch.float32) * (-40000.0)
     lse = softmax_lse_nt_slice.to(torch.float32).to(gtype).unsqueeze(0).unsqueeze(-1)
@@ -221,6 +254,7 @@ def golden_bsnd_bwd_from_fwd(
     window_size_right,
     *,
     gtype=torch.float64,
+    alibi_slopes=None,
 ):
     """BSND 反传标杆。softmax_lse layout: FA (B, N, S_q)。"""
     del out
@@ -251,6 +285,7 @@ def golden_bsnd_bwd_from_fwd(
         window_size_right,
         compute_dtype,
         gtype=gtype,
+        alibi_slopes=alibi_slopes,
     )
     drop_mask = torch.tensor(1)
     dq_bn, dk_bn, dv_bn = tbackward_bsnd(
@@ -284,6 +319,7 @@ def golden_tnd_bwd_from_fwd(
     window_size_right,
     *,
     gtype=torch.float64,
+    alibi_slopes=None,
 ):
     """TND 反传标杆。softmax_lse layout: FA varlen (N, total_q) NT。"""
     del out
@@ -333,6 +369,7 @@ def golden_tnd_bwd_from_fwd(
             window_size_right,
             compute_dtype,
             gtype=gtype,
+            alibi_slopes=alibi_slopes,
         )
         dqi, dki, dvi = tbackward_tnd(
             dxi, qi, ki_new, vi_new, softmax_res_i, drop_mask, scale, softcap, dropout_p

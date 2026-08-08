@@ -70,6 +70,7 @@ struct FAGInfo {
     int32_t *qSeqlenList{nullptr};
     int32_t *kvSeqlenList{nullptr};
     bool isDeterministic = false;
+    int64_t alibiSlopesBatchStride = 0;
 };
 } // namespace FAGTiling
 

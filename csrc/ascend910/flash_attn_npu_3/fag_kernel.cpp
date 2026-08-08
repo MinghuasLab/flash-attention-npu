@@ -791,7 +791,7 @@ public:
         AscendC::TPipe pipeVec;
         TBuf<> unifiedBuffer;
         EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
-            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv,
+            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, params.alibi_slopes,
             params.workspace, params.tiling, unifiedBuffer);
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
@@ -987,7 +987,8 @@ template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
           const uint32_t INPUT_LAYOUT = BSND, const bool IS_ATTEN_MASK = 0,
           const bool IS_DROP = 0,
           const bool IS_DTM = 0, // 是否开启确定性计算
-          const bool HAS_SOFTCAP = 0
+          const bool HAS_SOFTCAP = 0,
+          const bool HAS_ALIBI = 0
           >
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
@@ -1089,7 +1090,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, InputType, FAGTilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2SameAbVec = Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP>;
+    using EpilogueAtlasA2SameAbVec = Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, HAS_ALIBI>;
     using EpilogueFAGSabVec = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV

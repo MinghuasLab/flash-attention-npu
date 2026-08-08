@@ -27,6 +27,8 @@ std::vector<at::Tensor> launch_fag_general(
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    bool deterministic);
+    bool deterministic,
+    uint8_t *alibi_slopes_ptr,            
+    int64_t alibi_slopes_batch_stride);   
 
 #endif

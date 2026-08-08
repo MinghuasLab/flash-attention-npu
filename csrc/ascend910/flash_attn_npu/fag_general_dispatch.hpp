@@ -31,6 +31,7 @@ struct FagGeneralLaunchArgs {
     aclrtStream aclStream;
     uint64_t fftsAddr;
     bool is_causal;
+    bool has_alibi;
     bool deterministic;
     bool is_softcap;
     uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256
@@ -46,6 +47,7 @@ struct FagGeneralLaunchArgs {
     uint8_t *dqDevice;
     uint8_t *dkDevice;
     uint8_t *dvDevice;
+    uint8_t *alibiSlopesDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
 };

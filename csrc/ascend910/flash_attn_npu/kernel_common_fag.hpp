@@ -88,6 +88,7 @@ struct FAGTilingData {
     // sfmg tiling data
     SoftMaxTiling softmaxTilingData;
     SoftMaxTiling softmaxGradTilingData;
+    int64_t alibiSlopesBatchStride = 0;
 };
 
 struct FAGv2TilingData {
@@ -96,6 +97,7 @@ struct FAGv2TilingData {
     uint32_t coreNum;
     float scaleValue;
     float softcapValue;
+    int64_t alibiSlopesBatchStride = 0;
     int64_t batch;
     int64_t t1;
     int64_t t2;
