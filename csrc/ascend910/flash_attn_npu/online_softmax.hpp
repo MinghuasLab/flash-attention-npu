@@ -23,15 +23,16 @@ template <
     class InputType_,
     class MaskType_,
     LseModeT LSE_MODE_,
-    bool HAS_SOFTCAP_>
+    bool HAS_SOFTCAP_,
+    bool RETURN_SOFTMAX_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -67,7 +68,8 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_)
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, 
+        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, uint32_t maxKvSeqlen_)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -87,6 +89,13 @@ public:
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
+
+        if constexpr (RETURN_SOFTMAX_) {
+            gPret = gPret_;
+            stridePret = stridePret_;
+            maxKvSeqlen = maxKvSeqlen_;
+        }
+
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
@@ -101,11 +110,13 @@ public:
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
     }
-
-    template <typename T>
-    __aicore__ inline T Min(T a, T b)
+    
+    __aicore__ inline
+    void set_gmOffsetPret(uint64_t gmOffsetPret_)
     {
-        return (a > b) ? b : a;
+        if constexpr (RETURN_SOFTMAX_) {
+            gmOffsetPret = gmOffsetPret_;
+        }
     }
 
     __aicore__ inline
@@ -813,6 +824,27 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
+    __aicore__ inline
+    void CopyPretUbToGm(
+        uint32_t sUbOffset, uint64_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum,
+        uint32_t columnNum, uint32_t columnNumRound, uint32_t qSBlockSize)
+    {
+        uint32_t rowsDone = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
+            AscendC::DataCopyPad(
+                gPret[gmOffsetPret + qNOffset + qSOffset], lpUbTensor[sUbOffset][rowsDone * columnNumRound],
+                AscendC::DataCopyExtParams(
+                    rowsCurHead, columnNum * sizeof(ElementOutput),
+                    (columnNumRound - columnNum) * sizeof(ElementOutput) / 32,
+                    (maxKvSeqlen - columnNum) * sizeof(ElementOutput), 0));
+            rowsDone += rowsCurHead;
+            qNOffset += stridePret;
+            qSIdxCurBlock = 0;
+            qSOffset = 0;
+        }
+    }
+
     template <bool doTriUMask>
     __aicore__ inline
     void SubCoreCompute(
@@ -820,7 +852,8 @@ public:
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
+        uint32_t curStackTileMod, uint32_t rowOffsetIoGm, uint32_t qSBlockSize,
+        bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -859,6 +892,15 @@ public:
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
+
+        if constexpr (RETURN_SOFTMAX_) {
+            uint64_t qNOffset = static_cast<uint64_t>(rowOffsetIoGm / qSBlockSize) * stridePret;
+            uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
+            uint32_t qSOffset = qSIdxCurBlock * maxKvSeqlen;
+            CopyPretUbToGm(
+                sUbOffset, qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, columnNumRound, qSBlockSize);
+        }
+
         if constexpr (!doTriUMask) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
             if (isLastNoMaskStackTile && isLastRowLoop) {
@@ -948,6 +990,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
             }
@@ -1088,6 +1132,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
@@ -1306,6 +1352,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     false,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
@@ -1342,6 +1390,11 @@ public:
 private:
     float scaleValue;
     float softcapValue;
+    uint64_t gmOffsetPret;
+    uint64_t stridePret;
+    uint32_t maxKvSeqlen;
+    AscendC::GlobalTensor<ElementOutput> gPret;
+
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;

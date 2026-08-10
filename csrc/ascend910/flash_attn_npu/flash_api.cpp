@@ -666,7 +666,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
     TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-    TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -710,7 +709,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {
-        p = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, opts);
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        p = torch::zeros({batch_size, num_heads, seqlen_q, seqlen_k}, opts);
     }
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
 
@@ -778,11 +778,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+    tiling_cpu_ptr->set_maxKvSeqlen(seqlen_k);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
     tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
     tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
     tiling_cpu_ptr->set_UpdateSize(UpdateSize);
     tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
 
     uint32_t totalTaskNum = 0;
     uint32_t groupSize = num_heads / num_heads_k;
@@ -831,6 +833,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.has_softcap = has_softcap;
+    fwd_args.return_softmax = return_softmax;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -890,19 +893,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
     TORCH_CHECK(!zero_tensors, "NPU FlashAttention does not support zero_tensors.");
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-    TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
     TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-    }  else {
-        out = torch::empty_like(q);
-    }
 
     // 可选输入，当前均不支持
     at::Tensor seqlens_k, leftpad_k, alibi_slopes, block_table;
@@ -974,6 +969,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         }
     }
 
+    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
+    auto opts = q.options().device(at::kPrivateUse1);
+    auto p = torch::empty({0}, opts);
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        p = torch::zeros({batch_size, num_heads, max_seqlen_q, max_seqlen_k}, opts);
+    }
+    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+
     tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
     tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
     tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
@@ -997,6 +1001,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
+    tiling_cpu_ptr->set_maxKvSeqlen(max_seqlen_k);
+    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
 
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
     uint64_t PRELANCH_NUM = 3;
@@ -1089,6 +1095,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.has_softcap = has_softcap;
+    fwd_args.return_softmax = return_softmax;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -1102,9 +1109,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.tilingDevice = tilingDevice;
     launch_fwd<true>(fwd_args);
 
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(at::Device(at::kPrivateUse1));
-    at::Tensor rng_state =  torch::empty({2}, options.dtype(torch::kInt64));
-    at::Tensor p = torch::empty({ 0 }, options.dtype(torch::kInt64));
     return {out, softmaxlse, p, rng_state};
 }
 
