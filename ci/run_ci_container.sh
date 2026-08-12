@@ -34,6 +34,11 @@ CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 # 宿主机日志目录: 挂载进容器, 容器内写的日志直接落到宿主机, 避免 --rm 删除容器后日志丢失。
 # 同时让 workflow 的 upload-artifact (path: /tmp/ci_test_logs) 能读到日志。
 CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs}"
+# 本 run 的唯一标识, 用作 docker 容器 label:
+#   1. 多个 workflow (NPU CI / NPU CI Full) 共用同一镜像, 不能按镜像名清理容器;
+#      必须按本 run 自己的 label 清理, 避免误杀并行的其它 run 的容器。
+#   2. 不同 run 写各自独立的宿主机日志目录, 避免日志互相覆盖/混用。
+CI_RUN_LABEL="${CI_RUN_LABEL:-$(basename "$CI_TEST_LOG_DIR_HOST")}"
 
 log() { printf '[CI] %s\n' "$*"; }
 die() { printf '[CI][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -84,6 +89,7 @@ run_build_phase() {
   log "=== Phase 1: build (no NPU lock) ==="
   docker run --rm \
     "${privileged_args[@]}" \
+    --label "ci_run_id=$CI_RUN_LABEL" \
     --network host \
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
@@ -116,6 +122,7 @@ run_docker_test() {
   chmod 777 "$CI_TEST_LOG_DIR_HOST" 2>/dev/null || true
   docker run --rm \
     "${privileged_args[@]}" \
+    --label "ci_run_id=$CI_RUN_LABEL" \
     --network host \
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \

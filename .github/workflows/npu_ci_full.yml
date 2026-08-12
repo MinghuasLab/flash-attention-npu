@@ -76,6 +76,10 @@ jobs:
       CI_TEST_WORKERS: ${{ github.event.inputs.workers }}
       CI_MODE: full
       CI_REF: ${{ github.event.inputs.ref }}
+      # 每个 run 独立的宿主机日志目录 + 容器 label, 避免与本机并行的其它 run (如 NPU CI)
+      # 共用 /tmp/ci_test_logs 导致日志混淆, 也避免 cleanup 误杀其它 run 的容器。
+      CI_TEST_LOG_DIR_HOST: /tmp/ci_test_logs/${{ github.run_id }}-${{ matrix.arch_label }}
+      CI_RUN_LABEL: ${{ github.run_id }}-${{ matrix.arch_label }}
     steps:
       - name: Check arch match
         id: arch
@@ -142,14 +146,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.arch_label }}
-          path: /tmp/ci_test_logs/
+          path: ${{ env.CI_TEST_LOG_DIR_HOST }}/
           retention-days: 7
 
       - name: Kill orphaned CI containers
         if: always()
         run: |
-          echo "cleaning up orphaned containers from image: $CI_DOCKER_IMAGE"
-          orphans=$(docker ps -q --filter "ancestor=$CI_DOCKER_IMAGE")
+          echo "cleaning up orphaned containers for run: $CI_RUN_LABEL"
+          orphans=$(docker ps -q --filter "label=ci_run_id=$CI_RUN_LABEL")
           if [ -n "$orphans" ]; then
             echo "killing orphaned containers: $orphans"
             docker kill $orphans 2>/dev/null || true
