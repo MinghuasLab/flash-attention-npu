@@ -527,9 +527,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         (max_kv_seqlen >= static_cast<int32_t>(blockDim) * 512);
     bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
         (max_kv_seqlen >= 1024);
+    bool flashDecodeDimSupported = head_size_og <= 128;
     bool flashDecodeFlag = paged_KV &&
         (seqlen_q * groupSize <= 128) && (seqlen_q <= 16) &&
-        (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
+        (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq) && flashDecodeDimSupported;
 
     SplitContext splitCtx;
     splitCtx.batch_size = batch_size;

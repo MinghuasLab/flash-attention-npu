@@ -618,3 +618,22 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     _, r_plain_cann = compare_rule(golden_out.cpu().float(), out_out.cpu().float())
     assert r_plain_cann, "Golden vs CANN check FAILED"
     print("--- end ---")
+
+test_cases = [
+    (torch.bfloat16, 4, 8, 8, 32, 128, 201, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 8, 32, 8, 1, 512, 195, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 4, 32, 4, 16, 512, 200, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 4, 32, 4, 32, 256, 235, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 2, 32, 8, 1, 256, 197, 128, False, "BSND", False, -1, -1),
+    (torch.bfloat16, 4, 32, 8, 32, 256, 200, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 8, 32, 8, 32, 256, 200, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 4, 32, 8, 64, 256, 200, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 8, 32, 8, 64, 256, 200, 128, True, "TND", False, -1, -1),
+    (torch.bfloat16, 4, 32, 8, 48, 256, 200, 128, False, "TND", False, -1, -1),
+    (torch.bfloat16, 2, 16, 2, 15, 2048, 200, 128, True, "TND", False, -1, -1, 0.0),
+]
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+@pytest.mark.parametrize("cache_mode", [0, 1])
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, layout, is_varied, window_size_left, window_size_right", test_cases)
+def test_fa_custom_ops_with_headdim_lt_192(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits):
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits)

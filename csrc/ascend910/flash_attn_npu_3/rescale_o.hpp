@@ -666,7 +666,8 @@ public:
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
-        uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embed;
+        uint32_t embedRoundV = (layoutInput.stride(0) == 0) ? BLOCK_SIZE : layoutInput.stride(0);
+        uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
         uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
 
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();

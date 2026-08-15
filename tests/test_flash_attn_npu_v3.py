@@ -547,6 +547,25 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 test_cases = [
+    (torch.bfloat16, 4, 8, 8, 32, 128, 201, 128, False, "BSND", False, -1, -1, 0.0),
+    (torch.bfloat16, 8, 32, 8, 1, 512, 195, 128, False, "BSND", False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 4, 16, 512, 200, 128, False, "BSND", False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 4, 32, 256, 235, 128, False, "BSND", False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 1, 256, 197, 128, False, "BSND", False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 32, 256, 200, 128, False, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 8, 32, 8, 32, 256, 200, 128, False, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 64, 256, 200, 128, False, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 8, 32, 8, 64, 256, 200, 128, True, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 48, 256, 200, 128, False, "TND", False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 16, 2, 15, 2048, 200, 128, True, "TND", False, -1, -1, 0.0),
+]
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+@pytest.mark.parametrize("cache_mode", [0, 1])
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap", test_cases)
+def test_fa_custom_ops_with_headdim_lt_192(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits, window_size_left, window_size_right, softcap):
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits, window_size_left, window_size_right, softcap)
+
+test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
     (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
     (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),

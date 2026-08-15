@@ -434,6 +434,21 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
 
 
 test_cases = [
+    (torch.bfloat16, 4, 32, 2, 6, 512, 201, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 2, 40, 2, 6, 512, 240, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 256, 512, 200, 1, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 256, 512, 200, 1, 128, True, 512, 256, 30.0),
+    (torch.bfloat16, 5, 4, 4, 256, 512, 240, 0, 128, True, -128, 864, 30.0),
+    (torch.bfloat16, 1, 1, 1, 256, 512, 200, 1, 128, False, 0, 256, 30.0),
+    (torch.float16, 2, 2, 2, 512, 512, 200, 0, 128, False, 64, 128, 30.0),
+    (torch.bfloat16, 1, 3, 1, 128, 512, 240, 1, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 3, 1, 128, 512, 200, 0, 128, False, -1, -1, 30.0),
+]
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
+def test_fa_custom_ops_with_headdim_lt_192(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap):
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap)
+
+test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
     (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
     (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
