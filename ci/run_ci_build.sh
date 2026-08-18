@@ -14,7 +14,7 @@ log() { printf '[CI-build] %s\n' "$*"; }
 die() { printf '[CI-build][ERROR] %s\n' "$*" >&2; exit 1; }
 
 # git safe.directory (容器内 root 操作宿主机 runner 用户的目录, 会触发 dubious ownership)
-git config --global --add safe.directory "$REPO_ROOT"
+git config --global --add safe.directory "*"
 
 log "repo=$REPO_ROOT (build phase, no NPU needed)"
 log "build phase start: $(date '+%Y-%m-%d %H:%M:%S')"

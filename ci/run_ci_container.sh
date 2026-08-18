@@ -91,7 +91,7 @@ run_build_phase() {
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \
-    bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_build.sh' &
+    bash -lc 'git config --global --add safe.directory "*" && bash ci/run_ci_build.sh' &
   CURRENT_DOCKER_PID=$!
   wait "$CURRENT_DOCKER_PID"
 }
@@ -135,7 +135,7 @@ run_docker_test() {
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \
-    bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_test.sh' &
+    bash -lc 'git config --global --add safe.directory "*" && bash ci/run_ci_test.sh' &
   CURRENT_DOCKER_PID=$!
   wait "$CURRENT_DOCKER_PID"
 }
