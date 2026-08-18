@@ -448,6 +448,10 @@ test_cases = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
     (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
+    # Causal with sq < sk
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, True, 0.0),
+    (torch.float16, 1, 1, 1, 528, 1024, 128, False, True, 0.0),
+    (torch.float16, 1, 1, 1, 544, 1024, 128, False, True, 0.0),
     # Softcap
     (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
     (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 30.0),
@@ -496,7 +500,7 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
     atten_mask = None
     if is_causal:
-        atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+        atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1).bool()
     for i in range(batch_size):
         key_cache_per_batch = None
         value_cache_per_batch = None
