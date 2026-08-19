@@ -2,7 +2,7 @@
 """
 FlashAttention v2 反向 pytest。
 
-- 正向：flash_attn_func / flash_attn_varlen_func 得到 out / softmax_lse，不与标杆比较
+- 正向：flash_attn_func / flash_attn_varlen_func 得到 out / softmax_lse，并与标杆比较
 - 标杆：小算子 fa_small_op_golden（golden_*_bwd_from_fwd，传入 FA out/lse，仅算反传）
 - 被测：torch.autograd.grad（FlashAttnFunc / FlashAttnVarlenFunc）
 
@@ -26,7 +26,11 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
-from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd  # noqa: E402
+from fa_small_op_golden import (  # noqa: E402
+    golden_bsnd_bwd_from_fwd,
+    golden_tnd_bwd_from_fwd,
+)
+from test_flash_attn_npu_v2 import ref_flash_attention  # noqa: E402
 
 RTOL_GOLDEN = 1e-2
 ATOL_GOLDEN = 1e-2
@@ -45,6 +49,104 @@ def assert_grad_close(fa_grad, golden_grad, data_type, name=""):
     torch.testing.assert_close(
         fa_grad.cpu(), golden_grad.cpu(), rtol=rtol, atol=atol
     )
+
+
+def assert_forward_close(fa_value, golden_value, data_type, name=""):
+    rtol, atol = golden_tolerance(data_type)
+    torch.testing.assert_close(
+        fa_value.cpu(), golden_value.cpu(), rtol=rtol, atol=atol,
+        msg=f"{name} mismatch (rtol={rtol}, atol={atol})",
+    )
+
+
+def _make_forward_mask(seq_q, seq_k, is_causal, window_size_left, window_size_right):
+    wl = window_size_left
+    wr = window_size_right
+    if seq_k > 0 and wl >= seq_k:
+        wl = -1
+    if seq_k > 0 and wr >= seq_k:
+        wr = -1
+    if is_causal:
+        wr = 0
+    is_causal_out = wl < 0 and wr == 0
+    is_local = (wl >= 0 or wr > 0) and not is_causal_out
+    if is_causal_out:
+        return torch.triu(
+            torch.ones(seq_q, seq_k), diagonal=seq_k - seq_q + 1
+        ).bool()
+    if not is_local:
+        return None
+    if wl < 0:
+        wl = seq_k
+    if wr < 0:
+        wr = seq_k
+    pre = seq_k - seq_q - wl
+    nxt = seq_k - seq_q + wr
+    i = torch.arange(seq_q)[:, None]
+    j = torch.arange(seq_k)[None, :]
+    return ((-i + j) < pre) | ((-i + j) > nxt)
+
+
+def _golden_bsnd_fwd(
+    query, key, value, num_heads, kv_heads, scale, softcap, is_causal,
+    window_size_left, window_size_right,
+):
+    batch, seq_q, _, headdim = query.shape
+    seq_k = key.shape[1]
+    mask = _make_forward_mask(
+        seq_q, seq_k, is_causal, window_size_left, window_size_right
+    )
+
+    q_cpu = query.detach().cpu()
+    k_cpu = key.detach().cpu()
+    v_cpu = value.detach().cpu()
+    out = torch.empty((batch, seq_q, num_heads, headdim), dtype=query.dtype)
+    lse = torch.empty((batch, num_heads, seq_q), dtype=torch.float32)
+    for b in range(batch):
+        out_b, lse_b = ref_flash_attention(
+            q_cpu[b], k_cpu[b], v_cpu[b], scale, mask, query.dtype, softcap=softcap
+        )
+        out[b] = out_b
+        lse[b] = lse_b
+    return out, lse
+
+
+def _golden_tnd_fwd(
+    query, key, value, num_heads, kv_heads, seqlens_q, seqlens_k,
+    scale, softcap, is_causal, window_size_left, window_size_right,
+):
+    seqlens_q = list(seqlens_q)
+    seqlens_k = list(seqlens_k)
+    cu_q = [0]
+    cu_k = [0]
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        cu_q.append(cu_q[-1] + int(sq))
+        cu_k.append(cu_k[-1] + int(sk))
+
+    q_cpu = query.detach().cpu()
+    k_cpu = key.detach().cpu()
+    v_cpu = value.detach().cpu()
+    out = torch.zeros_like(q_cpu)
+    lse = torch.zeros((num_heads, q_cpu.shape[0]), dtype=torch.float32)
+    for i, sq in enumerate(seqlens_q):
+        sk = seqlens_k[i]
+        if sq == 0 or sk == 0:
+            continue
+        mask = _make_forward_mask(
+            sq, sk, is_causal, window_size_left, window_size_right
+        )
+        out_i, lse_i = ref_flash_attention(
+            q_cpu[cu_q[i]:cu_q[i + 1]],
+            k_cpu[cu_k[i]:cu_k[i + 1]],
+            v_cpu[cu_k[i]:cu_k[i + 1]],
+            scale,
+            mask,
+            query.dtype,
+            softcap=softcap,
+        )
+        out[cu_q[i]:cu_q[i + 1]] = out_i
+        lse[:, cu_q[i]:cu_q[i + 1]] = lse_i
+    return out, lse
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +208,13 @@ def run_bsnd_bwd(
         window_size=window_size,
         return_attn_probs=True,
     )
+    out_golden, lse_golden = _golden_bsnd_fwd(
+        query, key, value, num_heads, kv_heads, scale, softcap, is_causal,
+        window_size[0], window_size[1],
+    )
+    assert_forward_close(out_fa, out_golden, data_type, "out")
+    assert_forward_close(lse_fa, lse_golden, data_type, "lse")
+
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
     torch.npu.synchronize()
 
@@ -143,6 +252,13 @@ def run_varlen_bwd(
         window_size=window_size,
         return_attn_probs=True,
     )
+    out_golden, lse_golden = _golden_tnd_fwd(
+        query, key, value, num_heads, kv_heads, seqlens_q, seqlens_k,
+        scale, softcap, is_causal, window_size[0], window_size[1],
+    )
+    assert_forward_close(out_fa, out_golden, data_type, "out")
+    assert_forward_close(lse_fa, lse_golden, data_type, "lse")
+
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
     torch.npu.synchronize()
 
@@ -178,6 +294,91 @@ test_cases_bsnd = [
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0),
     (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, 30.0),
     (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 30.0),
+    (torch.float16, 24, 5, 5, 9216, 9216, 64, False, 0.0),
+    (torch.float16, 24, 10, 10, 2304, 2304, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 144, 144, 64, False, 0.0),
+    (torch.float16, 24, 10, 10, 2304, 80, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 576, 80, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 144, 80, 64, False, 0.0),
+    (torch.bfloat16, 4, 10, 10, 2048, 2048, 128, True, 0.0),
+    (torch.bfloat16, 8, 10, 10, 2048, 2048, 128, True, 0.0),
+    (torch.bfloat16, 2, 10, 10, 4096, 4096, 128, True, 0.0),
+    (torch.bfloat16, 4, 10, 10, 4096, 4096, 128, True, 0.0),
+    (torch.float16, 1, 20, 20, 576, 77, 64, False, 0.0),
+    (torch.float16, 32, 20, 20, 576, 576, 64, False, 0.0),
+    (torch.float16, 32, 20, 20, 144, 144, 64, False, 0.0),
+    (torch.float16, 32, 20, 20, 576, 77, 64, False, 0.0),
+    (torch.float16, 8, 20, 20, 576, 576, 64, False, 0.0),
+    (torch.float16, 16, 20, 20, 144, 144, 64, False, 0.0),
+    (torch.float16, 16, 20, 20, 144, 77, 64, False, 0.0),
+    (torch.bfloat16, 2, 8, 8, 4096, 4096, 128, True, 0.0),
+    (torch.bfloat16, 4, 8, 8, 4096, 4096, 128, True, 0.0),
+    (torch.float16, 4, 10, 10, 3952, 3952, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3952, 77, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 3952, 512, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 4032, 4032, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 4032, 4032, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 4032, 4032, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 4096, 512, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 4096, 512, 64, False, 0.0),
+    (torch.float16, 1, 20, 20, 1008, 512, 64, False, 0.0),
+    (torch.float16, 1, 20, 20, 1024, 1024, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 1024, 1024, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 1024, 1024, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 1024, 77, 64, False, 0.0),
+    (torch.float16, 1, 20, 20, 1024, 512, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 1024, 512, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 3712, 3712, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 3744, 3744, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 3840, 3840, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 3840, 3840, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3840, 3840, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3840, 77, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 3840, 512, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 3840, 512, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3872, 3872, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3888, 3888, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 3888, 77, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 3888, 512, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 4000, 4000, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 4000, 77, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 4048, 4048, 64, False, 0.0),
+    (torch.float16, 1, 10, 10, 4080, 4080, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 4080, 4080, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 1012, 1012, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 1012, 1012, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 1012, 512, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 1020, 1020, 64, False, 0.0),
+    (torch.float16, 1, 20, 20, 1020, 512, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 928, 928, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 928, 928, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 936, 936, 64, False, 0.0),
+    (torch.float16, 1, 20, 20, 960, 960, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 960, 77, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 960, 512, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 968, 968, 64, False, 0.0),
+    (torch.float16, 2, 20, 20, 972, 972, 64, False, 0.0),
+    (torch.float16, 4, 20, 20, 972, 972, 64, False, 0.0),
+    (torch.float16, 24, 5, 5, 9216, 77, 64, False, 0.0),
+    (torch.float16, 24, 10, 10, 2304, 77, 64, False, 0.0),
+    (torch.bfloat16, 702, 16, 16, 16, 16, 72, False, 0.0),
+    (torch.bfloat16, 140, 16, 16, 96, 96, 72, False, 0.0),
+    (torch.bfloat16, 420, 16, 16, 32, 32, 72, False, 0.0),
+    (torch.bfloat16, 782, 16, 16, 128, 128, 72, False, 0.0),
+    (torch.bfloat16, 1820, 16, 16, 64, 64, 72, False, 0.0),
+    (torch.float16, 24, 5, 5, 9216, 80, 64, False, 0.0),
+    (torch.bfloat16, 1, 12, 12, 4096, 4096, 128, True, 0.0),
+    (torch.float16, 1, 12, 12, 4096, 4096, 128, True, 0.0),
+    (torch.float16, 1, 4, 4, 4096, 4096, 256, True, 0.0),
+    (torch.float16, 1, 10, 10, 4096, 4096, 64, False, 0.0),
+    (torch.float16, 2, 10, 10, 4096, 4096, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 4096, 4096, 64, False, 0.0),
+    (torch.float16, 4, 10, 10, 4096, 77, 64, False, 0.0),
+    (torch.float16, 24, 10, 10, 77, 77, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 114, 114, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 576, 576, 64, False, 0.0),
+    (torch.float16, 24, 20, 20, 77, 77, 64, False, 0.0),
+    (torch.float16, 24, 5, 5, 77, 77, 64, False, 0.0),
 ]
 
 
@@ -218,6 +419,7 @@ test_cases_bsnd_swa = [
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 30.0),
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, -1, -1, 30.0),
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
+    (torch.bfloat16, 144, 14, 14, 16, 16, 120, False, -11, 14, 0.0),
 ]
 
 
