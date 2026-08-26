@@ -276,8 +276,8 @@ class BishengBuildExt(build_ext):
 
     def _build_aicpu_metadata(self, ext_fullpath, ext_name):
         """Compile fa_metadata.aicpu (host AICPU object) for the ascend910
-        extensions that carry the scheduler-metadata feature (v2 and v3). This
-        is a separate `bisheng -x aicpu` invocation (host CPU code
+        extensions that carry the scheduler-metadata feature (v2, v3 and v4).
+        This is a separate `bisheng -x aicpu` invocation (host CPU code
         cross-compiled with hcc, not ASC device code); the resulting object is
         linked into the extension alongside the ASC device objects. Returns the
         .o path, or None if there is no aicpu source."""
@@ -285,6 +285,7 @@ class BishengBuildExt(build_ext):
         aicpu_src_dirs = {
             "flash_attn_npu.flash_attn_npu": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu"),
             "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
+            "flash_attn_npu_4.flash_attn_npu_4": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_4"),
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:

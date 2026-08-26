@@ -99,6 +99,7 @@ def _flash_attn_forward(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k = [maybe_contiguous(x) for x in (q, k)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -130,6 +131,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         learnable_sink,
+        scheduler_metadata,
     )
     return out, softmax_lse
 
@@ -334,7 +336,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors=None,
         aux_scalars=None,
         return_lse=False,
-    ):  
+        scheduler_metadata=None,
+        seqlen_k_per_split=None,
+        disable_scheduler_metadata=False,
+    ):
         assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
         assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
         if softmax_scale is None:
@@ -368,6 +373,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             learnable_sink=learnable_sink,
+            scheduler_metadata=None if disable_scheduler_metadata else scheduler_metadata,
         )
 
         ctx.save_for_backward(
@@ -477,6 +483,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # aux_tensors
             None,  # aux_scalars
             None,  # return_lse
+            None,  # scheduler_metadata
+            None,  # seqlen_k_per_split
+            None,  # disable_scheduler_metadata
         )
 
 
@@ -501,7 +510,7 @@ def flash_attn_varlen_func(
     softcap=0.0, # 0.0 means deactivated
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
-    deterministic:bool = False, 
+    deterministic:bool = False,
     score_mod=None,
     score_mod_bwd=None,
     mask_mod=None,
@@ -509,6 +518,9 @@ def flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     aux_scalars: Optional[tuple] = None,
     return_lse: bool = False,
+    scheduler_metadata = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
 ):
     """
     FlashAttention for variable-length sequences with optional paged KV cache.
@@ -608,7 +620,7 @@ def flash_attn_varlen_func(
         softcap, # 0.0 means deactivated
         num_splits,    # Can be tuned for speed
         pack_gqa,   # Can be tuned for speed
-        deterministic, 
+        deterministic,
         score_mod,
         score_mod_bwd,
         mask_mod,
@@ -616,4 +628,157 @@ def flash_attn_varlen_func(
         aux_tensors,
         aux_scalars,
         return_lse,
+        scheduler_metadata,
+        seqlen_k_per_split,
+        disable_scheduler_metadata,
     )
+
+def flash_attn_func(
+    q,
+    k,
+    v,
+    qv= None,
+    gather_kv_indices=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    learnable_sink= None,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    score_mod= None,
+    score_mod_bwd= None,
+    mask_mod= None,
+    aux_tensors= None,
+    aux_scalars= None,
+    block_sparse_tensors=None,
+    block_sparse_tensors_bwd=None,
+    return_lse=False,
+    scheduler_metadata=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        return_lse: bool. Whether to return the logsumexp of the attention scores.
+        scheduler_metadata: Precomputed metadata blob for faster kernel launch.
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen).
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = _flash_attn_forward(
+        q,
+        k,
+        v,
+        qv=qv,
+        out_=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        min_seqlen_k=None,
+        page_table=None,
+        gather_kv_indices=gather_kv_indices,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        learnable_sink=learnable_sink,
+        scheduler_metadata=scheduler_metadata,
+    )
+    return (out, softmax_lse) if return_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size,
+    max_seqlen_q,
+    max_seqlen_k,
+    num_heads_q,
+    num_heads_kv,
+    headdim,
+    headdim_v=None,
+    qkv_dtype=torch.bfloat16,
+    cache_seqlens=None,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    cu_seqlens_k_new=None,
+    seqused_q=None,
+    cache_leftpad=None,
+    page_size=None,
+    max_seqlen_k_new=0,
+    causal=False,
+    window_size=(-1, -1),
+    num_splits=0,
+):
+    """Precompute scheduler metadata (tiling + mask) on AICPU.
+
+    The returned byte tensor can be passed as scheduler_metadata to
+    flash_attn_func / flash_attn_varlen_func
+    to skip host-side tiling and mask generation.
+
+    Arguments:
+        batch_size: number of sequences in the batch.
+        max_seqlen_q: maximum query sequence length.
+        max_seqlen_k: maximum key/value sequence length.
+        num_heads_q: number of query heads.
+        num_heads_kv: number of key/value heads (for MQA/GQA).
+        headdim: dimension per head (Q and K).
+        headdim_v: dimension per head for V (defaults to headdim).
+        qkv_dtype: data type (torch.bfloat16 or torch.float16).
+        cache_seqlens: (batch_size,) int32 tensor with KV cache lengths.
+        cu_seqlens_q: (batch_size+1,) int32 cumulative query sequence lengths
+            for varlen (TND) layout.
+        cu_seqlens_k: (batch_size+1,) int32 cumulative key sequence lengths
+            for varlen KV.
+        page_size: block size for paged KV cache.
+        max_seqlen_k_new: max new key sequence length (unused, reserved).
+        causal: whether to use causal attention mask.
+        window_size: (left, right) sliding window. (-1, -1) disables.
+        num_splits: number of KV splits for flash decode (0 = auto).
+
+    Returns:
+        scheduler_metadata: byte tensor containing the precomputed metadata.
+    """
+    assert cache_seqlens is not None, "cache_seqlens is required"
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+    scheduler_metadata = flash_attn_npu_4.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        cache_leftpad,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0],
+        window_size[1],
+        num_splits,
+    )
+    return scheduler_metadata

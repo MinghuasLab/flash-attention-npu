@@ -3,6 +3,7 @@
 import torch
 import torch_npu
 import pytest
+
 from tests.common.attention_ref import ref_flash_attention, ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
@@ -19,7 +20,7 @@ from tests.common.test_utils import (
 if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_4 import flash_attn_varlen_func
 else:
-    from flash_attn_npu_4 import flash_attn_varlen_func
+    from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""
@@ -634,3 +635,86 @@ def test_fa_kvcache_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_head
     if "Ascend910" in name:
         pytest.skip("Sq > Sk not support in Ascend910")
     test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits)
+
+
+# ============================================================================
+# flash_attn_func tests (BSND layout only, 910 only)
+# ============================================================================
+
+test_cases_fa_func = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap)
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0),
+    # SWA (window_size covers full sequence)
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 512, 0, 0.0),
+    # MHA + GQA + MQA
+    (torch.bfloat16, 2, 8, 8, 512, 512, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 2, 8, 2, 512, 512, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 4, 1, 512, 512, 128, True, -1, -1, 0.0),
+    (torch.float16, 2, 8, 8, 256, 256, 128, False, -1, -1, 0.0),
+    (torch.float16, 2, 8, 2, 512, 512, 128, True, -1, -1, 0.0),
+    (torch.float16, 2, 4, 1, 256, 256, 128, False, -1, -1, 0.0),
+    # head_size=64
+    (torch.bfloat16, 2, 16, 16, 512, 512, 64, True, -1, -1, 0.0),
+    (torch.float16, 2, 4, 1, 256, 256, 64, True, -1, -1, 0.0),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, "
+    "is_causal, window_size_left, window_size_right, softcap",
+    test_cases_fa_func,
+)
+def test_fa_func_custom_ops(
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
+    is_causal, window_size_left, window_size_right, softcap,
+):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910")
+
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    scale = 1.0 / (head_size ** 0.5)
+
+    ret = flash_attn_func(
+        query,
+        key_cache,
+        value_cache,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=(window_size_left, window_size_right),
+        softcap=softcap,
+        return_lse=True,
+    )
+    out_out, softmax_lse = ret
+
+    golden_out_ref = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_out_pt = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL_ref = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    golden_lseL_pt = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    atten_mask = None
+    if is_causal:
+        atten_mask = build_cann_causal_mask()[:q_seqlen, :kv_seqlen]
+    for i in range(batch_size):
+        key_cache_per_batch = key_cache.detach().cpu()[i:i+1]
+        value_cache_per_batch = value_cache.detach().cpu()[i:i+1]
+        query_cpu = query.detach().cpu()[i:i+1]
+        out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+            query_cpu, key_cache_per_batch, value_cache_per_batch,
+            scale, atten_mask, data_type, softcap=softcap,
+        )
+        golden_out_ref[i:i + 1] = out_ref.reshape(1, q_seqlen, num_heads, head_size)
+        golden_out_pt[i:i + 1] = out_pt.reshape(1, q_seqlen, num_heads, head_size)
+        golden_lseL_ref[i:i + 1] = lse_ref.reshape(1, num_heads, q_seqlen)
+        golden_lseL_pt[i:i + 1] = lse_pt.reshape(1, num_heads, q_seqlen)
+
+    assert_fa_close(out_out, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
+    assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
