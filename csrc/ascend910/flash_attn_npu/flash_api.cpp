@@ -831,6 +831,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    // blockDim = 1;
     at::Tensor workspace_tensor;
     at::Tensor mask_gpu_tensor;
     at::Tensor tiling_gpu_tensor;

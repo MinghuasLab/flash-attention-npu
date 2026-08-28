@@ -34,3 +34,16 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+PROF*/
+OPPROF_*/
+core.*
+make.log
+tests/fa_varlen_call.py
+0001-debug-print.patch
+0002-debug-2.patch
+0003-829.patch
+1.log
+compare_bsnd_attn_step3_results_old.csv
+compare_tnd_attn_step3_results_20260830.csv
+profile_am_bsnd_50/
+tests/fa_varlen_call_me.py

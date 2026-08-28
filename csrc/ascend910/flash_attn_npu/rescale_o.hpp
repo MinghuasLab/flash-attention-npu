@@ -90,10 +90,10 @@ public:
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LSE_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
+        constexpr uint32_t LSE_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 11 * 256;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
 
         dropoutValue = dropoutValue_;
 
@@ -274,6 +274,7 @@ public:
         const LayoutLse &layoutLse,
         uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
+        uint32_t taskStateSlot,
         uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
         uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
         const SplitKVParams &splitParams,
@@ -288,6 +289,10 @@ public:
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
+        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
+
+        // AscendC::printf("rescaleO 1\n");
+        // AscendC::printf("isFirstStackTile %u  isLastStackTile %u\n", isFirstStackTile, isLastStackTile);
 
         // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
         uint32_t oHiddenSize_gmlo = 0;
@@ -362,11 +367,20 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
 
+        // if (AscendC::GetSubBlockIdx() == 0) {
+        //     // AscendC::printf("RS st=%u first=%u last=%u row=%u go0=%f gl0=%f gm0=%f dm0=%f\n",
+        //         taskStateSlot, isFirstStackTile, isLastStackTile, rowOffsetLoop,
+        //         (float)goUbTensor32.GetValue(0),
+        //         (float)glUbTensor.GetValue(stateRowOffset),
+        //         (float)gmUbTensor.GetValue(stateRowOffset),
+        //         (float)dmUbTensor.GetValue(dmUbOffsetCurStackTile));
+        // }
+
         if (isLastStackTile) {
             // *** gl_block = expand_to_block(gl)
             AscendC::Brcb(
                 tvUbTensor.ReinterpretCast<uint32_t>(),
-                glUbTensor.ReinterpretCast<uint32_t>()[rowOffsetLoop],
+                glUbTensor.ReinterpretCast<uint32_t>()[stateRowOffset],
                 curRowNumRound / FLOAT_BLOCK_SIZE,
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
@@ -529,7 +543,7 @@ public:
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
                         lseUbTensor,
-                        glUbTensor,
+                        glUbTensor[taskStateSlot * 64],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
@@ -537,7 +551,7 @@ public:
                     AscendC::Add<float, false>(
                         lseUbTensor,
                         lseUbTensor,
-                        gmUbTensor,
+                        gmUbTensor[taskStateSlot * 64],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -599,7 +613,9 @@ public:
                             }
                         }
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
@@ -609,7 +625,7 @@ public:
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
                             lseUbTensor,
-                            glUbTensor,
+                            glUbTensor[taskStateSlot * 64],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
@@ -617,7 +633,7 @@ public:
                         AscendC::Add<float, false>(
                             lseUbTensor,
                             lseUbTensor,
-                            gmUbTensor,
+                            gmUbTensor[taskStateSlot * 64],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -645,7 +661,9 @@ public:
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
-                        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }
             }
@@ -671,6 +689,7 @@ public:
         GemmCoord actualBlockShape,
         uint32_t qSBlockSize, uint32_t qNBlockSize,
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
+        uint32_t taskStateSlot,
         const SplitKVParams& splitParams = SplitKVParams(),
         int32_t delStartRow = 0, int32_t delEndRow = 0, uint32_t qSeqlen = 0,
         uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1)
@@ -789,6 +808,7 @@ public:
                     isFirstStackTile,
                     isLastStackTile,
                     curStackTileMod,
+                    taskStateSlot,
                     needRowLoop,
                     (rowLoopIdx == rowLoop - 1U),
                     rowOffsetLoop,
