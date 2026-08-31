@@ -285,6 +285,7 @@ class BishengBuildExt(build_ext):
         aicpu_src_dirs = {
             "flash_attn_npu.flash_attn_npu": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu"),
             "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
+            "flash_attn_npu_4.flash_attn_npu_4": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_4"),
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:

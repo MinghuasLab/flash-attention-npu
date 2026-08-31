@@ -19,7 +19,7 @@ from tests.common.test_utils import (
 if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_4 import flash_attn_varlen_func
 else:
-    from flash_attn_npu_4 import flash_attn_varlen_func
+    from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""
@@ -531,6 +531,120 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")
         assert_fa_close(dv_ag, dv_ref, dv_pt, name="dV")
     return
+
+
+# flash_attn_func test parameters (dense BSND, Ascend910 only; supports backward).
+# data_type: [torch.float16, torch.bfloat16]
+# num_heads,kv_heads: cover MHA (6,6)/(4,4)/(8,8) and GQA (6,3)/(6,1)/(8,2)
+# window: (-1,-1) no window, causal via is_causal, and SWA/local windows.
+flash_attn_func_cases = [
+    # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size
+    (torch.float16, 2, 6, 6, 128, 128, 64, False, (-1, -1)),
+    (torch.float16, 2, 6, 6, 128, 128, 64, True, (-1, -1)),
+    (torch.float16, 2, 6, 3, 64, 256, 64, True, (-1, -1)),
+    (torch.float16, 2, 6, 1, 128, 128, 128, False, (64, 64)),
+    (torch.float16, 1, 8, 2, 256, 512, 128, True, (-1, -1)),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 64, True, (-1, -1)),
+    (torch.bfloat16, 2, 6, 3, 256, 256, 128, False, (-1, -1)),
+    (torch.bfloat16, 2, 6, 1, 512, 512, 128, True, (512, 0)),
+    (torch.bfloat16, 2, 4, 4, 128, 192, 192, False, (0, 64)),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 128, True, (128, 128)),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
+    flash_attn_func_cases,
+)
+def test_flash_attn_func(
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
+):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend950" in name:
+        pytest.skip("flash_attn_func is only available on Ascend910")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    key = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    scale = 1.0 / (head_size ** 0.5)
+
+    window_size_left, window_size_right = window_size
+    # Match Tri Dao GPU host: both sides vs kv_seqlen.
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
+        window_size_left_golden = -1
+    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    if is_local_golden:
+        if window_size_left_golden < 0:
+            window_size_left_golden = kv_seqlen
+        if window_size_right_golden < 0:
+            window_size_right_golden = kv_seqlen
+    atten_mask = None
+    if is_causal_golden:
+        atten_mask = torch.triu(
+            torch.ones(q_seqlen, kv_seqlen),
+            diagonal=(kv_seqlen - q_seqlen + 1),
+        ).bool()
+    elif is_local_golden:
+        atten_mask = make_local_attention_mask(
+            q_seqlen,
+            kv_seqlen,
+            window_size_left_golden,
+            window_size_right_golden,
+        )
+
+    out, softmax_lse = flash_attn_func(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=window_size,
+        return_lse=True,
+    )
+
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key.detach().cpu().requires_grad_(True)
+    value_ref = value.detach().cpu().requires_grad_(True)
+    golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
+        query_ref, key_ref, value_ref, scale, atten_mask, data_type
+    )
+    if atten_mask is not None:
+        fully_masked = atten_mask.all(dim=-1)
+        golden_out_ref[:, fully_masked] = 0
+        golden_out_pt[:, fully_masked] = 0
+        golden_lse_ref[:, :, fully_masked] = torch.inf
+        golden_lse_pt[:, :, fully_masked] = torch.inf
+    assert_fa_close(out, golden_out_ref, golden_out_pt, name="out")
+    assert_fa_close(softmax_lse, golden_lse_ref, golden_lse_pt, name="softmax_lse")
+
+    dout = make_random_tensor(out.shape, out.dtype, low=-0.5, high=0.5, device="npu")
+    dq_ag, dk_ag, dv_ag = torch.autograd.grad(out, (query, key, value), dout)
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+        golden_out_ref,
+        (query_ref, key_ref, value_ref),
+        dout.detach().cpu(),
+        retain_graph=True,
+    )
+    dq_pt, dk_pt, dv_pt = torch.autograd.grad(
+        golden_out_pt,
+        (query_ref, key_ref, value_ref),
+        dout.detach().cpu(),
+    )
+    assert_fa_close(dq_ag, dq_ref, dq_pt, name="dQ")
+    assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")
+    assert_fa_close(dv_ag, dv_ref, dv_pt, name="dV")
 
 # flash_attn_varlen_func test parameters (Ascend950 head_dim<=256 coverage, NPU only)
 # Single-option parameters: fixed values
