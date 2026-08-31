@@ -258,6 +258,8 @@ namespace SplitFuse {
             nDynNum = L1_MAX_N_NUM % nDynNum != 0 ? RoundDown((nDynNum - 1), NUM_32) : nDynNum;
 
             uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * kDynNum * sizeof(ElementQ);
+            blockMmadQK.SetPingPongState(&pingPongState);
+            blockMmadPV.SetPingPongState(&pingPongState);
             blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN);
             uint32_t kPVDynNum = nDynNum * kDynNum / BlockMmadPV::L1TileShape::M;
             blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE);
@@ -391,7 +393,9 @@ namespace SplitFuse {
                 // 当前 batch 派生量缓存（GM 输入只读，同 batch 内不变），0xFFFFFFFF 表示未缓存
                 uint32_t cachedBatch = 0xFFFFFFFFU;
                 uint32_t curQNBlockNumCur = 0;
+                uint32_t curQSBlockNumCur = 0;
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum))  {
+                    // AscendC::printf("taskIdx %u\n", taskIdx);
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
@@ -423,12 +427,17 @@ namespace SplitFuse {
                         uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
                         uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                         curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
+                        curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
                         cachedBatch = curBatchTmp;
                     }
 
                     uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
-                    uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
-                    uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+                    // uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
+                    // uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+
+                    uint32_t qNBlockIdxCur = taskIdxCurBatch / curQSBlockNumCur;
+                    uint32_t qSBlockIdxCur = taskIdxCurBatch - qNBlockIdxCur * curQSBlockNumCur;
+                    
 
                     uint32_t pipelineDrain = 0; 
                     if(taskIdx + uint32_t(coreNum) >= totalTaskNum) {
@@ -1152,6 +1161,7 @@ namespace SplitFuse {
         Arch::CrossCoreFlag qkReady{QK_READY_ID};
         Arch::CrossCoreFlag softmaxReady{SOFTMAX_READY_ID};
         Arch::CrossCoreFlag pvReady{PV_READY_ID};
+        Gemm::Block::BlockPingPongState pingPongState;
 
         BlockMmadQK blockMmadQK;
         BlockMmadPV blockMmadPV;

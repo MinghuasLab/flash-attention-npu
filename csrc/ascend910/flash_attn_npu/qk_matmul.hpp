@@ -94,6 +94,8 @@ public:
 
     __aicore__ inline
     ~BlockMmad() {}
+    __aicore__ inline
+    void SetPingPongState(BlockPingPongState *state) { pingPongState = state; }
 
     __aicore__ inline
     void init(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn,
@@ -233,16 +235,20 @@ public:
             blockStart = blockSize - blockStartOffset;
             setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
         }
+        // AscendC::printf("l1\n");
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             uint32_t mActual = actualShape.m();
             uint32_t kActual = actualShape.k();
             uint32_t nActual = actualShape.n();
             LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
+            // AscendC::printf("l1 pingpong : %u \n", pingPongState->l1PingPongFlag);
+            l1KPingPongFlag = pingPongState->l1PingPongFlag;
+            pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
             if constexpr (PAGED_CACHE_FLAG_) {
                 uint32_t l1NResDynamic = (nL1Idx < (nL1Loop-1)) ? l1NDynamic : (stackSeqTile - nL1Idx * l1NDynamic);
                 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(embed, l1NResDynamic);
                 uint32_t kvL1Len = 0;
-                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KvPingPongFlag);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
                 while(kvL1Len < l1NResDynamic){
                     uint32_t nowLen = 0;
                     uint32_t curBlockSize = (curBlockIdx < (curBlockTotalNum-1)) ? blockSize : blockEnd;
@@ -251,12 +257,12 @@ public:
                     getKVOffset(gBlockTable, gBOffset, nowNIdx, blockStartOffset, strideKV, blockSize);
                     auto layoutBTile = layoutB.GetTileLayout(MakeCoord(embed, nowLen));
                     MatrixCoord l1BTileCoord{0, kvL1Len};
-                    auto l1BTile = l1BTensor[l1KvPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];
+                    auto l1BTile = l1BTensor[l1KPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];
                     copyGmToL1B(l1BTile, gB[gBOffset], layoutBInL1, layoutBTile);
                     kvL1Len += nowLen;
                     updateBlockOffset(nowLen, curBlockIdx, blockSize);
                 }
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KvPingPongFlag);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
                 mActual = actualShape.m();
                 kActual = actualShape.k();
                 nActual = l1NResDynamic;
@@ -269,16 +275,20 @@ public:
                 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
 
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
-                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KvPingPongFlag);
-                copyGmToL1B(l1BTensor[l1KvPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KvPingPongFlag);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
+                copyGmToL1B(l1BTensor[l1KPingPongFlag], gB[gBOffset], layoutBInL1, layoutBTile);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
             }
             uint32_t mL0Loop = CeilDiv(mActual, L0TileShape::M);
             uint32_t kL0Loop = CeilDiv(kActual, L0TileShape::K);
             for (uint32_t mL0Idx = 0; mL0Idx < mL0Loop; mL0Idx++) {
                 uint32_t mL0Actual = (mL0Idx < mL0Loop - 1U) ? L0TileShape::M : (mActual - mL0Idx * L0TileShape::M);
+                l0CPingPongFlag = pingPongState->l0CPingPongFlag;
+                pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
                 for (uint32_t kL0Idx = 0; kL0Idx < kL0Loop; kL0Idx++) {
+                    l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
+                    pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
                     uint32_t kL0Actual = (kL0Idx < kL0Loop - 1U) ? L0TileShape::K : (kActual - kL0Idx * L0TileShape::K);
 
                     LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0Actual, kL0Actual);
@@ -290,14 +300,14 @@ public:
 
                     LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Actual, nActual);
                     MatrixCoord l1BTileCoord{kL0Idx * L0TileShape::K, 0};
-                    auto l1BTile = l1BTensor[l1KvPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];
+                    auto l1BTile = l1BTensor[l1KPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];
                     if ((mL0Idx == 0U) && (kL0Idx == 0U)) {
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1KvPingPongFlag);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
                     }
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
                     copyL1ToL0B(l0BTensor[l0ABPingPongFlag], l1BTile, layoutBInL0, layoutBInL1);
                     if ((mL0Idx == mL0Loop - 1U) && (kL0Idx == kL0Loop - 1U)) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1KvPingPongFlag);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
                     }
 
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
@@ -313,7 +323,7 @@ public:
                         initMmad);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                    l0ABPingPongFlag = 1U - l0ABPingPongFlag;
+                    // pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -322,9 +332,9 @@ public:
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                l0CPingPongFlag = 1U - l0CPingPongFlag;
+                // pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
             }
-            l1KvPingPongFlag = 1U - l1KvPingPongFlag;
+            // pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
         }
     }
 protected:
@@ -342,9 +352,10 @@ protected:
     CopyL1ToL0B copyL1ToL0B;
     CopyL0CToGm copyL0CToGm;
 
-    uint32_t l1KvPingPongFlag = 0;
-    uint32_t l0CPingPongFlag = 0;
+    BlockPingPongState *pingPongState = nullptr;
+    uint32_t l1KPingPongFlag = 0;
     uint32_t l0ABPingPongFlag = 0;
+    uint32_t l0CPingPongFlag = 0;
 
     uint32_t l1MDynamic = 0;
     uint32_t l1NDynamic = 0;

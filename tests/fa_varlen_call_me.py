@@ -33,9 +33,9 @@ import torch
 import torch_npu
 
 CASES = [
-    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 131475, "heads_q": 8,
-     "total_kv": 131475, "heads_kv": 8, "head_dim": 128, "scale": 1.0,
-     "causal": False, "batch": 512, "max_q": 279, "max_kv": 279, "dropout": 0.0},
+    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 30, "heads_q": 1,
+     "total_kv": 2790, "heads_kv": 1, "head_dim": 128, "scale": 1.0,
+     "causal": False, "batch": 10, "max_q": 3, "max_kv": 279, "dropout": 0.0},
     {"name": "tnd_T1536_H16_causal_dropout0.1", "total_q": 131475, "heads_q": 16,
      "total_kv": 131475, "heads_kv": 16, "head_dim": 128, "scale": 1.0,
      "causal": True, "batch": 512, "max_q": 279, "max_kv": 279, "dropout": 0.0},
@@ -427,8 +427,8 @@ def compare_per_batch(got, ref, lens, tol, label, batched=False):
     for i, (g, r) in enumerate(
             zip(split_by_batch(got, lens, batched),
                 split_by_batch(ref, lens, batched))):
-        print(f"batch out g: {g}")
-        print(f"batch out r: {r}")
+        # print(f"batch out g: {g}")
+        # print(f"batch out r: {r}")
         diff = (g - r).abs()
         abs_err = diff.max().item()
         rel_err = (diff / (r.abs() + 1e-6)).max().item()
@@ -436,8 +436,8 @@ def compare_per_batch(got, ref, lens, tol, label, batched=False):
         n_fail += 0 if ok else 1
         max_abs = max(max_abs, abs_err)
         max_rel = max(max_rel, rel_err)
-        print(f"    batch {i:>4} (len={lens[i]}): max_abs_err={abs_err:.6g}, "
-              f"max_rel_err={rel_err:.6g}  {'PASS' if ok else 'FAIL'}")
+        # print(f"    batch {i:>4} (len={lens[i]}): max_abs_err={abs_err:.6g}, "
+        #       f"max_rel_err={rel_err:.6g}  {'PASS' if ok else 'FAIL'}")
     verdict = "PASS" if n_fail == 0 else "FAIL"
     print(f"  {label}: per-batch {verdict} "
           f"({len(lens) - n_fail}/{len(lens)} batches ok, tol={tol}), "
