@@ -35,6 +35,7 @@ constexpr int32_t NUM576 = 576;
 constexpr int32_t BASIC_BLOCK_SIZE = 256;
 constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
+constexpr int64_t SPARSE_MODE_INT_MAX = 2147483647;
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
@@ -318,7 +319,7 @@ public:
     void operator()(TensorB &gBTensor, TensorC &ubCTensor,
                     AscendC::GlobalTensor<int32_t> gBlockTable,
                     GemmCoord actualOriShape, uint32_t blockSize,
-                    uint32_t kvSTileIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
+                    uint32_t kvSTileIdx, uint32_t kvSTileRelIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink, 
                     uint32_t globalWindowSize, uint32_t localWindowSize,
                     uint32_t qSBlockSize, uint32_t qNBlockSize,
@@ -336,7 +337,7 @@ public:
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[1];
 
-        uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
+        uint32_t l1BBufId = kvSTileRelIdx % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
         // Must match loadQGM: the multi-ND copy stores adjacent Q heads
@@ -358,7 +359,7 @@ public:
             uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
-            uint32_t l0CLoopCounter = kvSTileIdx;
+            uint32_t l0CLoopCounter = kvSTileRelIdx;
             uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId;
             auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNAct);
@@ -492,7 +493,7 @@ public:
                     tla::MakeCoord(mL0Itr * L0_TILE_M, 0), tla::MakeShape(l0TileMAct, l0TileNAct));
                 for (uint32_t kL0Itr = 0; kL0Itr < kL0LoopNum; kL0Itr++) {
                     uint32_t l0ALoopCounter = prefixSumL0AStages + GetCurLoopCounter(mL0Itr, kL0LoopNum, kL0Itr);
- 	                uint32_t l0BLoopCounter = prefixSumL0BStages + GetCurLoopCounter(nLoopCounter, kL0LoopNum, kL0Itr);
+                    uint32_t l0BLoopCounter = prefixSumL0BStages + GetCurLoopCounter(nLoopCounter, kL0LoopNum, kL0Itr);
                     uint32_t l0TileKAct = (kL0Itr == kL0LoopNum - 1) ?
                         (embed - kL0Itr * L0_TILE_K) : L0_TILE_K;
                     uint32_t l0ABufId = l0ALoopCounter % L0_STAGES;

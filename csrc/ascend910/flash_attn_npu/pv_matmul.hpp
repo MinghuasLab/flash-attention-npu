@@ -16,6 +16,7 @@
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
 #include "fa_block.h"
+#include "kernel_common.hpp"
 
 namespace Catlass::Gemm::Block {
 
@@ -175,8 +176,27 @@ public:
         AscendC::GlobalTensor<int32_t> gBlockTable,
         LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
         uint32_t &nIdx, uint32_t &nLoop, uint32_t &blockSize, uint32_t kvSeqlen, uint32_t strideKV,
-        uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag)
+        uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag,
+        bool doCopyback = false,
+        AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
+        uint64_t cacheRowBase = 0,
+        AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
+        uint32_t cachePageSize = 0,
+        uint32_t cacheTableBase = 0)
     {
+        (void)doCopyback;
+        (void)gBCache;
+        (void)cacheRowBase;
+        (void)gCacheTable;
+        (void)cachePageSize;
+        (void)cacheTableBase;
+        // Append-KV writeback state, consumed by the writeback below.
+        appendDoCopyback = doCopyback;
+        appendGBCache = gBCache;
+        appendCacheRowBase = cacheRowBase;
+        appendGCacheTable = gCacheTable;
+        appendCachePageSize = cachePageSize;
+        appendCacheTableBase = cacheTableBase;
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t embed = actualOriShape[COORD_DIM1];
         uint32_t stackSeqTile = actualOriShape[COORD_DIM2];
@@ -186,23 +206,32 @@ public:
         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(stackSeqTile, embed);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
         if constexpr (PAGED_CACHE_FLAG_) {
-            uint32_t curBlockIdx =  0;
-            uint32_t blockStart = blockSize - blockStartOffset;
-            uint32_t blockEnd = 0;
-            uint32_t curBlockTotalNum = 0;
-            setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
-            while(curBlockIdx < curBlockTotalNum) {
-                uint32_t nowLen = (curBlockIdx < (curBlockTotalNum-1)) ? (blockSize - blockStartOffset) : (blockEnd -
-                    blockStartOffset);
-                uint32_t nowNIdx = nIdx * maxKVStackLen / blockSize + curBlockIdx;
-                getBlockShape(actualShape, nowLen);
-                getKVOffset(gBlockTable, gBOffset, blockStartOffset, nowNIdx, strideKV, blockSize);
+            if (appendCachePageSize != 0U) {
+                // Newkv phase: contiguous source (not page-table addressed);
+                // the writeback below is page-aware.
+                getBlockShape(actualShape, stackSeqTile);
+                getKVOffset(gBOffset, nIdx, strideKV);
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(actualShape.k(), actualShape.n()));
-                uint32_t curBlockSize = (curBlockIdx > 0) ? ((curBlockIdx - 1) * blockSize + blockStart) : 0;
-                MatrixCoord l1BTileCoord{curBlockSize, 0};
-                auto l1BTile = l1BTensor[layoutBInL1.GetOffset(l1BTileCoord)];
-                copyGmToL1B(l1BTile, gB[gBOffset], layoutBInL1, layoutBTile);
-                updateBlockOffset(nowLen, curBlockIdx, blockSize);
+                copyGmToL1B(l1BTensor, gB[gBOffset], layoutBInL1, layoutBTile);
+            } else {
+                uint32_t curBlockIdx =  0;
+                uint32_t blockStart = blockSize - blockStartOffset;
+                uint32_t blockEnd = 0;
+                uint32_t curBlockTotalNum = 0;
+                setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
+                while(curBlockIdx < curBlockTotalNum) {
+                    uint32_t nowLen = (curBlockIdx < (curBlockTotalNum-1)) ? (blockSize - blockStartOffset) : (blockEnd -
+                        blockStartOffset);
+                    uint32_t nowNIdx = nIdx * maxKVStackLen / blockSize + curBlockIdx;
+                    getBlockShape(actualShape, nowLen);
+                    getKVOffset(gBlockTable, gBOffset, blockStartOffset, nowNIdx, strideKV, blockSize);
+                    auto layoutBTile = layoutB.GetTileLayout(MakeCoord(actualShape.k(), actualShape.n()));
+                    uint32_t curBlockSize = (curBlockIdx > 0) ? ((curBlockIdx - 1) * blockSize + blockStart) : 0;
+                    MatrixCoord l1BTileCoord{curBlockSize, 0};
+                    auto l1BTile = l1BTensor[layoutBInL1.GetOffset(l1BTileCoord)];
+                    copyGmToL1B(l1BTile, gB[gBOffset], layoutBInL1, layoutBTile);
+                    updateBlockOffset(nowLen, curBlockIdx, blockSize);
+                }
             }
         } else {
             getBlockShape(actualShape, stackSeqTile);
@@ -285,9 +314,38 @@ public:
                 l0CPingPongFlag = 1U - l0CPingPongFlag;
             }
         }
+        if (appendDoCopyback) {
+            // Write the staged new-V block back to the cache at row appendCacheRowBase
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyParams ndLoadParams(stackSeqTile, embed / BLOCK_SIZE,
+                strideKV / BLOCK_SIZE - embed / BLOCK_SIZE, 0);
+            AscendC::DataCopy(l1BTensor, gB[gBOffset], ndLoadParams);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            if (appendCachePageSize == 0U) {
+                AscendC::DataCopyParams ndStoreParams(stackSeqTile, embed / BLOCK_SIZE,
+                    0, strideKV / BLOCK_SIZE - embed / BLOCK_SIZE);
+                AscendC::DataCopy(appendGBCache[appendCacheRowBase * strideKV], l1BTensor, ndStoreParams);
+            } else {
+                uint32_t segSrc = 0;
+                while (segSrc < stackSeqTile) {
+                    const uint32_t segRow = static_cast<uint32_t>(appendCacheRowBase) + segSrc;
+                    const uint32_t pageIdx = appendCacheTableBase + segRow / appendCachePageSize;
+                    const uint32_t pageOff = segRow % appendCachePageSize;
+                    const uint32_t segLen = AscendC::Std::min(stackSeqTile - segSrc, appendCachePageSize - pageOff);
+                    const uint32_t pageBase = static_cast<uint32_t>(appendGCacheTable.GetValue(pageIdx)) * appendCachePageSize;
+                    AscendC::DataCopyParams ndStoreParams(segLen, embed / BLOCK_SIZE,
+                        0, strideKV / BLOCK_SIZE - embed / BLOCK_SIZE);
+                    AscendC::DataCopy(
+                        appendGBCache[(uint64_t)(pageBase + pageOff) * strideKV],
+                        l1BTensor[segSrc * embed], ndStoreParams);
+                    segSrc += segLen;
+                }
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
     }
- 
+
 protected:
     AscendC::LocalTensor<ElementA> l1ATensor[STAGES];
     AscendC::LocalTensor<ElementB> l1BTensor;
@@ -309,6 +367,13 @@ protected:
     uint32_t l1MDynamic = 0;
     uint32_t l1NDynamic = 0;
     uint32_t l1KDynamic = 0;
+
+    bool appendDoCopyback = false;
+    AscendC::GlobalTensor<ElementB> appendGBCache;
+    uint64_t appendCacheRowBase = 0;
+    AscendC::GlobalTensor<int32_t> appendGCacheTable;
+    uint32_t appendCachePageSize = 0;
+    uint32_t appendCacheTableBase = 0;
 
     uint32_t blockStartOffset = 0;
     uint32_t maxKVStackLen = 0;

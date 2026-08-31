@@ -38,6 +38,7 @@ def _maybe_contiguous(x):
     """Make sure the inner-most stride is 1; the kernel asserts it."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+
 @_torch_custom_op_wrapper(
     "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
@@ -155,6 +156,120 @@ def _flash_attn_forward_fake(
     softmax_lse_accum = torch.tensor([], device=q.device)
     return out, softmax_lse, out_accum, softmax_lse_accum
 
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3_950_C::_flash_attn_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types="npu",
+)
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    sequed_q: Optional[torch.Tensor] = None,
+    sequed_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> torch.Tensor:
+    # Placeholder registered for interface parity with Ascend 910; the 950
+    # backend has no backward kernel, so the actual implementation is absent.
+    raise NotImplementedError(
+        "Ascend 950 does not support flash attention backward pass."
+    )
+
+
+def get_scheduler_metadata(
+    batch_size,
+    max_seqlen_q,
+    num_heads_q,
+    num_heads_kv,
+    headdim,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v=None,
+    max_seqlen_k=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    num_blocks: Optional[int] = None,
+    max_num_blocks_per_seq: Optional[int] = None,
+    causal=False,
+    softmax_scale=None,
+    num_splits=0,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    has_softcap=False,
+    pack_gqa=None,
+    sm_margin=0,  # 910-compatible parameter; unused on Ascend 950
+):
+    """Precompute AICPU scheduler metadata (tiling + causal mask) on Ascend 950.
+
+    The returned NPU byte tensor can be passed to ``flash_attn_func``,
+    ``flash_attn_varlen_func``, or ``flash_attn_with_kvcache`` through their
+    ``scheduler_metadata`` argument to avoid per-call host tiling and H2D/D2H
+    copies. It depends on shapes, dtype-independent tiling constants, causal
+    flag, and the actual per-batch sequence lengths; re-create it whenever those
+    change.
+    """
+    cache_seqlens = _maybe_contiguous(cache_seqlens)
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
+    if cu_seqlens_k is not None:
+        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
+    if headdim_v is None:
+        headdim_v = headdim
+    if softmax_scale is None:
+        softmax_scale = headdim ** (-0.5)
+    if qkv_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("qkv_dtype must be torch.float16 or torch.bfloat16")
+    if page_size is not None and max_num_blocks_per_seq is None and max_seqlen_k is not None:
+        max_num_blocks_per_seq = (max_seqlen_k + page_size - 1) // page_size
+    if page_size is not None and num_blocks is None and max_num_blocks_per_seq is not None:
+        num_blocks = batch_size * max_num_blocks_per_seq
+    if attention_chunk != 0:
+        raise ValueError("Ascend 950 does not support attention_chunk")
+    if has_softcap:
+        raise ValueError("Ascend 950 does not support softcap")
+    if pack_gqa is not None and pack_gqa:
+        raise ValueError("Ascend 950 does not support pack_gqa")
+    scheduler_metadata = flash_attn_npu_3_950.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_size,
+        num_blocks,
+        max_num_blocks_per_seq,
+        causal,
+        softmax_scale,
+        num_splits,
+        max_seqlen_k if max_seqlen_k is not None else 0,
+        window_size[0],
+        window_size[1],
+    )
+    return scheduler_metadata
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -233,9 +348,13 @@ def flash_attn_with_kvcache(
         q: (batch_size, seqlen, nheads, headdim)
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
+            When cu_seqlens_q is provided (TND), non-paged cache must be 3D:
+            (total_tokens, nheads_k, headdim).
             page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.).
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
+            When cu_seqlens_q is provided (TND), non-paged cache must be 3D:
+            (total_tokens, nheads_k, headdim_v).
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
@@ -279,10 +398,64 @@ def flash_attn_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        num_batch = cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
         cache_seqlens = torch.full(
-            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (num_batch,), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
+
+    if scheduler_metadata is None:
+        if cu_seqlens_q is not None:
+            if max_seqlen_q is None:
+                raise ValueError(
+                    "max_seqlen_q must be provided when cu_seqlens_q is provided"
+                )
+            batch_size = cu_seqlens_q.numel() - 1
+            num_heads_q = q.shape[1]
+            headdim = q.shape[2]
+            headdim_v = v_cache.shape[-1]
+            kv_heads = k_cache.shape[1] if k_cache.dim() == 3 else k_cache.shape[2]
+            max_q = max_seqlen_q
+        else:
+            batch_size = q.shape[0]
+            num_heads_q = q.shape[2]
+            headdim = q.shape[3]
+            headdim_v = v_cache.shape[-1]
+            kv_heads = k_cache.shape[2]
+            max_q = q.shape[1]
+        if page_table is not None:
+            page_size = k_cache.shape[1]
+            num_blocks = k_cache.shape[0]
+            max_blocks = page_table.shape[1]
+        else:
+            page_size = None
+            num_blocks = None
+            max_blocks = None
+        if page_table is not None:
+            max_seqlen_k_bound = max_blocks * page_size
+        elif cu_seqlens_q is not None:
+            max_seqlen_k_bound = k_cache.shape[0]  # TND 3D non-paged: total_tokens bound
+        else:
+            max_seqlen_k_bound = k_cache.shape[1]
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_q,
+            num_heads_q=num_heads_q,
+            num_heads_kv=kv_heads,
+            headdim=headdim,
+            headdim_v=headdim_v,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=page_size,
+            num_blocks=num_blocks,
+            max_num_blocks_per_seq=max_blocks,
+            causal=causal,
+            window_size=window_size,
+            max_seqlen_k=max_seqlen_k_bound,
+            softmax_scale=softmax_scale,
+            num_splits=num_splits,
+        )
 
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
@@ -293,7 +466,7 @@ def flash_attn_with_kvcache(
         qv,
         None,                # out (let the kernel allocate)
         cu_seqlens_q,
-        None,                # cu_seqlens_k 
+        None,                # cu_seqlens_k
         cu_seqlens_k_new,
         None,                # seqused_q
         cache_seqlens,       # seqused_k — required by the 950 wrapper
@@ -320,3 +493,352 @@ def flash_attn_with_kvcache(
         return_softmax_lse=return_softmax_lse,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+class FlashAttnFunc(torch.autograd.Function):
+    """Forward-only autograd wrapper for BSND flash attention on Ascend 950."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        qv=None,
+        q_descale=None, k_descale=None, v_descale=None,
+        window_size=(-1, -1),
+        attention_chunk=0,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        sm_margin=0,
+        return_attn_probs=False,
+    ):
+        assert q.stride(-1) == 1, "q must have contiguous last dimension"
+        assert k.stride(-1) == 1, "k must have contiguous last dimension"
+        assert v.stride(-1) == 1, "v must have contiguous last dimension"
+
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        batch_size = q.shape[0]
+        seqlen_k = k.shape[1]
+        seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
+
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=seqlen_k,
+            num_heads_q=q.shape[2],
+            num_heads_kv=k.shape[2],
+            headdim=q.shape[3],
+            headdim_v=v.shape[3],
+            cache_seqlens=seqused_k,
+            qkv_dtype=q.dtype,
+            causal=causal,
+            window_size=window_size,
+            softmax_scale=softmax_scale,
+            num_splits=num_splits,
+        )
+
+        out, softmax_lse, *rest = _flash_attn_forward(
+            q,
+            k,
+            v,
+            None,                # k_new
+            None,                # v_new
+            qv,                  # qv
+            None,                # out (let the kernel allocate)
+            None,                # cu_seqlens_q (BSND, not varlen)
+            None,                # cu_seqlens_k
+            None,                # cu_seqlens_k_new
+            None,                # seqused_q
+            seqused_k,           # seqused_k — required by the 950 backend
+            None,                # max_seqlen_q
+            None,                # max_seqlen_k
+            None,                # page_table
+            None,                # kv_batch_idx
+            None,                # leftpad_k
+            None,                # rotary_cos
+            None,                # rotary_sin
+            None,                # seqlens_rotary
+            q_descale, k_descale, v_descale,
+            softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=True,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_attn_probs,
+        )
+        return (out, softmax_lse.transpose(-1, -2)) if return_attn_probs else out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        raise NotImplementedError(
+            "Ascend 950 does not support backward pass; flash_attn_func is forward-only."
+        )
+
+
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """FlashAttention v3 forward pass for BSND layout (Ascend 950).
+
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    Note: Ascend 950 does not support backward pass. This is a forward-only implementation.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). Sliding window local attention bounds;
+            (-1, -1) means no window restriction.
+        return_attn_probs: bool. Whether to return the attention log-sum-exp values.
+            If True, returns (out, softmax_lse).
+
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, seqlen, nheads).
+            The logsumexp of each row of the matrix QK^T * scaling.
+    """
+    return FlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale, k_descale, v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        return_attn_probs,
+    )
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    """Forward-only autograd wrapper for TND (varlen) flash attention on Ascend 950."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqused_q=None,
+        seqused_k=None,
+        softmax_scale=None,
+        causal=False,
+        qv=None,
+        q_descale=None, k_descale=None, v_descale=None,
+        window_size=(-1, -1),
+        attention_chunk=0,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        sm_margin=0,
+        return_attn_probs=False,
+    ):
+        assert q.stride(-1) == 1, "q must have contiguous last dimension"
+        assert k.stride(-1) == 1, "k must have contiguous last dimension"
+        assert v.stride(-1) == 1, "v must have contiguous last dimension"
+
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        # Derive per-batch sequence lengths from cumulative cu_seqlens if not provided.
+        # cu_seqlens format: [0, s1, s1+s2, s1+s2+s3, ...]
+        # Per-batch: [s1, s2, s3, ...]
+        if seqused_q is None:
+            seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        if seqused_k is None:
+            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+
+        seqused_q = _maybe_contiguous(seqused_q)
+        seqused_k = _maybe_contiguous(seqused_k)
+
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size=cu_seqlens_q.numel() - 1,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            num_heads_q=q.shape[1],
+            num_heads_kv=k.shape[1],
+            headdim=q.shape[2],
+            headdim_v=v.shape[2],
+            cache_seqlens=seqused_k,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            causal=causal,
+            window_size=window_size,
+            softmax_scale=softmax_scale,
+            num_splits=num_splits,
+        )
+
+        out, softmax_lse, *rest = _flash_attn_forward(
+            q,
+            k,
+            v,
+            None,                # k_new
+            None,                # v_new
+            qv,                  # qv
+            None,                # out (let the kernel allocate)
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,                # cu_seqlens_k_new
+            seqused_q,           # seqused_q
+            seqused_k,           # seqused_k — required by the 950 backend
+            max_seqlen_q,
+            max_seqlen_k,
+            None,                # page_table
+            None,                # kv_batch_idx
+            None,                # leftpad_k
+            None,                # rotary_cos
+            None,                # rotary_sin
+            None,                # seqlens_rotary
+            q_descale, k_descale, v_descale,
+            softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=True,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_attn_probs,
+        )
+        return (out, softmax_lse.transpose(-1, -2)) if return_attn_probs else out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        raise NotImplementedError(
+            "Ascend 950 does not support backward pass; flash_attn_varlen_func is forward-only."
+        )
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """FlashAttention v3 forward pass for TND (varlen) layout (Ascend 950).
+
+    Supports variable-length sequences packed into contiguous tensors.
+    Q, K, V are in TND layout: (total_tokens, nheads, headdim).
+
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+
+    Note: Ascend 950 does not support backward pass. This is a forward-only implementation.
+
+    Arguments:
+        q: (total_q, nheads, headdim) — TND layout.
+        k: (total_k, nheads_k, headdim) — TND layout.
+        v: (total_k, nheads_k, headdim) — TND layout.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths for Q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths for K/V.
+        max_seqlen_q: int. Maximum query sequence length.
+        max_seqlen_k: int. Maximum key sequence length.
+        seqused_q: (batch_size,), dtype torch.int32, optional. Per-batch Q sequence lengths.
+            If not provided, derived from cu_seqlens_q.
+        seqused_k: (batch_size,), dtype torch.int32, optional. Per-batch KV sequence lengths.
+            If not provided, derived from cu_seqlens_k.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        return_attn_probs: bool. Whether to return the attention log-sum-exp values.
+
+    Return:
+        out: (total_q, nheads, headdim_v).
+        softmax_lse [optional, if return_attn_probs=True]: (total_q, nheads).
+            The logsumexp of each row of the matrix QK^T * scaling.
+    """
+    return FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqused_q,
+        seqused_k,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale, k_descale, v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        return_attn_probs,
+    )

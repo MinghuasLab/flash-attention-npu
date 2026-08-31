@@ -446,13 +446,19 @@ public:
         uint32_t proTokenIdx, uint32_t proTokenNum,
         uint32_t integralHeadNum, uint32_t epiTokenNum, bool isNextMask)
     {
+        // 910B DataCopyPad requires the row byte length to be 8-aligned; a
+        // causal tail tile of kvSEndIdx % 8 != 0 (kv=2049..2051, 2060, ...)
+        // would otherwise issue a 4/12-byte row copy -> device error 507015.
+        // Read RoundUp(columnNum, 8) bytes per row (the padded bytes are
+        // stale; ApplyMask trims the add span to the valid columns).
+        uint32_t maskRowLen = RoundUp(columnNum, (uint32_t)8) * sizeof(ElementMask);
         uint32_t innerUbRowOffset = isNextMask ? MAX_UB_S_ELEM_NUM : 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask[proTokenIdx * maskStride],
                 AscendC::DataCopyExtParams(
-                    proTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    proTokenNum, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += proTokenNum * columnNumRound;
         }
@@ -460,8 +466,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    tokenNumPerHead, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    tokenNumPerHead, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += tokenNumPerHead * columnNumRound;
         }
@@ -469,8 +475,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    epiTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    epiTokenNum, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
         }
     }
@@ -548,7 +554,7 @@ public:
             CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        if (maskColumnRound == columnNumRound) {
+        if (maskColumnRound == columnNumRound && addMaskUbOffset == 0U) {
             AscendC::Add<float, false>(
                 lsUbTensor[sUbOffset],
                 lsUbTensor[sUbOffset],
@@ -557,7 +563,9 @@ public:
                 CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         } else {
-            uint32_t loop = maskColumnRound / FLOAT_VECTOR_SIZE;
+            // Trim the mask span so it never crosses the tile into the next row's UB.
+            uint32_t maskAddNum = AscendC::Std::min(maskColumnRound, columnNumRound - addMaskUbOffset);
+            uint32_t loop = maskAddNum / FLOAT_VECTOR_SIZE;
             for (uint32_t i = 0; i < loop; i++) {
                 AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
                     lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
@@ -570,8 +578,8 @@ public:
                         columnNumRound / FLOAT_BLOCK_SIZE,
                         maskColumnRound / FLOAT_BLOCK_SIZE));
             }
-            if (maskColumnRound % FLOAT_VECTOR_SIZE > 0) {
-                SetVecMask(maskColumnRound % FLOAT_VECTOR_SIZE);
+            if (maskAddNum % FLOAT_VECTOR_SIZE > 0) {
+                SetVecMask(maskAddNum % FLOAT_VECTOR_SIZE);
                 AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
                     lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
                     maskUbTensor32[loop * FLOAT_VECTOR_SIZE],
@@ -982,22 +990,54 @@ public:
         uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ?
             rowOffsetThisSubBlock : 0;
 
-        // calc mask shift in gm
+        // Causal mask tile: the UNIT triangle read from the mask origin at
+        // rows [rowShift, rowShift+rowNum), cols [0, maskColumn), applied at
+        // S column addMaskUbOffset = S0 = RoundDown(triUp - kvSStartIdx, 32).
+        // mask[r][c] = [c > r] is constant along diagonals, so the triangle
+        // shifted by S0 columns and rowShift rows equals the triangle at the
+        // true diagonal: hidden iff c = m - S0 > rowShift + qrow, i.e.
+        // kvSStartIdx + m > triUp + qrow. S0 must stay 32-aligned: this
+        // reproduces the legacy corner-only read pattern exactly (same mask
+        // rows, same add span ending at columnNumRound — never crossing into
+        // the next UB row), and keeps every ApplyMask tail count an 8-multiple
+        // (the 910 vector mask/address granularity is 8 fp32; unaligned tails
+        // raise device error 507015). The legacy corner-only form branched on
+        // triUp >= kvSStartIdx and rounded triUp down to 32: for unaligned
+        // append-KV diagonals (e.g. 513 with old=1535) RoundDown(triUp,32)
+        // fell below kvSStartIdx while triUp >= kvSStartIdx, so addMaskUbOffset
+        // went negative and wrapped to uint32 -> OOB write crash. The diag-
+        // based branch below fixes that; the full-tile form (read rows
+        // [triUp ...], maskColumn = columnNum) clamped rows by the whole-tile
+        // rowNum, shifting the diagonal by (qNBlockSize-1)*qSBlockSize; and
+        // an 8-aligned S0 variant broke the row-fit invariant (S0 +
+        // maskColumnRound > columnNumRound, e.g. varlen diagonals with
+        // triUp % 32 == 13) — both are subsumed by the 32-aligned form plus
+        // the ApplyMask span trim.
         uint32_t gmOffsetMaskRow;
         uint32_t gmOffsetMaskColumn;
         uint32_t maskColumn;
         uint32_t addMaskUbOffset;
-        if (triUp >= static_cast<int64_t>(kvSStartIdx)) {
-            uint32_t triUpRoundDown = RoundDown(
-                static_cast<uint32_t>(triUp), BLOCK_SIZE_IN_BYTE);
-            gmOffsetMaskRow = static_cast<uint32_t>(triUp) - triUpRoundDown;
+        int64_t diagColLocal = triUp - static_cast<int64_t>(kvSStartIdx);
+        if (diagColLocal >= 0) {
+            // diagonal cuts through this tile: 32-aligned add start (matches
+            // the legacy corner-only read pattern, so the mask data rows and
+            // the add span are identical to it — keep it that way: the span
+            // then always ends exactly at columnNumRound), the residue (<32)
+            // absorbed as the mask row shift. 32-alignment also keeps every
+            // ApplyMask tail count an 8-multiple (the 910 vector mask and
+            // address granularity), and the diag-based branch (instead of
+            // triUp >= kvSStartIdx) never goes negative for unaligned
+            // append-KV diagonals (e.g. 513 with old=1535) -> no uint32 wrap.
+            uint32_t diagU = static_cast<uint32_t>(diagColLocal);
+            addMaskUbOffset = RoundDown(diagU, BLOCK_SIZE_IN_BYTE);
+            gmOffsetMaskRow = diagU - addMaskUbOffset;
             gmOffsetMaskColumn = 0;
-            maskColumn = kvSEndIdx - triUpRoundDown;
-            addMaskUbOffset = triUpRoundDown - kvSStartIdx;
+            maskColumn = columnNum - addMaskUbOffset;
         } else {
+            // tile fully below the diagonal (all-visible prefix): full-width
+            // triangle shifted right so its diagonal lands at triUp.
             gmOffsetMaskRow = 0;
-            gmOffsetMaskColumn = static_cast<uint32_t>(
-                static_cast<int64_t>(kvSStartIdx) - triUp);
+            gmOffsetMaskColumn = static_cast<uint32_t>(-diagColLocal);
             maskColumn = columnNum;
             addMaskUbOffset = 0;
         }

@@ -24,9 +24,9 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
-#include "fai_host_api.hpp"
-#include "fai_tiling.cpp"
-#include "fai_tilingdata.h"
+#include "fwd_dispatch.hpp"
+#include "tiling.cpp"
+#include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
@@ -258,7 +258,7 @@ mha_fwd(at::Tensor q,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
         return_lse,
-        is_varlen_q ? "TND" : "BSND");
+        is_varlen_q);
 
     FAInferTilingData tilingData{};
     {
@@ -304,21 +304,11 @@ mha_fwd(at::Tensor q,
     at::Tensor tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
 
     // ============================================================
-    // 10. Build kernelKey + launch via fai_host::LaunchFAI
+    // 10. Launch via launch_fwd
     // ============================================================
     const Format fmt = is_varlen_q ? Format::TND : Format::BSND;
-    const CacheMode cacheMode = paged_KV ? CacheMode::pagedCache
-                                           : CacheMode::normalCache;
-    const PageShape pageShape = paged_KV ? PageShape::BnBsND
-                                           : PageShape::normalShape;
-    const uint32_t maskTypeKey = is_causal ? 1u : 0u;
-    const uint32_t innerPrec = 0u; // FP32 accum
-    const std::string dataType = is_bf16 ? "bf16" : "half";
-    const std::string cacheLayout = "nd"; // nd only
-
-    const uint32_t kernelKey = fai_host::BuildKernelKey(
-        dataType, cacheLayout, maskTypeKey, innerPrec,
-        fmt, cacheMode, pageShape);
+    const MaskCategory mask_category = is_causal ? MaskCategory::MASK_CAUSAL
+                                                 : MaskCategory::NO_MASK;
 
     // device pointers
     auto qDev = static_cast<uint8_t*>(q.data_ptr());
@@ -368,25 +358,20 @@ mha_fwd(at::Tensor q,
     }
 
     const bool enableDN =
-        (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
+        (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256);
 
-    const aclError err = fai_host::LaunchFAI(
-        kernelKey, enableDN, return_lse,
+    const FwdLaunchArgs fwdArgs{
+        is_bf16, fmt, mask_category, paged_KV,
+        enableDN, return_lse,
         blockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
-        wsDev, tilDev);
-    TORCH_CHECK(err == ACL_SUCCESS,
-                "950 backend (v4): unsupported kernelKey=", kernelKey,
-                " (no launcher registered for "
-                "dtype=", dataType, " cacheLayout=", cacheLayout,
-                " maskType=", maskTypeKey, " innerPrec=", innerPrec,
-                " layout=", (fmt == Format::TND ? "TND" : "BSND"),
-                " cacheMode=", (paged_KV ? "paged" : "normal"),
-                ")");
+        wsDev, tilDev};
+    launch_fwd(fwdArgs);
+
     const aclError sync_err = aclrtSynchronizeStream(aclStream);
     TORCH_CHECK(sync_err == ACL_SUCCESS,
-                "950 backend (v4): aclrtSynchronizeStream failed after LaunchFAI, err=",
+                "950 backend (v4): aclrtSynchronizeStream failed after launch_fwd, err=",
                 sync_err);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));

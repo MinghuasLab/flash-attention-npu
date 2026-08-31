@@ -37,7 +37,7 @@
 #include "qk_matmul.hpp"
 #include "qk_matmul_DN.hpp"
 #include "pv_matmul.hpp"
-#include "fai_tilingdata.h"
+#include "tilingdata.h"
 
 using namespace Catlass;
 using namespace tla;
@@ -58,14 +58,14 @@ template <
     PageShape kvcacheShape,
     MaskCategory maskCategory,
     CacheLayout cacheLayout,
-    bool enableDN,
-    bool LSE_MODE_>
+    bool IsDN,
+    bool LseMode>
 class FAIKernel950 {
 public:
     using ArchTag = typename BlockMmadQK::ArchTag;
 
-    using ElementQ = std::conditional_t<enableDN, typename BlockMmadQK::ElementB, typename BlockMmadQK::ElementA>;
-    using ElementK = std::conditional_t<enableDN, typename BlockMmadQK::ElementA, typename BlockMmadQK::ElementB>;
+    using ElementQ = std::conditional_t<IsDN, typename BlockMmadQK::ElementB, typename BlockMmadQK::ElementA>;
+    using ElementK = std::conditional_t<IsDN, typename BlockMmadQK::ElementA, typename BlockMmadQK::ElementB>;
     using ElementS = typename EpilogueOnlineSoftmax::ElementInput;
     using ElementP = typename BlockMmadPV::ElementA;
     using ElementV = typename BlockMmadPV::ElementB;
@@ -73,8 +73,8 @@ public:
     using ElementO = typename BlockMmadQK::ElementA;
     using ElementMask = typename EpilogueOnlineSoftmax::ElementMask;
 
-    using LayoutQ = std::conditional_t<enableDN, layout::ColumnMajor, layout::RowMajor>;
-    using LayoutK = std::conditional_t<enableDN, layout::RowMajor, layout::ColumnMajor>;
+    using LayoutQ = std::conditional_t<IsDN, layout::ColumnMajor, layout::RowMajor>;
+    using LayoutK = std::conditional_t<IsDN, layout::RowMajor, layout::ColumnMajor>;
     using LayoutS = layout::RowMajor;
     using LayoutP = layout::RowMajor;
     using LayoutV = layout::RowMajor;
@@ -206,8 +206,11 @@ public:
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_);
-        EpilogueRescaleO epilogueRescaleO(resource);
+        // FA4 rescale-skip (ported from csrc/flash_attn_npu_3 commit e4bf01f):
+        // 4.0f arms the online-softmax baseline freeze; `true` arms the matching O-rescale
+        // compute-skip. Set the threshold to 0.0f (and the flag to false) to fully disable.
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, 4.0f);
+        EpilogueRescaleO epilogueRescaleO(resource, /*enableRescaleSkip=*/true);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
 
@@ -221,7 +224,6 @@ public:
         } else {
             kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1);
         }
-        // int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
 
         strideQ = qHeads_ * embed_;
         if constexpr (cacheLayout == CacheLayout::nd) {
@@ -323,7 +325,7 @@ public:
                 qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
             uint32_t rowNum = qSBlockSize * qNBlockSize;
             uint32_t rowNumRound = 0;
-            if constexpr (enableDN) {
+            if constexpr (IsDN) {
                 rowNumRound = RoundUp(rowNum, 32U);
             } else {
                 rowNumRound = RoundUp(rowNum, 16U);
@@ -345,7 +347,7 @@ public:
             uint32_t fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
             if (kvSLoopNum == 0) {
 #ifdef __DAV_VEC__
-                initOutputs.template operator()<LSE_MODE_>(
+                initOutputs.template operator()<LseMode>(
                     gO[gmOffsetO],
                     gLse[lseOffset],
                     qSBlockSize,
@@ -366,7 +368,7 @@ public:
             auto gmQTensorTlaDN = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTlaDN, Arch::PositionGM{});
             
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
-            if constexpr (enableDN) {
+            if constexpr (IsDN) {
                 blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ,
                     qSBlockSize, qNBlockSize);
             } else {
@@ -412,7 +414,7 @@ public:
                         kvSTileIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopNum, true);
                     uint64_t prefixSumL0BStages = CalcCrossqkpvPrefixSumL0ABStages(
                         kvSTileIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopNum, true);
-                    if constexpr (enableDN) {
+                    if constexpr (IsDN) {
                         blockMmadQK(
                             gmKTensorTlaDN, ubSTensorTlaDN,
                             gBlockTable[blockBOffset],
@@ -491,7 +493,7 @@ public:
                                 qNBlockSize);
                         }
                     } else {
-                        if constexpr (enableDN) {
+                        if constexpr (IsDN) {
                             epilogueOnlineSoftmax(
                                 l1PTensorTla,
                                 actualBlockShapeQK,
@@ -555,8 +557,8 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = kvSTileIdxNow % (PRE_LAUNCH + 1);
-                    if constexpr (enableDN) {
-                        epilogueRescaleO.template operator()<LSE_MODE_>(
+                    if constexpr (IsDN) {
+                        epilogueRescaleO.template operator()<LseMode>(
                             gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
@@ -567,7 +569,7 @@ public:
                             lseHeadStride,
                             static_cast<uint32_t>(strideO));
                     } else {
-                        epilogueRescaleO.template operator()<LSE_MODE_>(
+                        epilogueRescaleO.template operator()<LseMode>(
                             gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
@@ -770,7 +772,7 @@ private:
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout, bool LSE_MODE_>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode>
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -816,8 +818,8 @@ CATLASS_GLOBAL void FAInfer(
         ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
     using SType = Gemm::GemmType<ElementS, LayoutS>;
-    using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
-    using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, maskType, TileCopySoftmax>;
+    using MaskType = Gemm::GemmType<ElementMask, LayoutMask>;
+    using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>;
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
@@ -834,18 +836,18 @@ CATLASS_GLOBAL void FAInfer(
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
         DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS, TileCopyRescaleO, Arch::PositionL0C>;
 
-    using FAIKernel950 = FAIKernel950<
-        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LSE_MODE_>;
+    using Kernel = FAIKernel950<
+        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
         actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
-    FAIKernel950 faInfer;
+    Kernel faInfer;
     faInfer(params);
 }
 
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout, bool LSE_MODE_>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode>
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -884,8 +886,8 @@ CATLASS_GLOBAL void FAInferDn(
         ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
     using SType = Gemm::GemmType<ElementS, LayoutS>;
-    using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
-    using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, maskType, TileCopySoftmax>;
+    using MaskType = Gemm::GemmType<ElementMask, LayoutMask>;
+    using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>;
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
@@ -902,10 +904,10 @@ CATLASS_GLOBAL void FAInferDn(
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
         DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS, TileCopyRescaleO, Arch::PositionL0C>;
 
-    using FAIKernel950 = FAIKernel950<
-        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LSE_MODE_>;
+    using Kernel = FAIKernel950<
+        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
         actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
-    FAIKernel950 faInfer;
+    Kernel faInfer;
     faInfer(params);
 }

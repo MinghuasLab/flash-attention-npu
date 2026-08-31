@@ -13,7 +13,7 @@
 #include "fag_epilogue_sfmg.hpp"
 #include "fag_epilogue_op.hpp"
 #include "fag_epilogue_post.hpp"
-#include "kernel_common_fag.hpp"
+#include "fag_kernel_common.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "fag_mmad_cube1.hpp"

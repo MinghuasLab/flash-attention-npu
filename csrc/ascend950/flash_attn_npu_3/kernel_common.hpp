@@ -22,6 +22,7 @@ constexpr int32_t NUM576 = 576;
 constexpr int32_t BASIC_BLOCK_SIZE = 256;
 constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
+constexpr int64_t SPARSE_MODE_INT_MAX = 2147483647;
 
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t Q_M_TILE_MAX = 128;

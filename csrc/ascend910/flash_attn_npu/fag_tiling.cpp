@@ -13,7 +13,7 @@
 #include <cstring>
 
 #include "softmax_tiling.cpp"
-#include "kernel_common_fag.hpp"
+#include "fag_kernel_common.hpp"
 
 namespace FAGTiling {
 struct FAGInfo {

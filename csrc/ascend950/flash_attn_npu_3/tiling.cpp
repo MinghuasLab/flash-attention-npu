@@ -16,9 +16,8 @@
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
-#include <string>
 #include <vector>
-#include "fai_tilingdata.h"
+#include "tilingdata.h"
 
 namespace optiling{
     const uint32_t SIZE_OF_16BIT = 2;
@@ -29,12 +28,11 @@ namespace optiling{
     const uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
     const uint32_t BASE_KV_SIZE = 128;
     const uint32_t PRELANCH_NUM = 3;
-    const uint64_t ASCEND950_L1_SIZE = 512ULL * 1024ULL;
-    const uint64_t RESCALE_OTMP_STAGE_SIZE = 32ULL * 1024ULL;
 
     enum class MaskType : uint32_t {
         NO_MASK = 0,
-        MASK_SPEC = 1
+        MASK_SPEC = 1,
+        MASK_BAND = 2
     };
 
     enum class DataType : uint32_t {
@@ -56,8 +54,9 @@ namespace optiling{
         int64_t maxKvSeqlen = 0;
         int64_t preToken = 0;
         int64_t nextToken = 0;
+        int64_t windowSizeLeft = 0;
+        int64_t windowSizeRight = 0;
         int32_t sparseMode = 0;
-        std::string cacheLayout = "nd";
         uint32_t maxNumBlocksPerBatch = 0;
         const int32_t *qSeqlenList{nullptr};
         const int32_t *kvSeqlenList{nullptr};
@@ -71,7 +70,7 @@ namespace optiling{
         bool learnableSinkFlag = false;
         bool flashDecodeFlag = false;
         bool kvcacheNzFlag = false;
-        std::string layout;
+        bool isTnd = false;
         bool pagedShapeFlag = true;
     };
 
@@ -162,10 +161,11 @@ namespace optiling{
         faTilingData.set_maskType(static_cast<uint32_t>(faInfo_.maskType));
         faTilingData.set_scaleValue(faInfo_.scaleValue);
         faTilingData.set_sparseMode(faInfo_.sparseMode);
-        faTilingData.set_cacheLayout(faInfo_.cacheLayout);
         faTilingData.set_preToken(static_cast<int64_t>(faInfo_.preToken));
         faTilingData.set_nextToken(static_cast<int64_t>(faInfo_.nextToken));
-        
+        faTilingData.set_windowSizeLeft(faInfo_.windowSizeLeft);
+        faTilingData.set_windowSizeRight(faInfo_.windowSizeRight);
+
         auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
         auto kvBaseTile_ = BASE_KV_SIZE;
         auto embeddingSizeAligned16_ =
@@ -246,7 +246,7 @@ namespace optiling{
         for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
             uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
             uint32_t kvSeqlen = *(faInfo_.kvSeqlenList + batchIdx);
-            if (faInfo_.layout == "TND") {
+            if (faInfo_.isTnd) {
                 uint64_t prevQSeqlenSum = *(faInfo_.qSeqlenList + batchIdx);
                 qSeqlen = *(faInfo_.qSeqlenList + batchIdx + 1) - prevQSeqlenSum;
                 if (!faInfo_.pagedCacheFlag) {

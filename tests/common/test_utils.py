@@ -300,3 +300,39 @@ def make_padded_varlen_mask(
         diff = col - row
         mask = mask | (diff < offsets - left) | (diff > offsets + right)
     return q_valid, k_valid, mask
+
+def check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
+                          k_new, v_new, cache_seqlens, block_tables, block_size):
+    """Validate the in-place append: cache[i][old:old+s_new] == k_new[i], the rest untouched.
+    Non-paged: row-internal coordinates; paged: locate each token via the block table."""
+    torch.npu.synchronize()
+    kc, vc = key_cache.detach().cpu(), value_cache.detach().cpu()
+    kc0, vc0 = key_cache_orig.detach().cpu(), value_cache_orig.detach().cpu()
+    kn, vn = k_new.detach().cpu(), v_new.detach().cpu()
+    sl = cache_seqlens.detach().cpu()
+    bt = block_tables.detach().cpu() if block_tables is not None else None
+    s_new = kn.shape[1]
+    page_size = kc.shape[1] if bt is not None else 0
+    n_fail = 0
+    for i in range(len(sl)):
+        old = int(sl[i])
+        if bt is not None:
+            table = bt[i]
+            ok_region = all(
+                torch.equal(kc[int(table[(old + j) // page_size]), (old + j) % page_size], kn[i, j]) and
+                torch.equal(vc[int(table[(old + j) // page_size]), (old + j) % page_size], vn[i, j])
+                for j in range(s_new))
+            ok_keep = all(
+                torch.equal(kc[int(table[j // page_size]), j % page_size], kc0[int(table[j // page_size]), j % page_size]) and
+                torch.equal(vc[int(table[j // page_size]), j % page_size], vc0[int(table[j // page_size]), j % page_size])
+                for j in range(old))
+        else:
+            ok_region = (torch.equal(kc[i, old:old + s_new], kn[i]) and
+                         torch.equal(vc[i, old:old + s_new], vn[i]))
+            ok_keep = (torch.equal(kc[i, :old], kc0[i, :old]) and
+                       torch.equal(vc[i, :old], vc0[i, :old]) and
+                       torch.equal(kc[i, old + s_new:], kc0[i, old + s_new:]) and
+                       torch.equal(vc[i, old + s_new:], vc0[i, old + s_new:]))
+        if not (ok_region and ok_keep):
+            n_fail += 1
+    assert n_fail == 0, f"kvcache in-place append mismatch: {n_fail}/{len(sl)} batches"

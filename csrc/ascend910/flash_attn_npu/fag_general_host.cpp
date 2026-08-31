@@ -8,11 +8,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "../flash_attn_npu_3/fag_tiling.h"
 #include "../flash_attn_npu_3/fag_tiling.cpp"
-// The FAGGeneral kernel instantiations live in per-dtype dispatch TUs
-// (fag_general_dispatch_{bf16,fp16}.cpp), compiled in parallel. This host
-// function only sets up tiling/workspace and hands the raw pointers to
-// launch_fag_general_dispatch(); it no longer pulls in fag_kernel.cpp.
-#include "runtime/rt_ffts.h"          // rtGetC2cCtrlAddr (was via fag_general_launch.hpp)
+#include "runtime/rt_ffts.h"
 #include "fag_general_dispatch.hpp"
 
 std::vector<at::Tensor> launch_fag_general(

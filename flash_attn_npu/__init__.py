@@ -6,7 +6,7 @@ import torch_npu
 def is_ascend910() -> bool:
     """Return True if the current device belongs to Ascend 910B/C."""
     device_name = torch_npu.npu.get_device_name()
-    return "Ascend910B" in device_name or "Ascend910C" in device_name
+    return "Ascend910" in device_name
 
 
 if is_ascend910():

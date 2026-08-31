@@ -9,6 +9,7 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/arch.hpp"
+#include "catlass/coord.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 
 using namespace Catlass;

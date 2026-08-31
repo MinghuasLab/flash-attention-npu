@@ -697,6 +697,7 @@ class _FAInferTilingData(ctypes.Structure):
         ("splitLseTotalSize", ctypes.c_uint64), ("splitOTotalSize", ctypes.c_uint64),
         ("totalSplitNodeNum", ctypes.c_uint32), ("needCoreNum", ctypes.c_uint32),
         ("flashDecodeFlag", ctypes.c_uint32),
+        ("kvNewSeqlen", ctypes.c_uint32), ("kvCacheSeqlen", ctypes.c_uint32),
         ("coreInfo", _CoreNode * 25),
         ("splitInfo", _SplitNode * 25),
         ("pDevice", ctypes.c_uint64),

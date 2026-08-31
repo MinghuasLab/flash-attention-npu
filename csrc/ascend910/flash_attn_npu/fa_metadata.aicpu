@@ -130,6 +130,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
             ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
             ctx.is_varlen_q = false;
             ctx.blockDim = bd;
+            ctx.kvNewSeqlen = 0;  // scheduler-metadata path: no append-KV FD split yet
             fa_split::splitBN2S1GS2(tilingData, ctx);
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;

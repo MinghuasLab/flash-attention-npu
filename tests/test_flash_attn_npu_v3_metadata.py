@@ -4,9 +4,6 @@ import pytest
 import torch
 import torch_npu
 
-if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
-    pytest.skip("flash_attn_func / flash_attn_varlen_func / get_scheduler_metadata not on Ascend950", allow_module_level=True)
-
 from flash_attn_npu_3 import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -18,7 +15,24 @@ from tests.common.compare import assert_fa_close
 from tests.common.test_utils import gather_paged_kv_batch, make_random_tensor
 
 
+def _is_ascend910():
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    return "Ascend910" in name
+
+
+def _is_ascend950():
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    return "Ascend950" in name
+
+
 WINDOW_SIZE = (-1, -1)
+SMALL_RANGE = (-1.0, 1.0)
+WIDE_RANGE = (-5.0, 5.0)
+
+
+def _rand_npu(shape, data_type, value_range):
+    low, high = value_range
+    return (low + (high - low) * torch.rand(shape)).to(data_type).npu()
 
 def _prefix_sums(lengths):
     offsets = [0]
@@ -114,6 +128,18 @@ def _make_paged_cache(batch_size, kv_seqlen, kv_heads, head_size, block_size, da
     return key_cache, value_cache, page_table
 
 
+def _paged_kv_for_batch(key_cache_cpu, value_cache_cpu, page_table_cpu, batch_idx, kv_seqlen, block_size):
+    key_blocks = []
+    value_blocks = []
+    page_row = page_table_cpu[batch_idx]
+    for pos in range(kv_seqlen):
+        block_number = int(page_row[pos // block_size])
+        block_offset = pos % block_size
+        key_blocks.append(key_cache_cpu[block_number, block_offset])
+        value_blocks.append(value_cache_cpu[block_number, block_offset])
+    return torch.stack(key_blocks, dim=0), torch.stack(value_blocks, dim=0)
+
+
 def _assert_bsnd_matches_ref(
     output_npu,
     softmax_lse_npu,
@@ -143,7 +169,8 @@ def _assert_bsnd_matches_ref(
     )
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
+    if softmax_lse_npu is not None:
+        assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
 
 
 def _assert_tnd_matches_ref(
@@ -231,10 +258,26 @@ def metadata_spy(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def metadata_spy_950(monkeypatch):
+    """Ascend 950 版本的 metadata_spy：950 走 flash_attn_npu_interface_950。"""
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as interface
+    calls = []
+    original = interface.get_scheduler_metadata
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
+    return calls
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -278,6 +321,7 @@ def test_flash_attn_func_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -331,6 +375,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -393,6 +438,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -458,6 +504,7 @@ def test_flash_attn_kvcache_metadata_tnd(
 
 
 @pytest.mark.parametrize("is_causal", [False])
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     """FD + metadata path with idle cores (needCoreNum < blockDim)."""
     batch_size, num_heads, kv_heads = 1, 1, 1
@@ -560,6 +607,7 @@ KV_CACHE_SWA_SOFTCAP_CASES = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -603,6 +651,7 @@ def test_flash_attn_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, softcap, softmax_scale, metadata_spy,
@@ -647,6 +696,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -701,6 +751,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap
@@ -773,6 +824,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         (True, (-1, -1), False, (-1, -1)),     # metadata has a causal mask, call needs none
     ],
 )
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     meta_causal, meta_window, call_causal, call_window
 ):
@@ -814,6 +866,7 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     """Paged geometry baked into the tiling must match the call's cache/page table."""
     data_type = torch.bfloat16
@@ -861,6 +914,7 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
         call_with(unpaged)
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     """softcap/softmax_scale are baked into the tiling; mismatches must be rejected."""
     data_type = torch.bfloat16
@@ -897,6 +951,7 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     """A copied metadata tensor loses its creation-argument fingerprint."""
     data_type = torch.bfloat16
@@ -931,6 +986,7 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
         )
 
 
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     """A hand-crafted buffer with a forged fingerprint but the wrong size must be
     rejected by the C++ exact-size check (defense in depth behind the Python
@@ -967,3 +1023,143 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
             page_table=page_table,
             scheduler_metadata=bad,
         )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type, is_causal", [
+    (torch.bfloat16, False),
+    (torch.bfloat16, True),
+    (torch.float16, True),
+])
+def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_spy_950):
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 32, 64, 4, 2, 128
+    total_q = batch * q_seqlen
+    total_kv = batch * kv_seqlen
+    query = _rand_npu((total_q, heads, head), data_type, WIDE_RANGE)
+    key = _rand_npu((total_kv, kv_heads, head), data_type, WIDE_RANGE)
+    value = _rand_npu((total_kv, kv_heads, head), data_type, WIDE_RANGE)
+    q_offsets = [0, q_seqlen, q_seqlen * 2]
+    kv_offsets = [0, kv_seqlen, kv_seqlen * 2]
+    cu_seqlens_q = _int32_npu(q_offsets)
+    cu_seqlens_k = _int32_npu(kv_offsets)
+    scale = 1.0 / (head ** 0.5)
+
+    output_npu = flash_attn_varlen_func(
+        query, key, value, cu_seqlens_q, cu_seqlens_k,
+        q_seqlen, kv_seqlen,
+        softmax_scale=scale, causal=is_causal,
+        window_size=WINDOW_SIZE, num_splits=1,
+    )
+    assert len(metadata_spy_950) == 1
+
+    _assert_tnd_matches_ref(
+        output_npu, None, query,
+        (
+            key.detach().cpu().reshape(batch, kv_seqlen, kv_heads, head),
+            value.detach().cpu().reshape(batch, kv_seqlen, kv_heads, head),
+        ),
+        q_offsets=q_offsets, batch_size=batch, num_heads=heads, head_size=head,
+        scale=scale, data_type=data_type, is_causal=is_causal,
+    )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
+def test_flash_attn_with_kvcache_metadata_matches(data_type):
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 16, 128, 4, 2, 128
+    block_size = 128
+    query = _rand_npu((batch, q_seqlen, heads, head), data_type, SMALL_RANGE)
+    key_cache, value_cache, page_table = _make_paged_cache(
+        batch, kv_seqlen, kv_heads, head, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch)
+    scale = 1.0 / (head ** 0.5)
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=data_type,
+        page_size=block_size,
+        causal=False,
+        softmax_scale=scale,
+    )
+    output_npu = flash_attn_with_kvcache(
+        query, key_cache, value_cache,
+        cache_seqlens=cache_seqlens, page_table=page_table,
+        max_seqlen_q=q_seqlen, softmax_scale=None, causal=False,
+        window_size=WINDOW_SIZE, rotary_interleaved=False,
+        scheduler_metadata=scheduler_metadata, num_splits=0,
+    )
+
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    page_table_cpu = page_table.cpu()
+    key_cpu = torch.stack([
+        _paged_kv_for_batch(key_cache_cpu, value_cache_cpu, page_table_cpu,
+                            batch_idx, kv_seqlen, block_size)[0]
+        for batch_idx in range(batch)
+    ], dim=0)
+    value_cpu = torch.stack([
+        _paged_kv_for_batch(key_cache_cpu, value_cache_cpu, page_table_cpu,
+                            batch_idx, kv_seqlen, block_size)[1]
+        for batch_idx in range(batch)
+    ], dim=0)
+    # 950 kernel 目前不输出有效 softmax_lse（始终为 inf），只校验 output 与 golden。
+    _assert_bsnd_matches_ref(
+        output_npu, None, query, (key_cpu, value_cpu),
+        batch_size=batch, q_seqlen=q_seqlen, num_heads=heads, head_size=head,
+        scale=scale, data_type=data_type, is_causal=False,
+    )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
+    # 3D TND kvcache (total_tokens, kv_heads, head_dim): regression for the
+    # wrapper assuming a 4D cache when auto-generating scheduler_metadata.
+    data_type = torch.bfloat16
+    batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 16, 128, 4, 2, 128
+    total_q = batch * q_seqlen
+    total_kv = batch * kv_seqlen
+    query = _rand_npu((total_q, heads, head), data_type, SMALL_RANGE)
+    key_cache = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    value_cache = _rand_npu((total_kv, kv_heads, head), data_type, SMALL_RANGE)
+    q_offsets = [0, q_seqlen, q_seqlen * 2]
+    cu_seqlens_q = _int32_npu(q_offsets)
+    cache_seqlens = _int32_npu([kv_seqlen] * batch)
+    scale = 1.0 / (head ** 0.5)
+
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=batch,
+        max_seqlen_q=q_seqlen,
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        headdim=head,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=data_type,
+        cu_seqlens_q=cu_seqlens_q,
+        causal=False,
+        softmax_scale=scale,
+    )
+    output_npu = flash_attn_with_kvcache(
+        query, key_cache, value_cache,
+        cache_seqlens=cache_seqlens, cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_seqlen, softmax_scale=None, causal=False,
+        window_size=WINDOW_SIZE, rotary_interleaved=False,
+        scheduler_metadata=scheduler_metadata, num_splits=0,
+    )
+
+    # 950 kernel 目前不输出有效 softmax_lse（始终为 inf），只校验 output 与 golden。
+    _assert_tnd_matches_ref(
+        output_npu, None, query,
+        (
+            key_cache.detach().cpu().reshape(batch, kv_seqlen, kv_heads, head),
+            value_cache.detach().cpu().reshape(batch, kv_seqlen, kv_heads, head),
+        ),
+        q_offsets=q_offsets, batch_size=batch, num_heads=heads, head_size=head,
+        scale=scale, data_type=data_type, is_causal=False,
+    )

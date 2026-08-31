@@ -53,6 +53,9 @@ struct FAMetadataArgs {
     float softcapValue;
     int64_t windowSizeLeft;
     int64_t windowSizeRight;
+    // Append-KV tiling fields (0 = append disabled), mirrored by ComputeFAMetadata.
+    uint32_t kvNewSeqlen;
+    uint32_t kvCacheSeqlen;
 };
 
 #endif

@@ -14,7 +14,7 @@
 #include "catlass/matrix_coord.hpp"
 #include "fag_block.h"
 #include "kernel_operator.h"
-#include "kernel_common_fag.hpp"
+#include "fag_kernel_common.hpp"
 
 using AscendC::CopyRepeatParams;
 using AscendC::DataCopyExtParams;

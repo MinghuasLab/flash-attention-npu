@@ -772,7 +772,7 @@ public:
         }
     }
 
-    template <bool LSE_MODE_, class TensorDst>
+    template <bool LseMode, class TensorDst>
     __aicore__ inline
     void operator()(TensorDst &gOTensor,
                     AscendC::GlobalTensor<float> gLse,
@@ -854,7 +854,7 @@ public:
                 fullyMaskedRowsPerHead);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         }
-        if constexpr (LSE_MODE_) {
+        if constexpr (LseMode) {
             if constexpr (std::is_same_v<SMDtype, float>) {
                 if (rowNumCurSubCore > 0U && isLastKvSTile) {
                     WriteGroupedLse(gLse, qSBlockSize, qNBlockSize, lseHeadStride,

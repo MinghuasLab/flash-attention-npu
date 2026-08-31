@@ -1,5 +1,5 @@
-#ifndef KERNEL_COMMON_FAG_HPP
-#define KERNEL_COMMON_FAG_HPP
+#ifndef FAG_KERNEL_COMMON_HPP
+#define FAG_KERNEL_COMMON_HPP
 
 constexpr static uint32_t BSND = 0;
 constexpr static uint32_t TND = 1;

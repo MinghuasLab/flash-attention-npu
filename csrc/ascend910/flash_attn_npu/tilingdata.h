@@ -63,6 +63,8 @@ struct FAInferTilingData {
     uint32_t totalSplitNodeNum;
     uint32_t needCoreNum;
     uint32_t flashDecodeFlag;
+    uint32_t kvNewSeqlen;
+    uint32_t kvCacheSeqlen;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
     __gm__ uint8_t* pDevice = nullptr;
@@ -101,6 +103,8 @@ struct FAInferTilingData {
     __gm__ uint8_t* get_pDevice() const { return pDevice; }
     __gm__ uint8_t* get_dropMaskDevice() const { return dropMaskDevice; }
     uint32_t get_flashDecodeFlag() const { return flashDecodeFlag; }
+    uint32_t get_kvNewSeqlen() const { return kvNewSeqlen; }
+    uint32_t get_kvCacheSeqlen() const { return kvCacheSeqlen; }
 
     void set_numHeads(uint32_t value) { numHeads = value; }
     void set_embeddingSize(uint32_t value) { embeddingSize = value; }
@@ -135,6 +139,8 @@ struct FAInferTilingData {
     void set_pDevice(__gm__ uint8_t* value) { pDevice = value; }
     void set_dropMaskDevice(__gm__ uint8_t* value) { dropMaskDevice = value; }
     void set_flashDecodeFlag(uint32_t value) { flashDecodeFlag = value; }
+    void set_kvNewSeqlen(uint32_t value) { kvNewSeqlen = value; }
+    void set_kvCacheSeqlen(uint32_t value) { kvCacheSeqlen = value; }
 };
 
 #endif

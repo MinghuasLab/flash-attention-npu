@@ -20,6 +20,9 @@
 #   CI_NPU_WAIT_MAX_SEC      (默认 600)    所有卡忙时最长等待秒数
 #   CI_NPU_WAIT_INTERVAL_SEC (默认 30)     所有卡忙时重探间隔秒数
 #   ASCEND_RT_VISIBLE_DEVICES               手动指定宿主机物理卡时跳过自动选卡
+#   GOLDEN_CACHE_HOST_DIR (CI 固定为 /home/FA_NPU_CI_DATA)
+#   GOLDEN_CACHE_DIR      (默认 /var/cache/flash-attention-npu/golden_cache)
+#   GOLDEN_CACHE_MODE     (默认 cache) cache|off
 
 set -euo pipefail
 
@@ -33,9 +36,11 @@ CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
-# 宿主机日志目录: 挂载进容器, 容器内写的日志直接落到宿主机, 避免 --rm 删除容器后日志丢失。
-# 同时让 workflow 的 upload-artifact (path: /tmp/ci_test_logs) 能读到日志。
-CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs}"
+CI_LOG_SCOPE="${CI_CONTAINER_SCOPE//[^A-Za-z0-9_.-]/_}"
+CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs/$CI_LOG_SCOPE}"
+GOLDEN_CACHE_HOST_DIR="${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
+GOLDEN_CACHE_DIR="${GOLDEN_CACHE_DIR:-/var/cache/flash-attention-npu/golden_cache}"
+GOLDEN_CACHE_MODE="${GOLDEN_CACHE_MODE:-cache}"
 
 log() { printf '[CI] %s\n' "$*"; }
 die() { printf '[CI][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -124,6 +129,17 @@ run_docker_test() {
   # 创建宿主机日志目录并开放权限 (容器内 root 写, 宿主机 runner 用户读)
   mkdir -p "$CI_TEST_LOG_DIR_HOST"
   chmod 777 "$CI_TEST_LOG_DIR_HOST" 2>/dev/null || true
+  local golden_mount_args=()
+  if [ "$GOLDEN_CACHE_MODE" != "off" ] && [ "$GOLDEN_CACHE_MODE" != "0" ]; then
+    # The test container runs as root, so a pre-provisioned root-owned directory
+    # is valid even when the runner user itself cannot write to it.
+    if mkdir -p "$GOLDEN_CACHE_HOST_DIR" 2>/dev/null && [ -d "$GOLDEN_CACHE_HOST_DIR" ]; then
+      golden_mount_args=(-v "$GOLDEN_CACHE_HOST_DIR:$GOLDEN_CACHE_DIR:rw")
+    else
+      log "warning: golden cache directory is unavailable ($GOLDEN_CACHE_HOST_DIR); disabling cache"
+      GOLDEN_CACHE_MODE=off
+    fi
+  fi
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
@@ -131,6 +147,7 @@ run_docker_test() {
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
     -v "$CI_TEST_LOG_DIR_HOST:/tmp/ci_test_logs" \
+    "${golden_mount_args[@]}" \
     "${mount_args[@]}" \
     -e ASCEND_RT_VISIBLE_DEVICES="$device_id" \
     -e CI_MODE="$CI_MODE" \
@@ -142,6 +159,11 @@ run_docker_test() {
     -e CI_QUICK_SAMPLE="${CI_QUICK_SAMPLE:-30}" \
     -e CI_TEST_LOG_DIR="/tmp/ci_test_logs" \
     -e CI_CONTAINER_DEVICE="$CI_CONTAINER_DEVICE" \
+    -e GOLDEN_CACHE_MODE="$GOLDEN_CACHE_MODE" \
+    -e GOLDEN_CACHE_DIR="$GOLDEN_CACHE_DIR" \
+    -e GOLDEN_CACHE_REFRESH="${GOLDEN_CACHE_REFRESH:-0}" \
+    -e GOLDEN_CACHE_MAX_DIRS="${GOLDEN_CACHE_MAX_DIRS:-5}" \
+    -e GOLDEN_CACHE_MAX_TEST_DIRS="${GOLDEN_CACHE_MAX_TEST_DIRS:-5}" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \

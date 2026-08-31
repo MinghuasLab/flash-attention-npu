@@ -9,10 +9,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef FLASH_ATTENTION_REGULAR_H
-#define FLASH_ATTENTION_REGULAR_H
-
-#include <string>
+#ifndef TILINGDATA_H
+#define TILINGDATA_H
 
 struct coreNode {
     int startBIdx;
@@ -63,10 +61,11 @@ struct FAInferTilingData {
     uint32_t padding3;
     int64_t preToken = 0;
     int64_t nextToken = 0;
+    int64_t windowSizeLeft = 0;
+    int64_t windowSizeRight = 0;
     int32_t sparseMode = 0;
     uint32_t globalWindowSize = 4;
     uint32_t localWindowSize = 0;
-    std::string cacheLayout = "nd";
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
@@ -147,9 +146,12 @@ struct FAInferTilingData {
     void set_sparseMode(int32_t value) { sparseMode = value; }
     void set_globalWindowSize(uint32_t value) { globalWindowSize = value; }
     void set_localWindowSize(uint32_t value) { localWindowSize = value; }
-    void set_cacheLayout(std::string value) { cacheLayout = value; }
     void set_preToken(int64_t value) { preToken = value; }
     void set_nextToken(int64_t value) { nextToken = value; }
+    void set_windowSizeLeft(int64_t value) { windowSizeLeft = value; }
+    void set_windowSizeRight(int64_t value) { windowSizeRight = value; }
+    int64_t get_windowSizeLeft() const { return windowSizeLeft; }
+    int64_t get_windowSizeRight() const { return windowSizeRight; }
     void set_splitLseTotalSize(uint64_t value) { splitLseTotalSize = value; }
     void set_splitOTotalSize(uint64_t value) { splitOTotalSize = value; }
     void set_totalSplitNodeNum(uint32_t value) { totalSplitNodeNum = value; }

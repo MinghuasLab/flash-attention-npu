@@ -241,6 +241,10 @@ jobs:
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
       CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      CI_TEST_LOG_DIR_HOST: /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
+      GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
+      GOLDEN_CACHE_MODE: cache
     outputs:
       run_outcome: ${{ steps.run.outcome }}
     steps:
@@ -362,13 +366,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.arch_label }}
-          path: /tmp/ci_test_logs/
+          path: /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}/
           retention-days: 7
 
       - name: Clean up this job's CI containers
-        if: always()
+        if: always() && steps.arch.outputs.match == 'true'
         run: |
-          bash ci/cleanup_ci_containers.sh
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi
 
   finalize:
     name: 写最终状态

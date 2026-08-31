@@ -1,0 +1,173 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Modified by Minghua Shen, 2026.
+ */
+
+#include "aicpu_api.h"
+#include "fa_metadata_args.h"
+#include "tilingdata.h"
+#include <cstdint>
+
+namespace {
+constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t BASE_KV_SIZE = 128;
+
+inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (b == 0) ? 0 : (a + b - 1) / b;
+}
+
+inline uint32_t QSBlockTile(uint32_t embeddingSizeV)
+{
+    // Match fai_tiling.cpp GetQSBlockTile: head_dim > 128 uses a 64-wide Q tile.
+    return embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
+}
+
+inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
+                            bool restrictMergedRowsForLargeD)
+{
+    // Must match kernel GetQNBlockTile (S/N combined axis): several Q heads are
+    // merged into one task. Using a per-head task count here overcounts
+    // totalTaskNum for GQA/MQA and makes the kernel schedule phantom tasks past
+    // the last batch, causing out-of-bounds GM access (507015).
+    constexpr uint32_t Q_M_TILE_MAX = 128;
+    constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
+        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
+        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
+        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
+        maxTile = maxTile > 0U ? maxTile : 1U;
+        tile = tile < maxTile ? tile : maxTile;
+    }
+    tile = tile < groupSize ? tile : groupSize;
+    if (tile > Q_N_SPLIT_ALIGN) {
+        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    }
+    return tile < 1U ? 1U : tile;
+}
+}  // namespace
+
+__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+{
+    FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
+    const bool hasMask = metaArgs->maskType != 0;
+    FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
+        metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
+    const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
+    const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
+
+    tilingData->batch = metaArgs->batch;
+    tilingData->numHeads = metaArgs->numHeads;
+    tilingData->kvHeads = metaArgs->numHeadsK;
+    tilingData->embeddingSize = metaArgs->embeddingSize;
+    tilingData->embeddingSizeV = metaArgs->embeddingSizeV;
+    tilingData->numBlocks = metaArgs->numBlocks;
+    tilingData->blockSize = metaArgs->pagedKV != 0 ? metaArgs->blockSize : BASE_KV_SIZE;
+    tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
+    tilingData->maskType = metaArgs->maskType;
+    tilingData->scaleValue = metaArgs->softmaxScale;
+    tilingData->sparseMode = 0;
+    tilingData->preToken = 0;
+    tilingData->nextToken = 0;
+    tilingData->globalWindowSize = 4;
+    tilingData->localWindowSize = 0;
+    tilingData->windowSizeLeft = metaArgs->windowSizeLeft;
+    tilingData->windowSizeRight = metaArgs->windowSizeRight;
+
+    const uint32_t qBaseTile = QSBlockTile(metaArgs->embeddingSizeV);
+    const uint32_t embeddingSizeAligned16 =
+        (metaArgs->embeddingSize + 15U) / 16U * 16U;
+    const uint32_t embeddingSizeVAligned16 =
+        (metaArgs->embeddingSizeV + 15U) / 16U * 16U;
+
+    tilingData->innerPrec = 0;
+    tilingData->actSeqAval = 0;
+    tilingData->qBaseTile = qBaseTile;
+    tilingData->kvBaseTile = BASE_KV_SIZE;
+    tilingData->qkL1TileM = qBaseTile;
+    tilingData->qkL1TileN = 256;
+    tilingData->qkL1TileKLeft = embeddingSizeAligned16;
+    tilingData->qkL1TileKRight = 192;
+    tilingData->pvL1TileM = qBaseTile;
+    tilingData->pvL1TileN = embeddingSizeVAligned16;
+    tilingData->pvL1TileKLeft = BASE_KV_SIZE;
+    tilingData->pvL1TileKRight = BASE_KV_SIZE;
+    tilingData->qL1BufNum = 1;
+    tilingData->kL1BufNum = 2;
+    tilingData->vL1BufNum = 2;
+    tilingData->pL1BufNum = 3;
+    tilingData->qSeqlenAligned = 0;
+    tilingData->kvSeqlenAligned = 0;
+
+    uint32_t maxQSeqlen = 0;
+    uint32_t maxKvSeqlen = 0;
+    uint32_t totalTaskNum = 0;
+    uint32_t firstBatchTaskNum = 0;
+    const uint32_t groupSize = metaArgs->numHeads / metaArgs->numHeadsK;
+    int32_t *kvCum = reinterpret_cast<int32_t *>(
+        metaArgs->metaOutAddr + fa_metadata::KvSeqlenOffset(hasMask));
+    kvCum[0] = 0;
+    uint32_t kvCumSum = 0;
+    for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+        uint32_t qSeqlen = metaArgs->maxQSeqlen;
+        if (metaArgs->isVarlen != 0) {
+            qSeqlen = static_cast<uint32_t>(
+                cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+        }
+        uint32_t kvSeqlen = static_cast<uint32_t>(seqlensK[batchIdx]);
+        if (metaArgs->isVarlenKv != 0) {
+            kvSeqlen = static_cast<uint32_t>(
+                seqlensK[batchIdx + 1] - seqlensK[batchIdx]);
+        }
+        if (qSeqlen > maxQSeqlen) {
+            maxQSeqlen = qSeqlen;
+        }
+        if (kvSeqlen > maxKvSeqlen) {
+            maxKvSeqlen = kvSeqlen;
+        }
+        kvCumSum += kvSeqlen;
+        kvCum[batchIdx + 1] = static_cast<int32_t>(kvCumSum);
+        const uint32_t curQNBlockTile = QNBlockTile(
+            qSeqlen, groupSize, metaArgs->embeddingSizeV > 128U);
+        const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+        const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
+        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qBaseTile);
+        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        if (batchIdx == 0) {
+            firstBatchTaskNum = curTaskNum;
+        }
+        totalTaskNum += curTaskNum;
+    }
+    tilingData->maxQSeqlen = maxQSeqlen;
+    tilingData->maxKvSeqlen = maxKvSeqlen;
+    tilingData->firstBatchTaskNum = firstBatchTaskNum;
+    tilingData->totalTaskNum = totalTaskNum;
+
+    const uint64_t blockDim = static_cast<uint64_t>(metaArgs->blockDim);
+    tilingData->qkOutSize = fa_metadata::Mm1OutSize(blockDim);
+    tilingData->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);
+    tilingData->pvOutSize = fa_metadata::Mm2OutSize(blockDim);
+    tilingData->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
+    uint64_t workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+    if (workSpaceSize < fa_metadata::WS_FLOOR) {
+        workSpaceSize = fa_metadata::WS_FLOOR;
+    }
+    tilingData->workSpaceSize = workSpaceSize;
+
+    if (hasMask) {
+        // Same triu(1) mask the host path uploads for both causal and band/SWA;
+        // the band restriction is applied by the kernel from windowSizeLeft/Right.
+        int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
+        const uint32_t maskDim = fa_metadata::MASK_DIM;
+        for (uint32_t row = 0; row < maskDim; ++row) {
+            int8_t *maskRow = maskBase + static_cast<uint64_t>(row) * maskDim;
+            for (uint32_t col = 0; col < maskDim; ++col) {
+                maskRow[col] = (col > row) ? static_cast<int8_t>(1) : static_cast<int8_t>(0);
+            }
+        }
+    }
+
+    AscendC::DataStoreBarrier();
+    return 0;
+}

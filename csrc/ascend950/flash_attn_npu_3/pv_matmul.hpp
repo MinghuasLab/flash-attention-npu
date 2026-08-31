@@ -270,7 +270,7 @@ public:
     void operator()(TensorB &gBTensor, TensorC &ubCTensor,
                     AscendC::GlobalTensor<int32_t> gBlockTable,
                     GemmCoord actualOriShape, uint32_t blockSize,
-                    uint32_t kvSTileIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
+                    uint32_t kvSTileIdx, uint32_t kvSTileRelIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
                     uint32_t globalWindowSize, uint32_t localWindowSize,
                     Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag,
@@ -286,9 +286,9 @@ public:
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[2];
 
-        uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
+        uint32_t l1BBufId = kvSTileRelIdx % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 3;
-        uint32_t l1ABufId = kvSTileIdx % l1ABufNum;
+        uint32_t l1ABufId = kvSTileRelIdx % l1ABufNum;
 
         auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(curBaseTileSize, embedPhysical);
         auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
@@ -436,7 +436,7 @@ public:
             uint32_t l0TileNPhysical = RoundUp(l0TileNAct, C0_ELEMS);
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
-            uint32_t l0CLoopCounter = kvSTileIdx;
+            uint32_t l0CLoopCounter = kvSTileRelIdx;
             uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId + 2;
             auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNPhysical);

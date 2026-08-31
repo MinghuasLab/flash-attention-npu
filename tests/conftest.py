@@ -82,6 +82,10 @@ def _seed_per_case(request):
     seed = int(env_seed) if env_seed else zlib.crc32(
         request.node.nodeid.encode("utf-8"))
     torch.manual_seed(seed)
-    if hasattr(torch.npu, "manual_seed"):
+    if hasattr(torch, "npu") and hasattr(torch.npu, "manual_seed"):
         torch.npu.manual_seed(seed)
+    os.environ["GOLDEN_CACHE_NODEID"] = request.node.nodeid
+    os.environ["GOLDEN_CACHE_TEST_FILE"] = str(request.path)
     yield
+    os.environ.pop("GOLDEN_CACHE_NODEID", None)
+    os.environ.pop("GOLDEN_CACHE_TEST_FILE", None)

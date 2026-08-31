@@ -27,7 +27,7 @@ public:
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
     }
 
-    template <bool LSE_MODE_>
+    template <bool LseMode>
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementO> gOutput,
                     AscendC::GlobalTensor<float> gLse,
@@ -80,7 +80,7 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
 
-        if constexpr (LSE_MODE_) {
+        if constexpr (LseMode) {
             uint32_t lseElems = rowCount * LSE_ELEMS_PER_ROW;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
             AscendC::Duplicate(

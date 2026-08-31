@@ -380,4 +380,3 @@ private:
 } // namespace Catlass
 
 #endif // CATLASS_EPILOGUE_BLOCK_COMBINE_SCALE_HPP
-

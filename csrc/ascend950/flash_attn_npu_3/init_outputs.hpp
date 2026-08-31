@@ -1,3 +1,12 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Modified by Minghua Shen, 2026.
+ *
+ * InitOut for Ascend950 FA v3 empty spans (dense / causal / SWA):
+ * write O=0 and LSE=+inf for the current Q tile / head.
+ * SWA host already prefills LSE=+inf; rewriting +inf is harmless.
+ */
+
 #ifndef FAI950_INIT_OUTPUTS_HPP
 #define FAI950_INIT_OUTPUTS_HPP
 
@@ -27,7 +36,7 @@ public:
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
     }
 
-    template <bool LSE_MODE_>
+    template <bool LseMode>
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementO> gOutput,
                     AscendC::GlobalTensor<float> gLse,
@@ -80,7 +89,7 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
 
-        if constexpr (LSE_MODE_) {
+        if constexpr (LseMode) {
             uint32_t lseElems = rowCount * LSE_ELEMS_PER_ROW;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
             AscendC::Duplicate(
@@ -110,6 +119,6 @@ private:
     AscendC::LocalTensor<float> lseUbTensor;
 };
 
-}
+}  // namespace Catlass::Epilogue::Block
 
-#endif
+#endif  // FAI950_INIT_OUTPUTS_HPP

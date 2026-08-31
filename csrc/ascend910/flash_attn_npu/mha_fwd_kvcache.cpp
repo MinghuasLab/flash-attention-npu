@@ -16,7 +16,7 @@
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "pv_matmul.hpp"
 #include "qk_matmul.hpp"
-#include "CombineScale.hpp"
+#include "combine_scale.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "fa_block.h"
 #include "catlass/gemm/gemm_type.hpp"
@@ -95,6 +95,8 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
             AscendC::GlobalTensor<ElementP>& gPret;
             AscendC::GlobalTensor<ElementMask>& gDrop;
+            AscendC::GlobalTensor<ElementK>& gKNew;
+            AscendC::GlobalTensor<ElementK>& gVNew;
         };
 
         __aicore__ inline
@@ -126,6 +128,8 @@ namespace SplitFuse {
             maxQSeqlen = fATilingData->maxQSeqlen;
             maxKvSeqlen = fATilingData->maxKvSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
+            kvNewSeqlen = fATilingData->kvNewSeqlen;
+            kvCacheSeqlen = fATilingData->kvCacheSeqlen;
 
             // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
             uint64_t Lsesize = 0;
@@ -177,11 +181,19 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementMask> gDrop;
             gDrop.SetGlobalBuffer((__gm__ ElementMask *)(fATilingData->dropMaskDevice));
 
+            // Append-KV newkv tensors (nullptr when kvNewSeqlen == 0).
+            AscendC::GlobalTensor<ElementK> gKNew;
+            gKNew.SetGlobalBuffer((__gm__ ElementK *)params.kNew);
+            AscendC::GlobalTensor<ElementK> gVNew;
+            gVNew.SetGlobalBuffer((__gm__ ElementK *)params.vNew);
+            // Append-KV per-batch cache-batch indices / left padding (GM params).
+
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gMask, gBlockTable,
                 gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate, gPret, gDrop
+                gS, gP, gOTmp, gOUpdate, gPret, 
+                gDrop, gKNew, gVNew
             };
 
             strideQ = static_cast<uint64_t>(qHeads * embed);
@@ -224,8 +236,14 @@ namespace SplitFuse {
             nDynNum = L1_MAX_N_NUM % nDynNum != 0 ? RoundDown((nDynNum - 1), NUM_32) : nDynNum;
 
             uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * kDynNum * sizeof(ElementQ);
-            blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN);
             uint32_t kPVDynNum = nDynNum * kDynNum / BlockMmadPV::L1TileShape::M;
+            // Append-KV QK writeback staging (ND copy of the new-K sub-tile), placed after
+            // the QK/PV shared K/P region and the PV V region (the K and P tiles share one
+            // L1 region across the QK/PV phases, so it must not be counted twice).
+            uint32_t ndCopyL1Offset = L1_QK_SIZE +
+                nDynNum * kDynNum * sizeof(ElementK) * DOUBLE_BUFFER +
+                embedV * MAX_KV_STACK_LEN * sizeof(ElementV);
+            blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN, 0, ndCopyL1Offset);
             blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE);
 #endif
 #ifdef __DAV_C220_VEC__
@@ -280,7 +298,7 @@ namespace SplitFuse {
 
                 for (uint32_t BIdx = startBIdx; BIdx <= endBIdx; BIdx++) {
                     uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
-                    uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                    uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx)) + kvNewSeqlen;
                     if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
                         uint32_t prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
                         qSeqlenCur = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1)) - prevQSeqlenSum;
@@ -296,6 +314,11 @@ namespace SplitFuse {
                     uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
                     uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
                     uint32_t curKSBlockNumTmp = CeilDiv(kvSeqlenCur, MAX_KV_STACK_LEN);
+                    if (kvNewSeqlen != 0U) {
+                        curKSBlockNumTmp = CeilDiv(
+                            static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx)), MAX_KV_STACK_LEN) +
+                            CeilDiv(kvNewSeqlen, MAX_KV_STACK_LEN);
+                    }
 
                     int32_t stN1IdxNow = (BIdx == startBIdx) ? (int32_t)startN1Idx : 0;
                     int32_t enN1IdxNow = (BIdx == endBIdx) ? (int32_t)endN1Idx : (int32_t)curQNBlockNumTmp - 1;
@@ -483,9 +506,15 @@ namespace SplitFuse {
             auto& gOUpdate = globalTensors.gOUpdate;
             auto& gPret = globalTensors.gPret;
             auto& gDrop = globalTensors.gDrop;
+            auto& gKNew = globalTensors.gKNew;
+            auto& gVNew = globalTensors.gVNew;
 
+
+            const bool appendKVFlag = (kvNewSeqlen != 0U);
             uint32_t qSeqlen = maxQSeqlen;
-            uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+            // total S = old + new
+            uint32_t kvSeqlenOld = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+            uint32_t kvSeqlen = kvSeqlenOld + (appendKVFlag ? kvNewSeqlen : 0U);
             uint32_t prevQSeqlenSum = 0;
             uint32_t prevKvSeqlenSum = 0;
 
@@ -493,19 +522,34 @@ namespace SplitFuse {
                 prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
                 qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1)) - prevQSeqlenSum;
                 if constexpr (!PAGED_CACHE_FLAG) {
-                    prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
-                    kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) - prevKvSeqlenSum;
+                    // gActualKvseqlen holds prefix sums; append uses the capacity-aligned
+                    // per-batch cache layout, so the offset is kvCacheSeqlen-stepped.
+                    kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) -
+                        static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                    kvSeqlenOld = kvSeqlen;
+                    prevKvSeqlenSum = appendKVFlag ?
+                        BIdx * kvCacheSeqlen : static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
                 }
             } else {
                 // BSND: Q/O/LSE per-batch storage step is maxQSeqlen.
                 prevQSeqlenSum = BIdx * maxQSeqlen;
                 if constexpr (!PAGED_CACHE_FLAG) {
-                    // Mirror mha_fwd_kvcache_2.cpp semantics: per-batch K/V step
-                    // uses each batch's actual kvSeqlen (prefix sum across batches).
-                    for (uint32_t b = 0; b < BIdx; b++) {
-                        prevKvSeqlenSum += static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
+                    if (appendKVFlag) {
+                        // Capacity-aligned cache: cache batch occupies [BIdx * kvCacheSeqlen, ...).
+                        prevKvSeqlenSum = BIdx * kvCacheSeqlen;
+                    } else {
+                        // Mirror mha_fwd_kvcache_2.cpp semantics: per-batch K/V step
+                        // uses each batch's actual kvSeqlen (prefix sum across batches).
+                        for (uint32_t b = 0; b < BIdx; b++) {
+                            prevKvSeqlenSum += static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
+                        }
                     }
                 }
+            }
+
+            // TND non-paged read the per-batch old length from prefix sums; re-add new.
+            if (appendKVFlag) {
+                kvSeqlen = kvSeqlenOld + kvNewSeqlen;
             }
 
             uint64_t qBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideQ;
@@ -538,6 +582,10 @@ namespace SplitFuse {
             uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
             uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
             uint32_t curKSBlockNum = CeilDiv(kvSeqlen, MAX_KV_STACK_LEN);
+            if (appendKVFlag) {
+                curKSBlockNum = CeilDiv(kvSeqlenOld, MAX_KV_STACK_LEN) +
+                    CeilDiv(kvNewSeqlen, MAX_KV_STACK_LEN);
+            }
 
             uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;
             uint32_t kvNIdx = qNBlockIdx / qNBlockNumPerGroup;
@@ -549,6 +597,11 @@ namespace SplitFuse {
                 static_cast<uint64_t>(qNStartIdx * embed);
             uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx * embed);
             uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx * embedV);
+            // newkv are (b, s_new, h_k, d); batch b starts at b * kvNewSeqlen tokens.
+            uint64_t gmOffsetKNew = appendKVFlag ?
+                static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideK + static_cast<uint64_t>(kvNIdx * embed) : 0;
+            uint64_t gmOffsetVNew = appendKVFlag ?
+                static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideV + static_cast<uint64_t>(kvNIdx * embedV) : 0;
             uint64_t gmOffsetO = oBOffset +
                 static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideO +
                 static_cast<uint64_t>(qNStartIdx * embedV);
@@ -632,6 +685,29 @@ namespace SplitFuse {
             uint32_t winKvStart = kvStart;
             uint32_t winKvEnd = kvSLoopNumTotal;
             uint32_t kvEnd = winKvEnd;
+
+            // Append-KV phase split: [0, kvStartOld) reads the cache,
+            // [kvStartOld, kvEnd) reads newkv and writes it back to the cache
+            // (writeback must run even for fully-masked tiles).
+            uint32_t kvStartOld = 0;
+            uint32_t kvLoopNumTotalNew = 0;
+            uint32_t kvSLoopNumTotalOld = kvSLoopNumTotal;
+            if (appendKVFlag) {
+                kvStartOld = CeilDiv(kvSeqlenOld, MAX_KV_STACK_LEN);
+                kvSLoopNumTotalOld = CeilDiv(
+                    AscendC::Std::max((int64_t)0,
+                        AscendC::Std::min(noSkipKvS, (int64_t)kvSeqlenOld)),
+                    (int64_t)MAX_KV_STACK_LEN);
+                kvLoopNumTotalNew = CeilDiv(kvNewSeqlen, MAX_KV_STACK_LEN);
+                kvSLoopNumTotal = kvSLoopNumTotalOld + kvLoopNumTotalNew;
+                kvEnd = kvSLoopNumTotal;
+                // winKvEnd must be the per-phase total (v3 captures it after
+                // the append update) so the FD fdEnd fallback covers old+new.
+                winKvEnd = kvSLoopNumTotal;
+            }
+
+            // FD cap runs AFTER the append update (v3 order): the coreInfo S2
+            // slice is final and must not be overridden by append's kvEnd.
             if (flashDecodeFlag != 0U) {
                 uint32_t fdStart = static_cast<uint32_t>(stS2IdxNow);
                 uint32_t fdEnd = (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) ?
@@ -668,11 +744,19 @@ namespace SplitFuse {
 #endif
             for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + preKVNum; kvSIdx++) {
                 if (kvSIdx < kvEnd) {
-                    if (kvSIdx + 1 > kvSLoopNumTotal - 1U) {
-                        stackSeqTile = noSkipKvS - kvSIdx * MAX_KV_STACK_LEN;
-                    } else {
-                        stackSeqTile = MAX_KV_STACK_LEN;
-                    }
+                    // New phase: read newkv; one task per batch (qS == BIdx % curQSBlockNum)
+                    // additionally writes it back into the cache.
+                    const bool isAppendBlock = appendKVFlag && (kvSIdx >= kvStartOld);
+                    const bool doCopyback = isAppendBlock && (qSBlockIdx == (BIdx % curQSBlockNum));
+                    const uint32_t kvSIdxLocal = isAppendBlock ? (kvSIdx - kvStartOld) : kvSIdx;
+                    AscendC::GlobalTensor<ElementK> gQKSrc = isAppendBlock ? gKNew : gK;
+                    uint64_t qkSrcOffset = isAppendBlock ? gmOffsetKNew : gmOffsetK;
+                    // Row offset within the cache row.
+                    uint64_t qkCacheOffset = doCopyback ?
+                        (uint64_t)(kvSeqlenOld + kvSIdxLocal * MAX_KV_STACK_LEN) : 0;
+                    stackSeqTile = GetStackSeqTile(isAppendBlock, kvSIdx, kvSIdxLocal,
+                                                   kvLoopNumTotalNew, kvSLoopNumTotalOld,
+                                                   noSkipKvS, kvSeqlenOld, kvNewSeqlen);
                     uint32_t curStackTileMod = stackSeqCount % (PRE_LAUNCH + 1U);
                     uint64_t gmOffsetS =
                         static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * (PRE_LAUNCH + 1U) +
@@ -680,34 +764,46 @@ namespace SplitFuse {
                     GemmCoord actualBlockShapeQK{rowNum, stackSeqTile, embed};
                     LayoutS layOutS(rowNum, stackSeqTile, stackSeqTilePad);
 #ifdef __DAV_C220_CUBE__
+                    // Newkv blocks read the contiguous k_new tensor and write back
+                    // into the cache (page-addressed when paged); old blocks read
+                    // the cache via the page table.
                     if constexpr (PAGED_CACHE_FLAG) {
                         blockMmadQK(
                             gQ[gmOffsetQ],
-                            gK[gmOffsetK],
+                            gQKSrc[qkSrcOffset],
                             gS[gmOffsetS],
-                            gBlockTable[blockBOffset],
+                            isAppendBlock ? gBlockTable : gBlockTable[blockBOffset],
                             layoutQTemp,
                             layoutKTemp,
                             layOutS,
                             actualBlockShapeQK,
-                            kvSIdx,
+                            kvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
-                            strideK);
+                            strideK,
+                            doCopyback,
+                            gK[gmOffsetK],
+                            qkCacheOffset,
+                            gBlockTable,
+                            isAppendBlock ? pagedBlockSize : 0U,
+                            static_cast<uint32_t>(blockBOffset));
                     } else {
                         blockMmadQK(
                             gQ[gmOffsetQ],
-                            gK[gmOffsetK],
+                            gQKSrc[qkSrcOffset],
                             gS[gmOffsetS],
                             gBlockTable,
                             layoutQTemp,
                             layoutKTemp,
                             layOutS,
                             actualBlockShapeQK,
-                            kvSIdx,
+                            kvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
-                            strideK);
+                            strideK,
+                            doCopyback,
+                            gK[gmOffsetK],
+                            qkCacheOffset);
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);
 #endif
@@ -715,7 +811,8 @@ namespace SplitFuse {
                     LayoutP layOutP(rowNum, stackSeqTile, stackSeqTilePad);
                     LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
                     uint64_t gmOffsetP = gmOffsetS;
-                    uint32_t kvSStartIdx = kvSIdx * MAX_KV_STACK_LEN;
+                    uint32_t kvSStartIdx = isAppendBlock ?
+                        (kvSeqlenOld + kvSIdxLocal * MAX_KV_STACK_LEN) : kvSIdx * MAX_KV_STACK_LEN;
                     uint32_t kvSEndIdx = kvSStartIdx + stackSeqTile;
                     epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
                     epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
@@ -765,11 +862,23 @@ namespace SplitFuse {
                                     false);
                             }
                         } else {
-                            uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
+                            // Last nomask tile before the diagonal tile, append phase
+                            // split aware (a tile ending exactly at triUp+1 is nomask).
+                            uint32_t lastNoMaskTile;
+                            if (triUp + 1U == kvSeqlen) {
+                                lastNoMaskTile = kvSLoopNumTotal - 1U;
+                            } else if (triUp + 1U == kvSeqlenOld) {
+                                lastNoMaskTile = kvStartOld - 1U;
+                            } else if (triUp + 1U < kvSeqlenOld) {
+                                lastNoMaskTile = (triUp + 1U) / MAX_KV_STACK_LEN - 1U;
+                            } else {
+                                lastNoMaskTile = kvStartOld +
+                                    (triUp + 1U - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
+                            }
                             Arch::CrossCoreWaitFlag(qkReady);
                             int32_t lastNoMaskStackId;
                             if (flashDecodeFlag != 0U) {
-                                lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
+                                lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -790,7 +899,7 @@ namespace SplitFuse {
                                     layOutS,
                                     actualBlockShapeQK,
                                     (stackSeqCount == 0),
-                                    (stackSeqCount == noMaskStackSeqNum - 1),
+                                    (stackSeqCount == lastNoMaskTile),
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
@@ -892,11 +1001,18 @@ namespace SplitFuse {
                 }
                 if (kvSIdx >= kvStart + preKVNum) {
                     uint32_t nowkvSIdx = kvSIdx - preKVNum;
-                    if (nowkvSIdx + 1 > kvSLoopNumTotal - 1U) {
-                        stackSeqTile = noSkipKvS - nowkvSIdx * MAX_KV_STACK_LEN;
-                    } else {
-                        stackSeqTile = MAX_KV_STACK_LEN;
-                    }
+                    // PV-side phase split (nowkvSIdx is preKVNum behind kvSIdx); dedup like QK.
+                    const bool isAppendBlockPV = appendKVFlag && (nowkvSIdx >= kvStartOld);
+                    const bool doCopybackPV = isAppendBlockPV && (qSBlockIdx == (BIdx % curQSBlockNum));
+                    uint32_t nowKvSIdxLocal =
+                        isAppendBlockPV ? (nowkvSIdx - kvStartOld) : nowkvSIdx;
+                    AscendC::GlobalTensor<ElementK> gPVSrc = isAppendBlockPV ? gVNew : gV;
+                    uint64_t pvSrcOffset = isAppendBlockPV ? gmOffsetVNew : gmOffsetV;
+                    uint64_t pvCacheOffset = doCopybackPV ?
+                        (uint64_t)(kvSeqlenOld + nowKvSIdxLocal * MAX_KV_STACK_LEN) : 0;
+                    stackSeqTile = GetStackSeqTile(isAppendBlockPV, nowkvSIdx, nowKvSIdxLocal,
+                                                   kvLoopNumTotalNew, kvSLoopNumTotalOld,
+                                                   noSkipKvS, kvSeqlenOld, kvNewSeqlen);
                     uint32_t curStackTileMod = (stackSeqCount - PRE_LAUNCH) % (PRE_LAUNCH + 1U);
                     uint64_t gmOffsetOTmp =
                         static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * (PRE_LAUNCH + 1U) +
@@ -910,37 +1026,46 @@ namespace SplitFuse {
                     if constexpr (PAGED_CACHE_FLAG) {
                         blockMmadPV(
                             gP[gmOffsetP],
-                            gV[gmOffsetV],
+                            gPVSrc[pvSrcOffset],
                             gOTmp[gmOffsetOTmp],
-                            gBlockTable[blockBOffset],
+                            isAppendBlockPV ? gBlockTable : gBlockTable[blockBOffset],
                             layoutPTemp,
                             layoutVTemp,
                             layoutOTmp,
                             actualBlockShapePV,
-                            nowkvSIdx,
+                            nowKvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
                             noSkipKvS,
                             strideV,
                             blockStackNum,
-                            softmaxReady);
+                            softmaxReady,
+                            doCopybackPV,
+                            gV[gmOffsetV],
+                            pvCacheOffset,
+                            gBlockTable,
+                            isAppendBlockPV ? pagedBlockSize : 0U,
+                            static_cast<uint32_t>(blockBOffset));
                     } else {
                         blockMmadPV(
                             gP[gmOffsetP],
-                            gV[gmOffsetV],
+                            gPVSrc[pvSrcOffset],
                             gOTmp[gmOffsetOTmp],
                             gBlockTable,
                             layoutPTemp,
                             layoutVTemp,
                             layoutOTmp,
                             actualBlockShapePV,
-                            nowkvSIdx,
+                            nowKvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
                             noSkipKvS,
                             strideV,
                             blockStackNum,
-                            softmaxReady);
+                            softmaxReady,
+                            doCopybackPV,
+                            gV[gmOffsetV],
+                            pvCacheOffset);
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
@@ -1034,6 +1159,9 @@ namespace SplitFuse {
         uint32_t maxQSeqlen;
         uint32_t maxKvSeqlen;
         uint32_t flashDecodeFlag;
+        // Append-KV: per-batch new length (0 = disabled) and cache capacity.
+        uint32_t kvNewSeqlen;
+        uint32_t kvCacheSeqlen;
 
         uint64_t strideQ;
         uint64_t strideO;
@@ -1081,7 +1209,9 @@ namespace SplitFuse {
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
         GM_ADDR workspace,
-        GM_ADDR tiling)
+        GM_ADDR tiling,
+        GM_ADDR kNew,
+        GM_ADDR vNew)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1145,7 +1275,8 @@ namespace SplitFuse {
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+                               kNew, vNew};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

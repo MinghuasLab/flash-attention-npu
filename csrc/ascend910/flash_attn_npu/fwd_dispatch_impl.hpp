@@ -3,42 +3,60 @@
  * Modified by Minghua Shen, 2026.
  */
 
-//
-// Shared implementation of the v2 forward FAInfer dispatch. Included by the
-// generated autogen/fwd_dispatch_<dtype>_<layout>.cpp stubs, each of which
-// explicitly instantiates one launch_fwd_impl<DType, IS_TND>, so the FAInfer
-// template instantiations land in separate (parallel-compiled) object files.
-//
-// The launch tree below reproduces the exact dtype x paged x mask x layout
-// combinations of the three original host functions (mha_fwd_kvcache: BSND
-// with FD; mha_fwd: BSND non-paged; mha_varlen_fwd: TND). Flash-decode is NOT
-// a template axis: it is a runtime tiling flag (FAInferTilingData
-// .flashDecodeFlag) so the AICPU scheduler-metadata path can decide it on
-// device; idle cores past needCoreNum are skipped inside the kernel.
-
 #pragma once
 
 #include "fwd_dispatch.hpp"
 
-// Standard headers that the CATLASS/FAG headers (reached via mha_fwd_kvcache.cpp)
-// assume to be already visible.
 #include <algorithm>
 #include <cstring>
 #include <limits>
 
-// mha_fwd_kvcache.cpp provides the SplitFuse::FAInfer kernel template, the
-// FAInferKernel class, FAIKernelParams, and the FaiKenel enum namespace.
 #include "mha_fwd_kvcache.cpp"
 
-// 8-param FAInfer (no IS_FD template arg — flash-decode moved to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT_ENUM, SOFTCAP, RETURN_SOFTMAX, DROPOUT)                       \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED,                                 \
-                       FaiKenel::MaskType::MASK, LAYOUT_ENUM,                      \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT>             \
-        <<<blockDim, nullptr, aclStream>>>(                                        \
-            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
-            oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
-            workspaceDevice, tilingDevice)
+// FAInfer (no IS_FD template arg — flash-decode moved to tiling). MASK_TYPE and
+// LAYOUT are named enum values fixed by the switch macros below. RETURN_SOFTMAX
+// and DROPOUT are the forward's optional epilogue / dropout template axes.
+#define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT) \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT,                        \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT> \
+        <<<blockDim, nullptr, aclStream>>>(                                                  \
+            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,               \
+            oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                              \
+            workspaceDevice, tilingDevice, kNewDevice, vNewDevice);
+
+// BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
+// branch fixes the runtime bool as a named constexpr flag, so the dispatch
+// below reads named flags instead of bare true/false literals. Statement-form
+// (no lambda/return) to match the statement-style macros already used here;
+// both branches are compiled, so the set of FAInfer instantiations is
+// unchanged.
+#define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
+    do {                                                   \
+        if (COND) {                                        \
+            constexpr bool CONST_NAME = true;              \
+            __VA_ARGS__                                    \
+        } else {                                           \
+            constexpr bool CONST_NAME = false;             \
+            __VA_ARGS__                                    \
+        }                                                  \
+    } while (0)
+
+// Three-way mask selection with the original precedence: local (MASK_SWA) >
+// causal (MASK_CAUSAL) > NO_MASK. Fixes the chosen enum as a named constexpr
+// so the launch reads MaskType instead of a bare enumerator token.
+#define FWD_MASK_SWITCH(IS_LOCAL, IS_CAUSAL, CONST_NAME, ...)             \
+    do {                                                                  \
+        if (IS_LOCAL) {                                                   \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_SWA;     \
+            __VA_ARGS__                                                   \
+        } else if (IS_CAUSAL) {                                           \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_CAUSAL;  \
+            __VA_ARGS__                                                   \
+        } else {                                                          \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::NO_MASK;      \
+            __VA_ARGS__                                                   \
+        }                                                                 \
+    } while (0)
 
 template <typename DType, bool IS_TND>
 void launch_fwd_impl(const FwdLaunchArgs &a) {
@@ -57,6 +75,8 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
     uint8_t *vDevice = a.vDevice;
+    uint8_t *kNewDevice = a.kNewDevice;
+    uint8_t *vNewDevice = a.vNewDevice;
     uint8_t *maskDevice = a.maskDevice;
     uint8_t *blockTableDevice = a.blockTableDevice;
     uint8_t *oDevice = a.oDevice;
@@ -67,192 +87,19 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     uint8_t *tilingDevice = a.tilingDevice;
     (void)flashDecodeFlag;
 
-    if (paged_KV) {
-        if (is_local) {
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        } else if (is_causal) {
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        } else {
-            // NO_MASK
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        }
-    } else {
-        if (is_local) {
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        } else if (is_causal) {
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        } else {
-            if (has_softcap) {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, false, false);
-                    }
-                }
-            } else {
-                if (return_softmax) {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, true, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, true, false);
-                    }
-                } else {
-                    if (has_dropout) {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, false, true);
-                    } else {
-                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, false, false);
-                    }
-                }
-            }
-        }
-    }
+    FWD_BOOL_SWITCH(paged_KV, IsPaged, {
+        FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
+            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
+                FWD_BOOL_SWITCH(return_softmax, ReturnSoftmax, {
+                    FWD_BOOL_SWITCH(has_dropout, HasDropout, {
+                        FWD_KERNEL_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap, ReturnSoftmax, HasDropout);
+                    });
+                });
+            });
+        });
+    });
 }
 
-#undef FWD_LAUNCH
+#undef FWD_MASK_SWITCH
+#undef FWD_BOOL_SWITCH
+#undef FWD_KERNEL_LAUNCH

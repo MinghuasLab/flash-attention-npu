@@ -128,4 +128,8 @@ jobs:
       - name: Clean up this job's CI containers
         if: always()
         run: |
-          bash ci/cleanup_ci_containers.sh
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi

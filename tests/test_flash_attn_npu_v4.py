@@ -1,9 +1,10 @@
 # Copyright (c) 2026, Minghua Shen.
 
+import os
 import torch
 import torch_npu
 import pytest
-from tests.common.attention_ref import ref_flash_attention, ref_flash_attention_pair
+from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention, ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
@@ -516,16 +517,12 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     if bwd_supported:
         dout = make_random_tensor(out_out.shape, out_out.dtype, low=-0.5, high=0.5, device="npu")
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-            golden_out_gpu_ref,
+        dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+            os.environ.get("GOLDEN_CACHE_NODEID", "v4"),
+            (golden_out_gpu_ref, golden_out_gpu_pt),
             (query_ref, key_ref, value_ref),
-            dout.detach().cpu(),
-            retain_graph=True,
-        )
-        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-            golden_out_gpu_pt,
-            (query_ref, key_ref, value_ref),
-            dout.detach().cpu(),
+            dout,
+            metadata={"version": 4},
         )
         assert_fa_close(dq_ag, dq_ref, dq_pt, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")

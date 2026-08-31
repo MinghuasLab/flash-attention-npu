@@ -1,5 +1,9 @@
 # Copyright (c) 2026, Minghua Shen.
+import os
+
 import torch
+
+from tests.common.golden_cache import get_or_compute_golden
 """
   Shared FlashAttention NPU reference / golden implementation.
 
@@ -183,7 +187,8 @@ def ref_flash_attention(
         out = pv_out(prob, value).permute(0, 2, 1, 3)
     return out.to(dtype_og), lse
 
-def ref_flash_attention_pair(
+
+def _ref_flash_attention_pair(
     query,
     key,
     value,
@@ -209,3 +214,170 @@ def ref_flash_attention_pair(
         drop_mask=drop_mask, dropout_p=dropout_p, **kwargs,
     )
     return out_ref, lse_ref, out_pt, lse_pt
+
+
+def _golden_metadata(query, key, value, scale, mask, data_type, softcap, extra=None):
+    metadata = {
+        "query_shape": list(query.shape),
+        "key_shape": list(key.shape),
+        "value_shape": list(value.shape),
+        "query_dtype": str(query.dtype),
+        "key_dtype": str(key.dtype),
+        "value_dtype": str(value.dtype),
+        "data_type": str(data_type),
+        "scale": scale,
+        "softcap": softcap,
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def cached_ref_flash_attention_pair(
+    query,
+    key,
+    value,
+    scale,
+    mask,
+    data_type,
+    softcap=0.0,
+    *,
+    nodeid=None,
+    rescale_threshold=None,
+    sink_matrix=None,
+    drop_mask=None,
+    dropout_p=0.0,
+    metadata=None,
+):
+    """Cached wrapper for the two forward reference implementations."""
+    case_metadata = _golden_metadata(
+        query, key, value, scale, mask, data_type, softcap, metadata
+    )
+    case_metadata["rescale_threshold"] = rescale_threshold
+    case_metadata["dropout_p"] = dropout_p
+    inputs = {
+        "query": query,
+        "key": key,
+        "value": value,
+        "mask": mask,
+        "sink": sink_matrix,
+        "drop_mask": drop_mask,
+    }
+
+    def compute():
+        values = _ref_flash_attention_pair(
+            query, key, value, scale, mask, data_type, softcap,
+            rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
+            drop_mask=drop_mask, dropout_p=dropout_p,
+        )
+        return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
+
+    values = get_or_compute_golden(
+        nodeid=nodeid or _current_nodeid(),
+        metadata=case_metadata,
+        inputs=inputs,
+        compute_fn=compute,
+        expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
+        source_files=[__file__],
+        test_source_files=_golden_test_source_files(),
+    )
+    return tuple(values[name] for name in ("out_ref", "lse_ref", "out_pt", "lse_pt"))
+
+
+def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=None):
+    """Cache an existing pair of reference autograd results.
+
+    ``outputs`` and ``refs`` are the exact tensors already built by the test,
+    so this helper also works for packed/varlen views whose gradient shape is
+    different from the padded reference input.
+    """
+    query, key, value = refs
+    case_metadata = {
+        "gradient": True,
+        "metadata": _json_metadata(metadata),
+        "output_shapes": [list(outputs[0].shape), list(outputs[1].shape)],
+    }
+    caller_inputs = inputs if inputs is not None else {
+        "query": query,
+        "key": key,
+        "value": value,
+        "dout": dout,
+    }
+    cache_inputs = {
+        "caller_inputs": caller_inputs,
+        "out_ref": outputs[0],
+        "out_pt": outputs[1],
+    }
+
+    def compute():
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+            outputs[0], refs, dout.detach().cpu(), retain_graph=True
+        )
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
+            outputs[1], refs, dout.detach().cpu()
+        )
+        return {
+            "dq_ref": dq_ref, "dk_ref": dk_ref, "dv_ref": dv_ref,
+            "dq_pt": dq_pt, "dk_pt": dk_pt, "dv_pt": dv_pt,
+        }
+
+    values = get_or_compute_golden(
+        nodeid=nodeid,
+        metadata=case_metadata,
+        inputs=cache_inputs,
+        compute_fn=compute,
+        expected_keys=("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"),
+        source_files=[__file__],
+        test_source_files=_golden_test_source_files(),
+    )
+    return tuple(values[name] for name in ("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"))
+
+
+def _json_metadata(value):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return {"value": value}
+
+
+def _golden_test_source_files():
+    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE")
+    return [test_file] if test_file else []
+
+
+def _current_nodeid():
+    return os.environ.get("GOLDEN_CACHE_NODEID", "standalone")
+
+
+def ref_flash_attention_pair(
+    query,
+    key,
+    value,
+    scale,
+    mask,
+    data_type,
+    softcap=0.0,
+    rescale_threshold=None,
+    sink_matrix=None,
+    drop_mask=None,
+    dropout_p=0.0,
+):
+    # Backward tests need the live CPU graph to remain available when their
+    # separate gradient artifact is missing or being refreshed.  Forward-only
+    # cases use the persistent cache below.
+    if any(
+        isinstance(tensor, torch.Tensor) and tensor.requires_grad
+        for tensor in (query, key, value)
+    ):
+        return _ref_flash_attention_pair(
+            query, key, value, scale, mask, data_type, softcap,
+            rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
+            drop_mask=drop_mask, dropout_p=dropout_p,
+        )
+    return cached_ref_flash_attention_pair(
+        query, key, value, scale, mask, data_type, softcap,
+        nodeid=_current_nodeid(),
+        rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
+        drop_mask=drop_mask, dropout_p=dropout_p,
+    )

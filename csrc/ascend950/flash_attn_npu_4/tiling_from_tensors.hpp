@@ -109,10 +109,8 @@ inline void fill_inference_context(
     int  head_size_v,
     float softmax_scale,
     bool lse_flag,
-    const std::string& layout_str)              // "TND" | "BSND"
+    bool is_tnd)                                // true: TND (varlen), false: BSND
 {
-    const bool is_tnd = (layout_str == "TND");
-
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr,
                     "fill_inference_context: varlen Q requires cu_seqlens_q");
@@ -191,8 +189,7 @@ inline void fill_inference_context(
                                   : optiling::DataType::FP16;
     ctx.pagedCacheFlag = paged_KV;
     ctx.lseFlag = lse_flag;
-    ctx.cacheLayout = "nd"; // ND only; 
-    ctx.layout = layout_str;    // "TND" | "BSND"
+    ctx.isTnd = is_tnd;         // TND (varlen) or BSND layout
 
     ctx.innerPrecise = 0;   // fixed FP32 accumulation
     ctx.isTilingSink = false;

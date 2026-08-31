@@ -2,23 +2,11 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * Modified by Minghua Shen, 2026.
  */
-//
-// RE-DERIVED for main (not ported from opt_compiler): main's v4-910 forward
-// unifies TND+BSND FAInfer behind a single host function and selects layout at
-// runtime via is_varlen_q (varlen => TND, else BSND). main also dropped the
-// FAInfer flash-decode template parameter — FD is now a tiling-axis handled by
-// fa_split (flashDecodeFlag only adjusts launchBlockDim / tiling, never a
-// template arg). So FAInfer here takes 7 template params
-// <DType, DType, float, PAGED, MASK, LAYOUT, OUT_ONLY>, and the per-(dtype,
-// layout) TU instantiates 6 variants (paged x {SWA, causal, no-mask}).
 
 #pragma once
 
 #include "fwd_dispatch.hpp"
 
-// Standard headers that the CATLASS/FAG headers (reached via mha_fwd_kvcache.cpp)
-// assume to be already visible. In the original single-TU layout these were
-// supplied transitively; supply them explicitly here.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -33,22 +21,43 @@
 #include "mha_fwd_kvcache.cpp"
 
 // 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT, SOFTCAP)                            \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED,                                 \
-                       FaiKenel::MaskType::MASK, FaiKenel::inputLayout::LAYOUT,    \
+#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                  \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE,         \
                        Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>             \
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
-            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
             workspaceDevice, tilingDevice)
 
-// IS_TND selects layout at compile time (false => BSND, true => TND); each
-// (dtype, IS_TND) pair is explicitly instantiated in its own autogen TU, so
-// only the matching if constexpr branch is kept. flashDecodeFlag is extracted
-// for symmetry with FwdLaunchArgs but is NOT a template axis here (FD is
-// resolved in tiling by fa_split before this launch).
+#define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
+    do {                                                   \
+        if (COND) {                                        \
+            constexpr bool CONST_NAME = true;              \
+            __VA_ARGS__                                    \
+        } else {                                           \
+            constexpr bool CONST_NAME = false;             \
+            __VA_ARGS__                                    \
+        }                                                  \
+    } while (0)
+
+#define FWD_MASK_SWITCH(IS_LOCAL, IS_CAUSAL, CONST_NAME, ...)             \
+    do {                                                                  \
+        if (IS_LOCAL) {                                                   \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_SWA;     \
+            __VA_ARGS__                                                   \
+        } else if (IS_CAUSAL) {                                           \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_CAUSAL;  \
+            __VA_ARGS__                                                   \
+        } else {                                                          \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::NO_MASK;      \
+            __VA_ARGS__                                                   \
+        }                                                                 \
+    } while (0)
+
 template <typename DType, bool IS_TND>
 void launch_fwd_dtype(const FwdLaunchArgs &a) {
+    constexpr auto LAYOUT = IS_TND ? FaiKenel::inputLayout::TND : FaiKenel::inputLayout::BSND;
+
     const uint32_t launchBlockDim = a.launchBlockDim;
     const aclrtStream aclStream = a.aclStream;
     const uint64_t fftsAddr = a.fftsAddr;
@@ -70,95 +79,15 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     uint8_t *tilingDevice = a.tilingDevice;
     (void)flashDecodeFlag;
 
-    if (paged_KV) {
-        if (is_local) {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, MASK_SWA, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, MASK_SWA, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, MASK_SWA, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, MASK_SWA, BSND, false);
-                }
-            }
-        } else if (is_causal) {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, MASK_CAUSAL, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, MASK_CAUSAL, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, MASK_CAUSAL, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, MASK_CAUSAL, BSND, false);
-                }
-            }
-        } else {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, NO_MASK, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, NO_MASK, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, true, NO_MASK, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, true, NO_MASK, BSND, false);
-                }
-            }
-        }
-    } else {
-        if (is_local) {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, MASK_SWA, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, MASK_SWA, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, MASK_SWA, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, MASK_SWA, BSND, false);
-                }
-            }
-        } else if (is_causal) {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, MASK_CAUSAL, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, MASK_CAUSAL, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, MASK_CAUSAL, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, MASK_CAUSAL, BSND, false);
-                }
-            }
-        } else {
-            if constexpr (IS_TND) {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, NO_MASK, TND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, NO_MASK, TND, false);
-                }
-            } else {
-                if (has_softcap) {
-                    FWD_LAUNCH(DType, false, NO_MASK, BSND, true);
-                } else {
-                    FWD_LAUNCH(DType, false, NO_MASK, BSND, false);
-                }
-            }
-        }
-    }
+    FWD_BOOL_SWITCH(paged_KV, IsPaged, {
+        FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
+            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
+                FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap);
+            });
+        });
+    });
 }
 
+#undef FWD_MASK_SWITCH
+#undef FWD_BOOL_SWITCH
 #undef FWD_LAUNCH

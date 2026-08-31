@@ -8,7 +8,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "kernel_operator.h"
-#include "../../flash_attn_npu/kernel_common_fag.hpp"
+#include "../../flash_attn_npu/fag_kernel_common.hpp"
 
 using AscendC::CopyRepeatParams;
 using AscendC::DataCopyExtParams;

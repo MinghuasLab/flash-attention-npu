@@ -13,7 +13,7 @@
 #include "catlass/matrix_coord.hpp"
 
 #include "../flash_attn_npu/fag_block.h"
-#include "../flash_attn_npu/kernel_common_fag.hpp"
+#include "../flash_attn_npu/fag_kernel_common.hpp"
 #include "fag_common/epilogue_fag_deterministic_add.hpp"
 #include "../flash_attn_npu/fag_epilogue_sfmg.hpp"
 #include "../flash_attn_npu/fag_epilogue_op.hpp"
