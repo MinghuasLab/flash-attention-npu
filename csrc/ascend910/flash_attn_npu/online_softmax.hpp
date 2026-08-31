@@ -458,8 +458,6 @@ public:
             AscendC::DataCopyParams(
                 rowNumCurLoop, columnNumRound / FLOAT_BLOCK_SIZE,
                 (columnNumPad - columnNumRound) / FLOAT_BLOCK_SIZE, 0));
-        // AscendC::printf("CopySGmToUb: sUbOffset%u\n", sUbOffset);
-        // AscendC::DumpTensor(lsUbTensor[sUbOffset], 1, 128);
     }
 
     __aicore__ inline
@@ -657,6 +655,7 @@ public:
                 lmUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::PipeBarrier<PIPE_V>();
+            return;
         } else {
             SetVecMask(rowNumCurLoop);
             // *** hm = vmax(lm, gm)
@@ -1023,14 +1022,6 @@ public:
         UpdateGlobalRowSum(
             sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, stateRowOffset, 
             rowOffset, isFirstStackTile);
-        // if (AscendC::GetSubBlockIdx() == 0) {
-        //     AscendC::printf("taskStateSlot=%u\n", taskStateSlot);
-        //     AscendC::printf("SM st=%u first=%u row=%u gm0=%f gl0=%f dm0=%f\n",
-        //         taskStateSlot, isFirstStackTile, rowOffset,
-        //         (float)gmUbTensor.GetValue(stateRowOffset),
-        //         (float)glUbTensor.GetValue(stateRowOffset),
-        //         (float)dmUbTensor.GetValue(dmUbOffsetCurCycle));
-        // }
     }
 
     __aicore__ inline
@@ -1040,7 +1031,6 @@ public:
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
     {   
-        // AscendC::printf("softmax 1\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE);
@@ -1124,7 +1114,6 @@ public:
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, int64_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
     {
-        // AscendC::printf("softmax 2\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE_IN_BYTE);
@@ -1289,7 +1278,6 @@ public:
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
         int32_t nextTokenEndLen, bool isSplitKV = false)
     {
-        // AscendC::printf("softmax 3\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE_IN_BYTE);
@@ -1476,7 +1464,7 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
-                    0,
+                    taskStateSlot,
                     rowOffsetIoGm,
                     qSBlockSize,
                     isSplitKV,

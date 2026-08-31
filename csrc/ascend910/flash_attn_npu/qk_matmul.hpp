@@ -124,7 +124,6 @@ public:
         uint32_t tokenNumPerGroup = rowNum / singleGroupHeads;
         auto layoutSingleANd = layoutA.GetTileLayout(MakeCoord(singleGroupHeads, embed));
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
-        // AscendC::printf("WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3)");
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
         if (singleGroupHeads == 1U) {
             LayoutA denseSrc(rowNum, embed, qHeads * embed);

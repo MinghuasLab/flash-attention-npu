@@ -6,8 +6,9 @@
 
 Two entry points can be benchmarked on identical inputs:
 
-* raw  -- torch_npu.npu_fusion_attention(_v2) with input_layout="TND" and
-  actual_seq_qlen/actual_seq_kvlen (aclnnFlashAttentionVarLenScore).
+* raw  -- torch_npu.npu_fusion_attention(_v2), input_layout="TND" (varlen, with
+  actual_seq_qlen/actual_seq_kvlen -> aclnnFlashAttentionVarLenScore) or
+  "BSND" (fixed-length batched -> aclnnFlashAttentionScore).
 * func -- flash_attn_varlen_func from flash_attn_npu/__init__.py, which wraps
   the same kernel behind the packaged flash-attn interface (incl. AICPU
   scheduler metadata generation, contiguous/padding handling and the
@@ -32,11 +33,11 @@ import torch
 import torch_npu
 
 CASES = [
-    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 128, "heads_q": 1,
-     "total_kv": 1024, "heads_kv": 1, "head_dim": 128, "scale": 1.0,
-     "causal": False, "batch": 4, "max_q": 32, "max_kv": 256, "dropout": 0.0},
-    {"name": "tnd_T1536_H16_causal_dropout0.1", "total_q": 1536, "heads_q": 16,
-     "total_kv": 1536, "heads_kv": 16, "head_dim": 128, "scale": 1.0,
+    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 131475, "heads_q": 8,
+     "total_kv": 131475, "heads_kv": 8, "head_dim": 128, "scale": 1.0,
+     "causal": False, "batch": 512, "max_q": 279, "max_kv": 279, "dropout": 0.0},
+    {"name": "tnd_T1536_H16_causal_dropout0.1", "total_q": 131475, "heads_q": 16,
+     "total_kv": 131475, "heads_kv": 16, "head_dim": 128, "scale": 1.0,
      "causal": True, "batch": 512, "max_q": 279, "max_kv": 279, "dropout": 0.0},
     {"name": "tnd_Q1536_KV131475_H16_causal_dropout0.1", "total_q": 1536, "heads_q": 16,
      "total_kv": 131475, "heads_kv": 16, "head_dim": 128, "scale": 1.0,
@@ -53,6 +54,21 @@ CASES = [
     {"name": "ZJ_causal", "total_q": 10240, "heads_q": 24,
      "total_kv": 10240, "heads_kv": 4, "head_dim": 128, "scale": None,
      "causal": True, "batch": 320, "max_q": 32, "max_kv": 32, "dropout": 0.0},
+    {"name": "bsnd_B8_S4096_H16_causal", "layout": "BSND", "batch": 8,
+     "max_q": 279, "max_kv": 279, "heads_q": 8, "heads_kv": 8,
+     "head_dim": 128, "scale": 1.0, "causal": False, "dropout": 0.0},
+    {"name": "bsnd_B16_S2048_H32_causal", "layout": "BSND", "batch": 512,
+     "max_q": 279, "max_kv": 279, "heads_q": 16, "heads_kv": 16,
+     "head_dim": 128, "scale": 1.0, "causal": True, "dropout": 0.0},
+    {"name": "bsnd_B64_S512_H16_causal", "layout": "BSND", "batch": 512,
+     "max_q": 3, "max_kv": 512, "heads_q": 16, "heads_kv": 16,
+     "head_dim": 128, "scale": None, "causal": True, "dropout": 0.0},
+    {"name": "bsnd_B32_S1024_H16_nocausal", "layout": "BSND", "batch": 32,
+     "max_q": 279, "max_kv": 279, "heads_q": 8, "heads_kv": 8,
+     "head_dim": 128, "scale": None, "causal": True, "dropout": 0.0},
+    {"name": "bsnd_B16_S2048_H8GQA_kv4_causal", "layout": "BSND", "batch": 16,
+     "max_q": 279, "max_kv": 279, "heads_q": 32, "heads_kv": 8,
+     "head_dim": 128, "scale": 1.0, "causal": True, "dropout": 0.0},
 ]
 
 COMPARE_TOL = 1e-2  # per-batch allclose tolerance used in precision checks
@@ -82,6 +98,23 @@ def gen_seq_lens(total, batch, max_len, seed, lower=None):
 
 
 def make_inputs(case, dtype, device, seed):
+    layout = case.get("layout", "TND")
+    if layout == "BSND":
+        batch, sq, skv = case["batch"], case["max_q"], case["max_kv"]
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        q = torch.randn(batch, sq, case["heads_q"], case["head_dim"], generator=g)
+        k = torch.randn(batch, skv, case["heads_kv"], case["head_dim"], generator=g)
+        v = torch.randn(batch, skv, case["heads_kv"], case["head_dim"], generator=g)
+        q = q.to(dtype).to(device).contiguous()
+        k = k.to(dtype).to(device).contiguous()
+        v = v.to(dtype).to(device).contiguous()
+        return {
+            "q": q, "k": k, "v": v,
+            "lens_q": [sq] * batch, "lens_kv": [skv] * batch,
+            "cu_q": None, "cu_kv": None,
+            "actual_q": None, "actual_kv": None,
+            "max_q": sq, "max_kv": skv, "layout": layout,
+        }
     lens_q = gen_seq_lens(case["total_q"], case["batch"], case["max_q"], seed)
     if case["causal"] and case["total_kv"] == case["total_q"]:
         lens_kv = list(lens_q)
@@ -110,12 +143,19 @@ def make_inputs(case, dtype, device, seed):
         "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=device),
         "cu_kv": torch.tensor(cu_kv, dtype=torch.int32, device=device),
         "actual_q": tuple(cu_q[1:]), "actual_kv": tuple(cu_kv[1:]),
-        "max_q": max(lens_q), "max_kv": max(lens_kv),
+        "max_q": max(lens_q), "max_kv": max(lens_kv), "layout": layout,
     }
 
 
 def make_atten_mask(size, device):
     return torch.triu(torch.ones(size, size, dtype=torch.bool), diagonal=1).to(device)
+
+
+def make_causal_mask(sq, skv, device):
+    """Causal mask (True = masked) with flash-attention bottom-right alignment:
+    query row i may attend to key j <= i + (skv - sq)."""
+    return torch.triu(torch.ones(sq, skv, dtype=torch.bool),
+                      diagonal=skv - sq + 1).to(device)
 
 
 def call_fa_raw(q, k, v, case, actual_q, actual_kv, atten_mask, scale_value):
@@ -124,12 +164,18 @@ def call_fa_raw(q, k, v, case, actual_q, actual_kv, atten_mask, scale_value):
         "atten_mask": atten_mask if case["causal"] else None,
         "keep_prob": 1.0 - case["dropout"],
         "inner_precise": 0,
-        "actual_seq_qlen": actual_q,
-        "actual_seq_kvlen": actual_kv,
-        "sparse_mode": 3 if case["causal"] else 0,
     }
     if scale_value is not None:
         common["scale"] = scale_value
+    if case.get("layout", "TND") == "BSND":
+        common["sparse_mode"] = 0
+        res = torch_npu.npu_fusion_attention(
+            q, k, v, case["heads_q"], "BSND",
+            pre_tockens=2147483647, next_tockens=2147483647, **common)
+        return res
+    common["actual_seq_qlen"] = actual_q
+    common["actual_seq_kvlen"] = actual_kv
+    common["sparse_mode"] = 3 if case["causal"] else 0
     # if hasattr(torch_npu, "npu_fusion_attention_v2"):
     #     try:
     #         res = torch_npu.npu_fusion_attention_v2(
@@ -145,8 +191,20 @@ def call_fa_raw(q, k, v, case, actual_q, actual_kv, atten_mask, scale_value):
 
 
 def call_fa_func(q, k, v, case, cu_q, cu_kv, max_q, max_kv, scale_value):
+    if case.get("layout", "TND") == "BSND":
+        from flash_attn_npu import flash_attn_func
+        return flash_attn_func(
+            q, k, v,
+            dropout_p=case["dropout"],
+            softmax_scale=scale_value,
+            causal=case["causal"],
+            window_size=(-1, -1),
+            softcap=0.0,
+            alibi_slopes=None,
+            deterministic=False,
+            return_attn_probs=False,
+        )
     from flash_attn_npu import flash_attn_varlen_func
-    print("lch func !!!!!!!!!!")
     return flash_attn_varlen_func(
         q, k, v,
         cu_q, cu_kv,
@@ -261,6 +319,7 @@ def run_fwd_bwd_auto(fwd, q, k, v, dy):
 
 def call_fa_grad(q, k, v, dy, fwd, case, lens_q, lens_kv, actual_q, actual_kv,
                  atten_mask, scale_value):
+    layout = case.get("layout", "TND")
     common = {
         "pse": None,
         "padding_mask": None,
@@ -270,15 +329,18 @@ def call_fa_grad(q, k, v, dy, fwd, case, lens_q, lens_kv, actual_q, actual_kv,
         "softmax_in": None,
         "attention_in": fwd[0],
         "keep_prob": 1.0 - case["dropout"],
-        "input_layout": "TND",
-        "actual_seq_qlen": actual_q,
-        "actual_seq_kvlen": actual_kv,
+        "input_layout": layout,
         "seed": fwd[4],
         "offset": fwd[5],
-        "numels": sum(a * b for a, b in zip(lens_q, lens_kv)) * case["heads_q"],
         "inner_precise": 0,
-        "sparse_mode": 3 if case["causal"] else 0,
+        "sparse_mode": 0 if layout == "BSND" else (3 if case["causal"] else 0),
     }
+    if layout == "TND":
+        common["actual_seq_qlen"] = actual_q
+        common["actual_seq_kvlen"] = actual_kv
+        common["numels"] = sum(a * b for a, b in zip(lens_q, lens_kv)) * case["heads_q"]
+    else:
+        common["numels"] = case["batch"] * case["max_q"] * case["max_kv"] * case["heads_q"]
     if scale_value is not None:
         common["scale_value"] = scale_value
     if hasattr(torch_npu, "npu_fusion_attention_grad_v2"):
@@ -332,11 +394,19 @@ def naive_reference_backward(q, k, v, dy, lens_q, lens_kv, scale, causal):
     return dq, dk, dv
 
 
-def split_by_batch(tensor, lens):
-    """Split a packed [total, ...] tensor into per-batch tensors along dim 0.
+def split_by_batch(tensor, lens, batched=False):
+    """Split a tensor into per-batch chunks.
 
-    lens gives the sequence length of each batch in packed (TND) order.
+    TND (packed) tensors have shape [total, ...] and are split by cumulative
+    offsets of lens. BSND tensors already have batch on dim 0 and are split
+    into equal chunks (lens only contributes its length).
     """
+    if batched:
+        n = len(lens)
+        assert tensor.shape[0] % n == 0, \
+            f"batched split: dim0={tensor.shape[0]} not divisible by {n}"
+        size = tensor.shape[0] // n
+        return [tensor[i * size:(i + 1) * size] for i in range(n)]
     batches, start = [], 0
     for ln in lens:
         batches.append(tensor[start:start + ln])
@@ -346,7 +416,7 @@ def split_by_batch(tensor, lens):
     return batches
 
 
-def compare_per_batch(got, ref, lens, tol, label):
+def compare_per_batch(got, ref, lens, tol, label, batched=False):
     """Compare got vs ref batch-by-batch (packed dim-0 split by lens).
 
     Prints per-batch error stats and PASS/FAIL, then a summary line.
@@ -355,7 +425,8 @@ def compare_per_batch(got, ref, lens, tol, label):
     max_abs = max_rel = 0.0
     n_fail = 0
     for i, (g, r) in enumerate(
-            zip(split_by_batch(got, lens), split_by_batch(ref, lens))):
+            zip(split_by_batch(got, lens, batched),
+                split_by_batch(ref, lens, batched))):
         print(f"batch out g: {g}")
         print(f"batch out r: {r}")
         diff = (g - r).abs()
@@ -401,17 +472,39 @@ def main():
     summary = []
 
     for idx, case in enumerate(selected):
+        layout = case.get("layout", "TND")
         inp = make_inputs(case, dtype, device, args.seed + idx)
         scale_value = case["scale"]
         effective_scale = scale_value if scale_value is not None else 1.0
-        atten_mask = make_atten_mask(2048, device)
+        if layout == "BSND":
+            atten_mask = (make_causal_mask(inp["max_q"], inp["max_kv"], device)
+                          if case["causal"] else None)
+        else:
+            atten_mask = make_atten_mask(2048, device)
+
+        def ref_tensors(qt, kt, vt, dyt=None):
+            """Flatten BSND inputs to packed TND form for reference impls."""
+            if layout == "BSND":
+                flat = lambda t: t.reshape(-1, t.shape[2], t.shape[3]) if t.ndim == 4 else t
+                if dyt is None:
+                    return flat(qt), flat(kt), flat(vt)
+                return flat(qt), flat(kt), flat(vt), flat(dyt)
+            if dyt is None:
+                return qt, kt, vt
+            return qt, kt, vt, dyt
 
         print(f"\n=== [{idx}] {case['name']} ===")
-        print(f"  layout=TND, q: {tuple(inp['q'].shape)} {inp['q'].dtype}, "
-              f"kv: {tuple(inp['k'].shape)}, B={case['batch']}, causal={case['causal']}, "
-              f"dropout={case['dropout']}, scale={effective_scale}")
-        print(f"  cu_seqlens_q: len={len(inp['cu_q'])}, max_q={inp['max_q']}, "
-              f"cu_seqlens_k: len={len(inp['cu_kv'])}, max_kv={inp['max_kv']}")
+        if layout == "BSND":
+            print(f"  layout=BSND, q: {tuple(inp['q'].shape)} {inp['q'].dtype}, "
+                  f"kv: {tuple(inp['k'].shape)}, B={case['batch']}, S_q={inp['max_q']}, "
+                  f"S_kv={inp['max_kv']}, causal={case['causal']}, "
+                  f"dropout={case['dropout']}, scale={effective_scale}")
+        else:
+            print(f"  layout=TND, q: {tuple(inp['q'].shape)} {inp['q'].dtype}, "
+                  f"kv: {tuple(inp['k'].shape)}, B={case['batch']}, causal={case['causal']}, "
+                  f"dropout={case['dropout']}, scale={effective_scale}")
+            print(f"  cu_seqlens_q: len={len(inp['cu_q'])}, max_q={inp['max_q']}, "
+                  f"cu_seqlens_k: len={len(inp['cu_kv'])}, max_kv={inp['max_kv']}")
 
         results = {}
         fwds = {}
@@ -455,21 +548,28 @@ def main():
                 if case["dropout"] > 0:
                     print("  check: skipped (dropout > 0)")
                 else:
-                    ref = naive_reference(inp["q"], inp["k"], inp["v"], inp["lens_q"], inp["lens_kv"],
+                    qr, kr, vr = ref_tensors(inp["q"], inp["k"], inp["v"])
+                    ref = naive_reference(qr, kr, vr, inp["lens_q"], inp["lens_kv"],
                                           effective_scale, case["causal"])
+                    if layout == "BSND":
+                        ref = ref.reshape(inp["q"].shape)
                     got = out.float().cpu()
                     print("  check: per-batch comparison vs naive reference "
                           "(split by lens_q):")
                     compare_per_batch(got, ref, inp["lens_q"], COMPARE_TOL,
-                                      "check vs naive reference")
+                                      "check vs naive reference",
+                                      batched=(layout == "BSND"))
+                    qr, kr, vr = ref_tensors(inp["q"], inp["k"], inp["v"])
                     fa_ref = flash_attention_reference(
-                        inp["q"], inp["k"], inp["v"], inp["lens_q"],
-                        inp["lens_kv"], effective_scale, case["causal"],
-                        block_size=512)
+                        qr, kr, vr, inp["lens_q"], inp["lens_kv"],
+                        effective_scale, case["causal"], block_size=512)
+                    if layout == "BSND":
+                        fa_ref = fa_ref.reshape(inp["q"].shape)
                     print("  check: per-batch comparison vs flash-attention CPU "
                           "golden (kv chunk=512, split by lens_q):")
                     compare_per_batch(got, fa_ref, inp["lens_q"], COMPARE_TOL,
-                                      "check vs flash-attn golden")
+                                      "check vs flash-attn golden",
+                                      batched=(layout == "BSND"))
 
         if len(outs) == 2:
             print("\n  --- raw vs func: precision comparison of outputs ---")
@@ -477,7 +577,7 @@ def main():
             f_out = outs["func"].float().cpu()
             print("  per-batch comparison (split by lens_q):")
             compare_per_batch(r_out, f_out, inp["lens_q"], COMPARE_TOL,
-                              "raw vs func")
+                              "raw vs func", batched=(layout == "BSND"))
             diff = (r_out - f_out).abs()
             max_abs = diff.max().item()
             mean_abs = diff.mean().item()
@@ -499,15 +599,21 @@ def main():
             if case["dropout"] > 0:
                 print(f"  [{tag}] check: skipped (dropout > 0)")
                 return
-            refs = naive_reference_backward(inp["q"], inp["k"], inp["v"], dy,
+            qr, kr, vr, dr = ref_tensors(inp["q"], inp["k"], inp["v"], dy)
+            refs = naive_reference_backward(qr, kr, vr, dr,
                                             inp["lens_q"], inp["lens_kv"],
                                             effective_scale, case["causal"])
+            if layout == "BSND":
+                refs = [refs[0].reshape(inp["q"].shape),
+                        refs[1].reshape(inp["k"].shape),
+                        refs[2].reshape(inp["v"].shape)]
             for nm, got_t, ref_t in zip(("dq", "dk", "dv"), grads, refs):
                 g = got_t.float().cpu()
                 lens = inp["lens_q"] if nm == "dq" else inp["lens_kv"]
                 print(f"  [{tag}] check {nm}: per-batch comparison "
                       f"(split by {'lens_q' if nm == 'dq' else 'lens_kv'}):")
-                compare_per_batch(g, ref_t, lens, COMPARE_TOL, f"{tag} {nm}")
+                compare_per_batch(g, ref_t, lens, COMPARE_TOL, f"{tag} {nm}",
+                                  batched=(layout == "BSND"))
 
         def print_grad_stats(tag, grads):
             print(f"  [{tag}] |dq|max={grads[0].abs().max().item():.6f}, "

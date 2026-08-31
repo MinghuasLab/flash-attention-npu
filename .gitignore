@@ -47,3 +47,10 @@ compare_bsnd_attn_step3_results_old.csv
 compare_tnd_attn_step3_results_20260830.csv
 profile_am_bsnd_50/
 tests/fa_varlen_call_me.py
+compare_am_attn_step3.py
+compare_bsnd_attn_step3.py
+kernel_detail.csv
+kernel_summary.csv
+perf/
+tests/compare_am_attn_step3.py
+tests/compare_bsnd_attn_step3.py

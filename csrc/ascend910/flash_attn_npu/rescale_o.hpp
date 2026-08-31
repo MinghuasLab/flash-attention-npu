@@ -291,9 +291,6 @@ public:
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
 
-        // AscendC::printf("rescaleO 1\n");
-        // AscendC::printf("isFirstStackTile %u  isLastStackTile %u\n", isFirstStackTile, isLastStackTile);
-
         // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
         uint32_t oHiddenSize_gmlo = 0;
         uint32_t qHeads_gmlse = 0;
@@ -366,15 +363,6 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
-
-        // if (AscendC::GetSubBlockIdx() == 0) {
-        //     // AscendC::printf("RS st=%u first=%u last=%u row=%u go0=%f gl0=%f gm0=%f dm0=%f\n",
-        //         taskStateSlot, isFirstStackTile, isLastStackTile, rowOffsetLoop,
-        //         (float)goUbTensor32.GetValue(0),
-        //         (float)glUbTensor.GetValue(stateRowOffset),
-        //         (float)gmUbTensor.GetValue(stateRowOffset),
-        //         (float)dmUbTensor.GetValue(dmUbOffsetCurStackTile));
-        // }
 
         if (isLastStackTile) {
             // *** gl_block = expand_to_block(gl)
