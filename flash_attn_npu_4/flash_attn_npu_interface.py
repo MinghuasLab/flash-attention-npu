@@ -780,6 +780,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.aux_tensors = aux_tensors
         ctx.aux_scalars = aux_scalars
         ctx.head_size_og = q.size(-1)
+
+        # Do not materialize unused output gradients as zero tensors.
+        # V4 backward does not support dlse; unused LSE gradients
+        # should therefore arrive in backward as None.
+        ctx.set_materialize_grads(False)
+
+        # softmax_lse is an auxiliary output; V4 backward does not
+        # support gradients with respect to LSE.
+        if return_lse:
+            ctx.mark_non_differentiable(softmax_lse)
         return (out, softmax_lse) if return_lse else out
 
     @staticmethod
@@ -787,10 +797,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = (
             ctx.saved_tensors
         )
-        # torch_npu may pass a zero tensor (not None) for unused LSE grads.
-        dlse = args[0] if ctx.return_lse and len(args) > 0 else None
-        if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
-            dlse = None
+        # softmax_lse is non-differentiable in V4.
+        # The underlying backward operator does not support dlse.
+        dlse = None
         win_l, win_r = ctx.window_size
         if win_l is not None and win_l < 0:
             win_l = None
