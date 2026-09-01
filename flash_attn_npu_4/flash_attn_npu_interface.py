@@ -13,6 +13,7 @@ from . import flash_attn_npu_4  # Registers operators with PyTorch
 
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
 else:
     def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
         def wrap(func):
@@ -20,7 +21,14 @@ else:
         if fn is None:
             return wrap
         return fn
+    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        def wrap(func):
+            return func
+        if fn is None:
+            return wrap
+        return fn
     _torch_custom_op_wrapper = noop_custom_op_wrapper
+    _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
 def maybe_contiguous(x):
@@ -190,6 +198,58 @@ def get_scheduler_metadata(
         softmax_scale,
     )
     return scheduler_metadata
+@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_forward")
+def _flash_attn_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Metadata-only fake for V4 A2 forward. Returns (out, lse)."""
+    if out_ is not None:
+        raise TypeError(
+            "Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported."
+        )
+
+    is_varlen_q = cu_seqlens_q is not None
+    # Real mha_fwd uses empty_like(q) when out_ is absent.
+    out = torch.empty_like(q)
+
+    if is_varlen_q:
+        # (num_heads, total_q)
+        num_heads = q.shape[1]
+        total_q = q.shape[0]
+        softmax_lse = torch.empty(
+            (num_heads, total_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        # (batch_size, num_heads, seqlen_q)
+        batch_size = q.shape[0]
+        seqlen_q = q.shape[1]
+        num_heads = q.shape[2]
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
+
+    return out, softmax_lse
 
 
 @_torch_custom_op_wrapper(
@@ -242,6 +302,46 @@ def _flash_attn_backward_op(
         softcap,
         deterministic,
         0,  # sm_margin
+    )
+    return softmax_d
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_backward_op")
+def _flash_attn_backward_op_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    deterministic: bool,
+) -> torch.Tensor:
+    """Metadata-only fake for V4 A2 backward_op. Returns softmax_d; mutates dq/dk/dv."""
+    is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        nheads = q.shape[1]
+        # Real mha_bwd always allocates (batch, nheads, max_seqlen_q).
+        seqlen_q = max_seqlen_q
+    else:
+        batch_size = q.shape[0]
+        nheads = q.shape[2]
+        seqlen_q = q.shape[1]
+
+    softmax_d = torch.empty(
+        (batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device
     )
     return softmax_d
 
