@@ -214,7 +214,6 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-        Arch::CrossCoreWaitFlag(softmaxFlag);
 
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);
         uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);
@@ -237,6 +236,11 @@ public:
                     auto gmTileA = gA[layoutA.GetOffset(gmATileCoord)];
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
+                    // wait for the softmax P right before the first A(P) GM->L1
+                    // load, so the mmad loop setup can overlap with softmax
+                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                        Arch::CrossCoreWaitFlag(softmaxFlag);
+                    }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1PPingPongFlag);
 

@@ -1028,7 +1028,8 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, bool isSplitKV = false,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
+        Arch::CrossCoreFlag qkReady, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
     {   
         uint32_t rowNum = actualBlockShape.m();
@@ -1066,6 +1067,11 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
                 if (startsWithMaskTile && rowLoopIdx == 0) {
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                }
+                // wait QK right before moveS so the setup above can overlap
+                // with the still-running QK matmul (matches the mask branches)
+                if (rowLoopIdx == 0) {
+                    Arch::CrossCoreWaitFlag(qkReady);
                 }
                 CopySGmToUb(
                     gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);

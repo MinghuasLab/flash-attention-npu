@@ -675,6 +675,7 @@ public:
         const LayoutUpdate &layoutUpdate,
         const LayoutLse &layoutLse,
         GemmCoord actualBlockShape,
+        Arch::CrossCoreFlag pvReady,
         uint32_t qSBlockSize, uint32_t qNBlockSize,
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
         uint32_t taskStateSlot,
@@ -780,7 +781,10 @@ public:
                 proTokenNum = AscendC::Std::min(rowActualCurLoop, (qSThisSubBlock - proTokenIdx)) % qSThisSubBlock;
                 integralHeadNum = (rowActualCurLoop - proTokenNum) / qSThisSubBlock;
                 epiTokenNum = rowActualCurLoop - proTokenNum - integralHeadNum * qSThisSubBlock;
-
+                
+                if (rowLoopIdx == 0) {
+                    Arch::CrossCoreWaitFlag(pvReady);
+                }
                 SubCoreCompute(
                     gOutputCurLoop,
                     gInputCurLoop,

@@ -873,7 +873,6 @@ namespace SplitFuse {
                             }
                         } else {
                             uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
-                            Arch::CrossCoreWaitFlag(qkReady);
                             int32_t lastNoMaskStackId;
                             if (flashDecodeFlag != 0U) {
                                 lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
@@ -889,6 +888,7 @@ namespace SplitFuse {
                                     qNBlockSize,
                                     curStackTileMod,
                                     desc.taskStateSlot,
+                                    qkReady,
                                     isSplitKV);
                             } else {
                                 epilogueOnlineSoftmax(
@@ -903,6 +903,7 @@ namespace SplitFuse {
                                     qNBlockSize,
                                     curStackTileMod,
                                     desc.taskStateSlot,
+                                    qkReady,
                                     false);
                             }
                         }
@@ -950,7 +951,6 @@ namespace SplitFuse {
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
                             uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN) : RoundDown(kvSeqlenLimit, MAX_KV_STACK_LEN);
                             uint32_t noMaskStackSeqNum = (alignedKvSeqlenLimit - kvStart * MAX_KV_STACK_LEN) / MAX_KV_STACK_LEN;
-                            Arch::CrossCoreWaitFlag(qkReady);
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
@@ -963,13 +963,13 @@ namespace SplitFuse {
                                 qNBlockSize,
                                 curStackTileMod,
                                 desc.taskStateSlot,
+                                qkReady,
                                 (flashDecodeFlag != 0U) ? isSplitKV : false,
                                 startsWithMaskTile,
                                 startsWithMaskThenNomaskFlag);
                             startsWithMaskTile = false;
                         }
                     } else {
-                        Arch::CrossCoreWaitFlag(qkReady);
                         if (flashDecodeFlag != 0U) {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
@@ -983,6 +983,7 @@ namespace SplitFuse {
                                 qNBlockSize,
                                 curStackTileMod,
                                 desc.taskStateSlot,
+                                qkReady,
                                 isSplitKV);
                         } else {
                             epilogueOnlineSoftmax(
@@ -997,6 +998,7 @@ namespace SplitFuse {
                                 qNBlockSize,
                                 curStackTileMod,
                                 desc.taskStateSlot,
+                                qkReady,
                                 false);
                         }
                     }
@@ -1060,7 +1062,7 @@ namespace SplitFuse {
                     LayoutLse layoutLse(qHeads,
                         (INPUT_LAYOUT == FaiKenel::inputLayout::TND) ? totalQTokens : maxQSeqlen);
                     uint64_t gmOffsetUpdate = (uint64_t)(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
-                    Arch::CrossCoreWaitFlag(pvReady);
+                    // Arch::CrossCoreWaitFlag(pvReady);
                     
                     // TODO FD 未适配
                     if (flashDecodeFlag != 0U) {
@@ -1083,6 +1085,7 @@ namespace SplitFuse {
                             layoutUpdate,
                             layoutLse,
                             actualBlockShapePV,
+                            pvReady,
                             pvDesc.qSBlockSize,
                             pvDesc.qNBlockSize,
                             pvDesc.firstStack,
@@ -1101,6 +1104,7 @@ namespace SplitFuse {
                             layoutUpdate,
                             layoutLse,
                             actualBlockShapePV,
+                            pvReady,
                             pvDesc.qSBlockSize,
                             pvDesc.qNBlockSize,
                             pvDesc.firstStack,
