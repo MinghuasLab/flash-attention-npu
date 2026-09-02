@@ -138,13 +138,68 @@ test_cases = [
     (torch.float16, 2, 8, 2, 513, 513, 128, 0, 128, False, -1, -1, 30.0, True, False),
     (torch.bfloat16, 4, 16, 4, 512, 512, 128, 0, 128, True, -1, -1, 50.0, True, False),
     (torch.bfloat16, 1, 4, 2, 257, 257, 256, 0, 128, True, -1, -1, 30.0, True, False),
-    # AppendKV
+    # ALiBi crossed with unaligned D and 127/129 or 511/513 split boundaries.
+    (torch.float16, 3, 10, 2, 129, 513, 59, 0, 128, False, -1, -1, 0.0, True, False),
+    # Flash Decode odd-Sq dispatch: 3/5/7/11/13/15 and GQA groups 4/8.
+    (torch.bfloat16, 1, 32, 4, 3, 2048, 128, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 16, 2, 5, 4096, 128, 1, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 1, 64, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 1, 32, 4, 11, 4096, 128, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 16, 2, 15, 2048, 128, 1, 128, True, -1, -1, 0.0, False, False),
+    # Non-default batch/head scheduling and GQA group transitions.
+    (torch.bfloat16, 4, 32, 8, 1, 2048, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 8, 64, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 4, 64, 16, 16, 1024, 128, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 8, 128, 16, 32, 2048, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 4, 64, 8, 64, 4096, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    # Historical shape/window regressions: large heads, tiny D, and Sq/Sk asymmetry.
+    (torch.float16, 1, 64, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.float16, 1, 128, 1, 1, 1024, 128, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.float16, 1, 512, 1, 1, 1024, 4, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.float16, 16, 2, 2, 4096, 2, 128, 0, 128, False, 65, 412, 0.0, False, False),
+    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, False, 826, 973, 0.0, False, False),
+    (torch.float16, 4, 4, 2, 4, 4096, 1, 0, 128, True, 826, 973, 0.0, False, False),
+    # softcap=30 across dense/paged, decode/multi-token, and aligned/unaligned D.
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 30.0, False, False),
+    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 30.0, False, False),
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 30.0, False, False),
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 30.0, False, False),
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 30.0, False, False),
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 30.0, False, False),
+    # ATK supplement: large/asymmetric shapes and non-standard GQA heads.
+    (torch.float16, 4, 16, 2, 136, 129, 151, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.float16, 1, 16, 2, 256, 192, 192, 1, 128, True, -1, -1, 0.0, False, False),
+    (torch.float16, 1, 16, 2, 1024, 128, 201, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 40, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 4, 48, 4, 9, 4096, 128, 1, 128, True, -1, -1, 0.0, False, False),
+    # Split boundaries 127/129 and 511/513 crossed with odd batch and non-aligned D.
+    (torch.float16, 3, 10, 2, 127, 129, 35, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, 1, 128, True, -1, -1, 0.0, False, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, 1, 128, False, -1, -1, 0.0, False, False),
+    # 8K KV MQA/GQA dtype symmetry.
+    (torch.float16, 3, 5, 1, 15, 8192, 151, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, 1, 128, True, -1, -1, 0.0, False, False),
+    # Boundary SWA windows with MHA/GQA and non-default batch.
+    (torch.float16, 16, 8, 8, 128, 129, 224, 0, 128, False, 127, 0, 0.0, False, False),
+    (torch.bfloat16, 5, 6, 3, 129, 512, 256, 1, 128, False, 511, 0, 0.0, False, False),
+    # Maximum practical batch tier with a minimal tensor footprint.
+    (torch.float16, 64, 1, 1, 1, 1, 1, 0, 128, False, -1, -1, 0.0, False, False),
+    # Cache-update path: new_kv=True appends k_new/v_new to the existing KV cache.
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, False, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, -1, -1, 0.0, False, True),
     (torch.bfloat16, 1, 16, 2, 1024, 2048, 128, 1, 128, True, -1, -1, 0.0, False, True),
     (torch.bfloat16, 2, 4, 2, 513, 2048, 128, 1, 128, False, -1, -1, 0.0, False, True),
     (torch.bfloat16, 1, 16, 2, 128, 2048, 128, 0, 128, False, -1, -1, 0.0, True, True),
     (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, -1, -1, 0.0, True, True),
+    (torch.bfloat16, 1, 16, 2, 128, 2048, 128, 0, 128, False, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, -1, -1, 0.0, False, True),
+    # new_kv=True dtype symmetry at 127/129 and 511/513 cache-update boundaries.
+    (torch.float16, 3, 10, 2, 127, 513, 64, 1, 128, False, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 5, 24, 4, 129, 511, 256, 0, 128, True, -1, -1, 0.0, False, True),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv", test_cases)
@@ -430,6 +485,23 @@ func_cases = [
     (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True), 
     (torch.float16, 2, 4, 2, 513, 513, 128, True, True, -1, -1, 50.0, 0.0, True),
     (torch.bfloat16, 1, 4, 4, 512, 512, 256, True, False, -1, -1, 30.0, 0.0, True),
+    # ALiBi with unaligned D and a 127/129 sequence boundary.
+    (torch.bfloat16, 5, 24, 4, 127, 129, 101, False, True, -1, -1, 0.0, 0.0, True),
+    # Cross-entry migration from KV-cache coverage: odd batch/Sq and softcap=30.
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, -1, -1, 30.0, 0.0, False),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, -1, -1, 30.0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 30.0, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, -1, -1, 30.0, 0.0, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 30.0, 0.0, False),
+    # 127/129 and 511/513 boundary migration for the ordinary FlashAttention API.
+    (torch.float16, 3, 10, 2, 127, 129, 35, False, False, -1, -1, 0.0, 0.0, False),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, True, True, -1, -1, 0.0, 0.0, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, True, False, -1, -1, 0.0, 0.0, False),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, False, True, -1, -1, 0.0, 0.0, False),
+    # 8K KV migration for ordinary MQA/GQA forward/backward.
+    (torch.float16, 3, 5, 1, 15, 8192, 151, False, False, -1, -1, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, True, -1, -1, 0.0, 0.0, False),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi", func_cases)
@@ -621,6 +693,30 @@ varlen_cases = [
     (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, 0, 128, 0.0, True),
     (torch.float16, 3, 4, 2, 512, 512, 128, False, 64, 128, 0.0, 0, 128, 0.0, True),
     (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 30.0, 0, 128, 0.0, True),
+    # Packed ALiBi with unaligned D and a 511/513 sequence boundary.
+    (torch.float16, 3, 10, 2, 511, 513, 59, False, -1, -1, 0.0, 0, 128, 0.0, True),
+    # Long/odd varlen and non-default batch migration.
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 30.0, 0, 128, 0.0, False),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 30.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 30.0, 0, 128, 0.0, False),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 30.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 2, 4, 2, 4, 512, 128, True, -1, -1, 30.0, 1, 128, 0.0, False),
+    # Signed/near-boundary SWA windows from the ATK supplement.
+    (torch.bfloat16, 2, 4, 2, 512, 512, 128, False, 508, -256, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 2, 4, 2, 512, 512, 128, True, -128, 864, 0.0, 0, 128, 0.0, False),
+    # TODO: Re-enable after the paged-varlen metadata/forward max_seqlen_k
+    # (torch.bfloat16, 2, 4, 2, 256, 512, 128, False, 511, 0, 0.0, 1, 128, 0.0, False),
+    # 127/129 and 511/513 boundary migration for packed varlen.
+    (torch.float16, 3, 10, 2, 127, 129, 35, False, -1, -1, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, True, -1, -1, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, True, 127, 0, 0.0, 0, 128, 0.0, False),
+    # TODO: Re-enable with the paged-varlen SWA boundary case above after the
+    # metadata/forward max_seqlen_k bound mismatch is fixed.
+    # (torch.bfloat16, 8, 48, 4, 513, 511, 111, False, 511, 0, 0.0, 1, 128, 0.0, False),
+    # 8K KV migration for packed MQA/GQA.
+    (torch.float16, 3, 5, 1, 15, 8192, 151, False, -1, -1, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, -1, -1, 0.0, 1, 128, 0.0, False),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi", varlen_cases)
