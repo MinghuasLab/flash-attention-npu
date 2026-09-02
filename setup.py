@@ -380,8 +380,9 @@ class BishengBuildExt(build_ext):
 
         # One shared pool across all extensions so the heaviest TUs compile
         # concurrently regardless of which extension owns them. TUs per extension
-        # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
-        # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
+        # once autogen dispatch + combo TUs are added: ascend910_v2=76
+        # (12 dispatch stubs + 64 combo TUs), ascend910_v3=9, ascend950_v3=6,
+        # ascend910_v4=5, ascend950_v4=6.
         max_workers = min(len(tasks), os.cpu_count() or 1)
         objs_by_ext = {ext.name: [] for ext in self.extensions}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:

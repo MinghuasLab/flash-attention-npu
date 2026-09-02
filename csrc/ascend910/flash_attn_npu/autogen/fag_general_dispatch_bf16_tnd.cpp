@@ -9,4 +9,4 @@
 
 #include "../fag_general_dispatch_impl.hpp"
 
-template void launch_fag_general_dispatch_bf16<TND>(const FagGeneralLaunchArgs &);  // TND
+template void launch_fag_general_dispatch_bf16<TND>(const FagGeneralLaunchArgs &);  // TND (constant from fag_layout.hpp)

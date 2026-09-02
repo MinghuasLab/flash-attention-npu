@@ -1,8 +1,10 @@
 #ifndef KERNEL_COMMON_FAG_HPP
 #define KERNEL_COMMON_FAG_HPP
 
-constexpr static uint32_t BSND = 0;
-constexpr static uint32_t TND = 1;
+// BSND/TND layout constants live in the self-contained fag_layout.hpp so the
+// light dispatch/stub TUs can use the named constants without this header's
+// kernel-header prerequisites.
+#include "fag_layout.hpp"
 
 struct FAGTilingData {
     int64_t coreNum;
