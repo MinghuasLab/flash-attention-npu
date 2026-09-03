@@ -700,7 +700,8 @@ namespace SplitFuse {
                 kvStartOld = CeilDiv(kvSeqlenOld, MAX_KV_STACK_LEN);
                 kvSLoopNumTotalOld = CeilDiv(
                     AscendC::Std::max((int64_t)0,
-                        AscendC::Std::min(noSkipKvS, (int64_t)kvSeqlenOld)),
+                        AscendC::Std::min(static_cast<int64_t>(noSkipKvS),
+                            static_cast<int64_t>(kvSeqlenOld))),
                     (int64_t)MAX_KV_STACK_LEN);
                 kvLoopNumTotalNew = CeilDiv(kvNewSeqlen, MAX_KV_STACK_LEN);
                 kvSLoopNumTotal = kvSLoopNumTotalOld + kvLoopNumTotalNew;
