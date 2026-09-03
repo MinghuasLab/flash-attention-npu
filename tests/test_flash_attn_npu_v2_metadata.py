@@ -88,6 +88,7 @@ def _metadata(
     softcap=0.0,
     softmax_scale=None,
     alibi_slopes_batch_stride=0,
+    num_splits=0,
 ):
     return get_scheduler_metadata(
         batch_size=batch_size,
@@ -105,6 +106,7 @@ def _metadata(
         softcap=softcap,
         softmax_scale=softmax_scale,
         alibi_slopes_batch_stride=alibi_slopes_batch_stride,
+        num_splits=num_splits,
     )
 
 
@@ -314,6 +316,43 @@ def test_flash_attn_func_metadata_bsnd(
         data_type=data_type,
         is_causal=is_causal,
     )
+
+
+def test_flash_attn_kvcache_metadata_num_splits_mismatch_rejected():
+    """The metadata split schedule must match the num_splits used by the forward."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 2, 1
+    q_seqlen, kv_seqlen, head_size, block_size = 1, 1024, 128, 128
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen])
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+        num_splits=2,
+    )
+
+    with pytest.raises(ValueError, match="num_splits"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            num_splits=4,
+            scheduler_metadata=scheduler_metadata,
+        )
 
 
 @pytest.mark.parametrize(
@@ -837,6 +876,7 @@ class _FAInferTilingData(ctypes.Structure):
         ("splitLseTotalSize", ctypes.c_uint64), ("splitOTotalSize", ctypes.c_uint64),
         ("totalSplitNodeNum", ctypes.c_uint32), ("needCoreNum", ctypes.c_uint32),
         ("flashDecodeFlag", ctypes.c_uint32),
+        ("numSplits", ctypes.c_uint32),
         ("kvNewSeqlen", ctypes.c_uint32), ("kvCacheSeqlen", ctypes.c_uint32),
         ("coreInfo", _CoreNode * 25),
         ("splitInfo", _SplitNode * 25),
@@ -853,8 +893,9 @@ def _tiling_from_metadata(scheduler_metadata, has_mask):
     return tiling
 
 
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
+def test_flash_attn_kvcache_metadata_flash_decode(is_causal, num_splits):
     """FD (BSND paged, tiny Q, long KV) must be decided and scheduled on the AICPU."""
     batch_size, num_heads, kv_heads = 2, 4, 1
     q_seqlen, kv_seqlen, head_size, block_size = 1, 4096, 128, 128
@@ -878,11 +919,24 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
         data_type=data_type,
         page_size=block_size,
         is_causal=is_causal,
+        num_splits=num_splits,
     )
     tiling = _tiling_from_metadata(scheduler_metadata, has_mask=is_causal)
     assert tiling.flashDecodeFlag == 1
+    assert tiling.numSplits == max(num_splits, 1)
     assert tiling.needCoreNum > 0
-    assert tiling.splitLseTotalSize > 0
+    if num_splits == 1:
+        assert tiling.totalSplitNodeNum == 0
+        assert tiling.splitLseTotalSize == 0
+        assert tiling.splitOTotalSize == 0
+    else:
+        assert tiling.splitLseTotalSize > 0
+    if num_splits > 1:
+        assert tiling.totalSplitNodeNum == batch_size
+        assert all(
+            tiling.splitInfo[idx].splitNum == num_splits
+            for idx in range(tiling.totalSplitNodeNum)
+        )
     assert tiling.workSpaceSize > 0
 
     output_npu, softmax_lse_npu = flash_attn_with_kvcache(
@@ -894,7 +948,7 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
         softmax_scale=scale,
         causal=is_causal,
         window_size=WINDOW_SIZE,
-        num_splits=0,
+        num_splits=num_splits,
         scheduler_metadata=scheduler_metadata,
         return_softmax_lse=True,
     )
