@@ -332,7 +332,9 @@ func_cases = [
     (torch.float16, 1, 1, 1, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.3),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 0.0, 0.3),
 ]
-
+func_cases =[
+    (torch.float16, 1, 6, 1, 4, 4, 128, True, False, -1, -1, 0.0, 0.0)
+]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p", func_cases)
 def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p):
     num_blocks = 64

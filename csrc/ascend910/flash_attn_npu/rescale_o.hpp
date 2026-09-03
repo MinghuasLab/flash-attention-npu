@@ -143,9 +143,16 @@ public:
                 LSE_OUT_INI,
                 (end - start) * FLOAT_BLOCK_SIZE
             );
-            if (start == 0U) {
-                AscendC::Duplicate(lseUbTensor[start], LSE_OUT_INI, (end - start));
-            }
+            uint32_t len = end - start;
+            uint64_t mask = ((1ULL << len) - 1) << start;
+            AscendC::Duplicate<float>(
+                lseUbTensor,  // 32B 对齐的起始地址
+                LSE_OUT_INI,
+                mask,
+                1,            // repeatTime
+                1,            // dstBlockStride
+                8             // dstRepeatStride
+            );
         }
         if (qNThisSubBlock == 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
             uint32_t rowStart = qNSubBlockStartOffset;
@@ -576,21 +583,14 @@ public:
                         }
                     } else {
                         if (qNThisSubBlock == 0U) {
-                            uint32_t qNSubBlockStartOffset = qSBlockIdx * VECTOR_SIZE + inRowOffsetThisSubBlock;
-                            uint32_t qNSubBlockEnbdOffset = totalRowNum + qNSubBlockStartOffset;
-                            if (delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow && qNSubBlockStartOffset <= delStartRow) {
-                                AscendC::DataCopyPad(
-                                    gLse, tvUbTensor,
-                                    AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0, 0, 0));
-                            } else {
-                                AscendC::DataCopyPad(
-                                    gLse, lseUbTensor,
-                                    AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
-                            }
+                            AscendC::DataCopyPad(
+                                gLse, lseUbTensor,
+                                AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
                         } else {
                             // multi-head: per-token gather (srcStride) + scatter (dstStride).
                             uint32_t lseHeadStrideGm = layoutLse.stride(0);  // S_q, BNS/NT head stride
-                            for (uint32_t sIdx = 0; sIdx < qSBlockSize; sIdx++) {
+                            bool isA = qSBlockSize % 8 == 0;
+                            for (uint32_t sIdx = 0; sIdx < qSBlockSize && !isA; sIdx++) {
                                 AscendC::DataCopyPad(
                                     gLse[sIdx],
                                     tvUbTensor[sIdx * FLOAT_BLOCK_SIZE],
@@ -599,6 +599,14 @@ public:
                                         qSBlockSize - 1,
                                         (lseHeadStrideGm - 1) * sizeof(float), 0));
                             }
+                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock && isA; qNIdx++) {
+                                AscendC::DataCopyPad(
+                                    gLse[qNIdx * lseHeadStrideGm],
+                                    lseUbTensor[qNIdx * qSBlockSize],
+                                    AscendC::DataCopyExtParams(
+                                        1, qSBlockSize * sizeof(float), 0, 0, 0));
+                            }
+
                         }
                     }
                     uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
