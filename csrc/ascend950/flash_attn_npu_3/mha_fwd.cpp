@@ -11,7 +11,7 @@
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
  *   ✅ return_softmax_lse
  *   ✅ num_splits (FlashDecode for paged KV + TND)
- *   ✅ scheduler_metadata for non-FD execution
+ *   ✅ scheduler_metadata for normal FA and FlashDecode
  *   ❌ pack_gqa, leftpad_k
  */
 
@@ -118,11 +118,6 @@ mha_fwd(at::Tensor q,
                 "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
-    if (scheduler_metadata_.has_value()) {
-        TORCH_CHECK(num_splits <= 1,
-                    "950 backend (v3) scheduler_metadata does not support "
-                    "explicit FlashDecode splits");
-    }
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(),
                 "950 backend (v3) does not support pack_gqa");
 
@@ -277,6 +272,7 @@ mha_fwd(at::Tensor q,
     at::Tensor mask_npu_tensor;
     bool is_local = false;
     bool flashDecodeEnabled = false;
+    bool metadataMayEnableFd = false;
     uint32_t launchBlockDim = blockDim;
     uint32_t combineBlockDim = 0U;
 
@@ -315,7 +311,14 @@ mha_fwd(at::Tensor q,
         metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;
+        metadataMayEnableFd = !is_local && paged_KV && is_varlen_q &&
+            seqlen_q <= 16 && num_splits != 1;
         workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+        if (metadataMayEnableFd) {
+            workSpaceSize = fd_tiling::WorkspaceUpperBound(
+                workSpaceSize, blockDim, static_cast<uint32_t>(head_size_v));
+            combineBlockDim = blockDim;
+        }
         if (workSpaceSize < fa_metadata::WS_FLOOR) {
             workSpaceSize = fa_metadata::WS_FLOOR;
         }
@@ -354,27 +357,35 @@ mha_fwd(at::Tensor q,
             }
         }
 
-        int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
-        int64_t max_q_seqlen = 0;
-        const int32_t *q_cu_ptr = is_varlen_q ?
-            cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
-        const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
-        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-            const int64_t q_len = is_varlen_q ?
-                static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
-                seqlen_q;
-            const int64_t kv_len = kv_len_ptr[batch_idx];
-            TORCH_CHECK(q_len > 0 && kv_len > 0,
-                        "950 backend (v3) requires positive Q and KV lengths");
-            min_q_seqlen = std::min(min_q_seqlen, q_len);
-            max_q_seqlen = std::max(max_q_seqlen, q_len);
+        // Keep the normal-FA seqlen contract unchanged.  FD-specific length
+        // validation is only needed for a layout that can actually enable FD;
+        // in particular num_splits=1 must not be rejected by the FD pre-gate.
+        bool flash_decode = false;
+        const bool fd_layout_candidate =
+            num_splits != 1 && !is_local && paged_KV && is_varlen_q;
+        if (fd_layout_candidate) {
+            int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+            int64_t max_q_seqlen = 0;
+            bool fd_lengths_valid = true;
+            const int32_t *q_cu_ptr = cu_seqlen_q_cpu.data_ptr<int32_t>();
+            const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+            for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+                const int64_t q_len =
+                    static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx];
+                const int64_t kv_len = kv_len_ptr[batch_idx];
+                if (q_len <= 0 || kv_len <= 0) {
+                    fd_lengths_valid = false;
+                    break;
+                }
+                min_q_seqlen = std::min(min_q_seqlen, q_len);
+                max_q_seqlen = std::max(max_q_seqlen, q_len);
+            }
+            flash_decode = fd_lengths_valid && min_q_seqlen > 0 &&
+                max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         }
-        const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
-            min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
-        const bool flash_decode = num_splits != 1 && fd_shape_supported;
 
         fill_inference_context(
             ctx, scratch,
@@ -427,6 +438,9 @@ mha_fwd(at::Tensor q,
         }
     }
 
+    const bool mayLaunchFlashDecode =
+        flashDecodeEnabled || metadataMayEnableFd;
+
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
@@ -447,7 +461,7 @@ mha_fwd(at::Tensor q,
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
     at::Tensor fd_lse;
-    if (flashDecodeEnabled && !return_softmax_lse) {
+    if (mayLaunchFlashDecode && !return_softmax_lse) {
         fd_lse = at::empty({num_heads, sizes[0]},
                            at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
@@ -471,7 +485,7 @@ mha_fwd(at::Tensor q,
     // even when the public API does not return it.
     auto lseDev = return_softmax_lse
         ? static_cast<uint8_t*>(softmaxlse.data_ptr())
-        : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
+        : (mayLaunchFlashDecode ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = tilingDevice;
 
@@ -504,12 +518,12 @@ mha_fwd(at::Tensor q,
         ? static_cast<uint8_t*>(page_table.data_ptr())
         : nullptr;
     const bool enableDN =
-        !flashDecodeEnabled && (!is_causal) && (!is_local) &&
+        !mayLaunchFlashDecode && (!is_causal) && (!is_local) &&
         (head_size_q <= 256) && (head_size_v <= 256);
 
     const FwdLaunchArgs fwdArgs{
         is_bf16, fmt, mask_category, paged_KV,
-        enableDN, return_softmax_lse, flashDecodeEnabled,
+        enableDN, return_softmax_lse, mayLaunchFlashDecode,
         combineBlockDim, launchBlockDim, aclStream,
         qDev, kDev, vDev, maskDevice, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,

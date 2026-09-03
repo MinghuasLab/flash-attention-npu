@@ -3,8 +3,8 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 
-#ifndef FLASH_ATTN_NPU_950_V4_FD_COMBINE_HPP
-#define FLASH_ATTN_NPU_950_V4_FD_COMBINE_HPP
+#ifndef FLASH_ATTN_NPU_950_V3_COMBINE_SCALE_HPP
+#define FLASH_ATTN_NPU_950_V3_COMBINE_SCALE_HPP
 
 #include <type_traits>
 
@@ -80,6 +80,9 @@ public:
 
         __gm__ FAInferTilingData *tiling =
             reinterpret_cast<__gm__ FAInferTilingData *>(params.tiling);
+        if (tiling->flashDecodeFlag == 0U) {
+            return;
+        }
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t combineIdx = AscendC::GetBlockIdx() / subBlockNum;
         if (combineIdx >= tiling->fdCombineTaskNum) {

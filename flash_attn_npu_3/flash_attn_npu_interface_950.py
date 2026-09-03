@@ -404,19 +404,10 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
 
-    # FlashDecode schedules depend on the runtime KV lengths and are produced
-    # by the host tiler.  Keep the upstream metadata path for normal FA, but
-    # do not pre-build metadata for explicit FD or for the narrow auto-FD
-    # candidate shape.
-    auto_fd_candidate = (
-        num_splits == 0
-        and page_table is not None
-        and cu_seqlens_q is not None
-        and max_seqlen_q is not None
-        and max_seqlen_q <= 16
-    )
-    use_host_tiling = num_splits > 1 or auto_fd_candidate
-    if scheduler_metadata is None and not use_host_tiling:
+    # AICPU metadata computes both normal-FA and FlashDecode schedules from the
+    # runtime sequence lengths. The C++ launcher uses a fixed safe upper bound
+    # for FD candidates, so this path does not need a D2H tiling decision.
+    if scheduler_metadata is None:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:
                 raise ValueError(
@@ -443,7 +434,24 @@ def flash_attn_with_kvcache(
             page_size = None
             num_blocks = None
             max_blocks = None
-        if cache_seqlens is not None:
+        # FD only supports causal/no-mask attention, for which mask derivation
+        # does not depend on the exact runtime KV maximum.  Use the paged-cache
+        # capacity for those candidates so metadata generation remains D2H-free.
+        # Normal FA with SWA still needs the actual KV maximum to normalize an
+        # open window side (for example, window_size=(2, -1)).
+        fd_mask_compatible = window_size[0] < 0 and (
+            causal or window_size[1] < 0
+        )
+        fd_metadata_candidate = (
+            page_table is not None
+            and cu_seqlens_q is not None
+            and max_q <= 16
+            and num_splits != 1
+            and fd_mask_compatible
+        )
+        if fd_metadata_candidate:
+            max_seqlen_k_bound = max_blocks * page_size
+        elif cache_seqlens is not None:
             max_seqlen_k_bound = int(cache_seqlens.max().item())
         elif page_table is not None:
             max_seqlen_k_bound = max_blocks * page_size

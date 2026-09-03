@@ -104,7 +104,7 @@ struct FAInferTilingData {
     uint32_t fdRowCapacity;
     uint32_t fdLseSubStride;
     uint32_t fdCombineBlockDim;
-    uint32_t fdReserved;
+    uint32_t fdPlanStatus;
     uint64_t fdPartialLseOffset;
     uint64_t fdPartialOOffset;
     uint64_t fdWorkspaceEnd;
