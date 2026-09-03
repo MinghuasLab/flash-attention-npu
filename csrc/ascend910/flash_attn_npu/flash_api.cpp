@@ -270,7 +270,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(!rotary_cos_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(!rotary_sin_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-    TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int>(blockDim),
+                "NPU FlashAttention supports num_splits in [0, ", blockDim,
+                "] (0 = auto; upper bound = number of AI cores). ");
+    TORCH_CHECK(num_splits <= 1 || paged_KV,
+                "NPU FlashAttention num_splits>1 currently requires paged KV cache and BSND kvcache layout");
 
     if (k_.has_value()) {
         k = k_.value();
@@ -489,6 +493,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
             (seqlen_q * groupSize <= 128) && (seqlen_q <= 16) &&
             (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
+        tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
 
         fa_split::SplitContext splitCtx;
         splitCtx.batch_size = batch_size;
@@ -500,6 +505,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
         splitCtx.is_varlen_q = false;
         splitCtx.blockDim = blockDim;
+        splitCtx.num_splits = static_cast<int32_t>(num_splits);
         splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
@@ -1519,7 +1525,8 @@ at::Tensor get_scheduler_metadata(
         int64_t window_size_right,
         double softcap,
         std::optional<double> softmax_scale,
-        int64_t alibi_slopes_batch_stride
+        int64_t alibi_slopes_batch_stride,
+        int64_t num_splits
     )
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
@@ -1533,6 +1540,11 @@ at::Tensor get_scheduler_metadata(
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
+                "NPU FlashAttention supports num_splits in [0, ", blockDim,
+                "] (0 = auto; upper bound = number of AI cores). ");
+    TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && !is_varlen_q),
+                "NPU FlashAttention num_splits>1 currently requires paged KV cache and BSND kvcache layout");
     TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative (0.0 disables softcap)");
     // Mask axes are fully derived on host from the declared seqlen bounds; the
     // AICPU kernel only copies the final values into the tiling blob.
@@ -1564,6 +1576,7 @@ at::Tensor get_scheduler_metadata(
     args.isVarlen = is_varlen_q ? 1U : 0U;
     args.isVarlenKv = 0U;  // cache_seqlens always carries per-batch KV lengths
     args.pagedKV = page_size.has_value() ? 1U : 0U;
+    args.numSplits = static_cast<uint32_t>(num_splits);
     args.scaleValue = scaleValue;
     args.softcapValue = static_cast<float>(softcap);
     args.alibiSlopesBatchStride = alibi_slopes_batch_stride;

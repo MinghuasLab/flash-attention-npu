@@ -48,6 +48,7 @@ struct FAMetadataArgs {
     uint32_t isVarlen;
     uint32_t isVarlenKv;
     uint32_t pagedKV;
+    uint32_t numSplits;
     float scaleValue;
     float softcapValue;
     int64_t alibiSlopesBatchStride;
