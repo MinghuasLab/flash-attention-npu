@@ -329,6 +329,49 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
                               k_new, v_new, cache_seqlens, block_tables, block_size)
     return
+
+
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
+def test_fa_kvcache_fd_num_splits(num_splits):
+    """The BSND paged-KV FD path supports auto, no-split and fixed-split schedules."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 4, 1
+    q_seqlen, kv_seqlen, head_size, block_size = 1, 4096, 128, 128
+    scale = 1.0 / (head_size ** 0.5)
+
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
+    key_cache, value_cache = make_paged_kv_cache(
+        batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type, device="npu"
+    )
+    block_table = make_block_table(batch_size, kv_seqlen, block_size).npu()
+    cache_seqlens = torch.full(
+        (batch_size,), kv_seqlen, dtype=torch.int32, device="npu"
+    )
+
+    output_npu, softmax_lse_npu = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=scale,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+
+    key_batched, value_batched = gather_paged_kv_batch(
+        key_cache.cpu(), value_cache.cpu(), block_table.cpu(), kv_seqlen, block_size
+    )
+    output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
+        query.cpu(), key_batched, value_batched, scale, None, data_type, 0.0
+    )
+    assert_fa_close(output_npu, output_ref, output_pt, name=f"out num_splits={num_splits}")
+    assert_fa_close(
+        softmax_lse_npu, lse_ref, lse_pt, name=f"softmax_lse num_splits={num_splits}"
+    )
+
 # flash_attn_func test parameters
 # Single-option parameters: fixed values
 # batch_size: [4]
