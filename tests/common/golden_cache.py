@@ -58,6 +58,26 @@ def retry_cached_value(value: torch.Tensor) -> bool:
     return False
 
 
+def _record_cache_event(event: str, nodeid: str) -> None:
+    """Append a best-effort cache event for CI observability."""
+    stats_file = os.environ.get("GOLDEN_CACHE_STATS_FILE")
+    if not stats_file:
+        return
+    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE", "")
+    scope = "selftest" if Path(test_file).name == "test_golden_cache.py" else "test"
+    safe_nodeid = str(nodeid).replace("\t", " ").replace("\n", " ")
+    try:
+        path = Path(stats_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            stream.write(f"{event}\t{scope}\t{os.getpid()}\t{safe_nodeid}\n")
+            stream.flush()
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, "1" if default else "0").strip().lower() in {
         "1", "true", "yes", "on"
@@ -259,6 +279,7 @@ def get_or_compute_golden(
     tensors on a cache hit and retain the caller's tensors on a miss.
     """
     if not _cache_enabled():
+        _record_cache_event("disabled", nodeid)
         result = dict(compute_fn())
         return (result, "disabled") if return_status else result
 
@@ -300,14 +321,17 @@ def get_or_compute_golden(
     if not refresh and artifact.is_file():
         try:
             result = _load_artifact(artifact, case_metadata)
+            _record_cache_event("hit", nodeid)
             print(f"[golden-cache] hit {nodeid}")
             return (result, "hit") if return_status else result
         except Exception as exc:  # cache is an optimization, never a test failure
+            _record_cache_event("read_error", nodeid)
             warnings.warn(
                 f"golden cache read failed for {nodeid}: {exc}; recomputing",
                 RuntimeWarning,
             )
 
+    _record_cache_event("refresh" if refresh else "miss", nodeid)
     values = dict(compute_fn())
     if set(values) != set(value_names):
         raise ValueError(
@@ -318,8 +342,10 @@ def get_or_compute_golden(
         with _exclusive_lock(root):
             _write_artifact(artifact, case_metadata, values)
             _evict(root)
+        _record_cache_event("write_ok", nodeid)
         print(f"[golden-cache] {'refresh' if refresh else 'miss'} {nodeid}")
     except Exception as exc:
+        _record_cache_event("write_error", nodeid)
         warnings.warn(
             f"golden cache write failed for {nodeid}: {exc}; continuing",
             RuntimeWarning,

@@ -30,6 +30,54 @@ def test_golden_cache_is_disabled_by_default(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir())
 
 
+def test_golden_cache_records_events_outside_worker_stdout(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOLDEN_CACHE_DIR", str(tmp_path / "cache"))
+    stats_file = tmp_path / "events.tsv"
+    monkeypatch.setenv("GOLDEN_CACHE_STATS_FILE", str(stats_file))
+    monkeypatch.setenv("GOLDEN_CACHE_TEST_FILE", "tests/test_example.py")
+    monkeypatch.setenv("GOLDEN_CACHE_MODE", "cache")
+
+    kwargs = {
+        "nodeid": "tests/test_example.py::test_case[x]",
+        "metadata": {"seed": 0},
+        "inputs": {"q": torch.ones(1)},
+        "compute_fn": lambda: {"out": torch.ones(1)},
+        "expected_keys": ("out",),
+    }
+    get_or_compute_golden(**kwargs)
+    get_or_compute_golden(**kwargs)
+
+    events = [line.split("\t", 2)[:2] for line in stats_file.read_text().splitlines()]
+    assert [event for event, scope in events if scope == "test"] == [
+        "miss", "write_ok", "hit"
+    ]
+
+
+def test_golden_cache_source_change_recomputes(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOLDEN_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("GOLDEN_CACHE_MODE", "cache")
+    source_file = tmp_path / "reference.py"
+    source_file.write_text("VERSION = 1\n")
+    calls = {"count": 0}
+
+    def compute():
+        calls["count"] += 1
+        return {"out": torch.tensor([calls["count"]])}
+
+    kwargs = {
+        "nodeid": "tests/example.py::test_case",
+        "metadata": {"seed": 0},
+        "inputs": {"q": torch.ones(1)},
+        "compute_fn": compute,
+        "expected_keys": ("out",),
+        "source_files": [str(source_file)],
+    }
+    assert get_or_compute_golden(**kwargs)["out"].item() == 1
+    source_file.write_text("VERSION = 2\n")
+    assert get_or_compute_golden(**kwargs)["out"].item() == 2
+    assert calls["count"] == 2
+
+
 def test_golden_cache_miss_hit_and_refresh(tmp_path, monkeypatch):
     monkeypatch.setenv("GOLDEN_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("GOLDEN_CACHE_MODE", "cache")

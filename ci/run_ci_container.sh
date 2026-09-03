@@ -23,6 +23,7 @@
 #   GOLDEN_CACHE_HOST_DIR (CI 固定为 /home/FA_NPU_CI_DATA)
 #   GOLDEN_CACHE_DIR      (默认 /var/cache/flash-attention-npu/golden_cache)
 #   GOLDEN_CACHE_MODE     (默认 cache) cache|off
+#   GOLDEN_CACHE_STATS_FILE (容器内固定为 /tmp/ci_test_logs/golden_cache_events.tsv)
 
 set -euo pipefail
 
@@ -135,6 +136,7 @@ run_docker_test() {
     # is valid even when the runner user itself cannot write to it.
     if mkdir -p "$GOLDEN_CACHE_HOST_DIR" 2>/dev/null && [ -d "$GOLDEN_CACHE_HOST_DIR" ]; then
       golden_mount_args=(-v "$GOLDEN_CACHE_HOST_DIR:$GOLDEN_CACHE_DIR:rw")
+      log "golden cache enabled: host=$GOLDEN_CACHE_HOST_DIR container=$GOLDEN_CACHE_DIR"
     else
       log "warning: golden cache directory is unavailable ($GOLDEN_CACHE_HOST_DIR); disabling cache"
       GOLDEN_CACHE_MODE=off
@@ -161,6 +163,7 @@ run_docker_test() {
     -e CI_CONTAINER_DEVICE="$CI_CONTAINER_DEVICE" \
     -e GOLDEN_CACHE_MODE="$GOLDEN_CACHE_MODE" \
     -e GOLDEN_CACHE_DIR="$GOLDEN_CACHE_DIR" \
+    -e GOLDEN_CACHE_STATS_FILE="/tmp/ci_test_logs/golden_cache_events.tsv" \
     -e GOLDEN_CACHE_REFRESH="${GOLDEN_CACHE_REFRESH:-0}" \
     -e GOLDEN_CACHE_MAX_DIRS="${GOLDEN_CACHE_MAX_DIRS:-5}" \
     -e GOLDEN_CACHE_MAX_TEST_DIRS="${GOLDEN_CACHE_MAX_TEST_DIRS:-5}" \
@@ -200,7 +203,7 @@ acquire_lock_and_run_test() {
 main() {
   local total_start
   total_start="$(date +%s)"
-  log "CI start: $(date '+%Y-%m-%d %H:%M:%S')"
+  log "CI start: $(date '+%Y-%m-%d %H:%M:%S') runner=${RUNNER_NAME:-<unset>} runner_host=$(hostname)"
 
   # 阶段1: 编译
   if [ "$CI_SKIP_BUILD" = "true" ]; then
