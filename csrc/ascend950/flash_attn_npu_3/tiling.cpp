@@ -17,13 +17,12 @@
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
-#include <vector>
+#include "fa_split.h"
 #include "tilingdata.h"
 
 namespace optiling{
     const uint32_t SIZE_OF_16BIT = 2;
     const uint32_t SIZE_OF_32BIT = 4;
-    const uint32_t N_SPLIT_HELPER = 2;
     const uint32_t MAX_KV_STACK_LEN = 512;
     const uint32_t Q_TILE_CEIL = 128;
     const uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
@@ -31,7 +30,6 @@ namespace optiling{
     const uint32_t PRELANCH_NUM = 3;
     const uint64_t ASCEND950_L1_SIZE = 512ULL * 1024ULL;
     const uint64_t RESCALE_OTMP_STAGE_SIZE = 32ULL * 1024ULL;
-    const uint64_t FD_WORKSPACE_ALIGNMENT = 512ULL;
 
     enum class MaskType : uint32_t {
         NO_MASK = 0,
@@ -120,20 +118,8 @@ namespace optiling{
 
     uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     {
-        uint32_t qRowNumCeil = Q_TILE_CEIL;
-        uint32_t qNBlockTile = (qSeqlen != 0) ?
-            (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-        if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
-            constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
-            uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
-            qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
-        }
-        qNBlockTile = std::min(qNBlockTile, groupSize);
-        if (qNBlockTile > N_SPLIT_HELPER) {
-            qNBlockTile = qNBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
-        }
-        qNBlockTile = std::max(qNBlockTile, static_cast<uint32_t>(1));
-        return qNBlockTile;
+        return fd_tiling::GetQNBlockTile(
+            qSeqlen, groupSize, faInfo_.embeddingSizeV > 128);
     }
 
     uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
@@ -253,208 +239,24 @@ namespace optiling{
         faTilingData.set_workSpaceSize(workSpaceSize);
     }
 
-    namespace {
-    struct FdBaseTaskHost {
-        uint32_t kvTiles;
-        uint32_t rowNum;
-    };
-
-    struct FdCandidateHost {
-        uint32_t baseTask;
-        uint32_t kvBegin;
-        uint32_t kvEnd;
-        uint64_t cost;
-    };
-
-    inline uint64_t AlignUpU64(uint64_t value, uint64_t alignment)
-    {
-        return (value + alignment - 1U) / alignment * alignment;
-    }
-    }
-
     void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData &tiling)
     {
-        for (uint32_t i = 0; i < MAX_FD_ACTIVE_CORE_NUM; ++i) {
-            tiling.fdDecodeSchedules[i] = {-1, -1, -1, -1};
-        }
-        for (uint32_t i = 0; i < MAX_FD_COMBINE_TASK_NUM; ++i) {
-            tiling.fdCombineSchedules[i] = {-1, -1, -1, 0};
-        }
-
-        const uint32_t cfdMax = std::min(blockNum_, MAX_FD_ACTIVE_CORE_NUM);
-        const uint32_t bfdMax = std::min(MAX_FD_COMBINE_TASK_NUM,
-            blockNum_ == 0U ? 0U : (3U * blockNum_ - 1U) / 10U);
-        tiling.fdPartialCapacity = (bfdMax == 0U || cfdMax == 0U) ?
-            0U : bfdMax + cfdMax - 1U;
-
-        std::vector<FdBaseTaskHost> bases;
-        const uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
-        for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; ++batchIdx) {
-            uint32_t qLen = static_cast<uint32_t>(faInfo_.qSeqlenList[batchIdx]);
-            uint32_t kvLen = static_cast<uint32_t>(faInfo_.kvSeqlenList[batchIdx]);
-            if (faInfo_.isTnd) {
-                qLen = static_cast<uint32_t>(faInfo_.qSeqlenList[batchIdx + 1] -
-                    faInfo_.qSeqlenList[batchIdx]);
-                if (!faInfo_.pagedCacheFlag) {
-                    kvLen = static_cast<uint32_t>(faInfo_.kvSeqlenList[batchIdx + 1] -
-                        faInfo_.kvSeqlenList[batchIdx]);
-                }
-            }
-            const uint32_t qTile = GetQSBlockTile(kvLen);
-            const uint32_t qTileNum = (qLen + qTile - 1U) / qTile;
-            const uint32_t kvTileNum = (kvLen + BASE_KV_SIZE - 1U) / BASE_KV_SIZE;
-            const uint32_t qNBlockTile = GetQNBlockTile(qLen, groupSize);
-            const uint32_t qNBlockNumPerGroup =
-                (groupSize + qNBlockTile - 1U) / qNBlockTile;
-            const uint32_t qNTaskNum = qNBlockNumPerGroup * faInfo_.kvHeads;
-            for (uint32_t qTileIdx = 0; qTileIdx < qTileNum; ++qTileIdx) {
-                const uint32_t qRows = std::min(qTile, qLen - qTileIdx * qTile);
-                for (uint32_t qNTask = 0; qNTask < qNTaskNum; ++qNTask) {
-                    const uint32_t qNBlockIdxInGroup = qNTask % qNBlockNumPerGroup;
-                    const uint32_t qNBlockSize = std::min(qNBlockTile,
-                        groupSize - qNBlockIdxInGroup * qNBlockTile);
-                    bases.push_back({kvTileNum, qRows * qNBlockSize});
-                }
-            }
-        }
-
-        tiling.fdBaseTaskNum = static_cast<uint32_t>(bases.size());
-        if (bases.empty() || bases.size() > bfdMax || cfdMax < 2U) {
-            tiling.flashDecodeFlag = 0U;
-            return;
-        }
-
-        std::vector<uint32_t> splitCounts(bases.size(), 1U);
-        if (faInfo_.numSplits > 1U) {
-            for (uint32_t base = 0; base < bases.size(); ++base) {
-                splitCounts[base] = std::min(faInfo_.numSplits, bases[base].kvTiles);
-            }
-        } else {
-            uint32_t totalSegments = static_cast<uint32_t>(bases.size());
-            while (totalSegments < cfdMax) {
-                uint32_t bestBase = static_cast<uint32_t>(bases.size());
-                uint64_t bestCost = 0U;
-                for (uint32_t base = 0; base < bases.size(); ++base) {
-                    if (splitCounts[base] >= bases[base].kvTiles) {
-                        continue;
-                    }
-                    const uint64_t cost = static_cast<uint64_t>(bases[base].rowNum) *
-                        bases[base].kvTiles / splitCounts[base];
-                    if (bestBase == bases.size() || cost > bestCost) {
-                        bestBase = base;
-                        bestCost = cost;
-                    }
-                }
-                if (bestBase == bases.size()) {
-                    break;
-                }
-                ++splitCounts[bestBase];
-                ++totalSegments;
-            }
-        }
-
-        std::vector<FdCandidateHost> candidates;
-        for (uint32_t base = 0; base < bases.size(); ++base) {
-            const uint32_t count = splitCounts[base];
-            for (uint32_t split = 0; split < count; ++split) {
-                const uint32_t begin = static_cast<uint32_t>(
-                    static_cast<uint64_t>(bases[base].kvTiles) * split / count);
-                const uint32_t end = static_cast<uint32_t>(
-                    static_cast<uint64_t>(bases[base].kvTiles) * (split + 1U) / count);
-                candidates.push_back({base, begin, end,
-                    static_cast<uint64_t>(bases[base].rowNum) * (end - begin)});
-            }
-        }
-
-        const uint32_t activeCores = std::min(cfdMax, static_cast<uint32_t>(candidates.size()));
-        if (activeCores <= bases.size()) {
-            tiling.flashDecodeFlag = 0U;
-            return;
-        }
-
-        uint64_t totalCost = 0U;
-        for (const auto &candidate : candidates) {
-            totalCost += candidate.cost;
-        }
-        std::vector<uint32_t> coreBegin(activeCores);
-        std::vector<uint32_t> coreEnd(activeCores);
-        uint32_t candidateBegin = 0U;
-        uint64_t consumedCost = 0U;
-        for (uint32_t core = 0; core < activeCores; ++core) {
-            coreBegin[core] = candidateBegin;
-            const uint32_t coresLeft = activeCores - core;
-            const uint32_t maxEnd = static_cast<uint32_t>(candidates.size()) - (coresLeft - 1U);
-            uint32_t end = candidateBegin + 1U;
-            const uint64_t target = totalCost * (core + 1U) / activeCores;
-            while (end < maxEnd && consumedCost + candidates[end - 1U].cost < target) {
-                consumedCost += candidates[end - 1U].cost;
-                ++end;
-            }
-            consumedCost += candidates[end - 1U].cost;
-            coreEnd[core] = end;
-            candidateBegin = end;
-
-            const auto &first = candidates[coreBegin[core]];
-            const auto &last = candidates[end - 1U];
-            tiling.fdDecodeSchedules[core] = {
-                static_cast<int32_t>(first.baseTask),
-                static_cast<int32_t>(last.baseTask + 1U),
-                static_cast<int32_t>(first.kvBegin),
-                static_cast<int32_t>(last.kvEnd)};
-        }
-
-        uint32_t partialStart = 0U;
-        uint32_t combineCount = 0U;
-        for (uint32_t base = 0; base < bases.size(); ++base) {
-            int32_t firstCore = -1;
-            uint32_t partialCount = 0U;
-            for (uint32_t core = 0; core < activeCores; ++core) {
-                const auto &schedule = tiling.fdDecodeSchedules[core];
-                if (schedule.baseTaskStart <= static_cast<int32_t>(base) &&
-                    static_cast<int32_t>(base) < schedule.baseTaskEnd) {
-                    if (firstCore < 0) {
-                        firstCore = static_cast<int32_t>(core);
-                    }
-                    ++partialCount;
-                }
-            }
-            if (partialCount > 1U) {
-                tiling.fdCombineSchedules[combineCount++] = {
-                    static_cast<int32_t>(base), firstCore,
-                    static_cast<int32_t>(partialStart),
-                    static_cast<int32_t>(partialCount)};
-                partialStart += partialCount;
-            }
-        }
-
-        if (combineCount == 0U || partialStart > tiling.fdPartialCapacity) {
-            tiling.flashDecodeFlag = 0U;
-            return;
-        }
-
-        tiling.fdActiveCoreNum = activeCores;
-        tiling.fdCombineTaskNum = combineCount;
-        tiling.fdPartialTaskNum = partialStart;
-        tiling.fdCombineBlockDim = std::min(blockNum_, combineCount);
-        uint32_t maxFdRows = 0U;
-        for (const auto &base : bases) {
-            maxFdRows = std::max(maxFdRows, base.rowNum);
-        }
-        tiling.fdRowCapacity = static_cast<uint32_t>(
-            AlignUpU64(maxFdRows, 8U));
-        tiling.fdLseSubStride = static_cast<uint32_t>(AlignUpU64(
-            (tiling.fdRowCapacity + 1U) / 2U, 8U));
-
-        const uint64_t pipelineEnd = tiling.workSpaceSize;
-        tiling.fdPartialLseOffset = AlignUpU64(pipelineEnd, FD_WORKSPACE_ALIGNMENT);
-        const uint64_t partialLseSize = static_cast<uint64_t>(tiling.fdPartialCapacity) *
-            2U * tiling.fdLseSubStride * sizeof(float);
-        tiling.fdPartialOOffset = AlignUpU64(
-            tiling.fdPartialLseOffset + partialLseSize, FD_WORKSPACE_ALIGNMENT);
-        const uint64_t partialOSize = static_cast<uint64_t>(tiling.fdPartialCapacity) *
-            tiling.fdRowCapacity * faInfo_.embeddingSizeV * SIZE_OF_16BIT;
-        tiling.fdWorkspaceEnd = tiling.fdPartialOOffset + partialOSize;
-        tiling.workSpaceSize = tiling.fdWorkspaceEnd;
+        const fd_tiling::PlanInput input{
+            faInfo_.qSeqlenList,
+            faInfo_.kvSeqlenList,
+            static_cast<uint32_t>(faInfo_.batch),
+            static_cast<uint32_t>(faInfo_.numHeads),
+            static_cast<uint32_t>(faInfo_.kvHeads),
+            static_cast<uint32_t>(faInfo_.embeddingSizeV),
+            blockNum_,
+            faInfo_.numSplits,
+            tiling.qBaseTile,
+            tiling.kvBaseTile,
+            faInfo_.isTnd,
+            faInfo_.pagedCacheFlag,
+            0U};
+        tiling.fdPlanStatus = static_cast<uint32_t>(
+            fd_tiling::BuildPlan(input, tiling));
     }
 
     void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData &faTilingData)
