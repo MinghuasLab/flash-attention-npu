@@ -154,11 +154,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);
     tilingData->pvOutSize = fa_metadata::Mm2OutSize(blockDim);
     tilingData->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
-    uint64_t workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
-    if (workSpaceSize < fa_metadata::WS_FLOOR) {
-        workSpaceSize = fa_metadata::WS_FLOOR;
-    }
-    tilingData->workSpaceSize = workSpaceSize;
 
     if (hasMask) {
         // Same triu(1) mask the host path uploads for both causal and band/SWA;
