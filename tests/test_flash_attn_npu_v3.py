@@ -167,13 +167,66 @@ test_cases = [
     # 6) Sk>>Sq left-infinite band (complement; no empty prefix)
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "TND", False, -1, 100, 0.0, 0, False),
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0.0, 0, False),
-    # AppendKV
+    # Dense TND restoration: dtype, causal, MHA/GQA/MQA, odd Sq/Sk, and D crossings.
+    (torch.float16, 1, 8, 4, 4, 128, 64, 0, 128, False, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 3, 6, 2, 7, 2048, 128, 0, 128, False, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.float16, 5, 4, 4, 65, 513, 59, 0, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 7, 8, 1, 13, 2048, 256, 0, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    (torch.float16, 2, 16, 2, 16, 1024, 128, 0, 128, False, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 4, 32, 4, 64, 4096, 128, 0, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    (torch.float16, 1, 2, 2, 129, 257, 192, 0, 128, False, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 3, 6, 3, 513, 1024, 64, 0, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    # Normal paged+BSND dispatch across dtype, causal, heads, odd Sq, and D.
+    (torch.float16, 1, 8, 4, 1, 2048, 64, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 3, 6, 2, 7, 2048, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 1, False),
+    (torch.float16, 5, 4, 4, 65, 513, 59, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 7, 8, 1, 13, 2048, 256, 1, 128, True, "BSND", False, -1, -1, 0.0, 1, False),
+    (torch.float16, 2, 16, 2, 16, 4096, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 4, 32, 4, 64, 4096, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 1, False),
+    (torch.float16, 1, 2, 2, 129, 257, 192, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 3, 6, 3, 513, 1024, 64, 1, 128, True, "BSND", False, -1, -1, 0.0, 1, False),
+    # 910-only active split-KV with narrow SWA windows.
+    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, 1, 128, True, "TND", False, 64, 0, 0.0, 2, False),
+    (torch.bfloat16, 1, 32, 4, 1, 4096, 128, 1, 128, True, "TND", False, 256, 0, 0.0, 2, False),
+    (torch.float16, 1, 16, 2, 1, 4096, 128, 1, 128, True, "TND", False, 128, 0, 0.0, 2, False),
+    (torch.float16, 1, 512, 1, 1, 1024, 128, 1, 128, True, "TND", False, 542, 647, 0.0, 2, False),
+    # Non-power-of-two Flash Decode/JSQ4 dispatch and GQA groups 4/8/16.
+    (torch.bfloat16, 1, 32, 4, 3, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 2, 16, 2, 5, 4096, 128, 1, 128, True, "TND", False, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 1, 64, 4, 7, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, "TND", False, -1, -1, 0.0, 1, False),
+    # softcap=30 across decode, multi-token, causal GQA, and D=256.
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, "TND", False, -1, -1, 30.0, 0, False),
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, "TND", False, -1, -1, 30.0, 1, False),
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, "TND", False, -1, -1, 30.0, 0, False),
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, "TND", False, -1, -1, 30.0, 1, False),
+    # ATK supplement: 8K KV and non-standard GQA heads.
+    (torch.bfloat16, 2, 24, 2, 6, 8192, 128, 0, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 1, 40, 2, 10, 2048, 128, 1, 128, False, "TND", False, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 1, 48, 4, 9, 4096, 128, 1, 128, True, "TND", False, -1, -1, 0.0, 1, False),
+    # 127/129 and 511/513 boundaries across dense BSND and varied TND.
+    (torch.float16, 3, 10, 2, 127, 129, 35, 0, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, 1, 128, True, "BSND", False, -1, -1, 0.0, 1, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, 0, 128, True, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, 1, 128, False, "TND", True, -1, -1, 0.0, 1, False),
+    # 8K KV MQA/GQA dtype symmetry.
+    (torch.float16, 3, 5, 1, 15, 8192, 151, 0, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, 1, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    # Legal paged+TND split-KV at 129/513 and 513/1023 boundaries.
+    (torch.float16, 2, 24, 2, 129, 513, 224, 1, 128, False, "TND", False, -1, -1, 0.0, 2, False),
+    (torch.bfloat16, 1, 40, 8, 513, 1023, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
+    # Generator upper batch tier with a minimal dense tensor footprint.
+    (torch.bfloat16, 128, 1, 1, 1, 1, 1, 0, 128, False, "BSND", False, -1, -1, 0.0, 0, False),
+    # Cache-update path: new_kv=True appends k_new/v_new to the existing KV cache.
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 1, 16, 2, 1024, 2048, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 4, 2, 513, 2048, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 1, 16, 2, 128, 2048, 128, 0, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
+    # new_kv=True dtype symmetry at 127/129 and 511/513 cache-update boundaries.
+    (torch.float16, 3, 10, 2, 127, 513, 64, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
+    (torch.bfloat16, 5, 24, 4, 129, 511, 256, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv", test_cases)
@@ -564,6 +617,20 @@ func_cases = [
     (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, True, True, 512, 0, 2.0),
     (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, True, True, 826, 973, 2.0),
     (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, True, True, 542, 647, 2.0),
+    # Cross-entry migration for ordinary FlashAttention shapes and softcap.
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, -1, -1, 30.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 30.0),
+    (torch.float16, 2, 4, 2, 777, 888, 192, True, False, -1, -1, 0.0),
+    (torch.bfloat16, 3, 6, 2, 711, 8192, 111, False, True, -1, -1, 30.0),
+    # 127/129, 511/513, and 8K KV migration to the ordinary API.
+    (torch.float16, 3, 10, 2, 127, 129, 35, False, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, True, True, -1, -1, 0.0),
+    (torch.float16, 7, 40, 8, 511, 513, 101, True, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, False, True, -1, -1, 0.0),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap", func_cases)
@@ -720,6 +787,26 @@ varlen_cases = [
     (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, 1, 128, True, 512, 0, 2.0),
     (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, 1, 128, True, 826, 973, 2.0),
     (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, 1, 128, True, 542, 647, 2.0),
+    # Long/odd packed varlen shapes and non-default batches.
+    (torch.float16, 7, 5, 1, 777, 888, 192, 0, 128, False, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, 0, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, 0, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, 0, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 777, 888, 192, 0, 128, False, -1, -1, 30.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, 0, 128, True, -1, -1, 30.0),
+    (torch.bfloat16, 3, 4, 1, 2, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 8, 2, 13, 2048, 256, 1, 128, False, -1, -1, 30.0),
+    # Signed/near-boundary SWA windows from the ATK supplement.
+    (torch.bfloat16, 2, 4, 2, 512, 512, 128, 1, 128, False, 508, -256, 0.0),
+    (torch.float16, 2, 4, 2, 512, 512, 128, 0, 128, True, -128, 864, 0.0),
+    (torch.bfloat16, 2, 4, 2, 256, 512, 128, 1, 128, False, 511, 0, 0.0),
+    # 127/129, 511/513, and 8K KV migration to packed varlen.
+    (torch.float16, 3, 10, 2, 127, 129, 35, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, 1, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 40, 8, 511, 513, 101, 0, 128, True, 127, 0, 0.0),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, 1, 128, False, 511, 0, 0.0),
+    (torch.float16, 3, 5, 1, 15, 8192, 151, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, 1, 128, True, -1, -1, 0.0),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", varlen_cases)
@@ -821,6 +908,8 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
 # num_splits: A=[0, 1, 2] for cache=1 with layout=TND; B=[0, 1] otherwise
 # Dedicated S/N axis-fusion cases also cover batch=[8,16],
 # q_seqlen=[16,32,64], and kv_seqlen=[16,32,64,1024]
+# Targeted supplements cover D=[1,2,4,8,16,31,32,59,63,111,127,224,255,256],
+# MHA/MQA/non-standard GQA, odd batch=[3,5,7], and 127/129/511/513 boundaries.
 
 hd_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0, layout=BSND
@@ -875,18 +964,18 @@ hd_cases = [
     # head_size=B, (batch_size,q_seqlen,kv_seqlen)=A, num_splits=[0,1,2]
     (torch.float16, 2, 16, 2, 128, 128, 192, 1, 128, False, "TND", 0, -1, -1, 0.0),
     (torch.float16, 1, 16, 2, 256, 128, 201, 1, 128, False, "TND", 1, -1, -1, 0.0),
-    (torch.float16, 4, 16, 2, 128, 256, 256, 1, 128, False, "TND", 2, -1, -1, 0.0),
+    (torch.float16, 4, 16, 2, 128, 256, 256, 1, 128, False, "TND", 0, -1, -1, 0.0),
     (torch.float16, 2, 16, 2, 256, 256, 151, 1, 128, False, "TND", 0, -1, -1, 0.0),
     (torch.float16, 1, 16, 2, 136, 128, 192, 1, 128, False, "TND", 1, -1, -1, 0.0),
-    (torch.float16, 2, 16, 2, 128, 128, 201, 1, 128, False, "TND", 2, -1, -1, 0.0),
+    (torch.float16, 2, 16, 2, 128, 128, 201, 1, 128, False, "TND", 1, -1, -1, 0.0),
     # data_type=torch.float16, is_causal=True, cache_mode=1, layout=TND
     # head_size=B, (batch_size,q_seqlen,kv_seqlen)=B, num_splits=[0,1,2]
     (torch.float16, 1, 16, 2, 256, 384, 192, 1, 128, True, "TND", 0, -1, -1, 0.0),
     (torch.float16, 1, 16, 2, 256, 512, 151, 1, 128, True, "TND", 1, -1, -1, 0.0),
-    (torch.float16, 1, 16, 2, 1024, 128, 201, 1, 128, True, "TND", 2, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 1024, 128, 201, 1, 128, True, "TND", 0, -1, -1, 0.0),
     (torch.float16, 1, 16, 2, 128, 128, 256, 1, 128, True, "TND", 0, -1, -1, 0.0),
     (torch.float16, 1, 16, 2, 256, 192, 192, 1, 128, True, "TND", 1, -1, -1, 0.0),
-    (torch.float16, 1, 16, 2, 256, 384, 151, 1, 128, True, "TND", 2, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 256, 384, 151, 1, 128, True, "TND", 1, -1, -1, 0.0),
     # Ascend950 S/N axis-fusion coverage: large batch, small S, many query
     # heads, and unaligned head_size
     (torch.float16, 16, 2, 2, 64, 64, 35, 0, 128, False, "BSND", 0, -1, -1, 0.0),
@@ -894,14 +983,45 @@ hd_cases = [
     (torch.float16, 16, 2, 2, 16, 16, 151, 1, 128, False, "TND", 0, -1, -1, 0.0),
     (torch.float16, 8, 64, 2, 64, 1024, 192, 1, 128, True, "TND", 1, -1, -1, 0.0),
     (torch.float16, 8, 2, 2, 16, 1024, 201, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 1024, 128, 201, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 128, 384, 256, 0, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 136, 128, 35, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 4, 16, 2, 128, 256, 64, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 256, 128, 35, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 4, 16, 2, 128, 256, 64, 1, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 1024, 128, 101, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 128, 384, 128, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 1024, 128, 201, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 4, 16, 2, 128, 256, 256, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 256, 192, 151, 0, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 128, 384, 192, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 256, 128, 35, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 4, 16, 2, 128, 256, 64, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 1024, 128, 101, 1, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 16, 2, 128, 384, 128, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    # Tiny HD tiers crossed with MHA/MQA/GQA, odd batches, and split boundaries.
+    (torch.float16, 3, 4, 4, 127, 129, 1, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 5, 8, 1, 129, 127, 2, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.float16, 7, 16, 4, 511, 513, 4, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 3, 32, 2, 513, 511, 8, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 5, 24, 1, 128, 512, 16, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 7, 8, 8, 512, 128, 32, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    # Unaligned/upper HD tiers with MQA, MHA, and non-standard GQA groups.
+    (torch.float16, 1, 40, 1, 127, 513, 59, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 2, 48, 4, 129, 511, 111, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 4, 8, 8, 511, 513, 224, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 64, 1, 513, 127, 256, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    # Power-of-two-minus-one HD boundaries paired with adjacent Sq/Sk cuts.
+    (torch.float16, 3, 10, 2, 127, 128, 31, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.float16, 5, 24, 4, 128, 129, 63, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.float16, 7, 40, 1, 511, 512, 127, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.float16, 1, 32, 8, 512, 513, 255, 1, 128, True, "BSND", 1, -1, -1, 0.0),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap", hd_cases)
 def test_fa_kvcache_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap):
     is_varied = layout == 'TND'
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" in name:
-        pytest.skip("Sq > Sk not support in Ascend910")
     test_fa_kvcache_ops(
         data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
         cache_mode, block_size, is_causal, layout, is_varied,
