@@ -70,14 +70,11 @@ struct FwdMaskDerivation {
     uint32_t maskType;
 };
 
-// Window normalization + mask-type derivation, mirroring the host tiling code,
-// but bounding the KV side with a host-known upper bound (cache capacity)
-// instead of the device-side actual max KV seqlen, so it is usable on the
-// scheduler-metadata path where no D2H sync is allowed. Both sides compare
-// against the KV bound (matching the host's "both sides vs seqlen_k" rule);
-// an over-long window collapses to "no window", and a window that covers the
-// whole sequence masks nothing, so a bound larger than the actual seqlen is
-// still semantically identical.
+// Window normalization + mask-type derivation, mirroring the host tiling code.
+// The caller provides the logical KV bound (or cache capacity for the KV-cache
+// API), so this path does not need a D2H sync to inspect the actual lengths.
+// Both sides compare against the KV bound, matching the host's
+// "both sides vs seqlen_k" rule.
 static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
                                        int64_t /*max_seqlen_q*/, int64_t max_seqlen_k_bound)
 {
@@ -162,46 +159,57 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
     return meta;
 }
 
-// async copy dropout tiling data
-static void PatchTilingDropoutFields(const at::Tensor &schedMd, uint64_t tilingOffset,
+// Patch fields that are only known by the forward consuming the metadata.
+// The copies run on the current stream after the AICPU metadataDone event.
+static void PatchTilingRuntimeFields(const at::Tensor &schedMd, uint64_t tilingOffset,
                                      float dropoutValue, uint8_t *pDevice,
-                                     uint8_t *dropMaskDevice)
+                                     uint8_t *dropMaskDevice,
+                                     std::optional<uint32_t> maxNumBlocksPerBatch = std::nullopt)
 {
-    if (dropMaskDevice == nullptr) {
+    if (dropMaskDevice == nullptr && !maxNumBlocksPerBatch.has_value()) {
         return;
     }
-    struct DropFields {
+    struct RuntimeFields {
         float dropoutValue;
+        uint32_t maxNumBlocksPerBatch;
         uint64_t pDevice;
         uint64_t dropMaskDevice;
     };
     // The Host2Device staging copy is async and reads the source after this function
     // returns; static + same-stream serialization keeps it alive and safe.
     static at::Tensor patchDev;
-    static DropFields fields;
+    static RuntimeFields fields;
     if (!patchDev.defined()) {
-        patchDev = torch::empty({static_cast<int64_t>(sizeof(DropFields))},
+        patchDev = torch::empty({static_cast<int64_t>(sizeof(RuntimeFields))},
                                 at::device(at::kPrivateUse1).dtype(at::kByte));
     }
     fields.dropoutValue = dropoutValue;
+    fields.maxNumBlocksPerBatch = maxNumBlocksPerBatch.value_or(0);
     fields.pDevice = reinterpret_cast<uint64_t>(pDevice);
     fields.dropMaskDevice = reinterpret_cast<uint64_t>(dropMaskDevice);
 
-    at::Tensor patchCpu = torch::from_blob(&fields, {static_cast<int64_t>(sizeof(DropFields))},
+    at::Tensor patchCpu = torch::from_blob(&fields, {static_cast<int64_t>(sizeof(RuntimeFields))},
                                            at::TensorOptions().dtype(torch::kUInt8));
     patchDev.copy_(patchCpu);  // H2D staging, current stream
 
     auto tilingView = schedMd.narrow(0, static_cast<int64_t>(tilingOffset),
                                      static_cast<int64_t>(sizeof(FAInferTilingData)));
-    tilingView.narrow(0, offsetof(FAInferTilingData, dropoutValue), 4)
-        .view(torch::kFloat32)
-        .copy_(patchDev.narrow(0, offsetof(DropFields, dropoutValue), 4).view(torch::kFloat32));
-    tilingView.narrow(0, offsetof(FAInferTilingData, pDevice), 8)
-        .view(torch::kInt64)
-        .copy_(patchDev.narrow(0, offsetof(DropFields, pDevice), 8).view(torch::kInt64));
-    tilingView.narrow(0, offsetof(FAInferTilingData, dropMaskDevice), 8)
-        .view(torch::kInt64)
-        .copy_(patchDev.narrow(0, offsetof(DropFields, dropMaskDevice), 8).view(torch::kInt64));
+    if (dropMaskDevice != nullptr) {
+        tilingView.narrow(0, offsetof(FAInferTilingData, dropoutValue), 4)
+            .view(torch::kFloat32)
+            .copy_(patchDev.narrow(0, offsetof(RuntimeFields, dropoutValue), 4).view(torch::kFloat32));
+        tilingView.narrow(0, offsetof(FAInferTilingData, pDevice), 8)
+            .view(torch::kInt64)
+            .copy_(patchDev.narrow(0, offsetof(RuntimeFields, pDevice), 8).view(torch::kInt64));
+        tilingView.narrow(0, offsetof(FAInferTilingData, dropMaskDevice), 8)
+            .view(torch::kInt64)
+            .copy_(patchDev.narrow(0, offsetof(RuntimeFields, dropMaskDevice), 8).view(torch::kInt64));
+    }
+    if (maxNumBlocksPerBatch.has_value()) {
+        tilingView.narrow(0, offsetof(FAInferTilingData, maxNumBlocksPerBatch), 4)
+            .view(torch::kInt32)
+            .copy_(patchDev.narrow(0, offsetof(RuntimeFields, maxNumBlocksPerBatch), 4).view(torch::kInt32));
+    }
 }
 
 std::vector<at::Tensor>
@@ -758,7 +766,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                                      at::device(at::kPrivateUse1).dtype(at::kByte));
         // The AICPU tiling does not carry the dropout fields; patch them in
         // with stream-ordered copies (after the AICPU metadataDone event).
-        PatchTilingDropoutFields(schedMd, fa_metadata::TilingOffset(hasMask),
+        PatchTilingRuntimeFields(schedMd, fa_metadata::TilingOffset(hasMask),
                                  1.0f / (1.0f - p_dropout),
                                  return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
                                  has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
@@ -1066,12 +1074,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         maskDevice = hasMask ? metaBase : nullptr;
         workspace_tensor = at::empty({static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim))},
                                      at::device(at::kPrivateUse1).dtype(at::kByte));
-        // Same dropout patch as mha_fwd: stream-ordered copies fill the
-        // AICPU tiling's missing dropout fields.
-        PatchTilingDropoutFields(schedMd, fa_metadata::TilingOffset(hasMask),
+        // Dropout pointers and the physical page-table row width are only
+        // available at forward time; patch them after AICPU metadata creation.
+        PatchTilingRuntimeFields(schedMd, fa_metadata::TilingOffset(hasMask),
                                  1.0f / (1.0f - p_dropout),
                                  return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
-                                 has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
+                                 has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr,
+                                 paged_KV ? std::optional<uint32_t>(static_cast<uint32_t>(max_num_blocks_per_seq))
+                                          : std::nullopt);
     } else {
         at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
                                                 at::device(c10::kCPU).dtype(at::kByte));
@@ -1531,6 +1541,7 @@ at::Tensor get_scheduler_metadata(
         cuSeqlensQDev = cu_q.data_ptr();
     }
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
+    TORCH_CHECK(!page_size.has_value() || page_size.value() > 0, "page_size must be positive");
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative (0.0 disables softcap)");

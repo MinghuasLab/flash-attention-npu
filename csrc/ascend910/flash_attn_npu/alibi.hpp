@@ -41,7 +41,8 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
     }
     
     if (baseColIdx < 0) {
-        AscendC::Abs(workUb, workUb, AscendC::Std::min(-baseColIdx, count));
+        AscendC::Abs(workUb, workUb,
+            AscendC::Std::min(-baseColIdx, static_cast<int64_t>(count)));
         AscendC::PipeBarrier<PIPE_V>();
     }
 }
