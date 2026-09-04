@@ -282,6 +282,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
             epilogueOnlineSoftmax.init(
                 resource, scaleValue, softcapValue, gPret, stridePret, gDrop, strideDrop, maxKvSeqlen);
@@ -289,7 +290,7 @@ namespace SplitFuse {
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
-
+            uint32_t softmaxPingPongFlag = 0;
             embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
             embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
             groupSize = qHeads / kvHeads;
@@ -370,7 +371,8 @@ namespace SplitFuse {
                                 descriptors,
                                 currentTaskStateSlot,
                                 issuedStackCount,
-                                pipelineDrain
+                                pipelineDrain,
+                                softmaxPingPongFlag
                             );
 
                             if (isSplitKV) {
@@ -455,7 +457,8 @@ namespace SplitFuse {
                         descriptors,
                         currentTaskStateSlot,
                         issuedStackCount,
-                        pipelineDrain
+                        pipelineDrain,
+                        softmaxPingPongFlag
                     );
                 }
             }
@@ -499,6 +502,7 @@ namespace SplitFuse {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 #endif
             AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -540,7 +544,8 @@ namespace SplitFuse {
             StackDescriptor (&descriptors)[STACK_SLOTS],
             const uint32_t& currentTaskStateSlot,
             uint32_t& issuedStackCount,
-            uint32_t pipelineDrain
+            uint32_t pipelineDrain,
+            uint32_t& softmaxPingPongFlag
         ) {
             auto& gQ = globalTensors.gQ;
             auto& gK = globalTensors.gK;
@@ -845,6 +850,7 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     desc.taskStateSlot,
                                     qkReady,
+                                    softmaxPingPongFlag,
                                     triUp,
                                     triDown,
                                     kvSStartIdx,
@@ -865,6 +871,7 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     desc.taskStateSlot,
                                     qkReady,
+                                    softmaxPingPongFlag,
                                     triUp,
                                     triDown,
                                     kvSStartIdx,
@@ -889,6 +896,7 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     desc.taskStateSlot,
                                     qkReady,
+                                    softmaxPingPongFlag,
                                     isSplitKV);
                             } else {
                                 epilogueOnlineSoftmax(
@@ -904,6 +912,7 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     desc.taskStateSlot,
                                     qkReady,
+                                    softmaxPingPongFlag,
                                     false);
                             }
                         }
@@ -938,6 +947,7 @@ namespace SplitFuse {
                                     curStackTileMod,
                                     desc.taskStateSlot,
                                     qkReady,
+                                    softmaxPingPongFlag,
                                     kvSStartIdx,
                                     doTriUPreMask,
                                     doTriUNextMask,
@@ -964,6 +974,7 @@ namespace SplitFuse {
                                 curStackTileMod,
                                 desc.taskStateSlot,
                                 qkReady,
+                                softmaxPingPongFlag,
                                 (flashDecodeFlag != 0U) ? isSplitKV : false,
                                 startsWithMaskTile,
                                 startsWithMaskThenNomaskFlag);
@@ -984,6 +995,7 @@ namespace SplitFuse {
                                 curStackTileMod,
                                 desc.taskStateSlot,
                                 qkReady,
+                                softmaxPingPongFlag,
                                 isSplitKV);
                         } else {
                             epilogueOnlineSoftmax(
@@ -999,6 +1011,7 @@ namespace SplitFuse {
                                 curStackTileMod,
                                 desc.taskStateSlot,
                                 qkReady,
+                                softmaxPingPongFlag,
                                 false);
                         }
                     }

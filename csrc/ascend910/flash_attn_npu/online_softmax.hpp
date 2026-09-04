@@ -80,7 +80,7 @@ public:
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
@@ -1029,7 +1029,7 @@ public:
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
-        Arch::CrossCoreFlag qkReady, bool isSplitKV = false,
+        Arch::CrossCoreFlag qkReady, uint32_t softmaxPingPongFlag, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
     {   
         uint32_t rowNum = actualBlockShape.m();
@@ -1055,7 +1055,7 @@ public:
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
@@ -1079,7 +1079,7 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop =
@@ -1110,6 +1110,9 @@ public:
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
             }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
+            }
         }
     }
 
@@ -1117,7 +1120,8 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, int64_t triUp, uint32_t triDown,
+        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, 
+        uint32_t softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
@@ -1180,7 +1184,7 @@ public:
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
@@ -1214,7 +1218,7 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowNumCurLoop = (delayedRowLoopIdx == rowLoopNum - 1) ?
                     (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
@@ -1273,6 +1277,9 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 }
             }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
+            }
         }
     }
 
@@ -1280,7 +1287,8 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, bool doTriUPreMask,
+        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, 
+        uint32_t softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
         int32_t nextTokenEndLen, bool isSplitKV = false)
     {
@@ -1356,7 +1364,7 @@ public:
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop =
@@ -1398,7 +1406,7 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowNumCurLoop =
                     (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
@@ -1502,6 +1510,9 @@ public:
                     }
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 }
+            }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
             }
         }
     }

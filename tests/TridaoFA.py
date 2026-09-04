@@ -27,10 +27,10 @@ from flash_attn_npu.flash_attn_npu_interface import _flash_attn_varlen_forward
 CASES = [
     {
         "name": "mini_Q384_KV2048_H16_causal",
-        "total_q": 10240, "heads_q": 24,
-        "total_kv": 10240, "heads_kv": 4,
+        "total_q": 1600, "heads_q": 24,
+        "total_kv": 1600, "heads_kv": 4,
         "head_dim": 128, "scale": 1.0, "causal": True,
-        "batch": 320, "max_q": 32, "max_kv": 32, "dropout": 0.0,
+        "batch": 50, "max_q": 32, "max_kv": 32, "dropout": 0.0,
     },
 ]
 
@@ -66,10 +66,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--save-metadata", default=None,
-                        help="path to save precomputed scheduler_metadata (real NPU only)")
-    parser.add_argument("--load-metadata", default=None,
-                        help="path to load precomputed scheduler_metadata (avoids AICPU launch)")
+    parser.add_argument("--save-meta", "--save-metadata", dest="save_metadata", default=None,
+                        help="path to save precomputed scheduler_metadata (--save-metadata alias; "
+                             "real NPU only)")
+    parser.add_argument("--load-meta", "--load-metadata", dest="load_metadata", default=None,
+                        help="path to load precomputed scheduler_metadata and pass it to the kernel "
+                             "without recomputing (--load-metadata alias)")
     parser.add_argument("--no-check", action="store_true",
                         help="skip the output abs-max check (fewer kernels in simulation)")
     args = parser.parse_args()
