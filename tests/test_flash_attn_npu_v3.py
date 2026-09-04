@@ -167,6 +167,8 @@ test_cases = [
     # 6) Sk>>Sq left-infinite band (complement; no empty prefix)
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "TND", False, -1, 100, 0.0, 0, False),
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0.0, 0, False),
+
+    
     # AppendKV
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
