@@ -13,6 +13,7 @@ from . import flash_attn_npu_4  # Registers operators with PyTorch
 
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
 else:
     def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
         def wrap(func):
@@ -20,7 +21,14 @@ else:
         if fn is None:
             return wrap
         return fn
+    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        def wrap(func):
+            return func
+        if fn is None:
+            return wrap
+        return fn
     _torch_custom_op_wrapper = noop_custom_op_wrapper
+    _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
 def maybe_contiguous(x):
@@ -138,6 +146,167 @@ def _flash_attn_forward(
     return out, softmax_lse
 
 
+
+# ----------------------------------------------------------------------
+# Scheduler metadata torch.compile support
+#
+# Keep these constants in sync with:
+#   csrc/ascend910/flash_attn_npu_4/fa_metadata_args.h
+#
+# Real metadata contract:
+#
+#   no mask:
+#       shape = (2376,)
+#
+#   causal / local mask:
+#       shape = (2376 + 2048 * 2048,)
+#
+#   dtype  = torch.uint8
+#   device = NPU
+#   stride = (1,)
+#
+# The custom op prevents TorchDynamo from tracing into the raw pybind
+# get_scheduler_metadata() implementation.
+# ----------------------------------------------------------------------
+
+_SCHEDULER_METADATA_TILING_BYTES = 2376
+_SCHEDULER_METADATA_MASK_BYTES = 2048 * 2048
+
+
+def _scheduler_metadata_has_mask(
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    max_seqlen_k: int,
+) -> bool:
+    """Mirror the mask/no-mask decision of DeriveFwdMask in flash_api.cpp."""
+
+    # DeriveFwdMask:
+    #
+    # A window bound covering the whole K sequence is equivalent to
+    # an infinite window and therefore collapses to -1.
+    if max_seqlen_k > 0 and window_size_left >= max_seqlen_k:
+        window_size_left = -1
+
+    if max_seqlen_k > 0 and window_size_right >= max_seqlen_k:
+        window_size_right = -1
+
+    # Causal attention forces the right window to zero.
+    if causal:
+        window_size_right = 0
+
+    is_causal = (
+        window_size_left < 0
+        and window_size_right == 0
+    )
+
+    is_local = (
+        (
+            window_size_left >= 0
+            or window_size_right >= 0
+        )
+        and not is_causal
+    )
+
+    return is_causal or is_local
+
+
+@torch.library.custom_op(
+    "flash_attn_npu_4::_get_scheduler_metadata",
+    mutates_args=(),
+)
+def _get_scheduler_metadata_op(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    page_size: Optional[int],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    return flash_attn_npu_4.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        page_size,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        softmax_scale,
+    )
+
+
+@_torch_register_fake_wrapper(
+    "flash_attn_npu_4::_get_scheduler_metadata"
+)
+def _get_scheduler_metadata_fake(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    page_size: Optional[int],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+
+    has_mask = _scheduler_metadata_has_mask(
+        causal,
+        window_size_left,
+        window_size_right,
+        max_seqlen_k,
+    )
+
+    metadata_bytes = (
+        _SCHEDULER_METADATA_TILING_BYTES
+        + (
+            _SCHEDULER_METADATA_MASK_BYTES
+            if has_mask
+            else 0
+        )
+    )
+
+    return torch.empty(
+        (metadata_bytes,),
+        dtype=torch.uint8,
+        device=cache_seqlens.device,
+    )
+
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
@@ -168,7 +337,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = flash_attn_npu_4.get_scheduler_metadata(
+    scheduler_metadata = _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
         max_seqlen_k,
@@ -190,6 +359,60 @@ def get_scheduler_metadata(
         softmax_scale,
     )
     return scheduler_metadata
+@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_forward")
+def _flash_attn_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    page_table: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    sm_margin: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Metadata-only fake for V4 A2 forward. Returns (out, lse)."""
+    if out_ is not None:
+        raise TypeError(
+            "Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported."
+        )
+
+    is_varlen_q = cu_seqlens_q is not None
+    # Real mha_fwd uses empty_like(q) when out_ is absent.
+    out = torch.empty_like(q)
+
+    if is_varlen_q:
+        # (num_heads, total_q)
+        num_heads = q.shape[1]
+        total_q = q.shape[0]
+        softmax_lse = torch.empty(
+            (num_heads, total_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        # (batch_size, num_heads, seqlen_q)
+        batch_size = q.shape[0]
+        seqlen_q = q.shape[1]
+        num_heads = q.shape[2]
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
+
+    return out, softmax_lse
 
 
 @_torch_custom_op_wrapper(
@@ -242,6 +465,46 @@ def _flash_attn_backward_op(
         softcap,
         deterministic,
         0,  # sm_margin
+    )
+    return softmax_d
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_backward_op")
+def _flash_attn_backward_op_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    deterministic: bool,
+) -> torch.Tensor:
+    """Metadata-only fake for V4 A2 backward_op. Returns softmax_d; mutates dq/dk/dv."""
+    is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        nheads = q.shape[1]
+        # Real mha_bwd always allocates (batch, nheads, max_seqlen_q).
+        seqlen_q = max_seqlen_q
+    else:
+        batch_size = q.shape[0]
+        nheads = q.shape[2]
+        seqlen_q = q.shape[1]
+
+    softmax_d = torch.empty(
+        (batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device
     )
     return softmax_d
 
@@ -680,6 +943,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.aux_tensors = aux_tensors
         ctx.aux_scalars = aux_scalars
         ctx.head_size_og = q.size(-1)
+
+        # Do not materialize unused output gradients as zero tensors.
+        # V4 backward does not support dlse; unused LSE gradients
+        # should therefore arrive in backward as None.
+        ctx.set_materialize_grads(False)
+
+        # softmax_lse is an auxiliary output; V4 backward does not
+        # support gradients with respect to LSE.
+        if return_lse:
+            ctx.mark_non_differentiable(softmax_lse)
         return (out, softmax_lse) if return_lse else out
 
     @staticmethod
@@ -687,10 +960,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = (
             ctx.saved_tensors
         )
-        # torch_npu may pass a zero tensor (not None) for unused LSE grads.
-        dlse = args[0] if ctx.return_lse and len(args) > 0 else None
-        if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
-            dlse = None
+        # softmax_lse is non-differentiable in V4.
+        # The underlying backward operator does not support dlse.
+        dlse = None
         win_l, win_r = ctx.window_size
         if win_l is not None and win_l < 0:
             win_l = None
