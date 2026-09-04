@@ -18,6 +18,8 @@
 #   CI_TEST_DIRECT_FILE         指定时只跑该文件 (绕过 tests/)
 #   CI_TEST_DIRECT_FILTER       直接模式的 -k 过滤
 #   CI_CONTAINER_DEVICE         容器内逻辑设备号 (默认 0)
+#   GOLDEN_CACHE_MODE/DIR       golden reference cache mode and container path
+#   GOLDEN_CACHE_STATS_FILE     xdist-safe tab-separated cache event output
 
 set -euo pipefail
 
@@ -32,6 +34,26 @@ die() { printf '[CI-test][ERROR] %s\n' "$*" >&2; exit 1; }
 
 LOG_DIR="${CI_TEST_LOG_DIR:-/tmp/ci_test_logs}"
 mkdir -p "$LOG_DIR"
+export GOLDEN_CACHE_STATS_FILE="${GOLDEN_CACHE_STATS_FILE:-$LOG_DIR/golden_cache_events.tsv}"
+CACHE_STATS_FILE="$GOLDEN_CACHE_STATS_FILE"
+
+cache_artifact_count() {
+  if [ -n "${GOLDEN_CACHE_DIR:-}" ] && [ -d "$GOLDEN_CACHE_DIR" ]; then
+    { find "$GOLDEN_CACHE_DIR" -type f -name 'case_*.tar.gz' 2>/dev/null || true; } | wc -l | tr -d ' '
+  else
+    printf '0\n'
+  fi
+}
+
+CACHE_ARTIFACTS_BEFORE=0
+if [ "${GOLDEN_CACHE_MODE:-off}" != "off" ] && [ "${GOLDEN_CACHE_MODE:-off}" != "0" ]; then
+  : > "$CACHE_STATS_FILE"
+  CACHE_ARTIFACTS_BEFORE="$(cache_artifact_count)"
+  log "golden cache: mode=${GOLDEN_CACHE_MODE} dir=${GOLDEN_CACHE_DIR:-<unset>} artifacts_before=$CACHE_ARTIFACTS_BEFORE stats=$CACHE_STATS_FILE"
+else
+  : > "$CACHE_STATS_FILE"
+  log "golden cache: disabled"
+fi
 
 log "repo=$REPO_ROOT device=$DEVICE mode=${CI_MODE:-quick}"
 log "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
@@ -101,6 +123,24 @@ run_pytest() {
   fi
 }
 
+summarize_golden_cache() {
+  local artifacts_after
+  artifacts_after="$(cache_artifact_count)"
+  if [ ! -s "$CACHE_STATS_FILE" ]; then
+    log "[golden-cache-summary] no events recorded artifacts_before=$CACHE_ARTIFACTS_BEFORE artifacts_after=$artifacts_after"
+    return
+  fi
+  awk -F '\t' '
+    $2 == "test" { count[$1]++ }
+    END {
+      printf "[CI-test] [golden-cache-summary] hit=%d miss=%d refresh=%d read_error=%d write_ok=%d write_error=%d disabled=%d\n",
+        count["hit"], count["miss"], count["refresh"], count["read_error"],
+        count["write_ok"], count["write_error"], count["disabled"]
+    }
+  ' "$CACHE_STATS_FILE"
+  log "[golden-cache-summary] artifacts_before=$CACHE_ARTIFACTS_BEFORE artifacts_after=$artifacts_after"
+}
+
 log "running pytest (mode=$MODE workers=$TEST_WORKERS sample=${SAMPLE_ARG:-<none>})"
 
 # 直接模式: CI_TEST_DIRECT_FILE 指定时, 只跑指定文件 (绕过 tests/)
@@ -110,7 +150,9 @@ else
   run_pytest "tests/" "$LOG_DIR/all_tests.log"
 fi
 
-FAILED_CASES="$(cat "$FAILED_FILE" 2>/dev/null | tr '\n' ' ')"
+summarize_golden_cache
+
+FAILED_CASES="$(tr '\n' ' ' < "$FAILED_FILE" 2>/dev/null || true)"
 if [ -n "$FAILED_CASES" ]; then
   die "pytest FAILED targets:$FAILED_CASES"
 fi
