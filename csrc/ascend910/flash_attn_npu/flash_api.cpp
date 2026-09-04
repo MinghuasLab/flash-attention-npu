@@ -1541,8 +1541,8 @@ at::Tensor get_scheduler_metadata(
         cuSeqlensQDev = cu_q.data_ptr();
     }
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
+    TORCH_CHECK(!page_size.has_value() || page_size.value() > 0, "page_size must be positive");
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
-    TORCH_CHECK(!page_size.has_value() || ps > 0, "page_size must be positive");
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative (0.0 disables softcap)");
     // Mask axes are fully derived on host from the declared seqlen bounds; the
