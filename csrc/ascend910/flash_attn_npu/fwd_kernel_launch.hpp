@@ -33,7 +33,7 @@
 // This repo's FAInfer has no append-KV (kNew/vNew) parameters.
 #define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT) \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT,                        \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT> \
+                       Catlass::Epilogue::LseModeT::NONE, SOFTCAP, RETURN_SOFTMAX, DROPOUT> \
         <<<a.blockDim, nullptr, a.aclStream>>>(                                              \
             a.fftsAddr, a.qDevice, a.kDevice, a.vDevice, a.maskDevice, a.blockTableDevice,   \
             a.oDevice, a.softmaxLseDevice, a.qSeqDevice, a.kvSeqDevice,                      \

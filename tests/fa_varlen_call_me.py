@@ -33,9 +33,9 @@ import torch
 import torch_npu
 
 CASES = [
-    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 60, "heads_q": 6,
-     "total_kv": 60, "heads_kv": 1, "head_dim": 128, "scale": 1.0,
-     "causal": False, "batch": 2, "max_q": 30, "max_kv": 30, "dropout": 0.0},
+    {"name": "tnd_T131475_H8_nocausal_dropout0.1", "total_q": 1024, "heads_q": 1,
+     "total_kv": 2048, "heads_kv": 1, "head_dim": 128, "scale": 1.0,
+     "causal": True, "batch": 4, "max_q": 256, "max_kv": 512, "dropout": 0.0},
     {"name": "tnd_T1536_H16_causal_dropout0.1", "total_q": 131475, "heads_q": 16,
      "total_kv": 131475, "heads_kv": 16, "head_dim": 128, "scale": 1.0,
      "causal": True, "batch": 512, "max_q": 279, "max_kv": 279, "dropout": 0.0},
