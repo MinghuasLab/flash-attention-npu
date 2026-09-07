@@ -267,7 +267,6 @@ mha_fwd(at::Tensor q,
     uint8_t *tilingDevice = nullptr;
     uint8_t *maskDevice = nullptr;
     uint8_t *metaBase = nullptr;
-    uint64_t workSpaceSize = 0;
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
     FAInferTilingData tilingData{};
@@ -315,10 +314,6 @@ mha_fwd(at::Tensor q,
         metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;
-        workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
-        if (workSpaceSize < fa_metadata::WS_FLOOR) {
-            workSpaceSize = fa_metadata::WS_FLOOR;
-        }
     } else {
         at::Tensor cu_seqlen_q_cpu;
         if (is_varlen_q) {
@@ -405,10 +400,6 @@ mha_fwd(at::Tensor q,
             launchBlockDim = tilingData.fdActiveCoreNum;
             combineBlockDim = tilingData.fdCombineBlockDim;
         }
-        if (tilingData.workSpaceSize < fa_metadata::WS_FLOOR) {
-            tilingData.workSpaceSize = fa_metadata::WS_FLOOR;
-        }
-        workSpaceSize = tilingData.workSpaceSize;
 
         at::Tensor tiling_cpu = at::empty(
             {static_cast<int64_t>(sizeof(FAInferTilingData))},
@@ -430,10 +421,6 @@ mha_fwd(at::Tensor q,
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
-    auto workspace = at::empty(
-        {static_cast<int64_t>(workSpaceSize)},
-        at::device(at::kPrivateUse1).dtype(at::kByte));
-
     at::Tensor softmaxlse = at::empty(
         {0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (return_softmax_lse && is_varlen_q) {
@@ -450,6 +437,12 @@ mha_fwd(at::Tensor q,
     if (flashDecodeEnabled && !return_softmax_lse) {
         fd_lse = at::empty({num_heads, sizes[0]},
                            at::device(at::kPrivateUse1).dtype(at::kFloat));
+    }
+    at::Tensor workspace;
+    if (flashDecodeEnabled) {
+        workspace = at::empty(
+            {static_cast<int64_t>(tilingData.workSpaceSize)},
+            at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================
@@ -472,7 +465,10 @@ mha_fwd(at::Tensor q,
     auto lseDev = return_softmax_lse
         ? static_cast<uint8_t*>(softmaxlse.data_ptr())
         : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
-    auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
+    uint8_t *wsDev = nullptr;
+    if (flashDecodeEnabled) {
+        wsDev = static_cast<uint8_t*>(workspace.data_ptr());
+    }
     auto tilDev = tilingDevice;
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
