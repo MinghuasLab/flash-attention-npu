@@ -73,8 +73,7 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
     FwdMaskDerivation derived;
     derived.is_causal = (window_left < 0 && window_right == 0);
     derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    // Match the host tiling: infinite local side -> finite KV bound, not
-    // SPARSE_MODE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+    // infinite local side -> finite KV bound, not INT_MAX.
     if (derived.is_local) {
         if (window_left < 0) {
             window_left = max_seqlen_k_bound;
