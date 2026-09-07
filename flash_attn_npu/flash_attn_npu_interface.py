@@ -964,22 +964,20 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         num_heads, head_size = q.shape[1], q.shape[2]
         if block_table is not None:
             # Paged KV: k/v are (num_blocks, page_size, num_heads_k, headdim);
-            # the metadata seqlen bound is the cache capacity, matching the
-            # flash_attn_with_kvcache contract.
+            # scheduler metadata uses the logical max KV length for SWA. The
+            # physical page-table stride is supplied by mha_varlen_fwd.
             page_size = k.shape[1]
             num_heads_k = k.shape[2]
-            metadata_max_seqlen_k = block_table.shape[1] * page_size
         else:
             page_size = None
             num_heads_k = k.shape[1]
-            metadata_max_seqlen_k = max_seqlen_k
         cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         if alibi_slopes is None:
             alibi_slopes_batch_stride = 0
         else:
             alibi_slopes_batch_stride = alibi_slopes.shape[1] if alibi_slopes.dim() == 2 else 0
         scheduler_metadata = get_scheduler_metadata(
-            batch_size, max_seqlen_q, metadata_max_seqlen_k, num_heads, num_heads_k, head_size,
+            batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
             cache_seqlens,
             qkv_dtype=q.dtype,
             cu_seqlens_q=cu_seqlens_q,
@@ -1759,7 +1757,7 @@ def get_scheduler_metadata(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,   # 0.0 means deactivated
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
-    alibi_slopes_batch_stride=0,  
+    alibi_slopes_batch_stride=0,
 ):
     """Precompute the forward scheduler metadata (tiling, optional mask, and —
     for paged KV cache — the flash-decode split schedule) on the AICPU. Pass the

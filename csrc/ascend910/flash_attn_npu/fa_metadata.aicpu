@@ -81,6 +81,21 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     }
     tilingData->maxKvSeqlen = maxKvSeqlen;
 
+    // A declared KV bound can exceed every actual per-batch length. Clamp a
+    // local side that already covers the actual maximum; this preserves the
+    // mask semantics while retaining MASK_BAND for stable host dispatch.
+    if (metaArgs->maskType == MASK_TYPE_BAND && maxKvSeqlen > 0) {
+        const int64_t actualMaxKv = static_cast<int64_t>(maxKvSeqlen);
+        if (tilingData->windowSizeLeft < 0 ||
+            tilingData->windowSizeLeft >= actualMaxKv) {
+            tilingData->windowSizeLeft = actualMaxKv;
+        }
+        if (tilingData->windowSizeRight < 0 ||
+            tilingData->windowSizeRight >= actualMaxKv) {
+            tilingData->windowSizeRight = actualMaxKv;
+        }
+    }
+
     const uint64_t blockDim = static_cast<uint64_t>(metaArgs->blockDim);
     tilingData->mm1OutSize = fa_metadata::Mm1OutSize(blockDim);
     tilingData->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);

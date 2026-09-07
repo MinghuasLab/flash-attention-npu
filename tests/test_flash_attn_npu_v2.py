@@ -603,6 +603,10 @@ varlen_cases = [
     (torch.float16, 5, 5, 1, 777, 888, 128, True, -1, -1, 0.0, 0, 128, 0.2, False),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -1, -1, 30.0, 0, 128, 0.1, False),
     (torch.float16, 2, 4, 2, 512, 512, 128, False, -1, -1, 0.0, 1, 128, 0.3, False),
+    # Issue #196 (Ascend 910): paged-varlen metadata must normalize SWA with
+    # the logical max KV length rather than the page-aligned cache capacity.
+    (torch.bfloat16, 2, 4, 2, 256, 512, 128, False, 511, 0, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, False, 511, 0, 0.0, 1, 128, 0.0, False),
     # Dropout backward regression cases from the former standalone v2_bwd test.
     (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, 0, 128, 0.3, False),
     (torch.float16, 5, 5, 1, 777, 888, 128, False, -1, -1, 0.0, 0, 128, 0.2, False),
@@ -746,3 +750,160 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
         assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+
+
+def test_fa_varlen_paged_swa_overprovisioned_block_table():
+    """V2 forward must use the physical block-table row width for paging."""
+
+    data_type = torch.bfloat16
+    seqlens_q, seqlens_k = [17, 11], [129, 65]
+    max_seqlen_q, max_seqlen_k = max(seqlens_q), max(seqlens_k)
+    batch_size, num_heads, kv_heads, head_size, block_size = 2, 2, 1, 64, 64
+    logical_blocks = (max_seqlen_k + block_size - 1) // block_size
+    block_table_width = logical_blocks + 2
+    num_blocks = batch_size * block_table_width
+    generator = torch.Generator().manual_seed(196)
+
+    query = make_packed_random_tensor(
+        seqlens_q, max_seqlen_q, num_heads, head_size, data_type,
+        generator=generator, device="npu",
+    )
+    key = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size), data_type,
+        generator=generator, device="npu",
+    )
+    value = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size), data_type,
+        generator=generator, device="npu",
+    )
+    block_table = torch.arange(num_blocks, dtype=torch.int32).reshape(
+        batch_size, block_table_width
+    ).npu()
+    cu_q, cu_k = make_cu_seqlens(seqlens_q), make_cu_seqlens(seqlens_k)
+    scale = head_size ** -0.5
+    window_size = (max_seqlen_k, 0)
+
+    output_npu = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_q.npu(),
+        cu_k.npu(),
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_table,
+    )
+
+    query_ref = query.cpu()
+    key_ref = key.cpu()
+    value_ref = value.cpu()
+    query_padded = pad_packed_tensor(query_ref, seqlens_q, max_seqlen_q)
+    key_padded, value_padded = gather_paged_kv_batch(
+        key_ref, value_ref, block_table.cpu(), max_seqlen_k, block_size
+    )
+    q_valid, _, atten_mask = make_padded_varlen_mask(
+        seqlens_q,
+        seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        False,
+        *window_size,
+    )
+    golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
+        query_padded,
+        key_padded,
+        value_padded,
+        scale,
+        atten_mask,
+        data_type,
+        0.0,
+    )
+    fully_masked = atten_mask.all(dim=-1)
+    golden_out_ref[fully_masked] = 0
+    golden_out_pt[fully_masked] = 0
+    assert_fa_close(
+        output_npu,
+        golden_out_ref[q_valid],
+        golden_out_pt[q_valid],
+        name="paged_swa_overprovisioned_block_table_out",
+    )
+
+
+def test_fa_varlen_swa_invalid_prefix_clear_regression():
+    """ATK SWA #146: guard multi-head output clearing for q_len > kv_len."""
+
+    seqlens_q = [43, 21]
+    seqlens_k = [512, 1]
+    max_seqlen_q, max_seqlen_k = max(seqlens_q), max(seqlens_k)
+    num_heads, kv_heads, head_size = 8, 1, 224
+    window_size = (511, 0)
+    softcap = 1.0
+    generator = torch.Generator().manual_seed(146)
+    query = make_packed_random_tensor(
+        seqlens_q, max_seqlen_q, num_heads, head_size, torch.bfloat16,
+        generator=generator, device="npu",
+    )
+    key = make_packed_random_tensor(
+        seqlens_k, max_seqlen_k, kv_heads, head_size, torch.bfloat16,
+        generator=generator, device="npu",
+    )
+    value = make_packed_random_tensor(
+        seqlens_k, max_seqlen_k, kv_heads, head_size, torch.bfloat16,
+        generator=generator, device="npu",
+    )
+    cu_q, cu_k = make_cu_seqlens(seqlens_q), make_cu_seqlens(seqlens_k)
+
+    output_npu = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_q.npu(),
+        cu_k.npu(),
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=0.0,
+        causal=False,
+        window_size=window_size,
+        softcap=softcap,
+        deterministic=True,
+        return_attn_probs=False,
+    )
+
+    query_ref = query.cpu()
+    key_ref = key.cpu()
+    value_ref = value.cpu()
+    query_padded = pad_packed_tensor(query_ref, seqlens_q, max_seqlen_q)
+    key_padded = pad_packed_tensor(key_ref, seqlens_k, max_seqlen_k)
+    value_padded = pad_packed_tensor(value_ref, seqlens_k, max_seqlen_k)
+    q_valid, _, atten_mask = make_padded_varlen_mask(
+        seqlens_q,
+        seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        False,
+        *window_size,
+    )
+    fully_masked = atten_mask.all(dim=-1)
+    assert int(fully_masked[1, :seqlens_q[1]].sum()) == 20
+    golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
+        query_padded,
+        key_padded,
+        value_padded,
+        0.0,
+        atten_mask,
+        torch.bfloat16,
+        softcap,
+    )
+    golden_out_ref[fully_masked] = 0
+    golden_out_pt[fully_masked] = 0
+    assert_fa_close(
+        output_npu,
+        golden_out_ref[q_valid],
+        golden_out_pt[q_valid],
+        softcap=softcap,
+        name="swa_invalid_prefix_out",
+    )
