@@ -582,31 +582,43 @@ public:
                                 }
                         }
                     } else {
-                        if (qNThisSubBlock == 0U) {
+                        // Final LSE is head-major: NT for TND and BNS for BSND.
+                        // BNS (and single-batch NT) stores all heads owned by this
+                        // vector contiguously, so collapse them into one DMA block.
+                        // Multi-batch NT has a total-token stride between heads.
+                        uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
+                        uint32_t lseSeqLen = totalRowNum / lseHeadCount;
+                        uint32_t lseHeadStrideGm = layoutLse.stride(0);
+                        bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
+                        if (isLseContiguous) {
                             AscendC::DataCopyPad(
                                 gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
+                                AscendC::DataCopyExtParams(
+                                    1, totalRowNum * sizeof(float), 0, 0, 0));
+                        } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
+                            AscendC::DataCopyPad(
+                                gLse, lseUbTensor,
+                                AscendC::DataCopyExtParams(
+                                    lseHeadCount,
+                                    lseSeqLen * sizeof(float),
+                                    0,
+                                    (lseHeadStrideGm - lseSeqLen) * sizeof(float),
+                                    0));
                         } else {
-                            // multi-head: per-token gather (srcStride) + scatter (dstStride).
-                            uint32_t lseHeadStrideGm = layoutLse.stride(0);  // S_q, BNS/NT head stride
-                            bool isA = qSBlockSize % 8 == 0;
-                            for (uint32_t sIdx = 0; sIdx < qSBlockSize && !isA; sIdx++) {
+                            // An unaligned multi-block MTE3 transfer rounds each UB
+                            // source block to 32 bytes. Use the broadcast staging
+                            // tensor so every scalar source block is aligned.
+                            for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
                                 AscendC::DataCopyPad(
                                     gLse[sIdx],
                                     tvUbTensor[sIdx * FLOAT_BLOCK_SIZE],
                                     AscendC::DataCopyExtParams(
-                                        qNThisSubBlock, sizeof(float),
-                                        qSBlockSize - 1,
-                                        (lseHeadStrideGm - 1) * sizeof(float), 0));
+                                        lseHeadCount,
+                                        sizeof(float),
+                                        lseSeqLen - 1U,
+                                        (lseHeadStrideGm - 1U) * sizeof(float),
+                                        0));
                             }
-                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock && isA; qNIdx++) {
-                                AscendC::DataCopyPad(
-                                    gLse[qNIdx * lseHeadStrideGm],
-                                    lseUbTensor[qNIdx * qSBlockSize],
-                                    AscendC::DataCopyExtParams(
-                                        1, qSBlockSize * sizeof(float), 0, 0, 0));
-                            }
-
                         }
                     }
                     uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
