@@ -77,24 +77,7 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
 
 
 def round_up_headdim(head_size: int) -> int:
-    from flash_attn_config import CONFIG
-
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM64"]:
-        if head_size <= 64:
-            return 64
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM96"]:
-        if head_size <= 96:
-            return 96
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM128"]:
-        if head_size <= 128:
-            return 128
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM192"]:
-        if head_size <= 192:
-            return 192
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM256"]:
-        if head_size <= 256:
-            return 256
-    return 256
+    return round_multiple(head_size, _HEADDIM_BWD_ALIGN)
 
 
 @_torch_custom_op_wrapper("flash_attn_npu_3::_flash_attn_forward", mutates_args=(), device_types="npu")
