@@ -54,3 +54,4 @@ kernel_summary.csv
 perf/
 tests/compare_am_attn_step3.py
 tests/compare_bsnd_attn_step3.py
+profile_am_bsnd_50_without_lse/

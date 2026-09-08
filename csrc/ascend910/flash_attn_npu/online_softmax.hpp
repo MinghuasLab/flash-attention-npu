@@ -1035,7 +1035,7 @@ public:
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
-        Arch::CrossCoreFlag qkReady, uint32_t softmaxPingPongFlag, bool isSplitKV = false,
+        Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
     {   
         // AscendC::printf("22222222222\n");
@@ -1059,6 +1059,12 @@ public:
         rowNumTile = AscendC::Std::min(rowNumTile, FLOAT_VECTOR_SIZE);
         uint32_t rowLoopNum = CeilDiv(rowActualThisSubBlock, rowNumTile);
         uint32_t preLoad = 1;
+
+        // The idle vector core must still consume this stack's QK-ready flag.
+        if (rowActualThisSubBlock == 0) {
+            Arch::CrossCoreWaitFlag(qkReady);
+            return;
+        }
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
@@ -1128,7 +1134,7 @@ public:
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, 
-        uint32_t softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
+        uint32_t& softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
     {   
         // AscendC::printf("111111111\n");
@@ -1303,7 +1309,7 @@ public:
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady, 
-        uint32_t softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
+        uint32_t& softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
         int32_t nextTokenEndLen, bool isSplitKV = false)
     {   

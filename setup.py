@@ -213,6 +213,11 @@ class BishengBuildExt(build_ext):
 
         include_flags = [
             *[f"-I{p}" for p in asc_include_paths],
+            # On Debian/Ubuntu aarch64, Python's architecture-specific
+            # pyconfig.h lives below /usr/include/aarch64-linux-gnu.  The
+            # CANN bisheng frontend does not define __AARCH64EL__ itself.
+            *(["-I/usr/include/aarch64-linux-gnu", "-D__aarch64__", "-D__AARCH64EL__"]
+              if platform.machine() == "aarch64" else []),
             f"-I{python_include}",
             f"-I{torch_npu_include}",
             f"-I{torch_include}",

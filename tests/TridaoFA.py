@@ -27,10 +27,10 @@ from flash_attn_npu.flash_attn_npu_interface import _flash_attn_varlen_forward
 CASES = [
     {
         "name": "mini_Q384_KV2048_H16_causal",
-        "total_q": 20480, "heads_q": 24,
-        "total_kv": 20480, "heads_kv": 4,
+        "total_q": 41280, "heads_q": 1,
+        "total_kv": 41280, "heads_kv": 1,
         "head_dim": 128, "scale": 1.0, "causal": True,
-        "batch": 320, "max_q": 64, "max_kv": 64, "dropout": 0.0,
+        "batch": 320, "max_q": 129, "max_kv": 129, "dropout": 0.0,
     },
 ]
 
