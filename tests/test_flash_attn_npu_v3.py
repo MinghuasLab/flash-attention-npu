@@ -16,7 +16,6 @@ from tests.common.test_utils import (
     make_golden_attention_mask,
     make_local_attention_mask,
     make_packed_random_tensor,
-    make_paged_kv_cache,
     make_padded_varlen_mask,
     pad_packed_tensor,
     make_random_tensor,
@@ -325,31 +324,50 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     t_q_sum = sum(q_sequences)
     t_kv_sum = sum(kv_sequences)
     if layout == "BSND":
-        query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, generator=gen, device="npu")
+        query = make_random_tensor(
+            (batch_size, num_heads, q_seqlen, head_size), data_type,
+            generator=gen, device="npu"
+        ).transpose(1, 2)
     elif layout == "TND":
         query = make_packed_random_tensor(q_sequences, q_seqlen, num_heads, head_size, data_type, generator=gen, device="npu")
     key_cache = None
     value_cache = None
     block_tables = None
     if cache_mode == 1:
-        # make_paged_kv_cache allocates physical blocks from kv_seqlen so long
-        # KV cases cannot make block_table reference nonexistent blocks and
-        # trigger an AICore DDR overrun.
-        key_cache, value_cache = make_paged_kv_cache(
-            batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type,
+        # Allocate every physical block referenced by block_tables. Build the
+        # storage as BNSD, then expose the paged-cache BSND view to the API.
+        num_blocks = batch_size * ((kv_seqlen + block_size - 1) // block_size)
+        key_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type,
             generator=gen, device="npu"
-        )
+        ).transpose(1, 2)
+        value_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type,
+            generator=gen, device="npu"
+        ).transpose(1, 2)
         block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
         if layout == "BSND":
-            key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, generator=gen, device="npu")
-            value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, generator=gen, device="npu")
+            key_cache = make_random_tensor(
+                (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                generator=gen, device="npu"
+            ).transpose(1, 2)
+            value_cache = make_random_tensor(
+                (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                generator=gen, device="npu"
+            ).transpose(1, 2)
         else:
             if new_kv:
                 # append-KV uses the capacity-aligned per-batch cache layout (same as BSND).
                 kv_min_range, kv_max_range = -5.0, 5.0
-                key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, low=kv_min_range, high=kv_max_range, generator=gen, device="npu")
-                value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, low=kv_min_range, high=kv_max_range, generator=gen, device="npu")
+                key_cache = make_random_tensor(
+                    (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                    low=kv_min_range, high=kv_max_range, generator=gen, device="npu"
+                ).transpose(1, 2)
+                value_cache = make_random_tensor(
+                    (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                    low=kv_min_range, high=kv_max_range, generator=gen, device="npu"
+                ).transpose(1, 2)
             else:
                 key_cache = make_packed_random_tensor(kv_sequences, kv_seqlen, kv_heads, head_size, data_type, generator=gen, device="npu")
                 value_cache = make_packed_random_tensor(kv_sequences, kv_seqlen, kv_heads, head_size, data_type, generator=gen, device="npu")
@@ -375,8 +393,12 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
                                   (batch_size,), generator=gen) * 512 + old_min) \
             if is_causal else torch.randint(0, capacity - new_seqlen + 1, (batch_size,), generator=gen)
         cache_seqlens = old_lens.to(torch.int32).npu()
-        k_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
-        v_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
+        k_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
+        v_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
         key_cache_orig = key_cache.detach().clone()
         value_cache_orig = value_cache.detach().clone()
     else:

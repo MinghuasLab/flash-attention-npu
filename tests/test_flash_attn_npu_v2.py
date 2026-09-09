@@ -25,7 +25,6 @@ from tests.common.test_utils import (
     make_block_table,
     make_cu_seqlens,
     make_golden_attention_mask,
-    make_paged_kv_cache,
     make_packed_random_tensor,
     make_padded_varlen_mask,
     make_random_tensor,
@@ -244,24 +243,27 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv", test_cases)
 def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv):
     block_size = 128
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type,
-                               device="npu", requires_grad=True)
+    query = make_random_tensor((batch_size, num_heads, q_seqlen, head_size), data_type,
+                               device="npu", requires_grad=True).transpose(1, 2)
     key_cache = None
     value_cache = None
     block_tables = None
     if cache_mode == 1:
-        # make_paged_kv_cache allocates physical blocks from kv_seqlen so long
-        # KV cases cannot make block_table reference nonexistent blocks and
-        # trigger an AICore DDR overrun.
-        key_cache, value_cache = make_paged_kv_cache(
-            batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type, device="npu"
-        )
+        # Allocate every physical block referenced by block_tables. Build the
+        # storage as BNSD, then expose the paged-cache BSND view to the API.
+        num_blocks = batch_size * ((kv_seqlen + block_size - 1) // block_size)
+        key_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type, device="npu"
+        ).transpose(1, 2)
+        value_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type, device="npu"
+        ).transpose(1, 2)
         block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
-        key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type,
-                                       device="npu")
-        value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type,
-                                         device="npu")
+        key_cache = make_random_tensor((batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                                       device="npu").transpose(1, 2)
+        value_cache = make_random_tensor((batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                                         device="npu").transpose(1, 2)
         block_tables = None
     kv_seqlen_list = [kv_seqlen] * batch_size
     scale = 1.0 / (head_size ** 0.5)
@@ -280,8 +282,12 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
                                   (batch_size,), generator=gen) * 512 + old_min) \
             if is_causal else torch.randint(0, capacity - new_seqlen + 1, (batch_size,), generator=gen)
         cache_seqlens = old_lens.to(torch.int32).npu()
-        k_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
-        v_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
+        k_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
+        v_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
         key_cache_orig = key_cache.detach().clone()
         value_cache_orig = value_cache.detach().clone()
     else:
