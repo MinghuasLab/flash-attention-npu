@@ -740,6 +740,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cache_seqlens,
             qkv_dtype=q.dtype,
             cu_seqlens_q=cu_seqlens_q,
+            seqused_q=seqused_q,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1269,8 +1270,10 @@ def get_scheduler_metadata(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    seqused_q: Optional[torch.Tensor] = None,
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
+    seqused_q = maybe_contiguous(seqused_q)
     if headdim_v is None:
         headdim_v = headdim
     scheduler_metadata = flash_attn_npu_3.get_scheduler_metadata(
@@ -1280,7 +1283,7 @@ def get_scheduler_metadata(
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        None,  # seqused_q
+        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
