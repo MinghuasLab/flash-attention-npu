@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 
 import os
+import sys
 import torch
 import torch_npu
 import pytest
@@ -21,6 +22,101 @@ if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_4 import flash_attn_varlen_func
 else:
     from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_func_accepts_noncontiguous_bshd(dtype):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    is_ascend950 = "Ascend950" in name
+
+    batch_size, num_heads, seqlen, head_dim = 2, 4, 64, 64
+    q = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    k = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    v = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    q_contiguous = q.detach().contiguous().requires_grad_(True)
+    k_contiguous = k.detach().contiguous().requires_grad_(True)
+    v_contiguous = v.detach().contiguous().requires_grad_(True)
+    if is_ascend950:
+        out = flash_attn_varlen_func(q, k, v, causal=True)
+        out_contiguous = flash_attn_varlen_func(
+            q_contiguous, k_contiguous, v_contiguous, causal=True
+        )
+    else:
+        out = flash_attn_func(q, k, v, causal=True, deterministic=True)
+        out_contiguous = flash_attn_func(
+            q_contiguous, k_contiguous, v_contiguous,
+            causal=True, deterministic=True
+        )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+    if not is_ascend950:
+        out.sum().backward()
+        out_contiguous.sum().backward()
+        for grad, grad_contiguous in zip(
+            (q.grad, k.grad, v.grad),
+            (q_contiguous.grad, k_contiguous.grad, v_contiguous.grad),
+        ):
+            torch.testing.assert_close(grad, grad_contiguous, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_kv_accepts_native_outer_strides(dtype):
+    batch_size, q_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, page_size, head_dim = 8, 256, 128, 64
+    total_q = batch_size * q_seqlen
+    num_pages = batch_size * (kv_seqlen // page_size)
+
+    q = make_random_tensor(
+        (q_heads, total_q, head_dim), dtype, device="npu"
+    ).transpose(0, 1)
+    k_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    v_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    cu_seqlens_q = torch.arange(
+        0, total_q + 1, q_seqlen, dtype=torch.int32, device="npu"
+    )
+    seqused_k = torch.full(
+        (batch_size,), kv_seqlen, dtype=torch.int32, device="npu"
+    )
+    page_table = make_block_table(batch_size, kv_seqlen, page_size).npu()
+
+    assert not q.is_contiguous()
+    assert not k_cache.is_contiguous() and not v_cache.is_contiguous()
+    interface = sys.modules[flash_attn_varlen_func.__module__]
+    keep_strides = getattr(
+        interface,
+        "maybe_contiguous_last_dim",
+        getattr(interface, "_maybe_contiguous_last_dim", None),
+    )
+    assert keep_strides is not None
+    assert keep_strides(q) is q
+    assert keep_strides(k_cache) is k_cache
+    assert keep_strides(v_cache) is v_cache
+
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_seqlen,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        causal=True,
+        num_splits=1,
+    )
+    out = flash_attn_varlen_func(q, k_cache, v_cache, **kwargs)
+    out_contiguous = flash_attn_varlen_func(
+        q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), **kwargs
+    )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""

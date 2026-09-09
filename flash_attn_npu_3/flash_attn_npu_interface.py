@@ -33,7 +33,20 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 def maybe_contiguous(x):
+    """Materialize tensors used by kernel arguments that require dense storage."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the vector dimension must be contiguous."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def maybe_contiguous_output(x):
+    """Allocate a dense temporary for a strided kernel output buffer."""
+    if x is None or x.is_contiguous():
+        return x
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 def round_multiple(x, m):
@@ -134,8 +147,10 @@ def _flash_attn_forward(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q, k, v, k_new, v_new = [
+        maybe_contiguous_last_dim(x) for x in (q, k, v, k_new, v_new)
+    ]
+    qv = maybe_contiguous(qv)
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     ]
@@ -321,12 +336,14 @@ def _flash_attn_backward(
     deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dq_kernel, dk_kernel, dv_kernel = [
+        maybe_contiguous_output(x) for x in (dq, dk, dv)
+    ]
     (
-        dq,
-        dk,
-        dv,
+        dq_result,
+        dk_result,
+        dv_result,
         softmax_d,
     ) = flash_attn_npu_3.bwd(
         dout,
@@ -335,9 +352,9 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         cu_seqlens_q,
         cu_seqlens_k,
         sequed_q,
@@ -352,6 +369,13 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
     )
+    for dst, kernel_dst, src in (
+        (dq, dq_kernel, dq_result),
+        (dk, dk_kernel, dk_result),
+        (dv, dv_kernel, dv_result),
+    ):
+        if dst is not None and kernel_dst is not dst:
+            dst.copy_(src)
     return softmax_d
 
 
@@ -1144,8 +1168,8 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    k_cache_kernel = maybe_contiguous_last_dim(k_cache)
+    v_cache_kernel = maybe_contiguous_last_dim(v_cache)
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
@@ -1168,8 +1192,8 @@ def flash_attn_with_kvcache(
         )
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
-        k_cache,
-        v_cache,
+        k_cache_kernel,
+        v_cache_kernel,
         k,
         v,
         qv,
@@ -1200,6 +1224,10 @@ def flash_attn_with_kvcache(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
     )
+    if k is not None and k_cache_kernel is not k_cache:
+        k_cache.copy_(k_cache_kernel)
+    if v is not None and v_cache_kernel is not v_cache:
+        v_cache.copy_(v_cache_kernel)
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
@@ -1270,6 +1298,11 @@ def get_scheduler_metadata(
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
 ):
+    """Precompute scheduling metadata without binding it to tensor strides.
+
+    Q/K/V element strides are supplied separately on every kernel launch, so
+    this tensor may be reused by same-shaped views with different outer strides.
+    """
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim

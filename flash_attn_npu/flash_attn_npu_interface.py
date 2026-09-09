@@ -14,7 +14,20 @@ from . import flash_attn_npu
 # isort: on
 
 def maybe_contiguous(x):
+    """Materialize tensors used by kernel arguments that require dense storage."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the vector dimension must be contiguous."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def maybe_contiguous_output(x):
+    """Allocate a dense temporary for a strided kernel output buffer."""
+    if x is None or x.is_contiguous():
+        return x
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 def round_multiple(x, m):
@@ -96,7 +109,7 @@ def _flash_attn_forward(
     return_softmax: bool,
     scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_npu.fwd(
         q,
         k,
@@ -131,10 +144,10 @@ def _flash_attn_forward_fake(
     return_softmax: bool,
     scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
-    out = torch.empty_like(q)
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device, layout=q.layout)
     softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
@@ -173,7 +186,7 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_npu.varlen_fwd(
         q,
         k,
@@ -226,12 +239,12 @@ def _flash_attn_varlen_forward_fake(
     zero_tensors: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
     
-    out = torch.empty_like(q)
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device, layout=q.layout)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
@@ -266,12 +279,14 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dq_kernel, dk_kernel, dv_kernel = [
+        maybe_contiguous_output(x) for x in (dq, dk, dv)
+    ]
     (
-        dq,
-        dk,
-        dv,
+        dq_result,
+        dk_result,
+        dv_result,
         softmax_d,
     ) = flash_attn_npu.bwd(
         dout,
@@ -280,9 +295,9 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         alibi_slopes,
         dropout_p,
         softmax_scale,
@@ -294,6 +309,13 @@ def _flash_attn_backward(
         None,
         rng_state,
     )
+    for dst, kernel_dst, src in (
+        (dq, dq_kernel, dq_result),
+        (dk, dk_kernel, dk_result),
+        (dv, dv_kernel, dv_result),
+    ):
+        if dst is not None and kernel_dst is not dst:
+            dst.copy_(src)
     return softmax_d
 
 
@@ -363,12 +385,14 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dq_kernel, dk_kernel, dv_kernel = [
+        maybe_contiguous_output(x) for x in (dq, dk, dv)
+    ]
     (
-        dq,
-        dk,
-        dv,
+        dq_result,
+        dk_result,
+        dv_result,
         softmax_d,
     ) = flash_attn_npu.varlen_bwd(
         dout,
@@ -377,9 +401,9 @@ def _flash_attn_varlen_backward(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         cu_seqlens_q,
         cu_seqlens_k,
         alibi_slopes,
@@ -396,6 +420,13 @@ def _flash_attn_varlen_backward(
         None,
         rng_state,
     )
+    for dst, kernel_dst, src in (
+        (dq, dq_kernel, dq_result),
+        (dk, dk_kernel, dk_result),
+        (dv, dv_kernel, dv_result),
+    ):
+        if dst is not None and kernel_dst is not dst:
+            dst.copy_(src)
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
     return softmax_d
@@ -1646,9 +1677,9 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
+    k_cache_kernel = maybe_contiguous_last_dim(k_cache)
+    v_cache_kernel = maybe_contiguous_last_dim(v_cache)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
@@ -1672,8 +1703,8 @@ def flash_attn_with_kvcache(
         )
     out, softmax_lse = flash_attn_npu.fwd_kvcache(
         q,
-        k_cache,
-        v_cache,
+        k_cache_kernel,
+        v_cache_kernel,
         k,
         v,
         cache_seqlens,
@@ -1693,6 +1724,12 @@ def flash_attn_with_kvcache(
         num_splits,
         scheduler_metadata,
     )
+    # Only last-dimension-strided caches take the dense fallback. Outer-strided
+    # caches are passed directly to the kernel and need no copyback.
+    if k is not None and k_cache_kernel is not k_cache:
+        k_cache.copy_(k_cache_kernel)
+    if v is not None and v_cache_kernel is not v_cache:
+        v_cache.copy_(v_cache_kernel)
     return (out, softmax_lse) if return_softmax_lse else out
 
 
@@ -1759,10 +1796,13 @@ def get_scheduler_metadata(
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
     alibi_slopes_batch_stride=0,
 ):
-    """Precompute the forward scheduler metadata (tiling, optional mask, and —
-    for paged KV cache — the flash-decode split schedule) on the AICPU. Pass the
-    result as scheduler_metadata to flash_attn_with_kvcache to keep the forward
-    free of D2H/H2D syncs."""
+    """Precompute shape-dependent scheduling metadata on the AICPU.
+
+    Q/K/V strides are intentionally supplied per kernel launch and are not
+    stored here, so this tensor can be reused by same-shaped strided views.
+    Pass it to flash_attn_with_kvcache to keep the forward free of D2H/H2D
+    synchronization.
+    """
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim

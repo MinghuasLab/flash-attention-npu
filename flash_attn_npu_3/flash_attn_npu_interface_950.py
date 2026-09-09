@@ -35,7 +35,12 @@ else:
 
 
 def _maybe_contiguous(x):
-    """Make sure the inner-most stride is 1; the kernel asserts it."""
+    """Materialize tensors used by kernel arguments that require dense storage."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the vector dimension must be contiguous."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
@@ -79,8 +84,8 @@ def _flash_attn_forward(
     sm_margin: int,
     return_softmax_lse: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, k_new, v_new = (_maybe_contiguous(x) for x in (q, k, k_new, v_new))
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q, k, v = (_maybe_contiguous_last_dim(x) for x in (q, k, v))
+    k_new, v_new, qv = (_maybe_contiguous(x) for x in (k_new, v_new, qv))
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = (
         _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     )
@@ -224,7 +229,9 @@ def get_scheduler_metadata(
     ``scheduler_metadata`` argument to avoid per-call host tiling and H2D/D2H
     copies. It depends on shapes, dtype-independent tiling constants, causal
     flag, and the actual per-batch sequence lengths; re-create it whenever those
-    change.
+    change. Q/K/V element strides are launch-time arguments rather than fields
+    in this tensor, so it can be reused by same-shaped views with different
+    outer strides.
     """
     cache_seqlens = _maybe_contiguous(cache_seqlens)
     if cu_seqlens_q is not None:
@@ -391,8 +398,8 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    k_cache_kernel = _maybe_contiguous_last_dim(k_cache)
+    v_cache_kernel = _maybe_contiguous_last_dim(v_cache)
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -473,8 +480,8 @@ def flash_attn_with_kvcache(
 
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
-        k_cache,
-        v_cache,
+        k_cache_kernel,
+        v_cache_kernel,
         k,
         v,
         qv,
@@ -506,6 +513,10 @@ def flash_attn_with_kvcache(
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
     )
+    if k is not None and k_cache_kernel is not k_cache:
+        k_cache.copy_(k_cache_kernel)
+    if v is not None and v_cache_kernel is not v_cache:
+        v_cache.copy_(v_cache_kernel)
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
@@ -530,10 +541,6 @@ class FlashAttnFunc(torch.autograd.Function):
         sm_margin=0,
         return_attn_probs=False,
     ):
-        assert q.stride(-1) == 1, "q must have contiguous last dimension"
-        assert k.stride(-1) == 1, "k must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v must have contiguous last dimension"
-
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -700,10 +707,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         sm_margin=0,
         return_attn_probs=False,
     ):
-        assert q.stride(-1) == 1, "q must have contiguous last dimension"
-        assert k.stride(-1) == 1, "k must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v must have contiguous last dimension"
-
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 

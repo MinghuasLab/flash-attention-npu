@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 
 import os
+import sys
 import torch
 import torch_npu
 import pytest
@@ -22,7 +23,126 @@ from tests.common.test_utils import (
     make_varlen_seqlens,
     check_kvcache_inplace
 )
-from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_3 import (
+    flash_attn_with_kvcache,
+    flash_attn_func,
+    flash_attn_varlen_func,
+    get_scheduler_metadata,
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_func_accepts_noncontiguous_bshd(dtype):
+    batch_size, num_heads, seqlen, head_dim = 2, 4, 64, 64
+    q = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    k = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    v = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    q_contiguous = q.detach().contiguous().requires_grad_(True)
+    k_contiguous = k.detach().contiguous().requires_grad_(True)
+    v_contiguous = v.detach().contiguous().requires_grad_(True)
+    kwargs = {"causal": True}
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        kwargs["deterministic"] = True
+    out = flash_attn_func(q, k, v, **kwargs)
+    out_contiguous = flash_attn_func(
+        q_contiguous, k_contiguous, v_contiguous, **kwargs
+    )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        out.sum().backward()
+        out_contiguous.sum().backward()
+        for grad, grad_contiguous in zip(
+            (q.grad, k.grad, v.grad),
+            (q_contiguous.grad, k_contiguous.grad, v_contiguous.grad),
+        ):
+            torch.testing.assert_close(grad, grad_contiguous, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_kv_native_strides_reuse_scheduler_metadata(dtype):
+    batch_size, q_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, page_size, head_dim = 8, 256, 128, 64
+    pages_per_batch = kv_seqlen // page_size
+    num_pages = batch_size * pages_per_batch
+
+    q = make_random_tensor(
+        (batch_size, q_heads, q_seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    k_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    v_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    page_table = make_block_table(batch_size, kv_seqlen, page_size).npu()
+    cache_seqlens = torch.full(
+        (batch_size,), kv_seqlen, dtype=torch.int32, device="npu"
+    )
+
+    assert not q.is_contiguous()
+    assert not k_cache.is_contiguous() and not v_cache.is_contiguous()
+    interface = sys.modules[flash_attn_with_kvcache.__module__]
+    keep_strides = getattr(
+        interface,
+        "maybe_contiguous_last_dim",
+        getattr(interface, "_maybe_contiguous_last_dim", None),
+    )
+    assert keep_strides is not None
+    assert keep_strides(q) is q
+    assert keep_strides(k_cache) is k_cache
+    assert keep_strides(v_cache) is v_cache
+
+    device_name = torch_npu.npu.get_device_name()
+    if "Ascend950" in device_name:
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=q_seqlen,
+            max_seqlen_k=kv_seqlen,
+            num_heads_q=q_heads,
+            num_heads_kv=kv_heads,
+            headdim=head_dim,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=dtype,
+            page_size=page_size,
+            num_blocks=num_pages,
+            max_num_blocks_per_seq=pages_per_batch,
+            causal=True,
+        )
+    else:
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size,
+            q_seqlen,
+            kv_seqlen,
+            q_heads,
+            kv_heads,
+            head_dim,
+            cache_seqlens,
+            qkv_dtype=dtype,
+            page_size=page_size,
+            causal=True,
+        )
+
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=True,
+        scheduler_metadata=scheduler_metadata,
+    )
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, **kwargs)
+    # Reuse exactly the same scheduler metadata with a different stride set.
+    out_contiguous = flash_attn_with_kvcache(
+        q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), **kwargs
+    )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+
 
 # flash_attn_with_kvcache test parameters
 # Single-option parameters: fixed values

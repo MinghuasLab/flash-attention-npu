@@ -236,7 +236,8 @@ public:
     template <class TensorA>
     __aicore__ inline
     void loadQGM(TensorA &gATensor, GemmCoord actualOriShape,
-                 uint32_t qSBlockSize, uint32_t qNBlockSize)
+                 uint32_t qSBlockSize, uint32_t qNBlockSize,
+                 uint32_t qHeadStride)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
@@ -249,7 +250,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
         auto gmQLayoutTla = tla::MakeLayout(
             tla::MakeShape(qNBlockSize, embed),
-            tla::MakeStride(embed, tla::Int<1>{}));
+            tla::MakeStride(qHeadStride, tla::Int<1>{}));
         auto gmQTensorTla = tla::MakeTensor(
             gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
         auto l1QTile = GetTile(l1ATensorTla,
@@ -320,7 +321,8 @@ public:
                     GemmCoord actualOriShape, uint32_t blockSize,
                     uint32_t kvSTileIdx, uint32_t pipelineTileSeq,
                     uint32_t kvSeqlenTriDown, uint32_t kvHeads,
-                    uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink, 
+                    uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
+                    uint64_t kvBlockStride, uint32_t kvSeqStride,
                     uint32_t globalWindowSize, uint32_t localWindowSize,
                     uint32_t qSBlockSize, uint32_t qNBlockSize,
                     Arch::CrossCoreFlag qkReadyFlag,
@@ -367,8 +369,12 @@ public:
                     uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                     uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                     auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gBTensorTlaTile = GetTile(gBTensor,
-                        tla::MakeCoord(0, blockIdx * blockSize + blockOffset), tla::MakeShape(embed, l0TileNAct));
+                    uint64_t pageOffset = static_cast<uint64_t>(blockIdx) * kvBlockStride +
+                        static_cast<uint64_t>(blockOffset) * kvSeqStride;
+                    auto gBPageTensor = tla::MakeTensor(
+                        gBTensor.data()[pageOffset], gBTensor.layout(), Arch::PositionGM{});
+                    auto gBTensorTlaTile = GetTile(gBPageTensor,
+                        tla::MakeCoord(0, 0), tla::MakeShape(embed, l0TileNAct));
                     copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
                 } else {
                     if (isShrink == 1) {

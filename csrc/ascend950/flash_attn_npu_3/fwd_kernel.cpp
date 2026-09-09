@@ -235,10 +235,10 @@ public:
         }
         // int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
 
-        strideQ = qHeads_ * embed_;
+        strideQ = static_cast<int64_t>(params.qSeqStride);
         if constexpr (cacheLayout == CacheLayout::nd) {
-            strideK = kvHeads_ * embed_;
-            strideV = kvHeads_ * embedV_;
+            strideK = static_cast<int64_t>(params.kSeqStride);
+            strideV = static_cast<int64_t>(params.vSeqStride);
         } else {
             strideK = 16;
             strideV = 16;
@@ -286,10 +286,19 @@ public:
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                qBOffset += qSeqlen * strideQ;
+                if constexpr (qFormat == Format::TND) {
+                    qBOffset += qSeqlen * strideQ;
+                } else {
+                    qBOffset = static_cast<int64_t>(curBatch) * params.qBatchStride;
+                }
                 if constexpr (kvcacheType == CacheMode::normalCache) {
-                    kBOffset += static_cast<uint64_t>(kvSeqlen * strideK);
-                    vBOffset += static_cast<uint64_t>(kvSeqlen * strideV);
+                    if constexpr (kvFormat == Format::TND) {
+                        kBOffset += static_cast<uint64_t>(kvSeqlen * strideK);
+                        vBOffset += static_cast<uint64_t>(kvSeqlen * strideV);
+                    } else {
+                        kBOffset = static_cast<uint64_t>(curBatch) * params.kBatchStride;
+                        vBOffset = static_cast<uint64_t>(curBatch) * params.vBatchStride;
+                    }
                 } else {
                     blockBOffset += static_cast<uint64_t>(maxNumBlocksPerBatch_); 
                 }
@@ -332,10 +341,12 @@ public:
             int64_t gmOffsetV = 0;
             int64_t gmOffsetO = 0;
             int64_t qSOffset = qSTileIdx * qBaseTile_;
-            gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * embed_;
+            gmOffsetQ = qBOffset + qSOffset * strideQ +
+                static_cast<uint64_t>(qNStartIdx) * params.qHeadStride;
             gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * embedV_;
             uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
-            uint64_t lseOffset = static_cast<uint64_t>(qBOffset / strideQ) * qHeads_
+            uint64_t lseOffset = static_cast<uint64_t>(curBatch) *
+                static_cast<uint64_t>(faiTilingData->maxQSeqlen) * qHeads_
                 + static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             if constexpr (qFormat == Format::TND) {
                 lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
@@ -349,8 +360,8 @@ public:
                 gmOffsetK = static_cast<uint64_t>(kvHeadIdx) * embed_ * blockSize_;
                 gmOffsetV = static_cast<uint64_t>(kvHeadIdx) * embedV_ * blockSize_;
             } else if (cacheLayout == CacheLayout::nd) {
-                gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx * embed_);
-                gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_);
+                gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx) * params.kHeadStride;
+                gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx) * params.vHeadStride;
             } else {
                 gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx * embed_) * kvNumTokens;
                 gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_) * kvNumTokens;
@@ -496,7 +507,9 @@ public:
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
             uint32_t vShapeCol = strideV;
-            auto gmQLayoutTla = tla::MakeLayout<ElementQ, LayoutQ>(qBaseTile_, qShapeCol);
+            auto gmQLayoutTla = tla::MakeLayout(
+                tla::MakeShape(qBaseTile_, embed_),
+                tla::MakeStride(static_cast<uint32_t>(strideQ), tla::Int<1>{}));
             auto gmQLayoutTlaDN = tla::MakeLayout<ElementQ, LayoutQ>(qShapeCol, qBaseTile_);
             auto gmQTensorTla = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTla, Arch::PositionGM{});
             auto gmQTensorTlaDN = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTlaDN, Arch::PositionGM{});
@@ -507,7 +520,8 @@ public:
                     qSBlockSize, qNBlockSize);
             } else {
                 blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ,
-                    qSBlockSize, qNBlockSize);
+                    qSBlockSize, qNBlockSize,
+                    static_cast<uint32_t>(params.qHeadStride));
             }
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
@@ -515,11 +529,15 @@ public:
             } else {
                 kShapeRow = kvSeqlen;
             }
-            auto gmKLayoutTla = tla::MakeLayout<ElementK, LayoutK>(kShapeCol, kShapeRow);
+            auto gmKLayoutTla = tla::MakeLayout(
+                tla::MakeShape(embed_, kShapeRow),
+                tla::MakeStride(tla::Int<1>{}, static_cast<uint32_t>(strideK)));
             auto gmKLayoutTlaDN = tla::MakeLayout<ElementK, LayoutK>(kShapeRow, kShapeCol);
             auto gmKTensorTla = tla::MakeTensor(gK[gmOffsetK], gmKLayoutTla, Arch::PositionGM{});
             auto gmKTensorTlaDN = tla::MakeTensor(gK[gmOffsetK], gmKLayoutTlaDN, Arch::PositionGM{});
-            auto gmVLayoutTla = tla::MakeLayout<ElementV, LayoutV>(kShapeRow, vShapeCol);
+            auto gmVLayoutTla = tla::MakeLayout(
+                tla::MakeShape(kShapeRow, embedV_),
+                tla::MakeStride(static_cast<uint32_t>(strideV), tla::Int<1>{}));
             auto gmVTensorTla = tla::MakeTensor(gV[gmOffsetV], gmVLayoutTla, Arch::PositionGM{});
 #endif
 #ifdef __DAV_VEC__
@@ -576,7 +594,9 @@ public:
                             blockSize_,
                             kvSTileIdx, pipelineTileSeq, 0, kvHeads_,
                             kvNumTokens,
-                            kvBaseTile_, 0, 0, 0,
+                            kvBaseTile_, 0,
+                            params.kBatchStride, static_cast<uint32_t>(strideK),
+                            0, 0,
                             qSBlockSize, 
                             qNBlockSize,
                             qkReadyFlag,
@@ -738,7 +758,9 @@ public:
                         blockSize_,
                         kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_,
                         kvNumTokens,
-                        kvBaseTile_, 0, 0, 0,
+                        kvBaseTile_, 0,
+                        params.vBatchStride, static_cast<uint32_t>(strideV),
+                        0, 0,
                         softmaxReadyFlag, pvReadyFlag,
                         prefixSumL0AStages, 
                         prefixSumL0BStages);
@@ -982,7 +1004,10 @@ CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
     GM_ADDR workspace,
-    GM_ADDR tiling
+    GM_ADDR tiling,
+    uint64_t qBatchStride, uint64_t qSeqStride, uint64_t qHeadStride,
+    uint64_t kBatchStride, uint64_t kSeqStride, uint64_t kHeadStride,
+    uint64_t vBatchStride, uint64_t vSeqStride, uint64_t vHeadStride
 ) {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1044,7 +1069,10 @@ CATLASS_GLOBAL void FAInfer(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+        qBatchStride, qSeqStride, qHeadStride,
+        kBatchStride, kSeqStride, kHeadStride,
+        vBatchStride, vSeqStride, vHeadStride};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1057,7 +1085,10 @@ CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
     GM_ADDR workspace,
-    GM_ADDR tiling
+    GM_ADDR tiling,
+    uint64_t qBatchStride, uint64_t qSeqStride, uint64_t qHeadStride,
+    uint64_t kBatchStride, uint64_t kSeqStride, uint64_t kHeadStride,
+    uint64_t vBatchStride, uint64_t vSeqStride, uint64_t vHeadStride
 ) {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1112,7 +1143,10 @@ CATLASS_GLOBAL void FAInferDn(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+        qBatchStride, qSeqStride, qHeadStride,
+        kBatchStride, kSeqStride, kHeadStride,
+        vBatchStride, vSeqStride, vHeadStride};
     Kernel faInfer;
     faInfer(params);
 }
