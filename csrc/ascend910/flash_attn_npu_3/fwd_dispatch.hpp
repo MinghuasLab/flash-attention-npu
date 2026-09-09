@@ -44,6 +44,8 @@ struct FwdLaunchArgs {
     uint8_t *softmaxLseDevice;
     uint8_t *qSeqDevice;
     uint8_t *kvSeqDevice;
+    uint8_t *seqUsedQDevice;      // varlen only; nullptr in BSND or when seqused_q is absent
+    uint8_t *seqUsedKvDevice;     // varlen only; nullptr in BSND or when seqused_k is absent
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
 };

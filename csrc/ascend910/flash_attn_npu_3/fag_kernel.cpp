@@ -993,7 +993,8 @@ template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
                         GM_ADDR atten_mask, GM_ADDR softmax_lse,
-                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
+                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
+                        GM_ADDR seq_used_qlen, GM_ADDR seq_used_kvlen, GM_ADDR dq_,
                         GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_,
                         GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
 ) {
@@ -1103,7 +1104,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
 
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
-    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
+    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse,
+                           cu_seq_qlen, cu_seq_kvlen, seq_used_qlen, seq_used_kvlen,
+                           dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
 
     // call kernel
     FAGKernel flashAttn;

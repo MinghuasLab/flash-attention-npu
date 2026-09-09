@@ -633,6 +633,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     auto oDevice = static_cast<uint8_t *>(out.data_ptr());
     auto qSeqDevice = static_cast<uint8_t *>(seqlenq_gpu_tensor.data_ptr());
     auto kvSeqDevice = static_cast<uint8_t *>(seqlenk_gpu_tensor.data_ptr());
+    auto seqUsedQDevice = is_varlen_q && seqused_q_.has_value()
+        ? static_cast<uint8_t *>(seqused_q_->data_ptr()) : nullptr;
+    auto seqUsedKvDevice = is_varlen_q && seqused_k_.has_value()
+        ? static_cast<uint8_t *>(seqused_k_->data_ptr()) : nullptr;
     auto workspaceDevice = static_cast<uint8_t *>(workspace_tensor.data_ptr());
     auto softmaxLseDevice = static_cast<uint8_t *>(softmaxlse.data_ptr());
     // Forward kernel launches live in fwd_dispatch_<dtype>_<layout>.cpp. Layout
@@ -661,6 +665,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.softmaxLseDevice = softmaxLseDevice;
     fwd_args.qSeqDevice = qSeqDevice;
     fwd_args.kvSeqDevice = kvSeqDevice;
+    fwd_args.seqUsedQDevice = seqUsedQDevice;
+    fwd_args.seqUsedKvDevice = seqUsedKvDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     auto launch_fa_infer = [fwd_args, is_varlen_q]() -> int {
@@ -991,6 +997,10 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.storage().data()));
     auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.storage().data()));
     auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.storage().data()));
+    auto seqUsedQDevice = is_varlen_q && seqused_q_.has_value()
+        ? static_cast<uint8_t *>(const_cast<void *>(seqused_q_->storage().data())) : nullptr;
+    auto seqUsedKvDevice = is_varlen_q && seqused_k_.has_value()
+        ? static_cast<uint8_t *>(const_cast<void *>(seqused_k_->storage().data())) : nullptr;
     uint8_t *cuSeqQlenDevice = nullptr;
     uint8_t *cuSeqKvlenDevice = nullptr;
     at::Tensor seqlenq_gpu_tensor;
@@ -1026,6 +1036,8 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     bwd_args.softMaxLseDevice = softMaxLseDevice;
     bwd_args.cuSeqQlenDevice = cuSeqQlenDevice;
     bwd_args.cuSeqKvlenDevice = cuSeqKvlenDevice;
+    bwd_args.seqUsedQDevice = seqUsedQDevice;
+    bwd_args.seqUsedKvDevice = seqUsedKvDevice;
     bwd_args.dqDevice = dqDevice;
     bwd_args.dkDevice = dkDevice;
     bwd_args.dvDevice = dvDevice;

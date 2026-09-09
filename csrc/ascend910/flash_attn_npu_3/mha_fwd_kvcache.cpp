@@ -1167,6 +1167,8 @@ namespace SplitFuse {
         GM_ADDR lse,
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
+        GM_ADDR seqUsedQ,
+        GM_ADDR seqUsedKv,
         GM_ADDR workspace,
         GM_ADDR tiling,
         GM_ADDR kNew,
@@ -1233,7 +1235,8 @@ namespace SplitFuse {
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv,
+                               o, lse, workspace, tiling,
                                kNew, vNew};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);

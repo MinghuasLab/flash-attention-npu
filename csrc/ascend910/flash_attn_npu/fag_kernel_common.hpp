@@ -153,6 +153,8 @@ struct FAGKernelParams {
     GM_ADDR softmax_lse;
     GM_ADDR cu_seq_qlen;
     GM_ADDR cu_seq_kvlen;
+    GM_ADDR seq_used_qlen;
+    GM_ADDR seq_used_kvlen;
     GM_ADDR dq;
     GM_ADDR dk;
     GM_ADDR dv;
@@ -174,6 +176,8 @@ struct FAGKernelParams {
                     GM_ADDR softmax_lse_,
                     GM_ADDR cu_seq_qlen_,
                     GM_ADDR cu_seq_kvlen_,
+                    GM_ADDR seq_used_qlen_,
+                    GM_ADDR seq_used_kvlen_,
                     GM_ADDR dq_,
                     GM_ADDR dk_,
                     GM_ADDR dv_,
@@ -190,6 +194,8 @@ struct FAGKernelParams {
         , softmax_lse(softmax_lse_)
         , cu_seq_qlen(cu_seq_qlen_)
         , cu_seq_kvlen(cu_seq_kvlen_)
+        , seq_used_qlen(seq_used_qlen_)
+        , seq_used_kvlen(seq_used_kvlen_)
         , dq(dq_)
         , dk(dk_)
         , dv(dv_)
