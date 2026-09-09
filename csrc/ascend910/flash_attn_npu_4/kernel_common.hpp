@@ -24,7 +24,6 @@ namespace KernelCommon {
     constexpr uint32_t NUM_32 = 32;
     constexpr uint32_t NUM_128 = 128;
     constexpr uint32_t NUM_256 = 256;
-    constexpr int64_t SPARSE_MODE_INT_MAX = 2147483647;
 
     template <typename T>
     __aicore__ inline

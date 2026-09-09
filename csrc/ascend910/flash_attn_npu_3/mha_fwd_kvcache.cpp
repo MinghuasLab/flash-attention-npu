@@ -624,18 +624,16 @@ namespace SplitFuse {
                 int32_t leftPointwindowSizeRight = 0;
                 if (windowSizeLeft < 0 && windowSizeLeft * (-1) >= qSeqlen) {
                     kvStart = kvSeqlen / MAX_KV_STACK_LEN + 1;
-                } else if (windowSizeLeft != SPARSE_MODE_INT_MAX) {
+                } else {
                     leftPointwindowSizeLeft = kvSeqlen - qSeqlen - windowSizeLeft;
                     windowSizeLeftStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeLeft;
                     windowSizeLeftEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeLeft;
                     kvStart = AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) / static_cast<int32_t>(MAX_KV_STACK_LEN);
                     notPreMask = false;
-                } else {
-                    kvStart = 0;
                 }
                 if (windowSizeRight < 0 && windowSizeRight * (-1) >= kvSeqlen) {
                     kvSLoopNumTotal = 0;
-                } else if (windowSizeRight != SPARSE_MODE_INT_MAX) {
+                } else {
                     leftPointwindowSizeRight = kvSeqlen - qSeqlen + windowSizeRight;
                     windowSizeRightStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeRight;
                     windowSizeRightEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeRight;
@@ -648,13 +646,10 @@ namespace SplitFuse {
                         kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
                         notNextMask = false;
                     }
-                } else {
-                    noSkipKvS = kvSeqlen;
-                    kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
                 }
-                if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) && windowSizeLeft != SPARSE_MODE_INT_MAX) {
+                if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen)) {
                     delStartRow = kvSeqlen - leftPointwindowSizeLeft;
-                } else if (windowSizeRightStartLen < 0 && windowSizeRight != SPARSE_MODE_INT_MAX) {
+                } else if (windowSizeRightStartLen < 0) {
                     delEndRow = -leftPointwindowSizeRight;
                 }
             } else {
