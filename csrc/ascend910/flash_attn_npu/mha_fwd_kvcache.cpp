@@ -356,7 +356,7 @@ namespace SplitFuse {
                                 (enS2IdxNow - stS2IdxNow) < static_cast<int32_t>(curKSBlockNumTmp);
                             
                             uint32_t pipelineDrain = 0; 
-                            if(startBIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow) {
+                            if(BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow) {
                                 pipelineDrain = PRE_LAUNCH;
                             }
 
@@ -752,7 +752,7 @@ namespace SplitFuse {
                 if (kvSIdx < kvEnd) {
                     const uint32_t curStackTileMod = issuedStackCount % STACK_SLOTS;
                     StackDescriptor &desc = descriptors[curStackTileMod];
-                    if (kvSIdx + 1 > kvSLoopNumTotal - 1U) {
+                    if (kvSIdx + 1 > kvEnd - 1U) {
                         desc.stackSeqTile = noSkipKvS - kvSIdx * MAX_KV_STACK_LEN;
                     } else {
                         desc.stackSeqTile = MAX_KV_STACK_LEN;
@@ -767,7 +767,7 @@ namespace SplitFuse {
                     desc.qSBlockSize = qSBlockSize;
                     desc.qNBlockSize = qNBlockSize;
                     desc.kvSIdx = kvSIdx;
-                    desc.kvSLoopNumTotal = kvSLoopNumTotal;
+                    desc.kvSLoopNumTotal = kvEnd;
                     desc.noSkipKvS = noSkipKvS;
                     // desc.qBlockY = qBlockY;
                     // desc.curSelectNum = curSelectNum;
@@ -775,7 +775,7 @@ namespace SplitFuse {
                     desc.slot = curStackTileMod;
                     desc.taskStateSlot = currentTaskStateSlot;
                     desc.firstStack = taskStackCount == 0;
-                    desc.lastStack = kvSIdx + 1 >= kvSLoopNumTotal;
+                    desc.lastStack = kvSIdx + 1 >= kvEnd;
                     desc.delStartRow = delStartRow;
                     desc.delEndRow = delEndRow;
                     desc.qSBlockIdx = qSBlockIdx;

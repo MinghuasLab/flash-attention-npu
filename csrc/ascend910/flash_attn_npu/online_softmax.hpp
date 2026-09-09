@@ -1434,6 +1434,10 @@ public:
                     (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                // maskUbTensor32 aliases the P staging buffer. Match the
+                // causal-mask path and consume the previous P-store release
+                // before vector code reuses that storage for the SWA mask.
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
                 if (doTriUPreMask && doTriUNextMask) {
                     // *** TriUPreMask
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
