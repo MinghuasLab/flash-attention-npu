@@ -53,8 +53,8 @@
                 fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice,                      \
                 nullptr, attenMaskDevice, softMaxLseDevice,                                      \
                 cuSeqQlenDevice, cuSeqKvlenDevice,                                               \
-                seqUsedQDevice, seqUsedKvDevice,                                                   \
-                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);           \
+                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice,             \
+                seqUsedQDevice, seqUsedKvDevice);                                                  \
     } while (0)
 
 // Pick the headdim specialization at runtime.

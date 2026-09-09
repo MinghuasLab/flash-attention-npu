@@ -92,7 +92,8 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
                                            const at::Tensor &seqlensK,
-                                           const std::optional<at::Tensor> &cuSeqlensQ)
+                                           const std::optional<at::Tensor> &cuSeqlensQ,
+                                           const std::optional<at::Tensor> &seqUsedQ)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -131,6 +132,9 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
     c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
     if (cuSeqlensQ.has_value()) {
         c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
+    }
+    if (seqUsedQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(seqUsedQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
 }
@@ -412,9 +416,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
         int32_t* cu_seqlen_q_cpu = nullptr;
         at::Tensor cu_seqlen_q_cpu_tensor;
+        int32_t* seq_used_q_cpu = nullptr;
+        at::Tensor seq_used_q_cpu_tensor;
         if (is_varlen_q) {
             cu_seqlen_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
             cu_seqlen_q_cpu = static_cast<int32_t *>(cu_seqlen_q_cpu_tensor.data_ptr());
+            if (seqused_q_.has_value()) {
+                seq_used_q_cpu_tensor = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+                seq_used_q_cpu = static_cast<int32_t *>(seq_used_q_cpu_tensor.data_ptr());
+            }
         }
         tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
         tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
@@ -476,7 +486,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             if (is_varlen_q) {
-                qSeqlen = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
+                qSeqlen = seq_used_q_cpu != nullptr
+                    ? seq_used_q_cpu[batchIdx]
+                    : *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
             }
             uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
             uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
@@ -499,10 +511,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             int64_t qSeqlenVal = seqlen_q;
             int64_t kvSeqlenVal = *(seqlens_k_cpu + batchIdx) + (appendKV ? kvNewSeqlen : 0);
             if (is_varlen_q) {
-                qSeqlenVal = *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
-                if (is_varlen_kv) {
-                    kvSeqlenVal = *(seqlens_k_cpu + batchIdx + 1) - *(seqlens_k_cpu + batchIdx);
-                }
+                qSeqlenVal = seq_used_q_cpu != nullptr
+                    ? seq_used_q_cpu[batchIdx]
+                    : *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
             }
             maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
             minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
@@ -528,6 +539,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         splitCtx.seqlen_q = seqlen_q;
         splitCtx.head_size_v = head_size_og;
         splitCtx.cu_seqlen_q_cpu = cu_seqlen_q_cpu;
+        splitCtx.seq_used_q_cpu = seq_used_q_cpu;
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
         splitCtx.is_varlen_q = is_varlen_q;
         splitCtx.blockDim = blockDim;
@@ -716,6 +728,12 @@ at::Tensor get_scheduler_metadata(
         TORCH_CHECK(cu_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
         cuSeqlensQDev = cu_q.data_ptr();
     }
+    if (seqused_q.has_value()) {
+        auto used_q = seqused_q.value();
+        TORCH_CHECK(is_varlen_q, "seqused_q requires cu_seqlens_q");
+        TORCH_CHECK(used_q.dtype() == torch::kInt32, "seqused_q must have dtype int32");
+        TORCH_CHECK(used_q.numel() == batch_size, "seqused_q must have one length per batch element");
+    }
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
     const bool is_varlen_kv = cu_seqlens_k.has_value();
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
@@ -737,6 +755,8 @@ at::Tensor get_scheduler_metadata(
     }
     FAMetadataArgs args;
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cuSeqlensQDev) : 0ULL;
+    args.seqUsedQAddr = (is_varlen_q && seqused_q.has_value())
+        ? reinterpret_cast<uint64_t>(seqused_q.value().data_ptr()) : 0ULL;
     args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
     args.metaOutAddr = 0;  // set by GetSchedulerMetadataImpl
     args.batch = static_cast<uint32_t>(batch_size);
@@ -762,7 +782,7 @@ at::Tensor get_scheduler_metadata(
     // Append-KV tiling fields: kvNewSeqlen = new length (uniform), kvCacheSeqlen = cache capacity.
     args.kvNewSeqlen = (max_seqlen_k_new > 0) ? static_cast<uint32_t>(max_seqlen_k_new) : 0U;
     args.kvCacheSeqlen = static_cast<uint32_t>(max_seqlen_k);
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
+    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, seqused_q);
 }
 
 std::vector<at::Tensor>
@@ -818,8 +838,6 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!is_varlen_q || is_varlen_kv, "If cu_seqlens_q is provided in bwd, cu_seqlens_k must also be provided");
-    TORCH_CHECK(!seqused_q_.has_value(), "mha_bwd does not support seqused_q yet.");
-    TORCH_CHECK(!seqused_k_.has_value(), "mha_bwd does not support seqused_k yet.");
     TORCH_CHECK(sm_margin == 0, "mha_bwd does not support sm_margin yet.");
 
     at::Tensor cu_seqlens_q;
@@ -927,18 +945,30 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
+    at::Tensor seqused_q_cpu_for_tiling;
+    at::Tensor seqused_k_cpu_for_tiling;
     if (is_varlen_q) {
         cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
         cu_seqlens_k_cpu_for_tiling = cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        // Tiling expects cumulative seqlens with length B and no leading zero.
+        // FAG tiling uses cu_seqlens for physical TND endpoints. seqused_* are
+        // per-batch used lengths and are passed separately without cumsum.
         fagInfo.qSeqlenList = static_cast<int32_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
         fagInfo.kvSeqlenList = static_cast<int32_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
+        if (seqused_q_.has_value()) {
+            seqused_q_cpu_for_tiling = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            fagInfo.seqUsedQ = seqused_q_cpu_for_tiling.data_ptr<int32_t>();
+        }
+        if (seqused_k_.has_value()) {
+            seqused_k_cpu_for_tiling = seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            fagInfo.seqUsedKv = seqused_k_cpu_for_tiling.data_ptr<int32_t>();
+        }
     }
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     uint64_t ubSize = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
-    FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    const int64_t tilingStatus = FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    TORCH_CHECK(tilingStatus == 0, "mha_bwd: GetFAGTilingParam failed with status ", tilingStatus);
     // Host-only std::vector members must not be shallow-copied into the GM tiling buffer.
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();

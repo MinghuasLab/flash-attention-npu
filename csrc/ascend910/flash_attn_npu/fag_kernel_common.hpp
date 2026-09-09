@@ -153,14 +153,14 @@ struct FAGKernelParams {
     GM_ADDR softmax_lse;
     GM_ADDR cu_seq_qlen;
     GM_ADDR cu_seq_kvlen;
-    GM_ADDR seq_used_qlen;
-    GM_ADDR seq_used_kvlen;
     GM_ADDR dq;
     GM_ADDR dk;
     GM_ADDR dv;
     GM_ADDR alibi_slopes;
     GM_ADDR workspace;
     GM_ADDR tiling;
+    GM_ADDR seq_used_qlen;
+    GM_ADDR seq_used_kvlen;
     // Methods
     CATLASS_DEVICE
     FAGKernelParams() {
@@ -176,14 +176,14 @@ struct FAGKernelParams {
                     GM_ADDR softmax_lse_,
                     GM_ADDR cu_seq_qlen_,
                     GM_ADDR cu_seq_kvlen_,
-                    GM_ADDR seq_used_qlen_,
-                    GM_ADDR seq_used_kvlen_,
                     GM_ADDR dq_,
                     GM_ADDR dk_,
                     GM_ADDR dv_,
                     GM_ADDR alibi_slopes_,
                     GM_ADDR workspace_,
-                    GM_ADDR tiling_)
+                    GM_ADDR tiling_,
+                    GM_ADDR seq_used_qlen_ = nullptr,
+                    GM_ADDR seq_used_kvlen_ = nullptr)
         : dout(dout_)
         , q(q_)
         , k(k_)
@@ -194,14 +194,14 @@ struct FAGKernelParams {
         , softmax_lse(softmax_lse_)
         , cu_seq_qlen(cu_seq_qlen_)
         , cu_seq_kvlen(cu_seq_kvlen_)
-        , seq_used_qlen(seq_used_qlen_)
-        , seq_used_kvlen(seq_used_kvlen_)
         , dq(dq_)
         , dk(dk_)
         , dv(dv_)
         , alibi_slopes(alibi_slopes_)
         , workspace(workspace_)
-        , tiling(tiling_){
+        , tiling(tiling_)
+        , seq_used_qlen(seq_used_qlen_)
+        , seq_used_kvlen(seq_used_kvlen_){
     }
 };
 

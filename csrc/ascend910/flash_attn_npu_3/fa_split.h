@@ -60,6 +60,7 @@ struct SplitContext {
     int32_t seqlen_q;
     int32_t head_size_v;
     int32_t* cu_seqlen_q_cpu;
+    int32_t* seq_used_q_cpu;
     int32_t* seqlens_k_cpu;
     bool is_varlen_q;
     uint32_t blockDim;
@@ -71,7 +72,9 @@ inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const Split
 {
     BatchParams p;
     if (ctx.is_varlen_q) {
-        p.qSeqlen = static_cast<uint32_t>(ctx.cu_seqlen_q_cpu[bIdx + 1] - ctx.cu_seqlen_q_cpu[bIdx]);
+        p.qSeqlen = ctx.seq_used_q_cpu != nullptr
+            ? static_cast<uint32_t>(ctx.seq_used_q_cpu[bIdx])
+            : static_cast<uint32_t>(ctx.cu_seqlen_q_cpu[bIdx + 1] - ctx.cu_seqlen_q_cpu[bIdx]);
     } else {
         p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
     }

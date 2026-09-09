@@ -67,8 +67,12 @@ struct FAGInfo {
     int64_t vHeadDim = 0;
     int64_t window_size_left;
     int64_t window_size_right;
+    // Cumulative allocated-token endpoints used for TND physical layout.
     int32_t *qSeqlenList{nullptr};
     int32_t *kvSeqlenList{nullptr};
+    // Optional per-batch used lengths. When absent, allocated lengths are used.
+    const int32_t *seqUsedQ{nullptr};
+    const int32_t *seqUsedKv{nullptr};
     bool isDeterministic = false;
     int64_t alibiSlopesBatchStride = 0;
 };

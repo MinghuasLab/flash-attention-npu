@@ -103,6 +103,8 @@ public:
 
     __gm__ uint8_t *actual_seq_qlen_addr;
     __gm__ uint8_t *actual_seq_kvlen_addr;
+    __gm__ uint8_t *seq_used_qlen_addr;
+    __gm__ uint8_t *seq_used_kvlen_addr;
 
     constexpr static uint32_t ENABLE = 1;
     constexpr static int8_t OUTIDX= -1;
@@ -148,6 +150,8 @@ public:
 
         actual_seq_qlen_addr = params.cu_seq_qlen;
         actual_seq_kvlen_addr = params.cu_seq_kvlen;
+        seq_used_qlen_addr = params.seq_used_qlen;
+        seq_used_kvlen_addr = params.seq_used_kvlen;
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
         if constexpr (INPUT_LAYOUT == TND) {
@@ -202,12 +206,19 @@ public:
 
     __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
     {
-        if (unlikely(bIdx == 0)) {
+        if (seq_used_qlen_addr != nullptr) {
+            actualSeqQlen = ((__gm__ int32_t *)seq_used_qlen_addr)[bIdx];
+        } else if (unlikely(bIdx == 0)) {
             actualSeqQlen = ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
-            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
         } else {
             actualSeqQlen =
                 ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
+        }
+        if (seq_used_kvlen_addr != nullptr) {
+            actualSeqKvlen = ((__gm__ int32_t *)seq_used_kvlen_addr)[bIdx];
+        } else if (unlikely(bIdx == 0)) {
+            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
+        } else {
             actualSeqKvlen =
                 ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
         }
@@ -792,7 +803,7 @@ public:
         TBuf<> unifiedBuffer;
         EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
             params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, params.alibi_slopes,
-            params.workspace, params.tiling, unifiedBuffer);
+            params.workspace, params.tiling, unifiedBuffer, params.seq_used_qlen, params.seq_used_kvlen);
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
 
@@ -993,10 +1004,11 @@ template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
                         GM_ADDR atten_mask, GM_ADDR softmax_lse,
-                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
-                        GM_ADDR seq_used_qlen, GM_ADDR seq_used_kvlen, GM_ADDR dq_,
+                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
                         GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_,
-                        GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
+                        GM_ADDR workspace, GM_ADDR tiling,
+                        GM_ADDR seq_used_qlen = nullptr, GM_ADDR seq_used_kvlen = nullptr,
+                        GM_ADDR ptrDump = nullptr
 ) {
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
@@ -1105,8 +1117,8 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
     FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse,
-                           cu_seq_qlen, cu_seq_kvlen, seq_used_qlen, seq_used_kvlen,
-                           dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
+                           cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, alibi_slopes_,
+                           workspace, tiling, seq_used_qlen, seq_used_kvlen};
 
     // call kernel
     FAGKernel flashAttn;

@@ -32,6 +32,7 @@ inline uint64_t WorkSpaceSize(uint64_t blockDim)
 
 struct FAMetadataArgs {
     uint64_t cuSeqlensQAddr;
+    uint64_t seqUsedQAddr;
     uint64_t seqlensKAddr;
     uint64_t metaOutAddr;
     uint32_t batch;
