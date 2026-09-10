@@ -92,7 +92,12 @@ public:
         constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
-        constexpr uint32_t DROP_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        // Raw attention masks share [180224, 188416) in SWA.
+        // Dropout must not alias them: mask prefetch and dropout Select can
+        // overlap on MTE2/V. TV reductions use at most the first 5 KiB;
+        // reserve its last 2 KiB for the padded bit mask (up to 64 x 32 B).
+        // EVENT_ID2 (V_MTE2) already protects this buffer between row loops.
+        constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
@@ -440,7 +445,7 @@ public:
 
     __aicore__ inline void OperateNextMaskUb(uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
-        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor[MAX_UB_S_ELEM_NUM], rowNumCurLoop, columnNumRound);
+        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
         UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
     }
 
@@ -466,9 +471,13 @@ public:
         uint32_t columnNum, uint32_t columnNumRound,
         uint32_t maskStride, uint32_t tokenNumPerHead,
         uint32_t proTokenIdx, uint32_t proTokenNum,
-        uint32_t integralHeadNum, uint32_t epiTokenNum, bool isNextMask)
+        uint32_t integralHeadNum, uint32_t epiTokenNum, bool /*isNextMask*/)
     {
-        uint32_t innerUbRowOffset = isNextMask ? MAX_UB_S_ELEM_NUM : 0;
+        // Left/right masks are consumed serially; V_MTE2 EVENT_ID6 protects
+        // left -> right reuse, and EVENT_ID4 protects the next row-loop load.
+        // Do not place the right mask at 184 KiB: CANN scalar Select uses
+        // that address as implicit temporary UB, corrupting a prefetched mask.
+        uint32_t innerUbRowOffset = 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask[proTokenIdx * maskStride],
@@ -865,8 +874,12 @@ public:
     __aicore__ inline
     void ApplyDropoutNegate(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
     {
-        auto t0 = lmUbTensor.template ReinterpretCast<half>();
-        auto t1 = hmUbTensor.template ReinterpretCast<half>();
+        // Each scratch vector can contain 512 half values. HM is only 64
+        // floats: using it here overwrites LL and the live per-task GM slots.
+        // CalcExp has finished using TV; CalcLocalRowSum will initialize it
+        // again after dropout. Reuse two disjoint 1-KiB slices of its 8 KiB.
+        auto t0 = tvUbTensor.template ReinterpretCast<half>();
+        auto t1 = t0[UB_UINT8_VECTOR_SIZE / sizeof(half)];
         auto u0 = t0.template ReinterpretCast<uint16_t>();
         auto u1 = t1.template ReinterpretCast<uint16_t>();
         for (uint32_t r = 0; r < rowNum; r++) {
