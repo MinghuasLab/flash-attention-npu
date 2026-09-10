@@ -68,9 +68,15 @@ public:
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
     // 64 rows per vector: scalar LSE followed by 8-wide DMA staging rows.
+<<<<<<< HEAD
     // Keep this separate from softmax's TV scratch, raw mask and SDK scratch.
     // [177920, 180224) lies after the last DM slot's live 64 rows (ending
     // at 177408), and immediately before the raw mask [180224, 188416).
+=======
+    // Keep this separate from softmax's TV scratch and BOTH SWA raw masks.
+    // [177920, 180224) lies after the last DM slot's live 64 rows (ending
+    // at 177408), and immediately before the raw masks [180224, 196608).
+>>>>>>> origin/main
     static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
     static constexpr uint32_t LSE_STAGING_UB_OFFSET =
         11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
