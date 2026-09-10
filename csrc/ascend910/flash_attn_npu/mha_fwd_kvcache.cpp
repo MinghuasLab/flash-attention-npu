@@ -752,11 +752,10 @@ namespace SplitFuse {
                 if (kvSIdx < kvEnd) {
                     const uint32_t curStackTileMod = issuedStackCount % STACK_SLOTS;
                     StackDescriptor &desc = descriptors[curStackTileMod];
-                    if (kvSIdx + 1 > kvEnd - 1U) {
-                        desc.stackSeqTile = noSkipKvS - kvSIdx * MAX_KV_STACK_LEN;
-                    } else {
-                        desc.stackSeqTile = MAX_KV_STACK_LEN;
-                    }
+                    // A split's last stack can precede the sequence/window tail.
+                    // Its extent must still fit the fixed-size QK/PV workspace.
+                    desc.stackSeqTile = AscendC::Std::min(
+                        MAX_KV_STACK_LEN, noSkipKvS - kvSIdx * MAX_KV_STACK_LEN);
                     
                     desc.gmOffsetV = gmOffsetV;
                     desc.gmOffsetO = gmOffsetO;

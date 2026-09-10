@@ -987,9 +987,9 @@ public:
             isFirstStackTile);
 
         CalcExp(sUbOffset, rowNumCurLoop, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
-        // if constexpr (!doTriUMask) {
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
-        // } 
+        if constexpr (!doTriUMask) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
+        }
 
         DownCastP(sUbOffset, rowNumCurLoop, columnNumRound);
         if constexpr (HAS_DROPOUT_) {
@@ -1019,11 +1019,14 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
 
-        // if constexpr (!doTriUMask) {
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
-        // }
         if constexpr (doTriUMask) {
+            // Mask conversion aliases both P staging buffers; release both
+            // only after the masked tile's P store has completed.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+        } else {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
         }
         UpdateGlobalRowSum(
             sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, stateRowOffset, 
@@ -1242,6 +1245,11 @@ public:
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+                // The first masked tile may follow unmasked P stores on
+                // either ping-pong buffer. EVENT_ID2 alone is initially set
+                // and does not protect those stores from mask conversion.
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
                 // AscendC::printf("cmp pingpongFlag: %u\n", pingpongFlag);
                 UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
                 UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
@@ -1438,6 +1446,8 @@ public:
                 // causal-mask path and consume the previous P-store release
                 // before vector code reuses that storage for the SWA mask.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
                 if (doTriUPreMask && doTriUNextMask) {
                     // *** TriUPreMask
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
