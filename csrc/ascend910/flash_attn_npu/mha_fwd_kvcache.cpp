@@ -85,6 +85,10 @@ namespace SplitFuse {
             uint64_t gmOffsetV;
             uint64_t gmOffsetO;
             uint64_t gmOffsetLse;
+            // Delayed rescale must retain the producing task's split destination.
+            uint64_t gmOffsetLseFD;
+            uint64_t gmOffsetOFD;
+            bool isSplitKV;
             uint64_t blockBOffset;
             uint32_t rowNum;
             uint32_t stackSeqTile;
@@ -745,7 +749,6 @@ namespace SplitFuse {
             LayoutK layoutKTemp(strideK, stackSeqTile);
             LayoutV layoutVTemp(stackSeqTile, strideV);
             blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
-            blockMmadPV.resetBlockStart(kvStart, pagedBlockSize);
             blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
 #endif
             for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + pipelineDrain; kvSIdx++) {
@@ -760,13 +763,16 @@ namespace SplitFuse {
                     desc.gmOffsetV = gmOffsetV;
                     desc.gmOffsetO = gmOffsetO;
                     desc.gmOffsetLse = gmOffsetLse;
+                    desc.gmOffsetLseFD = gmOffsetLseFD;
+                    desc.gmOffsetOFD = gmOffsetOFD;
+                    desc.isSplitKV = isSplitKV;
                     desc.blockBOffset = blockBOffset;
                     desc.rowNum = rowNum;
                     desc.qSeqlen = qSeqlen;
                     desc.qSBlockSize = qSBlockSize;
                     desc.qNBlockSize = qNBlockSize;
                     desc.kvSIdx = kvSIdx;
-                    desc.kvSLoopNumTotal = kvEnd;
+                    desc.kvSLoopNumTotal = kvSLoopNumTotal;
                     desc.noSkipKvS = noSkipKvS;
                     // desc.qBlockY = qBlockY;
                     // desc.curSelectNum = curSelectNum;
@@ -1029,6 +1035,10 @@ namespace SplitFuse {
                     uint64_t gmOffsetP = coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
                         pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB;
                     if constexpr (PAGED_CACHE_FLAG) {
+                        // PV can consume the previous task after the next QK
+                        // task starts. Derive its page cursor from its own stack;
+                        // a short sequence tail must not shift the next task's V.
+                        blockMmadPV.resetBlockStart(pvDesc.kvSIdx, pagedBlockSize);
                         blockMmadPV(
                             gP[gmOffsetP],
                             gV[pvDesc.gmOffsetV],
@@ -1076,14 +1086,13 @@ namespace SplitFuse {
                     uint64_t gmOffsetUpdate = (uint64_t)(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
                     // Arch::CrossCoreWaitFlag(pvReady);
                     
-                    // TODO FD 未适配
                     if (flashDecodeFlag != 0U) {
                         LayoutLse layoutgmLse(pvDesc.qSBlockSize, pvDesc.qNBlockSize);
                         LayoutLse layoutgmLo(pvDesc.qSBlockSize, embed * pvDesc.qNBlockSize);
                         typename EpilogueRescaleO::SplitKVParams splitParams;
-                        splitParams.isSplitkv = isSplitKV;
-                        splitParams.gCombineLse = gLseFD[gmOffsetLseFD];
-                        splitParams.gCombineo = gOFD[gmOffsetOFD];
+                        splitParams.isSplitkv = pvDesc.isSplitKV;
+                        splitParams.gCombineLse = gLseFD[pvDesc.gmOffsetLseFD];
+                        splitParams.gCombineo = gOFD[pvDesc.gmOffsetOFD];
                         splitParams.layoutgmLse = &layoutgmLse;
                         splitParams.layoutgmLo = &layoutgmLo;
 
