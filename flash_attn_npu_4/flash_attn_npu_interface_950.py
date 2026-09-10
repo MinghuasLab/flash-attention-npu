@@ -24,7 +24,12 @@ else:
 
 
 def _maybe_contiguous(x):
-    """Make sure the inner-most stride is 1; the kernel asserts it."""
+    """Materialize tensors used by kernel arguments that require dense storage."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the vector dimension must be contiguous."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 @_torch_custom_op_wrapper(
@@ -56,8 +61,8 @@ def _flash_attn_forward(
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k = (_maybe_contiguous(x) for x in (q, k))
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q, k, v = (_maybe_contiguous_last_dim(x) for x in (q, k, v))
+    qv = _maybe_contiguous(qv)
     cu_seqlens_q, cu_seqlens_k = (
         _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)
     )
@@ -205,9 +210,6 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
-
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 

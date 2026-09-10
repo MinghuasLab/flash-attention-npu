@@ -131,6 +131,20 @@ public:
         value_d = fagTilingData->vHeadDim;
         dAlign = (d + 15) / 16 * 16;
         value_dAlign = (value_d + 15) / 16 * 16;
+        if constexpr (INPUT_LAYOUT == BSND) {
+            qBatchStride = fagTilingData->qStrides.batch;
+            qSeqStride = fagTilingData->qStrides.seq;
+            qHeadStride = fagTilingData->qStrides.head;
+            kBatchStride = fagTilingData->kStrides.batch;
+            kSeqStride = fagTilingData->kStrides.seq;
+            kHeadStride = fagTilingData->kStrides.head;
+            vBatchStride = fagTilingData->vStrides.batch;
+            vSeqStride = fagTilingData->vStrides.seq;
+            vHeadStride = fagTilingData->vStrides.head;
+            doutBatchStride = fagTilingData->doutStrides.batch;
+            doutSeqStride = fagTilingData->doutStrides.seq;
+            doutHeadStride = fagTilingData->doutStrides.head;
+        }
 
         s1Token = fagTilingData->s1Token;
         s2Token = fagTilingData->s2Token;
@@ -418,31 +432,46 @@ public:
             dbParam.bTensorOffsetCv += (dbParam.s2oIdx * s2CvInner * n2 + dbParam.n2Idx) * d;
             dbParam.s1Stride = n2 * g * d;
             dbParam.s2Stride = n2 * d;
+            dbParam.qTensorOffsetCv = dbParam.aTensorOffsetCv;
+            dbParam.kTensorOffsetCv = dbParam.bTensorOffsetCv;
+            dbParam.vTensorOffsetCv = dbParam.bTensorOffsetCv / d * value_d;
+            dbParam.doutTensorOffsetCv = dbParam.aTensorOffsetCv / d * value_d;
+            dbParam.qSeqStride = dbParam.s1Stride;
+            dbParam.kSeqStride = dbParam.s2Stride;
+            dbParam.vSeqStride = dbParam.s2Stride / d * value_d;
+            dbParam.doutSeqStride = dbParam.s1Stride / d * value_d;
         } else if constexpr (INPUT_LAYOUT == BSND) {
             dbParam.aTensorOffsetCv = (((dbParam.bIdx * s1 + dbParam.s1oIdx * s1CvInner) * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * d;
             dbParam.bTensorOffsetCv = ((dbParam.bIdx * s2 + dbParam.s2oIdx * s2CvInner) * n2 + dbParam.n2Idx) * d;
             dbParam.s1Stride = n2 * g * d;
             dbParam.s2Stride = n2 * d;
+            int64_t qHeadIdx = dbParam.n2Idx * g + dbParam.gIdx;
+            dbParam.qTensorOffsetCv = dbParam.bIdx * qBatchStride +
+                dbParam.s1oIdx * s1CvInner * qSeqStride + qHeadIdx * qHeadStride;
+            dbParam.kTensorOffsetCv = dbParam.bIdx * kBatchStride +
+                dbParam.s2oIdx * s2CvInner * kSeqStride + dbParam.n2Idx * kHeadStride;
+            dbParam.vTensorOffsetCv = dbParam.bIdx * vBatchStride +
+                dbParam.s2oIdx * s2CvInner * vSeqStride + dbParam.n2Idx * vHeadStride;
+            dbParam.doutTensorOffsetCv = dbParam.bIdx * doutBatchStride +
+                dbParam.s1oIdx * s1CvInner * doutSeqStride + qHeadIdx * doutHeadStride;
+            dbParam.qSeqStride = qSeqStride;
+            dbParam.kSeqStride = kSeqStride;
+            dbParam.vSeqStride = vSeqStride;
+            dbParam.doutSeqStride = doutSeqStride;
         }
 
         int64_t s1_size = dbParam.actualS1Len;
 
-        // dy * v need align the d to value_d.
-        int64_t specify_for_v_aTensorOffsetCv = dbParam.aTensorOffsetCv / d * value_d;
-        int64_t specify_for_v_bTensorOffsetCv = dbParam.bTensorOffsetCv / d * value_d;
-        int64_t specify_for_v_s1Stride = dbParam.s1Stride / d * value_d;
-        int64_t specify_for_v_s2Stride = dbParam.s2Stride / d * value_d;
-
         // mm-dyv
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, dbParam.s2CvExtend, value_d);
-        LayoutA layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), specify_for_v_s1Stride};
-        LayoutB layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), specify_for_v_s2Stride}; // ColumnMajor shape=(d,s2)  stride=n2*g*d
+        LayoutA layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), dbParam.doutSeqStride};
+        LayoutB layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.vSeqStride};
         LayoutC layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dbParam.s2CvExtendAlign};
 
         {
             BlockMmad blockMmadDyV(resource);
-            blockMmadDyV(dxGm[specify_for_v_aTensorOffsetCv], layoutA1,
-                    valueGm[specify_for_v_bTensorOffsetCv], layoutB1,
+            blockMmadDyV(dxGm[dbParam.doutTensorOffsetCv], layoutA1,
+                    valueGm[dbParam.vTensorOffsetCv], layoutB1,
                     mm1WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC1,
                     actualBlockShape1);
         }
@@ -452,12 +481,12 @@ public:
 
         // mm-qk
         GemmCoord actualBlockShape(dbParam.s1CvExtend, dbParam.s2CvExtend, d);
-        LayoutA layoutA{actualBlockShape.m(), actualBlockShape.k(), dbParam.s1Stride};
-        LayoutB layoutB{actualBlockShape.k(), actualBlockShape.n(), dbParam.s2Stride};
+        LayoutA layoutA{actualBlockShape.m(), actualBlockShape.k(), dbParam.qSeqStride};
+        LayoutB layoutB{actualBlockShape.k(), actualBlockShape.n(), dbParam.kSeqStride};
         LayoutC layoutC{actualBlockShape.m(), actualBlockShape.n(), dbParam.s2CvExtendAlign};
         BlockMmad blockMmadQk(resource);
-        blockMmadQk(queryGm[dbParam.aTensorOffsetCv], layoutA,
-                keyGm[dbParam.bTensorOffsetCv], layoutB,
+        blockMmadQk(queryGm[dbParam.qTensorOffsetCv], layoutA,
+                keyGm[dbParam.kTensorOffsetCv], layoutB,
                 mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC,
                 actualBlockShape);
     }
@@ -525,12 +554,12 @@ public:
         // // left [B, N2, G, S1, s2] right [B, N2, 1, S2, D] output [B, N2, G, S1, D]
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size}; // RowMajor  shape=(s1,s2)  stride=s2
-        LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.s2Stride};
+        LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.kSeqStride};
         LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc}; 
         {
             BlockMmad2 blockMmad2(resource);
             blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    keyGm[dbParam.bTensorOffsetCv],
+                    keyGm[dbParam.kTensorOffsetCv],
                     dqWorkSpaceGm[dqOffset],
                     layoutA1, layoutB1, layoutC1,
                     actualBlockShape1, true);
@@ -544,10 +573,10 @@ public:
         // // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
         LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(), s2_size}; // ColumnMajor  origin shape=(s2,s1), so stride=s2
-        LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
+        LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.qSeqStride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                queryGm[dbParam.aTensorOffsetCv],
+                queryGm[dbParam.qTensorOffsetCv],
                 dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
                 actualBlockShape2, true);
 
@@ -559,10 +588,10 @@ public:
         // // left [B, N2, G, S1, S2] right [B, N2, G, S1, D2] output [B, N2, 1, S2, D2]
         GemmCoord actualBlockShape3(dbParam.s2CvExtend, value_d, dbParam.s1CvExtend);
         LayoutA3 layoutA3{actualBlockShape3.m(), actualBlockShape3.k(), s2_size};
-        LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
+        LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.doutSeqStride};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                dxGm[dbParam.doutTensorOffsetCv],
                 dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
                 actualBlockShape3, true);
     }
@@ -610,19 +639,19 @@ public:
         // left [B, N2, G, S1, s2] right [B, N2, 1, S2, D] output [B, N2, G, S1, D]
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size};
-        LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.s2Stride};
+        LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.kSeqStride};
         LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
         {
             BlockMmad2 blockMmad2(resource);
             if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
                 blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
+                        keyGm[dbParam.kTensorOffsetCv],
                         dqWorkSpaceGm[dqOffset],
                         layoutA1, layoutB1, layoutC1,
                         actualBlockShape1, false);
             } else {
                 blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
+                        keyGm[dbParam.kTensorOffsetCv],
                         dqDtmWsGm[dqOffset],
                         layoutA1, layoutB1, layoutC1,
                         actualBlockShape1, false);
@@ -640,16 +669,16 @@ public:
         // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
         LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(), s2_size};
-        LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
+        LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.qSeqStride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
             blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    queryGm[dbParam.aTensorOffsetCv],
+                    queryGm[dbParam.qTensorOffsetCv],
                     dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
                     actualBlockShape2, false);
         } else {
             blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    queryGm[dbParam.aTensorOffsetCv],
+                    queryGm[dbParam.qTensorOffsetCv],
                     dkDtmWsGm[dkvOffset], layoutA2, layoutB2, layoutC2,
                     actualBlockShape2, false);
         }
@@ -662,16 +691,16 @@ public:
         // left [B, N2, G, S1, S2] right [B, N2, G, S1, D2] output [B, N2, 1, S2, D2]
         GemmCoord actualBlockShape3(dbParam.s2CvExtend, value_d, dbParam.s1CvExtend);
         LayoutA3 layoutA3{actualBlockShape3.m(), actualBlockShape3.k(), s2_size};
-        LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
+        LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.doutSeqStride};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
             blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                    dxGm[dbParam.doutTensorOffsetCv],
                     dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
                     actualBlockShape3, false);
         } else {
             blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                    dxGm[dbParam.doutTensorOffsetCv],
                     dvDtmWsGm[dvOffset], layoutA3, layoutB3, layoutC3,
                     actualBlockShape3, false);
         }
@@ -885,6 +914,21 @@ private:
     int64_t value_d;
     int64_t dAlign;
     int64_t value_dAlign;
+
+    // True element strides for the logical BSND views.  Dense workspace
+    // strides remain in DBParams::s1Stride/s2Stride.
+    int64_t qBatchStride{0};
+    int64_t qSeqStride{0};
+    int64_t qHeadStride{0};
+    int64_t kBatchStride{0};
+    int64_t kSeqStride{0};
+    int64_t kHeadStride{0};
+    int64_t vBatchStride{0};
+    int64_t vSeqStride{0};
+    int64_t vHeadStride{0};
+    int64_t doutBatchStride{0};
+    int64_t doutSeqStride{0};
+    int64_t doutHeadStride{0};
 
     uint32_t coreNum;
     uint32_t cubeCoreNum;

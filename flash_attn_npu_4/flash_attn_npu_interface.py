@@ -24,7 +24,44 @@ else:
 
 
 def maybe_contiguous(x):
+    """Materialize tensors used by kernel arguments that require dense storage."""
+    return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the vector dimension must be contiguous."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _is_bnsd_transpose_view(x):
+    if x is None or x.dim() != 4 or x.stride(-1) != 1:
+        return False
+    _, seqlen, nheads, headdim = x.shape
+    return x.stride() == (
+        nheads * seqlen * headdim,
+        headdim,
+        seqlen * headdim,
+        1,
+    )
+
+
+def maybe_contiguous_bwd(x):
+    if x is None or x.is_contiguous() or _is_bnsd_transpose_view(x):
+        return x
+    return x.contiguous()
+
+
+def maybe_contiguous_bwd_output(x):
+    if x is None or x.is_contiguous() or _is_bnsd_transpose_view(x):
+        return x, None
+    return torch.empty_like(x, memory_format=torch.contiguous_format), x
+
+
+def maybe_contiguous_output(x):
+    """Allocate a dense temporary for a strided kernel output buffer."""
+    if x is None or x.is_contiguous():
+        return x
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 def round_multiple(x, m):
@@ -102,8 +139,8 @@ def _flash_attn_forward(
     scheduler_metadata: Optional[torch.Tensor] = None,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    q, k = [maybe_contiguous(x) for x in (q, k)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q, k, v = [maybe_contiguous_last_dim(x) for x in (q, k, v)]
+    qv = maybe_contiguous(qv)
     cu_seqlens_q, cu_seqlens_k = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)
     ]
@@ -163,7 +200,9 @@ def get_scheduler_metadata(
     This avoids the device->host->device round trip in the eager tiling path by
     running the tiling/mask derivation on the NPU. The returned byte tensor is
     passed back to ``flash_attn_func`` / ``flash_attn_varlen_func`` through the
-    ``scheduler_metadata`` argument.
+    ``scheduler_metadata`` argument. Q/K/V element strides are supplied on each
+    kernel launch, so this tensor is reusable across same-shaped outer-strided
+    views.
     """
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -218,7 +257,10 @@ def _flash_attn_backward_op(
     softcap: float,
     deterministic: bool,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dout, q, k, v, out = [maybe_contiguous_bwd(x) for x in (dout, q, k, v, out)]
+    dq_kernel, dq_copyback = maybe_contiguous_bwd_output(dq)
+    dk_kernel, dk_copyback = maybe_contiguous_bwd_output(dk)
+    dv_kernel, dv_copyback = maybe_contiguous_bwd_output(dv)
     _dq, _dk, _dv, softmax_d = flash_attn_npu_4.bwd(
         dout,
         q,
@@ -226,9 +268,9 @@ def _flash_attn_backward_op(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         cu_seqlens_q,
         cu_seqlens_k,
         None,  # seqused_q
@@ -243,6 +285,12 @@ def _flash_attn_backward_op(
         deterministic,
         0,  # sm_margin
     )
+    if dq_copyback is not None:
+        dq_copyback.copy_(dq_kernel)
+    if dk_copyback is not None:
+        dk_copyback.copy_(dk_kernel)
+    if dv_copyback is not None:
+        dv_copyback.copy_(dv_kernel)
     return softmax_d
 
 
@@ -386,8 +434,6 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors_bwd=None,
         return_lse=False,
     ):
-        assert k.stride(-1) == 1, "k must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
 
@@ -579,8 +625,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqlen_k_per_split=None,
         disable_scheduler_metadata=False,
     ):  
-        assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         if seqused_k is not None and isinstance(seqused_k, int):

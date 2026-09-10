@@ -254,10 +254,22 @@ namespace SplitFuse {
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
-            strideQ = static_cast<uint64_t>(qHeads * embed);
+            qBatchStride = params.qBatchStride;
+            qHeadStride = params.qHeadStride;
+            strideQ = params.qSeqStride;
             strideO = static_cast<uint64_t>(qHeads * embedV);
-            strideK = static_cast<uint64_t>(kvHeads * embed);
-            strideV = static_cast<uint64_t>(kvHeads * embedV);
+            kBatchStride = params.kBatchStride;
+            kHeadStride = params.kHeadStride;
+            strideK = params.kSeqStride;
+            vBatchStride = params.vBatchStride;
+            vHeadStride = params.vHeadStride;
+            strideV = params.vSeqStride;
+            kNewBatchStride = params.kNewBatchStride;
+            kNewHeadStride = params.kNewHeadStride;
+            kNewSeqStride = params.kNewSeqStride;
+            vNewBatchStride = params.vNewBatchStride;
+            vNewHeadStride = params.vNewHeadStride;
+            vNewSeqStride = params.vNewSeqStride;
             embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
             embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
             groupSize = qHeads / kvHeads;
@@ -533,13 +545,20 @@ namespace SplitFuse {
                 kvSeqlen = kvSeqlenOld + kvNewSeqlen;
             }
 
-            uint64_t qBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideQ;
+            uint64_t qBOffset = (INPUT_LAYOUT == FaiKenel::inputLayout::TND)
+                ? static_cast<uint64_t>(prevQSeqlenSum) * strideQ
+                : static_cast<uint64_t>(BIdx) * qBatchStride;
             uint64_t kBOffset = 0;
             uint64_t vBOffset = 0;
             uint64_t blockBOffset = 0;
             if constexpr (!PAGED_CACHE_FLAG) {
-                kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
-                vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
+                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                    kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
+                    vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
+                } else {
+                    kBOffset = static_cast<uint64_t>(BIdx) * kBatchStride;
+                    vBOffset = static_cast<uint64_t>(BIdx) * vBatchStride;
+                }
             } else {
                 blockBOffset = static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(maxNumBlocksPerBatch);
             }
@@ -577,14 +596,14 @@ namespace SplitFuse {
 
             uint64_t gmOffsetQ = qBOffset +
                 static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
-                static_cast<uint64_t>(qNStartIdx * embed);
-            uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx * embed);
-            uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx * embedV);
+                static_cast<uint64_t>(qNStartIdx) * qHeadStride;
+            uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx) * kHeadStride;
+            uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx) * vHeadStride;
             // newkv are (b, s_new, h_k, d); batch b starts at b * kvNewSeqlen tokens.
             uint64_t gmOffsetKNew = appendKVFlag ?
-                static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideK + static_cast<uint64_t>(kvNIdx * embed) : 0;
+                static_cast<uint64_t>(BIdx) * kNewBatchStride + static_cast<uint64_t>(kvNIdx) * kNewHeadStride : 0;
             uint64_t gmOffsetVNew = appendKVFlag ?
-                static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideV + static_cast<uint64_t>(kvNIdx * embedV) : 0;
+                static_cast<uint64_t>(BIdx) * vNewBatchStride + static_cast<uint64_t>(kvNIdx) * vNewHeadStride : 0;
             uint64_t gmOffsetO = oBOffset +
                 static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideO +
                 static_cast<uint64_t>(qNStartIdx * embedV);
@@ -706,11 +725,11 @@ namespace SplitFuse {
             }
 #ifdef __DAV_C220_CUBE__
             LayoutQ layoutQTemp(rowNum, embed);
-            LayoutK layoutKTemp(strideK, stackSeqTile);
-            LayoutV layoutVTemp(stackSeqTile, strideV);
             blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
             blockMmadPV.resetBlockStart(kvStart, pagedBlockSize);
-            blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
+            blockMmadQK.loadQGM(
+                gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize,
+                static_cast<uint32_t>(strideQ), static_cast<uint32_t>(qHeadStride));
 #endif
             for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + preKVNum; kvSIdx++) {
                 if (kvSIdx < kvEnd) {
@@ -733,6 +752,8 @@ namespace SplitFuse {
                     GemmCoord actualBlockShapeQK{rowNum, stackSeqTile, embed};
                     LayoutS layOutS(rowNum, stackSeqTile, stackSeqTilePad);
 #ifdef __DAV_C220_CUBE__
+                    uint32_t qkSeqStride = static_cast<uint32_t>(isAppendBlock ? kNewSeqStride : strideK);
+                    LayoutK layoutKTemp(qkSeqStride, stackSeqTile);
                     if constexpr (PAGED_CACHE_FLAG) {
                         blockMmadQK(
                             gQ[gmOffsetQ],
@@ -746,10 +767,13 @@ namespace SplitFuse {
                             kvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
-                            strideK,
+                            qkSeqStride,
+                            isAppendBlock ? kNewBatchStride : kBatchStride,
                             doCopyback,
                             gK[gmOffsetK],
                             qkCacheOffset,
+                            static_cast<uint32_t>(strideK),
+                            kBatchStride,
                             gBlockTable,
                             isAppendBlock ? pagedBlockSize : 0U,
                             static_cast<uint32_t>(blockBOffset));
@@ -766,10 +790,13 @@ namespace SplitFuse {
                             kvSIdxLocal,
                             kvSLoopNumTotal,
                             pagedBlockSize,
-                            strideK,
+                            qkSeqStride,
+                            isAppendBlock ? kNewBatchStride : kBatchStride,
                             doCopyback,
                             gK[gmOffsetK],
-                            qkCacheOffset);
+                            qkCacheOffset,
+                            static_cast<uint32_t>(strideK),
+                            kBatchStride);
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);
 #endif
@@ -989,6 +1016,8 @@ namespace SplitFuse {
                     LayoutOTmp layoutOTmp(rowNum, embedV, embedRoundV);
 #ifdef __DAV_C220_CUBE__
                     LayoutP layoutPTemp(rowNum, stackSeqTile, stackSeqTilePad);
+                    uint32_t pvSeqStride = static_cast<uint32_t>(isAppendBlockPV ? vNewSeqStride : strideV);
+                    LayoutV layoutVTemp(stackSeqTile, pvSeqStride);
                     uint64_t gmOffsetP = coreIdx * WORKSPACE_BLOCK_SIZE_DB * (PRE_LAUNCH + 1) +
                         curStackTileMod * WORKSPACE_BLOCK_SIZE_DB;
                     if constexpr (PAGED_CACHE_FLAG) {
@@ -1005,12 +1034,15 @@ namespace SplitFuse {
                             kvSLoopNumTotal,
                             pagedBlockSize,
                             noSkipKvS,
-                            strideV,
+                            pvSeqStride,
+                            isAppendBlockPV ? vNewBatchStride : vBatchStride,
                             blockStackNum,
                             softmaxReady,
                             doCopybackPV,
                             gV[gmOffsetV],
                             pvCacheOffset,
+                            static_cast<uint32_t>(strideV),
+                            vBatchStride,
                             gBlockTable,
                             isAppendBlockPV ? pagedBlockSize : 0U,
                             static_cast<uint32_t>(blockBOffset));
@@ -1028,12 +1060,15 @@ namespace SplitFuse {
                             kvSLoopNumTotal,
                             pagedBlockSize,
                             noSkipKvS,
-                            strideV,
+                            pvSeqStride,
+                            isAppendBlockPV ? vNewBatchStride : vBatchStride,
                             blockStackNum,
                             softmaxReady,
                             doCopybackPV,
                             gV[gmOffsetV],
-                            pvCacheOffset);
+                            pvCacheOffset,
+                            static_cast<uint32_t>(strideV),
+                            vBatchStride);
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
@@ -1130,6 +1165,18 @@ namespace SplitFuse {
         uint64_t strideO;
         uint64_t strideK;
         uint64_t strideV;
+        uint64_t qBatchStride;
+        uint64_t qHeadStride;
+        uint64_t kBatchStride;
+        uint64_t kHeadStride;
+        uint64_t vBatchStride;
+        uint64_t vHeadStride;
+        uint64_t kNewBatchStride;
+        uint64_t kNewSeqStride;
+        uint64_t kNewHeadStride;
+        uint64_t vNewBatchStride;
+        uint64_t vNewSeqStride;
+        uint64_t vNewHeadStride;
         uint32_t embedRound;
         uint32_t embedRoundV;
         uint32_t groupSize;
@@ -1170,7 +1217,12 @@ namespace SplitFuse {
         GM_ADDR workspace,
         GM_ADDR tiling,
         GM_ADDR kNew,
-        GM_ADDR vNew)
+        GM_ADDR vNew,
+        uint64_t qBatchStride, uint64_t qSeqStride, uint64_t qHeadStride,
+        uint64_t kBatchStride, uint64_t kSeqStride, uint64_t kHeadStride,
+        uint64_t vBatchStride, uint64_t vSeqStride, uint64_t vHeadStride,
+        uint64_t kNewBatchStride, uint64_t kNewSeqStride, uint64_t kNewHeadStride,
+        uint64_t vNewBatchStride, uint64_t vNewSeqStride, uint64_t vNewHeadStride)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1234,7 +1286,12 @@ namespace SplitFuse {
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
         FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
-                               kNew, vNew};
+                               kNew, vNew,
+                               qBatchStride, qSeqStride, qHeadStride,
+                               kBatchStride, kSeqStride, kHeadStride,
+                               vBatchStride, vSeqStride, vHeadStride,
+                               kNewBatchStride, kNewSeqStride, kNewHeadStride,
+                               vNewBatchStride, vNewSeqStride, vNewHeadStride};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

@@ -38,9 +38,57 @@ using namespace KernelCommon;
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+static bool IsSupportedBsndBackwardLayout(const at::Tensor &tensor)
+{
+    if (tensor.dim() != 4 || tensor.stride(3) != 1) {
+        return false;
+    }
+    if (tensor.is_contiguous()) {
+        return true;
+    }
+    const int64_t seqlen = tensor.size(1);
+    const int64_t nheads = tensor.size(2);
+    const int64_t headdim = tensor.size(3);
+    return tensor.stride(0) == nheads * seqlen * headdim &&
+           tensor.stride(1) == headdim &&
+           tensor.stride(2) == seqlen * headdim;
+}
+
+static void SetBsndStrides(FAGTensorStrides &dst, const at::Tensor &tensor)
+{
+    dst.batch = tensor.stride(0);
+    dst.seq = tensor.stride(1);
+    dst.head = tensor.stride(2);
+}
+
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
+
+struct QkvElementStrides {
+    uint64_t batch;
+    uint64_t seq;
+    uint64_t head;
+};
+
+static QkvElementStrides GetQkvElementStrides(const at::Tensor &x, const char *name)
+{
+    TORCH_CHECK(x.dim() == 3 || x.dim() == 4, name, " must be a 3D TND or 4D BSND/paged tensor");
+    TORCH_CHECK(x.stride(x.dim() - 1) == 1, name, " must be contiguous in the last dimension");
+    for (int64_t i = 0; i < x.dim(); ++i) {
+        TORCH_CHECK(x.stride(i) >= 0, name, " does not support negative strides");
+    }
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(x.dim() - 2)) <= std::numeric_limits<uint32_t>::max(),
+                name, " head stride exceeds the kernel DMA limit");
+    const int64_t seqDim = x.dim() == 3 ? 0 : 1;
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(seqDim)) <= std::numeric_limits<uint32_t>::max(),
+                name, " sequence stride exceeds the kernel DMA limit");
+    if (x.dim() == 3) {
+        return {0, static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1))};
+    }
+    return {static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1)),
+            static_cast<uint64_t>(x.stride(2))};
+}
 
 struct FwdMaskDerivation {
     bool is_causal;
@@ -183,9 +231,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor k must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor v must have contiguous last dimension");
+    const QkvElementStrides qStrides = GetQkvElementStrides(q, "q");
+    const QkvElementStrides kStrides = GetQkvElementStrides(k, "k");
+    const QkvElementStrides vStrides = GetQkvElementStrides(v, "v");
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t launchBlockDim = blockDim;
     at::Tensor seqlens_k, block_table, out;
@@ -200,7 +248,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     if (paged_KV) {
         auto page_table = page_table_.value();
         TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype int32");
-        TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+        TORCH_CHECK(page_table.is_contiguous(), "page_table must be contiguous");
     }
 
     if (is_varlen_q) {
@@ -243,9 +291,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
     }  else {
-        out = torch::empty_like(q);
+        out = torch::empty(q.sizes(), q.options());
     }
     const auto sizes = q.sizes();
 
@@ -595,6 +643,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
+    fwd_args.qBatchStride = qStrides.batch;
+    fwd_args.qSeqStride = qStrides.seq;
+    fwd_args.qHeadStride = qStrides.head;
+    fwd_args.kBatchStride = kStrides.batch;
+    fwd_args.kSeqStride = kStrides.seq;
+    fwd_args.kHeadStride = kStrides.head;
+    fwd_args.vBatchStride = vStrides.batch;
+    fwd_args.vSeqStride = vStrides.seq;
+    fwd_args.vHeadStride = vStrides.head;
     // Launch the forward kernel through RunOpApiV2, matching the v3 path. The
     // scheduler-metadata task (GetSchedulerMetadataImpl) is also enqueued via
     // RunOpApiV2, so both run through the same ordered task queue: the metadata
@@ -744,6 +801,15 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
         dv = torch::empty_like(v);
     }
 
+    TORCH_CHECK(dout.is_contiguous(), "Input tensor dout must be contiguous");
+    TORCH_CHECK(q.is_contiguous(), "Input tensor q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "Input tensor k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "Input tensor v must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "Input tensor out must be contiguous");
+    TORCH_CHECK(dq.is_contiguous(), "Output tensor dq must be contiguous");
+    TORCH_CHECK(dk.is_contiguous(), "Output tensor dk must be contiguous");
+    TORCH_CHECK(dv.is_contiguous(), "Output tensor dv must be contiguous");
+
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
@@ -795,6 +861,12 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     } else {
         TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
+        TORCH_CHECK(IsSupportedBsndBackwardLayout(q) && IsSupportedBsndBackwardLayout(k) &&
+                        IsSupportedBsndBackwardLayout(v) && IsSupportedBsndBackwardLayout(dout) &&
+                        IsSupportedBsndBackwardLayout(out) && IsSupportedBsndBackwardLayout(dq) &&
+                        IsSupportedBsndBackwardLayout(dk) && IsSupportedBsndBackwardLayout(dv),
+                    "mha_bwd: BSND backward supports contiguous tensors or views produced by "
+                    "contiguous BNSD tensors followed by transpose(1, 2)");
     }
     // Kernel template only has 64/128/192/256 specializations.
     uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
@@ -862,6 +934,16 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
     FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    if (!is_varlen_q) {
+        SetBsndStrides(fagTilingData.qStrides, q);
+        SetBsndStrides(fagTilingData.kStrides, k);
+        SetBsndStrides(fagTilingData.vStrides, v);
+        SetBsndStrides(fagTilingData.doutStrides, dout);
+        SetBsndStrides(fagTilingData.outStrides, out);
+        SetBsndStrides(fagTilingData.dqStrides, dq);
+        SetBsndStrides(fagTilingData.dkStrides, dk);
+        SetBsndStrides(fagTilingData.dvStrides, dv);
+    }
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
@@ -884,11 +966,11 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     (void)error;
-    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.storage().data()));
-    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.storage().data()));
-    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.storage().data()));
-    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
-    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
+    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.data_ptr()));
+    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.data_ptr()));
+    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.data_ptr()));
+    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.data_ptr()));
+    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.data_ptr()));
     uint8_t *attenMaskDevice = nullptr;
     if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
@@ -914,9 +996,9 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
 
     auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));
-    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.storage().data()));
-    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.storage().data()));
-    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.storage().data()));
+    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.data_ptr()));
+    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.data_ptr()));
+    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.data_ptr()));
     uint8_t *cuSeqQlenDevice = nullptr;
     uint8_t *cuSeqKvlenDevice = nullptr;
     at::Tensor seqlenq_gpu_tensor;

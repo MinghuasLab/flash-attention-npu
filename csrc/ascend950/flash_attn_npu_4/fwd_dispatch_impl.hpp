@@ -51,7 +51,10 @@
         <<<a.block_dim, nullptr, a.stream>>>(                                      \
             a.q_device, a.k_device, a.v_device, a.mask_device,                     \
             a.block_table_device, a.o_device, a.lse_device, a.q_seq_device,        \
-            a.kv_seq_device, a.workspace_device, a.tiling_device)
+            a.kv_seq_device, a.workspace_device, a.tiling_device,                  \
+            a.q_batch_stride, a.q_seq_stride, a.q_head_stride,                    \
+            a.k_batch_stride, a.k_seq_stride, a.k_head_stride,                    \
+            a.v_batch_stride, a.v_seq_stride, a.v_head_stride)
 
 template <typename DType, bool IS_TND>
 void launch_fwd_impl(const FwdLaunchArgs &a) {
