@@ -7,6 +7,8 @@
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_FAG_POST_HPP
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_FAG_POST_HPP
 
+#include <type_traits>
+
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
@@ -80,6 +82,33 @@ public:
         uint32_t coreNum = tilingData->coreNum;
         scaleValue = tilingData->scaleValue;
 
+        if constexpr (std::is_same_v<TilingData, FAGTilingData>) {
+            qSeqlen = tilingData->qSeqlen;
+            kvSeqlen = tilingData->kvSeqlen;
+            qHeadNum = tilingData->kvHeadNum * tilingData->g;
+            kvHeadNum = tilingData->kvHeadNum;
+            qHeadDim = tilingData->qkHeadDim;
+            vHeadDim = tilingData->vHeadDim;
+            dqStrides.batch = tilingData->dqStrides.batch;
+            dqStrides.seq = tilingData->dqStrides.seq;
+            dqStrides.head = tilingData->dqStrides.head;
+            dkStrides.batch = tilingData->dkStrides.batch;
+            dkStrides.seq = tilingData->dkStrides.seq;
+            dkStrides.head = tilingData->dkStrides.head;
+            dvStrides.batch = tilingData->dvStrides.batch;
+            dvStrides.seq = tilingData->dvStrides.seq;
+            dvStrides.head = tilingData->dvStrides.head;
+            dqIsStrided = dqStrides.seq != 0 &&
+                (dqStrides.seq != qHeadNum * qHeadDim || dqStrides.head != qHeadDim ||
+                 dqStrides.batch != qSeqlen * qHeadNum * qHeadDim);
+            dkIsStrided = dkStrides.seq != 0 &&
+                (dkStrides.seq != kvHeadNum * qHeadDim || dkStrides.head != qHeadDim ||
+                 dkStrides.batch != kvSeqlen * kvHeadNum * qHeadDim);
+            dvIsStrided = dvStrides.seq != 0 &&
+                (dvStrides.seq != kvHeadNum * vHeadDim || dvStrides.head != vHeadDim ||
+                 dvStrides.batch != kvSeqlen * kvHeadNum * vHeadDim);
+        }
+
 
         dqGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dq);
         dkGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dk);
@@ -99,6 +128,9 @@ public:
 
         // dq
         qPostBaseNum = ubBaseSize / sizeof(float);
+        if (dqIsStrided) {
+            qPostBaseNum = qPostBaseNum / qHeadDim * qHeadDim;
+        }
         qPostBlockTotal = qSize;
 
         int64_t qPostTailNumTmp = qPostBlockTotal % qPostBaseNum;
@@ -109,6 +141,9 @@ public:
 
         // dkv
         kvPostBaseNum = qPostBaseNum;
+        if ((dkIsStrided || dvIsStrided) && !dqIsStrided) {
+            kvPostBaseNum = kvPostBaseNum / qHeadDim * qHeadDim;
+        }
         kvPostBlockTotal = kvSize;
 
         int64_t kvPostTailNumTmp = kvPostBlockTotal % kvPostBaseNum;
@@ -124,6 +159,34 @@ public:
     CATLASS_DEVICE
     ~BlockEpilogue()
     {
+    }
+
+    CATLASS_DEVICE
+    void CopyOutBsnd(AscendC::GlobalTensor<ElementVecDtype> dst,
+                     AscendC::LocalTensor<ElementVecDtype> src,
+                     uint64_t logicalOffset, uint64_t dataSize,
+                     FAGTensorStrides strides, int64_t seqlen,
+                     int64_t nheads, int64_t headdim)
+    {
+        uint64_t flatRow = logicalOffset / headdim;
+        uint64_t remainingRows = dataSize / headdim;
+        uint64_t ubRow = 0;
+        while (remainingRows > 0) {
+            int64_t nIdx = flatRow % nheads;
+            uint64_t bsIdx = flatRow / nheads;
+            int64_t sIdx = bsIdx % seqlen;
+            int64_t bIdx = bsIdx / seqlen;
+            uint64_t rows = remainingRows < static_cast<uint64_t>(nheads - nIdx) ?
+                                remainingRows : static_cast<uint64_t>(nheads - nIdx);
+            int64_t dstOffset = bIdx * strides.batch + sIdx * strides.seq + nIdx * strides.head;
+            DataCopyPad(dst[dstOffset], src[ubRow * headdim],
+                DataCopyExtParams(static_cast<uint16_t>(rows),
+                    static_cast<uint32_t>(headdim * sizeof(ElementVecDtype)), 0,
+                    static_cast<uint32_t>((strides.head - headdim) * sizeof(ElementVecDtype)), 0));
+            flatRow += rows;
+            ubRow += rows;
+            remainingRows -= rows;
+        }
     }
 
     CATLASS_DEVICE
@@ -153,7 +216,11 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
-            DataCopy(dqGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            if (dqIsStrided) {
+                CopyOutBsnd(dqGm, vecOut, i, dataSize, dqStrides, qSeqlen, qHeadNum, qHeadDim);
+            } else {
+                DataCopy(dqGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            }
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
@@ -182,7 +249,11 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
-            DataCopy(dkGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            if (dkIsStrided) {
+                CopyOutBsnd(dkGm, vecOut, i, dataSize, dkStrides, kvSeqlen, kvHeadNum, qHeadDim);
+            } else {
+                DataCopy(dkGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
         }
@@ -202,13 +273,31 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
-            DataCopy(dvGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            if (dvIsStrided) {
+                CopyOutBsnd(dvGm, vecOut, i, dataSize, dvStrides, kvSeqlen, kvHeadNum, vHeadDim);
+            } else {
+                DataCopy(dvGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
+            }
             if (i + kvPostBaseNum < kvEnd) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             }
         }
     }
+
+private:
+    FAGTensorStrides dqStrides;
+    FAGTensorStrides dkStrides;
+    FAGTensorStrides dvStrides;
+    int64_t qSeqlen{0};
+    int64_t kvSeqlen{0};
+    int64_t qHeadNum{0};
+    int64_t kvHeadNum{0};
+    int64_t qHeadDim{0};
+    int64_t vHeadDim{0};
+    bool dqIsStrided{false};
+    bool dkIsStrided{false};
+    bool dvIsStrided{false};
 };
 
 }

@@ -116,6 +116,34 @@ def test_paged_kv_accepts_native_outer_strides(dtype):
     )
     torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
 
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+def test_flash_attn_bnsd_transpose_backward_strides(data_type):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend950" in name:
+        pytest.skip("Ascend950 v4 does not expose this FAG backward path")
+    batch, q_seqlen, kv_seqlen, q_heads, kv_heads, head_dim = 2, 17, 23, 4, 2, 64
+
+    def make_view(shape):
+        base = make_random_tensor(shape, data_type, device="npu")
+        return base.transpose(1, 2).detach().requires_grad_(True)
+
+    q = make_view((batch, q_heads, q_seqlen, head_dim))
+    k = make_view((batch, kv_heads, kv_seqlen, head_dim))
+    v = make_view((batch, kv_heads, kv_seqlen, head_dim))
+    q_dense = q.detach().contiguous().requires_grad_(True)
+    k_dense = k.detach().contiguous().requires_grad_(True)
+    v_dense = v.detach().contiguous().requires_grad_(True)
+
+    out = flash_attn_func(q, k, v, num_splits=1)
+    out_dense = flash_attn_func(q_dense, k_dense, v_dense, num_splits=1)
+    dout = torch.randn_like(out_dense)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    grads_dense = torch.autograd.grad(out_dense, (q_dense, k_dense, v_dense), dout)
+
+    torch.testing.assert_close(out, out_dense, rtol=2e-2, atol=2e-2)
+    for grad, grad_dense, source in zip(grads, grads_dense, (q, k, v)):
+        assert grad.stride() == source.stride()
+        torch.testing.assert_close(grad.contiguous(), grad_dense, rtol=2e-2, atol=2e-2)
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""

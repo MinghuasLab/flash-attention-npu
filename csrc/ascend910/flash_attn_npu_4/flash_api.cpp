@@ -38,6 +38,29 @@ using namespace KernelCommon;
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+static bool IsSupportedBsndBackwardLayout(const at::Tensor &tensor)
+{
+    if (tensor.dim() != 4 || tensor.stride(3) != 1) {
+        return false;
+    }
+    if (tensor.is_contiguous()) {
+        return true;
+    }
+    const int64_t seqlen = tensor.size(1);
+    const int64_t nheads = tensor.size(2);
+    const int64_t headdim = tensor.size(3);
+    return tensor.stride(0) == nheads * seqlen * headdim &&
+           tensor.stride(1) == headdim &&
+           tensor.stride(2) == seqlen * headdim;
+}
+
+static void SetBsndStrides(FAGTensorStrides &dst, const at::Tensor &tensor)
+{
+    dst.batch = tensor.stride(0);
+    dst.seq = tensor.stride(1);
+    dst.head = tensor.stride(2);
+}
+
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
@@ -838,6 +861,12 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     } else {
         TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
+        TORCH_CHECK(IsSupportedBsndBackwardLayout(q) && IsSupportedBsndBackwardLayout(k) &&
+                        IsSupportedBsndBackwardLayout(v) && IsSupportedBsndBackwardLayout(dout) &&
+                        IsSupportedBsndBackwardLayout(out) && IsSupportedBsndBackwardLayout(dq) &&
+                        IsSupportedBsndBackwardLayout(dk) && IsSupportedBsndBackwardLayout(dv),
+                    "mha_bwd: BSND backward supports contiguous tensors or views produced by "
+                    "contiguous BNSD tensors followed by transpose(1, 2)");
     }
     // Kernel template only has 64/128/192/256 specializations.
     uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
@@ -905,6 +934,16 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
     FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    if (!is_varlen_q) {
+        SetBsndStrides(fagTilingData.qStrides, q);
+        SetBsndStrides(fagTilingData.kStrides, k);
+        SetBsndStrides(fagTilingData.vStrides, v);
+        SetBsndStrides(fagTilingData.doutStrides, dout);
+        SetBsndStrides(fagTilingData.outStrides, out);
+        SetBsndStrides(fagTilingData.dqStrides, dq);
+        SetBsndStrides(fagTilingData.dkStrides, dk);
+        SetBsndStrides(fagTilingData.dvStrides, dv);
+    }
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
@@ -927,11 +966,11 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     (void)error;
-    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.storage().data()));
-    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.storage().data()));
-    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.storage().data()));
-    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
-    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
+    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.data_ptr()));
+    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.data_ptr()));
+    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.data_ptr()));
+    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.data_ptr()));
+    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.data_ptr()));
     uint8_t *attenMaskDevice = nullptr;
     if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
@@ -957,9 +996,9 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
 
     auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));
-    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.storage().data()));
-    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.storage().data()));
-    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.storage().data()));
+    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.data_ptr()));
+    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.data_ptr()));
+    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.data_ptr()));
     uint8_t *cuSeqQlenDevice = nullptr;
     uint8_t *cuSeqKvlenDevice = nullptr;
     at::Tensor seqlenq_gpu_tensor;

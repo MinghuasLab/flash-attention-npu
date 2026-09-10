@@ -4,6 +4,12 @@
 constexpr static uint32_t BSND = 0;
 constexpr static uint32_t TND = 1;
 
+struct FAGTensorStrides {
+    int64_t batch = 0;
+    int64_t seq = 0;
+    int64_t head = 0;
+};
+
 struct FAGTilingData {
     int64_t coreNum;
     int64_t aicNum;
@@ -89,6 +95,18 @@ struct FAGTilingData {
     SoftMaxTiling softmaxTilingData;
     SoftMaxTiling softmaxGradTilingData;
     int64_t alibiSlopesBatchStride = 0;
+
+    // Element strides for native 4-D BSND backward.  These are populated from
+    // Tensor::stride() after normal FAG tiling, then copied with the rest of
+    // the tiling metadata.  TND kernels do not consume them.
+    FAGTensorStrides qStrides;
+    FAGTensorStrides kStrides;
+    FAGTensorStrides vStrides;
+    FAGTensorStrides doutStrides;
+    FAGTensorStrides outStrides;
+    FAGTensorStrides dqStrides;
+    FAGTensorStrides dkStrides;
+    FAGTensorStrides dvStrides;
 };
 
 struct FAGv2TilingData {
@@ -131,10 +149,18 @@ struct DBParams {
     int32_t s2CvExtendAlign;
     int64_t aTensorOffsetCv{0};
     int64_t bTensorOffsetCv{0};
+    int64_t qTensorOffsetCv{0};
+    int64_t kTensorOffsetCv{0};
+    int64_t vTensorOffsetCv{0};
+    int64_t doutTensorOffsetCv{0};
     int32_t actualS1Len{0};
     int32_t actualS2Len{0};
     int64_t s1Stride;
     int64_t s2Stride;
+    int64_t qSeqStride;
+    int64_t kSeqStride;
+    int64_t vSeqStride;
+    int64_t doutSeqStride;
     int64_t blockIdArr[24];  //确定性计算预留
     int32_t s1CvExtendArr[24];
     int32_t s2CvExtendArr[24];

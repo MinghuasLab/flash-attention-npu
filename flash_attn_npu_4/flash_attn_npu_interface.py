@@ -33,6 +33,30 @@ def maybe_contiguous_last_dim(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _is_bnsd_transpose_view(x):
+    if x is None or x.dim() != 4 or x.stride(-1) != 1:
+        return False
+    _, seqlen, nheads, headdim = x.shape
+    return x.stride() == (
+        nheads * seqlen * headdim,
+        headdim,
+        seqlen * headdim,
+        1,
+    )
+
+
+def maybe_contiguous_bwd(x):
+    if x is None or x.is_contiguous() or _is_bnsd_transpose_view(x):
+        return x
+    return x.contiguous()
+
+
+def maybe_contiguous_bwd_output(x):
+    if x is None or x.is_contiguous() or _is_bnsd_transpose_view(x):
+        return x, None
+    return torch.empty_like(x, memory_format=torch.contiguous_format), x
+
+
 def maybe_contiguous_output(x):
     """Allocate a dense temporary for a strided kernel output buffer."""
     if x is None or x.is_contiguous():
@@ -233,11 +257,11 @@ def _flash_attn_backward_op(
     softcap: float,
     deterministic: bool,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq_kernel, dk_kernel, dv_kernel = [
-        maybe_contiguous_output(x) for x in (dq, dk, dv)
-    ]
-    dq_result, dk_result, dv_result, softmax_d = flash_attn_npu_4.bwd(
+    dout, q, k, v, out = [maybe_contiguous_bwd(x) for x in (dout, q, k, v, out)]
+    dq_kernel, dq_copyback = maybe_contiguous_bwd_output(dq)
+    dk_kernel, dk_copyback = maybe_contiguous_bwd_output(dk)
+    dv_kernel, dv_copyback = maybe_contiguous_bwd_output(dv)
+    _dq, _dk, _dv, softmax_d = flash_attn_npu_4.bwd(
         dout,
         q,
         k,
@@ -261,13 +285,12 @@ def _flash_attn_backward_op(
         deterministic,
         0,  # sm_margin
     )
-    for dst, kernel_dst, src in (
-        (dq, dq_kernel, dq_result),
-        (dk, dk_kernel, dk_result),
-        (dv, dv_kernel, dv_result),
-    ):
-        if kernel_dst is not dst:
-            dst.copy_(src)
+    if dq_copyback is not None:
+        dq_copyback.copy_(dq_kernel)
+    if dk_copyback is not None:
+        dk_copyback.copy_(dk_kernel)
+    if dv_copyback is not None:
+        dv_copyback.copy_(dv_kernel)
     return softmax_d
 
 
