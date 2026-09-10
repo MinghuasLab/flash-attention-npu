@@ -258,6 +258,37 @@ def _flash_attn_backward_fake(
         device=q.device,
     )
 
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3_950::_get_scheduler_metadata",
+    device_types="npu",
+)
+def _get_scheduler_metadata_op(
+    causal: bool,
+    window_left: int,
+    window_right: int,
+):
+    return flash_attn_npu_3_950.get_scheduler_metadata(
+        causal,
+        (window_left, window_right),
+    )
+
+
+@_torch_register_fake_wrapper(
+    "flash_attn_npu_3_950::_get_scheduler_metadata"
+)
+def _get_scheduler_metadata_fake(
+    causal,
+    window_left,
+    window_right,
+):
+    return torch.empty(
+        (0,),
+        dtype=torch.int32,
+        device="meta",
+    )
+
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
