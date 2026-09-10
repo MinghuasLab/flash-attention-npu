@@ -4,6 +4,7 @@ from torch_compile_utils import (
     require_soc,
     run_metadata_compile_test,
     run_varlen_compile_test,
+    torch
 )
 
 
@@ -46,10 +47,13 @@ def test_fa3_950_scheduler_metadata_torch_compile_correctness():
         "flash_attn_npu_3.flash_attn_npu_interface_950"
     )
 
-    run_metadata_compile_test(
-        api,
-        expected_sizes=None,
-    )
+    with torch._dynamo.config.patch(
+        capture_dynamic_output_shape_ops=True
+    ):
+        run_metadata_compile_test(
+            api,
+            expected_sizes=None,
+        )
 
 
 def test_fa3_950_varlen_torch_compile_correctness():
@@ -59,10 +63,13 @@ def test_fa3_950_varlen_torch_compile_correctness():
         "flash_attn_npu_3.flash_attn_npu_interface_950"
     )
 
-    run_varlen_compile_test(
-        api,
-        backward=False,
-    )
+    with torch._dynamo.config.patch(
+        capture_dynamic_output_shape_ops=True
+    ):
+        run_varlen_compile_test(
+            api,
+            backward=False,
+        )
 
 
 def test_fa3_910_fixed_torch_compile_correctness():

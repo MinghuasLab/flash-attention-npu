@@ -258,6 +258,86 @@ def _flash_attn_backward_fake(
         device=q.device,
     )
 
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3_950::_get_scheduler_metadata",
+    mutates_args=(),
+    device_types="npu",
+)
+def _get_scheduler_metadata_op(
+    batch_size: int,
+    max_seqlen_q: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    page_size: Optional[int],
+    num_blocks: Optional[int],
+    max_num_blocks_per_seq: Optional[int],
+    causal: bool,
+    softmax_scale: float,
+    num_splits: int,
+    max_seqlen_k: int,
+    window_left: int,
+    window_right: int,
+) -> torch.Tensor:
+    return flash_attn_npu_3_950.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        page_size,
+        num_blocks,
+        max_num_blocks_per_seq,
+        causal,
+        softmax_scale,
+        num_splits,
+        max_seqlen_k,
+        window_left,
+        window_right,
+    )
+
+
+@_torch_register_fake_wrapper(
+    "flash_attn_npu_3_950::_get_scheduler_metadata"
+)
+def _get_scheduler_metadata_fake(
+    batch_size: int,
+    max_seqlen_q: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    page_size: Optional[int],
+    num_blocks: Optional[int],
+    max_num_blocks_per_seq: Optional[int],
+    causal: bool,
+    softmax_scale: float,
+    num_splits: int,
+    max_seqlen_k: int,
+    window_left: int,
+    window_right: int,
+) -> torch.Tensor:
+    ctx = torch.library.get_ctx()
+    metadata_size = ctx.new_dynamic_size()
+
+    return torch.empty(
+        (metadata_size,),
+        dtype=torch.uint8,
+        device=cache_seqlens.device,
+    )
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
@@ -312,7 +392,7 @@ def get_scheduler_metadata(
         raise ValueError("Ascend 950 does not support softcap")
     if pack_gqa is not None and pack_gqa:
         raise ValueError("Ascend 950 does not support pack_gqa")
-    scheduler_metadata = flash_attn_npu_3_950.get_scheduler_metadata(
+    scheduler_metadata = _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
         num_heads_q,
