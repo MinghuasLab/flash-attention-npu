@@ -213,6 +213,14 @@ class BishengBuildExt(build_ext):
 
         include_flags = [
             *[f"-I{p}" for p in asc_include_paths],
+            # System Python may select its architecture-specific pyconfig.h
+            # through these macros. Conda's pyconfig.h is self-contained; the
+            # same macros must not be forced there because they change AscendC
+            # half overload selection and conflict with torch's c10::Half.
+            *(["-I/usr/include/aarch64-linux-gnu", "-D__aarch64__", "-D__AARCH64EL__"]
+              if platform.machine() == "aarch64" and
+                 os.path.realpath(python_include).startswith(("/usr/include/", "/usr/local/include/"))
+              else []),
             f"-I{python_include}",
             f"-I{torch_npu_include}",
             f"-I{torch_include}",
@@ -385,8 +393,9 @@ class BishengBuildExt(build_ext):
 
         # One shared pool across all extensions so the heaviest TUs compile
         # concurrently regardless of which extension owns them. TUs per extension
-        # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
-        # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
+        # once autogen dispatch + combo TUs are added: ascend910_v2=76
+        # (12 dispatch stubs + 64 combo TUs), ascend910_v3=9, ascend950_v3=6,
+        # ascend910_v4=5, ascend950_v4=6.
         max_workers = min(len(tasks), os.cpu_count() or 1)
         objs_by_ext = {ext.name: [] for ext in self.extensions}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
