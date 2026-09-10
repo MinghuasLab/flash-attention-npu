@@ -24,6 +24,7 @@
 #   GOLDEN_CACHE_DIR      (默认 /var/cache/flash-attention-npu/golden_cache)
 #   GOLDEN_CACHE_MODE     (默认 cache) cache|off
 #   GOLDEN_CACHE_STATS_FILE (容器内固定为 /tmp/ci_test_logs/golden_cache_events.tsv)
+#   GOLDEN_CACHE_MAX_TEST_DIRS (默认 32, 每个 reference 版本保留的测试文件组数)
 
 set -euo pipefail
 
@@ -142,6 +143,8 @@ run_docker_test() {
       GOLDEN_CACHE_MODE=off
     fi
   fi
+  # Keep all current v2/v3/v4 test-file cache groups.  The old default of 5
+  # caused Ascend910 full runs to evict earlier groups before the next run.
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
@@ -166,7 +169,7 @@ run_docker_test() {
     -e GOLDEN_CACHE_STATS_FILE="/tmp/ci_test_logs/golden_cache_events.tsv" \
     -e GOLDEN_CACHE_REFRESH="${GOLDEN_CACHE_REFRESH:-0}" \
     -e GOLDEN_CACHE_MAX_DIRS="${GOLDEN_CACHE_MAX_DIRS:-5}" \
-    -e GOLDEN_CACHE_MAX_TEST_DIRS="${GOLDEN_CACHE_MAX_TEST_DIRS:-5}" \
+    -e GOLDEN_CACHE_MAX_TEST_DIRS="${GOLDEN_CACHE_MAX_TEST_DIRS:-32}" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \

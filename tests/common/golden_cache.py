@@ -158,8 +158,13 @@ def _limits() -> tuple[int, int]:
         except ValueError:
             return default
 
+    # A full Ascend910 run currently produces cache artifacts for more than
+    # five test files (v2/v3/v4 plus metadata/graph/smoke).  Keeping only five
+    # test directories causes the suite itself to evict artifacts that the
+    # next CI run would otherwise reuse.  Keep a larger, still bounded number
+    # by default; CI can override this with GOLDEN_CACHE_MAX_TEST_DIRS.
     max_common = get("GOLDEN_CACHE_MAX_DIRS", 5)
-    return max_common, get("GOLDEN_CACHE_MAX_TEST_DIRS", max_common)
+    return max_common, get("GOLDEN_CACHE_MAX_TEST_DIRS", 32)
 
 
 @contextlib.contextmanager
