@@ -260,13 +260,11 @@ public:
             blockStart = blockSize - blockStartOffset;
             setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
         }
-        // AscendC::printf("l1\n");
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             uint32_t mActual = actualShape.m();
             uint32_t kActual = actualShape.k();
             uint32_t nActual = actualShape.n();
             LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
-            // AscendC::printf("l1 pingpong : %u \n", pingPongState->l1PingPongFlag);
             l1KPingPongFlag = pingPongState->l1PingPongFlag;
             pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
             if constexpr (PAGED_CACHE_FLAG_) {
@@ -364,7 +362,6 @@ public:
                         initMmad);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                    // pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -373,9 +370,7 @@ public:
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                // pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
             }
-            // pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
         }
     }
 

@@ -102,9 +102,6 @@ namespace SplitFuse {
             uint32_t kvSIdx;
             uint32_t kvSLoopNumTotal;
             uint32_t noSkipKvS;
-            // uint32_t qBlockY;
-            // uint32_t curSelectNum;
-            // uint32_t kvYBlockNum;
             uint32_t slot;
             uint32_t taskStateSlot;
             uint32_t selectedKvCount;
@@ -112,8 +109,8 @@ namespace SplitFuse {
             uint32_t selectedKvIndices[MAX_STACK_BLOCKS];
             bool firstStack;
             bool lastStack;
-            int32_t delStartRow;
-            int32_t delEndRow;
+            int32_t invalidSuffixStartRow;
+            int32_t invalidPrefixEndRow;
             int32_t qSBlockIdx;
             int32_t curQNBlockTile;
         };
@@ -423,16 +420,14 @@ namespace SplitFuse {
                     }
                 }
             } else if (flashDecodeFlag == 0U) {
-                // taskIdx 随 for 单调递增，批次定位游标跨 task 复用，避免每个 task 从 batch 0 重扫
+                // Reuse the batch cursor across monotonically increasing tasks.
                 uint32_t curBatchTmp = 0;
                 uint32_t preTotalTaskNumTmp = 0;
                 uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
-                // 当前 batch 派生量缓存（GM 输入只读，同 batch 内不变），0xFFFFFFFF 表示未缓存
                 uint32_t cachedBatch = 0xFFFFFFFFU;
                 uint32_t curQNBlockNumCur = 0;
                 uint32_t curQSBlockNumCur = 0;
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum))  {
-                    // AscendC::printf("taskIdx %u\n", taskIdx);
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
@@ -469,8 +464,6 @@ namespace SplitFuse {
                     }
 
                     uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
-                    // uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
-                    // uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
 
                     uint32_t qNBlockIdxCur = taskIdxCurBatch / curQSBlockNumCur;
                     uint32_t qSBlockIdxCur = taskIdxCurBatch - qNBlockIdxCur * curQSBlockNumCur;
@@ -720,8 +713,8 @@ namespace SplitFuse {
             int32_t windowSizeRightEndLen = 0;
             bool notPreMask = true;
             bool notNextMask = true;
-            int32_t delStartRow = 0;
-            int32_t delEndRow = qSeqlen;
+            int32_t invalidSuffixStartRow = 0;  // 0 disables suffix clearing.
+            int32_t invalidPrefixEndRow = qSeqlen;  // qSeqlen disables prefix clearing.
             bool startsWithMaskTile = false;
             bool startsWithMaskThenNomaskFlag = false;
             if (maskType == 1U) {
@@ -731,7 +724,7 @@ namespace SplitFuse {
                 causalKvEnd = causalKvEnd < 0 ? 0 : causalKvEnd;
                 noSkipKvS = AscendC::Std::min(causalKvEnd, static_cast<int64_t>(kvSeqlen));
                 kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
-                delEndRow = qSeqlen > kvSeqlen ? static_cast<int32_t>(qSeqlen - kvSeqlen) : delEndRow;
+                invalidPrefixEndRow = qSeqlen > kvSeqlen ? static_cast<int32_t>(qSeqlen - kvSeqlen) : invalidPrefixEndRow;
             } else if (maskType == 2U) {
                 int32_t leftPointwindowSizeLeft = kvSeqlen;
                 int32_t leftPointwindowSizeRight = 0;
@@ -762,9 +755,9 @@ namespace SplitFuse {
                     kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
                 }
                 if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) && windowSizeLeft != SPARSE_MODE_INT_MAX) {
-                    delStartRow = kvSeqlen - leftPointwindowSizeLeft;
+                    invalidSuffixStartRow = kvSeqlen - leftPointwindowSizeLeft;
                 } else if (windowSizeRightStartLen < 0 && windowSizeRight != SPARSE_MODE_INT_MAX) {
-                    delEndRow = -leftPointwindowSizeRight;
+                    invalidPrefixEndRow = -leftPointwindowSizeRight;
                 }
             } else {
                 noSkipKvS = kvSeqlen;
@@ -852,15 +845,13 @@ namespace SplitFuse {
                         static_cast<uint64_t>(kvSeqlenOld) + kvSIdxLocal * MAX_KV_STACK_LEN : 0;
                     const uint32_t curStackTileMod = issuedStackCount % STACK_SLOTS;
                     StackDescriptor &desc = descriptors[curStackTileMod];
-                    // A split's last stack can precede the sequence/window tail.
-                    // Its extent must still fit the fixed-size QK/PV workspace.
+                    // Bound split tails by the fixed QK/PV workspace capacity.
                     desc.stackSeqTile = AscendC::Std::min(
                         MAX_KV_STACK_LEN, GetStackSeqTile(isAppendBlock, kvSIdx, kvSIdxLocal,
                             kvLoopNumTotalNew, kvSLoopNumTotalOld, noSkipKvS, kvSeqlenOld, kvNewSeqlen));
 
                     desc.gmOffsetV = gmOffsetV;
-                    // PV may execute in the next task: retain the source phase,
-                    // cache destination and writeback ownership of this stack.
+                    // Delayed PV retains this stack's source, cache destination and writeback owner.
                     desc.gmOffsetVSrc = isAppendBlock ? gmOffsetVNew : gmOffsetV;
                     desc.pvCacheOffset = qkCacheOffset;
                     desc.isAppendBlock = isAppendBlock;
@@ -878,15 +869,12 @@ namespace SplitFuse {
                     desc.kvSIdx = kvSIdxLocal;
                     desc.kvSLoopNumTotal = kvSLoopNumTotal;
                     desc.noSkipKvS = noSkipKvS;
-                    // desc.qBlockY = qBlockY;
-                    // desc.curSelectNum = curSelectNum;
-                    // desc.kvYBlockNum = kvYBlockNum;
                     desc.slot = curStackTileMod;
                     desc.taskStateSlot = currentTaskStateSlot;
                     desc.firstStack = taskStackCount == 0;
                     desc.lastStack = kvSIdx + 1 >= kvEnd;
-                    desc.delStartRow = delStartRow;
-                    desc.delEndRow = delEndRow;
+                    desc.invalidSuffixStartRow = invalidSuffixStartRow;
+                    desc.invalidPrefixEndRow = invalidPrefixEndRow;
                     desc.qSBlockIdx = qSBlockIdx;
                     desc.curQNBlockTile = curQNBlockTile;
                     uint64_t gmOffsetS =
@@ -950,7 +938,6 @@ namespace SplitFuse {
                     uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
                     epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
                     epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
-                    // TODO mask 部分的参数还未完全 通过 desc传递
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                         int64_t triUp =
                             static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
@@ -1184,9 +1171,7 @@ namespace SplitFuse {
                     uint64_t gmOffsetP = coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
                         pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB;
                     if constexpr (PAGED_CACHE_FLAG) {
-                        // PV can consume the previous task after the next QK
-                        // task starts. Derive its page cursor from its own stack;
-                        // a short sequence tail must not shift the next task's V.
+                        // Delayed PV derives its page cursor from its own stack, not the current QK task.
                         blockMmadPV.resetBlockStart(pvDesc.kvSIdx, pagedBlockSize);
                         blockMmadPV(
                             gP[gmOffsetP],
@@ -1242,7 +1227,6 @@ namespace SplitFuse {
                     LayoutLse layoutLse(qHeads,
                         (INPUT_LAYOUT == FaiKenel::inputLayout::TND) ? totalQTokens : maxQSeqlen);
                     uint64_t gmOffsetUpdate = (uint64_t)(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
-                    // Arch::CrossCoreWaitFlag(pvReady);
 
                     if (flashDecodeFlag != 0U) {
                         LayoutLse layoutgmLse(pvDesc.qSBlockSize, pvDesc.qNBlockSize);
@@ -1291,8 +1275,8 @@ namespace SplitFuse {
                             pvDesc.slot,
                             pvDesc.taskStateSlot,
                             typename EpilogueRescaleO::SplitKVParams(),
-                            pvDesc.delStartRow,
-                            pvDesc.delEndRow,
+                            pvDesc.invalidSuffixStartRow,
+                            pvDesc.invalidPrefixEndRow,
                             pvDesc.qSeqlen,
                             pvDesc.qSBlockIdx,
                             pvDesc.curQNBlockTile);

@@ -257,7 +257,6 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
                 for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; kL1Idx++) {
                     uint32_t kL1Actual = (kL1Idx < kL1Loop - 1U) ? l1KDynamic : (stackSeqTile - kL1Idx * l1KDynamic);
-                    // AscendC::printf("l1 pingpong : %u \n", pingPongState->l1PingPongFlag);
                     l1PPingPongFlag = pingPongState->l1PingPongFlag;
                     pingPongState->l1PingPongFlag = 1 - pingPongState->l1PingPongFlag;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1PPingPongFlag);
@@ -265,8 +264,7 @@ public:
                     auto gmTileA = gA[layoutA.GetOffset(gmATileCoord)];
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
-                    // wait for the softmax P right before the first A(P) GM->L1
-                    // load, so the mmad loop setup can overlap with softmax
+                    // Delay P-ready until the first GM -> L1 load to overlap scalar setup.
                     if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
                         Arch::CrossCoreWaitFlag(softmaxFlag);
                     }
@@ -314,9 +312,7 @@ public:
                             initMmad);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                        // pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
                     }
-                    // pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -325,7 +321,6 @@ public:
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL1Actual, nL1Actual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                // pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
             }
         }
         if (appendDoCopyback) {

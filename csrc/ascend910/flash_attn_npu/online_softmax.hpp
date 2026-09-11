@@ -94,14 +94,9 @@ public:
         constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
-        // Raw attention masks share [180224, 188416) in SWA.
-        // Dropout must not alias them: mask prefetch and dropout Select can
-        // overlap on MTE2/V. TV reductions use at most the first 5 KiB;
-        // reserve its last 2 KiB for the padded bit mask (up to 64 x 32 B).
-        // EVENT_ID2 (V_MTE2) already protects this buffer between row loops.
+        // TV reductions use at most 5 KiB; its last 2 KiB hold dropout bits, separate from SWA masks.
         constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
-        // ALiBi builds at most 512 floats before rowmax starts. LM-based
-        // staging would overwrite the compact, still-live per-task GM slots.
+        // ALiBi uses TV's first 2 KiB before rowmax; LM would overlap live task GM slots.
         constexpr uint32_t ALIBI_WORK_UB_OFFSET = TV_UB_TENSOR_OFFSET;
 
         scaleValue = scaleValue_;
@@ -480,10 +475,7 @@ public:
         uint32_t proTokenIdx, uint32_t proTokenNum,
         uint32_t integralHeadNum, uint32_t epiTokenNum, bool /*isNextMask*/)
     {
-        // Left/right masks are consumed serially; V_MTE2 EVENT_ID6 protects
-        // left -> right reuse, and EVENT_ID4 protects the next row-loop load.
-        // Do not place the right mask at 184 KiB: CANN scalar Select uses
-        // that address as implicit temporary UB, corrupting a prefetched mask.
+        // EVENT_ID6/4 serialize raw-mask reuse; 184 KiB is reserved for CANN Select scratch.
         uint32_t innerUbRowOffset = 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
@@ -883,10 +875,7 @@ public:
     __aicore__ inline
     void ApplyDropoutNegate(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
     {
-        // Each scratch vector can contain 512 half values. HM is only 64
-        // floats: using it here overwrites LL and the live per-task GM slots.
-        // CalcExp has finished using TV; CalcLocalRowSum will initialize it
-        // again after dropout. Reuse two disjoint 1-KiB slices of its 8 KiB.
+        // Reuse two 1-KiB TV slices between CalcExp and CalcLocalRowSum; HM is too small.
         auto t0 = tvUbTensor.template ReinterpretCast<half>();
         auto t1 = t0[UB_UINT8_VECTOR_SIZE / sizeof(half)];
         auto u0 = t0.template ReinterpretCast<uint16_t>();
@@ -1042,8 +1031,7 @@ public:
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
 
         if constexpr (doTriUMask) {
-            // Mask conversion aliases both P staging buffers; release both
-            // only after the masked tile's P store has completed.
+            // Mask conversion aliases both P buffers; release both after the P store.
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
@@ -1065,7 +1053,6 @@ public:
         uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
         int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
-        // AscendC::printf("22222222222\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE);
@@ -1108,8 +1095,7 @@ public:
                 if (startsWithMaskTile && rowLoopIdx == 0) {
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                 }
-                // wait QK right before moveS so the setup above can overlap
-                // with the still-running QK matmul (matches the mask branches)
+                // Delay QK-ready until the first S load to overlap scalar setup.
                 if (rowLoopIdx == 0) {
                     Arch::CrossCoreWaitFlag(qkReady);
                 }
@@ -1173,7 +1159,6 @@ public:
         int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
         int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
-        // AscendC::printf("111111111\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE_IN_BYTE);
@@ -1248,7 +1233,6 @@ public:
         }
         uint32_t maskColumnRound = RoundUp(maskColumn, BLOCK_SIZE_IN_BYTE);
 
-        // AscendC::printf("mask Column %u\n",maskColumn);
 
         int64_t offsetMask =
             layoutMask.GetOffset(MatrixCoord(gmOffsetMaskRow + maskOffsetThisSubBlock, gmOffsetMaskColumn));
@@ -1265,11 +1249,9 @@ public:
             Arch::CrossCoreWaitFlag(qkReady);
             return;
         }
-        // AscendC::printf("coreidx %u rowLoopNum %u rowActualThisSubBlock %u \n", subBlockIdx, rowLoopNum, rowActualThisSubBlock);
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
                 uint32_t pingpongFlag = softmaxPingPongFlag % 2;
-                // AscendC::printf("move pingpongFlag: %u\n", pingpongFlag);
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
@@ -1310,12 +1292,9 @@ public:
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
-                // The first masked tile may follow unmasked P stores on
-                // either ping-pong buffer. EVENT_ID2 alone is initially set
-                // and does not protect those stores from mask conversion.
+                // EVENT_ID2 starts set; also wait for both unmasked P stores before mask conversion.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
-                // AscendC::printf("cmp pingpongFlag: %u\n", pingpongFlag);
                 UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
                 UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
 
@@ -1367,9 +1346,7 @@ public:
                     uint32_t integralHeadNum = (nextRowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     uint32_t epiTokenNum =
                         nextRowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    // AscendC::printf("aaaa\n");
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-                    // AscendC::printf("bbbb\n");
                     CopyMaskGmToUb(
                         gMaskThisSubBlock,
                         maskColumn, maskColumnRound, maskStride,
@@ -1395,7 +1372,6 @@ public:
         int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
         int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
-        // AscendC::printf("33333333333333333\n");
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE_IN_BYTE);
@@ -1516,9 +1492,7 @@ public:
                     (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
-                // maskUbTensor32 aliases the P staging buffer. Match the
-                // causal-mask path and consume the previous P-store release
-                // before vector code reuses that storage for the SWA mask.
+                // SWA mask conversion must wait for the aliased P staging buffers.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);

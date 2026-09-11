@@ -67,10 +67,7 @@ public:
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
-    // 64 rows per vector: scalar LSE followed by 8-wide DMA staging rows.
-    // Keep this separate from softmax's TV scratch, raw mask and SDK scratch.
-    // [177920, 180224) lies after the last DM slot's live 64 rows (ending
-    // at 177408), and immediately before the raw mask [180224, 188416).
+    // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
     static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
     static constexpr uint32_t LSE_STAGING_UB_OFFSET =
         11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
@@ -138,87 +135,53 @@ public:
 
     __aicore__ inline
     void InvalidLineLSEProcess(
-        uint32_t qNThisSubBlock, int32_t delStartRow, uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
-        uint32_t totalRowNum, int32_t delEndRow, uint32_t qSeqlen, uint32_t qSThisSubBlock,
-        const AscendC::LocalTensor<float> &lseUbTensor,
-        const AscendC::LocalTensor<float> &lseBroadcastUbTensor)
+        uint32_t qNThisSubBlock, int32_t invalidSuffixStartRow, uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
+        uint32_t totalRowNum, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSThisSubBlock,
+        const AscendC::LocalTensor<float> &lseUbTensor)
     {
-        uint32_t qNSubBlockStartOffset = qNThisSubBlock == 0U ? qSBlockIdx * VECTOR_SIZE + inRowOffsetThisSubBlock : qSBlockIdx * VECTOR_SIZE;
-        uint32_t qNSubBlockEnbdOffset = totalRowNum + qNSubBlockStartOffset;
-        if (qNThisSubBlock == 0U && delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow) {
-            uint32_t start = qNSubBlockStartOffset > delStartRow ? 0 : (delStartRow - qNSubBlockStartOffset);
-            uint32_t end = totalRowNum;
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(
-                lseBroadcastUbTensor[start * FLOAT_BLOCK_SIZE],
-                LSE_OUT_INI,
-                (end - start) * FLOAT_BLOCK_SIZE
-            );
-            uint32_t len = end - start;
-            uint64_t mask = ((1ULL << len) - 1) << start;
-            AscendC::Duplicate<float>(
-                lseUbTensor,  // 32B 对齐的起始地址
-                LSE_OUT_INI,
-                mask,
-                1,            // repeatTime
-                1,            // dstBlockStride
-                8             // dstRepeatStride
-            );
+        if (totalRowNum == 0U || (invalidSuffixStartRow == 0 && invalidPrefixEndRow == qSeqlen)) {
+            return;
         }
-        if (qNThisSubBlock == 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
-            uint32_t rowStart = qNSubBlockStartOffset;
-            uint32_t start = 0;
-            uint32_t end = rowStart + totalRowNum >= delEndRow ? (delEndRow - rowStart) : totalRowNum;
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(
-                lseBroadcastUbTensor[start * FLOAT_BLOCK_SIZE],
-                LSE_OUT_INI,
-                (end - start) * FLOAT_BLOCK_SIZE
-            );
-            AscendC::Duplicate(
-                lseUbTensor[start],
-                LSE_OUT_INI,
-                (end - start)
-            );
+        const uint32_t headCount = qNThisSubBlock == 0U ? 1U : qNThisSubBlock;
+        const uint32_t rowsPerHead = qNThisSubBlock == 0U ? totalRowNum : qSThisSubBlock;
+        const int64_t tokenStart = static_cast<int64_t>(qSBlockIdx) * VECTOR_SIZE +
+            (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
+        uint64_t headMask = 0;
+        if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != qSeqlen && invalidPrefixEndRow > tokenStart) {
+            const uint32_t prefixRows = AscendC::Std::min(
+                static_cast<int64_t>(rowsPerHead), static_cast<int64_t>(invalidPrefixEndRow) - tokenStart);
+            headMask |= ~uint64_t{0} >> (FLOAT_VECTOR_SIZE - prefixRows);
         }
-        if (qNThisSubBlock != 0U && delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow) {
-            uint32_t start = delStartRow - qNSubBlockStartOffset;
-            uint32_t end = qSThisSubBlock;
-            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate(
-                    lseBroadcastUbTensor[(qNIdx * qSThisSubBlock + start) * FLOAT_BLOCK_SIZE],
-                    LSE_OUT_INI,
-                    (end - start) * FLOAT_BLOCK_SIZE
-                );
-            }
+        if (invalidSuffixStartRow > 0 && invalidSuffixStartRow < tokenStart + rowsPerHead) {
+            const uint32_t suffixStart = invalidSuffixStartRow > tokenStart ? invalidSuffixStartRow - tokenStart : 0U;
+            const uint32_t suffixRows = rowsPerHead - suffixStart;
+            headMask |= (~uint64_t{0} >> (FLOAT_VECTOR_SIZE - suffixRows)) << suffixStart;
         }
-        if (qNThisSubBlock != 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
-            uint32_t start = 0;
-            uint32_t end = qNSubBlockEnbdOffset >= delEndRow ? (delEndRow - qNSubBlockStartOffset) : totalRowNum;
-            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate(
-                    lseBroadcastUbTensor[(qNIdx * qSThisSubBlock + start) * FLOAT_BLOCK_SIZE],
-                    LSE_OUT_INI,
-                    (end - start) * FLOAT_BLOCK_SIZE
-                );
-            }
+        if (headMask == 0U) {
+            return;
         }
+        uint64_t invalidMask = 0;
+        for (uint32_t headIdx = 0; headIdx < headCount; ++headIdx) {
+            invalidMask |= headMask << (headIdx * rowsPerHead);
+        }
+        // Each vector owns at most 64 rows; mask from the aligned base even for unaligned heads.
+        uint64_t mask[2] = {invalidMask, 0};
+        AscendC::Duplicate<float>(lseUbTensor, LSE_OUT_INI, mask, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline
     void ClearInvalidOutputRows(
         uint32_t ubRowOffset, uint32_t tokenStart, uint32_t tokenNum,
-        int32_t delStartRow, int32_t delEndRow, uint32_t qSeqlen, uint32_t embedRound)
+        int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t embedRound)
     {
         if (tokenNum == 0U) {
             return;
         }
 
-        // delStartRow marks an invalid suffix [delStartRow, qSeqlen).
-        if (delStartRow > 0) {
-            uint32_t suffixStart = static_cast<uint32_t>(delStartRow);
+        // invalidSuffixStartRow marks an invalid suffix [invalidSuffixStartRow, qSeqlen).
+        if (invalidSuffixStartRow > 0) {
+            uint32_t suffixStart = static_cast<uint32_t>(invalidSuffixStartRow);
             uint32_t localStart = 0U;
             if (tokenStart < suffixStart) {
                 uint32_t validPrefix = suffixStart - tokenStart;
@@ -233,9 +196,9 @@ public:
             }
         }
 
-        // delEndRow marks an invalid prefix [0, delEndRow).
-        if (delEndRow >= 0 && delEndRow != static_cast<int32_t>(qSeqlen)) {
-            uint32_t prefixEnd = static_cast<uint32_t>(delEndRow);
+        // invalidPrefixEndRow marks an invalid prefix [0, invalidPrefixEndRow).
+        if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen)) {
+            uint32_t prefixEnd = static_cast<uint32_t>(invalidPrefixEndRow);
             uint32_t localEnd = 0U;
             if (tokenStart < prefixEnd) {
                 uint32_t invalidPrefix = prefixEnd - tokenStart;
@@ -340,7 +303,7 @@ public:
         uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
         uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
         const SplitKVParams &splitParams,
-        uint32_t rowOffsetCurLoop, int32_t delStartRow, int32_t delEndRow, uint32_t qSeqlen,
+        uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen,
         uint32_t qSBlockIdx, uint32_t rowNum, uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile)
     {
         uint32_t curRowNum = layoutInput.shape(0);
@@ -493,26 +456,26 @@ public:
             if (!splitParams.isSplitkv) {
                 if (curQNBlockTile == 1U) {
                     ClearInvalidOutputRows(
-                        0U, rowStart, curRowNum, delStartRow, delEndRow, qSeqlen, embedRound);
+                        0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
                 } else {
                     uint32_t innerGOUbRowOffset = 0U;
                     uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
                     if (proTokenNum != 0U) {
                         ClearInvalidOutputRows(
                             innerGOUbRowOffset, subBlockStart, proTokenNum,
-                            delStartRow, delEndRow, qSeqlen, embedRound);
+                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
                         innerGOUbRowOffset += proTokenNum;
                     }
                     for (uint32_t qNIdx = 0U; qNIdx < integralHeadNum; qNIdx++) {
                         ClearInvalidOutputRows(
                             innerGOUbRowOffset, qBlockStart, qSThisSubBlock,
-                            delStartRow, delEndRow, qSeqlen, embedRound);
+                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
                         innerGOUbRowOffset += qSThisSubBlock;
                     }
                     if (epiTokenNum != 0U) {
                         ClearInvalidOutputRows(
                             innerGOUbRowOffset, qBlockStart, epiTokenNum,
-                            delStartRow, delEndRow, qSeqlen, embedRound);
+                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
                     }
                 }
             }
@@ -540,11 +503,6 @@ public:
             }
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
-                    // MTE2 already waited on the preceding rescale's MTE3_MTE2
-                    // EVENT_ID6. Forward that dependency to V before reusing
-                    // LSE staging; softmax never touches this dedicated region.
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
                         lseUbTensor,
@@ -561,15 +519,14 @@ public:
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
 
-                    // *** lse_block = expand_to_block(lse)
+                    InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx,
+                            inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
+                            lseUbTensor);
                     AscendC::Brcb(
                         lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
                         lseUbTensor.ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
-                    InvalidLineLSEProcess(qNThisSubBlock, delStartRow, qSBlockIdx,
-                            inRowOffsetThisSubBlock, totalRowNum, delEndRow, qSeqlen, qSThisSubBlock,
-                            lseUbTensor, lseBroadcastUbTensor);
                     if (!splitParams.isSplitkv) {
                         AscendC::PipeBarrier<PIPE_V>();
                     }
@@ -593,10 +550,7 @@ public:
                                 }
                         }
                     } else {
-                        // Final LSE is head-major: NT for TND and BNS for BSND.
-                        // BNS (and single-batch NT) stores all heads owned by this
-                        // vector contiguously, so collapse them into one DMA block.
-                        // Multi-batch NT has a total-token stride between heads.
+                        // BNS/single-batch NT heads are contiguous; multi-batch NT strides by total tokens.
                         uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
                         uint32_t lseSeqLen = totalRowNum / lseHeadCount;
                         uint32_t lseHeadStrideGm = layoutLse.stride(0);
@@ -616,9 +570,7 @@ public:
                                     (lseHeadStrideGm - lseSeqLen) * sizeof(float),
                                     0));
                         } else {
-                            // An unaligned multi-block MTE3 transfer rounds each UB
-                            // source block to 32 bytes. Use the broadcast staging
-                            // tensor so every scalar source block is aligned.
+                            // MTE3 rounds UB blocks to 32 B; broadcast rows keep scalar sources aligned.
                             for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
                                 AscendC::DataCopyPad(
                                     gLse[sIdx],
@@ -641,8 +593,6 @@ public:
                 // because the combine epilogue requires per-split LSE for rescaling.
                 if (splitParams.isSplitkv) {
                     if (isLastRowLoop) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
                             lseUbTensor,
@@ -713,7 +663,7 @@ public:
         uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
         uint32_t taskStateSlot,
         const SplitKVParams& splitParams = SplitKVParams(),
-        int32_t delStartRow = 0, int32_t delEndRow = 0, uint32_t qSeqlen = 0,
+        int32_t invalidSuffixStartRow = 0, int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0,
         uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1)
     {
         uint32_t rowNum = actualBlockShape.m();
@@ -771,9 +721,7 @@ public:
             blockParams.gCombineLse = splitParams.gCombineLse[gmLseoffsetLse];
         }
 
-        // A one-row Q tail leaves one vector idle, but PV still signals both
-        // vectors. Consume that stack's ready flag even without an O transfer;
-        // otherwise the next task can read unfinished PV using a stale flag.
+        // Idle vectors must consume PV-ready to avoid leaving a stale flag for the next task.
         if (inRowActualThisSubBlock == 0U) {
             Arch::CrossCoreWaitFlag(pvReady);
             return;
@@ -814,11 +762,7 @@ public:
                 auto gInputCurLoop = gInput[offsetInput];
                 auto layoutInputCurLoop = layoutInput.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
-                // Unlike PV input, O-update is reused across tasks. Give each
-                // vector a fixed 64-row partition: a new short task on one
-                // vector must not overwrite the other vector's pending update
-                // rows from a longer task. Existing per-vector events protect
-                // reuse within each partition; no cross-task drain is needed.
+                // Fixed 64-row vector partitions prevent cross-task O-update overwrites.
                 int64_t offsetUpdate = layoutUpdate.GetOffset(
                     MatrixCoord(subBlockIdx * FLOAT_VECTOR_SIZE + rowOffsetLoop, 0));
                 auto gUpdateCurLoop = gUpdate[offsetUpdate];
@@ -857,8 +801,8 @@ public:
                     integralHeadNum,
                     blockParams,
                     rowOffsetCurLoop,
-                    delStartRow,
-                    delEndRow,
+                    invalidSuffixStartRow,
+                    invalidPrefixEndRow,
                     qSeqlen,
                     qSBlockIdx,
                     rowNum,
