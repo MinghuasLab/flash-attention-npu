@@ -59,6 +59,11 @@ PRELUDE = (
 )
 
 
+def _feature_suffix(*features: tuple) -> str:
+    """Return suffixes only for enabled boolean generation axes."""
+    return "".join(f"_{name}" for enabled, name in features if enabled)
+
+
 def _header(family_desc: str, dtype_key: str, layout_display: Optional[str]) -> str:
     layout_note = f", {layout_display} variant" if layout_display else " variant (always TND)"
     return (
@@ -93,8 +98,12 @@ def fwd_combo(dtype_key: str, layout: tuple, softcap: int, return_softmax: int, 
     layout_key, display, _, _ = layout
     layout_token = f"FaiKenel::inputLayout::{display}"
     sc, rs, do = BOOL_TOKEN[softcap], BOOL_TOKEN[return_softmax], BOOL_TOKEN[dropout]
-    softcap_suffix = "_softcap" if softcap else ""
-    symbol = f"fwd_combo_{dtype_key}_{layout_key}{softcap_suffix}_retsoftmax{return_softmax}_dropout{dropout}"
+    suffix = _feature_suffix(
+        (softcap, "softcap"),
+        (return_softmax, "retsoftmax"),
+        (dropout, "dropout"),
+    )
+    symbol = f"fwd_combo_{dtype_key}_{layout_key}{suffix}"
     body = (
         PRELUDE
         + f"// v2 forward FAInfer combo, {display} variant, softcap={sc} "
@@ -144,8 +153,8 @@ def fag_kernel_variant(dtype_key: str, layout: tuple, headdim: int, softcap: int
     ctype, _ = DTYPE_MAP[dtype_key]
     layout_key, display, _, enum = layout
     sc = BOOL_TOKEN[softcap]
-    softcap_suffix = "_softcap" if softcap else ""
-    symbol = f"fag_{dtype_key}_{layout_key}_headdim{headdim}{softcap_suffix}"
+    suffix = _feature_suffix((softcap, "softcap"))
+    symbol = f"fag_{dtype_key}_{layout_key}_headdim{headdim}{suffix}"
     body = (
         PRELUDE
         + f"// v2 FAGGeneral backward variant, {display}, headdim={headdim} softcap={sc}.\n"
@@ -202,22 +211,27 @@ def fwd_combo_decls() -> str:
             for softcap in (0, 1):
                 for return_softmax in (0, 1):
                     for dropout in (0, 1):
+                        suffix = _feature_suffix(
+                            (softcap, "softcap"),
+                            (return_softmax, "retsoftmax"),
+                            (dropout, "dropout"),
+                        )
                         decls.append(
                             f"void fwd_combo_{dtype_key}_{layout[0]}"
-                            f"{'_softcap' if softcap else ''}_retsoftmax{return_softmax}_dropout{dropout}"
+                            f"{suffix}"
                             "(const FwdLaunchArgs &a);"
                         )
     dispatch_macro = (
         "#define FWD_SELECT_COMBO_8(dt, ly)                                                                          \\\n"
         "    do {                                                                                                      \\\n"
-        "        if (!a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax0_dropout0(a); return; } \\\n"
-        "        if (!a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax0_dropout1(a); return; } \\\n"
-        "        if (!a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax1_dropout0(a); return; } \\\n"
-        "        if (!a.has_softcap &&  a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax1_dropout1(a); return; } \\\n"
-        "        if ( a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax0_dropout0(a); return; } \\\n"
-        "        if ( a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax0_dropout1(a); return; } \\\n"
-        "        if ( a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax1_dropout0(a); return; } \\\n"
-        "        fwd_combo_##dt##_##ly##_softcap_retsoftmax1_dropout1(a);                                                \\\n"
+        "        if (!a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly(a); return; }                 \\\n"
+        "        if (!a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_dropout(a); return; }      \\\n"
+        "        if (!a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax(a); return; }   \\\n"
+        "        if (!a.has_softcap &&  a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax_dropout(a); return; } \\\n"
+        "        if ( a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap(a); return; }      \\\n"
+        "        if ( a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_dropout(a); return; } \\\n"
+        "        if ( a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax(a); return; } \\\n"
+        "        fwd_combo_##dt##_##ly##_softcap_retsoftmax_dropout(a);                                                 \\\n"
         "    } while (0)\n"
     )
     return (

@@ -7,8 +7,8 @@
 
 //
 // Light half of the v2 forward (FAInfer) dispatch: selects one of the 32
-// generated autogen/fwd_combo_<dtype>_<layout>_softcap<0|1>_retsoftmax<0|1>_
-// dropout<0|1> combo functions. Each combo TU (heavy, via
+// generated autogen/fwd_combo_<dtype>_<layout>[_softcap][_retsoftmax]
+// [_dropout] combo functions. Each combo TU (heavy, via
 // fwd_kernel_launch.hpp) fixes one (softcap, return_softmax, dropout) triple
 // and instantiates the 6 paged x mask FAInfer variants, so the 48
 // instantiations of a (dtype, layout) family compile in 8 parallel TUs
