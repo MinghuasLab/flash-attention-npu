@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 # isort: off
-import flash_attn_npu_4
+import flash_attn_npu_4_950
 # isort: on
 
 if torch.__version__ >= "2.4.0":
@@ -75,7 +75,7 @@ def _flash_attn_forward(
     seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
     page_table = _maybe_contiguous(page_table)
 
-    out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_4.fwd(
+    out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_4_950.fwd(
         q, k, v,
         qv, out_,
         cu_seqlens_q, cu_seqlens_k,
@@ -189,7 +189,7 @@ def _get_scheduler_metadata_op(
     sm_margin: int,
     softmax_scale: Optional[float],
 ) -> torch.Tensor:
-    return flash_attn_npu_4.get_scheduler_metadata(
+    return flash_attn_npu_4_950.get_scheduler_metadata(
         batch_size,
         max_seqlen_q,
         max_seqlen_k,
@@ -395,7 +395,7 @@ def _flash_attn_backward_op(
     deterministic: bool,
 ) -> torch.Tensor:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    _dq, _dk, _dv, softmax_d = flash_attn_npu_4.bwd(
+    _dq, _dk, _dv, softmax_d = flash_attn_npu_4_950.bwd(
         dout,
         q,
         k,
@@ -616,24 +616,9 @@ class FlashAttnFunc(torch.autograd.Function):
         cache_seqlens = torch.full(
             (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
         )
-        scheduler_metadata = get_scheduler_metadata(
-            batch_size,
-            seqlen_q,
-            seqlen_k,
-            num_heads,
-            num_heads_k,
-            head_size,
-            cache_seqlens,
-            qkv_dtype=q.dtype,
-            headdim_v=head_size_v,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            num_splits=num_splits,
-            pack_gqa=pack_gqa,
-            sm_margin=0,
-            softmax_scale=softmax_scale,
-        )
+        #TODO:add scheduler_metadata after support
+        # Ascend950 does not support scheduler metadata currently.
+        scheduler_metadata = None
 
         out, softmax_lse = _flash_attn_forward(
             q,
@@ -825,26 +810,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 # the actual seqlen fails to collapse and yields a wrong mask.
                 metadata_max_seqlen_k = int(cache_seqlens.max().item())
                 fwd_max_seqlen_k = metadata_max_seqlen_k
-            scheduler_metadata = get_scheduler_metadata(
-                batch_size,
-                max_seqlen_q,
-                metadata_max_seqlen_k,
-                num_heads,
-                num_heads_k,
-                head_size,
-                cache_seqlens,
-                qkv_dtype=q.dtype,
-                headdim_v=head_size_v,
-                cu_seqlens_q=cu_seqlens_q,
-                page_size=k.shape[1] if (page_table is not None and k.dim() == 4) else None,
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
-                num_splits=num_splits,
-                pack_gqa=pack_gqa,
-                sm_margin=0,
-                softmax_scale=softmax_scale,
-            )
+            #TODO:add scheduler_metadata after support
+            # Ascend950 does not support scheduler metadata currently.
+        scheduler_metadata = None
 
         out, softmax_lse = _flash_attn_forward(
             q,

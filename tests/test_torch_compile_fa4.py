@@ -1,3 +1,4 @@
+import pytest
 from torch_compile_utils import (
     run_fixed_compile_test,
     load_api,
@@ -40,6 +41,7 @@ def test_fa4_910_varlen_torch_compile_correctness():
 
 
 def test_fa4_950_scheduler_metadata_torch_compile_correctness():
+    pytest.skip("Ascend950 does not support scheduler metadata currently")
     require_soc("950")
 
     api = load_api(
