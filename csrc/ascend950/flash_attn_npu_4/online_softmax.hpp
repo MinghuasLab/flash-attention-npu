@@ -1124,7 +1124,7 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMaskInvert(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
@@ -1229,7 +1229,7 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMaskPreNext(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
@@ -1446,7 +1446,7 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMaskInvert64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
@@ -1526,7 +1526,7 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMaskPreNext64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
