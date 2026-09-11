@@ -14,47 +14,47 @@
 
 #include "../fwd_dispatch.hpp"
 
-void fwd_combo_fp16_bsnd_softcap0_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap0_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap0_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap0_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap1_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap1_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap1_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_bsnd_softcap1_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap0_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap0_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap0_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap0_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap1_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap1_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap1_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_fp16_tnd_softcap1_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap0_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap0_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap0_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap0_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap1_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap1_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap1_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_bsnd_softcap1_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap0_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap0_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap0_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap0_retsoftmax1_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap1_retsoftmax0_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap1_retsoftmax0_dropout1(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap1_retsoftmax1_dropout0(const FwdLaunchArgs &a);
-void fwd_combo_bf16_tnd_softcap1_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_softcap_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_softcap_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_softcap_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_bsnd_softcap_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_softcap_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_softcap_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_softcap_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_fp16_tnd_softcap_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_softcap_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_softcap_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_softcap_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_bsnd_softcap_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_retsoftmax1_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_softcap_retsoftmax0_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_softcap_retsoftmax0_dropout1(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_softcap_retsoftmax1_dropout0(const FwdLaunchArgs &a);
+void fwd_combo_bf16_tnd_softcap_retsoftmax1_dropout1(const FwdLaunchArgs &a);
 
 #define FWD_SELECT_COMBO_8(dt, ly)                                                                          \
     do {                                                                                                      \
-        if (!a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap0_retsoftmax0_dropout0(a); return; } \
-        if (!a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap0_retsoftmax0_dropout1(a); return; } \
-        if (!a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap0_retsoftmax1_dropout0(a); return; } \
-        if (!a.has_softcap &&  a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap0_retsoftmax1_dropout1(a); return; } \
-        if ( a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap1_retsoftmax0_dropout0(a); return; } \
-        if ( a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap1_retsoftmax0_dropout1(a); return; } \
-        if ( a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap1_retsoftmax1_dropout0(a); return; } \
-        fwd_combo_##dt##_##ly##_softcap1_retsoftmax1_dropout1(a);                                                \
+        if (!a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax0_dropout0(a); return; } \
+        if (!a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax0_dropout1(a); return; } \
+        if (!a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax1_dropout0(a); return; } \
+        if (!a.has_softcap &&  a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax1_dropout1(a); return; } \
+        if ( a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax0_dropout0(a); return; } \
+        if ( a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax0_dropout1(a); return; } \
+        if ( a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax1_dropout0(a); return; } \
+        fwd_combo_##dt##_##ly##_softcap_retsoftmax1_dropout1(a);                                                \
     } while (0)

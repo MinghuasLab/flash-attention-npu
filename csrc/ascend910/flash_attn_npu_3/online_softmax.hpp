@@ -60,7 +60,8 @@ public:
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
     static constexpr uint32_t TASK_STATE_SLOTS = 3;
-    static constexpr uint32_t TASK_GM_UB_TENSOR_OFFSET = 184832;
+    static constexpr uint32_t TASK_GM_UB_TENSOR_OFFSET =
+        11 * UB_UINT8_BLOCK_SIZE + 4 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
     static constexpr uint32_t TASK_GL_UB_TENSOR_OFFSET =
         TASK_GM_UB_TENSOR_OFFSET + TASK_STATE_SLOTS * MAX_ROW_NUM_SUB_CORE * sizeof(float);
 
@@ -84,10 +85,14 @@ public:
         constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 256;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
+        constexpr uint32_t LL_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;

@@ -55,6 +55,7 @@ public:
     static constexpr uint32_t FLOAT_ELENUM_PER_LINE = 128;
     static constexpr uint32_t MULTIPLIER = 2;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
+    static constexpr uint32_t REPEAT_SIZE_IN_BYTE = 256;
     static constexpr float LSE_OUT_INI = std::numeric_limits<float>::infinity();
     static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
     static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;
@@ -95,9 +96,12 @@ public:
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
 
         dropoutValue = dropoutValue_;
 

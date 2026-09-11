@@ -7,9 +7,8 @@
 
 //
 // Light half of the v2 FAGGeneral backward dispatch: selects one of the 32
-// generated autogen/fag_combo_<dtype>_<layout>_headdim<64|128|192|256>_softcap<0|1>
-// combo
-// functions. Each combo TU (heavy, via fag_kernel_launch.hpp) fixes one
+// generated autogen/fag_<dtype>_<layout>_headdim<64|128|192|256>[_softcap]
+// functions. Each FAG variant TU (heavy, via fag_kernel_launch.hpp) fixes one
 // (headdim, softcap) pair and instantiates the 8 causal x deterministic x
 // dropout FAGGeneral variants, so the 64 instantiations of a (dtype, layout)
 // family compile in 8 parallel TUs instead of one. This header stays
@@ -21,8 +20,8 @@
 // without that header's kernel-header prerequisites). Host TUs keep getting
 // the constants from their own heavy include chains.
 //
-// The OpCommand("ascendc_fag") wrapper moved into the per-combo launchers
-// (fag_kernel_launch.hpp users): exactly one combo runs per dispatch, so the
+// The OpCommand("ascendc_fag") wrapper moved into the per-variant launchers
+// (fag_kernel_launch.hpp users): exactly one variant runs per dispatch, so the
 // wrapper still fires once per launch, as before.
 //
 
@@ -37,21 +36,21 @@
 // with only this header's light include set.
 #include "kernel_operator.h"
 
-#include "autogen/fag_combo_decls.hpp"
+#include "autogen/fag_decls.hpp"
 
 template <typename DType, uint32_t kInputLayout>
 void launch_fag_general_dispatch_impl(const FagGeneralLaunchArgs &a) {
     if constexpr (std::is_same_v<DType, half>) {
         if constexpr (kInputLayout == TND) {
-            FAG_SELECT_COMBO_16(fp16, tnd);
+            FAG_SELECT_VARIANT_16(fp16, tnd);
         } else {  // BSND
-            FAG_SELECT_COMBO_16(fp16, bsnd);
+            FAG_SELECT_VARIANT_16(fp16, bsnd);
         }
     } else {
         if constexpr (kInputLayout == TND) {
-            FAG_SELECT_COMBO_16(bf16, tnd);
+            FAG_SELECT_VARIANT_16(bf16, tnd);
         } else {  // BSND
-            FAG_SELECT_COMBO_16(bf16, bsnd);
+            FAG_SELECT_VARIANT_16(bf16, bsnd);
         }
     }
 }

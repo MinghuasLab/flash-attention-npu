@@ -9,8 +9,8 @@
 // Heavy half of the v2 FAGGeneral backward dispatch: the kernel definition
 // (via ../flash_attn_npu_3/fag_kernel.cpp), the OpCommand wrapper include and
 // the launch / switch macros. Included ONLY by the generated
-// autogen/fag_combo_<dtype>_<layout>_headdim<64|128|192|256>_softcap<0|1>.cpp
-// combo TUs,
+// autogen/fag_<dtype>_<layout>_headdim<64|128|192|256>[_softcap].cpp
+// FAG variant TUs,
 // each of which fixes one (headdim, softcap) pair and instantiates the 8
 // causal x deterministic x dropout FAGGeneral variants, so the 64
 // instantiations of a (dtype, layout) family compile in 8 parallel TUs
@@ -43,7 +43,7 @@
 // fag_kernel.cpp provides the ::FAGGeneral kernel template, the DTemplateType
 // enum, and the unqualified BSND/TND layout constants (0/1, from
 // fag_kernel_common.hpp which it includes). It self-includes fag_tiling.h for
-// the FAGTilingData type. Each combo TU includes it once.
+// the FAGTilingData type. Each FAG variant TU includes it once.
 #include "../flash_attn_npu_3/fag_kernel.cpp"
 
 // Launch one FAGGeneral specialization. All template axes are macro arguments
