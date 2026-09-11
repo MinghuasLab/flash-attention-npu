@@ -132,9 +132,6 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementP>& gP;
             AscendC::GlobalTensor<ElementOTmp>& gOTmp;
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
-            AscendC::GlobalTensor<ElementP>& gPret;
-            AscendC::GlobalTensor<ElementMask>& gDrop;
-            AscendC::GlobalTensor<float>& gAlibiSlopes;
             AscendC::GlobalTensor<ElementK>& gKNew;
             AscendC::GlobalTensor<ElementK>& gVNew;
         };
@@ -162,10 +159,8 @@ namespace SplitFuse {
             maskType = fATilingData->maskType;
             windowSizeLeft = fATilingData->windowSizeLeft;
             windowSizeRight = fATilingData->windowSizeRight;
-            alibiSlopesBatchStride = 0;
             scaleValue = fATilingData->scaleValue;
             softcapValue = fATilingData->softcapValue;
-            dropoutValue = 0.0f;
             maxQSeqlen = fATilingData->maxQSeqlen;
             maxKvSeqlen = fATilingData->maxKvSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
@@ -198,7 +193,6 @@ namespace SplitFuse {
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<ElementLse> gLse;
             gLse.SetGlobalBuffer((__gm__ ElementLse *)params.lse);
-            AscendC::GlobalTensor<float> gAlibiSlopes;
 
             AscendC::GlobalTensor<ElementLse> gLseFD;
             AscendC::GlobalTensor<ElementLse> gOFD;
@@ -218,8 +212,6 @@ namespace SplitFuse {
             gOUpdate.SetGlobalBuffer((__gm__ ElementOTmp *)(params.workSpace + Lsesize + Losize +
                 mm1OutSize + smOnlineOutSize + mm2OutSize));
 
-            AscendC::GlobalTensor<ElementP> gPret;
-            AscendC::GlobalTensor<ElementMask> gDrop;
 
             // Append-KV newkv tensors (nullptr when kvNewSeqlen == 0).
             AscendC::GlobalTensor<ElementK> gKNew;
@@ -232,16 +224,13 @@ namespace SplitFuse {
                 gQ, gK, gV, gMask, gBlockTable,
                 gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate, gPret,
-                gDrop, gAlibiSlopes, gKNew, gVNew
+                gS, gP, gOTmp, gOUpdate, gKNew, gVNew
             };
 
             strideQ = static_cast<uint64_t>(qHeads * embed);
             strideO = static_cast<uint64_t>(qHeads * embedV);
             strideK = static_cast<uint64_t>(kvHeads * embed);
             strideV = static_cast<uint64_t>(kvHeads * embedV);
-            stridePret = static_cast<uint64_t>(maxQSeqlen * maxKvSeqlen);
-            strideDrop = static_cast<uint64_t>(maxQSeqlen * CeilDiv(maxKvSeqlen, 8));
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
             uint32_t coreNum = AscendC::GetBlockNum();
@@ -309,8 +298,8 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
             epilogueOnlineSoftmax.init(
-                resource, scaleValue, softcapValue, gPret, stridePret, gDrop, strideDrop, maxKvSeqlen, gAlibiSlopes);
-            epilogueRescaleO.init(resource, dropoutValue);
+                resource, scaleValue, softcapValue);
+            epilogueRescaleO.init(resource);
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
@@ -587,8 +576,6 @@ namespace SplitFuse {
             auto& gP = globalTensors.gP;
             auto& gOTmp = globalTensors.gOTmp;
             auto& gOUpdate = globalTensors.gOUpdate;
-            auto& gPret = globalTensors.gPret;
-            auto& gDrop = globalTensors.gDrop;
             auto& gKNew = globalTensors.gKNew;
             auto& gVNew = globalTensors.gVNew;
 
@@ -690,10 +677,6 @@ namespace SplitFuse {
                 static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                 static_cast<uint64_t>(lseTokenOffset);
 
-            uint64_t gmOffsetPret = static_cast<uint64_t>(BIdx * qHeads + qNStartIdx) * stridePret +
-                                    static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * maxKvSeqlen;
-            uint64_t gmOffsetDrop = static_cast<uint64_t>(BIdx * qHeads + qNStartIdx) * strideDrop +
-                                    static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * CeilDiv(maxKvSeqlen, 8);
 
             uint32_t qSBlockSize = (qSBlockIdx == (curQSBlockNum - 1U)) ?
                 (qSeqlen - qSBlockIdx * curQSBlockTile) : curQSBlockTile;
@@ -817,13 +800,6 @@ namespace SplitFuse {
                 return;
             }
 
-#ifdef __DAV_C220_VEC__
-            int64_t qKSeqDiff = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
-            int64_t qSBlockBaseIdx = qSBlockIdx * curQSBlockTile;
-            int64_t qNBlockBaseIdx = qNStartIdx;
-            int64_t slopesBatchOffset = static_cast<int64_t>(BIdx) * alibiSlopesBatchStride;
-#endif
 #ifdef __DAV_C220_CUBE__
             LayoutQ layoutQTemp(rowNum, embed);
             LayoutK layoutKTemp(strideK, stackSeqTile);
@@ -933,8 +909,6 @@ namespace SplitFuse {
                     uint32_t kvSStartIdx = isAppendBlock ?
                         kvSeqlenOld + kvSIdxLocal * MAX_KV_STACK_LEN : kvSIdx * MAX_KV_STACK_LEN;
                     uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
-                    epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
-                    epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                         int64_t triUp =
                             static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
@@ -961,11 +935,7 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
-                                    isSplitKV,
-                                    qSBlockBaseIdx,
-                                    qNBlockBaseIdx,
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
+                                    isSplitKV);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
@@ -986,11 +956,7 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
-                                    false,
-                                    qSBlockBaseIdx,
-                                    qNBlockBaseIdx,
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
+                                    false);
                             }
                         } else {
                             uint32_t lastNoMaskTile;
@@ -1021,8 +987,7 @@ namespace SplitFuse {
                                     desc.taskStateSlot,
                                     qkReady,
                                     softmaxPingPongFlag,
-                                    isSplitKV, false, false, kvSStartIdx,
-                                    qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
+                                    isSplitKV, false, false);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
@@ -1038,8 +1003,7 @@ namespace SplitFuse {
                                     desc.taskStateSlot,
                                     qkReady,
                                     softmaxPingPongFlag,
-                                    false, false, false, kvSStartIdx,
-                                    qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
+                                    false, false, false);
                             }
                         }
                     } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
@@ -1081,11 +1045,7 @@ namespace SplitFuse {
                                     windowSizeLeftEndLen,
                                     windowSizeRightStartLen,
                                     windowSizeRightEndLen,
-                                    (flashDecodeFlag != 0U) ? isSplitKV : false,
-                                    qSBlockBaseIdx,
-                                    qNBlockBaseIdx,
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
+                                    (flashDecodeFlag != 0U) ? isSplitKV : false);
                         } else {
                             bool isLastNoMaskStackTile = (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
@@ -1107,12 +1067,7 @@ namespace SplitFuse {
                                 softmaxPingPongFlag,
                                 (flashDecodeFlag != 0U) ? isSplitKV : false,
                                 startsWithMaskTile,
-                                startsWithMaskThenNomaskFlag,
-                                kvSStartIdx,
-                                qSBlockBaseIdx,
-                                qNBlockBaseIdx,
-                                qKSeqDiff,
-                                slopesBatchOffset);
+                                startsWithMaskThenNomaskFlag);
                             startsWithMaskTile = false;
                         }
                     } else {
@@ -1131,8 +1086,7 @@ namespace SplitFuse {
                                 desc.taskStateSlot,
                                 qkReady,
                                 softmaxPingPongFlag,
-                                isSplitKV, false, false, kvSStartIdx,
-                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
+                                isSplitKV, false, false);
                         } else {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
@@ -1148,8 +1102,7 @@ namespace SplitFuse {
                                 desc.taskStateSlot,
                                 qkReady,
                                 softmaxPingPongFlag,
-                                false, false, false, kvSStartIdx,
-                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
+                                false, false, false);
                         }
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
@@ -1305,9 +1258,7 @@ namespace SplitFuse {
         int64_t  windowSizeRight;
         float    scaleValue;
         float    softcapValue;
-        float    dropoutValue;
         uint32_t totalQTokens;
-        int64_t  alibiSlopesBatchStride;
         uint32_t maxQSeqlen;
         uint32_t maxKvSeqlen;
         uint32_t flashDecodeFlag;
@@ -1319,8 +1270,6 @@ namespace SplitFuse {
         uint64_t strideO;
         uint64_t strideK;
         uint64_t strideV;
-        uint64_t stridePret;
-        uint64_t strideDrop;
         uint32_t embedRound;
         uint32_t embedRoundV;
         uint32_t groupSize;
@@ -1398,7 +1347,7 @@ namespace SplitFuse {
                                                    QType, KType, SType>;
 
         using DispatchPolicyOnlineSoftmax =
-            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, false, false, false>;
+            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
@@ -1412,7 +1361,7 @@ namespace SplitFuse {
         using BlockMmadPV = Gemm::Block::BlockMmad<DispatchPolicyPV, L1TileShapePV, L0TileShapePV,
                                                    PType, VType, OTmpType>;
 
-        using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec, false>;
+        using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec>;
         using OType = Gemm::GemmType<ElementO, LayoutO>;
         using OUpdateType = Gemm::GemmType<ElementUpdate, LayoutUpdate>;
         using LseType = Gemm::GemmType<ElementLse, LayoutLse>;

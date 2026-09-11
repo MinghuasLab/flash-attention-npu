@@ -15,7 +15,6 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
-#include "alibi.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -24,18 +23,15 @@ template <
     class InputType_,
     class MaskType_,
     LseModeT LSE_MODE_,
-    bool HAS_SOFTCAP_,
-    bool RETURN_SOFTMAX_,
-    bool HAS_DROPOUT_,
-    bool HAS_ALIBI_>
+    bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_, HAS_ALIBI_>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_, HAS_ALIBI_>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -75,9 +71,7 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_,
-        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_,
-        uint64_t strideDrop_, uint32_t maxKvSeqlen_, AscendC::GlobalTensor<float> alibiSlopesGm_)
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -94,19 +88,9 @@ public:
         constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
-        // TV reductions use at most 5 KiB; its last 2 KiB hold dropout bits, separate from SWA masks.
-        constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
-        // ALiBi uses TV's first 2 KiB before rowmax; LM would overlap live task GM slots.
-        constexpr uint32_t ALIBI_WORK_UB_OFFSET = TV_UB_TENSOR_OFFSET;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
-        alibiSlopesGm = alibiSlopesGm_;
-        gPret = gPret_;
-        stridePret = stridePret_;
-        gDrop = gDrop_;
-        strideDrop = strideDrop_;
-        maxKvSeqlen = maxKvSeqlen_;
 
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
@@ -121,20 +105,6 @@ public:
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(LL_UB_TENSOR_OFFSET);
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
-        alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
-        dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
-    }
-
-    __aicore__ inline
-    void set_gmOffsetPret(uint64_t gmOffsetPret_)
-    {
-        gmOffsetPret = gmOffsetPret_;
-    }
-
-    __aicore__ inline
-    void set_gmOffsetDrop(uint64_t gmOffsetDrop_)
-    {
-        gmOffsetDrop = gmOffsetDrop_;
     }
 
     __aicore__ inline
@@ -850,94 +820,6 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
-    __aicore__ inline
-    void CopyDropMaskToUb(
-        uint32_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum, uint32_t columnNum,
-        uint32_t qSBlockSize)
-    {
-        uint32_t rowsDone = 0;
-        while (rowsDone < rowNum) {
-            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
-            AscendC::DataCopyPad(
-                dropUbTensor[rowsDone * ((columnNum > 256) ? 64 : 32)],
-                gDrop[gmOffsetDrop + qNOffset + qSOffset],
-                AscendC::DataCopyExtParams(
-                    rowsCurHead, CeilDiv(columnNum, 8) * sizeof(ElementMask),
-                    (CeilDiv(maxKvSeqlen, 8) - CeilDiv(columnNum, 8)) * sizeof(ElementMask), 0, 0),
-                AscendC::DataCopyPadExtParams<ElementMask>());
-            rowsDone += rowsCurHead;
-            qNOffset += strideDrop;
-            qSIdxCurBlock = 0;
-            qSOffset = 0;
-        }
-    }
-
-    __aicore__ inline
-    void ApplyDropoutNegate(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
-    {
-        // Reuse two 1-KiB TV slices between CalcExp and CalcLocalRowSum; HM is too small.
-        auto t0 = tvUbTensor.template ReinterpretCast<half>();
-        auto t1 = t0[UB_UINT8_VECTOR_SIZE / sizeof(half)];
-        auto u0 = t0.template ReinterpretCast<uint16_t>();
-        auto u1 = t1.template ReinterpretCast<uint16_t>();
-        for (uint32_t r = 0; r < rowNum; r++) {
-            AscendC::Duplicate(t0, static_cast<half>(0.0f), columnNumRound);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Select(
-                t0, dropUbTensor[r * ((columnNum > 256) ? 64 : 32)], t0, static_cast<half>(-0.0f),
-                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
-            AscendC::PipeBarrier<PIPE_V>();
-            auto up = lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<uint16_t>();
-            AscendC::Or(u1, up, u0, columnNumRound);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::And(up, up, u0, columnNumRound);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Not(up, up, columnNumRound);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::And(up, up, u1, columnNumRound);
-        }
-    }
-
-    __aicore__ inline
-    void ApplyDropoutStd(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
-    {
-        if (columnNum == 512 || columnNum == 256) {
-            AscendC::Select(
-                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), dropUbTensor,
-                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), static_cast<half>(0.0f),
-                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, rowNum * columnNumRound);
-        } else {
-            for (uint32_t r = 0; r < rowNum; r++) {
-                AscendC::Select(
-                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
-                    dropUbTensor[r * ((columnNum > 256) ? 64 : 32)],
-                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
-                    static_cast<half>(0.0f), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
-            }
-        }
-    }
-
-    __aicore__ inline
-    void CopyPretUbToGm(
-        uint32_t sUbOffset, uint64_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum,
-        uint32_t columnNum, uint32_t columnNumRound, uint32_t qSBlockSize)
-    {
-        uint32_t rowsDone = 0;
-        while (rowsDone < rowNum) {
-            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
-            AscendC::DataCopyPad(
-                gPret[gmOffsetPret + qNOffset + qSOffset], lpUbTensor[sUbOffset][rowsDone * columnNumRound],
-                AscendC::DataCopyExtParams(
-                    rowsCurHead, columnNum * sizeof(ElementOutput),
-                    (columnNumRound - columnNum) * sizeof(ElementOutput) / 32,
-                    (maxKvSeqlen - columnNum) * sizeof(ElementOutput), 0));
-            rowsDone += rowsCurHead;
-            qNOffset += stridePret;
-            qSIdxCurBlock = 0;
-            qSOffset = 0;
-        }
-    }
-
     template <bool doTriUMask>
     __aicore__ inline
     void SubCoreCompute(
@@ -945,7 +827,7 @@ public:
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, uint32_t taskStateSlot, uint32_t rowOffsetIoGm, uint32_t qSBlockSize,
+        uint32_t curStackTileMod, uint32_t taskStateSlot,
         bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
@@ -967,16 +849,6 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
             }
         }
-
-        if constexpr (HAS_DROPOUT_) {
-            uint32_t qNOffset = (rowOffsetIoGm / qSBlockSize) * strideDrop;
-            uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
-            uint32_t qSOffset = qSIdxCurBlock * CeilDiv(maxKvSeqlen, 8);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-            CopyDropMaskToUb(qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, qSBlockSize);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
-        }
-
         if constexpr (!doTriUMask) {
             if (isLastNoMaskStackTile && isLastRowLoop) {
                 if (!startsWithMaskThenNomaskFlag) {
@@ -1003,25 +875,6 @@ public:
         }
 
         DownCastP(sUbOffset, rowNumCurLoop, columnNumRound);
-        if constexpr (HAS_DROPOUT_) {
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
-            if constexpr (RETURN_SOFTMAX_) {
-                ApplyDropoutNegate(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-                uint64_t qNOffset = static_cast<uint64_t>(rowOffsetIoGm / qSBlockSize) * stridePret;
-                uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
-                uint32_t qSOffset = qSIdxCurBlock * maxKvSeqlen;
-                CopyPretUbToGm(
-                    sUbOffset, qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, columnNumRound,
-                    qSBlockSize);
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
-            }
-            ApplyDropoutStd(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
 
         CalcLocalRowSum(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
@@ -1049,9 +902,7 @@ public:
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
         Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, bool isSplitKV = false,
-        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false,
-        uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
-        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
+        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1119,13 +970,6 @@ public:
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
-                if constexpr (HAS_ALIBI_) {
-                    ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
-                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                        static_cast<int64_t>(kvSStartIdx));
-                }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
@@ -1138,8 +982,6 @@ public:
                     pingpongFlag,
                     curStackTileMod,
                     taskStateSlot,
-                    rowOffsetIoGm,
-                    qSBlockSize,
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
             }
@@ -1155,9 +997,7 @@ public:
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
         uint32_t& softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
-        uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false,
-        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
-        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
+        uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1303,13 +1143,6 @@ public:
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
-                if constexpr (HAS_ALIBI_) {
-                    ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
-                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                        static_cast<int64_t>(kvSStartIdx));
-                }
                 ApplyMask(
                     (pingpongFlag * MAX_UB_S_ELEM_NUM),
                     rowNumCurLoop, columnNumRound,
@@ -1332,8 +1165,6 @@ public:
                     pingpongFlag,
                     curStackTileMod,
                     taskStateSlot,
-                    rowOffsetIoGm,
-                    qSBlockSize,
                     isSplitKV);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
@@ -1368,9 +1199,7 @@ public:
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
         uint32_t& softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
-        int32_t nextTokenEndLen, bool isSplitKV = false,
-        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
-        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
+        int32_t nextTokenEndLen, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1504,13 +1333,6 @@ public:
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
-                    if constexpr (HAS_ALIBI_) {
-                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
-                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                            static_cast<int64_t>(kvSStartIdx));
-                    }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
@@ -1540,13 +1362,6 @@ public:
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
-                    if constexpr (HAS_ALIBI_) {
-                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
-                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                            static_cast<int64_t>(kvSStartIdx));
-                    }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
                 } else if (doTriUNextMask) {
@@ -1555,13 +1370,6 @@ public:
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                    }
-                    if constexpr (HAS_ALIBI_) {
-                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
-                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                            static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundNext,
                               addMaskUbOffset);
@@ -1584,8 +1392,6 @@ public:
                     pingpongFlag,
                     curStackTileMod,
                     taskStateSlot,
-                    rowOffsetIoGm,
-                    qSBlockSize,
                     isSplitKV,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
@@ -1625,13 +1431,6 @@ public:
 private:
     float scaleValue;
     float softcapValue;
-    uint64_t gmOffsetPret;
-    uint64_t stridePret;
-    uint64_t gmOffsetDrop;
-    uint64_t strideDrop;
-    uint32_t maxKvSeqlen;
-    AscendC::GlobalTensor<ElementOutput> gPret;
-    AscendC::GlobalTensor<ElementMask> gDrop;
 
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
@@ -1646,9 +1445,6 @@ private:
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> softcapUbTensor;
-    AscendC::GlobalTensor<float> alibiSlopesGm;
-    AscendC::LocalTensor<float> alibiWorkUb;
-    AscendC::LocalTensor<ElementMask> dropUbTensor;
 };
 
 }
