@@ -171,8 +171,8 @@ def _flash_attn_backward(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
-    sequed_q: Optional[torch.Tensor] = None,
-    sequed_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     dq: Optional[torch.Tensor] = None,
@@ -186,12 +186,77 @@ def _flash_attn_backward(
     deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
-    # Placeholder registered for interface parity with Ascend 910; the 950
-    # backend has no backward kernel, so the actual implementation is absent.
-    raise NotImplementedError(
-        "Ascend 950 does not support flash attention backward pass."
+    dout, q, k, v, out = (
+        _maybe_contiguous(x) for x in (dout, q, k, v, out)
     )
+    _, _, _, softmax_d = flash_attn_npu_3_950.bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        sm_margin,
+    )
+    return softmax_d
 
+@_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_backward")
+def _flash_attn_backward_fake(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    dq=None,
+    dk=None,
+    dv=None,
+    softmax_scale=None,
+    is_causal=False,
+    window_size_left=-1,
+    window_size_right=-1,
+    softcap=0.0,
+    deterministic=False,
+    sm_margin=0,
+):
+    del (
+        dout, k, v, out, softmax_lse, cu_seqlens_k, seqused_q, seqused_k,
+        max_seqlen_k, softmax_scale, is_causal, window_size_left,
+        window_size_right, softcap, deterministic, sm_margin,
+    )
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q, num_heads = q.shape[:3]
+        return torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    return torch.empty(
+        (q.shape[1], q.shape[0]),
+        dtype=torch.float32,
+        device=q.device,
+    )
 
 def get_scheduler_metadata(
     batch_size,
@@ -268,7 +333,6 @@ def get_scheduler_metadata(
         window_size[1],
     )
     return scheduler_metadata
-
 
 def flash_attn_with_kvcache(
     q,
