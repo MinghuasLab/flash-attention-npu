@@ -15,6 +15,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
+#include "alibi.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -23,15 +24,18 @@ template <
     class InputType_,
     class MaskType_,
     LseModeT LSE_MODE_,
-    bool HAS_SOFTCAP_>
+    bool HAS_SOFTCAP_,
+    bool RETURN_SOFTMAX_,
+    bool HAS_DROPOUT_,
+    bool HAS_ALIBI_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_, HAS_ALIBI_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_, HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -59,6 +63,10 @@ public:
     static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
+    static constexpr uint32_t TASK_STATE_SLOTS = 3;
+    static constexpr uint32_t TASK_GM_UB_TENSOR_OFFSET = 184832;
+    static constexpr uint32_t TASK_GL_UB_TENSOR_OFFSET =
+        TASK_GM_UB_TENSOR_OFFSET + TASK_STATE_SLOTS * MAX_ROW_NUM_SUB_CORE * sizeof(float);
 
     __aicore__ inline
     BlockEpilogue() {}
@@ -67,12 +75,14 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_)
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_,
+        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_,
+        uint64_t strideDrop_, uint32_t maxKvSeqlen_, AscendC::GlobalTensor<float> alibiSlopesGm_)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
@@ -80,13 +90,24 @@ public:
         constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 11 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 256;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * 256;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * 256;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * 256;
+        // TV reductions use at most 5 KiB; its last 2 KiB hold dropout bits, separate from SWA masks.
+        constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
+        // ALiBi uses TV's first 2 KiB before rowmax; LM would overlap live task GM slots.
+        constexpr uint32_t ALIBI_WORK_UB_OFFSET = TV_UB_TENSOR_OFFSET;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
+        alibiSlopesGm = alibiSlopesGm_;
+        gPret = gPret_;
+        stridePret = stridePret_;
+        gDrop = gDrop_;
+        strideDrop = strideDrop_;
+        maxKvSeqlen = maxKvSeqlen_;
+
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
@@ -100,12 +121,20 @@ public:
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(LL_UB_TENSOR_OFFSET);
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
+        alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
+        dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
     }
 
-    template <typename T>
-    __aicore__ inline T Min(T a, T b)
+    __aicore__ inline
+    void set_gmOffsetPret(uint64_t gmOffsetPret_)
     {
-        return (a > b) ? b : a;
+        gmOffsetPret = gmOffsetPret_;
+    }
+
+    __aicore__ inline
+    void set_gmOffsetDrop(uint64_t gmOffsetDrop_)
+    {
+        gmOffsetDrop = gmOffsetDrop_;
     }
 
     __aicore__ inline
@@ -418,7 +447,7 @@ public:
 
     __aicore__ inline void OperateNextMaskUb(uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
-        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor[MAX_UB_S_ELEM_NUM], rowNumCurLoop, columnNumRound);
+        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
         UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
     }
 
@@ -444,21 +473,16 @@ public:
         uint32_t columnNum, uint32_t columnNumRound,
         uint32_t maskStride, uint32_t tokenNumPerHead,
         uint32_t proTokenIdx, uint32_t proTokenNum,
-        uint32_t integralHeadNum, uint32_t epiTokenNum, bool isNextMask)
+        uint32_t integralHeadNum, uint32_t epiTokenNum, bool /*isNextMask*/)
     {
-        // 910B DataCopyPad requires the row byte length to be 8-aligned; a
-        // causal tail tile of kvSEndIdx % 8 != 0 (kv=2049..2051, 2060, ...)
-        // would otherwise issue a 4/12-byte row copy -> device error 507015.
-        // Read RoundUp(columnNum, 8) bytes per row (the padded bytes are
-        // stale; ApplyMask trims the add span to the valid columns).
-        uint32_t maskRowLen = RoundUp(columnNum, (uint32_t)8) * sizeof(ElementMask);
-        uint32_t innerUbRowOffset = isNextMask ? MAX_UB_S_ELEM_NUM : 0;
+        // EVENT_ID6/4 serialize raw-mask reuse; 184 KiB is reserved for CANN Select scratch.
+        uint32_t innerUbRowOffset = 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask[proTokenIdx * maskStride],
                 AscendC::DataCopyExtParams(
-                    proTokenNum, maskRowLen,
-                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
+                    proTokenNum, columnNum * sizeof(ElementMask),
+                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += proTokenNum * columnNumRound;
         }
@@ -466,8 +490,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    tokenNumPerHead, maskRowLen,
-                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
+                    tokenNumPerHead, columnNum * sizeof(ElementMask),
+                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += tokenNumPerHead * columnNumRound;
         }
@@ -475,8 +499,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    epiTokenNum, maskRowLen,
-                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
+                    epiTokenNum, columnNum * sizeof(ElementMask),
+                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
         }
     }
@@ -554,7 +578,7 @@ public:
             CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        if (maskColumnRound == columnNumRound && addMaskUbOffset == 0U) {
+        if (maskColumnRound == columnNumRound) {
             AscendC::Add<float, false>(
                 lsUbTensor[sUbOffset],
                 lsUbTensor[sUbOffset],
@@ -563,7 +587,7 @@ public:
                 CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         } else {
-            // Trim the mask span so it never crosses the tile into the next row's UB.
+            // Trim the mask span so it never crosses the tile into the next row's UB
             uint32_t maskAddNum = AscendC::Std::min(maskColumnRound, columnNumRound - addMaskUbOffset);
             uint32_t loop = maskAddNum / FLOAT_VECTOR_SIZE;
             for (uint32_t i = 0; i < loop; i++) {
@@ -629,21 +653,26 @@ public:
 
     __aicore__ inline
     void UpdateGlobalRowMax(uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound, uint32_t columnNum,
-        uint32_t columnNumRound, uint32_t dmUbOffsetCurCycle, uint32_t rowOffset, uint32_t isFirstStackTile)
+        uint32_t columnNumRound, uint32_t dmUbOffsetCurCycle, uint32_t stateRowOffset, uint32_t rowOffset, uint32_t isFirstStackTile)
     {
         if (isFirstStackTile) {
             AscendC::DataCopy(
                 hmUbTensor[rowOffset],
                 lmUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::DataCopy(
+                gmUbTensor[stateRowOffset],
+                lmUbTensor[rowOffset],
+                AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::PipeBarrier<PIPE_V>();
+            return;
         } else {
             SetVecMask(rowNumCurLoop);
             // *** hm = vmax(lm, gm)
             AscendC::Max<float, false>(
                 hmUbTensor[rowOffset],
                 lmUbTensor[rowOffset],
-                gmUbTensor[rowOffset],
+                gmUbTensor[stateRowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -651,7 +680,7 @@ public:
             // *** dm = gm - hm
             AscendC::Sub<float, false>(
                 dmUbTensor[dmUbOffsetCurCycle],
-                gmUbTensor[rowOffset],
+                gmUbTensor[stateRowOffset],
                 hmUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
@@ -669,7 +698,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         // *** gm = hm
         AscendC::DataCopy(
-            gmUbTensor[rowOffset],
+            gmUbTensor[stateRowOffset],
             hmUbTensor[rowOffset],
             AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
         AscendC::PipeBarrier<PIPE_V>();
@@ -754,12 +783,12 @@ public:
 
     __aicore__ inline
     void UpdateGlobalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound,
-        uint32_t dmUbOffsetCurCycle, uint32_t rowOffset, uint32_t isFirstStackTile)
+        uint32_t dmUbOffsetCurCycle, uint32_t stateRowOffset, uint32_t rowOffset, uint32_t isFirstStackTile)
     {
         if (isFirstStackTile) {
             // *** gl = ll
             AscendC::DataCopy(
-                glUbTensor[rowOffset],
+                glUbTensor[stateRowOffset],
                 llUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::PipeBarrier<PIPE_V>();
@@ -767,17 +796,17 @@ public:
             SetVecMask(rowNumCurLoop);
             // *** gl = dm * gl
             AscendC::Mul<float, false>(
-                glUbTensor[rowOffset],
+                glUbTensor[stateRowOffset],
                 dmUbTensor[dmUbOffsetCurCycle],
-                glUbTensor[rowOffset],
+                glUbTensor[stateRowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** gl = ll + gl
             AscendC::Add<float, false>(
-                glUbTensor[rowOffset],
-                glUbTensor[rowOffset],
+                glUbTensor[stateRowOffset],
+                glUbTensor[stateRowOffset],
                 llUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
@@ -821,6 +850,94 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
+    __aicore__ inline
+    void CopyDropMaskToUb(
+        uint32_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum, uint32_t columnNum,
+        uint32_t qSBlockSize)
+    {
+        uint32_t rowsDone = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
+            AscendC::DataCopyPad(
+                dropUbTensor[rowsDone * ((columnNum > 256) ? 64 : 32)],
+                gDrop[gmOffsetDrop + qNOffset + qSOffset],
+                AscendC::DataCopyExtParams(
+                    rowsCurHead, CeilDiv(columnNum, 8) * sizeof(ElementMask),
+                    (CeilDiv(maxKvSeqlen, 8) - CeilDiv(columnNum, 8)) * sizeof(ElementMask), 0, 0),
+                AscendC::DataCopyPadExtParams<ElementMask>());
+            rowsDone += rowsCurHead;
+            qNOffset += strideDrop;
+            qSIdxCurBlock = 0;
+            qSOffset = 0;
+        }
+    }
+
+    __aicore__ inline
+    void ApplyDropoutNegate(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
+    {
+        // Reuse two 1-KiB TV slices between CalcExp and CalcLocalRowSum; HM is too small.
+        auto t0 = tvUbTensor.template ReinterpretCast<half>();
+        auto t1 = t0[UB_UINT8_VECTOR_SIZE / sizeof(half)];
+        auto u0 = t0.template ReinterpretCast<uint16_t>();
+        auto u1 = t1.template ReinterpretCast<uint16_t>();
+        for (uint32_t r = 0; r < rowNum; r++) {
+            AscendC::Duplicate(t0, static_cast<half>(0.0f), columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(
+                t0, dropUbTensor[r * ((columnNum > 256) ? 64 : 32)], t0, static_cast<half>(-0.0f),
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            auto up = lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<uint16_t>();
+            AscendC::Or(u1, up, u0, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(up, up, u0, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Not(up, up, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(up, up, u1, columnNumRound);
+        }
+    }
+
+    __aicore__ inline
+    void ApplyDropoutStd(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
+    {
+        if (columnNum == 512 || columnNum == 256) {
+            AscendC::Select(
+                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), dropUbTensor,
+                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), static_cast<half>(0.0f),
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, rowNum * columnNumRound);
+        } else {
+            for (uint32_t r = 0; r < rowNum; r++) {
+                AscendC::Select(
+                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
+                    dropUbTensor[r * ((columnNum > 256) ? 64 : 32)],
+                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
+                    static_cast<half>(0.0f), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
+            }
+        }
+    }
+
+    __aicore__ inline
+    void CopyPretUbToGm(
+        uint32_t sUbOffset, uint64_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum,
+        uint32_t columnNum, uint32_t columnNumRound, uint32_t qSBlockSize)
+    {
+        uint32_t rowsDone = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
+            AscendC::DataCopyPad(
+                gPret[gmOffsetPret + qNOffset + qSOffset], lpUbTensor[sUbOffset][rowsDone * columnNumRound],
+                AscendC::DataCopyExtParams(
+                    rowsCurHead, columnNum * sizeof(ElementOutput),
+                    (columnNumRound - columnNum) * sizeof(ElementOutput) / 32,
+                    (maxKvSeqlen - columnNum) * sizeof(ElementOutput), 0));
+            rowsDone += rowsCurHead;
+            qNOffset += stridePret;
+            qSIdxCurBlock = 0;
+            qSOffset = 0;
+        }
+    }
+
     template <bool doTriUMask>
     __aicore__ inline
     void SubCoreCompute(
@@ -828,7 +945,8 @@ public:
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
+        uint32_t curStackTileMod, uint32_t taskStateSlot, uint32_t rowOffsetIoGm, uint32_t qSBlockSize,
+        bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -836,21 +954,46 @@ public:
         uint32_t columnNumPad = layoutOutput.stride(0);
         uint32_t sUbOffset = pingpongFlag * MAX_UB_S_ELEM_NUM;
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
+        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffset;
 
+        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
         if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
             if (isFirstStackTile && isFirstRowLoop) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
             }
         } else {
             if (isFirstStackTile && isFirstRowLoop && isSplitKV) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
             }
         }
+
+        if constexpr (HAS_DROPOUT_) {
+            uint32_t qNOffset = (rowOffsetIoGm / qSBlockSize) * strideDrop;
+            uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
+            uint32_t qSOffset = qSIdxCurBlock * CeilDiv(maxKvSeqlen, 8);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
+            CopyDropMaskToUb(qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, qSBlockSize);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+        }
+
+        if constexpr (!doTriUMask) {
+            if (isLastNoMaskStackTile && isLastRowLoop) {
+                if (!startsWithMaskThenNomaskFlag) {
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+                }
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+            }
+        } else {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+        }
+
         CalcLocalRowMax(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
         UpdateGlobalRowMax(
             rowNumCurLoop, rowNumCurLoopRound,
             columnNum, columnNumRound,
             dmUbOffsetCurCycle,
+            stateRowOffset,
             rowOffset,
             isFirstStackTile);
 
@@ -860,6 +1003,25 @@ public:
         }
 
         DownCastP(sUbOffset, rowNumCurLoop, columnNumRound);
+        if constexpr (HAS_DROPOUT_) {
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            if constexpr (RETURN_SOFTMAX_) {
+                ApplyDropoutNegate(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                uint64_t qNOffset = static_cast<uint64_t>(rowOffsetIoGm / qSBlockSize) * stridePret;
+                uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
+                uint32_t qSOffset = qSIdxCurBlock * maxKvSeqlen;
+                CopyPretUbToGm(
+                    sUbOffset, qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, columnNumRound,
+                    qSBlockSize);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+            }
+            ApplyDropoutStd(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
 
         CalcLocalRowSum(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
@@ -867,27 +1029,29 @@ public:
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
-        if constexpr (!doTriUMask) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
-            if (isLastNoMaskStackTile && isLastRowLoop) {
-                if (!startsWithMaskThenNomaskFlag) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                }
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
+
+        if constexpr (doTriUMask) {
+            // Mask conversion aliases both P buffers; release both after the P store.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
         } else {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
         }
         UpdateGlobalRowSum(
-            sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, rowOffset, isFirstStackTile);
+            sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, stateRowOffset,
+            rowOffset, isFirstStackTile);
     }
 
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, bool isSplitKV = false,
-        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
+        Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, bool isSplitKV = false,
+        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false,
+        uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
+        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -910,9 +1074,15 @@ public:
         uint32_t rowLoopNum = CeilDiv(rowActualThisSubBlock, rowNumTile);
         uint32_t preLoad = 1;
 
+        // The idle vector core must still consume this stack's QK-ready flag.
+        if (rowActualThisSubBlock == 0) {
+            Arch::CrossCoreWaitFlag(qkReady);
+            return;
+        }
+
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
@@ -923,7 +1093,11 @@ public:
 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
                 if (startsWithMaskTile && rowLoopIdx == 0) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+                }
+                // Delay QK-ready until the first S load to overlap scalar setup.
+                if (rowLoopIdx == 0) {
+                    Arch::CrossCoreWaitFlag(qkReady);
                 }
                 CopySGmToUb(
                     gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);
@@ -931,7 +1105,7 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop =
@@ -945,6 +1119,13 @@ public:
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
+                if constexpr (HAS_ALIBI_) {
+                    ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                        static_cast<int64_t>(kvSStartIdx));
+                }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
@@ -956,8 +1137,14 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    taskStateSlot,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
+            }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
             }
         }
     }
@@ -966,8 +1153,11 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int64_t triUp, uint32_t triDown,
-        uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
+        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
+        uint32_t& softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
+        uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false,
+        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
+        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1043,6 +1233,7 @@ public:
         }
         uint32_t maskColumnRound = RoundUp(maskColumn, BLOCK_SIZE_IN_BYTE);
 
+
         int64_t offsetMask =
             layoutMask.GetOffset(MatrixCoord(gmOffsetMaskRow + maskOffsetThisSubBlock, gmOffsetMaskColumn));
         auto gMaskThisSubBlock = gMask[offsetMask];
@@ -1058,10 +1249,9 @@ public:
             Arch::CrossCoreWaitFlag(qkReady);
             return;
         }
-
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
@@ -1077,7 +1267,7 @@ public:
                     uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     // the number of integral heads within a cycle
                     uint32_t epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                     CopyMaskGmToUb(
                         gMaskThisSubBlock,
                         maskColumn, maskColumnRound, maskStride,
@@ -1095,12 +1285,16 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowNumCurLoop = (delayedRowLoopIdx == rowLoopNum - 1) ?
                     (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+                // EVENT_ID2 starts set; also wait for both unmasked P stores before mask conversion.
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
                 UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
                 UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
 
@@ -1108,6 +1302,13 @@ public:
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
+                if constexpr (HAS_ALIBI_) {
+                    ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                        static_cast<int64_t>(kvSStartIdx));
                 }
                 ApplyMask(
                     (pingpongFlag * MAX_UB_S_ELEM_NUM),
@@ -1130,6 +1331,9 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    taskStateSlot,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
@@ -1142,7 +1346,7 @@ public:
                     uint32_t integralHeadNum = (nextRowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     uint32_t epiTokenNum =
                         nextRowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                     CopyMaskGmToUb(
                         gMaskThisSubBlock,
                         maskColumn, maskColumnRound, maskStride,
@@ -1151,6 +1355,9 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 }
             }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
+            }
         }
     }
 
@@ -1158,9 +1365,12 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, bool doTriUPreMask,
+        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
+        uint32_t& softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
-        int32_t nextTokenEndLen, bool isSplitKV = false)
+        int32_t nextTokenEndLen, bool isSplitKV = false,
+        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
+        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1234,7 +1444,7 @@ public:
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
-                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 uint32_t rowNumCurLoop =
@@ -1250,7 +1460,7 @@ public:
                     uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     // the number of integral heads within a cycle
                     uint32_t epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                     if (doTriUPreMask && doTriUNextMask) {
                         CopyMaskGmToUb(gMaskThisSubBlockPre, maskColumnPre, columnNumRoundPre, maskStride,
                                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
@@ -1276,12 +1486,16 @@ public:
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
-                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
                 uint32_t rowNumCurLoop =
                     (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                // SWA mask conversion must wait for the aliased P staging buffers.
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
                 if (doTriUPreMask && doTriUNextMask) {
                     // *** TriUPreMask
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
@@ -1289,6 +1503,13 @@ public:
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                    }
+                    if constexpr (HAS_ALIBI_) {
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                            static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
@@ -1319,6 +1540,13 @@ public:
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
+                    if constexpr (HAS_ALIBI_) {
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                            static_cast<int64_t>(kvSStartIdx));
+                    }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
                 } else if (doTriUNextMask) {
@@ -1327,6 +1555,13 @@ public:
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     if constexpr (HAS_SOFTCAP_) {
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                    }
+                    if constexpr (HAS_ALIBI_) {
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                            static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundNext,
                               addMaskUbOffset);
@@ -1348,6 +1583,9 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    taskStateSlot,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
@@ -1361,7 +1599,7 @@ public:
                     uint32_t integralHeadNum = (nextRowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     uint32_t epiTokenNum =
                         nextRowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                     if (doTriUPreMask && doTriUNextMask) {
                         CopyMaskGmToUb(gMaskThisSubBlockPre, maskColumnPre, columnNumRoundPre, maskStride,
                                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
@@ -1378,12 +1616,23 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
                 }
             }
+            if (rowLoopIdx < rowLoopNum) {
+                softmaxPingPongFlag++;
+            }
         }
     }
 
 private:
     float scaleValue;
     float softcapValue;
+    uint64_t gmOffsetPret;
+    uint64_t stridePret;
+    uint64_t gmOffsetDrop;
+    uint64_t strideDrop;
+    uint32_t maxKvSeqlen;
+    AscendC::GlobalTensor<ElementOutput> gPret;
+    AscendC::GlobalTensor<ElementMask> gDrop;
+
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;
@@ -1397,6 +1646,9 @@ private:
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> softcapUbTensor;
+    AscendC::GlobalTensor<float> alibiSlopesGm;
+    AscendC::LocalTensor<float> alibiWorkUb;
+    AscendC::LocalTensor<ElementMask> dropUbTensor;
 };
 
 }

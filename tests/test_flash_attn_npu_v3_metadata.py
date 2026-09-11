@@ -60,7 +60,13 @@ def _band_mask(q_seqlen, kv_seqlen, window_size_left, window_size_right):
     rows = torch.arange(q_seqlen).unsqueeze(1)
     cols = torch.arange(kv_seqlen).unsqueeze(0)
     diag = cols - rows
-    return (diag < pre_token) | (diag > next_token)
+    # A negative window side is unbounded, including after normalization.
+    blocked = torch.zeros((q_seqlen, kv_seqlen), dtype=torch.bool)
+    if window_size_left >= 0:
+        blocked |= diag < pre_token
+    if window_size_right >= 0:
+        blocked |= diag > next_token
+    return blocked
 
 
 def _attn_mask(q_seqlen, kv_seqlen, is_causal, window_size):
@@ -79,6 +85,26 @@ def _attn_mask(q_seqlen, kv_seqlen, is_causal, window_size):
     if local_golden:
         return _band_mask(q_seqlen, kv_seqlen, window_left, window_right)
     return None
+
+
+@pytest.mark.parametrize("q_seqlen,kv_seqlen,window", [
+    (63, 2500, (255, 63)),
+    (64, 2500, (255, 63)),
+    (32, 8064, (1023, 31)),
+    (65, 2500, (255, 63)),
+    (63, 2500, (-1, 17)),
+    (63, 2500, (255, -1)),
+])
+def test_local_reference_unbounded_sides(q_seqlen, kv_seqlen, window):
+    rows = torch.arange(q_seqlen).unsqueeze(1)
+    cols = torch.arange(kv_seqlen).unsqueeze(0)
+    center = rows + kv_seqlen - q_seqlen
+    expected = torch.zeros((q_seqlen, kv_seqlen), dtype=torch.bool)
+    if window[0] >= 0:
+        expected |= cols < center - window[0]
+    if window[1] >= 0:
+        expected |= cols > center + window[1]
+    assert torch.equal(_attn_mask(q_seqlen, kv_seqlen, False, window), expected)
 
 
 def _metadata(
