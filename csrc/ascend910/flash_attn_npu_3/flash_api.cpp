@@ -92,8 +92,7 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
                                            const at::Tensor &seqlensK,
-                                           const std::optional<at::Tensor> &cuSeqlensQ,
-                                           const std::optional<at::Tensor> &seqUsedQ)
+                                           const std::optional<at::Tensor> &seqlensQ)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -130,11 +129,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
 
     c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
     c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
-    if (cuSeqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
-    }
-    if (seqUsedQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqUsedQ->storage().data_ptr(), aicpuStream);
+    if (seqlensQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
 }
@@ -414,17 +410,17 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
         at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
         int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
-        int32_t* cu_seqlen_q_cpu = nullptr;
-        at::Tensor cu_seqlen_q_cpu_tensor;
-        int32_t* seq_used_q_cpu = nullptr;
-        at::Tensor seq_used_q_cpu_tensor;
+        int32_t* seqlens_q_cpu = nullptr;
+        at::Tensor seqlens_q_cpu_tensor;
         if (is_varlen_q) {
-            cu_seqlen_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
-            cu_seqlen_q_cpu = static_cast<int32_t *>(cu_seqlen_q_cpu_tensor.data_ptr());
             if (seqused_q_.has_value()) {
-                seq_used_q_cpu_tensor = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-                seq_used_q_cpu = static_cast<int32_t *>(seq_used_q_cpu_tensor.data_ptr());
+                seqlens_q_cpu_tensor = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            } else {
+                at::Tensor cu_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
+                seqlens_q_cpu_tensor = cu_q_cpu.slice(0, 1, batch_size + 1) -
+                    cu_q_cpu.slice(0, 0, batch_size);
             }
+            seqlens_q_cpu = static_cast<int32_t *>(seqlens_q_cpu_tensor.data_ptr());
         }
         tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
         tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
@@ -486,9 +482,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             if (is_varlen_q) {
-                qSeqlen = seq_used_q_cpu != nullptr
-                    ? seq_used_q_cpu[batchIdx]
-                    : *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
+                qSeqlen = seqlens_q_cpu[batchIdx];
             }
             uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
             uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
@@ -511,9 +505,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             int64_t qSeqlenVal = seqlen_q;
             int64_t kvSeqlenVal = *(seqlens_k_cpu + batchIdx) + (appendKV ? kvNewSeqlen : 0);
             if (is_varlen_q) {
-                qSeqlenVal = seq_used_q_cpu != nullptr
-                    ? seq_used_q_cpu[batchIdx]
-                    : *(cu_seqlen_q_cpu + batchIdx + 1) - *(cu_seqlen_q_cpu + batchIdx);
+                qSeqlenVal = seqlens_q_cpu[batchIdx];
             }
             maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
             minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
@@ -536,12 +528,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         splitCtx.batch_size = batch_size;
         splitCtx.num_heads = num_heads;
         splitCtx.num_heads_k = num_heads_k;
-        splitCtx.seqlen_q = seqlen_q;
         splitCtx.head_size_v = head_size_og;
-        splitCtx.cu_seqlen_q_cpu = cu_seqlen_q_cpu;
-        splitCtx.seq_used_q_cpu = seq_used_q_cpu;
+        splitCtx.seqlens_q_cpu = seqlens_q_cpu;
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
-        splitCtx.is_varlen_q = is_varlen_q;
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
         splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
@@ -722,11 +711,9 @@ at::Tensor get_scheduler_metadata(
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     const bool is_varlen_q = cu_seqlens_q.has_value();
-    void *cuSeqlensQDev = nullptr;
     if (is_varlen_q) {
         auto cu_q = cu_seqlens_q.value();
         TORCH_CHECK(cu_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-        cuSeqlensQDev = cu_q.data_ptr();
     }
     if (seqused_q.has_value()) {
         auto used_q = seqused_q.value();
@@ -735,7 +722,6 @@ at::Tensor get_scheduler_metadata(
         TORCH_CHECK(used_q.numel() == batch_size, "seqused_q must have one length per batch element");
     }
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
-    const bool is_varlen_kv = cu_seqlens_k.has_value();
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
@@ -754,9 +740,15 @@ at::Tensor get_scheduler_metadata(
         scaleValue /= static_cast<float>(softcap);
     }
     FAMetadataArgs args;
-    args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cuSeqlensQDev) : 0ULL;
-    args.seqUsedQAddr = (is_varlen_q && seqused_q.has_value())
-        ? reinterpret_cast<uint64_t>(seqused_q.value().data_ptr()) : 0ULL;
+    std::optional<at::Tensor> seqlensQ;
+    if (seqused_q.has_value()) {
+        seqlensQ = seqused_q;
+    } else if (is_varlen_q) {
+        const at::Tensor &cuQ = cu_seqlens_q.value();
+        seqlensQ = cuQ.slice(0, 1, batch_size + 1) - cuQ.slice(0, 0, batch_size);
+    }
+    args.seqlensQAddr = seqlensQ.has_value()
+        ? reinterpret_cast<uint64_t>(seqlensQ->data_ptr()) : 0ULL;
     args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
     args.metaOutAddr = 0;  // set by GetSchedulerMetadataImpl
     args.batch = static_cast<uint32_t>(batch_size);
@@ -773,8 +765,7 @@ at::Tensor get_scheduler_metadata(
     args.windowSizeLeft = maskDer.window_left;
     args.windowSizeRight = maskDer.window_right;
     args.blockDim = blockDim;
-    args.isVarlen = is_varlen_q ? 1U : 0U;
-    args.isVarlenKv = is_varlen_kv ? 1U : 0U;
+    args.isVarlenQ = is_varlen_q ? 1U : 0U;
     args.pagedKV = page_size.has_value() ? 1U : 0U;
     args.numSplits = static_cast<uint32_t>(num_splits);
     args.scaleValue = scaleValue;
@@ -782,7 +773,7 @@ at::Tensor get_scheduler_metadata(
     // Append-KV tiling fields: kvNewSeqlen = new length (uniform), kvCacheSeqlen = cache capacity.
     args.kvNewSeqlen = (max_seqlen_k_new > 0) ? static_cast<uint32_t>(max_seqlen_k_new) : 0U;
     args.kvCacheSeqlen = static_cast<uint32_t>(max_seqlen_k);
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, seqused_q);
+    return GetSchedulerMetadataImpl(args, cache_seqlens, seqlensQ);
 }
 
 std::vector<at::Tensor>

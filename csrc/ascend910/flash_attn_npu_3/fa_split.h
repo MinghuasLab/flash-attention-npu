@@ -57,12 +57,9 @@ struct SplitContext {
     int32_t batch_size;
     int32_t num_heads;
     int32_t num_heads_k;
-    int32_t seqlen_q;
     int32_t head_size_v;
-    int32_t* cu_seqlen_q_cpu;
-    int32_t* seq_used_q_cpu;
+    int32_t* seqlens_q_cpu;
     int32_t* seqlens_k_cpu;
-    bool is_varlen_q;
     uint32_t blockDim;
     int32_t num_splits;
     int32_t kvNewSeqlen;
@@ -71,13 +68,7 @@ struct SplitContext {
 inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx)
 {
     BatchParams p;
-    if (ctx.is_varlen_q) {
-        p.qSeqlen = ctx.seq_used_q_cpu != nullptr
-            ? static_cast<uint32_t>(ctx.seq_used_q_cpu[bIdx])
-            : static_cast<uint32_t>(ctx.cu_seqlen_q_cpu[bIdx + 1] - ctx.cu_seqlen_q_cpu[bIdx]);
-    } else {
-        p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
-    }
+    p.qSeqlen = static_cast<uint32_t>(ctx.seqlens_q_cpu[bIdx]);
     p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx] + ctx.kvNewSeqlen);
     p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
     p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;

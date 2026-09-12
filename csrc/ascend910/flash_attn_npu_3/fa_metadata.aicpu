@@ -37,8 +37,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
         metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
-    const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
-    const int32_t *seqUsedQ = reinterpret_cast<const int32_t *>(metaArgs->seqUsedQAddr);
+    const int32_t *seqlensQ = reinterpret_cast<const int32_t *>(metaArgs->seqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
     uint8_t *tilingBytes = reinterpret_cast<uint8_t *>(tilingData);
@@ -67,9 +66,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t maxKvSeqlen = 0;
     if (seqlensK != nullptr) {
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-            uint32_t kvLen = metaArgs->isVarlenKv != 0
-                ? static_cast<uint32_t>(seqlensK[batchIdx + 1] - seqlensK[batchIdx])
-                : static_cast<uint32_t>(seqlensK[batchIdx]);
+            uint32_t kvLen = static_cast<uint32_t>(seqlensK[batchIdx]);
             kvLen += metaArgs->kvNewSeqlen;
             if (kvLen > maxKvSeqlen) {
                 maxKvSeqlen = kvLen;
@@ -90,10 +87,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t firstBatchTaskNum = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
-        if (metaArgs->isVarlen != 0) {
-            qSeqlen = seqUsedQ != nullptr
-                ? static_cast<uint32_t>(seqUsedQ[batchIdx])
-                : static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+        if (metaArgs->isVarlenQ != 0) {
+            qSeqlen = static_cast<uint32_t>(seqlensQ[batchIdx]);
         }
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -114,10 +109,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         uint32_t minQ = 0xFFFFFFFFu;
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
             uint32_t qLen = metaArgs->maxQSeqlen;
-            if (metaArgs->isVarlen != 0) {
-                qLen = seqUsedQ != nullptr
-                    ? static_cast<uint32_t>(seqUsedQ[batchIdx])
-                    : static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+            if (metaArgs->isVarlenQ != 0) {
+                qLen = static_cast<uint32_t>(seqlensQ[batchIdx]);
             }
             if (qLen > maxQ) maxQ = qLen;
             if (qLen < minQ) minQ = qLen;
@@ -126,7 +119,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlenQ != 0) &&
             (metaArgs->maskType != MASK_TYPE_BAND) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
@@ -136,12 +129,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
             ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
             ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
             ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
-            ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
             ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
-            ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
-            ctx.seq_used_q_cpu = const_cast<int32_t *>(seqUsedQ);
+            ctx.seqlens_q_cpu = const_cast<int32_t *>(seqlensQ);
             ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
-            ctx.is_varlen_q = metaArgs->isVarlen != 0;
             ctx.blockDim = bd;
             ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
             ctx.kvNewSeqlen = static_cast<int32_t>(metaArgs->kvNewSeqlen);
