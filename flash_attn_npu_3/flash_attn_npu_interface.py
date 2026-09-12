@@ -727,23 +727,29 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # Training interfaces do not expose scheduler_metadata (aligned with
         # official flash-attn); the scheduler metadata is computed internally on
-        # the AICPU so no D2H/H2D sync breaks the pipeline. seqlens_q and
-        # seqlens_k hold direct per-batch sequence lengths and stay on device.
+        # the AICPU so no D2H/H2D sync breaks the pipeline. Pass the original
+        # cumulative offsets to metadata; AICPU derives per-batch lengths.
         batch_size = cu_seqlens_q.shape[0] - 1
         num_heads, head_size = q.shape[1], q.shape[2]
         num_heads_k = k.shape[1]
         if seqused_q is not None:
             seqlens_q = seqused_q
+            is_seqlens_q_cumulative = False
         else:
-            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            seqlens_q = cu_seqlens_q
+            is_seqlens_q_cumulative = True
         if seqused_k is not None:
             seqlens_k = seqused_k
+            is_seqlens_k_cumulative = False
         else:
-            seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            seqlens_k = cu_seqlens_k
+            is_seqlens_k_cumulative = True
         scheduler_metadata = get_scheduler_metadata(
             batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
             seqlens_q=seqlens_q,
             seqlens_k=seqlens_k,
+            is_seqlens_q_cumulative=is_seqlens_q_cumulative,
+            is_seqlens_k_cumulative=is_seqlens_k_cumulative,
             qkv_dtype=q.dtype,
             causal=causal,
             window_size=window_size,
@@ -1274,6 +1280,8 @@ def get_scheduler_metadata(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    is_seqlens_q_cumulative=False,
+    is_seqlens_k_cumulative=False,
 ):
     seqlens_q = maybe_contiguous(seqlens_q)
     seqlens_k = maybe_contiguous(seqlens_k)
@@ -1297,6 +1305,8 @@ def get_scheduler_metadata(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
     # Fingerprint the creation arguments so flash_attn_with_kvcache can reject
     # metadata whose baked-in tiling does not match the call consuming it.

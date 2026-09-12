@@ -29,6 +29,12 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     qNBlockTile = qNBlockTile < 1u ? 1u : qNBlockTile;
     return qNBlockTile;
 }
+
+inline uint32_t GetSeqlen(const int32_t *seqlens, uint32_t batchIdx, bool cumulative)
+{
+    return cumulative ? static_cast<uint32_t>(seqlens[batchIdx + 1] - seqlens[batchIdx])
+                      : static_cast<uint32_t>(seqlens[batchIdx]);
+}
 }
 
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
@@ -66,7 +72,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t maxKvSeqlen = 0;
     if (seqlensK != nullptr) {
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-            uint32_t kvLen = static_cast<uint32_t>(seqlensK[batchIdx]);
+            uint32_t kvLen = GetSeqlen(seqlensK, batchIdx, metaArgs->isSeqlensKCumulative != 0);
             kvLen += metaArgs->kvNewSeqlen;
             if (kvLen > maxKvSeqlen) {
                 maxKvSeqlen = kvLen;
@@ -88,7 +94,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (seqlensQ != nullptr) {
-            qSeqlen = static_cast<uint32_t>(seqlensQ[batchIdx]);
+            qSeqlen = GetSeqlen(seqlensQ, batchIdx, metaArgs->isSeqlensQCumulative != 0);
         }
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -110,7 +116,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
             uint32_t qLen = metaArgs->maxQSeqlen;
             if (seqlensQ != nullptr) {
-                qLen = static_cast<uint32_t>(seqlensQ[batchIdx]);
+                qLen = GetSeqlen(seqlensQ, batchIdx, metaArgs->isSeqlensQCumulative != 0);
             }
             if (qLen > maxQ) maxQ = qLen;
             if (qLen < minQ) minQ = qLen;
@@ -132,6 +138,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
             ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
             ctx.seqlens_q_cpu = const_cast<int32_t *>(seqlensQ);
             ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
+            ctx.is_seqlens_q_cumulative = metaArgs->isSeqlensQCumulative != 0;
+            ctx.is_seqlens_k_cumulative = metaArgs->isSeqlensKCumulative != 0;
             ctx.blockDim = bd;
             ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
             ctx.kvNewSeqlen = static_cast<int32_t>(metaArgs->kvNewSeqlen);

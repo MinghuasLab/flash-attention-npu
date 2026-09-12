@@ -706,16 +706,25 @@ at::Tensor get_scheduler_metadata(
         int64_t num_splits,
         std::optional<bool> pack_gqa,
         int64_t sm_margin,
-        std::optional<double> softmax_scale)
+        std::optional<double> softmax_scale,
+        bool is_seqlens_q_cumulative,
+        bool is_seqlens_k_cumulative)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(seqlens_k));
     const bool is_varlen_q = seqlens_q.has_value();
     if (is_varlen_q) {
         const auto &q_lens = seqlens_q.value();
         TORCH_CHECK(q_lens.dtype() == torch::kInt32, "seqlens_q must have dtype int32");
-        TORCH_CHECK(q_lens.numel() == batch_size, "seqlens_q must have one length per batch element");
+        TORCH_CHECK(q_lens.numel() == (is_seqlens_q_cumulative ? batch_size + 1 : batch_size),
+                    is_seqlens_q_cumulative ?
+                    "cumulative seqlens_q must have batch_size+1 elements" :
+                    "seqlens_q must have one length per batch element");
     }
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
+    TORCH_CHECK(seqlens_k.numel() == (is_seqlens_k_cumulative ? batch_size + 1 : batch_size),
+                is_seqlens_k_cumulative ?
+                "cumulative seqlens_k must have batch_size+1 elements" :
+                "seqlens_k must have one length per batch element");
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
@@ -724,8 +733,8 @@ at::Tensor get_scheduler_metadata(
     TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && is_varlen_q),
                 "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
     TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative (0.0 disables softcap)");
-    // Mask axes are fully derived on host from the declared seqlen bounds; the
-    // AICPU kernel only copies the final values into the tiling blob.
+    // Mask axes are derived on host from the declared bounds. Sequence-length
+    // format decoding itself is deferred to AICPU via the two cumulative flags.
     FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right,
                                               max_seqlen_q, max_seqlen_k);
     float scaleValue = softmax_scale.has_value() ? static_cast<float>(softmax_scale.value())
@@ -737,6 +746,8 @@ at::Tensor get_scheduler_metadata(
     args.seqlensQAddr = seqlens_q.has_value()
         ? reinterpret_cast<uint64_t>(seqlens_q->data_ptr()) : 0ULL;
     args.seqlensKAddr = reinterpret_cast<uint64_t>(seqlens_k.data_ptr());
+    args.isSeqlensQCumulative = is_seqlens_q_cumulative ? 1U : 0U;
+    args.isSeqlensKCumulative = is_seqlens_k_cumulative ? 1U : 0U;
     args.metaOutAddr = 0;  // set by GetSchedulerMetadataImpl
     args.batch = static_cast<uint32_t>(batch_size);
     args.numHeads = static_cast<uint32_t>(num_heads_q);
