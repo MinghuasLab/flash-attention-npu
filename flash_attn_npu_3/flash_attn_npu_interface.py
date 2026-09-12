@@ -614,7 +614,8 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         scheduler_metadata = get_scheduler_metadata(
             batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, head_size,
-            cache_seqlens,
+            seqlens_q=None,
+            seqlens_k=cache_seqlens,
             qkv_dtype=q.dtype,
             causal=causal,
             window_size=window_size,
@@ -726,21 +727,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # Training interfaces do not expose scheduler_metadata (aligned with
         # official flash-attn); the scheduler metadata is computed internally on
-        # the AICPU so no D2H/H2D sync breaks the pipeline. cache_seqlens holds
-        # the per-batch KV lengths and stays on device.
+        # the AICPU so no D2H/H2D sync breaks the pipeline. seqlens_q and
+        # seqlens_k hold direct per-batch sequence lengths and stay on device.
         batch_size = cu_seqlens_q.shape[0] - 1
         num_heads, head_size = q.shape[1], q.shape[2]
         num_heads_k = k.shape[1]
-        if seqused_k is not None:
-            cache_seqlens = seqused_k
+        if seqused_q is not None:
+            seqlens_q = seqused_q
         else:
-            cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        if seqused_k is not None:
+            seqlens_k = seqused_k
+        else:
+            seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         scheduler_metadata = get_scheduler_metadata(
             batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
-            cache_seqlens,
+            seqlens_q=seqlens_q,
+            seqlens_k=seqlens_k,
             qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_q=seqused_q,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1254,10 +1258,10 @@ def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, sof
 
 def get_scheduler_metadata(
     batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
-    cache_seqlens: torch.Tensor,
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
@@ -1270,20 +1274,18 @@ def get_scheduler_metadata(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
-    seqused_q: Optional[torch.Tensor] = None,
 ):
-    cache_seqlens = maybe_contiguous(cache_seqlens)
-    seqused_q = maybe_contiguous(seqused_q)
+    seqlens_q = maybe_contiguous(seqlens_q)
+    seqlens_k = maybe_contiguous(seqlens_k)
     if headdim_v is None:
         headdim_v = headdim
     scheduler_metadata = flash_attn_npu_3.get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
@@ -1308,7 +1310,7 @@ def get_scheduler_metadata(
         "page_size": None if page_size is None else int(page_size),
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
-        "varlen_q": cu_seqlens_q is not None,
+        "varlen_q": seqlens_q is not None,
         "num_splits": int(num_splits),
     }
     return scheduler_metadata

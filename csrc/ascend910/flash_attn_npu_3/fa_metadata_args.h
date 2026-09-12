@@ -45,7 +45,6 @@ struct FAMetadataArgs {
     uint32_t maxQSeqlen;
     uint32_t maskType;
     uint32_t blockDim;
-    uint32_t isVarlenQ;
     uint32_t pagedKV;
     uint32_t numSplits;
     float scaleValue;

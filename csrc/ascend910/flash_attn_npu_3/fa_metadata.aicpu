@@ -87,7 +87,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t firstBatchTaskNum = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
-        if (metaArgs->isVarlenQ != 0) {
+        if (seqlensQ != nullptr) {
             qSeqlen = static_cast<uint32_t>(seqlensQ[batchIdx]);
         }
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
@@ -109,7 +109,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         uint32_t minQ = 0xFFFFFFFFu;
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
             uint32_t qLen = metaArgs->maxQSeqlen;
-            if (metaArgs->isVarlenQ != 0) {
+            if (seqlensQ != nullptr) {
                 qLen = static_cast<uint32_t>(seqlensQ[batchIdx]);
             }
             if (qLen > maxQ) maxQ = qLen;
@@ -119,7 +119,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlenQ != 0) &&
+        const bool fdFlag = (metaArgs->pagedKV != 0) && (seqlensQ != nullptr) &&
             (metaArgs->maskType != MASK_TYPE_BAND) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
