@@ -57,25 +57,28 @@ struct SplitContext {
     int32_t batch_size;
     int32_t num_heads;
     int32_t num_heads_k;
-    int32_t seqlen_q;
     int32_t head_size_v;
-    int32_t* cu_seqlen_q_cpu;
+    int32_t* seqlens_q_cpu;
     int32_t* seqlens_k_cpu;
-    bool is_varlen_q;
+    bool is_seqlens_q_cumulative = false;
+    bool is_seqlens_k_cumulative = false;
     uint32_t blockDim;
     int32_t num_splits;
     int32_t kvNewSeqlen;
 };
 
+inline uint32_t GetSeqlen(const int32_t *seqlens, uint32_t bIdx, bool cumulative)
+{
+    return cumulative ? static_cast<uint32_t>(seqlens[bIdx + 1] - seqlens[bIdx])
+                      : static_cast<uint32_t>(seqlens[bIdx]);
+}
+
 inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx)
 {
     BatchParams p;
-    if (ctx.is_varlen_q) {
-        p.qSeqlen = static_cast<uint32_t>(ctx.cu_seqlen_q_cpu[bIdx + 1] - ctx.cu_seqlen_q_cpu[bIdx]);
-    } else {
-        p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
-    }
-    p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx] + ctx.kvNewSeqlen);
+    p.qSeqlen = GetSeqlen(ctx.seqlens_q_cpu, bIdx, ctx.is_seqlens_q_cumulative);
+    p.kvSeqlen = GetSeqlen(ctx.seqlens_k_cpu, bIdx, ctx.is_seqlens_k_cumulative)
+        + ctx.kvNewSeqlen;
     p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
     p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;
     p.curQNBlockNum = p.qNBlockNumPerGroup * ctx.num_heads_k;

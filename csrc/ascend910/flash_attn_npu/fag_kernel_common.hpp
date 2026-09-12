@@ -159,6 +159,8 @@ struct FAGKernelParams {
     GM_ADDR alibi_slopes;
     GM_ADDR workspace;
     GM_ADDR tiling;
+    GM_ADDR seq_used_qlen;
+    GM_ADDR seq_used_kvlen;
     // Methods
     CATLASS_DEVICE
     FAGKernelParams() {
@@ -179,7 +181,9 @@ struct FAGKernelParams {
                     GM_ADDR dv_,
                     GM_ADDR alibi_slopes_,
                     GM_ADDR workspace_,
-                    GM_ADDR tiling_)
+                    GM_ADDR tiling_,
+                    GM_ADDR seq_used_qlen_ = nullptr,
+                    GM_ADDR seq_used_kvlen_ = nullptr)
         : dout(dout_)
         , q(q_)
         , k(k_)
@@ -195,7 +199,9 @@ struct FAGKernelParams {
         , dv(dv_)
         , alibi_slopes(alibi_slopes_)
         , workspace(workspace_)
-        , tiling(tiling_){
+        , tiling(tiling_)
+        , seq_used_qlen(seq_used_qlen_)
+        , seq_used_kvlen(seq_used_kvlen_){
     }
 };
 

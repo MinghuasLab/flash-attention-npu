@@ -27,6 +27,7 @@
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
+            seqUsedQDevice, seqUsedKvDevice,                                       \
             workspaceDevice, tilingDevice, kNewDevice, vNewDevice)
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
@@ -86,6 +87,8 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     uint8_t *softmaxLseDevice = a.softmaxLseDevice;
     uint8_t *qSeqDevice = a.qSeqDevice;
     uint8_t *kvSeqDevice = a.kvSeqDevice;
+    uint8_t *seqUsedQDevice = a.seqUsedQDevice;
+    uint8_t *seqUsedKvDevice = a.seqUsedKvDevice;
     uint8_t *workspaceDevice = a.workspaceDevice;
     uint8_t *tilingDevice = a.tilingDevice;
     (void)flashDecodeFlag;

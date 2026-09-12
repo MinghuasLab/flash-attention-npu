@@ -53,7 +53,8 @@
                 fftsAddr, dOutDevice, qDevice, kDevice, vDevice, outDevice,                      \
                 nullptr, attenMaskDevice, softMaxLseDevice,                                      \
                 cuSeqQlenDevice, cuSeqKvlenDevice,                                               \
-                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice);           \
+                dqDevice, dkDevice, dvDevice, nullptr, workspaceDevice, tilingDevice,             \
+                seqUsedQDevice, seqUsedKvDevice);                                                  \
     } while (0)
 
 // Pick the headdim specialization at runtime.
@@ -111,6 +112,8 @@ void bwd_dispatch_run(const BwdLaunchArgs &a) {
     uint8_t *softMaxLseDevice = a.softMaxLseDevice;
     uint8_t *cuSeqQlenDevice = a.cuSeqQlenDevice;
     uint8_t *cuSeqKvlenDevice = a.cuSeqKvlenDevice;
+    uint8_t *seqUsedQDevice = a.seqUsedQDevice;
+    uint8_t *seqUsedKvDevice = a.seqUsedKvDevice;
     uint8_t *dqDevice = a.dqDevice;
     uint8_t *dkDevice = a.dkDevice;
     uint8_t *dvDevice = a.dvDevice;

@@ -123,6 +123,32 @@ def make_varlen_seqlens(batch_size, max_seqlen_q, max_seqlen_k, seed=CASE_SEED):
     return seqlens_q, seqlens_k
 
 
+def make_varlen_seqlens_with_unused(
+    batch_size, max_seqlen_q, max_seqlen_k, is_causal, seed=CASE_SEED
+):
+    """Generate allocated and used lengths for the Tri Dao unused-token path."""
+    # Use a separate reproducible stream for the second prefix sample.
+    generator = torch.Generator().manual_seed(seed + 1)
+    q_lengths_a, k_lengths_a = make_varlen_seqlens(
+        batch_size, max_seqlen_q, max_seqlen_k, seed=seed
+    )
+    q_lengths_b = torch.randint(
+        max(1, max_seqlen_q - 20), max_seqlen_q + 1,
+        (batch_size,), generator=generator,
+    ).tolist()
+    k_lengths_b = torch.randint(
+        max(1, max_seqlen_k - 20), max_seqlen_k + 1,
+        (batch_size,), generator=generator,
+    ).tolist()
+    allocated_q = [max(a, b) for a, b in zip(q_lengths_a, q_lengths_b)]
+    allocated_k = [max(a, b) for a, b in zip(k_lengths_a, k_lengths_b)]
+    used_q = [min(a, b) for a, b in zip(q_lengths_a, q_lengths_b)]
+    used_k = [min(a, b) for a, b in zip(k_lengths_a, k_lengths_b)]
+    if is_causal:
+        used_q = [min(q, k) for q, k in zip(used_q, used_k)]
+    return allocated_q, allocated_k, used_q, used_k
+
+
 def make_packed_random_tensor(
     seqlens,
     max_seqlen,
