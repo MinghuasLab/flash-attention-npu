@@ -633,16 +633,37 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         } else {
             SetVecMask(rowNumCurLoop);
-            // *** hm = vmax(lm, gm)
-            AscendC::Max<float, false>(
-                hmUbTensor[rowOffset],
-                lmUbTensor[rowOffset],
-                gmUbTensor[rowOffset],
-                (uint64_t)0,
-                1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            // Compute hm directly before the correction gm - hm. Reconstructing
+            // hm from gm - min(0, gm - max(lm, gm) + threshold) loses the finite
+            // maximum when gm=-3e38 after a fully masked tile. That can overflow
+            // the FP16 probabilities when the next tile has valid keys.
+            if (rescaleThreshold > 0.0f) {
+                // hm = max(gm, lm - threshold).
+                AscendC::Adds<float, false>(
+                    hmUbTensor[rowOffset],
+                    lmUbTensor[rowOffset],
+                    -rescaleThreshold,
+                    (uint64_t)0,
+                    1,
+                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Max<float, false>(
+                    hmUbTensor[rowOffset],
+                    hmUbTensor[rowOffset],
+                    gmUbTensor[rowOffset],
+                    (uint64_t)0,
+                    1,
+                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            } else {
+                AscendC::Max<float, false>(
+                    hmUbTensor[rowOffset],
+                    lmUbTensor[rowOffset],
+                    gmUbTensor[rowOffset],
+                    (uint64_t)0,
+                    1,
+                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            // *** dm = gm - hm  (= -delta, delta = hm - gm >= 0)
             AscendC::Sub<float, false>(
                 dmUbTensor[dmUbOffsetCurCycle],
                 gmUbTensor[rowOffset],
@@ -651,40 +672,6 @@ public:
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
-            // *** FA4 逐行阈值跳过:当某行 delta <= rescaleThreshold 时保持旧基准 hm=gm,
-            //     使 correction dm=exp(0)=1,从而跳过对 gl/O 的 rescale。闭式等价于
-            //     hm = max(gm, lm - rescaleThreshold),对每行独立成立、数学结果精确;
-            //     当前 tile 内 exp 值上界为 e^rescaleThreshold。rescaleThreshold<=0 时整段
-            //     被跳过,退回逐块更新的原始行为
-            if (rescaleThreshold > 0.0f) {
-                // dm = threshold - delta
-                AscendC::Adds<float, false>(
-                    dmUbTensor[dmUbOffsetCurCycle],
-                    dmUbTensor[dmUbOffsetCurCycle],
-                    rescaleThreshold,
-                    (uint64_t)0,
-                    1,
-                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-                // dm = min(0, threshold - delta) = -relu(delta - threshold)
-                AscendC::Mins<float, false>(
-                    dmUbTensor[dmUbOffsetCurCycle],
-                    dmUbTensor[dmUbOffsetCurCycle],
-                    0.0f,
-                    (uint64_t)0,
-                    1,
-                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-                // hm = gm - dm = gm + relu(delta - threshold) = max(gm, lm - threshold)
-                AscendC::Sub<float, false>(
-                    hmUbTensor[rowOffset],
-                    gmUbTensor[rowOffset],
-                    dmUbTensor[dmUbOffsetCurCycle],
-                    (uint64_t)0,
-                    1,
-                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-            }
             // *** dm = exp(dm)
             AscendC::Exp<float, false>(
                 dmUbTensor[dmUbOffsetCurCycle],

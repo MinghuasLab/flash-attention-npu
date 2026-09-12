@@ -38,6 +38,7 @@ struct FwdLaunchArgs {
     uint8_t *vDevice;
     uint8_t *maskDevice;          // may be nullptr when is_causal is false
     uint8_t *blockTableDevice;    // may be nullptr when paged_KV is false
+    uint64_t blockTableStride;   // physical row stride, independent of used KV length
     uint8_t *oDevice;
     uint8_t *softmaxLseDevice;
     uint8_t *qSeqDevice;

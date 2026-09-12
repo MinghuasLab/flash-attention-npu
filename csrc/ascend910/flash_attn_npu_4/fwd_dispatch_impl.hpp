@@ -27,7 +27,7 @@
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
-            workspaceDevice, tilingDevice)
+            workspaceDevice, tilingDevice, a.blockTableStride)
 
 #define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
     do {                                                   \

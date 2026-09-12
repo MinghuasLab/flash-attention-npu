@@ -111,7 +111,9 @@ namespace SplitFuse {
             embed = fATilingData->embeddingSize;
             embedV = fATilingData->embeddingSizeV;
             pagedBlockSize = fATilingData->blockSize;
-            maxNumBlocksPerBatch = fATilingData->maxNumBlocksPerBatch;
+            // Metadata may infer capacity from the used KV length. The page
+            // table can reserve more pages or be a view with a larger stride.
+            blockTableStride = params.blockTableStride;
             firstBatchTaskNum = fATilingData->firstBatchTaskNum;
             totalTaskNum = fATilingData->totalTaskNum;
             blockSize = fATilingData->blockSize;
@@ -496,7 +498,7 @@ namespace SplitFuse {
                 kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
                 vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
             } else {
-                blockBOffset = static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(maxNumBlocksPerBatch);
+                blockBOffset = static_cast<uint64_t>(BIdx) * blockTableStride;
             }
             uint64_t oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
             // LSE flat offset depends on the output layout the host allocates:
@@ -993,7 +995,7 @@ namespace SplitFuse {
         uint32_t embed;
         uint32_t embedV;
         uint32_t pagedBlockSize;
-        uint32_t maxNumBlocksPerBatch;
+        uint64_t blockTableStride;
         uint32_t firstBatchTaskNum;
         uint32_t totalTaskNum;
         uint32_t blockSize;
@@ -1047,7 +1049,8 @@ namespace SplitFuse {
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
         GM_ADDR workspace,
-        GM_ADDR tiling)
+        GM_ADDR tiling,
+        uint64_t blockTableStride)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1110,7 +1113,8 @@ namespace SplitFuse {
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+                              blockTableStride};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

@@ -72,14 +72,16 @@ namespace KernelCommon {
         GM_ADDR lse;
         GM_ADDR workSpace;
         GM_ADDR tiling;
+        uint64_t blockTableStride;
 
         __aicore__ inline FAIKernelParams() {}
 
         __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                 GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_,
-                    GM_ADDR tiling_)
+                    GM_ADDR tiling_, uint64_t blockTableStride_)
             : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
-                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_) {}
+                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_),
+                blockTableStride(blockTableStride_) {}
     };
 
     __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)

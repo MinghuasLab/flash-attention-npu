@@ -20,6 +20,7 @@ from tests.common.test_utils import gather_paged_kv_batch, make_random_tensor
 
 WINDOW_SIZE = (-1, -1)
 
+
 def _prefix_sums(lengths):
     offsets = [0]
     for length in lengths:

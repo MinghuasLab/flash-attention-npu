@@ -589,6 +589,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.vDevice = vDevice;
     fwd_args.maskDevice = maskDevice;
     fwd_args.blockTableDevice = blockTableDevice;
+    fwd_args.blockTableStride = paged_KV ? static_cast<uint64_t>(block_table.stride(0)) : 0;
     fwd_args.oDevice = oDevice;
     fwd_args.softmaxLseDevice = softmaxLseDevice;
     fwd_args.qSeqDevice = qSeqDevice;
@@ -676,8 +677,6 @@ at::Tensor get_scheduler_metadata(
     args.numHeadsK = static_cast<uint32_t>(num_heads_kv);
     args.embeddingSize = static_cast<uint32_t>(headdim);
     args.embeddingSizeV = static_cast<uint32_t>(headdim_v);
-    // numBlocks is not consumed by the FAInfer kernel (only blockSize and
-    // maxNumBlocksPerBatch drive the paged addressing); keep it zeroed.
     args.numBlocks = 0;
     args.blockSize = ps;
     args.maxNumBlocksPerBatch = page_size.has_value()
