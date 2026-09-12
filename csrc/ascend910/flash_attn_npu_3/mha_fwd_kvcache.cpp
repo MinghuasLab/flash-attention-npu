@@ -322,14 +322,8 @@ namespace SplitFuse {
                 uint64_t gmOffsetOFD = fATilingData->coreInfo[coreIdx].firstSplitKVTaskOOffset;
 
                 for (uint32_t BIdx = startBIdx; BIdx <= endBIdx; BIdx++) {
-                    uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
-                    uint32_t kvSeqlenCur = GetKvSeqLen(BIdx, gActualKvseqlen, gSeqUsedKv) + kvNewSeqlen;
-                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        qSeqlenCur = GetQSeqLen(BIdx, gActualQseqlen, gSeqUsedQ);
-                        if constexpr (!PAGED_CACHE_FLAG) {
-                            kvSeqlenCur = GetKvSeqLen(BIdx, gActualKvseqlen, gSeqUsedKv);
-                        }
-                    }
+                    uint32_t qSeqlenCur = GetQSeqLen(BIdx, gActualQseqlen, gSeqUsedQ);
+                    uint32_t kvSeqlenCur = GetKvSeqLen(BIdx, gActualKvseqlen, gSeqUsedKv);
 
                     uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
                     uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
@@ -388,14 +382,8 @@ namespace SplitFuse {
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
-                        uint32_t qSeqlenTmp = fATilingData->maxQSeqlen;
+                        uint32_t qSeqlenTmp = GetQSeqLen(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                         uint32_t kvSeqlenTmp = GetKvSeqLen(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
-                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                            qSeqlenTmp = GetQSeqLen(curBatchTmp, gActualQseqlen, gSeqUsedQ);
-                            if constexpr (!PAGED_CACHE_FLAG) {
-                                kvSeqlenTmp = GetKvSeqLen(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
-                            }
-                        }
 
                         uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
                         uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
@@ -405,14 +393,8 @@ namespace SplitFuse {
                         curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                     }
 
-                    uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
+                    uint32_t qSeqlenCur = GetQSeqLen(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                     uint32_t kvSeqlenCur = GetKvSeqLen(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
-                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        qSeqlenCur = GetQSeqLen(curBatchTmp, gActualQseqlen, gSeqUsedQ);
-                        if constexpr (!PAGED_CACHE_FLAG) {
-                            kvSeqlenCur = GetKvSeqLen(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
-                        }
-                    }
                     uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
                     uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                     uint32_t curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
@@ -531,21 +513,18 @@ namespace SplitFuse {
             // ? maybe change to template later
             const bool appendKVFlag = (kvNewSeqlen != 0U);
 
-            uint32_t qSeqlen = maxQSeqlen;
+            uint32_t qSeqlen = GetQSeqLen(BIdx, gActualQseqlen, gSeqUsedQ);
             // Append KV: total S = old + new.
             uint32_t kvSeqlenOld = GetKvSeqLen(BIdx, gActualKvseqlen, gSeqUsedKv);
-            uint32_t kvSeqlen = kvSeqlenOld + (appendKVFlag ? kvNewSeqlen : 0U);
+            uint32_t kvSeqlen = kvSeqlenOld + kvNewSeqlen;
             uint32_t prevQSeqlenSum = 0;
             uint32_t prevKvSeqlenSum = 0;
 
             if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
                 prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
-                qSeqlen = GetQSeqLen(BIdx, gActualQseqlen, gSeqUsedQ);
                 if constexpr (!PAGED_CACHE_FLAG) {
                     // gActualKvseqlen holds prefix sums; append uses the capacity-aligned
                     // per-batch cache layout, so the offset is kvCacheSeqlen-stepped.
-                    kvSeqlen = GetKvSeqLen(BIdx, gActualKvseqlen, gSeqUsedKv);
-                    kvSeqlenOld = kvSeqlen;
                     prevKvSeqlenSum = appendKVFlag ?
                         BIdx * kvCacheSeqlen : static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
                 }
@@ -561,10 +540,6 @@ namespace SplitFuse {
                         prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(0)) * BIdx;
                     }
                 }
-            }
-            // TND non-paged read the per-batch old length from prefix sums; re-add new.
-            if (appendKVFlag) {
-                kvSeqlen = kvSeqlenOld + kvNewSeqlen;
             }
 
             uint64_t qBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideQ;
