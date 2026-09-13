@@ -77,24 +77,7 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
 
 
 def round_up_headdim(head_size: int) -> int:
-    from flash_attn_config import CONFIG
-
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM64"]:
-        if head_size <= 64:
-            return 64
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM96"]:
-        if head_size <= 96:
-            return 96
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM128"]:
-        if head_size <= 128:
-            return 128
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM192"]:
-        if head_size <= 192:
-            return 192
-    if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM256"]:
-        if head_size <= 256:
-            return 256
-    return 256
+    return round_multiple(head_size, _HEADDIM_BWD_ALIGN)
 
 
 @_torch_custom_op_wrapper("flash_attn_npu_3::_flash_attn_forward", mutates_args=(), device_types="npu")
@@ -1249,8 +1232,152 @@ def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, sof
         raise ValueError(
             "scheduler_metadata arguments do not match this call: " + "; ".join(mismatches)
         )
+# Real metadata contract:
+#   no mask:
+#       shape = (2384,)
+#   causal / local mask:
+#       shape = (2384 + 2048 * 2048,)
+#   dtype  = torch.uint8
+#   device = NPU
+#   stride = (1,)
+# The custom op prevents TorchDynamo from tracing into the raw pybind
+# get_scheduler_metadata() implementation. Schema matches the V3 910
+# pybind signature in flash_api.cpp (not the V4 parameter list).
+_SCHEDULER_METADATA_TILING_BYTES = 2384
+_SCHEDULER_METADATA_MASK_BYTES = 2048 * 2048
+def _scheduler_metadata_has_mask(
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    max_seqlen_k: int,
+) -> bool:
+    """Mirror the mask/no-mask decision of DeriveFwdMask in V3 flash_api.cpp."""
 
-
+    if max_seqlen_k > 0 and window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if max_seqlen_k > 0 and window_size_right >= max_seqlen_k:
+        window_size_right = -1
+    if causal:
+        window_size_right = 0
+    is_causal = (
+        window_size_left < 0
+        and window_size_right == 0
+    )
+    is_local = (
+        (
+            window_size_left >= 0
+            or window_size_right >= 0
+        )
+        and not is_causal
+    )
+    return is_causal or is_local
+@torch.library.custom_op(
+    "flash_attn_npu_3::_get_scheduler_metadata",
+    mutates_args=(),
+)
+def _get_scheduler_metadata_op(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k_new: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    cache_leftpad: Optional[torch.Tensor],
+    page_size: Optional[int],
+    max_seqlen_k_new: int,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    attention_chunk: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    return flash_attn_npu_3.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        cache_leftpad,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        softmax_scale,
+    )
+@_torch_register_fake_wrapper(
+    "flash_attn_npu_3::_get_scheduler_metadata"
+)
+def _get_scheduler_metadata_fake(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k_new: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    cache_leftpad: Optional[torch.Tensor],
+    page_size: Optional[int],
+    max_seqlen_k_new: int,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    attention_chunk: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    has_mask = _scheduler_metadata_has_mask(
+        causal,
+        window_size_left,
+        window_size_right,
+        max_seqlen_k,
+    )
+    metadata_bytes = (
+        _SCHEDULER_METADATA_TILING_BYTES
+        + (
+            _SCHEDULER_METADATA_MASK_BYTES
+            if has_mask
+            else 0
+        )
+    )
+    return torch.empty(
+        (metadata_bytes,),
+        dtype=torch.uint8,
+        device=cache_seqlens.device,
+    )
 def get_scheduler_metadata(
     batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
     cache_seqlens: torch.Tensor,
@@ -1273,8 +1400,17 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = flash_attn_npu_3.get_scheduler_metadata(
-        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+    # Route through the custom op so torch.compile / FakeTensor can use the
+    # registered fake instead of tracing into the raw pybind extension.
+    # Public API still hard-codes cu_seqlens_k / seqused_q as None (unchanged).
+    scheduler_metadata = _get_scheduler_metadata_op(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
         qkv_dtype,
         cache_seqlens,
         cu_seqlens_q,
@@ -1285,7 +1421,8 @@ def get_scheduler_metadata(
         page_size,
         max_seqlen_k_new,
         causal,
-        window_size[0], window_size[1],
+        window_size[0],
+        window_size[1],
         attention_chunk,
         softcap,
         num_splits,
@@ -1295,6 +1432,7 @@ def get_scheduler_metadata(
     )
     # Fingerprint the creation arguments so flash_attn_with_kvcache can reject
     # metadata whose baked-in tiling does not match the call consuming it.
+    # Remount after the custom_op return: dynamic attrs are not preserved.
     if softmax_scale is None:
         softmax_scale = headdim ** (-0.5)
     scheduler_metadata._fa_scheduler_params = {
