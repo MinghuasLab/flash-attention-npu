@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
-from typing import Optional, Tuple, Union
+from typing import Any,Callable, Optional, Tuple, Union
 
 import torch
 
@@ -312,62 +312,6 @@ def get_scheduler_metadata(
         softmax_scale,
     )
     return scheduler_metadata
-@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_forward")
-def _flash_attn_forward_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    qv: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
-    min_seqlen_k: Optional[int] = None,
-    page_table: Optional[torch.Tensor] = None,
-    gather_kv_indices: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size_left: int = -1,
-    window_size_right: int = -1,
-    softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
-    learnable_sink: Optional[torch.Tensor] = None,
-    scheduler_metadata: Optional[torch.Tensor] = None,
-    sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Metadata-only fake for V4 A2 forward. Returns (out, lse)."""
-    if out_ is not None:
-        raise TypeError(
-            "Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported."
-        )
-
-    is_varlen_q = cu_seqlens_q is not None
-    # Real mha_fwd uses empty_like(q) when out_ is absent.
-    out = torch.empty_like(q)
-
-    if is_varlen_q:
-        # (num_heads, total_q)
-        num_heads = q.shape[1]
-        total_q = q.shape[0]
-        softmax_lse = torch.empty(
-            (num_heads, total_q), dtype=torch.float32, device=q.device
-        )
-    else:
-        # (batch_size, num_heads, seqlen_q)
-        batch_size = q.shape[0]
-        seqlen_q = q.shape[1]
-        num_heads = q.shape[2]
-        softmax_lse = torch.empty(
-            (batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device
-        )
-
-    return out, softmax_lse
-
-
 @_torch_custom_op_wrapper(
     "flash_attn_npu_4::_flash_attn_backward_op",
     mutates_args=("dq", "dk", "dv"),
@@ -1240,6 +1184,9 @@ def flash_attn_varlen_func(
         seqused_k = torch.full(
             (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
         )
+        seqused_k = _maybe_contiguous(seqused_k)
+    if seqused_k is None and cu_seqlens_k is not None:
+        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         seqused_k = _maybe_contiguous(seqused_k)
 
     out, softmax_lse, *rest = _flash_attn_forward(

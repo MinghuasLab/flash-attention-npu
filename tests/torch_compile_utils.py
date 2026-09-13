@@ -270,14 +270,30 @@ def varlen_kwargs(api, cu_q, cu_k, max_seq):
     return kwargs
 
 
-def run_varlen_compile_test(api, backward):
+def run_varlen_compile_test(
+    api,
+    backward,
+    cu_q_values=(0, 3, 6),
+    cu_k_values=(0, 3, 6),
+    causal=False,
+    window_size=(-1, -1),
+):
     torch.manual_seed(20260909)
 
-    total_q = 6
-    total_k = 6
+    total_q = cu_q_values[-1]
+    total_k = cu_k_values[-1]
     nheads = 6
     head_dim = 32
-    max_seq = 3
+
+    max_seq_q = max(
+        cu_q_values[i + 1] - cu_q_values[i]
+        for i in range(len(cu_q_values) - 1)
+    )
+
+    max_seq_k = max(
+        cu_k_values[i + 1] - cu_k_values[i]
+        for i in range(len(cu_k_values) - 1)
+    )
 
     q_base = torch.randn(
         total_q,
@@ -304,13 +320,13 @@ def run_varlen_compile_test(api, backward):
     )
 
     cu_q = torch.tensor(
-        [0, 3, 6],
+        cu_q_values,
         dtype=torch.int32,
         device=DEVICE,
     )
 
     cu_k = torch.tensor(
-        [0, 3, 6],
+        cu_k_values,
         dtype=torch.int32,
         device=DEVICE,
     )
@@ -319,8 +335,20 @@ def run_varlen_compile_test(api, backward):
         api,
         cu_q=cu_q,
         cu_k=cu_k,
-        max_seq=max_seq,
+        max_seq=max(max_seq_q, max_seq_k),
     )
+
+    if "max_seqlen_q" in kwargs:
+        kwargs["max_seqlen_q"] = max_seq_q
+
+    if "max_seqlen_k" in kwargs:
+        kwargs["max_seqlen_k"] = max_seq_k
+
+    if "causal" in kwargs:
+        kwargs["causal"] = causal
+
+    if "window_size" in kwargs:
+        kwargs["window_size"] = window_size
 
     def fn(q, k, v):
         return api.flash_attn_varlen_func(
@@ -407,8 +435,6 @@ def run_varlen_compile_test(api, backward):
             atol=ATOL,
             rtol=RTOL,
         )
-
-
 
 def run_fixed_compile_test(api, backward=True):
     """

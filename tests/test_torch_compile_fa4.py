@@ -66,6 +66,20 @@ def test_fa4_950_varlen_torch_compile_correctness():
         backward=False,
     )
 
+def test_fa4_950_varlen_asymmetric_causal_torch_compile_correctness():
+    require_soc("950")
+
+    api = load_api(
+        "flash_attn_npu_4.flash_attn_npu_interface_950"
+    )
+
+    run_varlen_compile_test(
+        api,
+        backward=False,
+        cu_q_values=(0, 2, 6),
+        cu_k_values=(0, 1, 6),
+        causal=True,
+    )
 
 def test_fa4_910_fixed_torch_compile_correctness():
 
