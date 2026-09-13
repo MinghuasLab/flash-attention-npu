@@ -77,14 +77,43 @@ namespace KernelCommon {
         GM_ADDR kNew;
         GM_ADDR vNew;
 
+        // Element strides are launch-time address metadata, deliberately kept
+        // outside scheduler_metadata so the same scheduler buffer can be
+        // reused by equal-shaped tensors with different views.
+        uint64_t qBatchStride;
+        uint64_t qSeqStride;
+        uint64_t qHeadStride;
+        uint64_t kBatchStride;
+        uint64_t kSeqStride;
+        uint64_t kHeadStride;
+        uint64_t vBatchStride;
+        uint64_t vSeqStride;
+        uint64_t vHeadStride;
+        uint64_t kNewBatchStride;
+        uint64_t kNewSeqStride;
+        uint64_t kNewHeadStride;
+        uint64_t vNewBatchStride;
+        uint64_t vNewSeqStride;
+        uint64_t vNewHeadStride;
+
         __aicore__ inline FAIKernelParams() {}
 
         __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                 GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_,
-                    GM_ADDR tiling_, GM_ADDR alibiSlopes_, GM_ADDR kNew_ = nullptr, GM_ADDR vNew_ = nullptr)
+                    GM_ADDR tiling_, GM_ADDR alibiSlopes_, GM_ADDR kNew_, GM_ADDR vNew_,
+                    uint64_t qBatchStride_, uint64_t qSeqStride_, uint64_t qHeadStride_,
+                    uint64_t kBatchStride_, uint64_t kSeqStride_, uint64_t kHeadStride_,
+                    uint64_t vBatchStride_, uint64_t vSeqStride_, uint64_t vHeadStride_,
+                    uint64_t kNewBatchStride_, uint64_t kNewSeqStride_, uint64_t kNewHeadStride_,
+                    uint64_t vNewBatchStride_, uint64_t vNewSeqStride_, uint64_t vNewHeadStride_)
             : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
                 actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), alibiSlopes(alibiSlopes_),
-                kNew(kNew_), vNew(vNew_) {}
+                kNew(kNew_), vNew(vNew_),
+                qBatchStride(qBatchStride_), qSeqStride(qSeqStride_), qHeadStride(qHeadStride_),
+                kBatchStride(kBatchStride_), kSeqStride(kSeqStride_), kHeadStride(kHeadStride_),
+                vBatchStride(vBatchStride_), vSeqStride(vSeqStride_), vHeadStride(vHeadStride_),
+                kNewBatchStride(kNewBatchStride_), kNewSeqStride(kNewSeqStride_), kNewHeadStride(kNewHeadStride_),
+                vNewBatchStride(vNewBatchStride_), vNewSeqStride(vNewSeqStride_), vNewHeadStride(vNewHeadStride_) {}
     };
 
     __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)

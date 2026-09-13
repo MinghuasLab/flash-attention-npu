@@ -32,6 +32,9 @@ struct FwdLaunchArgs {
     uint8_t *kv_seq_device;
     uint8_t *workspace_device;
     uint8_t *tiling_device;
+    uint64_t q_batch_stride, q_seq_stride, q_head_stride;
+    uint64_t k_batch_stride, k_seq_stride, k_head_stride;
+    uint64_t v_batch_stride, v_seq_stride, v_head_stride;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

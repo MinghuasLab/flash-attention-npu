@@ -64,7 +64,6 @@ public:
         uint32_t coreNum = tilingData->coreNum;
         dAlign = (headdim + 15) / 16 * 16;
         cu_seq_qlen_addr = cu_seq_qlen;
-        n_stride = (nheads - 1) * headdim * sizeof(ElementVecDtype);
 
         // 计算 buffer 大小
         constexpr static uint32_t inputBufferLen = 24 * 1024;
@@ -77,9 +76,27 @@ public:
         if constexpr (INPUT_LAYOUT == BSND) {
             seq_q = tilingData->qSeqlen;
             normalAxisSize = batch * nheads * seq_q;
+            doutBatchStride = seq_q * nheads * headdim;
+            doutSeqStride = nheads * headdim;
+            doutHeadStride = headdim;
+            outBatchStride = doutBatchStride;
+            outSeqStride = doutSeqStride;
+            outHeadStride = doutHeadStride;
+            if constexpr (std::is_same_v<TilingData, FAGTilingData>) {
+                doutBatchStride = tilingData->doutStrides.batch;
+                doutSeqStride = tilingData->doutStrides.seq;
+                doutHeadStride = tilingData->doutStrides.head;
+                outBatchStride = tilingData->outStrides.batch;
+                outSeqStride = tilingData->outStrides.seq;
+                outHeadStride = tilingData->outStrides.head;
+            }
+            doutNStride = (doutSeqStride - headdim) * sizeof(ElementVecDtype);
+            outNStride = (outSeqStride - headdim) * sizeof(ElementVecDtype);
         } else {
             seq_q = 0;
             normalAxisSize = total_q * nheads;
+            doutNStride = (nheads - 1) * headdim * sizeof(ElementVecDtype);
+            outNStride = doutNStride;
         }
 
         normalCoreSize = (normalAxisSize + coreNum -1) / coreNum;
@@ -147,20 +164,23 @@ public:
     CATLASS_DEVICE
     void DoCopyIn(int64_t curS, int64_t curNBurst, int64_t dstOffset, GM_ADDR seqS)
     {
-        int64_t srcOffset = 0;
+        int64_t doutSrcOffset = 0;
+        int64_t outSrcOffset = 0;
         if constexpr (INPUT_LAYOUT == TND) {
             int64_t bOffset = bIdx == 0 ? 0 : nheads * ((__gm__ int32_t *)seqS)[bIdx - 1] * headdim;
-            srcOffset = bOffset + (sIdx * nheads + nIdx) * headdim;
-            } else if constexpr (INPUT_LAYOUT == BSND) {
-                srcOffset = bIdx * (seq_q * nheads * headdim) + sIdx * (nheads * headdim) + nIdx * headdim;
+            doutSrcOffset = bOffset + (sIdx * nheads + nIdx) * headdim;
+            outSrcOffset = doutSrcOffset;
+        } else if constexpr (INPUT_LAYOUT == BSND) {
+            doutSrcOffset = bIdx * doutBatchStride + sIdx * doutSeqStride + nIdx * doutHeadStride;
+            outSrcOffset = bIdx * outBatchStride + sIdx * outSeqStride + nIdx * outHeadStride;
         }
-        DataCopyPad(input1Buf[dstOffset], doutGm[srcOffset],
+        DataCopyPad(input1Buf[dstOffset], doutGm[doutSrcOffset],
                     {static_cast<uint16_t>(curNBurst), static_cast<uint32_t>(headdim * sizeof(ElementVecDtype)),
-                    static_cast<uint32_t>(n_stride), 0, 0},
+                    static_cast<uint32_t>(doutNStride), 0, 0},
                     {true, 0, static_cast<uint8_t>((dAlign - headdim)), 0});
-        DataCopyPad(input2Buf[dstOffset], outGm[srcOffset],
+        DataCopyPad(input2Buf[dstOffset], outGm[outSrcOffset],
                     {static_cast<uint16_t>(curNBurst), static_cast<uint32_t>(headdim * sizeof(ElementVecDtype)),
-                    static_cast<uint32_t>(n_stride), 0, 0},
+                    static_cast<uint32_t>(outNStride), 0, 0},
                     {true, 0, static_cast<uint8_t>((dAlign - headdim)), 0});
     }
 
@@ -331,7 +351,14 @@ protected:
     int64_t sIdx = 0;
 
     int64_t dstOffset = 0;
-    int64_t n_stride = 0;
+    int64_t doutBatchStride = 0;
+    int64_t doutSeqStride = 0;
+    int64_t doutHeadStride = 0;
+    int64_t outBatchStride = 0;
+    int64_t outSeqStride = 0;
+    int64_t outHeadStride = 0;
+    int64_t doutNStride = 0;
+    int64_t outNStride = 0;
 
     int64_t usedCoreNum;
     int64_t normalCoreSize;

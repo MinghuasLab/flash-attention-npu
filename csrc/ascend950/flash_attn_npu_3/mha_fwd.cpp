@@ -36,6 +36,31 @@
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+struct QkvElementStrides {
+    uint64_t batch;
+    uint64_t seq;
+    uint64_t head;
+};
+
+static QkvElementStrides GetQkvElementStrides(const at::Tensor &x, const char *name)
+{
+    TORCH_CHECK(x.dim() == 3 || x.dim() == 4, name, " must be a 3D TND or 4D BSND/paged tensor");
+    TORCH_CHECK(x.stride(x.dim() - 1) == 1, name, " must be contiguous in the last dimension");
+    for (int64_t i = 0; i < x.dim(); ++i) {
+        TORCH_CHECK(x.stride(i) >= 0, name, " does not support negative strides");
+    }
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(x.dim() - 2)) <= std::numeric_limits<uint32_t>::max(),
+                name, " head stride exceeds the kernel DMA limit");
+    const int64_t seqDim = x.dim() == 3 ? 0 : 1;
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(seqDim)) <= std::numeric_limits<uint32_t>::max(),
+                name, " sequence stride exceeds the kernel DMA limit");
+    if (x.dim() == 3) {
+        return {0, static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1))};
+    }
+    return {static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1)),
+            static_cast<uint64_t>(x.stride(2))};
+}
+
 using flash_attn_npu_950_v3::SeqlenScratch;
 using flash_attn_npu_950_v3::fill_inference_context;
 
@@ -98,9 +123,9 @@ mha_fwd(at::Tensor q,
                 "query, key and value must be on the same NPU device");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-    CHECK_CONTIGUOUS(q);
-    CHECK_CONTIGUOUS(k);
-    CHECK_CONTIGUOUS(v);
+    const QkvElementStrides qStrides = GetQkvElementStrides(q, "q");
+    const QkvElementStrides kStrides = GetQkvElementStrides(k, "k");
+    const QkvElementStrides vStrides = GetQkvElementStrides(v, "v");
 
     // ============================================================
     // 2. reject list
@@ -501,7 +526,8 @@ mha_fwd(at::Tensor q,
         : nullptr;
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) &&
-        (head_size_q <= 256) && (head_size_v <= 256);
+        (head_size_q <= 256) && (head_size_v <= 256) &&
+        q.is_contiguous() && k.is_contiguous() && v.is_contiguous();
 
     const FwdLaunchArgs fwdArgs{
         is_bf16, fmt, mask_category, paged_KV,
@@ -509,7 +535,10 @@ mha_fwd(at::Tensor q,
         combineBlockDim, launchBlockDim, aclStream,
         qDev, kDev, vDev, maskDevice, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
-        wsDev, tilDev};
+        wsDev, tilDev,
+        qStrides.batch, qStrides.seq, qStrides.head,
+        kStrides.batch, kStrides.seq, kStrides.head,
+        vStrides.batch, vStrides.seq, vStrides.head};
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

@@ -34,6 +34,11 @@ struct FwdLaunchArgs {
     uint8_t *kvSeqDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
+    uint64_t qBatchStride, qSeqStride, qHeadStride;
+    uint64_t kBatchStride, kSeqStride, kHeadStride;
+    uint64_t vBatchStride, vSeqStride, vHeadStride;
+    uint64_t kNewBatchStride, kNewSeqStride, kNewHeadStride;
+    uint64_t vNewBatchStride, vNewSeqStride, vNewHeadStride;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp.

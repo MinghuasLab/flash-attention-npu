@@ -61,6 +61,34 @@ AlibiSlopes set_params_alibi(const std::optional<at::Tensor> &alibi_slopes_, int
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args);
 
+struct QkvElementStrides {
+    uint64_t batch;
+    uint64_t seq;
+    uint64_t head;
+};
+
+// Q/K/V tiles are copied row-wise, so only D must remain physically dense.
+// The outer element strides travel with each launch, independently of cached
+// scheduler_metadata (which is shape/scheduling data only).
+static QkvElementStrides GetQkvElementStrides(const at::Tensor &x, const char *name)
+{
+    TORCH_CHECK(x.dim() == 3 || x.dim() == 4, name, " must be a 3D TND or 4D BSND/paged tensor");
+    TORCH_CHECK(x.stride(x.dim() - 1) == 1, name, " must be contiguous in the last dimension");
+    for (int64_t i = 0; i < x.dim(); ++i) {
+        TORCH_CHECK(x.stride(i) >= 0, name, " does not support negative strides");
+    }
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(x.dim() - 2)) <= std::numeric_limits<uint32_t>::max(),
+                name, " head stride exceeds the kernel DMA limit");
+    const int64_t seqDim = x.dim() == 3 ? 0 : 1;
+    TORCH_CHECK(static_cast<uint64_t>(x.stride(seqDim)) <= std::numeric_limits<uint32_t>::max(),
+                name, " sequence stride exceeds the kernel DMA limit");
+    if (x.dim() == 3) {
+        return {0, static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1))};
+    }
+    return {static_cast<uint64_t>(x.stride(0)), static_cast<uint64_t>(x.stride(1)),
+            static_cast<uint64_t>(x.stride(2))};
+}
+
 
 struct FwdMaskDerivation {
     bool is_causal;
@@ -247,9 +275,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key_cache must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value_cache must have the same dtype");
 
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
-    TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor kcache must have contiguous last dimension");
-    TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor vcache must have contiguous last dimension");
+    const QkvElementStrides qStrides = GetQkvElementStrides(q, "q");
+    const QkvElementStrides kStrides = GetQkvElementStrides(kcache, "kcache");
+    const QkvElementStrides vStrides = GetQkvElementStrides(vcache, "vcache");
 
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t launchBlockDim = blockDim;
@@ -266,7 +294,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (paged_KV) {
         block_table = block_table_.value();
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype int32");
-        TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+        TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
     }
 
     if (seqlens_k_.has_value()) {
@@ -300,8 +328,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     if (out_.has_value()) {
         out = out_.value();
+        TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
     }  else {
-        out = torch::empty_like(q);
+        out = torch::empty(q.sizes(), q.options());
     }
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
@@ -622,6 +651,27 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
+    fwd_args.qBatchStride = qStrides.batch;
+    fwd_args.qSeqStride = qStrides.seq;
+    fwd_args.qHeadStride = qStrides.head;
+    fwd_args.kBatchStride = kStrides.batch;
+    fwd_args.kSeqStride = kStrides.seq;
+    fwd_args.kHeadStride = kStrides.head;
+    fwd_args.vBatchStride = vStrides.batch;
+    fwd_args.vSeqStride = vStrides.seq;
+    fwd_args.vHeadStride = vStrides.head;
+    const QkvElementStrides kNewStrides = appendKV
+        ? GetQkvElementStrides(k_.value(), "k_new")
+        : QkvElementStrides{0, 0, 0};
+    const QkvElementStrides vNewStrides = appendKV
+        ? GetQkvElementStrides(v_.value(), "v_new")
+        : QkvElementStrides{0, 0, 0};
+    fwd_args.kNewBatchStride = kNewStrides.batch;
+    fwd_args.kNewSeqStride = kNewStrides.seq;
+    fwd_args.kNewHeadStride = kNewStrides.head;
+    fwd_args.vNewBatchStride = vNewStrides.batch;
+    fwd_args.vNewSeqStride = vNewStrides.seq;
+    fwd_args.vNewHeadStride = vNewStrides.head;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<false>(fwd_args);
         return 0;
@@ -658,10 +708,9 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(p_dropout >= 0.0f && p_dropout < 1.0f, "p_dropout must be in [0.0, 1.0)");
 
-    // block unsupported params
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    const QkvElementStrides qStrides = GetQkvElementStrides(q, "q");
+    const QkvElementStrides kStrides = GetQkvElementStrides(k, "k");
+    const QkvElementStrides vStrides = GetQkvElementStrides(v, "v");
 
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
@@ -697,7 +746,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
 
     // init output tensors
-    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
+    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty(q.sizes(), q.options());
+    TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {
@@ -894,6 +944,17 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
+    fwd_args.qBatchStride = qStrides.batch;
+    fwd_args.qSeqStride = qStrides.seq;
+    fwd_args.qHeadStride = qStrides.head;
+    fwd_args.kBatchStride = kStrides.batch;
+    fwd_args.kSeqStride = kStrides.seq;
+    fwd_args.kHeadStride = kStrides.head;
+    fwd_args.vBatchStride = vStrides.batch;
+    fwd_args.vSeqStride = vStrides.seq;
+    fwd_args.vHeadStride = vStrides.head;
+    fwd_args.kNewBatchStride = fwd_args.kNewSeqStride = fwd_args.kNewHeadStride = 0;
+    fwd_args.vNewBatchStride = fwd_args.vNewSeqStride = fwd_args.vNewHeadStride = 0;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<false>(fwd_args);
         return 0;
@@ -949,9 +1010,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    const QkvElementStrides qStrides = GetQkvElementStrides(q, "q");
+    const QkvElementStrides kStrides = GetQkvElementStrides(k, "k");
+    const QkvElementStrides vStrides = GetQkvElementStrides(v, "v");
 
     // 可选输入，当前均不支持
     at::Tensor seqlens_k, leftpad_k, alibi_slopes, block_table;
@@ -968,7 +1029,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (paged_KV) {
         block_table = block_table_.value();
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype int32");
-        TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+        TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
     }
 
     const auto sizes = q.sizes();
@@ -1023,7 +1084,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         }
     }
 
-    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
+    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty(q.sizes(), q.options());
+    TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {
@@ -1217,6 +1279,17 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
+    fwd_args.qBatchStride = qStrides.batch;
+    fwd_args.qSeqStride = qStrides.seq;
+    fwd_args.qHeadStride = qStrides.head;
+    fwd_args.kBatchStride = kStrides.batch;
+    fwd_args.kSeqStride = kStrides.seq;
+    fwd_args.kHeadStride = kStrides.head;
+    fwd_args.vBatchStride = vStrides.batch;
+    fwd_args.vSeqStride = vStrides.seq;
+    fwd_args.vHeadStride = vStrides.head;
+    fwd_args.kNewBatchStride = fwd_args.kNewSeqStride = fwd_args.kNewHeadStride = 0;
+    fwd_args.vNewBatchStride = fwd_args.vNewSeqStride = fwd_args.vNewHeadStride = 0;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<true>(fwd_args);
         return 0;
@@ -1280,6 +1353,15 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     }  else {
         dv = torch::empty_like(v);
     }
+
+    TORCH_CHECK(dout.is_contiguous(), "Input tensor dout must be contiguous");
+    TORCH_CHECK(q.is_contiguous(), "Input tensor q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "Input tensor k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "Input tensor v must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "Input tensor out must be contiguous");
+    TORCH_CHECK(dq.is_contiguous(), "Output tensor dq must be contiguous");
+    TORCH_CHECK(dk.is_contiguous(), "Output tensor dk must be contiguous");
+    TORCH_CHECK(dv.is_contiguous(), "Output tensor dv must be contiguous");
 
     // parse shape args
     auto qsizes = q.sizes();
@@ -1477,6 +1559,15 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     } else {
         dv = torch::empty_like(v);
     }
+
+    TORCH_CHECK(dout.is_contiguous(), "Input tensor dout must be contiguous");
+    TORCH_CHECK(q.is_contiguous(), "Input tensor q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "Input tensor k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "Input tensor v must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "Input tensor out must be contiguous");
+    TORCH_CHECK(dq.is_contiguous(), "Output tensor dq must be contiguous");
+    TORCH_CHECK(dk.is_contiguous(), "Output tensor dk must be contiguous");
+    TORCH_CHECK(dv.is_contiguous(), "Output tensor dv must be contiguous");
 
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();

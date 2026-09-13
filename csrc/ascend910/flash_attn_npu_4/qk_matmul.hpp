@@ -117,17 +117,18 @@ public:
     void loadQGM(
         AscendC::GlobalTensor<ElementA> gA,
         LayoutA layoutA,
-        uint32_t rowNum, uint32_t &singleGroupHeads, uint32_t &qHeads)
+        uint32_t rowNum, uint32_t &singleGroupHeads,
+        uint32_t qSeqStride, uint32_t qHeadStride)
     {
         uint32_t embed = layoutA.shape(1);
         uint32_t rowNumRound = RoundUp(rowNum, L1AAlignHelper::M_ALIGNED);
         uint32_t tokenNumPerGroup = rowNum / singleGroupHeads;
-        auto layoutSingleANd = layoutA.GetTileLayout(MakeCoord(singleGroupHeads, embed));
+        LayoutA layoutSingleANd(singleGroupHeads, embed, qHeadStride);
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
         copyGmToL1A(
             l1ATensor, gA,
             layoutAInL1, layoutSingleANd,
-            tokenNumPerGroup, qHeads * embed, tokenNumPerGroup, BLOCK_SIZE, rowNumRound);
+            tokenNumPerGroup, qSeqStride, tokenNumPerGroup, BLOCK_SIZE, rowNumRound);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
     }
@@ -168,17 +169,19 @@ public:
     }
 
     __aicore__ inline
-    void getKVOffset(uint32_t &kOffset, uint32_t nIdx, uint32_t nowNIdx, uint32_t strideKV)
+    void getKVOffset(uint64_t &kOffset, uint32_t nIdx, uint32_t nowNIdx, uint32_t strideKV)
     {
-        kOffset = nIdx * maxKVStackLen * strideKV + nowNIdx * l1NDynamic * strideKV;
+        kOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV +
+            static_cast<uint64_t>(nowNIdx) * l1NDynamic * strideKV;
     }
 
     __aicore__ inline
-    void getKVOffset(AscendC::GlobalTensor<int32_t> &gBlockTable, uint32_t &kOffset, uint32_t nowNIdx, 
-        uint32_t startOffset, uint32_t strideKV, uint32_t blockSize)
+    void getKVOffset(AscendC::GlobalTensor<int32_t> &gBlockTable, uint64_t &kOffset, uint32_t nowNIdx,
+        uint32_t startOffset, uint32_t strideKV, uint64_t blockStrideKV)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = blockTableId * blockSize * strideKV + startOffset * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * blockStrideKV +
+            static_cast<uint64_t>(startOffset) * strideKV;
     }
 
     __aicore__ inline
@@ -204,14 +207,15 @@ public:
                     AscendC::GlobalTensor<ElementC> gC,
                     AscendC::GlobalTensor<int32_t> gBlockTable,
                     LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
-                    uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV)
+                    uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV,
+                    uint64_t blockStrideKV)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t stackSeqTile = actualOriShape[COORD_DIM1];
         uint32_t embed = actualOriShape[COORD_DIM2];
 
         GemmCoord actualShape{rowNum, 0, embed};
-        uint32_t gBOffset = 0;
+        uint64_t gBOffset = 0;
 
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
 
@@ -240,7 +244,7 @@ public:
                     uint32_t curBlockSize = (curBlockIdx < (curBlockTotalNum-1)) ? blockSize : blockEnd;
                     uint32_t nowNIdx = nIdx * maxKVStackLen / blockSize + curBlockIdx;
                     getBlockShape(actualShape, blockStartOffset, l1NResDynamic, kvL1Len, nowLen, curBlockSize);
-                    getKVOffset(gBlockTable, gBOffset, nowNIdx, blockStartOffset, strideKV, blockSize);
+                    getKVOffset(gBlockTable, gBOffset, nowNIdx, blockStartOffset, strideKV, blockStrideKV);
                     auto layoutBTile = layoutB.GetTileLayout(MakeCoord(embed, nowLen));
                     MatrixCoord l1BTileCoord{0, kvL1Len};
                     auto l1BTile = l1BTensor[l1KvPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];

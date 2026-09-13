@@ -27,7 +27,12 @@
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
-            workspaceDevice, tilingDevice, kNewDevice, vNewDevice)
+            workspaceDevice, tilingDevice, kNewDevice, vNewDevice,                 \
+            a.qBatchStride, a.qSeqStride, a.qHeadStride,                           \
+            a.kBatchStride, a.kSeqStride, a.kHeadStride,                           \
+            a.vBatchStride, a.vSeqStride, a.vHeadStride,                           \
+            a.kNewBatchStride, a.kNewSeqStride, a.kNewHeadStride,                  \
+            a.vNewBatchStride, a.vNewSeqStride, a.vNewHeadStride)
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
 // branch fixes the runtime bool as a named constexpr flag, so the dispatch

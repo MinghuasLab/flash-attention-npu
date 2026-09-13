@@ -273,6 +273,7 @@ public:
                     uint32_t kvSTileIdx, uint32_t pipelineTileSeq,
                     uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
+                    uint64_t kvBlockStride, uint32_t kvSeqStride,
                     uint32_t globalWindowSize, uint32_t localWindowSize,
                     Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag,
                     uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages)
@@ -305,8 +306,12 @@ public:
                 uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                 uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                 auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                auto gBTensorTlaTile = GetTile(gBTensor,
-                    tla::MakeCoord(blockIdx * blockSize + blockOffset, 0), tla::MakeShape(curBaseTileSize, embed));
+                uint64_t pageOffset = static_cast<uint64_t>(blockIdx) * kvBlockStride +
+                    static_cast<uint64_t>(blockOffset) * kvSeqStride;
+                auto gBPageTensor = tla::MakeTensor(
+                    gBTensor.data()[pageOffset], gBTensor.layout(), Arch::PositionGM{});
+                auto gBTensorTlaTile = GetTile(gBPageTensor,
+                    tla::MakeCoord(0, 0), tla::MakeShape(curBaseTileSize, embed));
                 copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
             } else {
                 if (isShrink == 1) {

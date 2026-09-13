@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 
 import os
+import sys
 import torch
 import torch_npu
 import pytest
@@ -15,14 +16,162 @@ from tests.common.test_utils import (
     make_golden_attention_mask,
     make_local_attention_mask,
     make_packed_random_tensor,
-    make_paged_kv_cache,
     make_padded_varlen_mask,
     pad_packed_tensor,
     make_random_tensor,
     make_varlen_seqlens,
     check_kvcache_inplace
 )
-from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_3 import (
+    flash_attn_with_kvcache,
+    flash_attn_func,
+    flash_attn_varlen_func,
+    get_scheduler_metadata,
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_func_accepts_noncontiguous_bshd(dtype):
+    batch_size, num_heads, seqlen, head_dim = 2, 4, 64, 64
+    q = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    k = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+    v = make_random_tensor(
+        (batch_size, num_heads, seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2).detach().requires_grad_(True)
+
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    q_contiguous = q.detach().contiguous().requires_grad_(True)
+    k_contiguous = k.detach().contiguous().requires_grad_(True)
+    v_contiguous = v.detach().contiguous().requires_grad_(True)
+    kwargs = {"causal": True}
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        kwargs["deterministic"] = True
+    out = flash_attn_func(q, k, v, **kwargs)
+    out_contiguous = flash_attn_func(
+        q_contiguous, k_contiguous, v_contiguous, **kwargs
+    )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        out.sum().backward()
+        out_contiguous.sum().backward()
+        for grad, grad_contiguous in zip(
+            (q.grad, k.grad, v.grad),
+            (q_contiguous.grad, k_contiguous.grad, v_contiguous.grad),
+        ):
+            torch.testing.assert_close(grad, grad_contiguous, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_kv_native_strides_reuse_scheduler_metadata(dtype):
+    batch_size, q_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, page_size, head_dim = 8, 256, 128, 64
+    pages_per_batch = kv_seqlen // page_size
+    num_pages = batch_size * pages_per_batch
+
+    q = make_random_tensor(
+        (batch_size, q_heads, q_seqlen, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    k_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    v_cache = make_random_tensor(
+        (num_pages, kv_heads, page_size, head_dim), dtype, device="npu"
+    ).transpose(1, 2)
+    page_table = make_block_table(batch_size, kv_seqlen, page_size).npu()
+    cache_seqlens = torch.full(
+        (batch_size,), kv_seqlen, dtype=torch.int32, device="npu"
+    )
+
+    assert not q.is_contiguous()
+    assert not k_cache.is_contiguous() and not v_cache.is_contiguous()
+    interface = sys.modules[flash_attn_with_kvcache.__module__]
+    keep_strides = getattr(
+        interface,
+        "maybe_contiguous_last_dim",
+        getattr(interface, "_maybe_contiguous_last_dim", None),
+    )
+    assert keep_strides is not None
+    assert keep_strides(q) is q
+    assert keep_strides(k_cache) is k_cache
+    assert keep_strides(v_cache) is v_cache
+
+    device_name = torch_npu.npu.get_device_name()
+    if "Ascend950" in device_name:
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=q_seqlen,
+            max_seqlen_k=kv_seqlen,
+            num_heads_q=q_heads,
+            num_heads_kv=kv_heads,
+            headdim=head_dim,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=dtype,
+            page_size=page_size,
+            num_blocks=num_pages,
+            max_num_blocks_per_seq=pages_per_batch,
+            causal=True,
+        )
+    else:
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size,
+            q_seqlen,
+            kv_seqlen,
+            q_heads,
+            kv_heads,
+            head_dim,
+            cache_seqlens,
+            qkv_dtype=dtype,
+            page_size=page_size,
+            causal=True,
+        )
+
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=True,
+        scheduler_metadata=scheduler_metadata,
+    )
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, **kwargs)
+    # Reuse exactly the same scheduler metadata with a different stride set.
+    out_contiguous = flash_attn_with_kvcache(
+        q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), **kwargs
+    )
+    torch.testing.assert_close(out, out_contiguous, rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+def test_flash_attn_bnsd_transpose_backward_strides(data_type):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend950" in name:
+        pytest.skip("Ascend950 v3 does not expose this FAG backward path")
+    batch, q_seqlen, kv_seqlen, q_heads, kv_heads, head_dim = 2, 17, 23, 4, 2, 64
+
+    def make_view(shape):
+        base = make_random_tensor(shape, data_type, device="npu")
+        return base.transpose(1, 2).detach().requires_grad_(True)
+
+    q = make_view((batch, q_heads, q_seqlen, head_dim))
+    k = make_view((batch, kv_heads, kv_seqlen, head_dim))
+    v = make_view((batch, kv_heads, kv_seqlen, head_dim))
+    q_dense = q.detach().contiguous().requires_grad_(True)
+    k_dense = k.detach().contiguous().requires_grad_(True)
+    v_dense = v.detach().contiguous().requires_grad_(True)
+
+    out = flash_attn_func(q, k, v, num_splits=1)
+    out_dense = flash_attn_func(q_dense, k_dense, v_dense, num_splits=1)
+    dout = torch.randn_like(out_dense)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    grads_dense = torch.autograd.grad(out_dense, (q_dense, k_dense, v_dense), dout)
+
+    torch.testing.assert_close(out, out_dense, rtol=2e-2, atol=2e-2)
+    for grad, grad_dense, source in zip(grads, grads_dense, (q, k, v)):
+        assert grad.stride() == source.stride()
+        torch.testing.assert_close(grad.contiguous(), grad_dense, rtol=2e-2, atol=2e-2)
 
 # flash_attn_with_kvcache test parameters
 # Single-option parameters: fixed values
@@ -205,31 +354,50 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     t_q_sum = sum(q_sequences)
     t_kv_sum = sum(kv_sequences)
     if layout == "BSND":
-        query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, generator=gen, device="npu")
+        query = make_random_tensor(
+            (batch_size, num_heads, q_seqlen, head_size), data_type,
+            generator=gen, device="npu"
+        ).transpose(1, 2)
     elif layout == "TND":
         query = make_packed_random_tensor(q_sequences, q_seqlen, num_heads, head_size, data_type, generator=gen, device="npu")
     key_cache = None
     value_cache = None
     block_tables = None
     if cache_mode == 1:
-        # make_paged_kv_cache allocates physical blocks from kv_seqlen so long
-        # KV cases cannot make block_table reference nonexistent blocks and
-        # trigger an AICore DDR overrun.
-        key_cache, value_cache = make_paged_kv_cache(
-            batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type,
+        # Allocate every physical block referenced by block_tables. Build the
+        # storage as BNSD, then expose the paged-cache BSND view to the API.
+        num_blocks = batch_size * ((kv_seqlen + block_size - 1) // block_size)
+        key_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type,
             generator=gen, device="npu"
-        )
+        ).transpose(1, 2)
+        value_cache = make_random_tensor(
+            (num_blocks, kv_heads, block_size, head_size), data_type,
+            generator=gen, device="npu"
+        ).transpose(1, 2)
         block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
         if layout == "BSND":
-            key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, generator=gen, device="npu")
-            value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, generator=gen, device="npu")
+            key_cache = make_random_tensor(
+                (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                generator=gen, device="npu"
+            ).transpose(1, 2)
+            value_cache = make_random_tensor(
+                (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                generator=gen, device="npu"
+            ).transpose(1, 2)
         else:
             if new_kv:
                 # append-KV uses the capacity-aligned per-batch cache layout (same as BSND).
                 kv_min_range, kv_max_range = -5.0, 5.0
-                key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, low=kv_min_range, high=kv_max_range, generator=gen, device="npu")
-                value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, low=kv_min_range, high=kv_max_range, generator=gen, device="npu")
+                key_cache = make_random_tensor(
+                    (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                    low=kv_min_range, high=kv_max_range, generator=gen, device="npu"
+                ).transpose(1, 2)
+                value_cache = make_random_tensor(
+                    (batch_size, kv_heads, kv_seqlen, head_size), data_type,
+                    low=kv_min_range, high=kv_max_range, generator=gen, device="npu"
+                ).transpose(1, 2)
             else:
                 key_cache = make_packed_random_tensor(kv_sequences, kv_seqlen, kv_heads, head_size, data_type, generator=gen, device="npu")
                 value_cache = make_packed_random_tensor(kv_sequences, kv_seqlen, kv_heads, head_size, data_type, generator=gen, device="npu")
@@ -255,8 +423,12 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
                                   (batch_size,), generator=gen) * 512 + old_min) \
             if is_causal else torch.randint(0, capacity - new_seqlen + 1, (batch_size,), generator=gen)
         cache_seqlens = old_lens.to(torch.int32).npu()
-        k_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
-        v_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
+        k_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
+        v_new = torch.randn(
+            batch_size, kv_heads, new_seqlen, head_size, dtype=data_type, generator=gen
+        ).npu().transpose(1, 2)
         key_cache_orig = key_cache.detach().clone()
         value_cache_orig = value_cache.detach().clone()
     else:
