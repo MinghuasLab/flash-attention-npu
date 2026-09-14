@@ -49,21 +49,28 @@ static constexpr uint32_t DET_CAST_CHUNK_ROWS = 32;
 /*
  * FAG arch35 task pipeline and L1-buffer ownership:
  *
- *   C1: mm(Q, K^T)
+ *   C1: mm(Q, K^T)   -- K^T resident; Q kept in Q[taskId%2] for C34
+ *                       prefetch V^T (group head) overlapping S cube
  *       -- C1_TO_V1[taskId % 2] -->
  *   V1: scaledMaskSoftmax
- *       -- V1_TO_C5 --> C5: mm(P^T, dY)
- *       <-- C5_TO_V1 -- return the P L1 buffer
+ *       -- V1_TO_C5 --> C5: mm(P^T, dY)  -- reuse L1 DY[taskId%2] from C2;
+ *                                         dV accumulates in L0C until group end
+ *                                         D<=128: prefetch RowMajor K into RES_KT
+ *                                         upper half (overlaps MTE2 with cube)
+ *       <-- C5_TO_V1 -- return the P L1 buffer; release DY
  *
- *   C2: mm(dY, V^T)
+ *   C2: mm(dY, V^T)  -- V^T resident; dY kept in DY[taskId%2] for C5
  *       -- C2_TO_V2[taskId % 2] -->
  *   V2: dS
- *       -- V2_TO_C34 --> C3: mm(dS, K) and C4: mm(dS^T, Q)
+ *       -- V2_TO_C34 --> C3: mm(dS, K) / C4: mm(dS^T, Q)
+ *                       -- D<=128: reuse resident K + L1 Q (no K GM load)
+ *                       -- D>128: K-slice via DY scratch; reuse L1 Q
  *       <-- C34_TO_V2 -- return the dS L1 buffer
  *
+ * Scheduling: each AIC owns whole (batch, n2, s2Block) groups so contiguous
+ * s1 ranges never bounce across cores (keeps KV L1 residency valid).
+ *
  * In steady state, C1/C2 of task i overlap V1/V2/C5/C3/C4 of task i - 1.
- * C1/C2 completion flags use taskId % TASK_PINGPONG. P and dS L1 buffers
- * use a forward ready flag plus a reverse return flag to enforce ownership.
  */
 
 template <
@@ -242,7 +249,9 @@ public:
         }
 
         // L1 layout:
-        //   [P ping][P pong][dS ping][dS pong]
+        //   [P ping][P pong][dS ping][dS pong] | cube working via Mm12L1Offset
+        //   cube: [RES_KT|RES_K half][RES_VT][Q0][Q1][DY0][DY1]
+        //   Q/DY ping-pong by taskId%2; D<=128 packs RowMajor K above K^T.
         const uint32_t l1TileBytes =
             qBlockSize_ * kvBlockSize_ * sizeof(DataType);
         const uint32_t l1PBaseOffset = 0;
@@ -657,6 +666,12 @@ private:
         block.doutOffset =
             (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
         block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
+        // BN2S2 treats every task as its own residency/accumulate group: the
+        // shared C1/C2 stages reload K^T/V^T each task and dk/dv flush per
+        // task (the private/shared workspaces handle cross-task accumulation).
+        block.loadKv = true;
+        block.initDkv = true;
+        block.flushDkv = true;
 
         // Private dk/dv accumulator layout: which fold buffer this task
         // belongs to and the real column each buffer accumulates.
@@ -911,6 +926,8 @@ private:
         coreIdxBn2s2_ = coreIdx;
         uint64_t taskId = 0;
         bool hasPending = false;
+        bool ktResident = false;
+        bool vtResident = false;
         FAGBlockInfo pending{};
         for (uint32_t step = 0; step < totalRounds_; ++step) {
             FAGBlockInfo block{};
@@ -924,8 +941,20 @@ private:
 #ifdef __DAV_CUBE__
             // Front-end MM of the new task overlaps the back-end below.
             if (valid) {
+                // Per-task residency: release the previous K^T/V^T before C1
+                // reloads them (event pairing identical to the main loop).
+                if (ktResident) {
+                    mm12.ReleaseResidentKT();
+                    ktResident = false;
+                }
+                if (vtResident) {
+                    mm12.ReleaseResidentVT();
+                    vtResident = false;
+                }
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
+                ktResident = true;
+                vtResident = true;
             }
 #endif
             if (hasPending) {
@@ -966,6 +995,15 @@ private:
 #endif
         }
 #ifdef __DAV_CUBE__
+        // Must run even when this core has no pending task left: the final
+        // WaitCubeEvents consumes one token per L1 event, and the last C1's
+        // load is only balanced by this release.
+        if (ktResident) {
+            mm12.ReleaseResidentKT();
+        }
+        if (vtResident) {
+            mm12.ReleaseResidentVT();
+        }
         WaitCubeEvents();
 #endif
 #ifdef __DAV_VEC__
@@ -979,7 +1017,6 @@ private:
         uint32_t subBlockIdx)
     {
         if (coreIdx >= coreNum_ || coreNum_ == 0 ||
-            continuousBlockNum_ == 0 ||
             qBlockSize_ == 0 || kvBlockSize_ == 0) {
             return;
         }
@@ -997,116 +1034,161 @@ private:
 #ifdef __DAV_VEC__
         SetVecEvents();
 #endif
+        // Assign each (batch, n2, s2Block) group to exactly one AIC so that
+        // contiguous s1 ranges stay on the same core (KV L1 residency + local
+        // dk/dv accumulate). Round-robin over kvGroupId.
         uint64_t taskId = 0;
-        for (uint32_t issueRound = 0;; ++issueRound) {
-            const uint64_t blockBegin =
-                static_cast<uint64_t>(issueRound) * waveSize_ +
-                static_cast<uint64_t>(coreIdx) * continuousBlockNum_;
+        uint64_t kvGroupId = 0;
+        bool hasPrev = false;
+        bool ktResident = false;
+        bool vtResident = false;
 
-            // IS_DTM: whether this core issued any task in this round.
-            // Round-local by construction: the round-end flush below consumes
-            // the last task's back-end, so the deferred in-loop processing
-            // only triggers for lanes > 0 and no cross-round state is kept.
-            [[maybe_unused]] bool roundHasTask = false;
-            for (uint32_t issueLane = 0;
-                 issueLane < continuousBlockNum_; ++issueLane) {
-                FAGBlockInfo block{};
-                if (!DecodeBlock(blockBegin + issueLane, block)) {
-                    if constexpr (IS_DTM) {
-                        // No more tasks for this core in this round.  The
-                        // pending back-end is flushed at the round end below;
-                        // every core still joins the round barriers so the
-                        // SyncAll counts stay matched across cores.
-                        break;
-                    } else {
-                        if (taskId != 0) {
-#ifdef __DAV_CUBE__
-                            ProcessC5Stage(previousBlock_, false, mm345);
-                            ProcessC34Stage(previousBlock_, false, mm345);
-#endif
-#ifdef __DAV_VEC__
-                            ProcessV1Stage(previousBlock_, subBlockIdx);
-                            ProcessV2Stage(previousBlock_, subBlockIdx);
-#endif
-                        }
-#ifdef __DAV_CUBE__
-                        WaitCubeEvents();
-#endif
-#ifdef __DAV_VEC__
-                        WaitVecEvents();
-#endif
-                        return;
+        for (uint32_t batchIdx = 0; batchIdx < batchNum_; ++batchIdx) {
+            uint64_t qBatchStart = 0;
+            uint64_t kvBatchStart = 0;
+            uint32_t s1Length = 0;
+            uint32_t s2Length = 0;
+            GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
+            const uint32_t s1BlockNum =
+                static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+            const uint32_t s2BlockNum =
+                static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+
+            for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
+                for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum;
+                     ++s2BlockIdx, ++kvGroupId) {
+                    if ((kvGroupId % coreNum_) != coreIdx) {
+                        continue;
                     }
-                }
-                block.taskId = taskId;
-                block.issueRound = issueRound;
-                block.issueLane = issueLane;
 
-                // IS_DTM: at lane 0 previousBlock_ is the previous round's
-                // last task, whose back-end was already flushed at that
-                // round's end; lanes > 0 always have a pending same-round
-                // predecessor.
-                const bool hasPendingPrev =
-                    IS_DTM ? (issueLane != 0) : (taskId != 0);
-#ifdef __DAV_CUBE__
-                // Front-end MM of task i overlaps the vector and back-end MM
-                // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
-                if (hasPendingPrev) {
-                    ProcessC5Stage(previousBlock_, true, mm345);
-                    ProcessC34Stage(previousBlock_, true, mm345);
-                }
-#endif
-#ifdef __DAV_VEC__
-                if (hasPendingPrev) {
-                    ProcessV1Stage(previousBlock_, subBlockIdx);
-                    ProcessV2Stage(previousBlock_, subBlockIdx);
-                }
-#endif
+                    const uint32_t firstValidS1 = FirstValidS1Block(
+                        s1Length, s2Length, s2BlockIdx);
+                    if (firstValidS1 >= s1BlockNum) {
+                        continue;
+                    }
 
-                previousBlock_ = block;
-                ++taskId;
-                roundHasTask = true;
-            }
+                    const uint32_t validS1Num = s1BlockNum - firstValidS1;
+                    const uint32_t tasksInGroup = groupNum_ * validS1Num;
+                    if (tasksInGroup == 0) {
+                        continue;
+                    }
 
-            if constexpr (IS_DTM) {
-                // SyncAll publishes this round's det-slot fixpipe writes to
-                // every core (the only proven cross-core publication point on
-                // this chip). Det slots are banked by round parity, so
-                // VecDTM(r) can read its bank while C345(r+1) writes the other
-                // bank; r+2 cannot reuse r's bank until VecDTM(r) has returned.
-                const bool moreRounds = issueRound + 1 < totalRounds_;
-                if (roundHasTask) {
-                    // The final round has no following task, so its L1
-                    // buffers do not need to be returned (same as the
-                    // non-DTM drain path).
+                    uint32_t taskInGroup = 0;
+                    for (uint32_t groupIdx = 0; groupIdx < groupNum_; ++groupIdx) {
+                        for (uint32_t s1Ord = 0; s1Ord < validS1Num;
+                             ++s1Ord, ++taskInGroup) {
+                            FAGBlockInfo block{};
+                            const uint32_t s1BlockIdx = firstValidS1 + s1Ord;
+                            FillBlockInfoFrom(
+                                batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx,
+                                qBatchStart, kvBatchStart, s1Length, s2Length,
+                                block);
+                            block.taskId = taskId;
+                            block.loadKv = (taskInGroup == 0);
+                            block.initDkv = (taskInGroup == 0);
+                            block.flushDkv = (taskInGroup + 1 == tasksInGroup);
+
 #ifdef __DAV_CUBE__
-                    ProcessC5Stage(previousBlock_, moreRounds, mm345);
-                    ProcessC34Stage(previousBlock_, moreRounds, mm345);
+                            // New s2 group: free previous KT/VT before reload.
+                            if (block.loadKv && ktResident) {
+                                mm12.ReleaseResidentKT();
+                                ktResident = false;
+                            }
+                            if (block.loadKv && vtResident) {
+                                mm12.ReleaseResidentVT();
+                                vtResident = false;
+                            }
+                            ProcessC1Stage(block, mm12);
+                            ProcessC2Stage(block, mm12);
+                            if (block.loadKv) {
+                                ktResident = true;
+                                vtResident = true;
+                            }
+                            if (hasPrev) {
+                                ProcessC5Stage(previousBlock_, true, mm345);
+                                ProcessC34Stage(previousBlock_, true, mm345);
+                            }
 #endif
 #ifdef __DAV_VEC__
-                    ProcessV1Stage(previousBlock_, subBlockIdx);
-                    ProcessV2Stage(previousBlock_, subBlockIdx);
+                            if (hasPrev) {
+                                ProcessV1Stage(previousBlock_, subBlockIdx);
+                                ProcessV2Stage(previousBlock_, subBlockIdx);
+                            }
 #endif
-                }
-                AscendC::SyncAll<false>();
-#ifdef __DAV_VEC__
-                if (AscendC::GetBlockIdx() < dtmVecCoreNum_) {
-                    ProcessVecDTMStage(issueRound);
-                }
-#endif
-                if (!moreRounds) {
-#ifdef __DAV_CUBE__
-                    WaitCubeEvents();
-#endif
-#ifdef __DAV_VEC__
-                    WaitVecEvents();
-#endif
-                    return;
-                }
+                            previousBlock_ = block;
+                            hasPrev = true;
+                            ++taskId;
+                        }
+                    }                }
             }
         }
+
+        if (hasPrev) {
+#ifdef __DAV_CUBE__
+            ProcessC5Stage(previousBlock_, false, mm345);
+            ProcessC34Stage(previousBlock_, false, mm345);
+            if (ktResident) {
+                mm12.ReleaseResidentKT();
+            }
+            if (vtResident) {
+                mm12.ReleaseResidentVT();
+            }
+#endif
+#ifdef __DAV_VEC__
+            ProcessV1Stage(previousBlock_, subBlockIdx);
+            ProcessV2Stage(previousBlock_, subBlockIdx);
+#endif
+        }
+#ifdef __DAV_CUBE__
+        WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        WaitVecEvents();
+#endif
+    }
+
+    CATLASS_DEVICE
+    void FillBlockInfoFrom(
+        uint32_t batchIdx,
+        uint32_t n2Idx,
+        uint32_t groupIdx,
+        uint32_t s1BlockIdx,
+        uint32_t s2BlockIdx,
+        uint64_t qBatchStart,
+        uint64_t kvBatchStart,
+        uint32_t s1Length,
+        uint32_t s2Length,
+        FAGBlockInfo &block)
+    {
+        const uint32_t s1Start = s1BlockIdx * qBlockSize_;
+        const uint32_t s2Start = s2BlockIdx * kvBlockSize_;
+        const uint64_t totalS1Start = qBatchStart + s1Start;
+        const uint64_t totalS2Start = kvBatchStart + s2Start;
+        const uint64_t qHeadIdx =
+            static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
+
+        block.batchIdx = batchIdx;
+        block.n2Idx = n2Idx;
+        block.groupIdx = groupIdx;
+        block.s1BlockIdx = s1BlockIdx;
+        block.s2BlockIdx = s2BlockIdx;
+        block.s1Start = s1Start;
+        block.s2Start = s2Start;
+        block.curBatchS1 = s1Length;
+        block.curBatchS2 = s2Length;
+        block.s1Extend = Min(qBlockSize_, s1Length - s1Start);
+        block.s2Extend = Min(kvBlockSize_, s2Length - s2Start);
+        block.totalS1Start = totalS1Start;
+        block.totalS2Start = totalS2Start;
+        block.qOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
+        block.vOffset =
+            (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
+        block.doutOffset =
+            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
     }
 
 #ifdef __DAV_CUBE__
@@ -1118,8 +1200,10 @@ private:
         for (uint32_t eventId = 0; eventId < 4; ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
-        // mm12 and mm345 share the four physical L1-buffer tokens.
-        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+        // mm12/mm345 L1 slots + RES_K half-slot token (L1_EVENT_COUNT).
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT;
+             ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
         // One availability token for every physical 64-KB L0C slot.
@@ -1136,7 +1220,9 @@ private:
         for (uint32_t eventId = 0; eventId < 4; ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
-        for (uint32_t eventId = 0; eventId < 4; ++eventId) {
+        for (uint32_t eventId = 0;
+             eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT;
+             ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
         for (uint32_t eventId = 0;
@@ -1155,13 +1241,17 @@ private:
             qkHeadDim_, qHeadNum_ * qkHeadDim_);
         auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
             qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend,
+            vHeadDim_, kvHeadNum_ * vHeadDim_);
         auto sLayout = tla::MakeLayout(
             tla::MakeShape(block.s1Extend, block.s2Extend),
             tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto s = tla::MakeTensor(
             ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
-        mm12(q, k, s, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, qkHeadDim_));
+        // Prefetch V^T on the group’s first task so MTE2 overlaps S cube.
+        mm12.ComputeS(q, k, s, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, qkHeadDim_),
+            block.loadKv, slot, block.loadKv, v, block.s2Extend, vHeadDim_);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
@@ -1181,8 +1271,10 @@ private:
             tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto dp = tla::MakeTensor(
             ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
-        mm12(dy, v, dp, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, vHeadDim_));
+        // VT already prefetched in C1 when loadKv; only wait on first use.
+        mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(
+            block.s1Extend, block.s2Extend, vHeadDim_),
+            /*loadV=*/false, /*waitV=*/block.loadKv, slot);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
@@ -1200,27 +1292,21 @@ private:
             SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
-            vHeadDim_, qHeadNum_ * vHeadDim_);
-        if constexpr (IS_DTM) {
-            // Compact det slot: round-parity bank plus coreIdx * cbn + lane.
-            // Stride/row-step use the aligned head dim (matches tiling).
-            const uint64_t detSlot =
-                ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
-                (block.blockId % waveSize_);
-            auto dv = MakeGmTensor(dvDetWorkspaceGm_, detSlot * dvDetSlotElems_,
-                block.s2Extend, vHeadDim_, vHeadDimAlign_);
-            mm345.ComputeDv(l1PTensor[slot], dy, dv,
-                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                false);
-        } else {
-            auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
-                block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-            mm345.ComputeDv(l1PTensor[slot], dy, dv,
-                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                true);
+        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
+            block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+
+        // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
+        // with dv cube; subsequent C34 tasks in the group reuse it.
+        if (block.initDkv && qkHeadDim_ <= 128U) {
+            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
+                qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
 
+        // Reuse L1 dY from C2. Single AIC owns (b,n2,s2) → no GM atomic on dv.
+        mm345.ComputeDv(l1PTensor[slot], dv,
+            Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+            slot, block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
                 SYNC_C5_TO_V1_FLAG);
@@ -1243,31 +1329,20 @@ private:
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
             qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
-            qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        if constexpr (IS_DTM) {
-            const uint64_t detSlot =
-                ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
-                (block.blockId % waveSize_);
-            auto dq = MakeGmTensor(dqDetWorkspaceGm_, detSlot * dqDetSlotElems_,
-                block.s1Extend, qkHeadDim_, qkHeadDimAlign_);
-            auto dk = MakeGmTensor(dkDetWorkspaceGm_, detSlot * dkDetSlotElems_,
-                block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
-            mm345.ComputeDqDk(
-                l1dSTensor[slot], k, q, dq, dk,
-                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                false, false);
-        } else {
-            auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
-                block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-            auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
-                block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-            mm345.ComputeDqDk(
-                l1dSTensor[slot], k, q, dq, dk,
-                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                true, true);
-        }
+        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
+            block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
+            block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
+        // D<=128: waitResidentK on first task (C5 prefetched); later tasks hit
+        // resident K. D>128: ComputeDqDk streams K via DY scratch.
+        mm345.ComputeDqDk(
+            l1dSTensor[slot], k, dq, dk,
+            Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
+            slot,
+            /*waitResidentK=*/block.initDkv,
+            /*enAtomicDq=*/true,
+            block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
                 SYNC_C34_TO_V2_FLAG);
@@ -1318,20 +1393,27 @@ private:
 
         const uint32_t slot =
             static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
-            vHeadDim_, qHeadNum_ * vHeadDim_);
+        // Prefetch RowMajor K for the following C34 (D<=128).  Per-task group:
+        // the previous C34 released the resident slot on its flush.
+        if (qkHeadDim_ <= 128U) {
+            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
+                qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
+        }
+        // dY is already in L1 DY[slot] from C2; release it here.
         if (detPrivDkv_) {
             auto dv = MakeGmTensor(dvPrivGm_, bufIdx * dvPrivSlotElems_,
                 block.s2Extend, vHeadDim_, vHeadDimAlign_);
-            mm345.ComputeDv(l1PTensor[slot], dy, dv,
+            mm345.ComputeDv(l1PTensor[slot], dv,
                 Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                !firstOfBuf);
+                slot, /*initDv=*/true, /*flushDv=*/true,
+                /*enAtomicDv=*/!firstOfBuf);
         } else {
             auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
                 block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-            mm345.ComputeDv(l1PTensor[slot], dy, dv,
+            mm345.ComputeDv(l1PTensor[slot], dv,
                 Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                true);
+                slot, /*initDv=*/true, /*flushDv=*/true, /*enAtomicDv=*/true);
         }
 
         if (detPrivDkv_ && colEnd) {
@@ -1389,24 +1471,26 @@ private:
             static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
             qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
-            qkHeadDim_, qHeadNum_ * qkHeadDim_);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend,
             qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        // Q is read from L1 Q[slot] (loaded by C1), K from the resident slot
+        // (prefetched by C5) for D<=128; D>128 streams K through DY scratch.
         if (detPrivDkv_) {
             auto dk = MakeGmTensor(dkPrivGm_, bufIdx * dkPrivSlotElems_,
                 block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
             mm345.ComputeDqDk(
-                l1dSTensor[slot], k, q, dq, dk,
+                l1dSTensor[slot], k, dq, dk,
                 Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                true, !firstOfBuf);
+                slot, /*waitResidentK=*/true, /*enAtomicDq=*/true,
+                /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/!firstOfBuf);
         } else {
             auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
                 block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
             mm345.ComputeDqDk(
-                l1dSTensor[slot], k, q, dq, dk,
+                l1dSTensor[slot], k, dq, dk,
                 Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                true, true);
+                slot, /*waitResidentK=*/true, /*enAtomicDq=*/true,
+                /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/true);
         }
 
         if (detPrivDkv_ && colEnd) {
@@ -1441,6 +1525,8 @@ private:
     CATLASS_DEVICE
     uint32_t Mm12L1Offset() const
     {
+        // P/dS ping-pong occupies the front of L1; cube working tiles
+        // (RES_KT[+K half]/VT + Q0/Q1 + DY0/DY1) start after that.
         return 2U * TASK_PINGPONG * qBlockSize_ * kvBlockSize_ * sizeof(DataType);
     }
 #endif

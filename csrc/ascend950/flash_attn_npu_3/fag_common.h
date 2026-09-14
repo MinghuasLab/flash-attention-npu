@@ -179,6 +179,13 @@ struct FAGBlockInfo {
     uint64_t vOffset = 0;
     uint64_t doutOffset = 0;
 
+    // KV-group residency / local dk,dv accumulate control.
+    // One AIC owns a full (batch, n2, s2Block) group so K/V stay in L1 and
+    // dk/dv can accumulate in L0C until the last s1 of the group.
+    bool loadKv = true;
+    bool flushDkv = true;
+    bool initDkv = true;
+
     // BN2S2 only: fold accumulator index of this task and, for every fold
     // buffer of the current column, the real (batch, n2, s2) column that the
     // private dk/dv region accumulates.  Dense schedules use buffer 0 only.

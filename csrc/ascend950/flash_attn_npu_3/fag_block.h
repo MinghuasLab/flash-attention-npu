@@ -49,6 +49,32 @@ struct Ascend950FagL0CLayout {
     static constexpr uint32_t L0C_SDP_SLOT_NUM = 2;
 };
 
+// Shared cube L1 map after P/dS ping-pong (see Mm12L1Offset in fag_kernel.cpp).
+struct Ascend950FagL1Layout {
+    static constexpr uint32_t BASE = 128;
+    static constexpr uint32_t TASK_PINGPONG = 2;
+    static constexpr uint32_t SLOT_RES_KT = 0;
+    static constexpr uint32_t SLOT_RES_VT = 1;
+    static constexpr uint32_t SLOT_Q0 = 2;
+    static constexpr uint32_t SLOT_Q1 = 3;
+    static constexpr uint32_t SLOT_DY0 = 4;
+    static constexpr uint32_t SLOT_DY1 = 5;
+    static constexpr uint32_t SLOT_COUNT = 6;
+    // Hardware MTE1_MTE2 event id for RowMajor K packed above K^T (D<=BASE).
+    static constexpr uint32_t L1_EVENT_K = 6;
+    static constexpr uint32_t L1_EVENT_COUNT = 7;
+
+    CATLASS_DEVICE
+    static constexpr uint32_t QSlot(uint32_t taskPing) {
+        return taskPing ? SLOT_Q1 : SLOT_Q0;
+    }
+
+    CATLASS_DEVICE
+    static constexpr uint32_t DySlot(uint32_t taskPing) {
+        return taskPing ? SLOT_DY1 : SLOT_DY0;
+    }
+};
+
 
 // Ascend950 / Arch3501 FAG dQKV
 // Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.

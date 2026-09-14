@@ -247,6 +247,16 @@ mha_bwd(
         FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
     TORCH_CHECK(tiling_status == 0,
                 "Ascend950 v3 bwd: arch35 GetFAGTilingParam failed");
+    // The old in-loop VecDTM deterministic fallback was replaced by the cube
+    // BN2S2 schedule.  Any deterministic shape the tiler cannot map to BN2S2
+    // must fail loudly instead of silently running a non-deterministic loop.
+    if (deterministic) {
+        TORCH_CHECK(
+            fag_tiling_data.detSchedule ==
+                static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2),
+            "Ascend950 v3 bwd: deterministic backward requires the BN2S2 "
+            "schedule for this shape");
+    }
     at::Tensor tiling_cpu = at::empty(
         {static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))},
         at::device(c10::kCPU).dtype(at::kByte));
