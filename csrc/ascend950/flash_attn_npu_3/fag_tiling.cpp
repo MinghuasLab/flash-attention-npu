@@ -148,6 +148,83 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
                 return -1;
             }
             const bool gqa = tiling.groupSize != 1;
+            // Causal TND with per-batch sq == sk: opst's left-up causal schedule
+            // (CalTNDCausalIndex) then covers exactly the same block triangle as
+            // the right-down element mask, so it can replace dense+mask without
+            // changing semantics (the mask epilogue still handles the diagonal
+            // tiles).  Any batch with sq != sk keeps the dense schedule + mask,
+            // which is the only correct choice under right-down alignment.
+            if (info.maskType == MaskType::CAUSAL && !gqa) {
+                bool allSquare = true;
+                for (uint32_t b = 0; b < info.batch; ++b) {
+                    if (info.actualSeqQ[b] != info.actualSeqKv[b]) {
+                        allSquare = false;
+                        break;
+                    }
+                }
+                if (allSquare) {
+                    const fag_det_host::TndCausalParams tc =
+                        fag_det_host::ComputeTndCausalParams(
+                            static_cast<int64_t>(info.batch), info.actualSeqQ,
+                            info.actualSeqKv,
+                            static_cast<int64_t>(info.kvHeadNum),
+                            static_cast<int64_t>(info.aicNum), tiling.qTile,
+                            tiling.kvTile);
+                    if (tc.supported) {
+                        for (int64_t b = 0;
+                             b <= static_cast<int64_t>(info.batch) + 2 &&
+                             b < static_cast<int64_t>(TND_SWIZZLE_PREFIX_NUM);
+                             ++b) {
+                            tiling.tndPrefix[b] = tc.p0[b];
+                        }
+                        for (int64_t b = 0;
+                             b <= static_cast<int64_t>(info.batch) + 1 &&
+                             b < static_cast<int64_t>(TND_SWIZZLE_PREFIX_NUM);
+                             ++b) {
+                            tiling.tndCausalP1[b] = tc.p1[b];
+                            tiling.tndCausalP2[b] = tc.p2[b];
+                        }
+                        tiling.detKind = fag_det_host::KIND_TND_CAUSAL;
+                        tiling.detColumnRounds = 0;
+                        tiling.detBufNum = 1;
+                        // Columns may be covered by different lanes in
+                        // disjoint rounds, so dk/dv must be shared across lanes
+                        // (round barrier supplies the deterministic order).
+                        tiling.detPrivDkv = 0;
+                        tiling.detMaxRound =
+                            static_cast<uint64_t>(tc.maxRound);
+                        tiling.dqPostAbsorb = 0;
+                        tiling.continuousBlockNum = 1;
+                        tiling.dqVecNum = 0;
+                        tiling.dkVecNum = 0;
+                        tiling.dvVecNum = 0;
+                        const uint64_t dqWsSize =
+                            tiling.totalQ * tiling.qHeadNum * dAlign *
+                            FP32_BYTES;
+                        const uint64_t deltaWsSize =
+                            tiling.totalQ * tiling.qHeadNum * 8;
+                        tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
+                        const uint64_t dkWsSize = tiling.totalKv *
+                            tiling.kvHeadNum * dAlign * FP32_BYTES;
+                        const uint64_t dvWsSize = tiling.totalKv *
+                            tiling.kvHeadNum * dvAlign * FP32_BYTES;
+                        tiling.dkOffset = tiling.dqOffset +
+                            RoundUpU64(dqWsSize, GM_ALIGNMENT);
+                        tiling.dvOffset = tiling.dkOffset +
+                            RoundUpU64(dkWsSize, GM_ALIGNMENT);
+                        tiling.deltaOffset = tiling.dvOffset +
+                            RoundUpU64(dvWsSize, GM_ALIGNMENT);
+                        tiling.workspaceSize = tiling.deltaOffset +
+                            RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+                        tiling.dqDetOffset = 0;
+                        tiling.dkDetOffset = 0;
+                        tiling.dvDetOffset = 0;
+                        tiling.dkPrivOffset = 0;
+                        tiling.dvPrivOffset = 0;
+                        return 0;
+                    }
+                }
+            }
             if (!gqa && !fag_det_host::TndDenseSafe(
                     static_cast<int64_t>(info.batch), info.actualSeqQ,
                     info.actualSeqKv,
