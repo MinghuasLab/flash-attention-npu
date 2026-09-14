@@ -194,11 +194,16 @@ mha_bwd(
                     "Ascend950 v3 bwd: cu_seqlens must start at zero");
         actual_seq_q.resize(batch_size);
         actual_seq_kv.resize(batch_size);
+        bool tndAllNonEmpty = batch_size > 0;
         for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
             actual_seq_q[batch_idx] =
                 q_lengths[batch_idx + 1] - q_lengths[batch_idx];
             actual_seq_kv[batch_idx] =
                 kv_lengths[batch_idx + 1] - kv_lengths[batch_idx];
+            if (actual_seq_q[batch_idx] <= 0 ||
+                actual_seq_kv[batch_idx] <= 0) {
+                tndAllNonEmpty = false;
+            }
         }
         for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
             TORCH_CHECK(
@@ -222,13 +227,9 @@ mha_bwd(
         // Causal TND reuses the dense schedule with the causal mask applied
         // in the epilogue (masked blocks contribute exact zeros), same as
         // the rectangular BSND causal path.
-        if (deterministic &&
+        if (deterministic && tndAllNonEmpty &&
             batch_size + 1 <=
-                static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM) &&
-            (num_heads != num_heads_kv ||
-             fag_det_host::TndDenseSafe(
-                 batch_size, actual_seq_q.data(), actual_seq_kv.data(),
-                 num_heads_kv, static_cast<int64_t>(aic_num), 128, 128))) {
+                static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM)) {
             fag_info.actualSeqQ = actual_seq_q.data();
             fag_info.actualSeqKv = actual_seq_kv.data();
             fag_info.detSchedule =

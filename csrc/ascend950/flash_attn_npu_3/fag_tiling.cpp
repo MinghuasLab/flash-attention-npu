@@ -225,19 +225,18 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
                     }
                 }
             }
-            if (!gqa && !fag_det_host::TndDenseSafe(
-                    static_cast<int64_t>(info.batch), info.actualSeqQ,
-                    info.actualSeqKv,
-                    static_cast<int64_t>(info.kvHeadNum),
-                    static_cast<int64_t>(info.aicNum), tiling.qTile,
-                    tiling.kvTile)) {
-                fprintf(stderr,
-                    "FAG950 det bn2s2 tnd: s1Outer < min(k, s2Outer) for some batch\n");
-                return -1;
-            }
+            // MHA swizzle requires s1Outer >= min(k, s2Outer) for every batch
+            // (intra-round dq uniqueness).  Ragged MHA shapes that violate it
+            // take the same flat blocked partition as GQA with the shared
+            // dk/dv workspaces (a column may straddle two lanes' slices).
+            const bool flat = gqa || !fag_det_host::TndDenseSafe(
+                static_cast<int64_t>(info.batch), info.actualSeqQ,
+                info.actualSeqKv, static_cast<int64_t>(info.kvHeadNum),
+                static_cast<int64_t>(info.aicNum), tiling.qTile,
+                tiling.kvTile);
             int64_t prefix[TND_SWIZZLE_PREFIX_NUM] = {0};
             int64_t maxRound = 0;
-            if (gqa) {
+            if (flat) {
                 int64_t s1Max = 0;
                 int64_t s2Max = 0;
                 for (int64_t b = 0; b < static_cast<int64_t>(info.batch); ++b) {
@@ -276,11 +275,11 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
                  ++b) {
                 tiling.tndPrefix[b] = prefix[b];
             }
-            tiling.detKind = gqa ? fag_det_host::KIND_TND_GQA_DENSE
-                                 : fag_det_host::KIND_TND_DENSE;
+            tiling.detKind = flat ? fag_det_host::KIND_TND_GQA_DENSE
+                                  : fag_det_host::KIND_TND_DENSE;
             tiling.detColumnRounds = 0;  // column end uses coordinate comparison
             tiling.detBufNum = 1;
-            tiling.detPrivDkv = gqa ? 0U : 1U;
+            tiling.detPrivDkv = flat ? 0U : 1U;
             tiling.detMaxRound = static_cast<uint64_t>(maxRound);
             tiling.dqPostAbsorb = 0;
             tiling.continuousBlockNum = 1;
@@ -292,7 +291,7 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
                 tiling.totalQ * tiling.qHeadNum * dAlign * FP32_BYTES;
             const uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
             tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
-            if (gqa) {
+            if (flat) {
                 // Shared dk/dv workspaces (same as the BSND GQA path).
                 const uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum *
                     dAlign * FP32_BYTES;
