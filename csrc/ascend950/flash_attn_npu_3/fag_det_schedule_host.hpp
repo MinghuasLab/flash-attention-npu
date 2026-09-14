@@ -25,6 +25,7 @@ enum Kind : uint32_t {
     KIND_GQA_DENSE = 5,
     KIND_TND_DENSE = 6,
     KIND_TND_GQA_DENSE = 7,
+    KIND_TND_CAUSAL = 8,
 };
 
 inline int64_t HMin(int64_t a, int64_t b) { return a < b ? a : b; }
@@ -176,6 +177,84 @@ inline bool TndDenseSafe(
 
 // TND dense: exclusive end round of each batch, mirroring opst
 // CalcTNDSwizzleParam.  Returns prefix[batch] (the total schedule rounds).
+// ---------------------------------------------------------------------------
+// opst CalcleTNDCausalDeterPrefix/ParamNormal (MHA, step = 1): three prefix
+// tables + tail round counts for the left-up causal schedule.  Only used when
+// the shape is covered (batch small, MHA); the caller falls back to the dense
+// schedule + causal mask otherwise.
+// ---------------------------------------------------------------------------
+struct TndCausalParams {
+    bool supported = false;
+    int64_t maxRound = 0;
+    int64_t p0[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t p1[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t p2[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+};
+
+inline TndCausalParams ComputeTndCausalParams(
+    int64_t batch, const int64_t *seqQ, const int64_t *seqKv, int64_t n2,
+    int64_t k, int64_t qTile, int64_t kvTile)
+{
+    TndCausalParams out{};
+    // step = 1 layout needs batch + 3 prefix slots (p0 tail has two entries).
+    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || n2 <= 0 ||
+        k <= 0 || qTile <= 0 || kvTile <= 0 ||
+        batch + 2 >= static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM)) {
+        return out;
+    }
+    int64_t p0[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t p1[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t p2[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t m0Max = 0, m1Max = 0, m2Max = 0;
+    const int64_t N12 = (n2 % k) % 2;
+    for (int64_t i = 0; i < batch; ++i) {
+        if (seqQ[i] <= 0 || seqKv[i] <= 0) {
+            return out;
+        }
+        const int64_t m = HCeil(seqQ[i], qTile);
+        int64_t n = HCeil(seqKv[i], kvTile);
+        if (m < n) {
+            n = m;
+        }
+        m0Max = HMax(m0Max, 2 * m - n + 1);
+        p0[i + 1] = p0[i] + (2 * m - n + 1) * n;
+        if (N12 > 0) {
+            p1[i + 1] = p1[i] + (m - (n + 1) / 2 + 1) * (n / 2);
+            m1Max = HMax(m1Max, m - (n + 1) / 2 + 1);
+            p2[i + 1] = p2[i] + (m - n / 2) * ((n + 1) / 2);
+            m2Max = HMax(m2Max, m - n / 2);
+        }
+    }
+    const int64_t N11 = (n2 % k) / 2;
+    const int64_t N12b = (n2 % k) % 2;
+    const int64_t prefix0Max1 = p0[batch] / 2 * (n2 / k);
+    const int64_t prefix0Max2 = HMax(HCeil(p0[batch] * N11, k), m0Max);
+    int64_t total = prefix0Max1;
+    p0[batch + 1] = prefix0Max1;
+    if (N11 > 0) {
+        p0[batch + 2] = prefix0Max2;
+        total += prefix0Max2;
+    } else {
+        p0[batch + 2] = 0;
+    }
+    if (N12b > 0) {
+        const int64_t r1 = HMax(HCeil(p1[batch], k), m1Max);
+        const int64_t r2 = HMax(HCeil(p2[batch], k), m2Max);
+        p1[batch + 1] = r1;
+        p2[batch + 1] = r2;
+        total += r1 + r2;
+    }
+    // N12b == 0: p1/p2 stay zero-initialized (R1 = R2 = 0).
+    for (int64_t i = 0; i < static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM); ++i) {
+        out.p0[i] = p0[i];
+        out.p1[i] = p1[i];
+        out.p2[i] = p2[i];
+    }
+    out.maxRound = total;
+    out.supported = total > 0;
+    return out;
+}
+
 inline int64_t TndDensePrefix(
     int64_t batch, const int64_t *seqQ, const int64_t *seqKv, int64_t n1,
     int64_t k, int64_t qTile, int64_t kvTile, int64_t *prefix)

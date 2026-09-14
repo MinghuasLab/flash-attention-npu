@@ -67,6 +67,7 @@ enum Kind : uint32_t {
     KIND_GQA_DENSE = 5,           // opst CalGQADenseIndex
     KIND_TND_DENSE = 6,           // opst CalTNDDenseSwizzleIndex (ragged MHA)
     KIND_TND_GQA_DENSE = 7,       // opst CalTNDDenseIndex !IS_N_EQUAL (ragged GQA)
+    KIND_TND_CAUSAL = 8,          // opst CalTNDCausalIndex (ragged causal MHA)
 };
 
 struct Shape {
@@ -568,6 +569,283 @@ FAG_DET_AICORE bool CalTNDDenseGqaIndex(
     out.batch = w;
     out.n2 = deltaN - 1;
     out.g = n1Id - 1;
+    out.s1 = x - 1;
+    out.s2 = y - 1;
+    out.valid = true;
+    out.parity = 0;
+    out.foldCount = 1;
+    out.foldValid[0] = 1;
+    out.foldValid[1] = 0;
+    out.foldBatch[0] = out.batch;
+    out.foldN2[0] = out.n2;
+    out.foldG[0] = out.g;
+    out.foldS2[0] = out.s2;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// opst CalTNDCausalIndex (MHA): left-up causal decomposition of a ragged TND
+// batch set.  Host serializes three prefix tables (p0/p1/p2) plus the tail
+// round counts; each (round, lane) maps to one *real* tile of the causal
+// triangle (verified in .docs/scratch/tnd_causal_schedule.py: coverage ==
+// exact triangle, no duplicates, same-round dq keys / columns distinct, so
+// the shared dk/dv workspace + round barrier is deterministic).
+//
+// step = 1 only (batch <= 128); the host falls back to dense+mask otherwise.
+// ---------------------------------------------------------------------------
+FAG_DET_AICORE void CalVirtualIndex(int64_t flag, int64_t &m, int64_t &n)
+{
+    if (m < n) {
+        n = m;
+    }
+    if (flag == 0) {
+        m = 2 * m - n + 1;
+    } else if (flag == 1) {
+        m = m - (n + 1) / 2 + 1;
+        n = n / 2;
+    } else {
+        m = m - n / 2;
+        n = (n + 1) / 2;
+    }
+}
+
+FAG_DET_AICORE void CalCausalPosWholeBatch(
+    int64_t m, int64_t n, int64_t a, int64_t &x, int64_t &y)
+{
+    const int64_t n1 = n / 2 * 2;
+    const int64_t L = 2 * m - n1 + 1;
+    const int64_t rmLocal = n1 * L / 2;
+    if (a <= rmLocal) {
+        y = DetCeil(a, L);
+        int64_t r1 = a % L;
+        r1 = (r1 != 0) ? r1 : L;
+        x = r1 + y - 1;
+        if (x > m) {
+            x = 2 * m + 1 - x;
+            y = n1 + 1 - y;
+        }
+    } else {
+        const int64_t a1 = a - rmLocal;
+        y = n;
+        x = a1 - 1 + y;
+    }
+}
+
+// Inner decode (flag picks the virtual rectangle).  Outputs the 1-based
+// combined head index comb = batch * n1 + deltaN and the virtual (x, y).
+template <typename CuPtr, typename PrefixPtr>
+FAG_DET_AICORE bool CalTNDDenseCausalIndex(
+    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr prefix,
+    int64_t deterMaxRound, int64_t innerN1, int64_t flag,
+    int64_t j, int64_t r, int64_t &comb, int64_t &x, int64_t &y,
+    int64_t &realM, int64_t &realN)
+{
+    if (cuQ == nullptr || cuK == nullptr || prefix == nullptr ||
+        j < 1 || j > s.coreNum || r < 1 || r > deterMaxRound) {
+        return false;
+    }
+    const int64_t ID = (j - 1) * deterMaxRound + r;
+    int64_t w = 0;
+    while ((w + 1) < s.batch && ID > prefix[w + 1] * innerN1) {
+        ++w;
+    }
+    if (w >= s.batch) {
+        return false;
+    }
+    const int64_t qStart = w == 0 ? 0 : static_cast<int64_t>(cuQ[w - 1]);
+    const int64_t kvStart = w == 0 ? 0 : static_cast<int64_t>(cuK[w - 1]);
+    const int64_t s1Len = static_cast<int64_t>(cuQ[w]) - qStart;
+    const int64_t s2Len = static_cast<int64_t>(cuK[w]) - kvStart;
+    if (s1Len <= 0 || s2Len <= 0) {
+        return false;
+    }
+    realM = DetCeil(s1Len, s.qTile);
+    realN = DetCeil(s2Len, s.kvTile);
+    int64_t vm = realM;
+    int64_t vn = (realM < realN) ? realM : realN;
+    CalVirtualIndex(flag, vm, vn);
+    const int64_t base = vm * vn;
+    int64_t delta = ID - prefix[w] * innerN1;
+    const int64_t deltaN = (delta - 1) / base + 1;
+    delta = delta % base;
+    if (delta == 0) {
+        delta = base;
+    }
+    const int64_t gd = DetGcd(vm, deterMaxRound);
+    const int64_t t1 = deterMaxRound / gd;
+    const int64_t t2 = vm / gd;
+    x = (delta - 1) % vm + 1;
+    y = (delta - 1) / vm + 1;
+    if (t1 < vn) {
+        int64_t nTail = vn % t1;
+        nTail = (nTail != 0) ? nTail : t1;
+        if (y <= vn - nTail) {
+            const int64_t adj = DetCeil(y, t1);
+            delta += adj;
+            if (delta > adj * t2 * deterMaxRound) {
+                delta -= t2 * deterMaxRound;
+            }
+            x = (delta - 1) % vm + 1;
+            y = (delta - 1) / vm + 1;
+        }
+    }
+    comb = w * innerN1 + deltaN;
+    return true;
+}
+
+template <typename CuPtr>
+FAG_DET_AICORE int64_t TndBatchOuterQ(const Shape &s, CuPtr cuQ, int64_t bIdx)
+{
+    const int64_t qs = bIdx == 0 ? 0 : static_cast<int64_t>(cuQ[bIdx - 1]);
+    return DetCeil(static_cast<int64_t>(cuQ[bIdx]) - qs, s.qTile);
+}
+
+template <typename CuPtr>
+FAG_DET_AICORE int64_t TndBatchOuterK(const Shape &s, CuPtr cuK, int64_t bIdx)
+{
+    const int64_t ks = bIdx == 0 ? 0 : static_cast<int64_t>(cuK[bIdx - 1]);
+    return DetCeil(static_cast<int64_t>(cuK[bIdx]) - ks, s.kvTile);
+}
+
+template <typename CuPtr, typename PrefixPtr>
+FAG_DET_AICORE bool CalTNDCausalIndex(
+    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr p0, PrefixPtr p1,
+    PrefixPtr p2, int64_t maxRound, int64_t j, int64_t r, Coord &out)
+{
+    out = Coord{};
+    if (p0 == nullptr || maxRound <= 0 ||
+        j < 1 || j > s.coreNum || r < 1 || r > maxRound) {
+        return false;
+    }
+    const int64_t N1 = s.kvHeadNum * s.groupNum;   // g == 1 -> kvHeadNum
+    const int64_t N11 = (s.kvHeadNum % s.coreNum) / 2;   // inner n2 (segment 2)
+    const int64_t maxIdx = s.batch + 1;            // step == 1
+    const int64_t R01 = p0[maxIdx];
+    const int64_t R02 = p0[maxIdx + 1];
+    const int64_t R0 = R01 + R02;
+    const int64_t R1 = p1 != nullptr ? p1[maxIdx] : 0;
+    const int64_t R2 = p2 != nullptr ? p2[maxIdx] : 0;
+
+    int64_t batch = 0;
+    int64_t hn2 = 0;
+    int64_t x = 0;
+    int64_t y = 0;
+    int64_t realM = 0;
+    int64_t realN = 0;
+
+
+    if (r <= R01) {
+        const int64_t N10 = N1 / s.coreNum;
+        if (N10 <= 0) {
+            return false;
+        }
+        const int64_t aJudge = DetCeil(r * 2, N10);
+        int64_t w = 0;
+        while ((w + 1) < s.batch && aJudge > p0[w + 1]) {
+            ++w;
+        }
+        if (w >= s.batch) {
+            return false;
+        }
+        int64_t a = r - p0[w] * N10 / 2;
+        int64_t m = TndBatchOuterQ(s, cuQ, w);
+        int64_t n = TndBatchOuterK(s, cuK, w);
+        n = (m < n) ? m : n;
+        int64_t roundBatch = (2 * m - n + 1) * n / 2;
+        while (a > roundBatch * N10) {
+            a -= roundBatch * N10;
+            ++w;
+            if (w >= s.batch) {
+                return false;
+            }
+            m = TndBatchOuterQ(s, cuQ, w);
+            n = TndBatchOuterK(s, cuK, w);
+            n = (m < n) ? m : n;
+            roundBatch = (2 * m - n + 1) * n / 2;
+        }
+        int64_t a0 = a % roundBatch;
+        a0 = (a0 != 0) ? a0 : roundBatch;
+        int64_t cx = 0;
+        int64_t cy = 0;
+        CalCausalPosWholeBatch(m, n, a0, cx, cy);
+        int64_t ww = (a - 1) / roundBatch * s.coreNum + j;
+        ww = ((ww - 1) / s.coreNum) * s.coreNum +
+             ((cy - 1 + (ww - 1)) % s.coreNum) + 1;
+        const int64_t head = w * N1 + ww;
+        batch = (head - 1) / N1;
+        hn2 = (head - 1) % N1 + 1;
+        x = cx;
+        y = cy;
+        realM = m;
+        realN = n;
+    } else {
+        int64_t comb = 0;
+        int64_t cx = 0;
+        int64_t cy = 0;
+        if (r <= R0) {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p0, R02, N11, 0,
+                                        j, r - R01, comb, cx, cy, realM, realN)) {
+                return false;
+            }
+            const int64_t b1 = DetCeil(comb, N11);
+            int64_t b2 = comb % N11;
+            b2 = (b2 != 0) ? b2 : N11;
+            const int64_t m = realM;
+            int64_t n = (m < realN) ? m : realN;
+            if (cx >= cy + m - n + 1) {
+                x = cx - (m - n + 1);
+                y = cy;
+                b2 = 2 * b2 - 1;
+            } else {
+                x = m + 1 - cx;
+                y = n + 1 - cy;
+                b2 = 2 * b2;
+            }
+            const int64_t head = (b1 - 1) * N1 + (N1 / s.coreNum) * s.coreNum + b2;
+            batch = (head - 1) / N1;
+            hn2 = (head - 1) % N1 + 1;
+        } else if (r <= R0 + R1) {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p1, R1, 1, 1,
+                                        j, r - R0, comb, cx, cy, realM, realN)) {
+                return false;
+            }
+            const int64_t m = realM;
+            int64_t n = (m < realN) ? m : realN;
+            if (cx >= cy + m - n + 1) {
+                x = cx - (m - n + 1);
+                y = cy;
+            } else {
+                x = m + 1 - cx;
+                y = n + 1 - cy;
+            }
+            const int64_t head = comb * N1;
+            batch = (head - 1) / N1;
+            hn2 = (head - 1) % N1 + 1;
+        } else {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p2, R2, 1, 2,
+                                        j, r - R0 - R1, comb, cx, cy, realM, realN)) {
+                return false;
+            }
+            int64_t n = (realM < realN) ? realM : realN;
+            x = cx + n / 2;
+            y = cy;
+            const int64_t head = comb * N1;
+            batch = (head - 1) / N1;
+            hn2 = (head - 1) % N1 + 1;
+        }
+    }
+
+    if (batch < 0 || batch >= s.batch || hn2 < 1 || hn2 > s.kvHeadNum) {
+        return false;
+    }
+    const int64_t chkM = TndBatchOuterQ(s, cuQ, batch);
+    const int64_t chkN = TndBatchOuterK(s, cuK, batch);
+    if (x < 1 || x > chkM || y < 1 || y > chkN) {
+        return false;
+    }
+    out.batch = batch;
+    out.n2 = hn2 - 1;
+    out.g = 0;
     out.s1 = x - 1;
     out.s2 = y - 1;
     out.valid = true;

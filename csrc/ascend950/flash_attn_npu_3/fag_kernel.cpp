@@ -712,6 +712,16 @@ private:
                             static_cast<int64_t>(core) + 1,
                             static_cast<int64_t>(round) + 1,
                             static_cast<int64_t>(tiling_->detMaxRound), c);
+                } else if (detKind_ ==
+                           static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
+                    ok = cuSeqQPtr_ != nullptr && cuSeqKvPtr_ != nullptr &&
+                        fag_det::CalTNDCausalIndex(
+                            detShape_, cuSeqQPtr_, cuSeqKvPtr_,
+                            tiling_->tndPrefix, tiling_->tndCausalP1,
+                            tiling_->tndCausalP2,
+                            static_cast<int64_t>(tiling_->detMaxRound),
+                            static_cast<int64_t>(core) + 1,
+                            static_cast<int64_t>(round) + 1, c);
                 } else {
                     ok = fag_det::Decode(
                         static_cast<fag_det::Kind>(detKind_), detShape_,
@@ -722,6 +732,22 @@ private:
                     return false;
                 }
                 FillBlockInfoBn2s2(blockId, c, block);
+                // Causal mask is right-down aligned (j <= i + (sk - sq)); a block
+                // entirely above the diagonal contributes exact zeros, so skip it
+                // and let the dense schedule pay only for the causal region.
+                // Semantic no-op (the epilogue would mask the whole block).
+                if (tiling_->maskType != 0 && detBufNum_ <= 1 &&
+                    detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
+                    detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
+                    const int64_t diagOffset =
+                        static_cast<int64_t>(block.curBatchS2) -
+                        static_cast<int64_t>(block.curBatchS1);
+                    if (static_cast<int64_t>(block.s2Start) >
+                        static_cast<int64_t>(block.s1Start) +
+                            static_cast<int64_t>(block.s1Extend) - 1 + diagOffset) {
+                        return false;
+                    }
+                }
                 return true;
             }
         }

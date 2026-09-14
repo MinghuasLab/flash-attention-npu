@@ -129,6 +129,9 @@ struct FAGTilingData {
     uint64_t dvPrivOffset = 0;  // per-core dv fp32 accumulation region
     // TND BN2S2: exclusive end round of each batch (prefix[B] = detMaxRound).
     int64_t tndPrefix[TND_SWIZZLE_PREFIX_NUM] = {0};
+    // TND causal (KIND_TND_CAUSAL): diagonal-band prefix tables p1/p2.
+    int64_t tndCausalP1[TND_SWIZZLE_PREFIX_NUM] = {0};
+    int64_t tndCausalP2[TND_SWIZZLE_PREFIX_NUM] = {0};
 
     uint64_t dqOffset = 0;
     uint64_t dkOffset = 0;
