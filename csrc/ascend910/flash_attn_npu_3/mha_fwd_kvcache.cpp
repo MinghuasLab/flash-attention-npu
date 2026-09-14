@@ -378,17 +378,19 @@ namespace SplitFuse {
                                 pipelineDrain = PRE_LAUNCH;
                             }
 
-                            runMainLoop(
+                            const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+                            const bool hasTaskWork = runMainLoop(
                                 coreIdx, BIdx, (uint32_t)n1Idx, (uint32_t)s1Idx,
                                 isSplitKV, stS2IdxNow, enS2IdxNow,
                                 gmOffsetLseFD, gmOffsetOFD,
                                 globalTensors,
                                 descriptors,
-                                taskStateSequence,
+                                currentTaskStateSlot,
                                 issuedStackCount,
                                 pipelineDrain,
                                 softmaxPingPongFlag
                             );
+                            taskStateSequence += static_cast<uint32_t>(hasTaskWork);
 
                             if (isSplitKV) {
                                 uint32_t qSBlockSizeTmp = (s1Idx == static_cast<int32_t>(curQSBlockNumTmp - 1U)) ?
@@ -457,17 +459,19 @@ namespace SplitFuse {
                         pipelineDrain = PRE_LAUNCH;
                     }
 
-                    runMainLoop(
+                    const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+                    const bool hasTaskWork = runMainLoop(
                         coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur,
                         false, 0, 0,
                         0, 0,
                         globalTensors,
                         descriptors,
-                        taskStateSequence,
+                        currentTaskStateSlot,
                         issuedStackCount,
                         pipelineDrain,
                         softmaxPingPongFlag
                     );
+                    taskStateSequence += static_cast<uint32_t>(hasTaskWork);
                 }
             }
 
@@ -538,7 +542,7 @@ namespace SplitFuse {
             }
         }
 
-        __aicore__ inline void runMainLoop(
+        __aicore__ inline bool runMainLoop(
             uint32_t coreIdx,
             uint32_t BIdx,
             uint32_t qNBlockIdx,
@@ -550,7 +554,7 @@ namespace SplitFuse {
             uint64_t gmOffsetOFD,
             GlobalTensorBundle& globalTensors,
             StackDescriptor (&descriptors)[STACK_SLOTS],
-            uint32_t& taskStateSequence,
+            const uint32_t& currentTaskStateSlot,
             uint32_t& issuedStackCount,
             uint32_t pipelineDrain,
             uint32_t& softmaxPingPongFlag
@@ -782,7 +786,7 @@ namespace SplitFuse {
             uint32_t taskStackCount = 0;
 
             const bool isEmptyTask = kvStart >= kvEnd;
-            if (isEmptyTask) {
+            if (__builtin_expect(isEmptyTask, false)) {
 #ifdef __DAV_C220_VEC__
                 if (!isSplitKV) {
                     LayoutO layoutOInit(qSeqlen, embed * qHeads);
@@ -792,15 +796,10 @@ namespace SplitFuse {
                 }
 #endif
                 if (pipelineDrain == 0) {
-                    return;
+                    return false;
                 }
                 // A final empty task still drains the preceding tasks' delayed PV.
                 kvStart = kvEnd;
-            }
-
-            const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
-            if (!isEmptyTask) {
-                ++taskStateSequence;
             }
 
 #ifdef __DAV_C220_CUBE__
@@ -1242,6 +1241,7 @@ namespace SplitFuse {
                 ++issuedStackCount;
                 ++taskStackCount;
             }
+            return !isEmptyTask;
         }
 
     private:
