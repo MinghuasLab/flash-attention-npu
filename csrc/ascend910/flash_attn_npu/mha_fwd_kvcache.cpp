@@ -392,16 +392,13 @@ namespace SplitFuse {
                                 pipelineDrain = PRE_LAUNCH;
                             }
 
-                            const uint32_t currentTaskStateSlot =  taskStateSequence % STACK_SLOTS;
-                            ++taskStateSequence;
-
                             runMainLoop(
                                 coreIdx, BIdx, (uint32_t)n1Idx, (uint32_t)s1Idx,
                                 isSplitKV, stS2IdxNow, enS2IdxNow,
                                 gmOffsetLseFD, gmOffsetOFD,
                                 globalTensors,
                                 descriptors,
-                                currentTaskStateSlot,
+                                taskStateSequence,
                                 issuedStackCount,
                                 pipelineDrain,
                                 softmaxPingPongFlag
@@ -465,8 +462,8 @@ namespace SplitFuse {
 
                     uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
 
-                    uint32_t qNBlockIdxCur = taskIdxCurBatch / curQSBlockNumCur;
-                    uint32_t qSBlockIdxCur = taskIdxCurBatch - qNBlockIdxCur * curQSBlockNumCur;
+                    uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
+                    uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
 
 
                     uint32_t pipelineDrain = 0;
@@ -474,16 +471,13 @@ namespace SplitFuse {
                         pipelineDrain = PRE_LAUNCH;
                     }
 
-                    const uint32_t currentTaskStateSlot =  taskStateSequence % STACK_SLOTS;
-                    ++taskStateSequence;
-
                     runMainLoop(
                         coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur,
                         false, 0, 0,
                         0, 0,
                         globalTensors,
                         descriptors,
-                        currentTaskStateSlot,
+                        taskStateSequence,
                         issuedStackCount,
                         pipelineDrain,
                         softmaxPingPongFlag
@@ -570,7 +564,7 @@ namespace SplitFuse {
             uint64_t gmOffsetOFD,
             GlobalTensorBundle& globalTensors,
             StackDescriptor (&descriptors)[STACK_SLOTS],
-            const uint32_t& currentTaskStateSlot,
+            uint32_t& taskStateSequence,
             uint32_t& issuedStackCount,
             uint32_t pipelineDrain,
             uint32_t& softmaxPingPongFlag
@@ -807,8 +801,8 @@ namespace SplitFuse {
             uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
             uint32_t taskStackCount = 0;
 
-            // Empty after split\cap window (GPU early exit). Split partials host-inited to 0/-inf.
-            if (kvStart >= kvEnd) {
+            const bool isEmptyTask = kvStart >= kvEnd;
+            if (isEmptyTask) {
 #ifdef __DAV_C220_VEC__
                 if (!isSplitKV) {
                     LayoutO layoutOInit(qSeqlen, embed * qHeads);
@@ -817,7 +811,16 @@ namespace SplitFuse {
                     epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize);
                 }
 #endif
-                return;
+                if (pipelineDrain == 0) {
+                    return;
+                }
+                // A final empty task still drains the preceding tasks' delayed PV.
+                kvStart = kvEnd;
+            }
+
+            const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+            if (!isEmptyTask) {
+                ++taskStateSequence;
             }
 
 #ifdef __DAV_C220_VEC__
@@ -831,8 +834,10 @@ namespace SplitFuse {
             LayoutQ layoutQTemp(rowNum, embed);
             LayoutK layoutKTemp(strideK, stackSeqTile);
             LayoutV layoutVTemp(stackSeqTile, strideV);
-            blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
-            blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
+            if (!isEmptyTask) {
+                blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
+                blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
+            }
 #endif
             for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + pipelineDrain; kvSIdx++) {
                 if (kvSIdx < kvEnd) {
