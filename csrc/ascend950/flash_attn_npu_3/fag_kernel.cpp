@@ -125,10 +125,14 @@ public:
             dvPrivGm_.SetGlobalBuffer(
                 (__gm__ float *)(params.workspace + tiling_->dvPrivOffset));
         }
-        dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dk));
-        dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dv));
-        cuSeqQPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqQlen);
-        cuSeqKvPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqKvlen);
+        if constexpr (IS_DTM) {
+            // BN2S2 cast outputs / TND length pointers (unused by the
+            // non-deterministic instantiation).
+            dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dk));
+            dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dv));
+            cuSeqQPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqQlen);
+            cuSeqKvPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqKvlen);
+        }
 
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
         qSeqlen_ = static_cast<uint32_t>(tiling_->qSeqlen);
@@ -142,8 +146,10 @@ public:
         kvBlockSize_ = tiling_->kvTile;
         coreNum_ = tiling_->usedCoreNum;
         continuousBlockNum_ = tiling_->continuousBlockNum;
-        dtmVecCoreNum_ =
-            tiling_->dqVecNum + tiling_->dkVecNum + tiling_->dvVecNum;
+        if constexpr (IS_DTM) {
+            dtmVecCoreNum_ =
+                tiling_->dqVecNum + tiling_->dkVecNum + tiling_->dvVecNum;
+        }
         waveSize_ =
             static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
         scaleValue_ = tiling_->scaleValue;
@@ -381,10 +387,12 @@ private:
         pVWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
         dSVWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
         dSVWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
-        // BN2S2 dk/dv cast (AIV): single alternating set shared by dk and dv.
-        castMte3ToMte2_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
-        castMte2ToV_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
-        castVToMte3_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        if constexpr (IS_DTM) {
+            // BN2S2 dk/dv cast (AIV): single alternating set shared by dk/dv.
+            castMte3ToMte2_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
+            castMte2ToV_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+            castVToMte3_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        }
     }
 
     CATLASS_DEVICE
@@ -1449,10 +1457,12 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pVWaitMte3Pong);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Ping);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Pong);
-        if (detBn2s2_) {
-            // One-time arm; subsequent Set/Wait strictly alternate across
-            // cast chunks and flush points.
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
+        if constexpr (IS_DTM) {
+            if (detBn2s2_) {
+                // One-time arm; subsequent Set/Wait strictly alternate
+                // across cast chunks and flush points.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
+            }
         }
     }
 
