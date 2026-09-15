@@ -196,7 +196,7 @@ def flash_attn_with_kvcache(
             query i 和 key j 的注意力分数上。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -268,7 +268,7 @@ def flash_attn_func(
             返回的概率不保证正确（缩放可能不正确）。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -353,7 +353,7 @@ def flash_attn_varlen_func(
         block_table [可选]: 分页 KV 缓存的块表。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -459,7 +459,7 @@ def flash_attn_with_kvcache(
         return_softmax_lse: bool。是否返回注意力分数的 logsumexp。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -537,7 +537,7 @@ def flash_attn_func(
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -615,7 +615,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
@@ -709,7 +709,7 @@ def flash_attn_varlen_func(
         return_lse: bool。是否返回 attention scores 的 logsumexp。
 
     约束：
-        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - 1 <= headdim <= 256。
         - nheads % nheads_k == 0。
         - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。

@@ -201,7 +201,7 @@ def flash_attn_with_kvcache(
             Add bias to the attention scores of query i and key j of (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -275,7 +275,7 @@ def flash_attn_func(
             (they might not have the right scaling).
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -362,7 +362,7 @@ def flash_attn_varlen_func(
         block_table [optional]: Block table for paged KV cache.
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -469,7 +469,7 @@ def flash_attn_with_kvcache(
         return_softmax_lse: bool. Whether to return logsumexp of attention scores.
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -549,7 +549,7 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -628,7 +628,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
@@ -751,7 +751,7 @@ def flash_attn_varlen_func(
         return_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Constraints:
-        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - 1 <= headdim <= 256.
         - nheads % nheads_k == 0.
         - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).

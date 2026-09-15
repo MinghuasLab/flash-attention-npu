@@ -288,7 +288,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     const int page_block_size = !paged_KV ? 128 : k.size(1);
     const int num_heads_k = k.dim() == 3 ? k.size(1) : k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
+    TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256, "FlashAttention only supports head dimension in [1, 256]");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // If seqused_k_ was not provided, derive seqlens_k from tensor shapes or cu_seqlens_k
