@@ -337,6 +337,10 @@ test_cases = [
     # 5) Sk>>Sq left-infinite band (complement; no empty prefix)
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0),
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 1, 128, False, "TND", False, -1, 100, 0),
+    # 6) GQA empty-prefix O-clear (causal window=(0,0), two O tiles)
+    (torch.float16, 9, 86, 1, 9, 1, 172, 0, 128, True, "BSND", False, 0, 0, 0),
+    # 7) GQA empty-prefix O-clear (bidir window=(0,1), paged TND, two O tiles)
+    (torch.bfloat16, 1, 15, 1, 15, 3, 192, 1, 128, False, "TND", False, 0, 1, 0),
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits", test_cases)
 def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits):
