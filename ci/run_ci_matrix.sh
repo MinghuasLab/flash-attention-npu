@@ -21,6 +21,8 @@
 #   CI_DOCKER_PRIVILEGED  (默认 true)
 #   CI_CONTAINER_SCOPE   （默认 -local-$(id -u)-$$）当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_VERSION (默认 all) 编译哪些 API 代 (all/v2/v3/v4)
+#   PROXY_CONFIG_FILE (默认 /home/FA_NPU_CI_DATA/proxy.conf)
+#   CI_HTTP_PROXY / CI_HTTPS_PROXY / CI_NO_PROXY (可选, 覆盖代理配置)
 
 set -euo pipefail
 
@@ -38,9 +40,14 @@ PID_DIR="$LOG_DIR/pids"
 # 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
 ARCH_FILTER="${ARCH_FILTER:-}"
 
+# shellcheck source=ci/docker_proxy.sh
+source "$SCRIPT_DIR/docker_proxy.sh"
+docker_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
+
 log() { printf '[matrix-build] %s\n' "$*"; }
 die() { printf '[matrix-build][ERROR] %s\n' "$*" >&2; exit 1; }
 
+# shellcheck disable=SC2317
 cleanup_on_signal() {
   log "received cancel/terminate signal, stopping matrix docker clients for scope=$CI_CONTAINER_SCOPE"
   shopt -s nullglob
@@ -118,7 +125,6 @@ fi
 log "logs dir: $LOG_DIR"
 
 # ---------- 1. 预初始化子模块 (单容器一次) ----------
-first_name="${COMBOS[0]%%|*}"
 first_img="$(combo_image "${COMBOS[0]}")"
 log "pre-init submodule csrc/catlass (once, via $first_img)"
 preinit_pidfile="$PID_DIR/preinit.pid"
@@ -127,6 +133,7 @@ set +e
 docker run --rm \
   --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
   "${privileged_args[@]}" \
+  "${DOCKER_PROXY_ENV_ARGS[@]}" \
   --network host \
   -v "$REPO_ROOT:/workspace/flash-attention-npu" \
   -w /workspace/flash-attention-npu \
@@ -157,6 +164,7 @@ build_one() {
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
+    "${DOCKER_PROXY_ENV_ARGS[@]}" \
     --network host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
     -e FLASH_ATTN_FORCE_BUILD=TRUE \
