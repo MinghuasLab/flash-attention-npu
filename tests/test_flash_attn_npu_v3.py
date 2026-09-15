@@ -168,6 +168,21 @@ test_cases = [
     # 6) Sk>>Sq left-infinite band (complement; no empty prefix)
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "TND", False, -1, 100, 0.0, 0, False),
     (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0.0, 0, False),
+    # 7) dense TND varlen SWA regressions for GQA empty-prefix O-clear
+    (torch.bfloat16, 2, 6, 3, 128, 128, 192, 0, 128, False, "TND", True, 0, 256, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 2000, 128, 0, 128, False, "TND", True, 0, 256, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 6, 64, 800, 128, 0, 128, False, "TND", True, 542, 647, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 4096, 192, 0, 128, False, "TND", True, 542, 647, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 192, 0, 128, True, "TND", True, 542, 647, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 4096, 128, 0, 128, True, "TND", True, 0, 256, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 1, 1, 339, 192, 0, 128, True, "TND", True, 542, 647, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 6, 16, 2000, 192, 0, 128, True, "TND", True, 0, 256, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 1, 64, 2048, 128, 0, 128, True, "TND", True, 0, 256, 0.0, 0, False),
+    (torch.bfloat16, 2, 6, 3, 64, 800, 128, 0, 128, True, "TND", True, 542, 647, 0.0, 0, False),
+    # 8) GQA empty-prefix O-clear (causal window=(0,0), two O tiles)
+    (torch.float16, 9, 86, 1, 9, 1, 172, 0, 128, True, "BSND", False, 0, 0, 0.0, 0, False),
+    # 9) GQA empty-prefix O-clear (bidir window=(0,1), paged TND, two O tiles)
+    (torch.bfloat16, 1, 15, 1, 15, 3, 192, 1, 128, False, "TND", False, 0, 1, 0.0, 0, False),
     # AppendKV
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
