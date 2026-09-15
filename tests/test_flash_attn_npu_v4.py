@@ -17,10 +17,7 @@ from tests.common.test_utils import (
     make_random_tensor,
     make_varlen_seqlens,
 )
-if "Ascend950" in torch_npu.npu.get_device_name():
-    from flash_attn_npu_4 import flash_attn_varlen_func
-else:
-    from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
 
 def build_cann_causal_mask():
     """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""
@@ -45,7 +42,7 @@ def build_cann_causal_mask():
 #            A=[(1,128),(64,256),(3,799),(3,1024),(16,20000),(16,131072)]
 #            B=[(128,128),(1,339),(64,800),(64,2048),(1,131072),(16,4096)]
 #        (window_left,window_right): A=[(-1,-1),(512,0)], B=[(0,256),(542,647)]
-#   2) dense varlen TND (varlen-style, only mode supporting backward)
+#   2) dense varlen TND (varlen-style, supports backward)
 #                                              cache_mode=0, layout=TND, varlen, num_splits=0
 #        head_size: A=[32,64], B=[128,192]
 #        (q_seqlen,kv_seqlen) (small set to avoid excessive packed-varlen size):
@@ -316,6 +313,7 @@ test_cases = [
     (torch.float16, 2, 6, 6, 512, 1024, 128, 1, 128, True, "TND", True, 746, 16, 0),
     (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, "TND", True, 512, 0, 0),
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, "BSND", False, 508, -256, 0),
+    (torch.bfloat16, 1, 13, 1, 17, 1, 1, 1, 128, False, "BSND", False, 0, 0, 0),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, "BSND", False, -128, 864, 0),
     # SWA Sq>>Sk (empty-prefix / neg-empty / overlong-wR).
     (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "BSND", False, 8, -1, 0),
@@ -427,14 +425,20 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
                 pre_seq_sum += kv_sequences[i]
                 new_kv_seqlen_list_cpu.append(pre_seq_sum)
             new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
-    # Ascend950 v4 has no backward pass (flash_attn_npu_interface_950.py), so the
-    # cu_seqlens_k/bwd path is only exercised on Ascend910; on Ascend950 fall back to
-    # the validated cache-offset path. This also avoids passing seqused_k=None into the
-    # 950 kernel, which requires per-batch KV seqlen (csrc/ascend950/flash_attn_npu_4/mha_fwd.cpp).
-    bwd_supported = layout == "TND" and cache_mode == 0 and num_splits <= 1 and "Ascend950" not in name
+    is_950 = "Ascend950" in name
+    no_swa = window_size_left == -1 and window_size_right == -1
+    bwd_supported = (
+        layout == "TND"
+        and cache_mode == 0
+        and num_splits <= 1
+        and (not is_950 or no_swa)
+    )
     cu_seqlens_k_for_api = new_kv_seqlen_list if bwd_supported else None
     max_seqlen_k_for_api = kv_seqlen if bwd_supported else None
-    cache_seqlens_for_api = None if bwd_supported else kv_seqlen_list
+    if is_950:
+        cache_seqlens_for_api = kv_seqlen_list
+    else:
+        cache_seqlens_for_api = None if bwd_supported else kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_varlen_func(
         query,
         key_cache,
@@ -559,10 +563,11 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     return
 
 
-# flash_attn_func test parameters (dense BSND, Ascend910 only; supports backward).
+# flash_attn_func test parameters (dense BSND; supports backward).
+# Ascend950: no SWA in FAG bwd (window must be -1,-1); softcap must be 0.
 # data_type: [torch.float16, torch.bfloat16]
 # num_heads,kv_heads: cover MHA (6,6)/(4,4)/(8,8) and GQA (6,3)/(6,1)/(8,2)
-# window: (-1,-1) no window, causal via is_causal, and SWA/local windows.
+# window: (-1,-1) no window, causal via is_causal, and SWA/local windows (910).
 flash_attn_func_cases = [
     # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size
     (torch.float16, 2, 6, 6, 128, 128, 64, False, (-1, -1)),
@@ -586,8 +591,11 @@ def test_flash_attn_func(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
 ):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend950" in name:
-        pytest.skip("flash_attn_func is only available on Ascend910")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
+    window_size_left, window_size_right = window_size
+    if "Ascend950" in name and (window_size_left != -1 or window_size_right != -1):
+        pytest.skip("Ascend950 FAG bwd does not support SWA")
     query = make_random_tensor(
         (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu", requires_grad=True
     )
@@ -599,7 +607,6 @@ def test_flash_attn_func(
     )
     scale = 1.0 / (head_size ** 0.5)
 
-    window_size_left, window_size_right = window_size
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
     window_size_left_golden = window_size_left
     window_size_right_golden = window_size_right
