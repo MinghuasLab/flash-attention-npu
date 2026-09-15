@@ -66,7 +66,9 @@ jobs:
     # issue_comment 触发时只处理 PR 上的 /run-npu-ci; workflow_dispatch 直接放行
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/run-npu-ci'))
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/run-npu-ci'))
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       base_ref: ${{ steps.resolve.outputs.base_ref }}
@@ -232,7 +234,9 @@ jobs:
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
       CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
-      CI_TEST_LOG_DIR_HOST: /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      CI_TEST_LOG_DIR_HOST: >-
+        /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+        ${{ matrix.arch_label }}
       GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
       GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
       GOLDEN_CACHE_MODE: cache
@@ -244,7 +248,9 @@ jobs:
         run: |
           arch="${{ needs.prepare.outputs.arch }}"
           label="${{ matrix.arch_label }}"
-          if [ "$arch" = "both" ] || { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } || { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
+          if [ "$arch" = "both" ] ||
+            { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
+            { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
             echo "match=true" >> "$GITHUB_OUTPUT"
             echo "arch matches ($arch / $label), proceeding"
           else
@@ -263,11 +269,51 @@ jobs:
           git config --global --add safe.directory "$PWD"
           REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
 
+          # Resolve the host proxy before the repository is cloned (the shared
+          # ci/docker_proxy.sh helper is not available at this point yet).
+          proxy_http="${HTTP_PROXY:-}"
+          proxy_https="${HTTPS_PROXY:-}"
+          proxy_no="${NO_PROXY:-}"
+          case " $(hostname -I 2>/dev/null || true) " in
+            *" 192.168.13.241 "*)
+              proxy_http=http://127.0.0.1:18790
+              proxy_https=http://127.0.0.1:18790
+              proxy_no=localhost,127.0.0.1,::1 ;;
+            *" 192.168.9.226 "*)
+              proxy_http=http://127.0.0.1:17890
+              proxy_https=http://127.0.0.1:17890
+              proxy_no=localhost,127.0.0.1,::1 ;;
+          esac
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+              case "$proxy_key" in
+                HTTP_PROXY|http_proxy) proxy_http="$proxy_value" ;;
+                HTTPS_PROXY|https_proxy) proxy_https="$proxy_value" ;;
+                NO_PROXY|no_proxy) proxy_no="$proxy_value" ;;
+              esac
+            done < "$proxy_file"
+          fi
+          [ "${CI_HTTP_PROXY+x}" = x ] && proxy_http="$CI_HTTP_PROXY"
+          [ "${CI_HTTPS_PROXY+x}" = x ] && proxy_https="$CI_HTTPS_PROXY"
+          [ "${CI_NO_PROXY+x}" = x ] && proxy_no="$CI_NO_PROXY"
+          export HTTP_PROXY="$proxy_http" HTTPS_PROXY="$proxy_https" NO_PROXY="$proxy_no"
+          proxy_args=()
+          [ -n "$proxy_http" ] && proxy_args+=(-e "HTTP_PROXY=$proxy_http")
+          [ -n "$proxy_https" ] && proxy_args+=(-e "HTTPS_PROXY=$proxy_https")
+          [ -n "$proxy_no" ] && proxy_args+=(-e "NO_PROXY=$proxy_no")
+
           # docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突
           # clone 后: fetch base 分支最新, checkout base, merge PR head
           docker_ok=false
           if docker run --rm \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
             --network host \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -288,7 +334,8 @@ jobs:
                 git init -q
                 git remote remove origin 2>/dev/null || true
                 git remote add origin "$REPO_URL"
-                if git fetch --depth=50 origin "$BASE_REF" && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
+                if git fetch --depth=50 origin "$BASE_REF" \
+                  && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
                   rm -rf /workspace/csrc/catlass 2>/dev/null || true
                   git clean -fdx -e .git
                   git checkout -q FETCH_HEAD
@@ -321,7 +368,8 @@ jobs:
               git init -q
               git remote remove origin 2>/dev/null || true
               git remote add origin "$REPO_URL"
-              if git fetch --depth=50 origin "$BASE_REF" && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
+              if git fetch --depth=50 origin "$BASE_REF" \
+                && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
                 rm -rf csrc/catlass 2>/dev/null || true
                 git clean -fdx -e .git
                 git checkout -q FETCH_HEAD
@@ -357,7 +405,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.arch_label }}
-          path: /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}/
+          path: >-
+            /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+            ${{ matrix.arch_label }}/
           retention-days: 7
 
       - name: Clean up this job's CI containers

@@ -1,0 +1,35 @@
+# Lightweight, hardware-independent quality environment.
+# The repository is mounted at runtime; hooks and their pinned tool versions
+# are materialized by pre-commit inside this image.
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE}
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_EXTRA_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    GOPROXY=https://goproxy.cn,direct \
+    PRE_COMMIT_HOME=/tmp/pre-commit-cache \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update -qq \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates git golang-go \
+        && rm -rf /var/lib/apt/lists/*; \
+    elif command -v yum >/dev/null 2>&1; then \
+        yum install -y -q ca-certificates git golang \
+        && yum clean all; \
+    else \
+        echo 'unsupported base image: neither apt-get nor yum is available' >&2; \
+        exit 1; \
+    fi
+
+# actionlint's pinned pre-commit hook is a Go hook. Installing Go in the image
+# keeps both GitHub-hosted and self-hosted runners independent of host tools.
+
+COPY ci/quality-requirements.txt /tmp/quality-requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/quality-requirements.txt
+
+WORKDIR /workspace
+ENTRYPOINT ["/bin/bash"]

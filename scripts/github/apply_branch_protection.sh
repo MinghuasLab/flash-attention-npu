@@ -8,12 +8,12 @@
 #   bash scripts/github/apply_branch_protection.sh main
 #
 # 配置内容:
-#   - 必需状态检查: NPU CI / 手动验证
+#   - 必需状态检查: NPU CI / 手动验证 + Code Quality
 #   - PR 至少 2 个 approval
 #   - 需要 Code Owners review
 #   - push 新 commit 后旧 review 失效
 #   - 要求最后一次 push 不是审批人自己完成
-#   - 分支最新才能合并
+#   - 不强制分支保持最新 (push-to-main 的 Code Quality 会兜底)
 #   - Admin 也必须遵守分支保护
 #   - 禁止 force push
 #   - 禁止删除分支
@@ -49,8 +49,11 @@ api -X PUT \
   -d @- <<'JSON'
 {
   "required_status_checks": {
-    "strict": true,
-    "contexts": ["NPU CI / 手动验证"]
+    "strict": false,
+    "contexts": [
+      "NPU CI / 手动验证",
+      "Code Quality / lint / format / workflow checks"
+    ]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {
@@ -87,4 +90,4 @@ api "https://api.github.com/repos/$REPO/branches/$BRANCH/protection" \
       "bypass_users": d.get("required_pull_request_reviews",{}).get("bypass_pull_request_allowances",{}).get("users",[])
     }, indent=2))'
 
-log "done. 必需状态检查名称必须严格为: NPU CI / 手动验证"
+log "done. required checks: NPU CI / 手动验证; Code Quality / lint / format / workflow checks"

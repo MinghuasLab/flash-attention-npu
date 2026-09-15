@@ -1,0 +1,48 @@
+# Repository-wide quality checks. CI and local pre-commit use this file as the
+# single source of hook definitions and versions. Formatter hooks intentionally
+# use their normal write-back behavior, matching Apache Arrow: a commit that
+# triggers a rewrite stops, and the contributor reviews and stages the result.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^csrc/.*/autogen/.*\.(c|cc|cpp|cxx|h|hh|hpp|cuh)$
+      - id: end-of-file-fixer
+        exclude: ^csrc/.*/autogen/.*\.(c|cc|cpp|cxx|h|hh|hpp|cuh)$
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v21.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c, c++]
+        # CATLASS is a third-party submodule. autogen C/C++ files are emitted
+        # by generate_kernels.py and remain outside formatter enforcement.
+        exclude: ^(csrc/catlass/|csrc/.*/autogen/)
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args: [-c, .yamllint.yml]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        types: [shell]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
