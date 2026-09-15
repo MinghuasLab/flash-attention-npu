@@ -248,21 +248,16 @@ mha_fwd(at::Tensor q,
     }
     at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
-    int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
-    int64_t max_q_seqlen = 0;
+    // Preserve v4's normal-FA seqlen handling: TND non-paged calls may pass
+    // either per-batch lengths or batch_size + 1 cumulative offsets.  FD uses
+    // paged KV and therefore only examines the per-batch representation.
     int64_t max_kv_seqlen = 0;
-    const int32_t *q_cu_ptr = is_varlen_q ?
-        cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
     const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+    const bool kv_lengths_cumulative = seqlens_k.numel() == batch_size + 1;
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int64_t q_len = is_varlen_q ?
-            static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
-            seqlen_q;
-        const int64_t kv_len = kv_len_ptr[batch_idx];
-        TORCH_CHECK(q_len > 0 && kv_len > 0,
-                    "950 backend (v4) requires positive Q and KV lengths");
-        min_q_seqlen = std::min(min_q_seqlen, q_len);
-        max_q_seqlen = std::max(max_q_seqlen, q_len);
+        const int64_t kv_len = kv_lengths_cumulative ?
+            static_cast<int64_t>(kv_len_ptr[batch_idx + 1]) - kv_len_ptr[batch_idx] :
+            kv_len_ptr[batch_idx];
         max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
     }
 
@@ -287,12 +282,32 @@ mha_fwd(at::Tensor q,
         }
     }
 
-    const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
-        min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+    bool flash_decode = false;
+    const bool fd_layout_candidate =
+        num_splits != 1 && !is_local && paged_KV && is_varlen_q;
+    const bool fd_has_per_batch_kv = seqlens_k.numel() == batch_size;
+    if (fd_layout_candidate && fd_has_per_batch_kv) {
+        int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+        int64_t max_q_seqlen = 0;
+        bool fd_lengths_valid = true;
+        const int32_t *q_cu_ptr = cu_seqlen_q_cpu.data_ptr<int32_t>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            const int64_t q_len =
+                static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx];
+            const int64_t kv_len = kv_len_ptr[batch_idx];
+            if (q_len <= 0 || kv_len <= 0) {
+                fd_lengths_valid = false;
+                break;
+            }
+            min_q_seqlen = std::min(min_q_seqlen, q_len);
+            max_q_seqlen = std::max(max_q_seqlen, q_len);
+        }
+        flash_decode = fd_lengths_valid && min_q_seqlen > 0 &&
+            max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+    }
     // The tiler applies the small-task gate after building the same merged
     // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
     // which would over-count GQA/MQA tasks and incorrectly disable FD.
-    const bool flash_decode = num_splits != 1 && fd_shape_supported;
 
     // ============================================================
     // 7. Build FAInferContext + run host-side tiling

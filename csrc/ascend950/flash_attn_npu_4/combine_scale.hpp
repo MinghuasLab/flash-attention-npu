@@ -3,8 +3,8 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 
-#ifndef FLASH_ATTN_NPU_950_V3_FD_COMBINE_HPP
-#define FLASH_ATTN_NPU_950_V3_FD_COMBINE_HPP
+#ifndef FLASH_ATTN_NPU_950_V4_COMBINE_SCALE_HPP
+#define FLASH_ATTN_NPU_950_V4_COMBINE_SCALE_HPP
 
 #include <type_traits>
 

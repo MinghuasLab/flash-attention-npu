@@ -561,6 +561,47 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     return
 
 
+@pytest.mark.parametrize("num_splits", [0, 1])
+def test_ascend950_non_fd_tnd_preserves_cumulative_seqused_k(num_splits):
+    """FD pre-gating must not change v4's normal TND seqlen contract."""
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend950" not in name:
+        pytest.skip("Ascend950 v4 regression coverage")
+
+    q_lengths = [3, 2]
+    kv_lengths = [16, 24]
+    num_heads = 4
+    kv_heads = 2
+    head_size = 32
+    gen = torch.Generator().manual_seed(2026)
+    query = torch.randn(sum(q_lengths), num_heads, head_size,
+                        dtype=torch.float16, generator=gen).npu()
+    key = torch.randn(sum(kv_lengths), kv_heads, head_size,
+                      dtype=torch.float16, generator=gen).npu()
+    value = torch.randn(sum(kv_lengths), kv_heads, head_size,
+                        dtype=torch.float16, generator=gen).npu()
+    cu_seqlens_q = torch.tensor([0, 3, 5], dtype=torch.int32).npu()
+    kv_per_batch = torch.tensor(kv_lengths, dtype=torch.int32).npu()
+    kv_cumulative = torch.tensor([0, 16, 40], dtype=torch.int32).npu()
+
+    def run(seqused_k):
+        return flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(q_lengths),
+            seqused_k=seqused_k,
+            num_splits=num_splits,
+            return_lse=True,
+        )
+
+    out_per_batch, lse_per_batch, *_ = run(kv_per_batch)
+    out_cumulative, lse_cumulative, *_ = run(kv_cumulative)
+    torch.testing.assert_close(out_cumulative, out_per_batch, rtol=0, atol=0)
+    torch.testing.assert_close(lse_cumulative, lse_per_batch, rtol=0, atol=0)
+
+
 # flash_attn_func test parameters (dense BSND, Ascend910 only; supports backward).
 # data_type: [torch.float16, torch.bfloat16]
 # num_heads,kv_heads: cover MHA (6,6)/(4,4)/(8,8) and GQA (6,3)/(6,1)/(8,2)
