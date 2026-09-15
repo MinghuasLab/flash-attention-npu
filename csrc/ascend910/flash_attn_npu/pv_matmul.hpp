@@ -96,6 +96,8 @@ public:
 
     __aicore__ inline
     ~BlockMmad() {}
+    __aicore__ inline
+    void SetPingPongState(BlockPingPongState *state) { pingPongState = state; }
 
     __aicore__ inline
     void init(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn,
@@ -241,7 +243,6 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-        Arch::CrossCoreWaitFlag(softmaxFlag);
 
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);
         uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);
@@ -251,14 +252,22 @@ public:
             uint32_t nL1Actual = (nL1Idx < nL1Loop - 1U) ? L0TileShape::N : (embed - nL1Idx * L0TileShape::N);
             for (uint32_t mL1Idx = 0; mL1Idx < mL1Loop; mL1Idx++) {
                 uint32_t mL1Actual = (mL1Idx < mL1Loop - 1U) ? L1TileShape::M : (rowNum - mL1Idx * L1TileShape::M);
+                l0CPingPongFlag = pingPongState->l0CPingPongFlag;
+                pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
                 for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; kL1Idx++) {
                     uint32_t kL1Actual = (kL1Idx < kL1Loop - 1U) ? l1KDynamic : (stackSeqTile - kL1Idx * l1KDynamic);
+                    l1PPingPongFlag = pingPongState->l1PingPongFlag;
+                    pingPongState->l1PingPongFlag = 1 - pingPongState->l1PingPongFlag;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1PPingPongFlag);
                     MatrixCoord gmATileCoord{mL1Idx * L1TileShape::M, kL1Idx * l1KDynamic};
                     auto gmTileA = gA[layoutA.GetOffset(gmATileCoord)];
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
+                    // Delay P-ready until the first GM -> L1 load to overlap scalar setup.
+                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                        Arch::CrossCoreWaitFlag(softmaxFlag);
+                    }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1PPingPongFlag);
 
@@ -269,6 +278,9 @@ public:
                         LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL1Actual, kL0Actual);
                         MatrixCoord l1ATileCoord{0, kL0Idx * L0TileShape::K};
                         auto l1ATile = l1ATensor[l1PPingPongFlag][layoutAInL1.GetOffset(l1ATileCoord)];
+
+                        l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
+                        pingPongState->l0ABPingPongFlag = 1 - pingPongState->l0ABPingPongFlag;
 
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         if (kL0Idx == 0U) {
@@ -300,9 +312,7 @@ public:
                             initMmad);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                        l0ABPingPongFlag = 1U - l0ABPingPongFlag;
                     }
-                    l1PPingPongFlag = 1U - l1PPingPongFlag;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -311,7 +321,6 @@ public:
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL1Actual, nL1Actual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                l0CPingPongFlag = 1U - l0CPingPongFlag;
             }
         }
         if (appendDoCopyback) {
@@ -360,9 +369,10 @@ protected:
     CopyL1ToL0B copyL1ToL0B;
     CopyL0CToGm copyL0CToGm;
 
+    BlockPingPongState *pingPongState = nullptr;
     uint32_t l1PPingPongFlag = 0;
-    uint32_t l0CPingPongFlag = 0;
     uint32_t l0ABPingPongFlag = 0;
+    uint32_t l0CPingPongFlag = 0;
 
     uint32_t l1MDynamic = 0;
     uint32_t l1NDynamic = 0;

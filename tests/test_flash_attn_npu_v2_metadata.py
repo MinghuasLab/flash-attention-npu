@@ -50,7 +50,14 @@ def _band_mask(q_seqlen, kv_seqlen, window_size_left, window_size_right):
     rows = torch.arange(q_seqlen).unsqueeze(1)
     cols = torch.arange(kv_seqlen).unsqueeze(0)
     diag = cols - rows
-    return (diag < pre_token) | (diag > next_token)
+    # _attn_mask normalizes a fully covering side to -1. That side is
+    # unbounded, not a negative-width band (especially for short TND batches).
+    blocked = torch.zeros((q_seqlen, kv_seqlen), dtype=torch.bool)
+    if window_size_left >= 0:
+        blocked |= diag < pre_token
+    if window_size_right >= 0:
+        blocked |= diag > next_token
+    return blocked
 
 
 def _attn_mask(q_seqlen, kv_seqlen, is_causal, window_size):
