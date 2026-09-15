@@ -31,8 +31,10 @@ inline uint64_t WorkSpaceSize(uint64_t blockDim)
 }
 
 struct FAMetadataArgs {
-    uint64_t cuSeqlensQAddr;
+    uint64_t seqlensQAddr;
     uint64_t seqlensKAddr;
+    uint32_t isSeqlensQCumulative;
+    uint32_t isSeqlensKCumulative;
     uint64_t metaOutAddr;
     uint32_t batch;
     uint32_t numHeads;
@@ -45,8 +47,6 @@ struct FAMetadataArgs {
     uint32_t maxQSeqlen;
     uint32_t maskType;
     uint32_t blockDim;
-    uint32_t isVarlen;
-    uint32_t isVarlenKv;
     uint32_t pagedKV;
     uint32_t numSplits;
     float scaleValue;

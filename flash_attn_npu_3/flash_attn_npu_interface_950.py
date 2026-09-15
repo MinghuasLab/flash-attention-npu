@@ -264,7 +264,8 @@ def get_scheduler_metadata(
     num_heads_q,
     num_heads_kv,
     headdim,
-    cache_seqlens: torch.Tensor,
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
     max_seqlen_k=None,
@@ -291,7 +292,9 @@ def get_scheduler_metadata(
     flag, and the actual per-batch sequence lengths; re-create it whenever those
     change.
     """
-    cache_seqlens = _maybe_contiguous(cache_seqlens)
+    seqlens_k = _maybe_contiguous(seqlens_k)
+    # TODO: Normalize and consume direct per-batch seqlens_q in the Ascend 950
+    # metadata C++/AICPU path. It still consumes cumulative cu_seqlens_q today.
     if cu_seqlens_q is not None:
         cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
     if cu_seqlens_k is not None:
@@ -319,7 +322,7 @@ def get_scheduler_metadata(
         num_heads_kv,
         headdim,
         headdim_v,
-        cache_seqlens,
+        seqlens_k,
         cu_seqlens_q,
         cu_seqlens_k,
         page_size,
@@ -522,7 +525,8 @@ def flash_attn_with_kvcache(
             num_heads_kv=kv_heads,
             headdim=headdim,
             headdim_v=headdim_v,
-            cache_seqlens=cache_seqlens,
+            seqlens_q=None,
+            seqlens_k=cache_seqlens,
             qkv_dtype=q.dtype,
             cu_seqlens_q=cu_seqlens_q,
             page_size=page_size,
@@ -613,7 +617,8 @@ class FlashAttnFunc(torch.autograd.Function):
             num_heads_kv=k.shape[2],
             headdim=q.shape[3],
             headdim_v=v.shape[3],
-            cache_seqlens=seqused_k,
+            seqlens_q=None,
+            seqlens_k=seqused_k,
             qkv_dtype=q.dtype,
             causal=causal,
             window_size=window_size,
@@ -790,7 +795,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_heads_kv=k.shape[1],
             headdim=q.shape[2],
             headdim_v=v.shape[2],
-            cache_seqlens=seqused_k,
+            seqlens_q=seqused_q,
+            seqlens_k=seqused_k,
             qkv_dtype=q.dtype,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
