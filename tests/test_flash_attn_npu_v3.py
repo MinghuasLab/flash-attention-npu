@@ -831,8 +831,6 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name and "Ascend950" not in name:
         pytest.skip("flash_attn_varlen_func only supports Ascend910/Ascend950")
-    if "Ascend950" in name and add_unused_qkv:
-        pytest.skip("Ascend950 does not support seqused_q/seqused_k test path")
     if "Ascend950" in name and (softcap != 0.0):
         pytest.skip("Ascend950 does not support softcap")
     if add_unused_qkv:

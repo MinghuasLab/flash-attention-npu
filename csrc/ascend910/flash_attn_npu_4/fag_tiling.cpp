@@ -328,19 +328,24 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
             return -1;
         }
         for (int64_t i = 0; i < seqQShapeSize; ++i) {
-            if (i == 0) {
-                fagTilingData.actualSeqQlen.push_back(actualSeqQlenTensor[i]);
-                fagTilingData.actualSeqKvlen.push_back(actualSeqKvlenTensor[i]);
-            } else {
-                fagTilingData.actualSeqQlen.push_back(actualSeqQlenTensor[i] - actualSeqQlenTensor[i - 1]);
-                fagTilingData.actualSeqKvlen.push_back(actualSeqKvlenTensor[i] - actualSeqKvlenTensor[i - 1]);
+            const int32_t allocatedQ = actualSeqQlenTensor[i] - (i == 0 ? 0 : actualSeqQlenTensor[i - 1]);
+            const int32_t allocatedKv = actualSeqKvlenTensor[i] - (i == 0 ? 0 : actualSeqKvlenTensor[i - 1]);
+            const int32_t usedQ = fagInfo.seqUsedQ == nullptr ? allocatedQ : fagInfo.seqUsedQ[i];
+            const int32_t usedKv = fagInfo.seqUsedKv == nullptr ? allocatedKv : fagInfo.seqUsedKv[i];
+            if (allocatedQ < 0 || allocatedKv < 0 || usedQ < 0 || usedKv < 0 ||
+                usedQ > allocatedQ || usedKv > allocatedKv) {
+                cerr << "invalid allocated or used sequence length.\n";
+                return -1;
             }
+            fagTilingData.actualSeqQlen.push_back(usedQ);
+            fagTilingData.actualSeqKvlen.push_back(usedKv);
             fagTilingData.sumS1S2Product += fagTilingData.actualSeqQlen[i] * fagTilingData.actualSeqKvlen[i];
         }
 
         uint64_t tailZeroCount = 0;
         for (auto i = seqQShapeSize - 1; i >= 1; --i) {
-            if (fagTilingData.actualSeqQlen[i] <= 0 && fagTilingData.actualSeqKvlen[i] <= 0) {
+            if (actualSeqQlenTensor[i] == actualSeqQlenTensor[i - 1] &&
+                actualSeqKvlenTensor[i] == actualSeqKvlenTensor[i - 1]) {
                 ++tailZeroCount;
             } else {
                 break;

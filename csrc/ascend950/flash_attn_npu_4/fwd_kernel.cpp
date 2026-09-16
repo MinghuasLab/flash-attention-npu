@@ -82,8 +82,41 @@ public:
     using LayoutOTmp = layout::RowMajor;
     using LayoutMask = layout::RowMajor;
 
+    bool hasSeqUsedQ = false;
+    bool hasSeqUsedKv = false;
+
     __aicore__ inline
     FAIKernel950() {}
+
+    __aicore__ inline int64_t GetQSeqLen(
+        uint32_t bIdx, uint32_t maxQSeqlen,
+        AscendC::GlobalTensor<int32_t>& gQSeq,
+        AscendC::GlobalTensor<int32_t>& gSeqUsedQ) const
+    {
+        if constexpr (qFormat == Format::TND) {
+            if (hasSeqUsedQ) {
+                return static_cast<int64_t>(gSeqUsedQ.GetValue(bIdx));
+            }
+            return static_cast<int64_t>(gQSeq.GetValue(bIdx + 1) - gQSeq.GetValue(bIdx));
+        }
+        return static_cast<int64_t>(maxQSeqlen);
+    }
+
+    __aicore__ inline int64_t GetKvSeqLen(
+        uint32_t bIdx,
+        AscendC::GlobalTensor<int32_t>& gKvSeq,
+        AscendC::GlobalTensor<int32_t>& gSeqUsedKv) const
+    {
+        if constexpr (kvFormat == Format::TND) {
+            if (hasSeqUsedKv) {
+                return static_cast<int64_t>(gSeqUsedKv.GetValue(bIdx));
+            }
+            if constexpr (kvcacheType == CacheMode::normalCache) {
+                return static_cast<int64_t>(gKvSeq.GetValue(bIdx + 1) - gKvSeq.GetValue(bIdx));
+            }
+        }
+        return static_cast<int64_t>(gKvSeq.GetValue(bIdx));
+    }
 
     __aicore__ inline
     void operator()(FAIKernelParams const &params)
@@ -100,6 +133,12 @@ public:
         gActualQseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualQseqlen);
         AscendC::GlobalTensor<int32_t> gActualKvseqlen;
         gActualKvseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualKvseqlen);
+        AscendC::GlobalTensor<int32_t> gSeqUsedQ;
+        gSeqUsedQ.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedQ);
+        AscendC::GlobalTensor<int32_t> gSeqUsedKv;
+        gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedKv);
+        hasSeqUsedQ = params.seqUsedQ != nullptr;
+        hasSeqUsedKv = params.seqUsedKv != nullptr;
         AscendC::GlobalTensor<int32_t> gBlockTable;
         gBlockTable.SetGlobalBuffer((__gm__ int32_t *)(params.blockTables));
         AscendC::GlobalTensor<ElementO> gO;
@@ -255,14 +294,19 @@ public:
         int64_t blockBOffset = 0;
         uint32_t preTotalTaskNum = 0;
         uint32_t curBatch = 0;
-        int64_t qSeqlen = faiTilingData->maxQSeqlen;
-        int64_t kvSeqlen = gActualKvseqlen.GetValue(curBatch);
+        int64_t qSeqlen = GetQSeqLen(
+            curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
+        int64_t qPhysicalSeqlen = faiTilingData->maxQSeqlen;
+        int64_t kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
+        int64_t kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
         if constexpr (qFormat == Format::TND) {
-            qSeqlen = static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
+            qPhysicalSeqlen = static_cast<int64_t>(
+                gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
         }
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-            kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+            kvPhysicalSeqlen = static_cast<int64_t>(
+                gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -287,22 +331,27 @@ public:
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                qBOffset += qSeqlen * strideQ;
+                qBOffset += qPhysicalSeqlen * strideQ;
                 if constexpr (kvcacheType == CacheMode::normalCache) {
-                    kBOffset += static_cast<uint64_t>(kvSeqlen * strideK);
-                    vBOffset += static_cast<uint64_t>(kvSeqlen * strideV);
+                    kBOffset += static_cast<uint64_t>(kvPhysicalSeqlen * strideK);
+                    vBOffset += static_cast<uint64_t>(kvPhysicalSeqlen * strideV);
                 } else {
                     blockBOffset += static_cast<uint64_t>(maxNumBlocksPerBatch_); 
                 }
-                oBOffset += qSeqlen * strideO;
+                oBOffset += qPhysicalSeqlen * strideO;
                 
-                qSeqlen = faiTilingData->maxQSeqlen;
-                kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch));
+                qSeqlen = GetQSeqLen(
+                    curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
+                qPhysicalSeqlen = faiTilingData->maxQSeqlen;
+                kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
+                kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
                 if constexpr (qFormat == Format::TND) {
-                    qSeqlen = static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
+                    qPhysicalSeqlen = static_cast<int64_t>(
+                        gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
                 }
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-                    kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+                    kvPhysicalSeqlen = static_cast<int64_t>(
+                        gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
                 }
                 uint32_t curQNBlockTile = GetQNBlockTile(
                     static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
@@ -982,6 +1031,7 @@ template <class InDtype, class SMDtype,
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
+    GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
     GM_ADDR workspace,
     GM_ADDR tiling
 ) {
@@ -1045,7 +1095,7 @@ CATLASS_GLOBAL void FAInfer(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1057,6 +1107,7 @@ template <class InDtype, class SMDtype,
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
+    GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
     GM_ADDR workspace,
     GM_ADDR tiling
 ) {
@@ -1113,7 +1164,7 @@ CATLASS_GLOBAL void FAInferDn(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling};
     Kernel faInfer;
     faInfer(params);
 }
