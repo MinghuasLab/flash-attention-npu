@@ -363,6 +363,8 @@ def get_scheduler_metadata(
     has_softcap=False,
     pack_gqa=None,
     sm_margin=0,  # 910-compatible parameter; unused on Ascend 950
+    is_seqlens_q_cumulative=False,
+    is_seqlens_k_cumulative=False,
 ):
     """Precompute AICPU scheduler metadata (tiling + causal mask) on Ascend 950.
 
@@ -373,13 +375,14 @@ def get_scheduler_metadata(
     flag, and the actual per-batch sequence lengths; re-create it whenever those
     change.
     """
+    if seqlens_q is None and cu_seqlens_q is not None:
+        seqlens_q = cu_seqlens_q
+        is_seqlens_q_cumulative = True
+    if seqlens_k is None and cu_seqlens_k is not None:
+        seqlens_k = cu_seqlens_k
+        is_seqlens_k_cumulative = True
+    seqlens_q = _maybe_contiguous(seqlens_q)
     seqlens_k = _maybe_contiguous(seqlens_k)
-    # TODO: Normalize and consume direct per-batch seqlens_q in the Ascend 950
-    # metadata C++/AICPU path. It still consumes cumulative cu_seqlens_q today.
-    if cu_seqlens_q is not None:
-        cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
-    if cu_seqlens_k is not None:
-        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
     if headdim_v is None:
         headdim_v = headdim
     if softmax_scale is None:
@@ -403,9 +406,10 @@ def get_scheduler_metadata(
         num_heads_kv,
         headdim,
         headdim_v,
+        seqlens_q,
         seqlens_k,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
         page_size,
         num_blocks,
         max_num_blocks_per_seq,
@@ -596,7 +600,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         if scheduler_metadata is None:
-            meta_seqused_k = _maybe_contiguous(cu_seqlens_k[1:] - cu_seqlens_k[:-1])
             scheduler_metadata = get_scheduler_metadata(
                 batch_size=cu_seqlens_q.numel() - 1,
                 max_seqlen_q=max_seqlen_q,
@@ -605,11 +608,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 num_heads_kv=k.shape[1],
                 headdim=q.shape[2],
                 headdim_v=v.shape[2],
-                # TODO: Normalize and consume direct per-batch seqlens_q in the
-                # Ascend 950 metadata C++/AICPU path. It still consumes cumulative
-                # cu_seqlens_q today.
-                seqlens_q=None,
-                seqlens_k=meta_seqused_k,
+                seqlens_q=cu_seqlens_q,
+                seqlens_k=cu_seqlens_k,
+                is_seqlens_q_cumulative=True,
+                is_seqlens_k_cumulative=True,
                 qkv_dtype=q.dtype,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,

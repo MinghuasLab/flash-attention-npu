@@ -16,6 +16,7 @@ from tests.common.test_utils import (
     gather_paged_kv_batch,
     make_golden_attention_mask,
     make_random_tensor,
+    make_varlen_seqlens_with_unused,
 )
 
 
@@ -382,23 +383,25 @@ def test_flash_attn_func_metadata_bsnd(
     FLASH_ATTN_VARLEN_CASES,
 )
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
+@pytest.mark.parametrize("add_unused_qkv", [False, True])
 def test_flash_attn_varlen_func_metadata_tnd(
-    data_type,
-    batch_size,
-    num_heads,
-    kv_heads,
-    q_seqlen,
-    kv_seqlen,
-    head_size,
-    is_causal,
-    metadata_spy,
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    metadata_spy, add_unused_qkv, monkeypatch,
 ):
-    q_lengths = [q_seqlen] * batch_size
-    kv_lengths = [kv_seqlen] * batch_size
+    if add_unused_qkv:
+        q_lengths, kv_lengths, used_q_lengths, used_k_lengths = make_varlen_seqlens_with_unused(
+            batch_size, q_seqlen, kv_seqlen, is_causal
+        )
+    else:
+        q_lengths = used_q_lengths = [q_seqlen] * batch_size
+        kv_lengths = used_k_lengths = [kv_seqlen] * batch_size
     q_offsets = _prefix_sums(q_lengths)
     kv_offsets = _prefix_sums(kv_lengths)
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
+
+    seqused_q = _int32_npu(used_q_lengths) if add_unused_qkv else None
+    seqused_k = _int32_npu(used_k_lengths) if add_unused_qkv else None
 
     query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
     key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
@@ -409,10 +412,12 @@ def test_flash_attn_varlen_func_metadata_tnd(
         query,
         key,
         value,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        q_seqlen,
-        kv_seqlen,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
         softmax_scale=scale,
         causal=is_causal,
         window_size=WINDOW_SIZE,
@@ -420,22 +425,43 @@ def test_flash_attn_varlen_func_metadata_tnd(
     )
     assert len(metadata_spy) == 1
 
-    _assert_tnd_matches_ref(
-        output_npu,
-        None,
-        query,
-        (
-            key.reshape(batch_size, kv_seqlen, kv_heads, head_size).detach().cpu(),
-            value.reshape(batch_size, kv_seqlen, kv_heads, head_size).detach().cpu(),
-        ),
-        q_offsets=q_offsets,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        head_size=head_size,
-        scale=scale,
-        data_type=data_type,
-        is_causal=is_causal,
-    )
+    if add_unused_qkv:
+        from flash_attn_npu_3 import flash_attn_npu_interface as interface
+
+        # v3 has no public metadata-disable flag; bypass generation for this call.
+        with monkeypatch.context() as patch:
+            patch.setattr(interface, "get_scheduler_metadata", lambda *args, **kwargs: None)
+            output_eager = flash_attn_varlen_func(
+                query, key, value,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q, seqused_k=seqused_k,
+                max_seqlen_q=q_seqlen, max_seqlen_k=kv_seqlen,
+                softmax_scale=scale, causal=is_causal, window_size=WINDOW_SIZE,
+                num_splits=1,
+            )
+        assert len(metadata_spy) == 1
+
+    # Physical offsets come from allocated lengths; compare only used prefixes.
+    for batch_idx in range(batch_size):
+        q_start, k_start = q_offsets[batch_idx], kv_offsets[batch_idx]
+        used_q, used_k = used_q_lengths[batch_idx], used_k_lengths[batch_idx]
+        output_batch = output_npu[q_start:q_start + used_q]
+        if add_unused_qkv:
+            torch.testing.assert_close(output_batch, output_eager[q_start:q_start + used_q])
+        _assert_tnd_matches_ref(
+            output_batch,
+            None,
+            query[q_start:q_start + used_q],
+            (key[k_start:k_start + used_k].detach().cpu().unsqueeze(0),
+             value[k_start:k_start + used_k].detach().cpu().unsqueeze(0)),
+            q_offsets=[0, used_q],
+            batch_size=1,
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            data_type=data_type,
+            is_causal=is_causal,
+        )
 
 
 @pytest.mark.parametrize(

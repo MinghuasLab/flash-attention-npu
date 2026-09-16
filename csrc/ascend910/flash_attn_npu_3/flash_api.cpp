@@ -287,6 +287,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256, "FlashAttention only supports head dimension in [1, 256]");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    // A TND or paged-KV input does not carry a reliable per-batch K length in
+    // k.shape. Keep the existing k.size(1) fallback only for non-paged BSND.
+    if (!seqused_k_.has_value()) {
+        TORCH_CHECK(!paged_KV,
+                    "paged KV forward requires seqused_k when it is not provided by cu_seqlens_k");
+        TORCH_CHECK(!is_varlen_q || is_varlen_kv,
+                    "TND forward requires seqused_k or cu_seqlens_k");
+    }
+
     // If seqused_k_ was not provided, derive seqlens_k from tensor shapes or cu_seqlens_k
     if (!seqused_k_.has_value()) {
         if (is_varlen_kv) {
@@ -481,10 +490,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                 qSeqlen = seqlens_q_cpu[batchIdx];
             }
             uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
+            TORCH_CHECK(qSeqlen > 0 &&
+                        kvSeqlen + (appendKV ? static_cast<uint64_t>(kvNewSeqlen) : 0U) > 0,
+                        "NPU FlashAttention requires positive Q and KV lengths");
             uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
             uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
             uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(
+                kvSeqlen + (appendKV ? static_cast<uint64_t>(kvNewSeqlen) : 0U));
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (batchIdx == 0) {

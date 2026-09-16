@@ -98,6 +98,8 @@ public:
         outputLse.SetGlobalBuffer((__gm__ float *)params.lse);
         AscendC::GlobalTensor<int32_t> actualQ;
         actualQ.SetGlobalBuffer((__gm__ int32_t *)params.actualQseqlen);
+        AscendC::GlobalTensor<int32_t> seqUsedQ;
+        seqUsedQ.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedQ);
 
         const uint32_t baseTask = static_cast<uint32_t>(
             tiling->fdCombineSchedules[combineIdx].baseTask);
@@ -110,8 +112,10 @@ public:
         uint32_t qNTaskNum = 0U;
         const uint32_t groupSize = tiling->numHeads / tiling->kvHeads;
         while (batchIdx < tiling->batch) {
-            qLen = static_cast<uint32_t>(
-                actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
+            qLen = params.seqUsedQ != nullptr ?
+                static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx)) :
+                static_cast<uint32_t>(
+                    actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
             qNBlockTile = GetQNBlockTile(
                 qLen, groupSize, tiling->embeddingSizeV > 128U);
             qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
@@ -243,7 +247,8 @@ public:
         // O remains parallel across combine tasks; AIV0 serializes the small
         // (FD-gated) set of LSE reductions and scalar stores.
         if (AscendC::GetBlockIdx() == 0U) {
-            WriteAllLse(tiling, partialLse, actualQ, outputLse);
+            WriteAllLse(tiling, partialLse, actualQ, seqUsedQ,
+                params.seqUsedQ != nullptr, outputLse);
         }
 #endif
     }
@@ -320,6 +325,8 @@ private:
         __gm__ FAInferTilingData *tiling,
         AscendC::GlobalTensor<float> &partialLse,
         AscendC::GlobalTensor<int32_t> &actualQ,
+        AscendC::GlobalTensor<int32_t> &seqUsedQ,
+        bool hasSeqUsedQ,
         AscendC::GlobalTensor<float> &outputLse)
     {
         for (uint32_t combine = 0U;
@@ -334,9 +341,11 @@ private:
             uint32_t qNTaskNum = 0U;
             const uint32_t groupSize = tiling->numHeads / tiling->kvHeads;
             while (batchIdx < tiling->batch) {
-                qLen = static_cast<uint32_t>(
-                    actualQ.GetValue(batchIdx + 1U) -
-                    actualQ.GetValue(batchIdx));
+                qLen = hasSeqUsedQ ?
+                    static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx)) :
+                    static_cast<uint32_t>(
+                        actualQ.GetValue(batchIdx + 1U) -
+                        actualQ.GetValue(batchIdx));
                 qNBlockTile = GetQNBlockTile(
                     qLen, groupSize, tiling->embeddingSizeV > 128U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
@@ -436,10 +445,11 @@ template <class InDtype>
 CATLASS_GLOBAL void FAFlashDecodeCombine(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
-    GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling)
 {
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv,
+        o, lse, workspace, tiling};
     FlashDecodeCombine950<InDtype> combine;
     combine(params);
 }

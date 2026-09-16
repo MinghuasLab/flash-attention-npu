@@ -21,8 +21,7 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
                                            const at::Tensor &seqlensK,
-                                           const std::optional<at::Tensor> &cuSeqlensQ,
-                                           const std::optional<at::Tensor> &cuSeqlensK)
+                                           const std::optional<at::Tensor> &seqlensQ)
 {
     const int64_t bytes = static_cast<int64_t>(
         fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
@@ -49,7 +48,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
     FAMetadataArgs metaArgs = args;
     auto metadata_task = [curHandle, aicpuHandle,
                           inputReady = events.inputReady,
-                          metadataDone = events.metadataDone, metaArgs]() mutable -> int {
+                          metadataDone = events.metadataDone, metaArgs, meta, seqlensQ, seqlensK]() mutable -> int {
         ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
         ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
         ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
@@ -61,11 +60,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
 
     c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
     c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
-    if (cuSeqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
-    }
-    if (cuSeqlensK.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensK->storage().data_ptr(), aicpuStream);
+    if (seqlensQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
 }
@@ -77,9 +73,10 @@ at::Tensor get_scheduler_metadata(
         int64_t num_heads_kv,
         int64_t headdim,
         int64_t headdim_v,
-        at::Tensor cache_seqlens,
-        std::optional<at::Tensor> cu_seqlens_q,
-        std::optional<at::Tensor> cu_seqlens_k,
+        std::optional<at::Tensor> seqlens_q,
+        at::Tensor seqlens_k,
+        bool is_seqlens_q_cumulative,
+        bool is_seqlens_k_cumulative,
         std::optional<int64_t> page_size,
         std::optional<int64_t> num_blocks,
         std::optional<int64_t> max_num_blocks_per_seq,
@@ -90,40 +87,30 @@ at::Tensor get_scheduler_metadata(
         int64_t window_size_left,
         int64_t window_size_right)
 {
-    const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
-    TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32,
-                "cache_seqlens must have dtype int32");
-    TORCH_CHECK(cache_seqlens.is_contiguous(),
-                "cache_seqlens must be contiguous");
-    TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1,
-                "cache_seqlens must be an NPU tensor");
+    const c10::OptionalDeviceGuard device_guard(device_of(seqlens_k));
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32,
+                "seqlens_k must have dtype int32");
+    TORCH_CHECK(seqlens_k.is_contiguous(), "seqlens_k must be contiguous");
+    TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1,
+                "seqlens_k must be an NPU tensor");
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0,
                 "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_splits == 0 || num_splits == 1,
                 "950 backend (v3) only supports num_splits=0 or 1");
 
-    const bool is_varlen_q = cu_seqlens_q.has_value();
-    const bool is_varlen_kv = cu_seqlens_k.has_value();
-    if (is_varlen_q) {
-        auto cu_q = cu_seqlens_q.value();
-        TORCH_CHECK(cu_q.dtype() == torch::kInt32,
-                    "cu_seqlens_q must have dtype int32");
-        TORCH_CHECK(cu_q.is_contiguous(), "cu_seqlens_q must be contiguous");
-        TORCH_CHECK(cu_q.numel() == batch_size + 1,
-                    "cu_seqlens_q must have batch_size+1 elements");
+    const bool has_q = seqlens_q.has_value();
+    if (has_q) {
+        TORCH_CHECK(seqlens_q->dtype() == torch::kInt32,
+                    "seqlens_q must have dtype int32");
+        TORCH_CHECK(seqlens_q->is_contiguous(), "seqlens_q must be contiguous");
+        TORCH_CHECK(seqlens_q->numel() ==
+                    (is_seqlens_q_cumulative ? batch_size + 1 : batch_size),
+                    "seqlens_q has invalid number of elements");
     }
-    if (is_varlen_kv) {
-        auto cu_k = cu_seqlens_k.value();
-        TORCH_CHECK(cu_k.dtype() == torch::kInt32,
-                    "cu_seqlens_k must have dtype int32");
-        TORCH_CHECK(cu_k.is_contiguous(), "cu_seqlens_k must be contiguous");
-        TORCH_CHECK(cu_k.numel() == batch_size + 1,
-                    "cu_seqlens_k must have batch_size+1 elements");
-    } else {
-        TORCH_CHECK(cache_seqlens.numel() == batch_size,
-                    "cache_seqlens must have batch_size elements");
-    }
+    TORCH_CHECK(seqlens_k.numel() ==
+                (is_seqlens_k_cumulative ? batch_size + 1 : batch_size),
+                "seqlens_k has invalid number of elements");
 
     const uint32_t blockDim =
         platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
@@ -131,11 +118,11 @@ at::Tensor get_scheduler_metadata(
         ? static_cast<uint32_t>(page_size.value()) : 128;
 
     FAMetadataArgs args{};
-    args.cuSeqlensQAddr = is_varlen_q
-        ? reinterpret_cast<uint64_t>(cu_seqlens_q.value().data_ptr()) : 0;
-    args.seqlensKAddr = is_varlen_kv
-        ? reinterpret_cast<uint64_t>(cu_seqlens_k.value().data_ptr())
-        : reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
+    args.seqlensQAddr = has_q
+        ? reinterpret_cast<uint64_t>(seqlens_q->data_ptr()) : 0;
+    args.seqlensKAddr = reinterpret_cast<uint64_t>(seqlens_k.data_ptr());
+    args.isSeqlensQCumulative = is_seqlens_q_cumulative ? 1U : 0U;
+    args.isSeqlensKCumulative = is_seqlens_k_cumulative ? 1U : 0U;
     args.batch = static_cast<uint32_t>(batch_size);
     args.numHeads = static_cast<uint32_t>(num_heads_q);
     args.numHeadsK = static_cast<uint32_t>(num_heads_kv);
@@ -153,11 +140,9 @@ at::Tensor get_scheduler_metadata(
     args.windowSizeLeft = static_cast<int32_t>(maskDer.window_left);
     args.windowSizeRight = static_cast<int32_t>(maskDer.window_right);
     args.blockDim = blockDim;
-    args.isVarlen = is_varlen_q ? 1u : 0u;
-    args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
     args.softmaxScale = static_cast<float>(softmax_scale);
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, cu_seqlens_k);
+    return GetSchedulerMetadataImpl(args, seqlens_k, seqlens_q);
 }
 
 PYBIND11_MODULE(flash_attn_npu_3_950, m)

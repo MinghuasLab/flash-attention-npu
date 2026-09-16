@@ -482,17 +482,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        if seqused_k is None and cu_seqlens_k is not None:
-            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        if seqused_q is None and cu_seqlens_q is not None:
-            seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-
         if seqused_k is not None and isinstance(seqused_k, int):
             seqused_k = torch.full(
                 (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
             )
-        seqused_q = _maybe_contiguous(seqused_q)
-        seqused_k = _maybe_contiguous(seqused_k)
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,

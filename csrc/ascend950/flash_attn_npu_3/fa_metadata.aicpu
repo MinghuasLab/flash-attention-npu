@@ -18,6 +18,12 @@ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
     return (b == 0) ? 0 : (a + b - 1) / b;
 }
 
+inline uint32_t GetSeqlen(const int32_t *seqlens, uint32_t batchIdx, bool cumulative)
+{
+    return cumulative ? static_cast<uint32_t>(seqlens[batchIdx + 1] - seqlens[batchIdx])
+                      : static_cast<uint32_t>(seqlens[batchIdx]);
+}
+
 inline uint32_t QSBlockTile(uint32_t embeddingSizeV)
 {
     // Match fai_tiling.cpp GetQSBlockTile: head_dim > 128 uses a 64-wide Q tile.
@@ -59,7 +65,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     // not executed. Clear the complete structure to keep newly added fields
     // (including Flash Decoding flags and schedules) disabled by default.
     std::memset(tilingData, 0, sizeof(FAInferTilingData));
-    const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
+    const int32_t *seqlensQ = reinterpret_cast<const int32_t *>(metaArgs->seqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
     tilingData->batch = metaArgs->batch;
@@ -116,15 +122,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t kvCumSum = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
-        if (metaArgs->isVarlen != 0) {
-            qSeqlen = static_cast<uint32_t>(
-                cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+        if (seqlensQ != nullptr) {
+            qSeqlen = GetSeqlen(seqlensQ, batchIdx, metaArgs->isSeqlensQCumulative != 0);
         }
-        uint32_t kvSeqlen = static_cast<uint32_t>(seqlensK[batchIdx]);
-        if (metaArgs->isVarlenKv != 0) {
-            kvSeqlen = static_cast<uint32_t>(
-                seqlensK[batchIdx + 1] - seqlensK[batchIdx]);
-        }
+        uint32_t kvSeqlen = GetSeqlen(seqlensK, batchIdx, metaArgs->isSeqlensKCumulative != 0);
         if (qSeqlen > maxQSeqlen) {
             maxQSeqlen = qSeqlen;
         }
