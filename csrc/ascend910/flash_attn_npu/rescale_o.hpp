@@ -467,9 +467,9 @@ public:
                 }
             }
             uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop ;
-            uint32_t subBlockStart = (curQNBlockTile == 1U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+            uint32_t subBlockStart = (qNThisSubBlock == 0U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
             if (!splitParams.isSplitkv) {
-                if (curQNBlockTile == 1U) {
+                if (qNThisSubBlock == 0U) {
                     ClearInvalidOutputRows(
                         0U, rowStart, curRowNum, delStartRow, delEndRow, qSeqlen, embedRound);
                 } else {

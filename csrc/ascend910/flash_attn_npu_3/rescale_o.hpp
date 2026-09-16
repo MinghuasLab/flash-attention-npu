@@ -413,7 +413,7 @@ public:
             }
             uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop ;
             uint32_t innerGOUbOffset = 0;
-            uint32_t subBlockStart = (curQNBlockTile == 1U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+            uint32_t subBlockStart = (qNThisSubBlock == 0U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
             if (delStartRow != 0) {
                 if (proTokenNum != 0U && subBlockStart + proTokenNum >= delStartRow) {
                     uint32_t start = subBlockStart >= delStartRow ? 0 : delStartRow - subBlockStart;
@@ -452,9 +452,9 @@ public:
             }
             if (delEndRow != qSeqlen) {
                 if (proTokenNum != 0U && subBlockStart < delEndRow) {
-                    uint32_t start = curQNBlockTile == 1U ? rowStart : 0;
+                    uint32_t start = qNThisSubBlock == 0U ? rowStart : 0;
                     uint32_t end = (subBlockStart + proTokenNum >= delEndRow) ?
-                                                    (curQNBlockTile == 1U ? delEndRow : delEndRow - subBlockStart)
+                                                    (qNThisSubBlock == 0U ? delEndRow : delEndRow - subBlockStart)
                                                             : subBlockStart + proTokenNum;
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Duplicate<ElementOutput>(
@@ -466,9 +466,9 @@ public:
                 }
                 if (subBlockStart < delEndRow) {
                     for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
-                        uint32_t start = curQNBlockTile == 1U ? subBlockStart : proTokenNum;
+                        uint32_t start = qNThisSubBlock == 0U ? subBlockStart : proTokenNum;
                         uint32_t end = (subBlockStart + qSThisSubBlock >= delEndRow) ?
-                                            (curQNBlockTile == 1U ? delEndRow : delEndRow - subBlockStart)
+                                            (qNThisSubBlock == 0U ? delEndRow : delEndRow - subBlockStart)
                                                          : start + qSThisSubBlock;
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Duplicate<ElementOutput>(
@@ -480,8 +480,8 @@ public:
                     }
                 }
                 if (epiTokenNum != 0U && subBlockStart < delEndRow) {
-                    uint32_t start = curQNBlockTile == 1U ? subBlockStart : proTokenNum + integralHeadNum * qSThisSubBlock + subBlockStart;
-                    uint32_t end = curQNBlockTile == 1U ? (subBlockStart + epiTokenNum >= delEndRow ? delEndRow : subBlockStart + epiTokenNum) :
+                    uint32_t start = qNThisSubBlock == 0U ? subBlockStart : proTokenNum + integralHeadNum * qSThisSubBlock + subBlockStart;
+                    uint32_t end = qNThisSubBlock == 0U ? (subBlockStart + epiTokenNum >= delEndRow ? delEndRow : subBlockStart + epiTokenNum) :
                                             (epiTokenNum >= delEndRow ? start + delEndRow: start + epiTokenNum);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Duplicate<ElementOutput>(
