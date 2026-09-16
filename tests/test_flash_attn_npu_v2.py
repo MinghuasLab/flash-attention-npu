@@ -128,6 +128,7 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0, False, False),
     # Additional negative-side windows with KV-cache: (508,-256) and (-128,864)
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
+    (torch.bfloat16, 1, 13, 1, 17, 1, 1, 1, 128, False, 0, 0, 0.0, False, False),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
     # ALiBi 
     (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True, False),

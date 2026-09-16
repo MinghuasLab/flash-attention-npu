@@ -188,7 +188,7 @@ private:
      * valid columns in the current basic block.
      */
     template <bool HAS_ATTEN_MASK, bool HAS_SOFTCAP>
-    __simd_vf__ inline void MulsMaskSimpleSoftmax(
+    __simd_vf__ static inline void MulsMaskSimpleSoftmax(
         __ubuf__ ElementP *dstUb,
         __ubuf__ ElementS *srcUb,
         __ubuf__ uint8_t *maskUb,
