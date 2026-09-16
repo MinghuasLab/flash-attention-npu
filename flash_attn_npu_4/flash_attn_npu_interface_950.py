@@ -11,6 +11,7 @@ import flash_attn_npu_4_950
 
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
 else:
 
     def _noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
@@ -21,7 +22,16 @@ else:
             return wrap
         return fn
 
+    def _noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        def wrap(func):
+            return func
+
+        if fn is None:
+            return wrap
+        return fn
+
     _torch_custom_op_wrapper = _noop_custom_op_wrapper
+    _torch_register_fake_wrapper = _noop_register_fake_wrapper
 
 
 def _maybe_contiguous(x):
@@ -33,7 +43,7 @@ def _window_to_npu(window_size: Optional[int]) -> int:
 
 
 @_torch_custom_op_wrapper(
-    "flash_attn_npu_4_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
+    "flash_attn_npu_4_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -143,7 +153,47 @@ def _flash_attn_backward_op(
         window_size_right,
         softcap,
         deterministic,
-        0,
+        0,  # sm_margin
+    )
+    return softmax_d
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4_950_C::_flash_attn_backward_op")
+def _flash_attn_backward_op_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    deterministic: bool,
+) -> torch.Tensor:
+    """Metadata-only fake for V4 A2 backward_op. Returns softmax_d; mutates dq/dk/dv."""
+    is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        nheads = q.shape[1]
+        # Real mha_bwd always allocates (batch, nheads, max_seqlen_q).
+        seqlen_q = max_seqlen_q
+    else:
+        batch_size = q.shape[0]
+        nheads = q.shape[2]
+        seqlen_q = q.shape[1]
+
+    softmax_d = torch.empty(
+        (batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device
     )
     return softmax_d
 
@@ -617,6 +667,75 @@ def flash_attn_func(
         block_sparse_tensors_bwd,
         return_lse,
     )
+
+
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4_C::_flash_attn_forward")
+def _flash_attn_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    return_lse: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
+    is_varlen_q = cu_seqlens_q is not None
+    head_size_v = v.shape[-1]
+    out_dtype = q.dtype
+
+    if is_varlen_q:
+        total_q = q.shape[0]
+        num_heads = q.shape[1]
+        out = torch.empty(
+            (total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device
+        )
+        if return_lse:
+            softmax_lse = torch.empty(
+                (num_heads, total_q), dtype=torch.float32, device=q.device
+            )
+        else:
+            softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+    else:
+        batch_size = q.shape[0]
+        seqlen_q = q.shape[1]
+        num_heads = q.shape[2]
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v),
+            dtype=out_dtype,
+            device=q.device,
+        )
+        if return_lse:
+            softmax_lse = torch.empty(
+                (batch_size, num_heads, seqlen_q),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        else:
+            softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+
+    # Real mha_fwd currently always returns empty accum tensors.
+    out_accum = torch.empty((0,), dtype=torch.float32, device=q.device)
+    softmax_lse_accum = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return out, softmax_lse, out_accum, softmax_lse_accum
 
 
 def flash_attn_varlen_func(
