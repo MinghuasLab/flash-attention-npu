@@ -80,9 +80,10 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     LocalTensor<T1> dsL1Tensor;
     LocalTensor<T1> dxL1Tensor;
 
-    __gm__ uint8_t* actual_seq_qlen_addr;
-    __gm__ uint8_t* actual_seq_kvlen_addr;
-
+    __gm__ uint8_t *actual_seq_qlen_addr;
+    __gm__ uint8_t *actual_seq_kvlen_addr;
+    __gm__ uint8_t *seq_used_qlen_addr = nullptr;
+    __gm__ uint8_t *seq_used_kvlen_addr = nullptr;
     GlobalTensor<float> dvGm;
 
     SoftMaxTiling softmaxTilingData;
@@ -208,13 +209,17 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     AttenMaskCompress AttenBandMode = AttenMaskCompress::All;
 
     CATLASS_DEVICE
-    BlockEpilogue(Arch::Resource<ArchTag>& resource, AscendC::TPipe* pipe_in, __gm__ uint8_t* query,
-                  __gm__ uint8_t* key, __gm__ uint8_t* value, __gm__ uint8_t* dx, __gm__ uint8_t* drop_mask,
-                  __gm__ uint8_t* atten_mask, __gm__ uint8_t* forward_res, __gm__ uint8_t* softmax_lse,
-                  __gm__ uint8_t* actual_seq_qlen, __gm__ uint8_t* actual_seq_kvlen, __gm__ uint8_t* dq,
-                  __gm__ uint8_t* dk, __gm__ uint8_t* dv, __gm__ uint8_t* alibi_slopes, __gm__ uint8_t* workspace,
-                  __gm__ uint8_t* tiling_in, TBuf<>& buf)
-    {
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in,
+                  __gm__ uint8_t *query,
+                  __gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *dx,
+                  __gm__ uint8_t *drop_mask, __gm__ uint8_t *atten_mask, __gm__ uint8_t *forward_res,
+                  __gm__ uint8_t *softmax_lse,
+                  __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen,
+                  __gm__ uint8_t *dq, __gm__ uint8_t *dk,
+                  __gm__ uint8_t *dv, __gm__ uint8_t *alibi_slopes,
+                  __gm__ uint8_t *workspace, __gm__ uint8_t *tiling_in, TBuf<>& buf,
+                  __gm__ uint8_t *seq_used_qlen = nullptr,
+                  __gm__ uint8_t *seq_used_kvlen = nullptr)    {
         keyGm.SetGlobalBuffer((__gm__ T1*)key);
         valueGm.SetGlobalBuffer((__gm__ T1*)value);
         dxGm.SetGlobalBuffer((__gm__ T1*)dx);
@@ -282,6 +287,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
 
         actual_seq_qlen_addr = actual_seq_qlen;
         actual_seq_kvlen_addr = actual_seq_kvlen;
+        seq_used_qlen_addr = seq_used_qlen;
+        seq_used_kvlen_addr = seq_used_kvlen;
         if constexpr (IS_DROP == ENABLE) {
             dropMaskGm.SetGlobalBuffer((__gm__ uint8_t*)drop_mask);
         }
@@ -347,6 +354,20 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     }
 
     CATLASS_DEVICE
+    void GetUsedSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
+    {
+        int32_t allocatedQ = 0;
+        int32_t allocatedKv = 0;
+        if (seq_used_qlen_addr == nullptr || seq_used_kvlen_addr == nullptr) {
+            GetSeqQlenKvlenByBidx(bIdx, allocatedQ, allocatedKv);
+        }
+        actualSeqQlen = seq_used_qlen_addr != nullptr
+            ? ((__gm__ int32_t *)seq_used_qlen_addr)[bIdx] : allocatedQ;
+        actualSeqKvlen = seq_used_kvlen_addr != nullptr
+            ? ((__gm__ int32_t *)seq_used_kvlen_addr)[bIdx] : allocatedKv;
+    }
+
+    CATLASS_DEVICE
     void UpdateToken(int64_t bIdx)
     {
         if constexpr (IS_ATTEN_MASK != ENABLE) {
@@ -354,7 +375,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         }
         int32_t actualS1Len = 0;
         int32_t actualS2Len = 0;
-        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
+        GetUsedSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
         actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
         actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
     }
@@ -427,7 +448,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         if constexpr (INPUT_LAYOUT == TND) {
             int32_t actualS1Len = 0;
             int32_t actualS2Len = 0;
-            GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
+            GetUsedSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
             return causal_delta - actualS1Len + actualS2Len;
         } else {
             return causal_delta - s1 + s2;
@@ -688,7 +709,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             if constexpr (INPUT_LAYOUT == TND) {
                 int32_t actualS1LenBwd = 0;
                 int32_t actualS2LenBwd = 0;
-                GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1LenBwd, actualS2LenBwd);
+                GetUsedSeqQlenKvlenByBidx(dbParam.bIdx, actualS1LenBwd, actualS2LenBwd);
                 qKSeqDiff = static_cast<int64_t>(actualS2LenBwd) - static_cast<int64_t>(actualS1LenBwd);
             } else {
                 qKSeqDiff = s2 - s1;

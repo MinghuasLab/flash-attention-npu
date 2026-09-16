@@ -42,6 +42,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
         metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
+    const int32_t *seqUsedQ = reinterpret_cast<const int32_t *>(metaArgs->seqUsedQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
     std::memset(tilingData, 0, sizeof(FAInferTilingData));
@@ -132,7 +133,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (metaArgs->isVarlen != 0) {
-            qSeqlen = static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+            qSeqlen = seqUsedQ != nullptr
+                ? static_cast<uint32_t>(seqUsedQ[batchIdx])
+                : static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
         }
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -154,6 +157,21 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->totalTaskNum = totalTaskNum;
 
     {
+<<<<<<< HEAD
+=======
+        uint32_t maxQ = 0;
+        uint32_t minQ = 0xFFFFFFFFu;
+        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+            uint32_t qLen = metaArgs->maxQSeqlen;
+            if (metaArgs->isVarlen != 0) {
+                qLen = seqUsedQ != nullptr
+                    ? static_cast<uint32_t>(seqUsedQ[batchIdx])
+                    : static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
+            }
+            if (qLen > maxQ) maxQ = qLen;
+            if (qLen < minQ) minQ = qLen;
+        }
+>>>>>>> 036a60d9 (feat: add seqused qk support for 910 v3 varlen fwd bwd)
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
@@ -171,6 +189,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
             ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
             ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
             ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
+            ctx.seq_used_q_cpu = const_cast<int32_t *>(seqUsedQ);
             ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
             ctx.is_varlen_q = metaArgs->isVarlen != 0;
             ctx.blockDim = bd;
