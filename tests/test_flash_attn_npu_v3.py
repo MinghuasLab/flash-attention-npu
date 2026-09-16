@@ -700,7 +700,9 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
             softcap=softcap,
             name="softmax_lse",
         )
-    if "Ascend910" in name:
+    if "Ascend910" in name or (
+        "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+    ):
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
         dout_ref = dout.detach().cpu()
         dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
@@ -909,11 +911,14 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             for i in range(batch_size)
         ])
     assert_fa_close(output_compare, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    if "Ascend910" in name:
-        lse_compare = softmax_lse
+    if "Ascend910" in name or (
+        "Ascend950" in name
+        and window_size_left == -1 and window_size_right == -1
+    ):
+        lse_compare = softmax_lse.transpose(-1, -2) if "Ascend950" in name else softmax_lse
         if add_unused_qkv:
             lse_compare = torch.cat([
-                softmax_lse[:, int(cu_q[i]):int(cu_q[i]) + used_q_lengths[i]]
+                lse_compare[:, int(cu_q[i]):int(cu_q[i]) + used_q_lengths[i]]
                 for i in range(batch_size)
             ], dim=1)
         assert_fa_close(lse_compare, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")

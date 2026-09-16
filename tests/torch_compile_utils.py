@@ -3,6 +3,7 @@ import inspect
 
 import pytest
 import torch
+import torch_npu
 
 
 DEVICE = "npu:0"
@@ -22,7 +23,9 @@ def require_soc(prefix):
     name = soc_name()
 
     if prefix not in name:
-        pytest.skip(f"requires Ascend {prefix}, current device is {name!r}")
+        pytest.skip(
+            f"requires Ascend {prefix}, current device is {name!r}"
+        )
 
     return name
 
@@ -44,7 +47,9 @@ def first_tensor(value):
             if isinstance(item, torch.Tensor):
                 return item
 
-    raise AssertionError(f"expected Tensor or tuple/list containing Tensor, got {type(value)}")
+    raise AssertionError(
+        f"expected Tensor or tuple/list containing Tensor, got {type(value)}"
+    )
 
 
 def check_required_parameters(sig, kwargs, ignored=()):
@@ -61,7 +66,10 @@ def check_required_parameters(sig, kwargs, ignored=()):
             missing.append(name)
 
     if missing:
-        pytest.fail(f"unsupported required parameters in current API: {missing}; signature={sig}")
+        pytest.fail(
+            f"unsupported required parameters in current API: {missing}; "
+            f"signature={sig}"
+        )
 
 
 def metadata_kwargs(api, causal, window_size):
@@ -76,44 +84,57 @@ def metadata_kwargs(api, causal, window_size):
         "headdim": 32,
         "headdim_v": 32,
         "qkv_dtype": torch.float16,
+
         "cu_seqlens_q": None,
         "cu_seqlens_k": None,
         "cu_seqlens_k_new": None,
         "seqused_q": None,
+        "seqlens_q": None,
+        "is_seqlens_q_cumulative": False,
+        "is_seqlens_k_cumulative": False,
         "cache_leftpad": None,
+
         "page_size": None,
         "max_seqlen_k_new": 0,
+
         "causal": causal,
         "window_size": window_size,
         "window_size_left": window_size[0],
         "window_size_right": window_size[1],
+
         "attention_chunk": 0,
         "softcap": 0.0,
         "num_splits": 1,
         "pack_gqa": None,
         "sm_margin": 0,
         "deterministic": False,
-        "softmax_scale": 32**-0.5,
+
+        "softmax_scale": 32 ** -0.5,
         "alibi_slopes_batch_stride": 0,
         "learnable_sink": None,
     }
 
-    kwargs = {name: candidates[name] for name in sig.parameters if name in candidates}
+    kwargs = {
+        name: candidates[name]
+        for name in sig.parameters
+        if name in candidates
+    }
 
     check_required_parameters(
         sig,
         kwargs,
-        ignored=("cache_seqlens",),
+        ignored=("cache_seqlens", "seqlens_k"),
     )
 
     return kwargs
 
 
-def run_metadata_compile_test(
-    api,
-    expected_sizes=None,
-    tiling_only_metadata=False,
-):
+def run_metadata_compile_test(api, expected_sizes=None):
+    length_parameter = (
+        "seqlens_k"
+        if "seqlens_k" in inspect.signature(api.get_scheduler_metadata).parameters
+        else "cache_seqlens"
+    )
     cache_seqlens = torch.tensor(
         [16, 16],
         dtype=torch.int32,
@@ -139,7 +160,7 @@ def run_metadata_compile_test(
 
         def fn(cache):
             return api.get_scheduler_metadata(
-                cache_seqlens=cache,
+                **{length_parameter: cache},
                 **static_kwargs,
             )
 
@@ -191,18 +212,16 @@ def run_metadata_compile_test(
 
         observed_sizes[case_name] = compiled.numel()
 
-    assert observed_sizes["NO_MASK"] == observed_sizes["FULL_WINDOW_COLLAPSE"]
+    assert (
+        observed_sizes["NO_MASK"]
+        == observed_sizes["FULL_WINDOW_COLLAPSE"]
+    )
 
     base = observed_sizes["NO_MASK"]
 
-    if tiling_only_metadata:
-        assert observed_sizes["CAUSAL"] == base
-        assert observed_sizes["LOCAL_LEFT"] == base
-        assert observed_sizes["LOCAL_RIGHT"] == base
-    else:
-        assert observed_sizes["CAUSAL"] > base
-        assert observed_sizes["LOCAL_LEFT"] > base
-        assert observed_sizes["LOCAL_RIGHT"] > base
+    assert observed_sizes["CAUSAL"] > base
+    assert observed_sizes["LOCAL_LEFT"] > base
+    assert observed_sizes["LOCAL_RIGHT"] > base
 
 
 def varlen_kwargs(api, cu_q, cu_k, max_seq):
@@ -213,30 +232,42 @@ def varlen_kwargs(api, cu_q, cu_k, max_seq):
         "cu_seqlens_k": cu_k,
         "max_seqlen_q": max_seq,
         "max_seqlen_k": max_seq,
+
         "seqused_q": None,
         "seqused_k": None,
-        "softmax_scale": 32**-0.5,
+
+        "softmax_scale": 32 ** -0.5,
         "causal": False,
+
         "qv": None,
         "q_descale": None,
         "k_descale": None,
         "v_descale": None,
+
         "window_size": (-1, -1),
         "attention_chunk": 0,
         "softcap": 0.0,
+
         "num_splits": 1,
         "pack_gqa": None,
         "deterministic": False,
         "sm_margin": 0,
+
         "return_attn_probs": False,
         "return_lse": True,
+
         "scheduler_metadata": None,
         "disable_scheduler_metadata": False,
+
         "alibi_slopes": None,
         "learnable_sink": None,
     }
 
-    kwargs = {name: candidates[name] for name in sig.parameters if name in candidates}
+    kwargs = {
+        name: candidates[name]
+        for name in sig.parameters
+        if name in candidates
+    }
 
     check_required_parameters(
         sig,
@@ -262,9 +293,15 @@ def run_varlen_compile_test(
     nheads = 6
     head_dim = 32
 
-    max_seq_q = max(cu_q_values[i + 1] - cu_q_values[i] for i in range(len(cu_q_values) - 1))
+    max_seq_q = max(
+        cu_q_values[i + 1] - cu_q_values[i]
+        for i in range(len(cu_q_values) - 1)
+    )
 
-    max_seq_k = max(cu_k_values[i + 1] - cu_k_values[i] for i in range(len(cu_k_values) - 1))
+    max_seq_k = max(
+        cu_k_values[i + 1] - cu_k_values[i]
+        for i in range(len(cu_k_values) - 1)
+    )
 
     q_base = torch.randn(
         total_q,
@@ -407,7 +444,6 @@ def run_varlen_compile_test(
             rtol=RTOL,
         )
 
-
 def run_fixed_compile_test(api, backward=True):
     """
     Verify fixed-length FlashAttention correctness.
@@ -426,6 +462,7 @@ def run_fixed_compile_test(api, backward=True):
     heads = 6
     dim = 32
 
+
     q = torch.randn(
         batch,
         seq,
@@ -438,20 +475,24 @@ def run_fixed_compile_test(api, backward=True):
     k = torch.randn_like(q)
     v = torch.randn_like(q)
 
-    def fn(q, k, v):
+
+    def fn(q,k,v):
         return api.flash_attn_func(
             q,
             k,
             v,
         )
 
+
     q1 = q.clone().detach()
     k1 = k.clone().detach()
     v1 = v.clone().detach()
 
+
     q2 = q.clone().detach()
     k2 = k.clone().detach()
     v2 = v.clone().detach()
+
 
     if backward:
         q1.requires_grad_(True)
@@ -462,9 +503,15 @@ def run_fixed_compile_test(api, backward=True):
         k2.requires_grad_(True)
         v2.requires_grad_(True)
 
-    out_eager = fn(q1, k1, v1)
 
-    out_eager = out_eager[0] if isinstance(out_eager, tuple) else out_eager
+    out_eager = fn(q1,k1,v1)
+
+    out_eager = (
+        out_eager[0]
+        if isinstance(out_eager, tuple)
+        else out_eager
+    )
+
 
     torch._dynamo.reset()
 
@@ -474,9 +521,15 @@ def run_fixed_compile_test(api, backward=True):
         fullgraph=True,
     )
 
-    out_compile = compiled_fn(q2, k2, v2)
 
-    out_compile = out_compile[0] if isinstance(out_compile, tuple) else out_compile
+    out_compile = compiled_fn(q2,k2,v2)
+
+    out_compile = (
+        out_compile[0]
+        if isinstance(out_compile, tuple)
+        else out_compile
+    )
+
 
     torch.testing.assert_close(
         out_compile.float(),
@@ -485,16 +538,19 @@ def run_fixed_compile_test(api, backward=True):
         rtol=2e-3,
     )
 
+
     if not backward:
         return
+
 
     out_eager.float().sum().backward()
     out_compile.float().sum().backward()
 
-    for a, b in [
-        (q1.grad, q2.grad),
-        (k1.grad, k2.grad),
-        (v1.grad, v2.grad),
+
+    for a,b in [
+        (q1.grad,q2.grad),
+        (k1.grad,k2.grad),
+        (v1.grad,v2.grad),
     ]:
         assert a is not None
         assert b is not None
