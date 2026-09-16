@@ -641,13 +641,9 @@ class FlashAttnFunc(torch.autograd.Function):
         seqlen_k, num_heads_k = k.shape[1], k.shape[2]
         cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
         scheduler_metadata = get_scheduler_metadata(
-            batch_size,
-            seqlen_q,
-            seqlen_k,
-            num_heads,
-            num_heads_k,
-            head_size,
-            cache_seqlens,
+            batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, head_size,
+            seqlens_q=None,
+            seqlens_k=cache_seqlens,
             qkv_dtype=q.dtype,
             causal=causal,
             window_size=window_size,
@@ -790,26 +786,30 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # Training interfaces do not expose scheduler_metadata (aligned with
         # official flash-attn); the scheduler metadata is computed internally on
-        # the AICPU so no D2H/H2D sync breaks the pipeline. cache_seqlens holds
-        # the per-batch KV lengths and stays on device.
+        # the AICPU so no D2H/H2D sync breaks the pipeline. Pass the original
+        # cumulative offsets to metadata; AICPU derives per-batch lengths.
         batch_size = cu_seqlens_q.shape[0] - 1
         num_heads, head_size = q.shape[1], q.shape[2]
         num_heads_k = k.shape[1]
-        if seqused_k is not None:
-            cache_seqlens = seqused_k
+        if seqused_q is not None:
+            seqlens_q = seqused_q
+            is_seqlens_q_cumulative = False
         else:
-            cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            seqlens_q = cu_seqlens_q
+            is_seqlens_q_cumulative = True
+        if seqused_k is not None:
+            seqlens_k = seqused_k
+            is_seqlens_k_cumulative = False
+        else:
+            seqlens_k = cu_seqlens_k
+            is_seqlens_k_cumulative = True
         scheduler_metadata = get_scheduler_metadata(
-            batch_size,
-            max_seqlen_q,
-            max_seqlen_k,
-            num_heads,
-            num_heads_k,
-            head_size,
-            cache_seqlens,
+            batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
+            seqlens_q=seqlens_q,
+            seqlens_k=seqlens_k,
+            is_seqlens_q_cumulative=is_seqlens_q_cumulative,
+            is_seqlens_k_cumulative=is_seqlens_k_cumulative,
             qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_q=seqused_q,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1524,16 +1524,11 @@ def _get_scheduler_metadata_fake(
 
 
 def get_scheduler_metadata(
-    batch_size,
-    max_seqlen_q,
-    max_seqlen_k,
-    num_heads_q,
-    num_heads_kv,
-    headdim,
-    cache_seqlens: torch.Tensor,
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
@@ -1546,10 +1541,11 @@ def get_scheduler_metadata(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
-    seqused_q: Optional[torch.Tensor] = None,
+    is_seqlens_q_cumulative=False,
+    is_seqlens_k_cumulative=False,
 ):
-    cache_seqlens = maybe_contiguous(cache_seqlens)
-    seqused_q = maybe_contiguous(seqused_q)
+    seqlens_q = maybe_contiguous(seqlens_q)
+    seqlens_k = maybe_contiguous(seqlens_k)
     if headdim_v is None:
         headdim_v = headdim
     # Route through the custom op so torch.compile / FakeTensor can use the
@@ -1564,11 +1560,10 @@ def get_scheduler_metadata(
         headdim,
         headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
@@ -1581,6 +1576,8 @@ def get_scheduler_metadata(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
     # Fingerprint the creation arguments so flash_attn_with_kvcache can reject
     # metadata whose baked-in tiling does not match the call consuming it.
@@ -1595,7 +1592,7 @@ def get_scheduler_metadata(
         "page_size": None if page_size is None else int(page_size),
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
-        "varlen_q": cu_seqlens_q is not None,
+        "varlen_q": seqlens_q is not None,
         "num_splits": int(num_splits),
     }
     return scheduler_metadata

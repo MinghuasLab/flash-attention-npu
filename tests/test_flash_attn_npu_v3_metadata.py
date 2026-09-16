@@ -123,9 +123,9 @@ def _metadata(
     num_heads,
     kv_heads,
     head_size,
-    cache_seqlens,
     data_type,
-    cu_seqlens_q=None,
+    seqlens_q,
+    seqlens_k,
     page_size=None,
     is_causal=False,
     window_size=WINDOW_SIZE,
@@ -140,9 +140,9 @@ def _metadata(
         num_heads_q=num_heads,
         num_heads_kv=kv_heads,
         headdim=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
         qkv_dtype=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=page_size,
         causal=is_causal,
         window_size=window_size,
@@ -470,7 +470,8 @@ def test_flash_attn_kvcache_metadata_bsnd(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
         is_causal=is_causal,
@@ -529,8 +530,9 @@ def test_flash_attn_kvcache_metadata_tnd(
 ):
     q_lengths = [q_seqlen] * batch_size
     q_offsets = _prefix_sums(q_lengths)
-    cu_seqlens_q = _int32_npu(q_offsets)
+    seqlens_q = _int32_npu(q_lengths)
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+    cu_seqlens_q = _int32_npu(q_offsets)
 
     query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
@@ -545,9 +547,9 @@ def test_flash_attn_kvcache_metadata_tnd(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=seqlens_q,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=block_size,
         is_causal=is_causal,
     )
@@ -602,9 +604,10 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
-    cu_seqlens_q = _int32_npu([0, q_seqlen])
+    seqlens_q = _int32_npu([q_seqlen])
     cache_seqlens = _int32_npu([kv_seqlen])
-    scale = 1.0 / (head_size**0.5)
+    cu_seqlens_q = _int32_npu([0, q_seqlen])
+    scale = 1.0 / (head_size ** 0.5)
 
     scheduler_metadata = _metadata(
         batch_size=batch_size,
@@ -613,9 +616,9 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=seqlens_q,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=block_size,
         is_causal=is_causal,
     )
@@ -908,7 +911,8 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
         is_causal=is_causal,
@@ -1085,7 +1089,8 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
         is_causal=meta_causal,
@@ -1161,7 +1166,8 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
     )
 
@@ -1213,7 +1219,8 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
         softcap=0.0,
@@ -1252,7 +1259,8 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
     ).clone()
@@ -1291,7 +1299,8 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
     )
@@ -1382,7 +1391,8 @@ def test_flash_attn_with_kvcache_metadata_matches(data_type):
         num_heads_q=heads,
         num_heads_kv=kv_heads,
         headdim=head,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=None,
+        seqlens_k=cache_seqlens,
         qkv_dtype=data_type,
         page_size=block_size,
         causal=False,
@@ -1462,9 +1472,9 @@ def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
         num_heads_q=heads,
         num_heads_kv=kv_heads,
         headdim=head,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=_int32_npu([q_seqlen] * batch),
+        seqlens_k=cache_seqlens,
         qkv_dtype=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         causal=False,
         softmax_scale=scale,
     )
