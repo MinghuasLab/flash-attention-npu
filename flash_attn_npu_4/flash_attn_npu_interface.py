@@ -233,8 +233,8 @@ def _get_scheduler_metadata_op(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -244,6 +244,8 @@ def _get_scheduler_metadata_op(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
     return flash_attn_npu_4.get_scheduler_metadata(
         batch_size,
@@ -254,8 +256,8 @@ def _get_scheduler_metadata_op(
         headdim,
         headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         page_size,
         causal,
         window_size_left,
@@ -265,6 +267,8 @@ def _get_scheduler_metadata_op(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
 
 
@@ -280,8 +284,8 @@ def _get_scheduler_metadata_fake(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -291,6 +295,8 @@ def _get_scheduler_metadata_fake(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
 
     has_mask = _scheduler_metadata_has_mask(
@@ -312,7 +318,7 @@ def _get_scheduler_metadata_fake(
     return torch.empty(
         (metadata_bytes,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=seqlens_k.device,
     )
 
 
@@ -495,6 +501,8 @@ def _flash_attn_backward_op_fake(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,

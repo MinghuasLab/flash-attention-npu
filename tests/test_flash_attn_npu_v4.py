@@ -483,18 +483,15 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
     is_950 = "Ascend950" in name
     no_swa = window_size_left == -1 and window_size_right == -1
+    dense_varlen = layout == "TND" and cache_mode == 0
     bwd_supported = (
-        layout == "TND"
-        and cache_mode == 0
+        dense_varlen
         and num_splits <= 1
         and (not is_950 or no_swa)
     )
-    cu_seqlens_k_for_api = new_kv_seqlen_list if bwd_supported else None
-    max_seqlen_k_for_api = kv_seqlen if bwd_supported else None
-    if is_950:
-        cache_seqlens_for_api = kv_seqlen_list
-    else:
-        cache_seqlens_for_api = None if bwd_supported else kv_seqlen_list
+    cu_seqlens_k_for_api = new_kv_seqlen_list if dense_varlen else None
+    max_seqlen_k_for_api = kv_seqlen if dense_varlen else None
+    cache_seqlens_for_api = None if dense_varlen else kv_seqlen_list
     seqused_q = (torch.tensor(used_q_lengths, dtype=torch.int32).npu()
                  if add_unused_qkv else None)
     if add_unused_qkv:
@@ -895,4 +892,4 @@ hd_cases = [
 def test_fa_kvcache_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap):
     is_varied = layout == 'TND'
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits)
+    test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits, add_unused_qkv=False)

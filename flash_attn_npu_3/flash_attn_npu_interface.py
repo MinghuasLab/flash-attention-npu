@@ -1432,11 +1432,10 @@ def _get_scheduler_metadata_op(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     cu_seqlens_k: Optional[torch.Tensor],
     cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
     cache_leftpad: Optional[torch.Tensor],
     page_size: Optional[int],
     max_seqlen_k_new: int,
@@ -1449,6 +1448,8 @@ def _get_scheduler_metadata_op(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
     return flash_attn_npu_3.get_scheduler_metadata(
         batch_size,
@@ -1459,11 +1460,10 @@ def _get_scheduler_metadata_op(
         headdim,
         headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         cu_seqlens_k,
         cu_seqlens_k_new,
-        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
@@ -1476,6 +1476,8 @@ def _get_scheduler_metadata_op(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
 
 
@@ -1489,11 +1491,10 @@ def _get_scheduler_metadata_fake(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     cu_seqlens_k: Optional[torch.Tensor],
     cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
     cache_leftpad: Optional[torch.Tensor],
     page_size: Optional[int],
     max_seqlen_k_new: int,
@@ -1506,6 +1507,8 @@ def _get_scheduler_metadata_fake(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
     has_mask = _scheduler_metadata_has_mask(
         causal,
@@ -1519,7 +1522,7 @@ def _get_scheduler_metadata_fake(
     return torch.empty(
         (metadata_bytes,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=seqlens_k.device,
     )
 
 
@@ -1550,7 +1553,7 @@ def get_scheduler_metadata(
         headdim_v = headdim
     # Route through the custom op so torch.compile / FakeTensor can use the
     # registered fake instead of tracing into the raw pybind extension.
-    # Public API still hard-codes cu_seqlens_k / seqused_q as None (unchanged).
+    # Sequence lengths and cumulative flags follow the device scheduler API.
     scheduler_metadata = _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,

@@ -272,9 +272,10 @@ def _get_scheduler_metadata_op(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
     page_size: Optional[int],
     num_blocks: Optional[int],
     max_num_blocks_per_seq: Optional[int],
@@ -292,9 +293,10 @@ def _get_scheduler_metadata_op(
         num_heads_kv,
         headdim,
         headdim_v,
-        cache_seqlens,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        seqlens_q,
+        seqlens_k,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
         page_size,
         num_blocks,
         max_num_blocks_per_seq,
@@ -317,9 +319,10 @@ def _get_scheduler_metadata_fake(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
     page_size: Optional[int],
     num_blocks: Optional[int],
     max_num_blocks_per_seq: Optional[int],
@@ -336,7 +339,7 @@ def _get_scheduler_metadata_fake(
     return torch.empty(
         (metadata_size,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=seqlens_k.device,
     )
 
 def get_scheduler_metadata(
@@ -429,6 +432,8 @@ def _training_forward(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
+    seqused_q,
+    seqused_k,
     max_seqlen_q,
     max_seqlen_k,
     softmax_scale,
@@ -436,15 +441,16 @@ def _training_forward(
     window_size,
     scheduler_metadata,
 ):
-    if cu_seqlens_q is None:
-        seqused_k = torch.full(
-            (q.shape[0],),
-            k.shape[1],
-            dtype=torch.int32,
-            device=k.device,
-        )
-    else:
-        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    if seqused_k is None:
+        if cu_seqlens_k is None:
+            seqused_k = torch.full(
+                (q.shape[0],),
+                k.shape[1],
+                dtype=torch.int32,
+                device=k.device,
+            )
+        else:
+            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
 
     return _flash_attn_forward(
         q,
@@ -454,7 +460,7 @@ def _training_forward(
         cu_seqlens_q,
         cu_seqlens_k,
         None,                    # cu_seqlens_k_new
-        None,
+        seqused_q,
         seqused_k,
         max_seqlen_q,
         max_seqlen_k,
@@ -530,7 +536,8 @@ class FlashAttnFunc(torch.autograd.Function):
             )
 
         out, softmax_lse, _, _ = _training_forward(
-            q, k, v, None, None, None, None, softmax_scale, causal, window_size, scheduler_metadata
+            q, k, v, None, None, None, None, None, None,
+            softmax_scale, causal, window_size, scheduler_metadata
         )
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
@@ -589,7 +596,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         scheduler_metadata,
     ):
         if any(x is not None for x in (
-            seqused_q, seqused_k, qv, q_descale, k_descale, v_descale,
+            qv, q_descale, k_descale, v_descale,
         )):
             raise NotImplementedError("Ascend950 v3 varlen training scaffold does not support optional tensor inputs")
         if attention_chunk != 0 or softcap != 0.0:
@@ -608,10 +615,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 num_heads_kv=k.shape[1],
                 headdim=q.shape[2],
                 headdim_v=v.shape[2],
-                seqlens_q=cu_seqlens_q,
-                seqlens_k=cu_seqlens_k,
-                is_seqlens_q_cumulative=True,
-                is_seqlens_k_cumulative=True,
+                seqlens_q=seqused_q if seqused_q is not None else cu_seqlens_q,
+                seqlens_k=seqused_k if seqused_k is not None else cu_seqlens_k,
+                is_seqlens_q_cumulative=seqused_q is None,
+                is_seqlens_k_cumulative=seqused_k is None,
                 qkv_dtype=q.dtype,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
@@ -624,12 +631,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         out, softmax_lse, _, _ = _training_forward(
             q, k, v,
             cu_seqlens_q, cu_seqlens_k,
+            seqused_q, seqused_k,
             max_seqlen_q, max_seqlen_k,
             softmax_scale, causal, window_size,
             scheduler_metadata,
         )
         ctx.save_for_backward(
-            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k
+            q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k
         )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
@@ -644,11 +652,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *unused_grads):
         if ctx.window_size != (-1, -1):
             raise NotImplementedError("Ascend950 v3 backward does not support sliding-window attention")
-        q, k, v, out, softmax_lse, cu_q, cu_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_q, cu_k, seqused_q, seqused_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout, q, k, v, out, softmax_lse,
-            cu_q, cu_k, None, None,
+            cu_q, cu_k, seqused_q, seqused_k,
             ctx.max_seqlen_q, ctx.max_seqlen_k,
             dq, dk, dv,
             ctx.softmax_scale,
