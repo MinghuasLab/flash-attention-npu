@@ -1,0 +1,49 @@
+# LLVM is the formatter baseline.  The explicit settings below preserve the
+# repository's historical layout and CANN-specific source constraints.
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+# Preserve the repository's historical four-space indentation and long-line
+# allowance for AscendC types, templates, and compiler macros.
+UseTab: Never
+TabWidth: 4
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 120
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# Include order is part of the CANN/device build contract; comments often
+# contain compiler directives and must not be reflowed by the formatter.
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: false
+
+# Keep compact constructs expanded so host and device code have one layout.
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+
+# Keep the template declaration and the following class/struct/function on
+# separate lines. This is supported by the pinned clang-format 21.1.8.
+BreakTemplateDeclarations: Yes
+
+# Existing project style: control braces attach, function braces break.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterControlStatement: Never
+  AfterClass: false
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  SplitEmptyFunction: false
+SpaceBeforeParens: ControlStatements

@@ -1,0 +1,91 @@
+name: NPU CI 默认状态
+
+# PR 新建/重开/ready/push 新 commit 时, 给 head commit 写入
+#   NPU CI / 手动验证  pending  "未执行"
+# 并在 PR 下发机器人评论, 提示可用 /run-npu-ci 触发 full CI。
+# 真正的 NPU CI 不会由此自动执行。
+#
+# 用 pull_request_target (而非 pull_request): fork PR 也能访问 secrets
+# (NPU_CI_BOT_TOKEN) 并拿到可写的 GITHUB_TOKEN, 从而能写 commit status。
+# 安全性: 本 workflow 只调 GitHub API (写 status + 评论), 不 checkout/执行
+# PR 代码, 用 pull_request_target 是安全的。
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  statuses: write
+  pull-requests: write
+
+concurrency:
+  group: npu-ci-default-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: false
+
+jobs:
+  default_status:
+    name: 手动验证
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set pending "未执行" status
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${{ github.event.pull_request.head.sha }}"
+          pr_number="${{ github.event.pull_request.number }}"
+          actor="${{ github.event.pull_request.user.login }}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          event="${{ github.event.action }}"
+
+          # 若该 commit 已有 NPU CI 成功/失败/运行中状态, 保留已有状态, 不覆盖
+          existing="$(gh api "repos/$repo/commits/$sha/status" \
+            --jq '.statuses[] | select(.context == "NPU CI / 手动验证") | .state' || true)"
+          if [ "$existing" = "success" ] || [ "$existing" = "pending" ] || [ "$existing" = "failure" ]; then
+            echo "existing NPU CI status=$existing, keep it"
+            exit 0
+          fi
+
+          if [ "$event" = "synchronize" ]; then
+            desc="未执行：commit 已变化，请重新触发 /run-npu-ci（full）"
+          else
+            desc="未执行：评论 /run-npu-ci 触发 full CI (任何人可触发)"
+          fi
+
+          gh api --method POST "repos/$repo/statuses/$sha" \
+            -f state=pending \
+            -f context="NPU CI / 手动验证" \
+            -f description="$desc" \
+            -f target_url="$run_url" >/dev/null
+
+      - name: Bot comment with trigger hint
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          pr_number="${{ github.event.pull_request.number }}"
+          sha="${{ github.event.pull_request.head.sha }}"
+          event="${{ github.event.action }}"
+
+          if [ "$event" = "synchronize" ]; then
+            hint="commit 已变化, 重新评论 \`/run-npu-ci\` 触发 full NPU CI (任何人可触发)。"
+          else
+            hint="在下方评论 \`/run-npu-ci\` 触发 full NPU CI (任何人可触发)。"
+          fi
+
+          marker="<!--npu-ci-bot-->"
+          body="## NPU CI
+          $marker
+          - commit: \`${sha:0:8}\`
+          - 状态: 未执行
+          - $hint"
+
+          comment_id="$(gh api "repos/$repo/issues/$pr_number/comments" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | head -n1 || true)"
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$repo/issues/comments/$comment_id" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null
+          fi

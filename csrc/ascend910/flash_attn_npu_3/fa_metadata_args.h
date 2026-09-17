@@ -13,8 +13,10 @@ namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
 
-inline uint64_t TilingOffset(bool causal) { return causal ? MASK_BYTES : 0; }
-inline uint64_t MetadataBytes(bool causal) { return TilingOffset(causal) + sizeof(FAInferTilingData); }
+// The mask buffer is present whenever the final mask type is not NO_MASK
+// (causal or band/SWA); the tiling blob sits right after it.
+inline uint64_t TilingOffset(bool has_mask) { return has_mask ? MASK_BYTES : 0; }
+inline uint64_t MetadataBytes(bool has_mask) { return TilingOffset(has_mask) + sizeof(FAInferTilingData); }
 
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;
@@ -48,6 +50,12 @@ struct FAMetadataArgs {
     uint32_t pagedKV;
     uint32_t numSplits;
     float scaleValue;
+    float softcapValue;
+    int64_t windowSizeLeft;
+    int64_t windowSizeRight;
+    // Append-KV tiling fields (0 = append disabled), mirrored by ComputeFAMetadata.
+    uint32_t kvNewSeqlen;
+    uint32_t kvCacheSeqlen;
 };
 
 #endif

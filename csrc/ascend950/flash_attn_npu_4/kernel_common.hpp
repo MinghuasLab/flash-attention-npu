@@ -22,8 +22,9 @@ constexpr int32_t NUM576 = 576;
 constexpr int32_t BASIC_BLOCK_SIZE = 256;
 constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
-
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
+constexpr uint32_t Q_M_TILE_MAX = 128;
+constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
@@ -81,5 +82,24 @@ enum class CacheLayout : uint8_t
     nd = 0,
     nz = 1,
 };
+
+__aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
+                                          bool restrictMergedRowsForLargeD = false)
+{
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
+        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
+        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
+        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
+        maxTile = maxTile > 0U ? maxTile : 1U;
+        tile = tile < maxTile ? tile : maxTile;
+    }
+    tile = tile < groupSize ? tile : groupSize;
+    if (tile > Q_N_SPLIT_ALIGN) {
+        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    }
+    return tile < 1U ? 1U : tile;
+}
+
 
 #endif

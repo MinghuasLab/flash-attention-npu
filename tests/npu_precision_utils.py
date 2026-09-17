@@ -152,13 +152,10 @@ def compare_rule(golden: torch.Tensor, actual: torch.Tensor,
     error_count = torch.gt(diff, limit_error).sum().item()
     strict_error_count = torch.gt(diff, strict_limit_error).sum().item()
 
-    print(f"maxDiff {max_diff:.6e}")
-    print(f"1/1000 Accuracy is {1 - float(error_count) / total:.6f}")
-    print(f"5/1000 Accuracy is {1 - float(strict_error_count) / total:.6f}")
-
     result = (float(strict_error_count) / total) <= ratios[2]
-    if result:
-        print("compare success!!!")
-    else:
+    if not result:
+        print(f"maxDiff {max_diff:.6e}")
+        print(f"1/1000 Accuracy is {1 - float(error_count) / total:.6f}")
+        print(f"5/1000 Accuracy is {1 - float(strict_error_count) / total:.6f}")
         print("compare failed&")
     return max_diff, result

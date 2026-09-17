@@ -11,8 +11,8 @@
  * A full v base tile is loaded to L1 from GM，relavent instructions launched before p base tile crossCore wait
  * A full p*v base tile is loaded to UB from l0C, no workspace transit
  */
-#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP
-#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP
+#ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
+#define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -179,6 +179,7 @@ public:
     static constexpr uint32_t MAX_L1_STAGES = 3; // 编译期常量，为静态L1Tensor数组开辟准备。取一个buffer份数的极大值
     static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16; // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
     static constexpr uint32_t STRIDE_LIMIT = 65535;
+    static constexpr uint32_t C0_ELEMS = 16;
 
     __aicore__ inline
     BlockMmadTla(Arch::Resource<ArchTag> &resource, uint32_t l1BufAddrStart, BlockMmadPVTileHelper &pvL1TileHelper)
@@ -269,7 +270,8 @@ public:
     void operator()(TensorB &gBTensor, TensorC &ubCTensor,
                     AscendC::GlobalTensor<int32_t> gBlockTable,
                     GemmCoord actualOriShape, uint32_t blockSize,
-                    uint32_t kvSTileIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
+                    uint32_t kvSTileIdx, uint32_t pipelineTileSeq,
+                    uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
                     uint32_t globalWindowSize, uint32_t localWindowSize,
                     Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag,
@@ -282,13 +284,14 @@ public:
         CopyGmToL1B copyGmToL1B;
         uint32_t rowNum = actualOriShape[0];
         uint32_t embed = actualOriShape[1];
+        uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[2];
 
-        uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
+        uint32_t l1BBufId = pipelineTileSeq % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 3;
-        uint32_t l1ABufId = kvSTileIdx % l1ABufNum;
+        uint32_t l1ABufId = pipelineTileSeq % l1ABufNum;
 
-        auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(curBaseTileSize, embed);
+        auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(curBaseTileSize, embedPhysical);
         auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
         auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, curBaseTileSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[l1ABufId], l1ALayoutTla, Arch::PositionL1{});
@@ -431,12 +434,13 @@ public:
         // of the base tile is ready on l0C
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
             uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (embed - nL0Itr * L0_TILE_N) : L0_TILE_N;
+            uint32_t l0TileNPhysical = RoundUp(l0TileNAct, C0_ELEMS);
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
-            uint32_t l0CLoopCounter = kvSTileIdx;
+            uint32_t l0CLoopCounter = pipelineTileSeq;
             uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId + 2;
-            auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNAct);
+            auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNPhysical);
             auto l0CTensorTla = tla::MakeTensor(l0CTensor[l0CBufId], l0CLayoutTla, Arch::PositionL0C{});
             for (uint32_t mL0Itr = 0; mL0Itr < mL0LoopNum; mL0Itr++) {
                 uint32_t l0TileMAct = (mL0Itr == mL0LoopNum - 1) ? (rowNum - mL0Itr * L0_TILE_M) : L0_TILE_M;
@@ -526,17 +530,15 @@ public:
             // valid rows in AIV1: [mFixPAligned8 / 2, rowNum - 1]
             if constexpr (!ENABLE_DN_) {
                 uint32_t mFixPAligned8 = RoundUp(rowNum, 8);
-                uint32_t nFixPAligned8 = RoundUp(l0TileNAct, 8);
                 auto ubCTensorTlaTile = GetTile(ubCTensor,
-                    tla::MakeCoord(0, nL0Itr * L0_TILE_N), tla::MakeShape(mFixPAligned8, nFixPAligned8));
+                    tla::MakeCoord(0, nL0Itr * L0_TILE_N), tla::MakeShape(mFixPAligned8, l0TileNPhysical));
                 copyL0CToDst(ubCTensorTlaTile, l0CTensorTla);
             } else {
                 uint32_t mFixPAligned32 = RoundUp(rowNum, 32);
-                uint32_t nFixPAligned8 = RoundUp(l0TileNAct, 8);
                 auto ubCTensorTlaTile = GetTile(ubCTensor,
-                    tla::MakeCoord(0, nL0Itr * L0_TILE_N), tla::MakeShape(mFixPAligned32, nFixPAligned8));
+                    tla::MakeCoord(0, nL0Itr * L0_TILE_N), tla::MakeShape(mFixPAligned32, l0TileNPhysical));
                 auto l0CTensorTlaTile = GetTile(l0CTensorTla,
-                            tla::MakeCoord(0, 0), tla::MakeShape(mFixPAligned32, l0TileNAct));
+                            tla::MakeCoord(0, 0), tla::MakeShape(mFixPAligned32, l0TileNPhysical));
                 copyL0CToDst(ubCTensorTlaTile, l0CTensorTlaTile);
             }
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
@@ -567,4 +569,4 @@ protected:
 ////////////////////////////////////////////////////////////////////
 
 }  // namespace Catlass::Gemm::Block
-#endif  // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP
+#endif  // GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T

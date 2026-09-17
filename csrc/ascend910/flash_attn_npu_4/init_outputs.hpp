@@ -37,6 +37,7 @@ public:
     static constexpr uint32_t HALF_ELEM_NUM_PER_RPT = 128;
     static constexpr uint32_t FLOAT_ELEM_NUM_PER_RPT = 64;
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
+    static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
@@ -58,7 +59,8 @@ public:
         uint32_t qSThisSubBlock, uint32_t qNThisSubBlock)
     {
         uint32_t oHiddenSize = layoutOutput.shape(1);
-        uint32_t qHeads = layoutLse.shape(1);
+        uint32_t qHeads = layoutLse.shape(0);
+        uint32_t lseHeadStride = layoutLse.stride(0);
         uint32_t embedV = oHiddenSize / qHeads;
         uint32_t embedRoundV = RoundUp(embedV, HALF_ELEM_NUM_PER_BLK);
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -82,13 +84,14 @@ public:
             AscendC::Duplicate(lseOutUbTensor, LSE_OUT_INI, qSThisSubBlock * FLOAT_ELEM_NUM_PER_BLK);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
+            for (uint32_t sIdx = 0; sIdx < qSThisSubBlock; sIdx++) {
                 AscendC::DataCopyPad(
-                    gLse[qNIdx],
-                    lseOutUbTensor,
+                    gLse[sIdx],
+                    lseOutUbTensor[sIdx * FLOAT_BLOCK_SIZE],
                     AscendC::DataCopyExtParams(
-                        qSThisSubBlock, sizeof(ElementLseOut),
-                        0, (qHeads - 1) * sizeof(ElementLseOut), 0));
+                        qNThisSubBlock, sizeof(float),
+                        qSThisSubBlock - 1,
+                        (lseHeadStride - 1) * sizeof(float), 0));
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         }
@@ -105,7 +108,7 @@ public:
     {
         uint32_t rowNum = qSBlockSize * qNBlockSize;
         uint32_t oHiddenSize = layoutOutput.shape(1);
-        uint32_t qHeads = layoutLse.shape(1);
+        uint32_t qHeads = layoutLse.shape(0);
         uint32_t embedV = oHiddenSize / qHeads;
 
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
@@ -127,9 +130,9 @@ public:
         auto layoutOutputSubBlock = layoutOutput;
 
         uint32_t outLseRowOffsetSubBlock = (qNBlockSize == 1U) ?
-            rowOffsetSubBlock : 0;
-        uint32_t outLseColOffsetSubBlock = (qNBlockSize == 1U) ?
             0 : subBlockIdx * qNSplitSubBlock;
+        uint32_t outLseColOffsetSubBlock = (qNBlockSize == 1U) ?
+            rowOffsetSubBlock : 0;
         int64_t lseOffsetSubBlock =
             layoutLse.GetOffset(MatrixCoord(outLseRowOffsetSubBlock, outLseColOffsetSubBlock));
         auto gLseThisSubBlock = gLse[lseOffsetSubBlock];

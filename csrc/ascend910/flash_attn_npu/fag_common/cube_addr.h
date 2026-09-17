@@ -97,9 +97,14 @@ public:
 
         int32_t loopCnt = 0;
         while (overFlag) {
-            int32_t guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
+            // NO_MASK: full S1xS2 rectangle; CAUSAL: lower-triangular workspace footprint.
+            int32_t guardLen;
+            if constexpr (maskType == MaskType::NO_MASK) {
+                guardLen = s2BlockNum - seqKIdx;
+            } else {
+                guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
+            }
             int32_t reserve = limit - blockNum;
-            // TODO sparsemode = 0
             int32_t realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
             if (realLenAlign >= guardLen) {
                 if (coreSegmentBlockNum % coreNum == coreId) {
@@ -112,12 +117,20 @@ public:
                         s1TailLength);
                     globalCubeAddr->addrInfo[index].kx = getSeqRealLength(seqKIdx, guardLen, s2BlockNum, s2TailLength);
                     globalCubeAddr->addrInfo[index].lowerLeft = 1;
-                    // TODO sparsemode = 0
-                    globalCubeAddr->addrInfo[index].upperRight = (s1GuardInterval % 2);
+                    // NO_MASK: keep full rectangle (upperRight=1 => cube skips nothing).
+                    // CAUSAL: drop the upper-right corner tile when s1GuardInterval==2.
+                    if constexpr (maskType == MaskType::NO_MASK) {
+                        globalCubeAddr->addrInfo[index].upperRight = 1;
+                    } else {
+                        globalCubeAddr->addrInfo[index].upperRight = (s1GuardInterval % 2);
+                    }
                     globalCubeAddr->blockLength ++;
                 }
-                // TODO sparsemode = 0
-                blockNum += s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                if constexpr (maskType == MaskType::NO_MASK) {
+                    blockNum += s1GuardInterval * guardLen;
+                } else {
+                    blockNum += s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                }
                 qSeqIdx += s1GuardInterval;
                 seqKIdx = 0;
                 if (qSeqIdx == s1BlockNum - 1) {

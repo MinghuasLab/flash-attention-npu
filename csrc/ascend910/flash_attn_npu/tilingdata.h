@@ -52,6 +52,8 @@ struct FAInferTilingData {
     uint64_t workSpaceSize;
     float scaleValue;
     float softcapValue;
+    float dropoutValue;
+    int64_t alibiSlopesBatchStride;
     uint64_t padding1;
     uint64_t padding2;
     uint32_t padding3;
@@ -61,8 +63,13 @@ struct FAInferTilingData {
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
     uint32_t needCoreNum;
+    uint32_t flashDecodeFlag;
+    uint32_t kvNewSeqlen;
+    uint32_t kvCacheSeqlen;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
+    __gm__ uint8_t* pDevice = nullptr;
+    __gm__ uint8_t* dropMaskDevice = nullptr;
 
     uint32_t get_numHeads() const { return numHeads; }
     uint32_t get_embeddingSize() const { return embeddingSize; }
@@ -86,6 +93,8 @@ struct FAInferTilingData {
     uint64_t get_workSpaceSize() const { return workSpaceSize; }
     float get_scaleValue() const { return scaleValue; }
     float get_softcapValue() const { return softcapValue; }
+    float get_dropoutValue() const { return dropoutValue; }
+    int64_t get_alibiSlopesBatchStride() const { return alibiSlopesBatchStride; }
     uint64_t get_padding1() const { return padding1; }
     uint64_t get_padding2() const { return padding2; }
     uint32_t get_padding3() const { return padding3; }
@@ -93,6 +102,11 @@ struct FAInferTilingData {
     uint64_t get_splitOTotalSize() const { return splitOTotalSize; }
     uint32_t get_totalSplitNodeNum() const { return totalSplitNodeNum; }
     uint32_t get_needCoreNum() const { return needCoreNum; }
+    __gm__ uint8_t* get_pDevice() const { return pDevice; }
+    __gm__ uint8_t* get_dropMaskDevice() const { return dropMaskDevice; }
+    uint32_t get_flashDecodeFlag() const { return flashDecodeFlag; }
+    uint32_t get_kvNewSeqlen() const { return kvNewSeqlen; }
+    uint32_t get_kvCacheSeqlen() const { return kvCacheSeqlen; }
 
     void set_numHeads(uint32_t value) { numHeads = value; }
     void set_embeddingSize(uint32_t value) { embeddingSize = value; }
@@ -116,6 +130,8 @@ struct FAInferTilingData {
     void set_workSpaceSize(uint64_t value) { workSpaceSize = value; }
     void set_scaleValue(float value) { scaleValue = value; }
     void set_softcapValue(float value) { softcapValue = value; }
+    void set_dropoutValue(float value) { dropoutValue = value; }
+    void set_alibiSlopesBatchStride(int64_t value) { alibiSlopesBatchStride = value; }
     void set_padding1(uint64_t value) { padding1 = value; }
     void set_padding2(uint64_t value) { padding2 = value; }
     void set_padding3(uint32_t value) { padding3 = value; }
@@ -123,6 +139,11 @@ struct FAInferTilingData {
     void set_splitOTotalSize(uint64_t value) { splitOTotalSize = value; }
     void set_totalSplitNodeNum(uint32_t value) { totalSplitNodeNum = value; }
     void set_needCoreNum(uint32_t value) { needCoreNum = value; }
+    void set_pDevice(__gm__ uint8_t* value) { pDevice = value; }
+    void set_dropMaskDevice(__gm__ uint8_t* value) { dropMaskDevice = value; }
+    void set_flashDecodeFlag(uint32_t value) { flashDecodeFlag = value; }
+    void set_kvNewSeqlen(uint32_t value) { kvNewSeqlen = value; }
+    void set_kvCacheSeqlen(uint32_t value) { kvCacheSeqlen = value; }
 };
 
 #endif

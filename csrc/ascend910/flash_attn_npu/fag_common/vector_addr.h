@@ -129,28 +129,42 @@ public:
 
         int32_t loopCnt = 0;
         while (overFlag) {
-            int32_t guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
+            // NO_MASK: full S1xS2 tile grid; CAUSAL: lower-triangular tile set only.
+            int32_t guardLen;
+            if constexpr (maskType == MaskType::NO_MASK) {
+                guardLen = s2BlockNum - seqKIdx;
+            } else {
+                guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
+            }
             int32_t reserve = limit - blockNum;
-            
-            // TODO sparsemode = 0
+
             int32_t realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
             if (realLenAlign >= guardLen) {
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t blockId = blockNum;
                     for (int x = 0; x < guardLen; x++){
                         for (int y = 0; y < s1GuardInterval; y++){
-                                // TODO sparsemode = 0
-                                if (qSeqIdx + y >= seqKIdx + x){
-                                    getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
-                                    blockId ++;
-                                }
+                            if constexpr (maskType == MaskType::NO_MASK) {
+                                getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
+                                blockId ++;
+                            } else if (qSeqIdx + y >= seqKIdx + x) {
+                                getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
+                                blockId ++;
+                            }
                         }
                     }
-                    // TODO sparsemode = 0
-                    globalVecAddr->blockLength = blockNum + s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                    if constexpr (maskType == MaskType::NO_MASK) {
+                        globalVecAddr->blockLength = blockNum + s1GuardInterval * guardLen;
+                    } else {
+                        globalVecAddr->blockLength =
+                            blockNum + s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                    }
                 }
-                // TODO sparsemode = 0
-                blockNum += s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                if constexpr (maskType == MaskType::NO_MASK) {
+                    blockNum += s1GuardInterval * guardLen;
+                } else {
+                    blockNum += s1GuardInterval * guardLen - (s1GuardInterval + 1) % 2;
+                }
                 qSeqIdx += s1GuardInterval;
                 seqKIdx = 0;
                 if (qSeqIdx == s1BlockNum - 1) {
@@ -162,11 +176,13 @@ public:
                     int32_t blockId = blockNum;
                     for (int x = 0; x < realLen; x++){
                         for (int y = 0; y < s1GuardInterval; y++) {
-                                // TODO sparsemode = 0
-                                if (qSeqIdx + y >= seqKIdx + x) {
-                                    getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
-                                    blockId ++;
-                                }
+                            if constexpr (maskType == MaskType::NO_MASK) {
+                                getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
+                                blockId ++;
+                            } else if (qSeqIdx + y >= seqKIdx + x) {
+                                getOffset(globalVecAddr->VecBlkInfo[blockId], blockId, y, x);
+                                blockId ++;
+                            }
                         }
                     }
                     globalVecAddr->blockLength = blockNum + s1GuardInterval * realLen;

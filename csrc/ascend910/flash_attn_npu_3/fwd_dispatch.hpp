@@ -36,6 +36,8 @@ struct FwdLaunchArgs {
     uint8_t *qDevice;
     uint8_t *kDevice;
     uint8_t *vDevice;
+    uint8_t *kNewDevice;          // may be nullptr when append-KV is disabled
+    uint8_t *vNewDevice;          // may be nullptr when append-KV is disabled
     uint8_t *maskDevice;          // may be nullptr when is_causal is false
     uint8_t *blockTableDevice;    // may be nullptr when paged_KV is false
     uint8_t *oDevice;

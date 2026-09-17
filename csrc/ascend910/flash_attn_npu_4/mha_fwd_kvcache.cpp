@@ -9,16 +9,14 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
-#include "online_softmax_low_prec.hpp"
 #include "online_softmax.hpp"
-#include "rescale_o_low_prec.hpp"
 #include "rescale_o.hpp"
 #include "init_outputs.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "pv_matmul.hpp"
 #include "qk_matmul.hpp"
-#include "CombineScale.hpp"
+#include "combine_scale.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "fa_block.h"
 #include "catlass/gemm/gemm_type.hpp"
@@ -113,7 +111,9 @@ namespace SplitFuse {
             embed = fATilingData->embeddingSize;
             embedV = fATilingData->embeddingSizeV;
             pagedBlockSize = fATilingData->blockSize;
-            maxNumBlocksPerBatch = fATilingData->maxNumBlocksPerBatch;
+            // Metadata may infer capacity from the used KV length. The page
+            // table can reserve more pages or be a view with a larger stride.
+            blockTableStride = params.blockTableStride;
             firstBatchTaskNum = fATilingData->firstBatchTaskNum;
             totalTaskNum = fATilingData->totalTaskNum;
             blockSize = fATilingData->blockSize;
@@ -121,6 +121,7 @@ namespace SplitFuse {
             windowSizeLeft = fATilingData->windowSizeLeft;
             windowSizeRight = fATilingData->windowSizeRight;
             scaleValue = fATilingData->scaleValue;
+            softcapValue = fATilingData->softcapValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
 
@@ -232,7 +233,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            epilogueOnlineSoftmax.init(resource, scaleValue);
+            epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
             epilogueRescaleO.init(resource);
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -250,7 +251,10 @@ namespace SplitFuse {
                 totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));
             }
 
-            if (flashDecodeFlag != 0U) {
+            const bool idleCoreFD = (flashDecodeFlag != 0U) &&
+                (fATilingData->needCoreNum != 0U) &&
+                (coreIdx >= fATilingData->needCoreNum);
+            if (flashDecodeFlag != 0U && !idleCoreFD) {
                 uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
                 uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
                 uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
@@ -317,12 +321,11 @@ namespace SplitFuse {
                         }
                     }
                 }
-            } else {
+            } else if (flashDecodeFlag == 0U) {
+                uint32_t curBatchTmp = 0;
+                uint32_t preTotalTaskNumTmp = 0;
+                uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
-                    uint32_t curBatchTmp = 0;
-                    uint32_t preTotalTaskNumTmp = 0;
-                    uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
-
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
@@ -482,11 +485,8 @@ namespace SplitFuse {
                 // BSND: Q/O/LSE per-batch storage step is maxQSeqlen.
                 prevQSeqlenSum = BIdx * maxQSeqlen;
                 if constexpr (!PAGED_CACHE_FLAG) {
-                    // Mirror mha_fwd_kvcache_2.cpp semantics: per-batch K/V step
-                    // uses each batch's actual kvSeqlen (prefix sum across batches).
-                    for (uint32_t b = 0; b < BIdx; b++) {
-                        prevKvSeqlenSum += static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
-                    }
+                    // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
+                    prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(0)) * BIdx;
                 }
             }
 
@@ -498,7 +498,7 @@ namespace SplitFuse {
                 kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
                 vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
             } else {
-                blockBOffset = static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(maxNumBlocksPerBatch);
+                blockBOffset = static_cast<uint64_t>(BIdx) * blockTableStride;
             }
             uint64_t oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
             // LSE flat offset depends on the output layout the host allocates:
@@ -559,53 +559,60 @@ namespace SplitFuse {
             bool startsWithMaskTile = false;
             bool startsWithMaskThenNomaskFlag = false;
             if (maskType == 1U) {
-                int64_t diffS = kvSeqlen - qSeqlen;
-                diffS = (diffS < 0) ? 0 : diffS;
-                noSkipKvS = (qSBlockIdx + 1U) * curQSBlockTile + diffS;
-                noSkipKvS = AscendC::Std::min(static_cast<int64_t>(kvSeqlen), noSkipKvS);
+                int64_t diffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
+                int64_t causalKvEnd =
+                    static_cast<int64_t>((qSBlockIdx + 1U) * curQSBlockTile) + diffS;
+                causalKvEnd = causalKvEnd < 0 ? 0 : causalKvEnd;
+                noSkipKvS = AscendC::Std::min(causalKvEnd, static_cast<int64_t>(kvSeqlen));
                 kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
+                delEndRow = qSeqlen > kvSeqlen ? static_cast<int32_t>(qSeqlen - kvSeqlen) : delEndRow;
             } else if (maskType == 2U) {
                 int32_t leftPointwindowSizeLeft = kvSeqlen;
                 int32_t leftPointwindowSizeRight = 0;
                 if (windowSizeLeft < 0 && windowSizeLeft * (-1) >= qSeqlen) {
                     kvStart = kvSeqlen / MAX_KV_STACK_LEN + 1;
-                } else if (windowSizeLeft != SPARSE_MODE_INT_MAX) {
+                } else {
                     leftPointwindowSizeLeft = kvSeqlen - qSeqlen - windowSizeLeft;
                     windowSizeLeftStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeLeft;
                     windowSizeLeftEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeLeft;
                     kvStart = AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) / static_cast<int32_t>(MAX_KV_STACK_LEN);
                     notPreMask = false;
-                } else {
-                    kvStart = 0;
                 }
                 if (windowSizeRight < 0 && windowSizeRight * (-1) >= kvSeqlen) {
                     kvSLoopNumTotal = 0;
-                } else if (windowSizeRight != SPARSE_MODE_INT_MAX) {
+                } else {
                     leftPointwindowSizeRight = kvSeqlen - qSeqlen + windowSizeRight;
                     windowSizeRightStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeRight;
                     windowSizeRightEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeRight;
-                    noSkipKvS = AscendC::Std::min(static_cast<int32_t>(kvSeqlen), RoundUp(windowSizeRightEndLen, static_cast<int32_t>(MAX_KV_STACK_LEN)));
-                    noSkipKvS = noSkipKvS <= 0 ? kvSeqlen : noSkipKvS;
-                    kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
-                    notNextMask = false;
-                } else {
-                    noSkipKvS = kvSeqlen;
-                    kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
+                    if (windowSizeRightEndLen <= 0) {
+                        noSkipKvS = 0;
+                        kvSLoopNumTotal = 0;
+                    } else {
+                        noSkipKvS = AscendC::Std::min(static_cast<int32_t>(kvSeqlen),
+                            RoundUp(windowSizeRightEndLen, static_cast<int32_t>(MAX_KV_STACK_LEN)));
+                        kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
+                        notNextMask = false;
+                    }
                 }
-                if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) && windowSizeLeft != SPARSE_MODE_INT_MAX) {
+                if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen)) {
                     delStartRow = kvSeqlen - leftPointwindowSizeLeft;
-                } else if (windowSizeRightStartLen < 0 && windowSizeRight != SPARSE_MODE_INT_MAX) {
+                } else if (windowSizeRightStartLen < 0) {
                     delEndRow = -leftPointwindowSizeRight;
                 }
             } else {
                 kvSLoopNumTotal = CeilDiv(kvSeqlen, MAX_KV_STACK_LEN);
             }
 
-            uint32_t kvEnd = kvSLoopNumTotal;
+            // Match FA GPU split-KV: n_block_min/max = split ∩ window (do not overwrite SWA).
+            uint32_t winKvStart = kvStart;
+            uint32_t winKvEnd = kvSLoopNumTotal;
+            uint32_t kvEnd = winKvEnd;
             if (flashDecodeFlag != 0U) {
-                kvStart = (uint32_t)stS2IdxNow;
-                kvEnd = (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) ?
-                    kvSLoopNumTotal : (uint32_t)enS2IdxNow;
+                uint32_t fdStart = static_cast<uint32_t>(stS2IdxNow);
+                uint32_t fdEnd = (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) ?
+                    winKvEnd : static_cast<uint32_t>(enS2IdxNow);
+                kvStart = AscendC::Std::max(fdStart, winKvStart);
+                kvEnd = AscendC::Std::min(fdEnd, winKvEnd);
             }
 
             int32_t stackSeqCount = 0;
@@ -614,16 +621,18 @@ namespace SplitFuse {
             uint32_t stackSeqTile = MAX_KV_STACK_LEN;
             uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
 
+            // Empty after split\cap window (GPU early exit). Split partials host-inited to 0/-inf.
+            if (kvStart >= kvEnd) {
 #ifdef __DAV_C220_VEC__
-            if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
-                if (kvSLoopNumTotal <= 0 || kvStart >= kvSLoopNumTotal) {
+                if (!isSplitKV) {
                     LayoutO layoutOInit(qSeqlen, embed * qHeads);
-                    LayoutLse layoutLseInit(totalQTokens, qHeads);
+                    LayoutLse layoutLseInit(qHeads, lseHeadStride);
                     EpilogueInitOut epilogueInitOut(resource);
                     epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize);
                 }
-            }
 #endif
+                return;
+            }
 #ifdef __DAV_C220_CUBE__
             LayoutQ layoutQTemp(rowNum, embed);
             LayoutK layoutKTemp(strideK, stackSeqTile);
@@ -684,9 +693,10 @@ namespace SplitFuse {
                     uint32_t kvSStartIdx = kvSIdx * MAX_KV_STACK_LEN;
                     uint32_t kvSEndIdx = kvSStartIdx + stackSeqTile;
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
-                        uint32_t triUp = noSkipKvS - qSBlockSize;
-                        uint32_t triDown = noSkipKvS;
-                        bool doTriUMask = triUp < kvSEndIdx - 1;
+                        int64_t triUp =
+                            static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
+                        uint32_t triDown = static_cast<uint32_t>(noSkipKvS);
+                        bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
                         if (doTriUMask) {
                             if (flashDecodeFlag != 0U) {
                                 epilogueOnlineSoftmax(
@@ -728,11 +738,16 @@ namespace SplitFuse {
                                     false);
                             }
                         } else {
-                            uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
+                            uint32_t lastNoMaskTile;
+                            if (triUp + 1U == kvSeqlen) {
+                                lastNoMaskTile = kvSLoopNumTotal - 1U;
+                            } else {
+                                lastNoMaskTile = (triUp + 1U) / MAX_KV_STACK_LEN - 1U;
+                            }
                             Arch::CrossCoreWaitFlag(qkReady);
                             int32_t lastNoMaskStackId;
                             if (flashDecodeFlag != 0U) {
-                                lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
+                                lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -753,7 +768,7 @@ namespace SplitFuse {
                                     layOutS,
                                     actualBlockShapeQK,
                                     (stackSeqCount == 0),
-                                    (stackSeqCount == noMaskStackSeqNum - 1),
+                                    (stackSeqCount == lastNoMaskTile),
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
@@ -761,14 +776,18 @@ namespace SplitFuse {
                             }
                         }
                     } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+                        // StartLen can be negative when Sq>>Sk; compare in int32 so
+                        // it is not promoted against uint32 kvSStartIdx/kvSEndIdx.
+                        int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
+                        int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
                         bool doTriUPreMask = (maskType != 2 || notPreMask) ? false :
-                            (windowSizeLeftStartLen >= kvSStartIdx && windowSizeLeftStartLen < kvSEndIdx) ||
-                            (windowSizeLeftEndLen > kvSStartIdx && windowSizeLeftEndLen <= kvSEndIdx) ||
-                            (windowSizeLeftStartLen <= kvSStartIdx && windowSizeLeftEndLen >= kvSEndIdx);
+                            (windowSizeLeftStartLen >= kvStartI && windowSizeLeftStartLen < kvEndI) ||
+                            (windowSizeLeftEndLen > kvStartI && windowSizeLeftEndLen <= kvEndI) ||
+                            (windowSizeLeftStartLen <= kvStartI && windowSizeLeftEndLen >= kvEndI);
                         bool doTriUNextMask = (maskType != 2 || notNextMask) ? false :
-                            (windowSizeRightStartLen >= kvSStartIdx && windowSizeRightStartLen < kvSEndIdx) ||
-                            (windowSizeRightEndLen > kvSStartIdx && windowSizeRightEndLen <= kvSEndIdx) ||
-                            (windowSizeRightStartLen <= kvSStartIdx && windowSizeRightEndLen >= kvSEndIdx);
+                            (windowSizeRightStartLen >= kvStartI && windowSizeRightStartLen < kvEndI) ||
+                            (windowSizeRightEndLen > kvStartI && windowSizeRightEndLen <= kvEndI) ||
+                            (windowSizeRightStartLen <= kvStartI && windowSizeRightEndLen >= kvEndI);
                         bool doTriUMask = (doTriUPreMask || doTriUNextMask);
                         if (doTriUMask) {
                             startsWithMaskTile = true;
@@ -792,7 +811,8 @@ namespace SplitFuse {
                                     windowSizeLeftStartLen,
                                     windowSizeLeftEndLen,
                                     windowSizeRightStartLen,
-                                    windowSizeRightEndLen);
+                                    windowSizeRightEndLen,
+                                    (flashDecodeFlag != 0U) ? isSplitKV : false);
                         } else {
                             bool isLastNoMaskStackTile = (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
@@ -810,7 +830,7 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
-                                false,
+                                (flashDecodeFlag != 0U) ? isSplitKV : false,
                                 startsWithMaskTile,
                                 startsWithMaskThenNomaskFlag);
                             startsWithMaskTile = false;
@@ -975,7 +995,7 @@ namespace SplitFuse {
         uint32_t embed;
         uint32_t embedV;
         uint32_t pagedBlockSize;
-        uint32_t maxNumBlocksPerBatch;
+        uint64_t blockTableStride;
         uint32_t firstBatchTaskNum;
         uint32_t totalTaskNum;
         uint32_t blockSize;
@@ -983,6 +1003,7 @@ namespace SplitFuse {
         int64_t  windowSizeLeft;
         int64_t  windowSizeRight;
         float    scaleValue;
+        float    softcapValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
         uint32_t flashDecodeFlag;
@@ -1015,7 +1036,7 @@ namespace SplitFuse {
         bool PagedCacheFlag = false,
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
-        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE, bool HAS_SOFTCAP = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1028,7 +1049,8 @@ namespace SplitFuse {
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
         GM_ADDR workspace,
-        GM_ADDR tiling)
+        GM_ADDR tiling,
+        uint64_t blockTableStride)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1047,7 +1069,7 @@ namespace SplitFuse {
         using LayoutO = layout::RowMajor;
         using ElementLse = float;
         using LayoutLse = layout::RowMajor;
-        using ElementMask = int8_t;
+        using ElementMask = uint8_t;
         using LayoutMask = layout::RowMajor;
         using ElementOTmp = IntermCalcPrec;
         using LayoutOTmp = layout::RowMajor;
@@ -1063,7 +1085,7 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
@@ -1091,7 +1113,8 @@ namespace SplitFuse {
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
+                              blockTableStride};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

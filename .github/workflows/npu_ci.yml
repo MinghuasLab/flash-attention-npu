@@ -1,0 +1,476 @@
+name: NPU CI
+
+# 手动 NPU CI。PR 新建/push 不会自动跑, 可通过以下 GitHub 入口触发:
+#   1. Actions 页面 Run workflow (workflow_dispatch, 可选 workers)
+#   2. PR 评论 /run-npu-ci [workers=<n>] [arch=910|950|both]
+#      例如: /run-npu-ci workers=2 arch=910
+#      不带 workers= 则默认 2
+#      不带 arch= 则默认 both (950 和 910B 都跑)
+# GitHub 上所有触发均强制执行 full；原 quick 用户也可触发。
+#
+# 状态检查名: NPU CI / 手动验证
+# runner 标签: self-hosted, linux, arm64, npu, flash-attention-npu
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR 编号, 例如 23"
+        required: true
+        type: string
+      ci_mode:
+        description: "CI 模式"
+        required: true
+        type: choice
+        default: full
+        options:
+          - quick
+          - full
+      workers:
+        description: "case 内并行进程数 (pytest-xdist -n, 默认 2)"
+        required: false
+        type: string
+        default: "2"
+      arch:
+        description: "跑哪个架构 (910 只跑910B, 950 只跑950, both 都跑)"
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - 910
+          - 950
+      ops:
+        description: "可选, 逗号分隔的算子列表 (本仓暂未实现按算子过滤, 留空即可)"
+        required: false
+        type: string
+        default: ""
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  # 同一 PR 的同一 head commit 重复触发不会并发跑; 不同 PR / 不同 commit 各自独立
+  group: npu-ci-${{ github.event.issue.number || github.event.inputs.pr_number }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: 手动验证
+    runs-on: ubuntu-latest
+    # issue_comment 触发时只处理 PR 上的 /run-npu-ci; workflow_dispatch 直接放行
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/run-npu-ci'))
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      base_ref: ${{ steps.resolve.outputs.base_ref }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      ci_mode: ${{ steps.resolve.outputs.ci_mode }}
+      workers: ${{ steps.resolve.outputs.workers }}
+      arch: ${{ steps.resolve.outputs.arch }}
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Resolve PR / commit / mode
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+          CI_MODE_INPUT: ${{ github.event.inputs.ci_mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            pr_number="${{ github.event.issue.number }}"
+            actor="$COMMENT_USER"
+          else
+            pr_number="$PR_NUMBER_INPUT"
+            actor="${GITHUB_ACTOR}"
+          fi
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          # GitHub 触发统一执行 full；保留旧参数仅为兼容已有调用。
+          ci_mode="full"
+          echo "GitHub trigger forces CI_MODE=full (requested=${CI_MODE_INPUT:-comment})"
+          echo "ci_mode=$ci_mode" >> "$GITHUB_OUTPUT"
+
+          # 解析 workers 和 arch (评论: /run-npu-ci workers=2 arch=910)
+          # workflow_dispatch 从 inputs 取, issue_comment 从评论 body 解析
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            workers="$(echo "$COMMENT_BODY" | grep -oE 'workers=[0-9]+' | head -1 | cut -d= -f2- || true)"
+            arch="$(echo "$COMMENT_BODY" | grep -oE 'arch=(910|950|both)' | head -1 | cut -d= -f2- || true)"
+          else
+            workers="${{ github.event.inputs.workers }}"
+            arch="${{ github.event.inputs.arch }}"
+          fi
+          echo "workers=${workers:-2}" >> "$GITHUB_OUTPUT"
+          echo "arch=${arch:-both}" >> "$GITHUB_OUTPUT"
+
+          # 拿 PR head sha 和 base 分支
+          sha="$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha')"
+          base_ref="$(gh api "repos/$repo/pulls/$pr_number" --jq '.base.ref')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "resolved pr=$pr_number sha=$sha base=$base_ref mode=$ci_mode actor=$actor"
+
+      - name: Check permission
+        id: perm
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            actor="$COMMENT_USER"
+          else
+            actor="${{ github.actor }}"
+          fi
+          perm="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission' 2>/dev/null || echo none)"
+          ci_mode="${{ steps.resolve.outputs.ci_mode }}"
+          echo "actor=$actor permission=$perm ci_mode=$ci_mode"
+          echo "GitHub trigger authorized for full CI ($actor has '$perm')"
+
+      - name: Check existing NPU CI status for this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${{ steps.resolve.outputs.sha }}"
+          # 取最近一条 NPU CI / 手动验证 状态
+          existing="$(gh api "repos/$repo/commits/$sha/status" \
+            --jq '.statuses[] | select(.context == "NPU CI / 手动验证") | .state' || true)"
+          echo "existing status: ${existing:-<none>}"
+          if [ "$existing" = "success" ]; then
+            echo "already passed, skip" >&2
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            # pending/none/failure 都允许重跑 (手动触发语义)
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set pending status + bot comment
+        if: steps.check.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${{ steps.resolve.outputs.sha }}"
+          pr_number="${{ steps.resolve.outputs.pr_number }}"
+          ci_mode="${{ steps.resolve.outputs.ci_mode }}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            actor="$COMMENT_USER"
+          else
+            actor="${{ github.actor }}"
+          fi
+
+          # 写 pending
+          gh api --method POST "repos/$repo/statuses/$sha" \
+            -f state=pending \
+            -f context="NPU CI / 手动验证" \
+            -f description="NPU CI 已由 @$actor 触发 ($ci_mode+example)" \
+            -f target_url="$run_url" >/dev/null
+
+          # 找已有机器人评论 (按 marker)
+          marker="<!--npu-ci-bot-->"
+          comment_id="$(gh api "repos/$repo/issues/$pr_number/comments" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | head -n1 || true)"
+          body="## NPU CI
+          $marker
+          - 触发人: @$actor
+          - 模式: \`$ci_mode\` (含 Example ST)
+          - PR: #$pr_number  commit: \`${sha:0:8}\`
+          - 状态: 已开始
+          - Actions: [$run_url]($run_url)"
+
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$repo/issues/comments/$comment_id" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null
+          fi
+
+  run:
+    name: 运行 NPU CI (${{ matrix.arch_label }})
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch_label: x86_64-950
+            runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:950-cann9.1-torch2.9
+            require_healthy: "true"
+            max_tasks: "6"
+          - arch_label: aarch64-910B
+            runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:910b-cann9.1-torch2.9
+            require_healthy: "false"
+            max_tasks: "4"
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 240
+    env:
+      CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
+      CI_RUN_EXAMPLE_ST: "true"
+      CI_TEST_WORKERS: ${{ needs.prepare.outputs.workers }}
+      CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
+      CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
+      TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      CI_TEST_LOG_DIR_HOST: >-
+        /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+        ${{ matrix.arch_label }}
+      GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
+      GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
+      GOLDEN_CACHE_MODE: cache
+    outputs:
+      run_outcome: ${{ steps.run.outcome }}
+    steps:
+      - name: Check arch match
+        id: arch
+        run: |
+          arch="${{ needs.prepare.outputs.arch }}"
+          label="${{ matrix.arch_label }}"
+          if [ "$arch" = "both" ] ||
+            { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
+            { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "arch matches ($arch / $label), proceeding"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "arch mismatch ($arch / $label), skipping"
+          fi
+
+      - name: Clone repo + rebase PR head onto base (docker first 3x, then host 3x)
+        if: steps.arch.outputs.match == 'true'
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+
+          # Resolve the host proxy before the repository is cloned (the shared
+          # ci/docker_proxy.sh helper is not available at this point yet).
+          proxy_http="${HTTP_PROXY:-}"
+          proxy_https="${HTTPS_PROXY:-}"
+          proxy_no="${NO_PROXY:-}"
+          case " $(hostname -I 2>/dev/null || true) " in
+            *" 192.168.13.241 "*)
+              proxy_http=http://127.0.0.1:18790
+              proxy_https=http://127.0.0.1:18790
+              proxy_no=localhost,127.0.0.1,::1 ;;
+            *" 192.168.9.226 "*)
+              proxy_http=http://127.0.0.1:17890
+              proxy_https=http://127.0.0.1:17890
+              proxy_no=localhost,127.0.0.1,::1 ;;
+          esac
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+              case "$proxy_key" in
+                HTTP_PROXY|http_proxy) proxy_http="$proxy_value" ;;
+                HTTPS_PROXY|https_proxy) proxy_https="$proxy_value" ;;
+                NO_PROXY|no_proxy) proxy_no="$proxy_value" ;;
+              esac
+            done < "$proxy_file"
+          fi
+          [ "${CI_HTTP_PROXY+x}" = x ] && proxy_http="$CI_HTTP_PROXY"
+          [ "${CI_HTTPS_PROXY+x}" = x ] && proxy_https="$CI_HTTPS_PROXY"
+          [ "${CI_NO_PROXY+x}" = x ] && proxy_no="$CI_NO_PROXY"
+          export HTTP_PROXY="$proxy_http" HTTPS_PROXY="$proxy_https" NO_PROXY="$proxy_no"
+          proxy_args=()
+          [ -n "$proxy_http" ] && proxy_args+=(-e "HTTP_PROXY=$proxy_http")
+          [ -n "$proxy_https" ] && proxy_args+=(-e "HTTPS_PROXY=$proxy_https")
+          [ -n "$proxy_no" ] && proxy_args+=(-e "NO_PROXY=$proxy_no")
+
+          # docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突
+          # clone 后: fetch base 分支最新, checkout base, merge PR head
+          docker_ok=false
+          if docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
+            --network host \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+              git config --global user.email "ci-bot@flash-attention-npu"
+              git config --global user.name "NPU CI Bot"
+              REPO_URL="https://github.com/'"${GITHUB_REPOSITORY}"'.git"
+              TARGET_SHA="'"$TARGET_SHA"'"
+              BASE_REF="'"$BASE_REF"'"
+              PR_NUMBER="'"$PR_NUMBER"'"
+              for i in 1 2 3; do
+                echo "[clone][docker] attempt $i/3"
+                rm -rf /workspace/.git /workspace/csrc/catlass 2>/dev/null || true
+                git init -q
+                git remote remove origin 2>/dev/null || true
+                git remote add origin "$REPO_URL"
+                if git fetch --depth=50 origin "$BASE_REF" \
+                  && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
+                  rm -rf /workspace/csrc/catlass 2>/dev/null || true
+                  git clean -fdx -e .git
+                  git checkout -q FETCH_HEAD
+                  echo "[clone][docker] success"
+                  # rebase 在容器 (root) 内做, 避免宿主机 runner 用户写 root 的 .git
+                  echo "[rebase][docker] base=$BASE_REF <- PR head=$TARGET_SHA"
+                  git rebase "origin/$BASE_REF" || {
+                    echo "[rebase][docker] conflict, aborting"
+                    git rebase --abort 2>/dev/null || true
+                    exit 1
+                  }
+                  # 容器 (root) 创建的文件, 授权给宿主机 runner 用户
+                  chmod -R a+rw /workspace 2>/dev/null || true
+                  exit 0
+                fi
+                echo "[clone][docker] attempt $i/3 failed, retry in 15s..."
+                sleep 15
+              done
+              echo "[clone][docker] all 3 attempts failed"
+              exit 1
+            '; then
+            docker_ok=true
+          fi
+
+          if [ "$docker_ok" != "true" ]; then
+            echo "[clone][docker] failed, fallback to host"
+            for i in 1 2 3; do
+              echo "[clone][host] attempt $i/3"
+              rm -rf .git csrc/catlass 2>/dev/null || true
+              git init -q
+              git remote remove origin 2>/dev/null || true
+              git remote add origin "$REPO_URL"
+              if git fetch --depth=50 origin "$BASE_REF" \
+                && git fetch --depth=100 origin "refs/pull/${PR_NUMBER}/head"; then
+                rm -rf csrc/catlass 2>/dev/null || true
+                git clean -fdx -e .git
+                git checkout -q FETCH_HEAD
+                break
+              fi
+              echo "[clone][host] attempt $i/3 failed, retry in 15s..."
+              sleep 15
+            done
+          fi
+
+          # host fallback 路径的 rebase (docker 路径已在容器内 rebase)
+          if [ "$docker_ok" != "true" ]; then
+            echo "[rebase][host] base=$BASE_REF <- PR head=$TARGET_SHA"
+            git rebase "origin/$BASE_REF" || {
+              echo "[rebase][host] conflict, aborting rebase"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            }
+          fi
+
+          ls -la ci/run_ci_container.sh
+          git log --oneline -5
+
+      - name: Run NPU CI container
+        id: run
+        if: steps.arch.outputs.match == 'true'
+        run: |
+          set -euo pipefail
+          bash ci/run_ci_container.sh
+
+      - name: Upload test logs
+        if: always() && steps.arch.outputs.match == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.arch_label }}
+          path: >-
+            /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+            ${{ matrix.arch_label }}/
+          retention-days: 7
+
+      - name: Clean up this job's CI containers
+        if: always() && steps.arch.outputs.match == 'true'
+        run: |
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi
+
+  finalize:
+    name: 写最终状态
+    needs: [prepare, run]
+    # 只在 prepare 确认要跑 (should_run=true) 时才写最终状态。否则:
+    #   - 普通评论 (prepare 被 if 跳过) -> sha 为空, gh api 报错
+    #   - 已通过 commit 重复触发 (should_run=false) -> run 跳过, 把已通过的 commit 误标成 failure
+    if: always() && needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+      RUN_OUTCOME: ${{ needs.run.result }}
+      COMMENT_USER: ${{ github.event.comment.user.login }}
+    steps:
+      - name: Set final status + update bot comment
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          sha="${{ needs.prepare.outputs.sha }}"
+          pr_number="${{ needs.prepare.outputs.pr_number }}"
+          ci_mode="${{ needs.prepare.outputs.ci_mode }}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            actor="$COMMENT_USER"
+          else
+            actor="${{ github.actor }}"
+          fi
+
+          if [ "$RUN_OUTCOME" = "success" ]; then
+            state=success; desc="NPU CI 通过 ($ci_mode+example)"; status_text="通过"
+          else
+            state=failure; desc="NPU CI 失败 ($ci_mode+example)"; status_text="失败"
+          fi
+          gh api --method POST "repos/$repo/statuses/$sha" \
+            -f state="$state" \
+            -f context="NPU CI / 手动验证" \
+            -f description="$desc" \
+            -f target_url="$run_url" >/dev/null
+
+          marker="<!--npu-ci-bot-->"
+          body="## NPU CI
+          $marker
+          - 触发人: @$actor
+          - 模式: \`$ci_mode\` (含 Example ST)
+          - PR: #$pr_number  commit: \`${sha:0:8}\`
+          - 状态: $status_text
+          - Actions: [$run_url]($run_url)"
+
+          comment_id="$(gh api "repos/$repo/issues/$pr_number/comments" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" | head -n1 || true)"
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$repo/issues/comments/$comment_id" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null
+          fi
+          [ "$RUN_OUTCOME" = "success" ] || exit 1

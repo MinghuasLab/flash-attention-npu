@@ -14,7 +14,7 @@
 #include "catlass/matrix_coord.hpp"
 #include "fag_block.h"
 #include "kernel_operator.h"
-#include "kernel_common_fag.hpp"
+#include "fag_kernel_common.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -32,18 +32,6 @@ public:
 
     AscendC::TPipe *pipe;
     AscendC::GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm;
-    AscendC::GlobalTensor<uint8_t> drop_maskGm, maskWorkSpaceGm;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> helpQue;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inputQue;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> castQue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQue;
-
-    constexpr static uint32_t HELP_LEN = 256;
-    constexpr static uint32_t BIT8 = 8;
-    constexpr static uint32_t NUMBER_8 = 8;
-    constexpr static uint32_t B16_VECTOR_MASK = 128;
-    constexpr static uint32_t BOOL_BLOCK_NUMS = 32;
-    constexpr static uint32_t SINGLE_UB_PROCESS_NUM = 30 * 1024;
 
     uint32_t cBlockIdx;
     uint32_t qPreBlockFactor;
@@ -57,17 +45,6 @@ public:
     int64_t dqOffset;
     int64_t initdkSize;
     int64_t dkvOffset;
-    int64_t dropMaskSize;
-    int64_t maskSingleCoreNum;
-    uint32_t maskUsedCoreNum;
-    uint32_t maskUBProcessNum;
-    uint32_t maskTailUBProcessNum;
-    uint32_t maskUBLoop;
-    bool isDropBoolMode;
-
-    AscendC::DataCopyParams copyParams;
-    AscendC::BinaryRepeatParams repParams;
-    half padValue{1.0};
 
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *dq,
@@ -75,13 +52,7 @@ public:
     {
         cBlockIdx = AscendC::GetBlockIdx();
         pipe = pipe_in;
-        isDropBoolMode = false;
-        dropMaskSize = 0;
-        maskSingleCoreNum = 0;
-        maskUsedCoreNum = 0;
-        maskUBProcessNum = 0;
-        maskTailUBProcessNum = 0;
-        maskUBLoop = 0;
+        (void)drop_mask;
 
         __gm__ TilingData *tilingData = reinterpret_cast<__gm__ TilingData *>(tiling_in);
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
@@ -110,39 +81,6 @@ public:
         dqOffset = ((int64_t)cBlockIdx) * qPreBlockFactor;
         initdkSize = cBlockIdx == kvPreBlockTotal - 1 ? kvPreBlockTail : kvPreBlockFactor;
         dkvOffset = ((int64_t)cBlockIdx) * kvPreBlockFactor;
-
-        if constexpr (!std::is_same_v<TilingData, FAGv2TilingData>) {
-            isDropBoolMode = drop_mask != nullptr && tilingData->dropoutIsDivisibleBy8 == 0;
-            if (isDropBoolMode) {
-                drop_maskGm.SetGlobalBuffer((__gm__ uint8_t *)drop_mask);
-                maskWorkSpaceGm.SetGlobalBuffer((__gm__ uint8_t *)workspace + tilingData->dropBeginAddr);
-
-                constexpr uint32_t inputBufferLen = 4 * 1024;
-                constexpr uint32_t castBufferLen = 60 * 1024;
-                constexpr uint32_t outputBufferLen = 30 * 1024;
-                pipe->InitBuffer(helpQue, 1, HELP_LEN);
-                pipe->InitBuffer(inputQue, 1, inputBufferLen);
-                pipe->InitBuffer(castQue, 1, castBufferLen);
-                pipe->InitBuffer(outQue, 1, outputBufferLen);
-
-                dropMaskSize = tilingData->dropMaskSize;
-                int64_t maskSize = (dropMaskSize + BOOL_BLOCK_NUMS - 1) / BOOL_BLOCK_NUMS * BOOL_BLOCK_NUMS;
-                maskSingleCoreNum = ((maskSize + tilingData->blockOuter - 1) / tilingData->blockOuter
-                                    + BOOL_BLOCK_NUMS - 1) / BOOL_BLOCK_NUMS * BOOL_BLOCK_NUMS;
-                maskUsedCoreNum = tilingData->maskCoreNum;
-
-                repParams.src0BlkStride = 1;
-                repParams.src0RepStride = 0;
-                repParams.src1BlkStride = 0;
-                repParams.src1RepStride = 0;
-                repParams.dstBlkStride = 1;
-                repParams.dstRepStride = NUMBER_8;
-
-                copyParams.blockCount = 1;
-                copyParams.srcStride = 0;
-                copyParams.dstStride = 0;
-            }
-        }
     }
 
     CATLASS_DEVICE
@@ -160,62 +98,6 @@ public:
         if (g_coreType == AscendC::AIV && cBlockIdx < kvPreBlockTotal) {
             AscendC::InitOutput<float>(dkWorkSpaceGm[dkvOffset], initdkSize, 0);
             AscendC::InitOutput<float>(dvWorkSpaceGm[dkvOffset], initdkSize, 0);
-        }
-
-        if (g_coreType == AscendC::AIV && cBlockIdx < maskUsedCoreNum) {
-            if (!isDropBoolMode) {
-                return;
-            }
-            maskUBLoop = maskSingleCoreNum == 0 ? 0 :
-                (maskSingleCoreNum + SINGLE_UB_PROCESS_NUM - 1) / SINGLE_UB_PROCESS_NUM;
-            maskTailUBProcessNum = maskSingleCoreNum - (maskUBLoop - 1) * SINGLE_UB_PROCESS_NUM;
-            if (unlikely(cBlockIdx == maskUsedCoreNum - 1)) {
-                int64_t maskSize = (dropMaskSize + BOOL_BLOCK_NUMS - 1) / BOOL_BLOCK_NUMS * BOOL_BLOCK_NUMS;
-                int64_t tailCoreNum = maskSize - (static_cast<int64_t>(maskUsedCoreNum) - 1) * maskSingleCoreNum;
-                tailCoreNum = (tailCoreNum + BOOL_BLOCK_NUMS - 1) / BOOL_BLOCK_NUMS * BOOL_BLOCK_NUMS;
-                maskUBLoop = (tailCoreNum + SINGLE_UB_PROCESS_NUM - 1) / SINGLE_UB_PROCESS_NUM;
-                maskTailUBProcessNum = tailCoreNum - (maskUBLoop - 1) * SINGLE_UB_PROCESS_NUM;
-            }
-
-            auto helpTensor = helpQue.AllocTensor<half>();
-            AscendC::Duplicate<half>(helpTensor, padValue, HELP_LEN / sizeof(half));
-            AscendC::PipeBarrier<PIPE_V>();
-
-            int64_t outputAddr = static_cast<int64_t>(cBlockIdx) * maskSingleCoreNum;
-            int64_t inputAddr = outputAddr / BIT8;
-
-            for (int64_t idx = 0; idx < maskUBLoop; idx++) {
-                maskUBProcessNum = SINGLE_UB_PROCESS_NUM;
-                int64_t outputOffset = idx * maskUBProcessNum;
-                int64_t inputOffset = outputOffset / BIT8;
-                if (unlikely(idx == maskUBLoop - 1)) {
-                    maskUBProcessNum = maskTailUBProcessNum;
-                }
-
-                auto inputTensor = inputQue.AllocTensor<uint8_t>();
-                copyParams.blockLen = maskUBProcessNum / BIT8;
-                AscendC::DataCopyPad(inputTensor, drop_maskGm[inputAddr + inputOffset], copyParams, {false, 0, 0, 0});
-                inputQue.EnQue(inputTensor);
-                inputQue.DeQue<uint8_t>();
-
-                auto castTensor = castQue.AllocTensor<half>();
-                uint8_t selectRepeat = (maskUBProcessNum + B16_VECTOR_MASK - 1) / B16_VECTOR_MASK;
-                AscendC::Select(castTensor, inputTensor, helpTensor, static_cast<half>(0.0),
-                                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, B16_VECTOR_MASK, selectRepeat, repParams);
-                AscendC::PipeBarrier<PIPE_V>();
-                inputQue.FreeTensor(inputTensor);
-
-                auto outputTensor = outQue.AllocTensor<uint8_t>();
-                AscendC::Cast(outputTensor, castTensor, AscendC::RoundMode::CAST_ROUND, maskUBProcessNum);
-                castQue.FreeTensor(castTensor);
-
-                outQue.EnQue(outputTensor);
-                outQue.DeQue<uint8_t>();
-                copyParams.blockLen = maskUBProcessNum;
-                AscendC::DataCopyPad(maskWorkSpaceGm[outputAddr + outputOffset], outputTensor, copyParams);
-                outQue.FreeTensor(outputTensor);
-            }
-            helpQue.FreeTensor(helpTensor);
         }
     }
 };

@@ -12,6 +12,8 @@
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t N_SPLIT_HELPER = 2;
+// Keep in sync with FaiKenel::MaskType::MASK_BAND.
+constexpr uint32_t MASK_TYPE_BAND = 2;
 
 inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
@@ -32,9 +34,9 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
 {
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
-    const bool causal = metaArgs->maskType != 0;
+    const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
-        metaArgs->metaOutAddr + fa_metadata::TilingOffset(causal));
+        metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
@@ -53,15 +55,21 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
     tilingData->maskType = metaArgs->maskType;
     tilingData->scaleValue = metaArgs->scaleValue;
+    tilingData->softcapValue = metaArgs->softcapValue;
+    tilingData->windowSizeLeft = metaArgs->windowSizeLeft;
+    tilingData->windowSizeRight = metaArgs->windowSizeRight;
     tilingData->maxQSeqlen = metaArgs->maxQSeqlen;
     tilingData->numSplits = metaArgs->numSplits > 0u ? metaArgs->numSplits : 1u;
-
+    // Append-KV fields (0 = append disabled, from the memset above).
+    tilingData->kvNewSeqlen = metaArgs->kvNewSeqlen;
+    tilingData->kvCacheSeqlen = metaArgs->kvCacheSeqlen;
     uint32_t maxKvSeqlen = 0;
     if (seqlensK != nullptr) {
         for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
             uint32_t kvLen = metaArgs->isVarlenKv != 0
                 ? static_cast<uint32_t>(seqlensK[batchIdx + 1] - seqlensK[batchIdx])
                 : static_cast<uint32_t>(seqlensK[batchIdx]);
+            kvLen += metaArgs->kvNewSeqlen;
             if (kvLen > maxKvSeqlen) {
                 maxKvSeqlen = kvLen;
             }
@@ -114,6 +122,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
         const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+            (metaArgs->maskType != MASK_TYPE_BAND) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
@@ -135,7 +144,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         }
     }
 
-    if (causal) {
+    if (hasMask) {
+        // Same triu(1) mask the host path uploads for both causal and band/SWA;
+        // the band restriction itself is applied by the kernel from
+        // windowSizeLeft/Right in the tiling data.
         int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
         const uint32_t maskDim = fa_metadata::MASK_DIM;
         for (uint32_t row = 0; row < maskDim; ++row) {

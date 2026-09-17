@@ -8,11 +8,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "../flash_attn_npu_3/fag_tiling.h"
 #include "../flash_attn_npu_3/fag_tiling.cpp"
-// The FAGGeneral kernel instantiations live in per-dtype dispatch TUs
-// (fag_general_dispatch_{bf16,fp16}.cpp), compiled in parallel. This host
-// function only sets up tiling/workspace and hands the raw pointers to
-// launch_fag_general_dispatch(); it no longer pulls in fag_kernel.cpp.
-#include "runtime/rt_ffts.h"          // rtGetC2cCtrlAddr (was via fag_general_launch.hpp)
+#include "runtime/rt_ffts.h"
 #include "fag_general_dispatch.hpp"
 
 std::vector<at::Tensor> launch_fag_general(
@@ -34,7 +30,11 @@ std::vector<at::Tensor> launch_fag_general(
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    bool deterministic)
+    bool deterministic,
+    float p_dropout,
+    const std::optional<at::Tensor> &rng_state,
+    uint8_t *alibi_slopes_ptr,           
+    int64_t alibi_slopes_batch_stride)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -55,14 +55,41 @@ std::vector<at::Tensor> launch_fag_general(
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
     auto vsizes = v.sizes();
+    auto dout_sizes = dout.sizes();
+    auto out_sizes = out.sizes();
+    const int64_t expected_dim = is_varlen_q ? 3 : 4;
+    TORCH_CHECK(q.dim() == expected_dim && k.dim() == expected_dim && v.dim() == expected_dim &&
+                    dout.dim() == expected_dim && out.dim() == expected_dim,
+                "launch_fag_general: q/k/v/dout/out must be ", expected_dim, "-D (",
+                (is_varlen_q ? "TND" : "BSND"), ")");
+    TORCH_CHECK(dout_sizes == out_sizes, "launch_fag_general: out and dout must have the same shape");
+    TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
+                "launch_fag_general: dq/dk/dv must match q/k/v shapes");
+
     uint32_t nheads = is_varlen_q ? qsizes[1] : qsizes[2];
     uint32_t nheads_k = is_varlen_q ? ksizes[1] : ksizes[2];
-    uint32_t qk_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
+    uint32_t q_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
     uint32_t v_headdim = is_varlen_q ? vsizes[2] : vsizes[3];
     uint32_t k_headdim = is_varlen_q ? ksizes[2] : ksizes[3];
-    TORCH_CHECK(qk_headdim == k_headdim, "launch_fag_general: q and k must share the same head dimension.");
-    TORCH_CHECK(qk_headdim > 0 && qk_headdim <= 256, "launch_fag_general: q/k head dimension must be in (0, 256].");
-    uint32_t qk_headdim_kernel = qk_headdim <= 64 ? 64 : (qk_headdim <= 128 ? 128 : (qk_headdim <= 192 ? 192 : 256));
+    uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[expected_dim - 1]);
+    TORCH_CHECK(nheads > 0 && nheads_k > 0, "launch_fag_general: number of Q/KV heads must be positive");
+    TORCH_CHECK(nheads % nheads_k == 0,
+                "launch_fag_general: number of heads in key/value must divide number of heads in query");
+    // NPU FAG bwd currently requires q/k/v/dout headdim to be equal.
+    TORCH_CHECK(q_headdim == k_headdim && q_headdim == v_headdim && q_headdim == dout_headdim,
+                "launch_fag_general: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
+    TORCH_CHECK(q_headdim > 0 && q_headdim <= 256, "launch_fag_general: headdim must be in (0, 256].");
+    TORCH_CHECK(qsizes == dout_sizes, "launch_fag_general: q and dout must have the same shape");
+    TORCH_CHECK(ksizes == vsizes, "launch_fag_general: k and v must have the same shape");
+    if (is_varlen_q) {
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k,
+                    "launch_fag_general: v nheads_k must match k");
+    } else {
+        TORCH_CHECK(qsizes[0] == ksizes[0], "launch_fag_general: q and k must share the same batch size");
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k,
+                    "launch_fag_general: v nheads_k must match k");
+    }
+    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
     uint32_t tilingSize = sizeof(FAGTilingData);
@@ -77,7 +104,8 @@ std::vector<at::Tensor> launch_fag_general(
     }
     fagInfo.softcapValue = softcap;
 
-    fagInfo.keepProb = 1.0f;
+    bool has_dropout = (p_dropout > 0.0f);
+    fagInfo.keepProb = 1.0f - p_dropout;
     if (window_size_left >= max_seqlen_k - 1) {
         window_size_left = -1;
     }
@@ -106,12 +134,15 @@ std::vector<at::Tensor> launch_fag_general(
     fagInfo.batch = batch_size;
     fagInfo.qSeqlen = max_seqlen_q;
     fagInfo.qHeadNum = nheads;
-    fagInfo.qkHeadDim = qk_headdim;
+    fagInfo.qkHeadDim = q_headdim;
     fagInfo.kvSeqlen = max_seqlen_k;
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;
     fagInfo.isDeterministic = deterministic;
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
+
+    bool has_alibi = alibi_slopes_ptr != nullptr;
+    fagInfo.alibiSlopesBatchStride = alibi_slopes_batch_stride;
 
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
@@ -194,6 +225,26 @@ std::vector<at::Tensor> launch_fag_general(
         cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.data_ptr()));
     }
 
+    // Regenerate the dropout bit-mask from the forward's rng_state (seed,
+    // offset). Same aclnnDropoutGenMask call and the same bit layout as the
+    // forward (batch x heads x max_seqlen_q rows x ceil(max_seqlen_k/8) bytes
+    // per row, bit 1 = keep), so the backward applies the exact same mask
+    // element-wise as the forward.
+    at::Tensor drop_mask_npu_tensor;
+    if (has_dropout) {
+        TORCH_CHECK(rng_state.has_value(),
+                    "launch_fag_general: rng_state must be provided when p_dropout > 0.");
+        const at::Tensor &rng_state_tensor = rng_state.value();
+        TORCH_CHECK(rng_state_tensor.is_cpu() && rng_state_tensor.numel() == 2,
+                    "launch_fag_general: rng_state must be a CPU tensor of 2 int64 (seed, offset).");
+        const uint64_t *rng_state_ptr = reinterpret_cast<const uint64_t *>(rng_state_tensor.data_ptr());
+        int64_t drop_mask_bit_num =
+            static_cast<int64_t>(batch_size) * nheads * max_seqlen_q * ((max_seqlen_k + 7) / 8 * 8);
+        drop_mask_npu_tensor = at_npu::native::npu_dropout_gen_mask(
+            torch::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat)), {drop_mask_bit_num}, p_dropout,
+            rng_state_ptr[0], rng_state_ptr[1], false, false);
+    }
+
     // FAGGeneral backward kernel launches live in
     // fag_general_dispatch_<dtype>_<layout>.cpp. gen_args.is_causal carries
     // main's has_attn_mask flag (causal OR local), which selects the kernel's
@@ -205,6 +256,11 @@ std::vector<at::Tensor> launch_fag_general(
     gen_args.fftsAddr = fftsAddr;
     gen_args.is_causal = has_attn_mask;
     gen_args.is_softcap = has_softcap;
+    gen_args.has_dropout = has_dropout;
+    gen_args.dropMaskDevice =
+        has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr;
+    gen_args.has_alibi = has_alibi;
+    gen_args.alibiSlopesDevice = alibi_slopes_ptr;
     gen_args.deterministic = deterministic;
     gen_args.qk_headdim_kernel = qk_headdim_kernel;
     gen_args.dOutDevice = dOutDevice;

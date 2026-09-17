@@ -1,0 +1,65 @@
+name: Code Quality
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint / format / workflow checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run quality checks in Docker
+        env:
+          QUALITY_IMAGE: flash-attention-npu-quality:${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          mode=all
+          base_sha=
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              mode=all
+              ;;
+            pull_request)
+              mode=base
+              base_sha="$PR_BASE_SHA"
+              ;;
+            push)
+              if [ "$PUSH_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+                mode=all
+              else
+                mode=base
+                base_sha="$PUSH_BASE_SHA"
+              fi
+              ;;
+            *)
+              echo "unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$mode" = all ]; then
+            ci/run_code_quality_container.sh --all-files
+          else
+            ci/run_code_quality_container.sh --base "$base_sha"
+          fi

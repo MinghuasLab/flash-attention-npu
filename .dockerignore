@@ -1,0 +1,5 @@
+*
+!.pre-commit-config.yaml
+!ci/
+!ci/Dockerfile.code_quality
+!ci/quality-requirements.txt

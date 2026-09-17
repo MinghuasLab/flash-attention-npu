@@ -9,6 +9,7 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/arch.hpp"
+#include "catlass/coord.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 
 using namespace Catlass;
@@ -52,5 +53,13 @@ namespace Catlass::Gemm {
         static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 
     };
+
+    namespace Block {
+        struct BlockPingPongState {
+            uint32_t l1PingPongFlag = 0;
+            uint32_t l0CPingPongFlag = 0;
+            uint32_t l0ABPingPongFlag = 0;
+        };
+    }
 }
 #endif // FAI_BLOCK_HPP

@@ -50,6 +50,7 @@ struct BatchParams {
     uint32_t curQSBlockNum;
     uint32_t curKSBlockTile;
     uint32_t curKSBlockNum;
+    uint32_t curKSBlockTail;  // rows in the last S2 block (new segment tail, else old tail)
 };
 
 struct SplitContext {
@@ -63,6 +64,7 @@ struct SplitContext {
     bool is_varlen_q;
     uint32_t blockDim;
     int32_t num_splits;
+    int32_t kvNewSeqlen;
 };
 
 inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx)
@@ -73,14 +75,22 @@ inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const Split
     } else {
         p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
     }
-    p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx]);
+    p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx] + ctx.kvNewSeqlen);
     p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
     p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;
     p.curQNBlockNum = p.qNBlockNumPerGroup * ctx.num_heads_k;
     p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen);
     p.curQSBlockNum = (p.qSeqlen + p.curQSBlockTile - 1) / p.curQSBlockTile;
     p.curKSBlockTile = GetKSBlockTile(p.kvSeqlen);
-    p.curKSBlockNum = (p.kvSeqlen + p.curKSBlockTile - 1) / p.curKSBlockTile;
+    // Per-phase S2 block count: old blocks + new blocks
+    uint32_t kvSeqlenOld = static_cast<uint32_t>(p.kvSeqlen - ctx.kvNewSeqlen);
+    uint32_t kvSBlockNumOld = (kvSeqlenOld + p.curKSBlockTile - 1) / p.curKSBlockTile;
+    uint32_t kvSBlockNumNew = ctx.kvNewSeqlen != 0
+        ? (static_cast<uint32_t>(ctx.kvNewSeqlen) + p.curKSBlockTile - 1) / p.curKSBlockTile : 0U;
+    p.curKSBlockNum = kvSBlockNumOld + kvSBlockNumNew;
+    p.curKSBlockTail = kvSBlockNumNew != 0U
+        ? (static_cast<uint32_t>(ctx.kvNewSeqlen) - (kvSBlockNumNew - 1U) * p.curKSBlockTile)
+        : (kvSBlockNumOld != 0U ? (kvSeqlenOld - (kvSBlockNumOld - 1U) * p.curKSBlockTile) : 0U);
     return p;
 }
 
@@ -134,7 +144,7 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
                 : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
             uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
                 ? p.curKSBlockTile
-                : (p.kvSeqlen - nowS2Idx * p.curKSBlockTile);
+                : p.curKSBlockTail;
             uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
             resTaskNum -= static_cast<int32_t>(singleS2Task);
             nowS2Idx += 1;
@@ -206,7 +216,7 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
                 : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
             uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
                 ? p.curKSBlockTile
-                : (p.kvSeqlen - nowS2Idx * p.curKSBlockTile);
+                : p.curKSBlockTail;
             uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
             resTaskNum -= static_cast<int32_t>(singleS2Task);
             nowS2Idx += 1;
@@ -214,12 +224,29 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
 
         if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
 
-        tiling->coreInfo[coreIdx].endBIdx = nowBIdx;
+        BatchParams pEnd = getBatchParams(
+            nowBIdx >= ctx.batch_size ? ctx.batch_size - 1 : nowBIdx, groupSize, ctx);
+        tiling->coreInfo[coreIdx].endBIdx = nowBIdx < ctx.batch_size ? nowBIdx : ctx.batch_size - 1;
         tiling->coreInfo[coreIdx].endN1Idx = nowN1Idx;
         tiling->coreInfo[coreIdx].endS1Idx = nowS1Idx;
-        tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx;
+        // S2 reset to 0 by advanceCounters means the last combination's S2 range
+        // was fully consumed; close it at that combination's block count.
+        tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx != 0 ? nowS2Idx : pEnd.curKSBlockNum;
 
         advanceCounters();
+    }
+
+    // Flush: if tasks remain unconsumed (nowBIdx < batch_size), trailing S2 blocks
+    // must be assigned to the last core; otherwise, tail blocks are lost,
+    // leading to incorrect output and missing newkv writeback.
+    if (nowBIdx < ctx.batch_size) {
+        uint32_t lastCore = ctx.blockDim - 1;
+        BatchParams pFlush = getBatchParams(ctx.batch_size - 1, groupSize, ctx);
+        tiling->coreInfo[lastCore].endBIdx = ctx.batch_size - 1;
+        tiling->coreInfo[lastCore].endN1Idx = pFlush.curQNBlockNum - 1;
+        tiling->coreInfo[lastCore].endS1Idx = pFlush.curQSBlockNum - 1;
+        tiling->coreInfo[lastCore].endS2Idx = pFlush.curKSBlockNum;
+        tiling->set_needCoreNum(ctx.blockDim);
     }
 }
 

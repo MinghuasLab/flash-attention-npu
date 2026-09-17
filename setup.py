@@ -14,6 +14,7 @@ import platform
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 import subprocess
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import urllib.request
@@ -63,6 +64,16 @@ SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
 #          both 910 and 950.
 BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
 BUILD_NPU = os.getenv("FLASH_ATTN_BUILD_NPU", "all").lower()
+# FLASH_ATTN_ENABLE_MSSANITIZER: 使能 Ascend msSanitizer 内存异常检测。
+# 开启后：
+#  - 910 (dav-2201)：编译追加 "-g --cce-enable-sanitizer"，链接追加 "--cce-enable-sanitizer"（静态插桩）；
+#  - 950 (dav-3510)：CANN 9.1.0 未提供 sanitizer stub（libsanitizer_stub_dav-c310），无法静态插桩，
+#                    仅追加 "-g"（报告定位信息），内存检测需配合 mssanitizer 运行时注入：
+#                    mssanitizer --tool=memcheck python -m pytest ...
+# "-g" 用于异常报告输出文件名/行号/调用栈；静态插桩可检测越界访问、多核踩踏、非对齐访问等。
+# 仅用于调试定位，会显著增大二进制并降低性能。建议通过 bdist_wheel 独立产出检测版，
+# 避免覆盖正常版本（editable 安装下正常 .so 位于 flash_attn_npu/ 目录内）。
+ENABLE_MSSANITIZER = os.getenv("FLASH_ATTN_ENABLE_MSSANITIZER", "FALSE") == "TRUE"
 
 def get_platform():
     """
@@ -75,6 +86,49 @@ def get_platform():
 
 def get_cann_arch_dir():
     return f"{platform.machine()}-linux"  # aarch64-linux | x86_64-linux
+
+
+def _cmdhash(compile_common):
+    """Stable hash of the per-extension compile flags (arch / -O / ABI / includes).
+    A change here means a stored .o was produced with different flags and must be
+    rebuilt, even if no source/header mtime moved."""
+    return hashlib.md5("\0".join(compile_common).encode("utf-8")).hexdigest()
+
+
+def _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
+    """True iff `obj` may be reused instead of recompiled. Conservative: any
+    doubt -> False (recompile). Over-recompiling is safe; reusing a stale .o is
+    not. Three staleness signals:
+      1. source mtime > obj mtime  (.cpp edited)
+      2. any depfile-listed header newer than obj  (-MMD tracks user headers,
+         incl. .cpp files included as headers such as fag_kernel.cpp; NOT
+         system/CANN headers)
+      3. the recorded compile-flag hash differs from the current one, or is
+         missing (first time tracking this obj) -> rebuild to establish it."""
+    if not os.path.exists(obj):
+        return False
+    obj_mtime = os.path.getmtime(obj)
+    if os.path.getmtime(src) > obj_mtime:
+        return False
+    if os.path.exists(depfile):
+        try:
+            with open(depfile, "r", errors="replace") as f:
+                content = f.read().replace("\\\n", " ")
+            deps = content.split(":", 1)[1] if ":" in content else ""
+            for tok in deps.split():
+                if tok.endswith(":"):
+                    break  # secondary target (-MP not used; defensive)
+                if tok and os.path.exists(tok) and os.path.getmtime(tok) > obj_mtime:
+                    return False
+        except Exception:
+            return False  # parse error -> be safe, recompile
+    try:
+        with open(cmdhash_file, "r") as f:
+            prev = f.read().strip()
+    except OSError:
+        return False  # first time tracking this obj -> recompile to record hash
+    return prev == _cmdhash(compile_common)
+
 
 class BishengBuildExt(build_ext):
     _toolchains = None
@@ -148,6 +202,14 @@ class BishengBuildExt(build_ext):
         ]
         # At link time only the target arch is needed (for device-code linking).
         link_arch_flags = [f"--npu-arch={npu_arch}"]
+        # msSanitizer 静态插桩仅支持 910 (dav-c220)：CANN 9.1.0 未提供 950 的 sanitizer stub
+        # （libsanitizer_stub_dav-c310 缺失），950 编译时加 "--cce-enable-sanitizer" 会在设备链接阶段
+        # 报 "unable to find library -lsanitizer_stub_dav-c310"。
+        # 950 (dav-3510) 请改用 mssanitizer 运行时注入（编译不加插桩，运行测试命令前加 mssanitizer 前缀）。
+        use_ms_static = ENABLE_MSSANITIZER and not is_ascend950
+        if use_ms_static:
+            link_arch_flags = ["--cce-enable-sanitizer", *link_arch_flags]
+
 
         include_flags = [
             *[f"-I{p}" for p in asc_include_paths],
@@ -189,24 +251,59 @@ class BishengBuildExt(build_ext):
 
         compile_common = [*compiler, "-O2", *compile_arch_flags, "-fPIC", "-std=c++17",
                           abi_flag, *include_flags]
+        if use_ms_static:
+            # msSanitizer 静态插桩：-g 生成定位信息（异常报告输出文件名/行号/调用栈），
+            # --cce-enable-sanitizer 开启内存异常检测插桩。
+            compile_common += ["-g", "--cce-enable-sanitizer"]
+            print(f"[mssanitizer] {ext_name}: 已追加 -g（报告定位信息）；"
+                  f"内存检测请用运行时注入：mssanitizer --tool=memcheck python -m pytest ...")
+        elif ENABLE_MSSANITIZER:
+            # 950 (dav-3510)：静态插桩 "--cce-enable-sanitizer" 在此 CANN 下不可用
+            # （缺少 libsanitizer_stub_dav-c310，链接阶段报 unable to find library），
+            # 内存检测改由 mssanitizer 运行时注入完成，无需重新编译算子；
+            # 这里仍追加 "-g"，让运行时注入的异常报告能输出文件名/行号/调用栈。
+            compile_common += ["-g", "-fno-jump-tables"]
+            print(f"[mssanitizer] {ext_name}: 已追加 -g（报告定位信息）；"
+                  f"内存检测请用运行时注入：mssanitizer --tool=memcheck python -m pytest ...")
+                  
 
         self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
         return self._toolchains[ext_name]
 
-    def _build_aicpu_metadata(self, ext_fullpath):
-        """Compile fa_metadata.aicpu (host AICPU object) for the ascend910 v3 extension
-        (flash_attn_npu_3). This is a separate `bisheng -x aicpu` invocation
-        (host CPU code cross-compiled with hcc, not ASC device code); the
-        resulting object is linked into flash_attn_npu_3 alongside the ASC device
-        objects. Returns the .o path, or None if there is no aicpu source.
-        Preserved from main's metadata feature through the parallel-pipeline
-        refactor."""
+    def _force_rebuild(self):
+        return bool(getattr(self, "force", None)) or \
+            os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
+
+    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
+        """Compile fa_metadata.aicpu (host AICPU object) for the extensions
+        that carry the scheduler-metadata feature (910 v2/v3 and 950 v3). This
+        is a separate `bisheng -x aicpu` invocation (host CPU code
+        cross-compiled with hcc, not ASC device code); the resulting object is
+        linked into the extension alongside the ASC device objects. Returns the
+        .o path, or None if there is no aicpu source."""
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
-        v3_dir = os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3")
-        aicpu_src = os.path.join(v3_dir, "fa_metadata.aicpu")
+        aicpu_src_dirs = {
+            "flash_attn_npu.flash_attn_npu": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu"),
+            "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
+            "flash_attn_npu_3_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_3"),
+            "flash_attn_npu_4.flash_attn_npu_4": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_4"),
+        }
+        src_dir = aicpu_src_dirs.get(ext_name)
+        if src_dir is None:
+            return None
+        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
         if not os.path.exists(aicpu_src):
             return None
-        aicpu_obj = os.path.join(os.path.dirname(ext_fullpath), "fa_metadata.o")
+        aicpu_obj = os.path.join(
+            os.path.dirname(ext_fullpath),
+            "fa_metadata_950.o" if ext_name == "flash_attn_npu_3_950" else "fa_metadata.o",
+        )
+        # Incremental: aicpu is a host-code cross-compile (hcc) with no depfile,
+        # so mtime-on-source only. Skip if the object is already up-to-date.
+        if not self._force_rebuild() and os.path.exists(aicpu_obj) and \
+                os.path.getmtime(aicpu_src) <= os.path.getmtime(aicpu_obj):
+            print("[compile-aicpu-skip]", aicpu_src, "(obj up-to-date)")
+            return aicpu_obj
         cann_arch_dir = get_cann_arch_dir()
         aicpu_inc = os.path.join(ascend_home, cann_arch_dir, "asc/include/aicpu_api")
         aicpu_lib = os.path.join(ascend_home, cann_arch_dir, "lib64/device/lib64")
@@ -223,7 +320,7 @@ class BishengBuildExt(build_ext):
             "-D_FORTIFY_SOURCE=2",
             "-D_GNU_SOURCE",
             f"-I{aicpu_inc}",
-            f"-I{v3_dir}",  # tilingdata.h
+            f"-I{src_dir}",  # tilingdata.h
             f"--cce-aicpu-L{aicpu_lib}",
             "--cce-aicpu-laicpu_api",
             f"--cce-aicpu-toolkit-path={os.path.join(hcc, 'bin')}",
@@ -250,6 +347,7 @@ class BishengBuildExt(build_ext):
 
     def build_extensions(self):
         toolchains = {ext.name: self._get_toolchain(ext) for ext in self.extensions}
+        force = self._force_rebuild()
 
         # Map every TU source -> (ext_name, obj_path). obj dir is per-extension so
         # v2/v3 .o files (same basenames, e.g. flash_api.o) never collide.
@@ -266,13 +364,20 @@ class BishengBuildExt(build_ext):
         def compile_one(task):
             ext_name, src, obj = task
             _compiler, compile_common, _la, _lf = toolchains[ext_name]
-            cmd = [*compile_common, "-c", src, "-o", obj]
+            depfile = obj + ".d"
+            cmdhash_file = obj + ".cmdhash"
+            if not force and _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
+                print("[compile-skip]", ext_name, os.path.basename(src), "(obj up-to-date)")
+                return (ext_name, obj)
+            cmd = [*compile_common, "-c", src, "-o", obj, "-MMD", "-MF", depfile]
             print("[compile]", ext_name, os.path.basename(src))
             print("[compile-cmd]", " ".join(cmd))
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 if result.stdout:
                     print(result.stdout)
+                with open(cmdhash_file, "w") as f:
+                    f.write(_cmdhash(compile_common))
                 return (ext_name, obj)
             except subprocess.CalledProcessError as e:
                 print(f"Compilation failed for {src}! Error output:\n{e.stderr}")
@@ -290,21 +395,29 @@ class BishengBuildExt(build_ext):
                 ext_name, obj = fut.result()
                 objs_by_ext[ext_name].append(obj)
 
-        # AICPU metadata object for the ascend910 v3 extension: compiled separately
-        # (host code, `bisheng -x aicpu`) and appended to that extension's link
-        # set. Built after the parallel ASC compiles, before linking.
+        # AICPU metadata object for the extensions carrying the
+        # scheduler-metadata feature: compiled separately (host code,
+        # `bisheng -x aicpu`) and appended to each extension's link set. Built
+        # after the parallel ASC compiles, before linking.
         for ext in self.extensions:
-            if ext.name == "flash_attn_npu_3.flash_attn_npu_3":
-                ext_fullpath = self.get_ext_fullpath(ext.name)
-                aicpu_obj = self._build_aicpu_metadata(ext_fullpath)
-                if aicpu_obj is not None:
-                    objs_by_ext[ext.name].append(aicpu_obj)
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
+            if aicpu_obj is not None:
+                objs_by_ext[ext.name].append(aicpu_obj)
 
         # Link each extension from its own object files (serial; link is cheap
-        # relative to compile and each ext needs only its own .o set).
+        # relative to compile - measured ~1s/ext - so parallelizing would save
+        # only ~5s total and stays serial). Skip an ext's link when its .so
+        # already exists and is no older than every .o: that means no object
+        # changed since the last link, so relinking would be a no-op.
         for ext in self.extensions:
             ext_fullpath = self.get_ext_fullpath(ext.name)
             objs = objs_by_ext[ext.name]
+            if not force and os.path.exists(ext_fullpath) and \
+                    all(os.path.exists(o) and os.path.getmtime(o) <= os.path.getmtime(ext_fullpath)
+                        for o in objs):
+                print("[link-skip]", ext_fullpath, "(.so up-to-date)")
+                continue
             compiler, _cc, link_arch_flags, link_flags = toolchains[ext.name]
             link_cmd = [*compiler, *link_arch_flags, "-shared", "-fPIC", *objs, *link_flags, "-o", ext_fullpath]
             print("[link]", ext_fullpath)
@@ -354,28 +467,18 @@ src_ascend910_v3 = glob.glob(os.path.join(this_dir, "csrc/ascend910/flash_attn_n
 # metadata logic; the kernel templates are instantiated only in the autogen TUs.
 src_ascend910_v3 += glob.glob(os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True)
 src_ascend950_v3 = glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "flash_api.cpp"), recursive=True)
-src_ascend950_v3 += glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fai_host_api.cpp"), recursive=True)
 # ascend950 v3's forward FAInfer dispatch is split into per-(dtype, layout) translation
 # units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /
-# FAInferDn kernel templates compile in parallel. fai_host_api.cpp stays a
-# lightweight router (BuildKernelKey + LaunchFAI); the kernel templates are
-# instantiated only in the autogen TUs. head_dim is a runtime tiling axis, not a
-# generation axis, so it is not enumerated here.
 src_ascend950_v3 += glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True)
 src_ascend910_v4 = glob.glob(os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True)
-# ascend910 v4's forward FAInfer dispatch is split into per-(dtype, layout)
-# translation units under autogen/, generated by autogen/generate_kernels.py.
-# flash_api.cpp keeps the fa_split host loop; the kernel templates are
-# instantiated only in the autogen TUs.
+# ascend910's forward FAInfer / backward FAGGeneral dispatch is split into
+# per-(dtype, layout) translation units under autogen/, generated by
+# autogen/generate_kernels.py. flash_api.cpp keeps the fa_split host loop and
+# mha_bwd tiling; the kernel templates are instantiated only in the autogen TUs.
 src_ascend910_v4 += glob.glob(os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "autogen", "*.cpp"), recursive=True)
 src_ascend950_v4 = glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "flash_api.cpp"), recursive=True)
-src_ascend950_v4 += glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "fai_host_api.cpp"), recursive=True)
 # ascend950 v4's forward FAInfer dispatch is split into per-(dtype, layout) translation
 # units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /
-# FAInferDn kernel templates compile in parallel. fai_host_api.cpp stays a
-# lightweight router (BuildKernelKey + LaunchFAI); the kernel templates are
-# instantiated only in the autogen TUs. head_dim is a runtime tiling axis, not a
-# generation axis, so it is not enumerated here.
 src_ascend950_v4 += glob.glob(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "autogen", "*.cpp"), recursive=True)
 
 if not SKIP_NPU_BUILD:

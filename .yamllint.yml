@@ -1,0 +1,12 @@
+---
+extends: default
+
+rules:
+  document-start: disable
+  indentation:
+    indent-sequences: consistent
+  line-length:
+    max: 120
+  # GitHub Actions uses the YAML 1.2 meaning of `on`; yamllint's truthy rule
+  # otherwise reports every workflow trigger as a violation.
+  truthy: disable

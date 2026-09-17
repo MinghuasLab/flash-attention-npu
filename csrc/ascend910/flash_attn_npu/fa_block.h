@@ -15,19 +15,23 @@ using namespace Catlass;
 
 namespace Catlass::Epilogue {
     enum class LseModeT {NONE = 0, OUT_ONLY = 1};
-    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_>
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_, bool RETURN_SOFTMAX_, bool HAS_DROPOUT_, bool HAS_ALIBI_>
     struct EpilogueAtlasA2OnlineSoftmaxT {
         using ArchTag = Arch::AtlasA2;
         using IntermPrec = SM_DTYPE_;
         static constexpr LseModeT LSE_MODE = LSE_MODE_;
         static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+        static constexpr bool RETURN_SOFTMAX = RETURN_SOFTMAX_;
+        static constexpr bool HAS_DROPOUT = HAS_DROPOUT_;
+        static constexpr bool HAS_ALIBI = HAS_ALIBI_;
     };
 
-    template <LseModeT LSE_MODE_, typename SM_DTYPE_>
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_DROPOUT_>
     struct EpilogueAtlasA2RescaleOT {
         using ArchTag = Arch::AtlasA2;
         using IntermPrec = SM_DTYPE_;
         static constexpr LseModeT LSE_MODE = LSE_MODE_;
+        static constexpr bool HAS_DROPOUT = HAS_DROPOUT_;
     };
 
     template <LseModeT LSE_MODE_>
@@ -52,5 +56,13 @@ namespace Catlass::Gemm {
         static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 
     };
+
+    namespace Block {
+        struct BlockPingPongState {
+            uint32_t l1PingPongFlag = 0;
+            uint32_t l0CPingPongFlag = 0;
+            uint32_t l0ABPingPongFlag = 0;
+        };
+    }
 }
 #endif // FAI_BLOCK_HPP

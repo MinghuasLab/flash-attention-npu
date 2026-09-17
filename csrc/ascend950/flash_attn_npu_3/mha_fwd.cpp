@@ -5,27 +5,32 @@
  *
  *   ✅ FP16 / BF16
  *   ✅ Causal mask
+ *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch; kernel Phase 2/3)
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
- *   ❌ SWA / window_size != (-1, -1)
- *   ❌ num_splits > 1 (FlashDecode)
- *   ❌ pack_gqa, scheduler_metadata, leftpad_k
+ *   ✅ return_softmax_lse
+ *   ✅ num_splits (FlashDecode for paged KV + TND)
+ *   ✅ scheduler_metadata for non-FD execution
+ *   ❌ pack_gqa, leftpad_k
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <c10/core/Device.h>
 #include <torch/extension.h>
 
 #include "acl/acl.h"
-#include "fai_host_api.hpp"
-#include "fai_tiling.cpp"
-#include "fai_tilingdata.h"
+#include "fwd_dispatch.hpp"
+#include "tiling.cpp"
+#include "tilingdata.h"
+#include "fa_metadata_args.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
 
@@ -68,7 +73,8 @@ mha_fwd(at::Tensor q,
         std::optional<at::Tensor> scheduler_metadata_,
         int64_t                   num_splits,
         std::optional<bool>       pack_gqa_,
-        int64_t                   sm_margin)
+        int64_t                   sm_margin,
+        bool                      return_softmax_lse)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -86,11 +92,15 @@ mha_fwd(at::Tensor q,
     const bool is_fp16 = (q_dtype == torch::kFloat16);
     TORCH_CHECK(is_bf16 || is_fp16,
                 "FlashAttention only supports FP16 and BF16 data types");
+    TORCH_CHECK(q.device().type() == at::kPrivateUse1,
+                "query must be on NPU");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
+                "query, key and value must be on the same NPU device");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor k must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor v must have contiguous last dimension");
+    CHECK_CONTIGUOUS(q);
+    CHECK_CONTIGUOUS(k);
+    CHECK_CONTIGUOUS(v);
 
     // ============================================================
     // 2. reject list
@@ -104,14 +114,15 @@ mha_fwd(at::Tensor q,
                 && !v_descale_.has_value(),
                 "950 backend (v3) does not support FP8 descales");
     TORCH_CHECK(softcap == 0.0f, "950 backend (v3) does not support softcap");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "950 backend (v3) does not support SWA");
     TORCH_CHECK(attention_chunk == 0,
                 "950 backend (v3) does not support attention_chunk");
-    TORCH_CHECK(!scheduler_metadata_.has_value(),
-                "950 backend (v3) does not consume scheduler_metadata");
-    TORCH_CHECK(num_splits == 0 || num_splits == 1,
-                "950 backend (v3) only supports num_splits=0 or 1");
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
+                "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
+    if (scheduler_metadata_.has_value()) {
+        TORCH_CHECK(num_splits <= 1,
+                    "950 backend (v3) scheduler_metadata does not support "
+                    "explicit FlashDecode splits");
+    }
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(),
                 "950 backend (v3) does not support pack_gqa");
 
@@ -122,14 +133,24 @@ mha_fwd(at::Tensor q,
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
 
+    TORCH_CHECK(!k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value() &&
+                    !cu_seqlens_k_new_.has_value() && !kv_batch_idx_.has_value(),
+                "950 backend (v3) does not support KV-cache update inputs");
+    if (num_splits > 1) {
+        TORCH_CHECK(paged_KV && is_varlen_q,
+                    "950 backend (v3) num_splits>1 requires paged KV cache and "
+                    "TND varlen query");
+    }
+
     at::Tensor cu_seqlens_q, cu_seqlens_k, page_table, seqlens_k;
 
     if (paged_KV) {
         page_table = page_table_.value();
+        TORCH_CHECK(page_table.device() == q.device(),
+                    "page_table must be on the same NPU device as query");
         TORCH_CHECK(page_table.dtype() == torch::kInt32,
                     "page_table must have dtype int32");
-        TORCH_CHECK(page_table.stride(-1) == 1,
-                    "page_table must have contiguous last dimension");
+        CHECK_CONTIGUOUS(page_table);
     }
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
@@ -159,24 +180,23 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1,
                 "seqused_k must be on NPU");
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+    TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
 
     // ============================================================
-    // 4. Output tensor
+    // 4. Shape extraction and output tensor
     // ============================================================
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype,
-                    "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1,
-                    "Output tensor must have contiguous last dimension");
-    } else {
-        out = torch::empty_like(q);
+    const int64_t expected_q_dim = is_varlen_q ? 3 : 4;
+    const int64_t expected_kv_dim = (is_varlen_q && !paged_KV) ? 3 : 4;
+    TORCH_CHECK(q.dim() == expected_q_dim,
+                "query must be rank ", expected_q_dim,
+                is_varlen_q ? " in TND layout" : " in BSND layout");
+    TORCH_CHECK(k.dim() == expected_kv_dim && v.dim() == expected_kv_dim,
+                "key and value must both be rank ", expected_kv_dim);
+    TORCH_CHECK(k.dim() == v.dim(), "key and value must have the same rank");
+    if (is_varlen_q) {
+        TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.numel() >= 2,
+                    "cu_seqlens_q must be a rank-1 tensor with at least two elements");
     }
-
-    // ============================================================
-    // 5. Shape extraction
-    // ============================================================
     const auto sizes = q.sizes();
     int batch_size, seqlen_q, num_heads, head_size_q;
     if (is_varlen_q) {
@@ -193,164 +213,311 @@ mha_fwd(at::Tensor q,
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
-    const int num_heads_k = static_cast<int>((is_varlen_q && !paged_KV) ? k.size(1) : k.size(2));
+    // k is 3D TND for flash_attn_varlen_func, but 4D
+    // (batch/num_blocks, seqlen/block, kv_heads, head) for flash_attn_with_kvcache.
+    const int num_heads_k = static_cast<int>(k.dim() == 3 ? k.size(1) : k.size(2));
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(!(head_size_q != 64 && head_size_q != 128),
-                "FlashAttention only supports q head dimension 64 or 128");
-    TORCH_CHECK(!(head_size_v != 64 && head_size_v != 128),
-                "FlashAttention only supports v head dimension 64 or 128");
+    TORCH_CHECK(seqlen_q > 0 && num_heads > 0,
+                "query sequence length and head count must be positive");
+    TORCH_CHECK(seqlens_k.numel() == batch_size,
+                "seqused_k must contain one KV length per batch");
+    TORCH_CHECK(k.size(-1) == head_size_q,
+                "query and key must have the same head dimension");
+    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256,
+                "FlashAttention supports q/k head dimensions in [1, 256]");
+    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256,
+                "FlashAttention supports value head dimensions in [1, 256]");
     TORCH_CHECK(!(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
                 "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
+    TORCH_CHECK(num_heads_k > 0, "key/value head count must be positive");
     TORCH_CHECK(num_heads % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
-
-    // ============================================================
-    // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
-    //    FAInferContext consumes int32 lists, so we widen on host.
-    // ============================================================
-    at::Tensor cu_seqlen_q_cpu;
-    if (is_varlen_q) {
-        cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
+    if (!is_varlen_q && !paged_KV) {
+        TORCH_CHECK(q.size(0) == k.size(0),
+                    "query and key/value batch sizes must match in BSND layout");
     }
-    at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
+    if (paged_KV) {
+        TORCH_CHECK(num_blocks > 0 && max_num_blocks_per_seq > 0,
+                    "paged KV cache and page_table must contain at least one block");
+        TORCH_CHECK(page_table.size(0) == batch_size,
+                    "page_table batch dimension must match query batch size");
+    }
+
+    std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
+    output_sizes.back() = head_size_v;
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype,
+                    "output must have the same dtype as inputs");
+        TORCH_CHECK(out.device() == q.device(),
+                    "output must be on the same device as query");
+        TORCH_CHECK(out.sizes().vec() == output_sizes,
+                    "output shape must match query except for the last dimension, which must match value");
+        CHECK_CONTIGUOUS(out);
+    } else {
+        out = at::empty(output_sizes, q.options());
+    }
 
     // ============================================================
-    // 7. Build FAInferContext + run host-side tiling
+    // 6/7. Tiling source: precomputed AICPU metadata or host tiling
     // ============================================================
+    uint8_t *tilingDevice = nullptr;
+    uint8_t *maskDevice = nullptr;
+    uint8_t *metaBase = nullptr;
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
-    fill_inference_context(
-        ctx, scratch,
-        q, k, v,
-        is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
-        &seqlens_k_cpu,
-        paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
-        is_causal, is_varlen_q, is_bf16,
-        batch_size, seqlen_q, num_heads, num_heads_k,
-        head_size_q, head_size_v,
-        softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        /* lse_flag= */ true,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
-
     FAInferTilingData tilingData{};
-    {
-        optiling::FAInferTiling tiler(ctx);
-        tiler.SetCoreNum(blockDim);
-        tiler.DoTiling(tilingData);
-    }
+    static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
+                  "FAInferTilingData must remain a trivially-copyable Device ABI");
+    at::Tensor tiling_dev;
+    at::Tensor mask_npu_tensor;
+    bool is_local = false;
+    bool flashDecodeEnabled = false;
+    uint32_t launchBlockDim = blockDim;
+    uint32_t combineBlockDim = 0U;
 
-    // The 950 chunk-prefill driver overrides workSpaceSize to 128 MiB
-    constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4;  // 128 MiB
-    if (tilingData.workSpaceSize < WS_FLOOR) {
-        tilingData.workSpaceSize = WS_FLOOR;
+    if (scheduler_metadata_.has_value()) {
+        auto schedMd = scheduler_metadata_.value();
+        TORCH_CHECK(schedMd.dtype() == at::kByte,
+                    "scheduler_metadata must be a byte tensor");
+        TORCH_CHECK(schedMd.is_contiguous(),
+                    "scheduler_metadata must be contiguous");
+        TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1,
+                    "scheduler_metadata must be an NPU tensor");
+        // Derive the mask axes from this call's arguments the same way
+        // get_scheduler_metadata did when producing the buffer, so the
+        // template selection and the tiling offset match the AICPU-written
+        // tiling. No D2H is needed, so NPUGraph capture keeps working.
+        int64_t kvSeqlenBound = 0;
+        if (is_varlen_kv) {
+            kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
+        } else if (paged_KV) {
+            kvSeqlenBound = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
+        } else if (is_varlen_q) {
+            kvSeqlenBound = k.size(0);  // 3D TND non-paged: total_kv is an upper bound
+        } else {
+            kvSeqlenBound = k.size(1);
+        }
+        FwdMaskDerivation maskDer = DeriveFwdMask(
+            is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
+        is_causal = maskDer.is_causal;
+        is_local = maskDer.is_local;
+        const bool hasMask = maskDer.maskType != 0u;
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) ==
+                        fa_metadata::MetadataBytesWithKv(hasMask, batch_size),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
+
+        metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
+        tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
+        maskDevice = hasMask ? metaBase : nullptr;
+    } else {
+        at::Tensor cu_seqlen_q_cpu;
+        if (is_varlen_q) {
+            cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
+        }
+        at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
+
+        // 6b. SWA / causal host normalize
+        int32_t max_kv_seqlen = 0;
+        {
+            const int32_t* seqlens_k_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+            for (int i = 0; i < batch_size; ++i) {
+                max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_ptr[i]);
+            }
+        }
+        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+            window_size_left = -1;
+        }
+        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+            window_size_right = -1;
+        }
+        if (is_causal) {
+            window_size_right = 0;
+        }
+        is_causal = (window_size_left < 0 && window_size_right == 0);
+        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        if (is_local) {
+            if (window_size_left < 0) {
+                window_size_left = max_kv_seqlen;
+            }
+            if (window_size_right < 0) {
+                window_size_right = max_kv_seqlen;
+            }
+        }
+
+        int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+        int64_t max_q_seqlen = 0;
+        const int32_t *q_cu_ptr = is_varlen_q ?
+            cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
+        const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            const int64_t q_len = is_varlen_q ?
+                static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
+                seqlen_q;
+            const int64_t kv_len = kv_len_ptr[batch_idx];
+            TORCH_CHECK(q_len > 0 && kv_len > 0,
+                        "950 backend (v3) requires positive Q and KV lengths");
+            min_q_seqlen = std::min(min_q_seqlen, q_len);
+            max_q_seqlen = std::max(max_q_seqlen, q_len);
+        }
+        const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
+            min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+        // The tiler applies the small-task gate after building the same merged
+        // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
+        // which would over-count GQA/MQA tasks and incorrectly disable FD.
+        const bool flash_decode = num_splits != 1 && fd_shape_supported;
+
+        fill_inference_context(
+            ctx, scratch,
+            q, k, v,
+            is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+            &seqlens_k_cpu,
+            paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
+            is_causal,
+            is_local,
+            /* window_size_left= */ is_local ? window_size_left : 0,
+            /* window_size_right= */ is_local ? window_size_right : 0,
+            is_varlen_q, is_bf16,
+            batch_size, seqlen_q, num_heads, num_heads_k,
+            head_size_q, head_size_v,
+            softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
+            return_softmax_lse,
+            is_varlen_q);
+        ctx.flashDecodeFlag = flash_decode;
+        ctx.numSplits = static_cast<uint32_t>(num_splits);
+
+        {
+            optiling::FAInferTiling tiler(ctx);
+            tiler.SetCoreNum(blockDim);
+            tiler.DoTiling(tilingData);
+        }
+        flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
+        if (flashDecodeEnabled) {
+            launchBlockDim = tilingData.fdActiveCoreNum;
+            combineBlockDim = tilingData.fdCombineBlockDim;
+        }
+
+        at::Tensor tiling_cpu = at::empty(
+            {static_cast<int64_t>(sizeof(FAInferTilingData))},
+            at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData,
+                    sizeof(FAInferTilingData));
+        tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
+        tilingDevice = static_cast<uint8_t *>(tiling_dev.data_ptr());
+
+        if (is_causal || is_local) {
+            at::Tensor mask_cpu_tensor =
+                at::triu(at::ones({2048, 2048},
+                                  at::device(c10::kCPU).dtype(at::kByte)), 1);
+            mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            maskDevice = static_cast<uint8_t *>(mask_npu_tensor.data_ptr());
+        }
     }
 
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
-    auto workspace = at::empty(
-        {static_cast<int64_t>(tilingData.workSpaceSize)},
-        at::device(at::kPrivateUse1).dtype(at::kByte));
-
-    at::Tensor softmaxlse;
-    if (is_varlen_q) {
-        // Match v3's varlen lse shape: {total_q, num_heads}
-        softmaxlse = at::empty({sizes[0], num_heads},
+    at::Tensor softmaxlse = at::empty(
+        {0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    if (return_softmax_lse && is_varlen_q) {
+        softmaxlse = at::empty({num_heads, sizes[0]},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
-    } else {
-        softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+    } else if (return_softmax_lse) {
+        softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    if (return_softmax_lse) {
+        softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    }
+    at::Tensor fd_lse;
+    if (flashDecodeEnabled && !return_softmax_lse) {
+        fd_lse = at::empty({num_heads, sizes[0]},
+                           at::device(at::kPrivateUse1).dtype(at::kFloat));
+    }
+    at::Tensor workspace;
+    if (flashDecodeEnabled) {
+        workspace = at::empty(
+            {static_cast<int64_t>(tilingData.workSpaceSize)},
+            at::device(at::kPrivateUse1).dtype(at::kByte));
+    }
 
     // ============================================================
-    // 9. Tiling host→device (CPU byte tensor + .to(kPrivateUse1) —
-    //    same idiom
-    // ============================================================
-    at::Tensor tiling_cpu = at::empty(
-        {static_cast<int64_t>(sizeof(FAInferTilingData))},
-        at::device(c10::kCPU).dtype(at::kByte));
-    std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData,
-                sizeof(FAInferTilingData));
-    at::Tensor tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
-
-    // ============================================================
-    // 10. Build kernelKey + launch via fai_host::LaunchFAI
+    // 10. Launch via launch_fwd (inside a torch_npu op context so the launch
+    //     can be captured by NPUGraph)
     // ============================================================
     const Format fmt = is_varlen_q ? Format::TND : Format::BSND;
-    const CacheMode cacheMode = paged_KV ? CacheMode::pagedCache
-                                           : CacheMode::normalCache;
-    const PageShape pageShape = paged_KV ? PageShape::BnBsND
-                                           : PageShape::normalShape;
-    const uint32_t maskTypeKey = is_causal ? 1u : 0u;
-    const uint32_t innerPrec = 0u; // FP32 accum
-    const std::string dataType = is_bf16 ? "bf16" : "half";
-    const std::string cacheLayout = "nd"; // nd only
-
-    const uint32_t kernelKey = fai_host::BuildKernelKey(
-        dataType, cacheLayout, maskTypeKey, innerPrec,
-        fmt, cacheMode, pageShape);
+    const MaskCategory mask_category =
+        is_local ? MaskCategory::MASK_SWA
+                 : (is_causal ? MaskCategory::MASK_CAUSAL
+                              : MaskCategory::NO_MASK);
 
     // device pointers
     auto qDev = static_cast<uint8_t*>(q.data_ptr());
     auto kDev = static_cast<uint8_t*>(k.data_ptr());
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
-    auto lseDev = static_cast<uint8_t*>(softmaxlse.data_ptr());
-    auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
-    auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
+    // FD combine always materializes LSE for the numerically stable merge,
+    // even when the public API does not return it.
+    auto lseDev = return_softmax_lse
+        ? static_cast<uint8_t*>(softmaxlse.data_ptr())
+        : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
+    uint8_t *wsDev = nullptr;
+    if (flashDecodeEnabled) {
+        wsDev = static_cast<uint8_t*>(workspace.data_ptr());
+    }
+    auto tilDev = tilingDevice;
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
     at::Tensor q_seq_i64 = is_varlen_q
         ? cu_seqlens_q
         : at::empty({batch_size}, i64_npu);
     at::Tensor kv_seq_i64;
+    uint8_t *kvSeqDev = nullptr;
     if (is_varlen_kv) {
         kv_seq_i64 = cu_seqlens_k;
+        kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
     } else if (is_varlen_q && !paged_KV) {
-        kv_seq_i64 =
-        at::from_blob(const_cast<int32_t*>(ctx.kvSeqlenList), {batch_size + 1}, at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
+        if (scheduler_metadata_.has_value()) {
+            // AICPU precomputed the cumulative KV seqlen list in the metadata
+            // buffer, so the metadata path needs no host D2H or device cumsum.
+            kvSeqDev = metaBase + fa_metadata::KvSeqlenOffset(is_causal || is_local);
+        } else {
+            kv_seq_i64 = at::from_blob(
+                const_cast<int32_t *>(ctx.kvSeqlenList), {batch_size + 1},
+                at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
+            kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
+        }
     } else {
         kv_seq_i64 = seqlens_k;
+        kvSeqDev = static_cast<uint8_t *>(kv_seq_i64.data_ptr());
     }
     auto qSeqDev  = static_cast<uint8_t*>(q_seq_i64.data_ptr());
-    auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
     auto blockTableDev = paged_KV
         ? static_cast<uint8_t*>(page_table.data_ptr())
         : nullptr;
-    uint8_t* maskDev = nullptr;
-    at::Tensor mask_npu_tensor;
-    at::Tensor mask_cpu_tensor;
-    if (is_causal) {
-        mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
-        maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-    }
-
     const bool enableDN =
-        (!is_causal) && (head_size_q <= 128) && (head_size_v <= 128) && (innerPrec == 0u);
+        !flashDecodeEnabled && (!is_causal) && (!is_local) &&
+        (head_size_q <= 256) && (head_size_v <= 256);
 
-    const aclError err = fai_host::LaunchFAI(
-        kernelKey, enableDN,
-        blockDim, aclStream,
-        qDev, kDev, vDev, maskDev, blockTableDev,
+    const FwdLaunchArgs fwdArgs{
+        is_bf16, fmt, mask_category, paged_KV,
+        enableDN, return_softmax_lse, flashDecodeEnabled,
+        combineBlockDim, launchBlockDim, aclStream,
+        qDev, kDev, vDev, maskDevice, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
-        wsDev, tilDev);
-    TORCH_CHECK(err == ACL_SUCCESS,
-                "950 backend (v3): unsupported kernelKey=", kernelKey,
-                " (no launcher registered for "
-                "dtype=", dataType, " cacheLayout=", cacheLayout,
-                " maskType=", maskTypeKey, " innerPrec=", innerPrec,
-                " layout=", (fmt == Format::TND ? "TND" : "BSND"),
-                " cacheMode=", (paged_KV ? "paged" : "normal"),
-                ")");
-    const aclError sync_err = aclrtSynchronizeStream(aclStream);
-    TORCH_CHECK(sync_err == ACL_SUCCESS,
-                "950 backend (v3): aclrtSynchronizeStream failed after LaunchFAI, err=",
-                sync_err);
+        wsDev, tilDev};
+    auto launch_fa_infer = [fwdArgs]() -> int {
+        launch_fwd(fwdArgs);
+        return 0;
+    };
+    // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can
+    // be captured by NPUGraph; an explicit aclrtSynchronizeStream here would
+    // fail graph capture with a device error.
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     at::Tensor empty_softmax_lse_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));

@@ -6,6 +6,7 @@
 #include <vector>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
+#include "third_party/op-plugin/op_plugin/include/ops.h"
 
 // Launch general-purpose FAG (FlashAttentionGrad) kernel (BSND or TND).
 std::vector<at::Tensor> launch_fag_general(
@@ -27,6 +28,10 @@ std::vector<at::Tensor> launch_fag_general(
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    bool deterministic);
+    bool deterministic,
+    float p_dropout,
+    const std::optional<at::Tensor> &rng_state,
+    uint8_t *alibi_slopes_ptr,            
+    int64_t alibi_slopes_batch_stride);   
 
 #endif

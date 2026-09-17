@@ -1,4 +1,4 @@
 [submodule "csrc/catlass"]
 	path = csrc/catlass
 	url = https://gitcode.com/cann/catlass.git
-	tag = v1.6.1
+	tag = v2.0.0

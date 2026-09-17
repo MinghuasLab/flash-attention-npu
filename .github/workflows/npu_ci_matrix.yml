@@ -1,0 +1,172 @@
+name: NPU CI 编译矩阵
+
+# 多 CANN × torch/torch_npu 兼容编译矩阵。手动触发 (workflow_dispatch), 不跑每次 PR。
+# 在预构建的 fa-npu-ci:<name> 镜像里并发编译, 汇总 per-combo pass/fail。
+#
+# 双架构并行: 950 (x86_64) 和 910B (aarch64) 各跑一个 job, 同时执行。
+# 每个 job 用 ARCH_FILTER 只跑本机架构对应的 combo, 互不干扰。
+#
+# 前置 (每台 runner 上一次性操作):
+#   1. 确保 clone 镜像存在 (两架构均由 build_matrix_images.sh 构建):
+#      - 950 机器:  fa-npu-ci:950-cann9.1-torch2.9
+#      - 910B 机器: fa-npu-ci:910b-cann9.1-torch2.9
+#   2. bash ci/build_matrix_images.sh   # 构建本机架构的 combo 镜像 (910B 和 950 均需)
+#
+# runner 标签:
+#   950 机器:  self-hosted, linux, x64, npu, flash-attention-npu
+#   910B 机器: self-hosted, linux, arm64, npu, flash-attention-npu
+# 状态检查名: NPU CI 编译矩阵 / <arch> 编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: "并发容器数上限 (0=不限; 内存吃紧时调小, 如 3)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix_build:
+    name: ${{ matrix.arch_label }} 编译
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch_filter: x86_64
+            arch_label: x86_64-950
+            runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
+            clone_image: fa-npu-ci:950-cann9.1-torch2.9
+          - arch_filter: aarch64
+            arch_label: aarch64-910B
+            runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
+            clone_image: fa-npu-ci:910b-cann9.1-torch2.9
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 360
+    env:
+      CI_DOCKER_IMAGE: ${{ matrix.clone_image }}
+      CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
+      ARCH_FILTER: ${{ matrix.arch_filter }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+    steps:
+      - name: Clone repo (docker first 3x as root, then host 3x)
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          proxy_http="${HTTP_PROXY:-}"
+          proxy_https="${HTTPS_PROXY:-}"
+          proxy_no="${NO_PROXY:-}"
+          case " $(hostname -I 2>/dev/null || true) " in
+            *" 192.168.13.241 "*)
+              proxy_http=http://127.0.0.1:18790
+              proxy_https=http://127.0.0.1:18790
+              proxy_no=localhost,127.0.0.1,::1 ;;
+            *" 192.168.9.226 "*)
+              proxy_http=http://127.0.0.1:17890
+              proxy_https=http://127.0.0.1:17890
+              proxy_no=localhost,127.0.0.1,::1 ;;
+          esac
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+              case "$proxy_key" in
+                HTTP_PROXY|http_proxy) proxy_http="$proxy_value" ;;
+                HTTPS_PROXY|https_proxy) proxy_https="$proxy_value" ;;
+                NO_PROXY|no_proxy) proxy_no="$proxy_value" ;;
+              esac
+            done < "$proxy_file"
+          fi
+          [ "${CI_HTTP_PROXY+x}" = x ] && proxy_http="$CI_HTTP_PROXY"
+          [ "${CI_HTTPS_PROXY+x}" = x ] && proxy_https="$CI_HTTPS_PROXY"
+          [ "${CI_NO_PROXY+x}" = x ] && proxy_no="$CI_NO_PROXY"
+          export HTTP_PROXY="$proxy_http" HTTPS_PROXY="$proxy_https" NO_PROXY="$proxy_no"
+          proxy_args=()
+          [ -n "$proxy_http" ] && proxy_args+=(-e "HTTP_PROXY=$proxy_http")
+          [ -n "$proxy_https" ] && proxy_args+=(-e "HTTPS_PROXY=$proxy_https")
+          [ -n "$proxy_no" ] && proxy_args+=(-e "NO_PROXY=$proxy_no")
+
+          # ---------- 阶段1: docker 容器 clone (root, 重试 3 次) ----------
+          # 用 docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突。
+          # 容器内用 git init + fetch (不要求空目录), checkout 前用 git clean 删 untracked。
+          docker_ok=false
+          if docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
+            --network host \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+              REPO_URL="https://github.com/'"${GITHUB_REPOSITORY}"'.git"
+              TARGET_SHA="'"$TARGET_SHA"'"
+              for i in 1 2 3; do
+                echo "[clone][docker] attempt $i/3"
+                rm -rf /workspace/.git 2>/dev/null || true
+                git init -q
+                git remote remove origin 2>/dev/null || true
+                git remote add origin "$REPO_URL"
+                if git fetch --depth=1 origin "$TARGET_SHA"; then
+                  git clean -fdx -e .git
+                  git checkout -q FETCH_HEAD
+                  echo "[clone][docker] success"
+                  exit 0
+                fi
+                echo "[clone][docker] attempt $i/3 failed, retry in 15s..."
+                sleep 15
+              done
+              echo "[clone][docker] all 3 attempts failed"
+              exit 1
+            '; then
+            docker_ok=true
+          fi
+
+          # ---------- 阶段2: docker 失败, 改用宿主机 clone (重试 3 次) ----------
+          if [ "$docker_ok" != "true" ]; then
+            echo "[clone][docker] failed, fallback to host"
+            for i in 1 2 3; do
+              echo "[clone][host] attempt $i/3"
+              rm -rf .git 2>/dev/null || true
+              git init -q
+              git remote remove origin 2>/dev/null || true
+              git remote add origin "$REPO_URL"
+              if git fetch --depth=1 origin "$TARGET_SHA"; then
+                git clean -fdx -e .git
+                git checkout -q FETCH_HEAD
+                break
+              fi
+              echo "[clone][host] attempt $i/3 failed, retry in 15s..."
+              sleep 15
+            done
+          fi
+
+          ls -la ci/run_ci_matrix.sh
+          git log --oneline -1
+
+      - name: Run matrix build (${{ matrix.arch_filter }})
+        run: |
+          set -euo pipefail
+          bash ci/run_ci_matrix.sh
+
+      - name: Clean up this job's CI containers
+        if: always()
+        run: |
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi
