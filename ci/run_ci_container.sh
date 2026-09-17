@@ -2,7 +2,7 @@
 #
 # CI 容器入口 (两阶段):
 #   阶段1 (编译, 不加锁): docker run 不绑卡, 跑 ci/run_ci_build.sh
-#     - git submodule update --init
+#     - 遍历并初始化 catlass 及其嵌套子模块
 #     - python setup.py build  (产物在 build/, 通过 volume 持久化)
 #   阶段2 (测试, 动态选卡): 探测 task_count<阈值的空闲卡 + docker run 绑卡, 跑 ci/run_ci_test.sh
 #     - NPU 自检
@@ -25,8 +25,8 @@
 #   GOLDEN_CACHE_MODE     (默认 cache) cache|off
 #   GOLDEN_CACHE_STATS_FILE (容器内固定为 /tmp/ci_test_logs/golden_cache_events.tsv)
 #   GOLDEN_CACHE_MAX_TEST_DIRS (默认 32, 每个 reference 版本保留的测试文件组数)
-#   PROXY_CONFIG_FILE (默认 $GOLDEN_CACHE_HOST_DIR/proxy.conf)
-#   CI_HTTP_PROXY / CI_HTTPS_PROXY / CI_NO_PROXY (可选, 覆盖代理配置)
+#   GIT_PROXY_CONFIG_FILE (默认 $GOLDEN_CACHE_HOST_DIR/git-proxy.conf)
+#     原生 Git 配置文件，仅控制指定 Git URL 是否走代理
 
 set -euo pipefail
 
@@ -46,9 +46,9 @@ GOLDEN_CACHE_HOST_DIR="${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
 GOLDEN_CACHE_DIR="${GOLDEN_CACHE_DIR:-/var/cache/flash-attention-npu/golden_cache}"
 GOLDEN_CACHE_MODE="${GOLDEN_CACHE_MODE:-cache}"
 
-# shellcheck source=ci/docker_proxy.sh
-source "$SCRIPT_DIR/docker_proxy.sh"
-docker_proxy_init "$GOLDEN_CACHE_HOST_DIR"
+# shellcheck source=ci/git_proxy.sh
+source "$SCRIPT_DIR/git_proxy.sh"
+git_proxy_init "$GOLDEN_CACHE_HOST_DIR"
 
 log() { printf '[CI] %s\n' "$*"; }
 die() { printf '[CI][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -100,7 +100,7 @@ run_build_phase() {
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
-    "${DOCKER_PROXY_ENV_ARGS[@]}" \
+    "${DOCKER_GIT_PROXY_ARGS[@]}" \
     --network host \
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
@@ -155,7 +155,7 @@ run_docker_test() {
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
-    "${DOCKER_PROXY_ENV_ARGS[@]}" \
+    "${DOCKER_GIT_PROXY_ARGS[@]}" \
     --network host \
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \

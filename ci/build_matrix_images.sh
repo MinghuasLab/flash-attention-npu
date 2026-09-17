@@ -21,10 +21,6 @@ MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/build_matrix.tsv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fa-npu-ci}"
 PARALLEL="${BUILD_MATRIX_PARALLEL:-false}"
 
-# shellcheck source=ci/docker_proxy.sh
-source "$SCRIPT_DIR/docker_proxy.sh"
-docker_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
-
 # wheel 缓存: 构建前在 WHEEL_SEARCH_PATHS 里全局查找目标 wheel, 找到则复制到
 # WHEEL_CACHE_DIR (作为构建上下文一部分), Dockerfile 里 COPY 到 /wheels/ 并优先使用。
 # 这样 wheel 放在宿主机任意位置都能被复用, 省去每次构建重复下载几百 MB。
@@ -106,7 +102,6 @@ build_one() {
   done
 
   if docker build -t "$IMAGE_PREFIX:$name" \
-        "${DOCKER_PROXY_BUILD_ARGS[@]}" \
         --build-arg BASE_IMAGE="$base_image" \
         --build-arg PY_TAG="$py_tag" \
         --build-arg TORCH_VER="$torch_ver" \

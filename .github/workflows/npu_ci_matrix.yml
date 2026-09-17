@@ -60,42 +60,25 @@ jobs:
           set -euo pipefail
           git config --global --add safe.directory "$PWD"
           REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
-          proxy_http="${HTTP_PROXY:-}"
-          proxy_https="${HTTPS_PROXY:-}"
-          proxy_no="${NO_PROXY:-}"
-          case " $(hostname -I 2>/dev/null || true) " in
-            *" 192.168.13.241 "*)
-              proxy_http=http://127.0.0.1:18790
-              proxy_https=http://127.0.0.1:18790
-              proxy_no=localhost,127.0.0.1,::1 ;;
-            *" 192.168.9.226 "*)
-              proxy_http=http://127.0.0.1:17890
-              proxy_https=http://127.0.0.1:17890
-              proxy_no=localhost,127.0.0.1,::1 ;;
-          esac
-          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
-          if [ -f "$proxy_file" ]; then
-            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
-              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
-              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
-              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
-              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
-              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
-              case "$proxy_key" in
-                HTTP_PROXY|http_proxy) proxy_http="$proxy_value" ;;
-                HTTPS_PROXY|https_proxy) proxy_https="$proxy_value" ;;
-                NO_PROXY|no_proxy) proxy_no="$proxy_value" ;;
-              esac
-            done < "$proxy_file"
-          fi
-          [ "${CI_HTTP_PROXY+x}" = x ] && proxy_http="$CI_HTTP_PROXY"
-          [ "${CI_HTTPS_PROXY+x}" = x ] && proxy_https="$CI_HTTPS_PROXY"
-          [ "${CI_NO_PROXY+x}" = x ] && proxy_no="$CI_NO_PROXY"
-          export HTTP_PROXY="$proxy_http" HTTPS_PROXY="$proxy_https" NO_PROXY="$proxy_no"
+          proxy_file="${GIT_PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/git-proxy.conf}"
           proxy_args=()
-          [ -n "$proxy_http" ] && proxy_args+=(-e "HTTP_PROXY=$proxy_http")
-          [ -n "$proxy_https" ] && proxy_args+=(-e "HTTPS_PROXY=$proxy_https")
-          [ -n "$proxy_no" ] && proxy_args+=(-e "NO_PROXY=$proxy_no")
+          if [ -f "$proxy_file" ]; then
+            git config --file "$proxy_file" --list >/dev/null
+            proxy_dir="$(cd "$(dirname "$proxy_file")" && pwd -P)"
+            proxy_file="$proxy_dir/$(basename "$proxy_file")"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0=include.path
+            export GIT_CONFIG_VALUE_0="$proxy_file"
+            proxy_args=(
+              -v "$proxy_file:/tmp/flash-attention-npu-git-proxy.conf:ro"
+              -e GIT_CONFIG_COUNT=1
+              -e GIT_CONFIG_KEY_0=include.path
+              -e GIT_CONFIG_VALUE_0=/tmp/flash-attention-npu-git-proxy.conf
+            )
+            echo "Git-only proxy config enabled: $proxy_file"
+          else
+            echo "Git-only proxy config not found; using direct access: $proxy_file"
+          fi
 
           # ---------- 阶段1: docker 容器 clone (root, 重试 3 次) ----------
           # 用 docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突。

@@ -1,0 +1,16 @@
+# Git-only proxy configuration used by CI containers and pre-clone workflow
+# steps. Install it as /home/FA_NPU_CI_DATA/git-proxy.conf on a runner, or set
+# GIT_PROXY_CONFIG_FILE to another path.
+
+[http "https://github.com"]
+    proxy = http://127.0.0.1:17890
+
+# Retained to mirror environments that explicitly configure both keys. Git's
+# HTTP transport primarily resolves the http.<url>.proxy key above.
+[https "https://github.com"]
+    proxy = http://127.0.0.1:17890
+
+# Add more URL prefixes when another Git site should use a proxy. Each site can
+# use a different endpoint if required.
+# [http "https://example.com"]
+#     proxy = http://127.0.0.1:17891

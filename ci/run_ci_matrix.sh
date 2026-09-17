@@ -21,8 +21,8 @@
 #   CI_DOCKER_PRIVILEGED  (默认 true)
 #   CI_CONTAINER_SCOPE   （默认 -local-$(id -u)-$$）当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_VERSION (默认 all) 编译哪些 API 代 (all/v2/v3/v4)
-#   PROXY_CONFIG_FILE (默认 /home/FA_NPU_CI_DATA/proxy.conf)
-#   CI_HTTP_PROXY / CI_HTTPS_PROXY / CI_NO_PROXY (可选, 覆盖代理配置)
+#   GIT_PROXY_CONFIG_FILE (默认 /home/FA_NPU_CI_DATA/git-proxy.conf)
+#     原生 Git 配置文件，仅控制指定 Git URL 是否走代理
 
 set -euo pipefail
 
@@ -40,9 +40,9 @@ PID_DIR="$LOG_DIR/pids"
 # 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
 ARCH_FILTER="${ARCH_FILTER:-}"
 
-# shellcheck source=ci/docker_proxy.sh
-source "$SCRIPT_DIR/docker_proxy.sh"
-docker_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
+# shellcheck source=ci/git_proxy.sh
+source "$SCRIPT_DIR/git_proxy.sh"
+git_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
 
 log() { printf '[matrix-build] %s\n' "$*"; }
 die() { printf '[matrix-build][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -133,12 +133,15 @@ set +e
 docker run --rm \
   --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
   "${privileged_args[@]}" \
-  "${DOCKER_PROXY_ENV_ARGS[@]}" \
+  "${DOCKER_GIT_PROXY_ARGS[@]}" \
   --network host \
   -v "$REPO_ROOT:/workspace/flash-attention-npu" \
   -w /workspace/flash-attention-npu \
   "$first_img" \
-  bash -lc 'git config --global --add safe.directory "*" && git submodule update --init --recursive csrc/catlass' &
+  bash -lc '
+    set -e
+    bash ci/init_submodules.sh "$PWD" csrc/catlass
+  ' &
 preinit_pid=$!
 printf '%s\n' "$preinit_pid" > "$preinit_pidfile"
 if wait "$preinit_pid"; then
@@ -164,7 +167,7 @@ build_one() {
   docker run --rm \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
-    "${DOCKER_PROXY_ENV_ARGS[@]}" \
+    "${DOCKER_GIT_PROXY_ARGS[@]}" \
     --network host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
     -e FLASH_ATTN_FORCE_BUILD=TRUE \
