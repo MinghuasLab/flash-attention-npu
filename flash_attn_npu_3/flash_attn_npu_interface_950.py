@@ -426,6 +426,7 @@ def _training_forward(
     max_seqlen_k,
     softmax_scale,
     causal,
+    window_size,
     scheduler_metadata,
 ):
     if cu_seqlens_q is None:
@@ -455,8 +456,8 @@ def _training_forward(
         None, None, None,        # descales
         softmax_scale,
         causal,
-        -1,
-        -1,
+        window_size[0],
+        window_size[1],
         0,
         0.0,
         True,
@@ -493,8 +494,8 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         if any(x is not None for x in (qv, q_descale, k_descale, v_descale)):
             raise NotImplementedError("Ascend950 v3 training scaffold only supports q/k/v inputs")
-        if tuple(window_size) != (-1, -1) or attention_chunk != 0 or softcap != 0.0:
-            raise NotImplementedError("Ascend950 v3 training scaffold does not support SWA, attention_chunk or softcap")
+        if attention_chunk != 0 or softcap != 0.0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support attention_chunk or softcap")
         if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
             raise NotImplementedError("Ascend950 v3 training scaffold does not support split/pack/sm tuning")
         if softmax_scale is None:
@@ -521,17 +522,20 @@ class FlashAttnFunc(torch.autograd.Function):
             )
 
         out, softmax_lse, _, _ = _training_forward(
-            q, k, v, None, None, None, None, softmax_scale, causal, scheduler_metadata
+            q, k, v, None, None, None, None, softmax_scale, causal, window_size, scheduler_metadata
         )
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
         return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
+        if ctx.window_size != (-1, -1):
+            raise NotImplementedError("Ascend950 v3 backward does not support sliding-window attention")
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -580,8 +584,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q, seqused_k, qv, q_descale, k_descale, v_descale,
         )):
             raise NotImplementedError("Ascend950 v3 varlen training scaffold does not support optional tensor inputs")
-        if tuple(window_size) != (-1, -1) or attention_chunk != 0 or softcap != 0.0:
-            raise NotImplementedError("Ascend950 v3 training scaffold does not support SWA, attention_chunk or softcap")
+        if attention_chunk != 0 or softcap != 0.0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support attention_chunk or softcap")
         if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
             raise NotImplementedError("Ascend950 v3 training scaffold does not support split/pack/sm tuning")
         if softmax_scale is None:
@@ -611,7 +615,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q, k, v,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
-            softmax_scale, causal,
+            softmax_scale, causal, window_size,
             scheduler_metadata,
         )
         ctx.save_for_backward(
@@ -621,12 +625,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
         return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
+        if ctx.window_size != (-1, -1):
+            raise NotImplementedError("Ascend950 v3 backward does not support sliding-window attention")
         q, k, v, out, softmax_lse, cu_q, cu_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
