@@ -521,7 +521,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
         tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
 
-        fa_split::SplitContext splitCtx;
+        fa_split::SplitContext splitCtx{};
         splitCtx.batch_size = batch_size;
         splitCtx.num_heads = num_heads;
         splitCtx.num_heads_k = num_heads_k;
@@ -729,7 +729,7 @@ at::Tensor get_scheduler_metadata(
     if (softcap > 0.0) {
         scaleValue /= static_cast<float>(softcap);
     }
-    FAMetadataArgs args;
+    FAMetadataArgs args{};
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cuSeqlensQDev) : 0ULL;
     args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
     args.metaOutAddr = 0;  // set by GetSchedulerMetadataImpl

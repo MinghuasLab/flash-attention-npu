@@ -224,16 +224,34 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
 
         if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
 
-        BatchParams pEnd = getBatchParams(
-            nowBIdx >= ctx.batch_size ? ctx.batch_size - 1 : nowBIdx, groupSize, ctx);
-        tiling->coreInfo[coreIdx].endBIdx = nowBIdx < ctx.batch_size ? nowBIdx : ctx.batch_size - 1;
+        tiling->coreInfo[coreIdx].endBIdx = nowBIdx;
         tiling->coreInfo[coreIdx].endN1Idx = nowN1Idx;
         tiling->coreInfo[coreIdx].endS1Idx = nowS1Idx;
-        // S2 reset to 0 by advanceCounters means the last combination's S2 range
-        // was fully consumed; close it at that combination's block count.
-        tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx != 0 ? nowS2Idx : pEnd.curKSBlockNum;
+        tiling->coreInfo[coreIdx].endS2Idx = nowS2Idx;
+
+        // A zero S2 cursor points at the next task. Close the range at the
+        // preceding task instead: the kernel visits endB/endN1/endS1
+        // inclusively and would initialize the next task's output to zero.
+        if (nowS2Idx == 0) {
+            auto& end = tiling->coreInfo[coreIdx];
+            BatchParams pEnd = p;
+            if (end.endS1Idx > 0) {
+                --end.endS1Idx;
+            } else {
+                if (end.endN1Idx > 0) {
+                    --end.endN1Idx;
+                } else {
+                    --end.endBIdx;
+                    pEnd = getBatchParams(end.endBIdx, groupSize, ctx);
+                    end.endN1Idx = pEnd.curQNBlockNum - 1;
+                }
+                end.endS1Idx = pEnd.curQSBlockNum - 1;
+            }
+            end.endS2Idx = pEnd.curKSBlockNum;
+        }
 
         advanceCounters();
+        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
     }
 
     // Flush: if tasks remain unconsumed (nowBIdx < batch_size), trailing S2 blocks

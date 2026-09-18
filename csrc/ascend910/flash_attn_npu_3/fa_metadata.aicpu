@@ -127,7 +127,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
         if (fdFlag) {
-            fa_split::SplitContext ctx;
+            fa_split::SplitContext ctx{};
             ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
             ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
             ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
@@ -138,6 +138,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
             ctx.is_varlen_q = metaArgs->isVarlen != 0;
             ctx.blockDim = bd;
             ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
+            ctx.kvNewSeqlen = static_cast<int32_t>(metaArgs->kvNewSeqlen);
             fa_split::splitBN2S1GS2(tilingData, ctx);
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;

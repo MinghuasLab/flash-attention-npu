@@ -15,11 +15,6 @@ from tests.common.compare import assert_fa_close
 from tests.common.test_utils import gather_paged_kv_batch, make_random_tensor
 
 
-def _is_ascend910():
-    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    return "Ascend910" in name
-
-
 def _is_ascend950():
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     return "Ascend950" in name
@@ -124,6 +119,7 @@ def _metadata(
     softcap=0.0,
     softmax_scale=None,
     num_splits=0,
+    max_seqlen_k_new=0,
 ):
     return get_scheduler_metadata(
         batch_size=batch_size,
@@ -141,6 +137,7 @@ def _metadata(
         softcap=softcap,
         softmax_scale=softmax_scale,
         num_splits=num_splits,
+        max_seqlen_k_new=max_seqlen_k_new,
         sm_margin=0,
     )
 
@@ -267,6 +264,47 @@ KV_CACHE_TND_CASES = [
 ]
 
 
+KV_CACHE_FLASH_DECODE_CASES = [
+    # data_type, q_seqlen, num_heads, head_size, num_splits, is_causal, softcap, new_length
+    # Existing idle-core decode coverage.
+    (torch.bfloat16, 1, 1, 128, 0, False, 0.0, 0),
+    # Reported 24-AIC failures.
+    (torch.float16, 8, 1, 64, 2, False, 0.0, 0),
+    (torch.bfloat16, 8, 1, 64, 2, False, 0.0, 0),
+    (torch.float16, 4, 2, 64, 2, False, 30.0, 0),
+    (torch.bfloat16, 4, 2, 64, 2, False, 30.0, 0),
+    # Auto/no-split controls and Q/G/D boundaries.
+    (torch.float16, 8, 1, 64, 0, False, 0.0, 0),
+    (torch.bfloat16, 8, 1, 64, 0, False, 0.0, 0),
+    (torch.float16, 8, 1, 64, 1, False, 0.0, 0),
+    (torch.bfloat16, 8, 1, 64, 1, False, 0.0, 0),
+    (torch.float16, 16, 8, 256, 2, True, 0.0, 0),
+    (torch.bfloat16, 16, 8, 256, 2, True, 0.0, 0),
+    (torch.float16, 9, 8, 128, 0, False, 30.0, 0),
+    (torch.bfloat16, 9, 8, 128, 0, False, 30.0, 0),
+    # Append-KV coverage, including a partial S2 block.
+    (torch.float16, 8, 1, 64, 0, False, 0.0, 128),
+    (torch.bfloat16, 8, 1, 64, 0, False, 0.0, 128),
+    (torch.float16, 8, 1, 64, 1, False, 0.0, 128),
+    (torch.bfloat16, 8, 1, 64, 1, False, 0.0, 128),
+    (torch.float16, 8, 1, 64, 2, False, 0.0, 128),
+    (torch.bfloat16, 8, 1, 64, 2, False, 0.0, 128),
+    (torch.float16, 4, 2, 64, 2, True, 0.0, 513),
+    (torch.bfloat16, 4, 2, 64, 2, True, 0.0, 513),
+]
+
+
+KV_CACHE_FD_CONSTANT_CASES = [
+    # data_type, num_splits; Q=K=0, V=-80, Sk=1024 gives an exact O/LSE oracle.
+    (torch.float16, 0),
+    (torch.bfloat16, 0),
+    (torch.float16, 1),
+    (torch.bfloat16, 1),
+    (torch.float16, 2),
+    (torch.bfloat16, 2),
+]
+
+
 @pytest.fixture
 def metadata_spy(monkeypatch):
     """Spy on get_scheduler_metadata to prove the training interfaces route
@@ -303,7 +341,6 @@ def metadata_spy_950(monkeypatch):
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -347,7 +384,6 @@ def test_flash_attn_func_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
     metadata_spy,
@@ -401,7 +437,6 @@ def test_flash_attn_varlen_func_metadata_tnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -464,7 +499,6 @@ def test_flash_attn_kvcache_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
 ):
@@ -529,71 +563,91 @@ def test_flash_attn_kvcache_metadata_tnd(
     )
 
 
-@pytest.mark.parametrize("is_causal", [False])
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
-    """FD + metadata path with idle cores (needCoreNum < blockDim)."""
-    batch_size, num_heads, kv_heads = 1, 1, 1
-    q_seqlen, kv_seqlen, head_size, block_size = 1, 1024, 128, 128
-    data_type = torch.bfloat16
-
-    query = make_random_tensor((q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
-    key_cache, value_cache, page_table = _make_paged_cache(
-        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
-    )
+@pytest.mark.parametrize(
+    "data_type, q_seqlen, num_heads, head_size, num_splits, is_causal, softcap, new_length",
+    KV_CACHE_FLASH_DECODE_CASES,
+)
+def test_flash_attn_kvcache_metadata_flash_decode(
+    data_type, q_seqlen, num_heads, head_size, num_splits,
+    is_causal, softcap, new_length,
+):
+    """Check both scheduling paths against golden, with identical fresh caches."""
+    old_length, block_size = 1024, 128
+    total_length = old_length + new_length
+    capacity = ((total_length + block_size - 1) // block_size) * block_size
+    query = _rand_npu((q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache = _rand_npu((capacity // block_size, block_size, 1, head_size), data_type, SMALL_RANGE)
+    value_cache = _rand_npu(key_cache.shape, data_type, WIDE_RANGE)
+    page_table = _int32_npu(list(range(capacity // block_size))).reshape(1, -1)
     cu_seqlens_q = _int32_npu([0, q_seqlen])
-    cache_seqlens = _int32_npu([kv_seqlen])
-    scale = 1.0 / (head_size ** 0.5)
+    cache_seqlens = _int32_npu([old_length])
+    k_new = _rand_npu((1, new_length, 1, head_size), data_type, SMALL_RANGE) if new_length else None
+    v_new = _rand_npu((1, new_length, 1, head_size), data_type, WIDE_RANGE) if new_length else None
+    key_ref = key_cache.cpu().reshape(1, capacity, 1, head_size).clone()
+    value_ref = value_cache.cpu().reshape_as(key_ref).clone()
+    if new_length:
+        key_ref[:, old_length:total_length] = k_new.cpu()
+        value_ref[:, old_length:total_length] = v_new.cpu()
+    scale = head_size ** -0.5
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
-        page_size=block_size,
-        is_causal=is_causal,
-    )
-    output_npu, softmax_lse_npu, *_ = flash_attn_with_kvcache(
-        query,
-        key_cache,
-        value_cache,
-        cache_seqlens=cache_seqlens,
-        page_table=page_table,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=q_seqlen,
-        softmax_scale=scale,
-        causal=is_causal,
-        window_size=WINDOW_SIZE,
-        rotary_interleaved=False,
-        scheduler_metadata=scheduler_metadata,
-        num_splits=0,
-        return_softmax_lse=True,
-    )
+    for use_metadata in (False, True):
+        metadata = _metadata(
+            batch_size=1, q_seqlen=q_seqlen, kv_seqlen=capacity,
+            num_heads=num_heads, kv_heads=1, head_size=head_size,
+            cache_seqlens=cache_seqlens, data_type=data_type,
+            cu_seqlens_q=cu_seqlens_q, page_size=block_size,
+            is_causal=is_causal, softcap=softcap, softmax_scale=scale,
+            num_splits=num_splits, max_seqlen_k_new=new_length,
+        ) if use_metadata else None
+        keys, values = key_cache.clone(), value_cache.clone()
+        output, lse, *_ = flash_attn_with_kvcache(
+            query, keys, values, k=k_new, v=v_new,
+            cache_seqlens=cache_seqlens, page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q, max_seqlen_q=q_seqlen,
+            softmax_scale=scale, causal=is_causal, softcap=softcap,
+            num_splits=num_splits, scheduler_metadata=metadata,
+            return_softmax_lse=True,
+        )
+        _assert_bsnd_matches_ref(
+            output.reshape(1, q_seqlen, num_heads, head_size),
+            lse.reshape(1, num_heads, q_seqlen),
+            query.reshape(1, q_seqlen, num_heads, head_size),
+            (key_ref[:, :total_length], value_ref[:, :total_length]),
+            batch_size=1, q_seqlen=q_seqlen, num_heads=num_heads,
+            head_size=head_size, scale=scale, data_type=data_type,
+            is_causal=is_causal, softcap=softcap,
+        )
+        if new_length:
+            # Appending must update the cache without changing its old prefix
+            # or unused capacity. Each scheduling path starts with its own copy.
+            torch.testing.assert_close(keys.cpu().reshape_as(key_ref), key_ref, rtol=0, atol=0)
+            torch.testing.assert_close(values.cpu().reshape_as(value_ref), value_ref, rtol=0, atol=0)
 
-    key_cache_cpu = key_cache.detach().cpu()
-    value_cache_cpu = value_cache.detach().cpu()
-    page_table_cpu = page_table.cpu()
-    _assert_bsnd_matches_ref(
-        output_npu.reshape(batch_size, q_seqlen, num_heads, head_size),
-        softmax_lse_npu.reshape(batch_size, num_heads, q_seqlen),
-        query.reshape(batch_size, q_seqlen, num_heads, head_size),
-        gather_paged_kv_batch(
-            key_cache_cpu, value_cache_cpu, page_table_cpu, kv_seqlen, block_size
-        ),
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        num_heads=num_heads,
-        head_size=head_size,
-        scale=scale,
-        data_type=data_type,
-        is_causal=is_causal,
-    )
 
+@pytest.mark.parametrize("data_type, num_splits", KV_CACHE_FD_CONSTANT_CASES)
+def test_flash_attn_kvcache_metadata_fd_constant_value(data_type, num_splits):
+    """Exact uniform-attention oracle for unwritten O / log(2) LSE regressions."""
+    sq, sk, dim, page_size = 8, 1024, 64, 128
+    query = torch.zeros((sq, 1, dim), dtype=data_type, device="npu")
+    keys = torch.zeros((sk // page_size, page_size, 1, dim), dtype=data_type, device="npu")
+    values = torch.full_like(keys, -80)
+    lengths = _int32_npu([sk])
+    cu = _int32_npu([0, sq])
+    table = _int32_npu(list(range(sk // page_size))).reshape(1, -1)
+    metadata = _metadata(
+        batch_size=1, q_seqlen=sq, kv_seqlen=sk, num_heads=1, kv_heads=1,
+        head_size=dim, cache_seqlens=lengths, data_type=data_type,
+        cu_seqlens_q=cu, page_size=page_size, num_splits=num_splits,
+    )
+    output, lse, *_ = flash_attn_with_kvcache(
+        query, keys, values, cache_seqlens=lengths, page_table=table,
+        cu_seqlens_q=cu, max_seqlen_q=sq, num_splits=num_splits,
+        scheduler_metadata=metadata, return_softmax_lse=True,
+    )
+    # P=1/1024 and V=-80 are exactly representable in both low-precision types.
+    torch.testing.assert_close(output.cpu(), torch.full((sq, 1, dim), -80, dtype=data_type), rtol=0, atol=0)
+    expected_lse = torch.full((1, sq), torch.tensor(float(sk)).log().item())
+    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=1e-6)
 
 
 FLASH_ATTN_FUNC_SWA_CASES = [
@@ -633,7 +687,6 @@ KV_CACHE_SWA_SOFTCAP_CASES = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -677,7 +730,6 @@ def test_flash_attn_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, softcap, softmax_scale, metadata_spy,
@@ -722,7 +774,6 @@ def test_flash_attn_func_metadata_softcap_scale(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
@@ -777,7 +828,6 @@ def test_flash_attn_varlen_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap
@@ -850,7 +900,6 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         (True, (-1, -1), False, (-1, -1)),     # metadata has a causal mask, call needs none
     ],
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     meta_causal, meta_window, call_causal, call_window
 ):
@@ -892,7 +941,6 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     """Paged geometry baked into the tiling must match the call's cache/page table."""
     data_type = torch.bfloat16
@@ -940,7 +988,6 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
         call_with(unpaged)
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     """softcap/softmax_scale are baked into the tiling; mismatches must be rejected."""
     data_type = torch.bfloat16
@@ -977,7 +1024,6 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     """A copied metadata tensor loses its creation-argument fingerprint."""
     data_type = torch.bfloat16
@@ -1012,7 +1058,6 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     """A hand-crafted buffer with a forged fingerprint but the wrong size must be
     rejected by the C++ exact-size check (defense in depth behind the Python
