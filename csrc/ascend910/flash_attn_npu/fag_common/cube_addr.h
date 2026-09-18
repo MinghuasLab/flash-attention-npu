@@ -9,10 +9,10 @@
 
 #include "common_header.h"
 
-template<MaskType maskType, InputLayout inputLayout>
+template <MaskType maskType, InputLayout inputLayout>
 class CubeAddr {
 
-public:
+  public:
     int32_t batch;
     int32_t nheads;
     int32_t headdim;
@@ -41,17 +41,17 @@ public:
     int32_t roundId;
 
     int32_t overFlag = 1;
-    int32_t lastBatchSum = 0; 
+    int32_t lastBatchSum = 0;
 
-    struct CubeAddrInfo * globalCubeAddr;
+    struct CubeAddrInfo* globalCubeAddr;
 
-    __gm__ uint8_t *cu_seq_qlen_addr;
-    __gm__ uint8_t *cu_seq_kvlen_addr;
-    __gm__ uint8_t *q_gm_addr;
-    __gm__ uint8_t *k_gm_addr;
-    __gm__ uint8_t *v_gm_addr;
-    __gm__ uint8_t *dout_gm_addr;
-    __gm__ uint8_t *user_gm_addr;
+    __gm__ uint8_t* cu_seq_qlen_addr;
+    __gm__ uint8_t* cu_seq_kvlen_addr;
+    __gm__ uint8_t* q_gm_addr;
+    __gm__ uint8_t* k_gm_addr;
+    __gm__ uint8_t* v_gm_addr;
+    __gm__ uint8_t* dout_gm_addr;
+    __gm__ uint8_t* user_gm_addr;
 
     __aicore__ uint64_t getSeqRealLength(int32_t sIdx, int32_t len, int32_t s_block_num, int32_t s_tail)
     {
@@ -61,12 +61,12 @@ public:
             return len * 128;
         }
     }
-    
+
     __aicore__ int64_t getTotalLen(int32_t i)
     {
         int64_t cuTotalSeqQlen = 0;
         if (inputLayout == InputLayout::TND) {
-            cuTotalSeqQlen = ((__gm__ int32_t *)cu_seq_qlen_addr)[i];
+            cuTotalSeqQlen = ((__gm__ int32_t*)cu_seq_qlen_addr)[i];
         } else {
             cuTotalSeqQlen = (i + 1) * qSeqlen;
         }
@@ -74,13 +74,13 @@ public:
     }
 
     __aicore__ uint64_t getLeftAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t qSeqlen, int32_t qSeqIdx,
-        int32_t headdim)
+                                    int32_t headdim)
     {
         return lastBatchSum * nheads * headdim + (qSeqIdx * 128 * nheads + nheadsIdx) * headdim;
     }
 
     __aicore__ uint64_t getRightAddr(int32_t batchIdx, int32_t nheadsIdx, int32_t kSeqlen, int32_t seqKIdx,
-        int32_t headdim)
+                                     int32_t headdim)
     {
         return lastBatchSum * nheads_k * headdim + (seqKIdx * 128 * nheads_k + (nheadsIdx / g)) * headdim;
     }
@@ -90,7 +90,7 @@ public:
         return workspacePos * 128 * 128;
     }
 
-    __aicore__ int32_t addr_mapping(struct CubeAddrInfo * cubeAddrInfo)
+    __aicore__ int32_t addr_mapping(struct CubeAddrInfo* cubeAddrInfo)
     {
         globalCubeAddr = cubeAddrInfo;
         globalCubeAddr->blockLength = 0;
@@ -110,11 +110,11 @@ public:
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t index = globalCubeAddr->blockLength;
                     globalCubeAddr->addrInfo[index].left = getLeftAddr(batchIdx, nheadsIdx, qSeqlen, qSeqIdx, headdim);
-                    globalCubeAddr->addrInfo[index].right = getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx,
-                        headdim);
+                    globalCubeAddr->addrInfo[index].right =
+                        getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx, headdim);
                     globalCubeAddr->addrInfo[index].out = getOutAddr(blockNum);
-                    globalCubeAddr->addrInfo[index].ky = getSeqRealLength(qSeqIdx, s1GuardInterval, s1BlockNum,
-                        s1TailLength);
+                    globalCubeAddr->addrInfo[index].ky =
+                        getSeqRealLength(qSeqIdx, s1GuardInterval, s1BlockNum, s1TailLength);
                     globalCubeAddr->addrInfo[index].kx = getSeqRealLength(seqKIdx, guardLen, s2BlockNum, s2TailLength);
                     globalCubeAddr->addrInfo[index].lowerLeft = 1;
                     // NO_MASK: keep full rectangle (upperRight=1 => cube skips nothing).
@@ -124,7 +124,7 @@ public:
                     } else {
                         globalCubeAddr->addrInfo[index].upperRight = (s1GuardInterval % 2);
                     }
-                    globalCubeAddr->blockLength ++;
+                    globalCubeAddr->blockLength++;
                 }
                 if constexpr (maskType == MaskType::NO_MASK) {
                     blockNum += s1GuardInterval * guardLen;
@@ -141,15 +141,15 @@ public:
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t index = globalCubeAddr->blockLength;
                     globalCubeAddr->addrInfo[index].left = getLeftAddr(batchIdx, nheadsIdx, qSeqlen, qSeqIdx, headdim);
-                    globalCubeAddr->addrInfo[index].right = getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx,
-                        headdim);
+                    globalCubeAddr->addrInfo[index].right =
+                        getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx, headdim);
                     globalCubeAddr->addrInfo[index].out = getOutAddr(blockNum);
-                    globalCubeAddr->addrInfo[index].ky = getSeqRealLength(qSeqIdx, s1GuardInterval, s1BlockNum,
-                        s1TailLength);
+                    globalCubeAddr->addrInfo[index].ky =
+                        getSeqRealLength(qSeqIdx, s1GuardInterval, s1BlockNum, s1TailLength);
                     globalCubeAddr->addrInfo[index].kx = getSeqRealLength(seqKIdx, realLen, s2BlockNum, s2TailLength);
                     globalCubeAddr->addrInfo[index].lowerLeft = 1;
                     globalCubeAddr->addrInfo[index].upperRight = 1;
-                    globalCubeAddr->blockLength ++;
+                    globalCubeAddr->blockLength++;
                 }
                 blockNum += s1GuardInterval * realLen;
                 seqKIdx += realLen;
@@ -165,7 +165,7 @@ public:
                     lastBatchSum = getTotalLen(batchIdx);
                     batchIdx++;
                     nheadsIdx = 0;
-                    if (inputLayout == InputLayout::TND) { 
+                    if (inputLayout == InputLayout::TND) {
                         qSeqlen = getSeqLen(batchIdx);
                         kSeqlen = getSeqLen(batchIdx);
                     }
@@ -199,18 +199,18 @@ public:
     {
         int64_t cuSeqQlen;
         if (i == 0) {
-            cuSeqQlen = ((__gm__ int32_t *)cu_seq_qlen_addr)[0];
+            cuSeqQlen = ((__gm__ int32_t*)cu_seq_qlen_addr)[0];
         } else {
-            cuSeqQlen = ((__gm__ int32_t *)cu_seq_qlen_addr)[i] - ((__gm__ int32_t *)cu_seq_qlen_addr)[i - 1];
+            cuSeqQlen = ((__gm__ int32_t*)cu_seq_qlen_addr)[i] - ((__gm__ int32_t*)cu_seq_qlen_addr)[i - 1];
         }
         return cuSeqQlen;
     }
 
-    __aicore__ void init(int32_t batchIn, int32_t nheadsIn, int32_t gIn, int32_t headDimIn, uint32_t coreIdx, 
-        uint32_t seq_q_len, uint32_t seq_k_len,
-        __gm__ uint8_t *cu_seq_qlen, __gm__ uint8_t *cu_seq_kvlen, uint32_t totalCoreNum)
+    __aicore__ void init(int32_t batchIn, int32_t nheadsIn, int32_t gIn, int32_t headDimIn, uint32_t coreIdx,
+                         uint32_t seq_q_len, uint32_t seq_k_len, __gm__ uint8_t* cu_seq_qlen,
+                         __gm__ uint8_t* cu_seq_kvlen, uint32_t totalCoreNum)
     {
-        
+
         batch = batchIn;
         nheads = nheadsIn;
         g = gIn;
@@ -228,7 +228,7 @@ public:
         nheadsIdx = 0;
         qSeqIdx = 0;
         seqKIdx = 0;
-        if (inputLayout == InputLayout::TND) {     
+        if (inputLayout == InputLayout::TND) {
             qSeqlen = getSeqLen(batchIdx);
             kSeqlen = getSeqLen(batchIdx);
         } else {

@@ -16,8 +16,7 @@ constexpr uint32_t BASIC_TILE_NUM = SOFTMAX_DEFAULT_BLK_SIZE / SOFTMAX_FLOAT_SIZ
 constexpr uint32_t SOFTMAX_BASICBLOCK_MIN_SIZE = 256;
 constexpr uint32_t SOFTMAX_BASICBLOCK_UNIT = 64;
 
-struct SoftMaxTilingLocal
-{
+struct SoftMaxTilingLocal {
     uint32_t srcM = 0;
     uint32_t srcK = 0;
     uint32_t srcSize = 0;
@@ -36,7 +35,7 @@ struct SoftMaxTilingLocal
     uint32_t tailReduceSize = 0;
 };
 
-template<typename T>
+template <typename T>
 inline std::vector<uint32_t> GetLastAxisShapeND(const std::vector<T> srcShape)
 {
     std::vector<uint32_t> ret;
@@ -48,7 +47,7 @@ inline std::vector<uint32_t> GetLastAxisShapeND(const std::vector<T> srcShape)
 
     const uint32_t srcK = shapeDims.back();
     uint32_t srcM = calculateSize / srcK;
-    ret = { srcM, srcK };
+    ret = {srcM, srcK};
     return ret;
 }
 
@@ -67,7 +66,7 @@ inline void AdjustToBasicBlockBaseM(uint32_t& baseM, const uint32_t srcM, const 
 }
 
 static void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint32_t dataTypeSize,
-    const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxTiling)
+                              const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxTiling)
 {
     std::vector<uint32_t> retVec = GetLastAxisShapeND(srcShape);
     if (retVec.size() <= 1 || dataTypeSize == 0) {
@@ -85,7 +84,7 @@ static void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint3
     AdjustToBasicBlockBaseM(baseM, srcM, srcK);
 
     softmaxTiling.srcM = srcM;
-    softmaxTiling.srcK =srcK;
+    softmaxTiling.srcK = srcK;
     softmaxTiling.srcSize = srcM * srcK;
 
     softmaxTiling.outMaxM = srcM;
@@ -110,7 +109,7 @@ static void SoftMaxTilingFunc(const std::vector<uint32_t>& srcShape, const uint3
 }
 
 static void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const uint32_t dataTypeSize,
-    const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxGradTiling)
+                                  const uint32_t localWorkSpaceSize, SoftMaxTiling& softmaxGradTiling)
 {
     std::vector<uint32_t> retVec = GetLastAxisShapeND(srcShape);
     if (retVec.size() <= 1 || dataTypeSize == 0) {
@@ -122,8 +121,8 @@ static void SoftMaxGradTilingFunc(const std::vector<int64_t>& srcShape, const ui
     const uint32_t srcM = retVec[0];
     uint32_t baseM = 0;
     if (dataTypeSize == SOFTMAX_HALF_SIZE) {
-        baseM = workLocalSize /
-            (elementNumPerBlk * SOFTMAX_TMPBUFFER_COUNT + srcK * SOFTMAXGRAD_TMPBUFFER_COUNT + SOFTMAX_BASICBLOCK_UNIT);
+        baseM = workLocalSize / (elementNumPerBlk * SOFTMAX_TMPBUFFER_COUNT + srcK * SOFTMAXGRAD_TMPBUFFER_COUNT +
+                                 SOFTMAX_BASICBLOCK_UNIT);
     } else {
         baseM = workLocalSize / (elementNumPerBlk + srcK + SOFTMAX_BASICBLOCK_UNIT);
     }

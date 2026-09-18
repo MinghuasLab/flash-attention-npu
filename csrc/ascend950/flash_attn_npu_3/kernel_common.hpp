@@ -46,39 +46,36 @@ struct FAIKernelParams {
     __aicore__ inline FAIKernelParams() {}
 
     __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
-            GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_)
+                                      GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_,
+                                      GM_ADDR workSpace_, GM_ADDR tiling_)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
-            actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_) {}
+          actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_)
+    {}
 };
 
-enum class Format
-{
+enum class Format {
     TND = 0,
     BSND = 1
 };
 
-enum class CacheMode 
-{
+enum class CacheMode {
     normalCache = 0,
     pagedCache = 1,
 };
 
-enum class PageShape 
-{
+enum class PageShape {
     BnBsND = 0,
     BnNBsD = 1,
     normalShape = 2,
 };
 
-enum class MaskCategory 
-{
+enum class MaskCategory {
     NO_MASK = 0,
     MASK_CAUSAL = 1,
     MASK_SWA = 4,
 };
 
-enum class CacheLayout : uint8_t
-{
+enum class CacheLayout : uint8_t {
     nd = 0,
     nz = 1,
 };
@@ -86,8 +83,7 @@ enum class CacheLayout : uint8_t
 __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
                                           bool restrictMergedRowsForLargeD = false)
 {
-    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
-        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX : (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
     if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
         constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
         uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
@@ -100,6 +96,5 @@ __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
     }
     return tile < 1U ? 1U : tile;
 }
-
 
 #endif

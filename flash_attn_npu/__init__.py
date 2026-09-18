@@ -2,6 +2,17 @@ __version__ = "0.3.0"
 
 import torch_npu
 
+__all__ = [
+    "flash_attn_func",
+    "flash_attn_kvpacked_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_varlen_func",
+    "flash_attn_varlen_kvpacked_func",
+    "flash_attn_varlen_qkvpacked_func",
+    "flash_attn_with_kvcache",
+    "get_scheduler_metadata",
+]
+
 
 def is_ascend910() -> bool:
     """Return True if the current device belongs to Ascend 910B/C."""

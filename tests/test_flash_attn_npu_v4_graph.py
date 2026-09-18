@@ -6,12 +6,14 @@ import torch_npu
 
 _device_name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
 if "Ascend910" not in _device_name:
-    pytest.skip("flash_attn_varlen_func / get_scheduler_metadata only on Ascend910", allow_module_level=True)
+    pytest.skip(
+        "flash_attn_varlen_func / get_scheduler_metadata only on Ascend910", allow_module_level=True
+    )
 
-from flash_attn_npu_4 import flash_attn_varlen_func, get_scheduler_metadata
-from tests.common.attention_ref import ref_flash_attention_pair
-from tests.common.compare import assert_fa_close
-from tests.common.test_utils import make_random_tensor
+from flash_attn_npu_4 import flash_attn_varlen_func, get_scheduler_metadata  # noqa: E402
+from tests.common.attention_ref import ref_flash_attention_pair  # noqa: E402
+from tests.common.compare import assert_fa_close  # noqa: E402
+from tests.common.test_utils import make_random_tensor  # noqa: E402
 
 
 DATA_TYPE = torch.bfloat16
@@ -22,7 +24,7 @@ Q_SEQLEN = 16
 KV_SEQLEN = 128
 HEAD_SIZE = 128
 BLOCK_SIZE = 128
-SCALE = 1.0 / (HEAD_SIZE ** 0.5)
+SCALE = 1.0 / (HEAD_SIZE**0.5)
 WINDOW_SIZE = (-1, -1)
 
 
@@ -55,8 +57,12 @@ def _run_flash_attn(
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_varlen_graph(is_causal):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    key_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    value_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    key_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
+    value_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()

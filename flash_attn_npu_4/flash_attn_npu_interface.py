@@ -15,18 +15,23 @@ if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
     _torch_register_fake_wrapper = torch.library.register_fake
 else:
+
     def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
         def wrap(func):
             return func
+
         if fn is None:
             return wrap
         return fn
+
     def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
         def wrap(func):
             return func
+
         if fn is None:
             return wrap
         return fn
+
     _torch_custom_op_wrapper = noop_custom_op_wrapper
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
@@ -43,8 +48,7 @@ _HEADDIM_BWD_ALIGN = 64
 
 
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
-    """Pad headdim to a multiple of 64 for the FAG bwd kernel.
-    """
+    """Pad headdim to a multiple of 64 for the FAG bwd kernel."""
     q_dtype = q.dtype
     if q_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"mha_bwd only supports FP16 and BF16, got {q_dtype}")
@@ -56,8 +60,7 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
             )
     if dout.size(-1) != head_size_og:
         raise ValueError(
-            f"dout headdim ({dout.size(-1)}) must equal original q/k/v "
-            f"headdim ({head_size_og})"
+            f"dout headdim ({dout.size(-1)}) must equal original q/k/v headdim ({head_size_og})"
         )
     qkv_out_headdims = [t.size(-1) for t in (q, k, v, out)]
     if len(set(qkv_out_headdims)) != 1:
@@ -67,9 +70,7 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
         )
     ctx_headdim = qkv_out_headdims[0]
     if ctx_headdim <= 0 or ctx_headdim > 256:
-        raise ValueError(
-            f"headdim must be in (0, 256], got {ctx_headdim} "
-        )
+        raise ValueError(f"headdim must be in (0, 256], got {ctx_headdim} ")
     target = round_multiple(ctx_headdim, _HEADDIM_BWD_ALIGN)
 
     def _pad(t):
@@ -121,9 +122,7 @@ def _flash_attn_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k = [maybe_contiguous(x) for x in (q, k)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
-    cu_seqlens_q, cu_seqlens_k = [
-        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)
-    ]
+    cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
     seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
     page_table = maybe_contiguous(page_table)
     out, softmax_lse = flash_attn_npu_4.fwd(
@@ -153,7 +152,6 @@ def _flash_attn_forward(
         sm_margin,
     )
     return out, softmax_lse
-
 
 
 # ----------------------------------------------------------------------
@@ -204,18 +202,9 @@ def _scheduler_metadata_has_mask(
     if causal:
         window_size_right = 0
 
-    is_causal = (
-        window_size_left < 0
-        and window_size_right == 0
-    )
+    is_causal = window_size_left < 0 and window_size_right == 0
 
-    is_local = (
-        (
-            window_size_left >= 0
-            or window_size_right >= 0
-        )
-        and not is_causal
-    )
+    is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
 
     return is_causal or is_local
 
@@ -268,9 +257,7 @@ def _get_scheduler_metadata_op(
     )
 
 
-@_torch_register_fake_wrapper(
-    "flash_attn_npu_4::_get_scheduler_metadata"
-)
+@_torch_register_fake_wrapper("flash_attn_npu_4::_get_scheduler_metadata")
 def _get_scheduler_metadata_fake(
     batch_size: int,
     max_seqlen_q: int,
@@ -300,13 +287,8 @@ def _get_scheduler_metadata_fake(
         max_seqlen_k,
     )
 
-    metadata_bytes = (
-        _SCHEDULER_METADATA_TILING_BYTES
-        + (
-            _SCHEDULER_METADATA_MASK_BYTES
-            if has_mask
-            else 0
-        )
+    metadata_bytes = _SCHEDULER_METADATA_TILING_BYTES + (
+        _SCHEDULER_METADATA_MASK_BYTES if has_mask else 0
     )
 
     return torch.empty(
@@ -330,7 +312,7 @@ def get_scheduler_metadata(
     page_size: Optional[int] = None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0,   # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,
@@ -368,6 +350,8 @@ def get_scheduler_metadata(
         softmax_scale,
     )
     return scheduler_metadata
+
+
 @_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
@@ -409,9 +393,7 @@ def _flash_attn_forward_fake(
         # (num_heads, total_q)
         num_heads = q.shape[1]
         total_q = q.shape[0]
-        softmax_lse = torch.empty(
-            (num_heads, total_q), dtype=torch.float32, device=q.device
-        )
+        softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
     else:
         # (batch_size, num_heads, seqlen_q)
         batch_size = q.shape[0]
@@ -512,9 +494,7 @@ def _flash_attn_backward_op_fake(
         nheads = q.shape[2]
         seqlen_q = q.shape[1]
 
-    softmax_d = torch.empty(
-        (batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device
-    )
+    softmax_d = torch.empty((batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device)
     return softmax_d
 
 
@@ -587,7 +567,9 @@ def _flash_attn_backward(
     assert mask_mod is None, "flash_attn_npu_v4 bwd does not support mask_mod"
     assert aux_tensors is None, "flash_attn_npu_v4 bwd does not support aux_tensors"
     assert aux_scalars is None, "flash_attn_npu_v4 bwd does not support aux_scalars"
-    assert block_sparse_tensors is None, "flash_attn_npu_v4 bwd does not support block_sparse_tensors"
+    assert block_sparse_tensors is None, (
+        "flash_attn_npu_v4 bwd does not support block_sparse_tensors"
+    )
     assert dlse is None, "flash_attn_npu_v4 bwd does not support dlse"
     assert seqused_q is None, "flash_attn_npu_v4 bwd does not support seqused_q"
     assert seqused_k is None, "flash_attn_npu_v4 bwd does not support seqused_k"
@@ -632,7 +614,6 @@ _flash_attn_bwd = _flash_attn_backward
 
 
 class FlashAttnFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -645,7 +626,7 @@ class FlashAttnFunc(torch.autograd.Function):
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         learnable_sink=None,
-        softcap=0.0,   # 0.0 means deactivated
+        softcap=0.0,  # 0.0 means deactivated
         num_splits=1,  # Can be tuned for speed
         pack_gqa=None,  # Can be tuned for speed
         deterministic=False,
@@ -669,9 +650,7 @@ class FlashAttnFunc(torch.autograd.Function):
         seqlen_k = k.shape[1]
         num_heads_k = k.shape[2]
         head_size_v = v.shape[-1]
-        cache_seqlens = torch.full(
-            (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
-        )
+        cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
         scheduler_metadata = get_scheduler_metadata(
             batch_size,
             seqlen_q,
@@ -751,9 +730,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
-            dout, q, k, v, out, ctx.head_size_og
-        )
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
@@ -815,7 +792,6 @@ class FlashAttnFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -836,10 +812,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         learnable_sink=None,
-        softcap=0.0, # 0.0 means deactivated
-        num_splits=0,    # Can be tuned for speed
-        pack_gqa=None,   # Can be tuned for speed
-        deterministic=False, 
+        softcap=0.0,  # 0.0 means deactivated
+        num_splits=0,  # Can be tuned for speed
+        pack_gqa=None,  # Can be tuned for speed
+        deterministic=False,
         score_mod=None,
         score_mod_bwd=None,
         mask_mod=None,
@@ -850,19 +826,21 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         scheduler_metadata=None,
         seqlen_k_per_split=None,
         disable_scheduler_metadata=False,
-    ):  
+    ):
         assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
         assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         if seqused_k is not None and isinstance(seqused_k, int):
-            seqused_k = torch.full(
-                (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
-            )
+            seqused_k = torch.full((q.shape[0],), seqused_k, dtype=torch.int32, device=k.device)
             seqused_k = maybe_contiguous(seqused_k)
 
         fwd_max_seqlen_k = max_seqlen_k
-        if scheduler_metadata is None and not disable_scheduler_metadata and cu_seqlens_q is not None:
+        if (
+            scheduler_metadata is None
+            and not disable_scheduler_metadata
+            and cu_seqlens_q is not None
+        ):
             batch_size = cu_seqlens_q.shape[0] - 1
             num_heads = q.shape[1]
             head_size = q.shape[2]
@@ -978,9 +956,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
-            dout, q, k, v, out, ctx.head_size_og
-        )
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
@@ -1061,7 +1037,7 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     learnable_sink=None,
-    softcap=0.0,   # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     num_splits=1,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
     deterministic=False,
@@ -1119,7 +1095,7 @@ def flash_attn_func(
         causal,
         window_size,  # -1 means infinite context window
         learnable_sink,
-        softcap,   # 0.0 means deactivated
+        softcap,  # 0.0 means deactivated
         num_splits,  # Can be tuned for speed
         pack_gqa,  # Can be tuned for speed
         deterministic,
@@ -1149,13 +1125,13 @@ def flash_attn_varlen_func(
     gather_kv_indices: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
-    causal:bool = False,
+    causal: bool = False,
     window_size=(-1, -1),  # -1 means infinite context window
     learnable_sink: Optional[torch.Tensor] = None,
-    softcap=0.0, # 0.0 means deactivated
-    num_splits=0,    # Can be tuned for speed
-    pack_gqa=None,   # Can be tuned for speed
-    deterministic:bool = False, 
+    softcap=0.0,  # 0.0 means deactivated
+    num_splits=0,  # Can be tuned for speed
+    pack_gqa=None,  # Can be tuned for speed
+    deterministic: bool = False,
     score_mod=None,
     score_mod_bwd=None,
     mask_mod=None,
@@ -1262,10 +1238,10 @@ def flash_attn_varlen_func(
         causal,
         window_size,  # -1 means infinite context window
         learnable_sink,
-        softcap, # 0.0 means deactivated
-        num_splits,    # Can be tuned for speed
-        pack_gqa,   # Can be tuned for speed
-        deterministic, 
+        softcap,  # 0.0 means deactivated
+        num_splits,  # Can be tuned for speed
+        pack_gqa,  # Can be tuned for speed
+        deterministic,
         score_mod,
         score_mod_bwd,
         mask_mod,

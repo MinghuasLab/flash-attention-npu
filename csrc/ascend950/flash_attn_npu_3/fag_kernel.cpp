@@ -40,10 +40,10 @@ static constexpr uint8_t DETER_FIX_SYNC_MODE = 0;
 static constexpr uint16_t SYNC_DQ_ROUND_FLAG = 10;
 // BN2S2 per-column dk/dv conversion: AIC signals a completed private column,
 // the paired AIVs cast it to the bf16 output and release the buffer.
-static constexpr uint16_t SYNC_C34_TO_V5_FLAG = 11;  // dk column ready
-static constexpr uint16_t SYNC_C5_TO_V6_FLAG = 12;   // dv column ready
-static constexpr uint16_t SYNC_V5_TO_C34_FLAG = 13;  // dk buffer free
-static constexpr uint16_t SYNC_V6_TO_C5_FLAG = 14;   // dv buffer free
+static constexpr uint16_t SYNC_C34_TO_V5_FLAG = 11; // dk column ready
+static constexpr uint16_t SYNC_C5_TO_V6_FLAG = 12;  // dv column ready
+static constexpr uint16_t SYNC_V5_TO_C34_FLAG = 13; // dk buffer free
+static constexpr uint16_t SYNC_V6_TO_C5_FLAG = 14;  // dv buffer free
 static constexpr uint32_t DET_CAST_CHUNK_ROWS = 32;
 
 /*
@@ -73,23 +73,13 @@ static constexpr uint32_t DET_CAST_CHUNK_ROWS = 32;
  * In steady state, C1/C2 of task i overlap V1/V2/C5/C3/C4 of task i - 1.
  */
 
-template <
-    typename DataType,
-    class BlockMmadSdP_,
-    class BlockMmaddQKV_,
-    class EpilogueScaledMaskSoftmax_,
-    class EpilogueSubMul_,
-    FAGTiling950::Layout INPUT_LAYOUT,
-    bool IS_ATTEN_MASK,
-    bool IS_DTM,
-    bool IS_SOFTCAP
->
+template <typename DataType, class BlockMmadSdP_, class BlockMmaddQKV_, class EpilogueScaledMaskSoftmax_,
+          class EpilogueSubMul_, FAGTiling950::Layout INPUT_LAYOUT, bool IS_ATTEN_MASK, bool IS_DTM, bool IS_SOFTCAP>
 class FlashAttentionScoreGrad950 {
-public:
+  public:
     using BlockMmadSdP = BlockMmadSdP_;
     using BlockMmaddQKV = BlockMmaddQKV_;
-    using EpilogueScaledMaskSoftmax =
-        EpilogueScaledMaskSoftmax_;
+    using EpilogueScaledMaskSoftmax = EpilogueScaledMaskSoftmax_;
     using EpilogueSubMul = EpilogueSubMul_;
 
     // Methods
@@ -100,45 +90,37 @@ public:
     ~FlashAttentionScoreGrad950() {}
 
     CATLASS_DEVICE
-    void Init(FAGKernelParams const &params)
+    void Init(FAGKernelParams const& params)
     {
-        tiling_ = reinterpret_cast<const __gm__ TilingData *>(params.tiling);
+        tiling_ = reinterpret_cast<const __gm__ TilingData*>(params.tiling);
 
-        doutGm_.SetGlobalBuffer((__gm__ DataType *)params.dout);
-        qGm_.SetGlobalBuffer((__gm__ DataType *)params.q);
-        kGm_.SetGlobalBuffer((__gm__ DataType *)params.k);
-        vGm_.SetGlobalBuffer((__gm__ DataType *)params.v);
-        attenMaskGm_.SetGlobalBuffer((__gm__ uint8_t *)params.attenMask);
-        softmaxLseGm_.SetGlobalBuffer((__gm__ float *)params.softmaxLse);
-        cuSeqQGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqQlen);
-        cuSeqKvGm_.SetGlobalBuffer((__gm__ int32_t *)params.cuSeqKvlen);
+        doutGm_.SetGlobalBuffer((__gm__ DataType*)params.dout);
+        qGm_.SetGlobalBuffer((__gm__ DataType*)params.q);
+        kGm_.SetGlobalBuffer((__gm__ DataType*)params.k);
+        vGm_.SetGlobalBuffer((__gm__ DataType*)params.v);
+        attenMaskGm_.SetGlobalBuffer((__gm__ uint8_t*)params.attenMask);
+        softmaxLseGm_.SetGlobalBuffer((__gm__ float*)params.softmaxLse);
+        cuSeqQGm_.SetGlobalBuffer((__gm__ int32_t*)params.cuSeqQlen);
+        cuSeqKvGm_.SetGlobalBuffer((__gm__ int32_t*)params.cuSeqKvlen);
 
-        dqWorkspaceGm_.SetGlobalBuffer(
-            (__gm__ float *)(params.workspace + tiling_->dqOffset));
-        dkWorkspaceGm_.SetGlobalBuffer(
-            (__gm__ float *)(params.workspace + tiling_->dkOffset));
-        dvWorkspaceGm_.SetGlobalBuffer(
-            (__gm__ float *)(params.workspace + tiling_->dvOffset));
+        dqWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dqOffset));
+        dkWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkOffset));
+        dvWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dvOffset));
 
         if constexpr (IS_DTM) {
-            dqDetWorkspaceGm_.SetGlobalBuffer(
-                (__gm__ float *)(params.workspace + tiling_->dqDetOffset));
-            dkDetWorkspaceGm_.SetGlobalBuffer(
-                (__gm__ float *)(params.workspace + tiling_->dkDetOffset));
-            dvDetWorkspaceGm_.SetGlobalBuffer(
-                (__gm__ float *)(params.workspace + tiling_->dvDetOffset));
-            dkPrivGm_.SetGlobalBuffer(
-                (__gm__ float *)(params.workspace + tiling_->dkPrivOffset));
-            dvPrivGm_.SetGlobalBuffer(
-                (__gm__ float *)(params.workspace + tiling_->dvPrivOffset));
+            dqDetWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dqDetOffset));
+            dkDetWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkDetOffset));
+            dvDetWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dvDetOffset));
+            dkPrivGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkPrivOffset));
+            dvPrivGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dvPrivOffset));
         }
         if constexpr (IS_DTM) {
             // BN2S2 cast outputs / TND length pointers (unused by the
             // non-deterministic instantiation).
-            dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dk));
-            dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(params.dv));
-            cuSeqQPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqQlen);
-            cuSeqKvPtr_ = reinterpret_cast<__gm__ int32_t *>(params.cuSeqKvlen);
+            dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(params.dk));
+            dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(params.dv));
+            cuSeqQPtr_ = reinterpret_cast<__gm__ int32_t*>(params.cuSeqQlen);
+            cuSeqKvPtr_ = reinterpret_cast<__gm__ int32_t*>(params.cuSeqKvlen);
         }
 
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
@@ -154,31 +136,22 @@ public:
         coreNum_ = tiling_->usedCoreNum;
         continuousBlockNum_ = tiling_->continuousBlockNum;
         if constexpr (IS_DTM) {
-            dtmVecCoreNum_ =
-                tiling_->dqVecNum + tiling_->dkVecNum + tiling_->dvVecNum;
+            dtmVecCoreNum_ = tiling_->dqVecNum + tiling_->dkVecNum + tiling_->dvVecNum;
         }
-        waveSize_ =
-            static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
+        waveSize_ = static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
         scaleValue_ = tiling_->scaleValue;
         softcapValue_ = tiling_->softcapValue;
-        softcapInputScale_ = IS_SOFTCAP
-            ? scaleValue_ / softcapValue_
-            : scaleValue_;
+        softcapInputScale_ = IS_SOFTCAP ? scaleValue_ / softcapValue_ : scaleValue_;
 
         if constexpr (IS_DTM) {
             // Det slot geometry must match fag_tiling.cpp: one slot is
             // qTile/kvTile rows of RoundUp(headDim, 8) floats.
             qkHeadDimAlign_ = (qkHeadDim_ + 7) / 8 * 8;
             vHeadDimAlign_ = (vHeadDim_ + 7) / 8 * 8;
-            dqDetSlotElems_ =
-                static_cast<uint64_t>(qBlockSize_) * qkHeadDimAlign_;
-            dkDetSlotElems_ =
-                static_cast<uint64_t>(kvBlockSize_) * qkHeadDimAlign_;
-            dvDetSlotElems_ =
-                static_cast<uint64_t>(kvBlockSize_) * vHeadDimAlign_;
-            detBn2s2_ =
-                tiling_->detSchedule ==
-                static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2);
+            dqDetSlotElems_ = static_cast<uint64_t>(qBlockSize_) * qkHeadDimAlign_;
+            dkDetSlotElems_ = static_cast<uint64_t>(kvBlockSize_) * qkHeadDimAlign_;
+            dvDetSlotElems_ = static_cast<uint64_t>(kvBlockSize_) * vHeadDimAlign_;
+            detBn2s2_ = tiling_->detSchedule == static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2);
             if (detBn2s2_) {
                 // opst arch35 BN2S2 schedule: every cube core runs the same
                 // round sequence; the schedule itself provides dq/dk/dv
@@ -193,41 +166,26 @@ public:
                 detShape_.kvTile = static_cast<int64_t>(kvBlockSize_);
                 detShape_.coreNum = static_cast<int64_t>(coreNum_);
                 detKind_ = tiling_->detKind;
-                detColumnRounds_ = tiling_->detColumnRounds == 0
-                    ? 1 : tiling_->detColumnRounds;
-                detBufNum_ = tiling_->detBufNum == 0
-                    ? 1 : tiling_->detBufNum;
+                detColumnRounds_ = tiling_->detColumnRounds == 0 ? 1 : tiling_->detColumnRounds;
+                detBufNum_ = tiling_->detBufNum == 0 ? 1 : tiling_->detBufNum;
                 detPrivDkv_ = tiling_->detPrivDkv != 0;
-                dkPrivSlotElems_ =
-                    static_cast<uint64_t>(kvBlockSize_) * qkHeadDimAlign_;
-                dvPrivSlotElems_ =
-                    static_cast<uint64_t>(kvBlockSize_) * vHeadDimAlign_;
+                dkPrivSlotElems_ = static_cast<uint64_t>(kvBlockSize_) * qkHeadDimAlign_;
+                dvPrivSlotElems_ = static_cast<uint64_t>(kvBlockSize_) * vHeadDimAlign_;
                 totalRounds_ = static_cast<uint32_t>(tiling_->detMaxRound);
-                totalBlockNum_ =
-                    static_cast<uint64_t>(totalRounds_) * waveSize_;
+                totalBlockNum_ = static_cast<uint64_t>(totalRounds_) * waveSize_;
 
                 // AIV dk/dv cast buffers live in a dedicated tail region of
                 // UB; fag_tiling.cpp checks the budget against ubSize.
-                castChunkRows_ = kvBlockSize_ < DET_CAST_CHUNK_ROWS
-                    ? kvBlockSize_ : DET_CAST_CHUNK_ROWS;
-                const uint64_t inCol =
-                    qkHeadDimAlign_ > vHeadDimAlign_
-                    ? qkHeadDimAlign_ : vHeadDimAlign_;
-                const uint64_t headCol = qkHeadDim_ > vHeadDim_
-                    ? qkHeadDim_ : vHeadDim_;
-                const uint64_t castInBytes = RoundUp<32>(
-                    static_cast<uint64_t>(castChunkRows_) * inCol *
-                    sizeof(float));
-                const uint64_t castOutBytes = RoundUp<32>(
-                    static_cast<uint64_t>(castChunkRows_) * headCol *
-                    sizeof(DataType));
+                castChunkRows_ = kvBlockSize_ < DET_CAST_CHUNK_ROWS ? kvBlockSize_ : DET_CAST_CHUNK_ROWS;
+                const uint64_t inCol = qkHeadDimAlign_ > vHeadDimAlign_ ? qkHeadDimAlign_ : vHeadDimAlign_;
+                const uint64_t headCol = qkHeadDim_ > vHeadDim_ ? qkHeadDim_ : vHeadDim_;
+                const uint64_t castInBytes = RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * inCol * sizeof(float));
+                const uint64_t castOutBytes =
+                    RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * headCol * sizeof(DataType));
                 if (tiling_->ubSize > castInBytes + castOutBytes) {
                     castInUb_ =
-                        resource.ubBuf.template GetBufferByByte<float>(
-                            tiling_->ubSize - castInBytes - castOutBytes);
-                    castOutUb_ =
-                        resource.ubBuf.template GetBufferByByte<DataType>(
-                            tiling_->ubSize - castOutBytes);
+                        resource.ubBuf.template GetBufferByByte<float>(tiling_->ubSize - castInBytes - castOutBytes);
+                    castOutUb_ = resource.ubBuf.template GetBufferByByte<DataType>(tiling_->ubSize - castOutBytes);
                 }
             } else {
                 // Every core derives the same total task/round count so that
@@ -238,13 +196,10 @@ public:
                     uint64_t qStart = 0, kvStart = 0;
                     uint32_t s1Len = 0, s2Len = 0;
                     GetBatchShape(b, qStart, kvStart, s1Len, s2Len);
-                    const uint32_t s1BlkNum = static_cast<uint32_t>(
-                        CeilDiv(s1Len, qBlockSize_));
-                    totalBlockNum_ += kvHeadNum_ * groupNum_ *
-                        CountValidS2Blocks(s1Len, s2Len, s1BlkNum);
+                    const uint32_t s1BlkNum = static_cast<uint32_t>(CeilDiv(s1Len, qBlockSize_));
+                    totalBlockNum_ += kvHeadNum_ * groupNum_ * CountValidS2Blocks(s1Len, s2Len, s1BlkNum);
                 }
-                totalRounds_ = static_cast<uint32_t>(
-                    CeilDiv(totalBlockNum_, waveSize_));
+                totalRounds_ = static_cast<uint32_t>(CeilDiv(totalBlockNum_, waveSize_));
             }
         }
 
@@ -252,18 +207,12 @@ public:
         //   [P ping][P pong][dS ping][dS pong] | cube working via Mm12L1Offset
         //   cube: [RES_KT|RES_K half][RES_VT][Q0][Q1][DY0][DY1]
         //   Q/DY ping-pong by taskId%2; D<=128 packs RowMajor K above K^T.
-        const uint32_t l1TileBytes =
-            qBlockSize_ * kvBlockSize_ * sizeof(DataType);
+        const uint32_t l1TileBytes = qBlockSize_ * kvBlockSize_ * sizeof(DataType);
         const uint32_t l1PBaseOffset = 0;
-        const uint32_t l1dSBaseOffset =
-            TASK_PINGPONG * l1TileBytes;
+        const uint32_t l1dSBaseOffset = TASK_PINGPONG * l1TileBytes;
         for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
-            l1PTensor[i] =
-                resource.l1Buf.template GetBufferByByte<DataType>(
-                    l1PBaseOffset + i * l1TileBytes);
-            l1dSTensor[i] =
-                resource.l1Buf.template GetBufferByByte<DataType>(
-                    l1dSBaseOffset + i * l1TileBytes);
+            l1PTensor[i] = resource.l1Buf.template GetBufferByByte<DataType>(l1PBaseOffset + i * l1TileBytes);
+            l1dSTensor[i] = resource.l1Buf.template GetBufferByByte<DataType>(l1dSBaseOffset + i * l1TileBytes);
         }
 
         // Per-AIV UB layout.  Ping and pong each own one complete half of UB:
@@ -272,17 +221,12 @@ public:
         // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
         const uint32_t mAligned = RoundUp(qBlockSize_, 16);
         const uint32_t rowsPerSubBlock = mAligned / 2;
-        const uint32_t mmResTileBytes =
-            rowsPerSubBlock * kvBlockSize_ * sizeof(float);
-        const uint32_t attenMaskTileBytes =
-            rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
-        const uint32_t lseTileBytes =
-            RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
-        const uint32_t pTileBytes =
-            (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
+        const uint32_t mmResTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(float);
+        const uint32_t attenMaskTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
+        const uint32_t lseTileBytes = RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
+        const uint32_t pTileBytes = (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
         const uint32_t dSTileBytes = pTileBytes;
-        const uint32_t deltaTileBytes =
-            rowsPerSubBlock * 8U * sizeof(float);
+        const uint32_t deltaTileBytes = rowsPerSubBlock * 8U * sizeof(float);
 
         const uint32_t mm1SlotOffset = 0;
         const uint32_t mm2SlotOffset = mm1SlotOffset + mmResTileBytes;
@@ -295,27 +239,14 @@ public:
 
         for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
             const uint32_t halfBaseOffset = i * pingPongHalfBytes;
-            ubMm1ResTensor[i] =
-                resource.ubBuf.template GetBufferByByte<float>(
-                    halfBaseOffset + mm1SlotOffset);
-            ubMm2ResTensor[i] =
-                resource.ubBuf.template GetBufferByByte<float>(
-                    halfBaseOffset + mm2SlotOffset);
+            ubMm1ResTensor[i] = resource.ubBuf.template GetBufferByByte<float>(halfBaseOffset + mm1SlotOffset);
+            ubMm2ResTensor[i] = resource.ubBuf.template GetBufferByByte<float>(halfBaseOffset + mm2SlotOffset);
             attenMaskUbTensor[i] =
-                resource.ubBuf.template GetBufferByByte<uint8_t>(
-                    halfBaseOffset + attenMaskSlotOffset);
-            lseUbTensor[i] =
-                resource.ubBuf.template GetBufferByByte<float>(
-                    halfBaseOffset + lseSlotOffset);
-            ubPTensor[i] =
-                resource.ubBuf.template GetBufferByByte<DataType>(
-                    halfBaseOffset + pSlotOffset);
-            ubDSTensor[i] =
-                resource.ubBuf.template GetBufferByByte<DataType>(
-                    halfBaseOffset + dSSlotOffset);
-            deltaUbTensor[i] =
-                resource.ubBuf.template GetBufferByByte<float>(
-                    halfBaseOffset + deltaSlotOffset);
+                resource.ubBuf.template GetBufferByByte<uint8_t>(halfBaseOffset + attenMaskSlotOffset);
+            lseUbTensor[i] = resource.ubBuf.template GetBufferByByte<float>(halfBaseOffset + lseSlotOffset);
+            ubPTensor[i] = resource.ubBuf.template GetBufferByByte<DataType>(halfBaseOffset + pSlotOffset);
+            ubDSTensor[i] = resource.ubBuf.template GetBufferByByte<DataType>(halfBaseOffset + dSSlotOffset);
+            deltaUbTensor[i] = resource.ubBuf.template GetBufferByByte<float>(halfBaseOffset + deltaSlotOffset);
         }
 
         if (batchNum_ != 0 && qBlockSize_ != 0 && kvBlockSize_ != 0) {
@@ -325,7 +256,7 @@ public:
     }
 
     CATLASS_DEVICE
-    void operator()(FAGKernelParams const &params)
+    void operator()(FAGKernelParams const& params)
     {
         Init(params);
         uint32_t coreIdx = 0;
@@ -338,43 +269,27 @@ public:
         const uint32_t vectorBlockIdx = AscendC::GetBlockIdx();
         coreIdx = vectorBlockIdx / subBlockNum;
         subBlockIdx = vectorBlockIdx % subBlockNum;
-        epilogueScaledMaskSoftmax_.Init(
-            resource,
-            params.tiling);
-        epilogueSubMul_.Init(
-            resource,
-            params.workspace,
-            params.tiling);
+        epilogueScaledMaskSoftmax_.Init(resource, params.tiling);
+        epilogueSubMul_.Init(resource, params.workspace, params.tiling);
         epiloguePre_.Init(resource, params.workspace, params.tiling);
-        epilogueSoftmaxGradFront_.Init(
-            resource, params.dout, params.out, params.workspace,
-            params.tiling);
-        epilogueDetAdd_.Init(
-            resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen,
-            params.workspace, params.tiling);
-        epiloguePost_.Init(
-            resource, params.dq, params.dk, params.dv, params.workspace,
-            params.tiling);
+        epilogueSoftmaxGradFront_.Init(resource, params.dout, params.out, params.workspace, params.tiling);
+        epilogueDetAdd_.Init(resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen, params.workspace, params.tiling);
+        epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
-        epiloguePre_(
-            vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
-        epilogueSoftmaxGradFront_(
-            vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping,
-            mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
-            vWaitMte3Ping, vWaitMte3Pong);
+        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
+        epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
+                                  vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
 #endif
         AscendC::SyncAll<false>();
         RunTasks(coreIdx, subBlockIdx);
         AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-        epiloguePost_(
-            vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping,
-            mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
-            vWaitMte3Ping, vWaitMte3Pong);
+        epiloguePost_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
+                      vWaitMte3Ping, vWaitMte3Pong);
 #endif
     }
 
-private:
+  private:
     using TilingData = FAGTiling950::FAGTilingData;
 
     CATLASS_DEVICE
@@ -405,28 +320,14 @@ private:
     }
 
     CATLASS_DEVICE
-    void GetBatchShape(
-        uint32_t batchIdx,
-        uint64_t &qBatchStart,
-        uint64_t &kvBatchStart,
-        uint32_t &s1Length,
-        uint32_t &s2Length)
+    void GetBatchShape(uint32_t batchIdx, uint64_t& qBatchStart, uint64_t& kvBatchStart, uint32_t& s1Length,
+                       uint32_t& s2Length)
     {
         if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
-            const uint64_t qEnd =
-                static_cast<uint64_t>(cuSeqQGm_.GetValue(batchIdx));
-            const uint64_t kvEnd =
-                static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx));
-            qBatchStart =
-                batchIdx == 0
-                    ? 0
-                    : static_cast<uint64_t>(
-                          cuSeqQGm_.GetValue(batchIdx - 1));
-            kvBatchStart =
-                batchIdx == 0
-                    ? 0
-                    : static_cast<uint64_t>(
-                          cuSeqKvGm_.GetValue(batchIdx - 1));
+            const uint64_t qEnd = static_cast<uint64_t>(cuSeqQGm_.GetValue(batchIdx));
+            const uint64_t kvEnd = static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx));
+            qBatchStart = batchIdx == 0 ? 0 : static_cast<uint64_t>(cuSeqQGm_.GetValue(batchIdx - 1));
+            kvBatchStart = batchIdx == 0 ? 0 : static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx - 1));
             s1Length = static_cast<uint32_t>(qEnd - qBatchStart);
             s2Length = static_cast<uint32_t>(kvEnd - kvBatchStart);
         } else {
@@ -438,10 +339,7 @@ private:
     }
 
     CATLASS_DEVICE
-    uint32_t FirstValidS1Block(
-        uint32_t s1Length,
-        uint32_t s2Length,
-        uint32_t s2BlockIdx)
+    uint32_t FirstValidS1Block(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx)
     {
         if constexpr (!IS_ATTEN_MASK) {
             return 0;
@@ -450,31 +348,21 @@ private:
         // floor((s2BlockIdx * kvBlockSize - (s2Length - s1Length)) /
         //       qBlockSize), clamped to [0, ceil(s1Length / qBlockSize)].
         const int64_t numerator =
-            static_cast<int64_t>(s2BlockIdx) * kvBlockSize_ -
-            (static_cast<int64_t>(s2Length) - s1Length);
+            static_cast<int64_t>(s2BlockIdx) * kvBlockSize_ - (static_cast<int64_t>(s2Length) - s1Length);
         if (numerator <= 0) {
             return 0;
         }
-        const uint32_t s1BlockNum =
-            static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
-        return Min(
-            static_cast<uint32_t>(numerator / qBlockSize_), s1BlockNum);
+        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+        return Min(static_cast<uint32_t>(numerator / qBlockSize_), s1BlockNum);
     }
 
     CATLASS_DEVICE
-    uint64_t CountValidS1Blocks(
-        uint32_t s1Length,
-        uint32_t s2Length,
-        uint32_t s2BlockNum)
+    uint64_t CountValidS1Blocks(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockNum)
     {
-        const uint32_t s1BlockNum =
-            static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
         uint64_t count = 0;
-        for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum;
-             ++s2BlockIdx) {
-            count += s1BlockNum -
-                FirstValidS1Block(
-                    s1Length, s2Length, s2BlockIdx);
+        for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx) {
+            count += s1BlockNum - FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
         }
         return count;
     }
@@ -482,13 +370,9 @@ private:
     // Deterministic axis order (b -> n2 -> s1 -> g -> s2) scans s1 outer and
     // s2 inner, so the per-s1 valid s2-block count is the segment length.
     CATLASS_DEVICE
-    uint32_t ValidS2BlockNum(
-        uint32_t s1Length,
-        uint32_t s2Length,
-        uint32_t s1BlockIdx)
+    uint32_t ValidS2BlockNum(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
-        const uint32_t s2BlockNum =
-            static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+        const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
         if constexpr (!IS_ATTEN_MASK) {
             return s2BlockNum;
         }
@@ -497,35 +381,25 @@ private:
         // j <= i + (s2Length - s1Length).  The last visible col of this s1
         // block is (s1BlockIdx + 1) * qBlockSize - 1 + (s2Length - s1Length).
         const int64_t lastCol =
-            static_cast<int64_t>(s1BlockIdx + 1) * qBlockSize_ - 1 +
-            (static_cast<int64_t>(s2Length) - s1Length);
+            static_cast<int64_t>(s1BlockIdx + 1) * qBlockSize_ - 1 + (static_cast<int64_t>(s2Length) - s1Length);
         if (lastCol < 0) {
             return 0;
         }
-        return Min(
-            static_cast<uint32_t>(lastCol / kvBlockSize_),
-            s2BlockNum - 1) + 1;
+        return Min(static_cast<uint32_t>(lastCol / kvBlockSize_), s2BlockNum - 1) + 1;
     }
 
     CATLASS_DEVICE
-    uint32_t LastValidS2Block(
-        uint32_t s1Length,
-        uint32_t s2Length,
-        uint32_t s1BlockIdx)
+    uint32_t LastValidS2Block(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
         // Mirror of FirstValidS1Block; requires ValidS2BlockNum > 0.
         return ValidS2BlockNum(s1Length, s2Length, s1BlockIdx) - 1;
     }
 
     CATLASS_DEVICE
-    uint64_t CountValidS2Blocks(
-        uint32_t s1Length,
-        uint32_t s2Length,
-        uint32_t s1BlockNum)
+    uint64_t CountValidS2Blocks(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockNum)
     {
         uint64_t count = 0;
-        for (uint32_t s1BlockIdx = 0; s1BlockIdx < s1BlockNum;
-             ++s1BlockIdx) {
+        for (uint32_t s1BlockIdx = 0; s1BlockIdx < s1BlockNum; ++s1BlockIdx) {
             count += ValidS2BlockNum(s1Length, s2Length, s1BlockIdx);
         }
         return count;
@@ -534,30 +408,19 @@ private:
     CATLASS_DEVICE
     void LoadDecoderBatch()
     {
-        GetBatchShape(
-            decoderBatchIdx_,
-            decoderQBatchStart_, decoderKvBatchStart_,
-            decoderS1Length_, decoderS2Length_);
-        decoderS1BlockNum_ = static_cast<uint32_t>(
-            CeilDiv(decoderS1Length_, qBlockSize_));
-        decoderS2BlockNum_ = static_cast<uint32_t>(
-            CeilDiv(decoderS2Length_, kvBlockSize_));
+        GetBatchShape(decoderBatchIdx_, decoderQBatchStart_, decoderKvBatchStart_, decoderS1Length_, decoderS2Length_);
+        decoderS1BlockNum_ = static_cast<uint32_t>(CeilDiv(decoderS1Length_, qBlockSize_));
+        decoderS2BlockNum_ = static_cast<uint32_t>(CeilDiv(decoderS2Length_, kvBlockSize_));
         if constexpr (IS_DTM) {
             // Axis order b -> n2 -> s1 -> g -> s2: per-s1 valid s2 counts.
-            decoderValidS2PerN2_ = CountValidS2Blocks(
-                decoderS1Length_, decoderS2Length_, decoderS1BlockNum_);
-            decoderBatchBlockNum_ =
-                kvHeadNum_ * groupNum_ *
-                decoderValidS2PerN2_;
+            decoderValidS2PerN2_ = CountValidS2Blocks(decoderS1Length_, decoderS2Length_, decoderS1BlockNum_);
+            decoderBatchBlockNum_ = kvHeadNum_ * groupNum_ * decoderValidS2PerN2_;
             decoderN2Idx_ = 0;
             decoderS1BlockIdx_ = 0;
             decoderS1BlockBegin_ = 0;
         } else {
-            decoderValidS1PerN2_ = CountValidS1Blocks(
-                decoderS1Length_, decoderS2Length_, decoderS2BlockNum_);
-            decoderBatchBlockNum_ =
-                kvHeadNum_ * groupNum_ *
-                decoderValidS1PerN2_;
+            decoderValidS1PerN2_ = CountValidS1Blocks(decoderS1Length_, decoderS2Length_, decoderS2BlockNum_);
+            decoderBatchBlockNum_ = kvHeadNum_ * groupNum_ * decoderValidS1PerN2_;
             decoderN2Idx_ = 0;
             decoderS2BlockIdx_ = 0;
             decoderS2BlockBegin_ = 0;
@@ -565,22 +428,14 @@ private:
     }
 
     CATLASS_DEVICE
-    void FillBlockInfo(
-        uint64_t blockId,
-        uint32_t n2Idx,
-        uint32_t groupIdx,
-        uint32_t s1BlockIdx,
-        uint32_t s2BlockIdx,
-        FAGBlockInfo &block)
+    void FillBlockInfo(uint64_t blockId, uint32_t n2Idx, uint32_t groupIdx, uint32_t s1BlockIdx, uint32_t s2BlockIdx,
+                       FAGBlockInfo& block)
     {
         const uint32_t s1Start = s1BlockIdx * qBlockSize_;
         const uint32_t s2Start = s2BlockIdx * kvBlockSize_;
-        const uint64_t totalS1Start =
-            decoderQBatchStart_ + s1Start;
-        const uint64_t totalS2Start =
-            decoderKvBatchStart_ + s2Start;
-        const uint64_t qHeadIdx =
-            static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
+        const uint64_t totalS1Start = decoderQBatchStart_ + s1Start;
+        const uint64_t totalS2Start = decoderKvBatchStart_ + s2Start;
+        const uint64_t qHeadIdx = static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
 
         block.blockId = blockId;
         block.batchIdx = decoderBatchIdx_;
@@ -592,20 +447,14 @@ private:
         block.s2Start = s2Start;
         block.curBatchS1 = decoderS1Length_;
         block.curBatchS2 = decoderS2Length_;
-        block.s1Extend =
-            Min(qBlockSize_, decoderS1Length_ - s1Start);
-        block.s2Extend =
-            Min(kvBlockSize_, decoderS2Length_ - s2Start);
+        block.s1Extend = Min(qBlockSize_, decoderS1Length_ - s1Start);
+        block.s2Extend = Min(kvBlockSize_, decoderS2Length_ - s2Start);
         block.totalS1Start = totalS1Start;
         block.totalS2Start = totalS2Start;
-        block.qOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
-        block.kOffset =
-            (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
-        block.vOffset =
-            (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
-        block.doutOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        block.qOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset = (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
+        block.vOffset = (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
+        block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
         // TODO: M方向划分和MM1输出一致
         block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
     }
@@ -613,24 +462,17 @@ private:
     // Fill one task from the opst BN2S2 schedule coordinate.  BSND uses the
     // uniform global shape; TND reads the per-batch cumulative lengths.
     CATLASS_DEVICE
-    void FillBlockInfoBn2s2(
-        uint64_t blockId,
-        const fag_det::Coord &c,
-        FAGBlockInfo &block)
+    void FillBlockInfoBn2s2(uint64_t blockId, const fag_det::Coord& c, FAGBlockInfo& block)
     {
         uint32_t s1Len = qSeqlen_;
         uint32_t s2Len = kvSeqlen_;
         uint64_t qBatchStart = 0;
         uint64_t kvBatchStart = 0;
         if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
-            qBatchStart = c.batch == 0
-                ? 0 : static_cast<uint64_t>(cuSeqQPtr_[c.batch - 1]);
-            kvBatchStart = c.batch == 0
-                ? 0 : static_cast<uint64_t>(cuSeqKvPtr_[c.batch - 1]);
-            s1Len = static_cast<uint32_t>(
-                static_cast<uint64_t>(cuSeqQPtr_[c.batch]) - qBatchStart);
-            s2Len = static_cast<uint32_t>(
-                static_cast<uint64_t>(cuSeqKvPtr_[c.batch]) - kvBatchStart);
+            qBatchStart = c.batch == 0 ? 0 : static_cast<uint64_t>(cuSeqQPtr_[c.batch - 1]);
+            kvBatchStart = c.batch == 0 ? 0 : static_cast<uint64_t>(cuSeqKvPtr_[c.batch - 1]);
+            s1Len = static_cast<uint32_t>(static_cast<uint64_t>(cuSeqQPtr_[c.batch]) - qBatchStart);
+            s2Len = static_cast<uint32_t>(static_cast<uint64_t>(cuSeqKvPtr_[c.batch]) - kvBatchStart);
         } else {
             qBatchStart = static_cast<uint64_t>(c.batch) * qSeqlen_;
             kvBatchStart = static_cast<uint64_t>(c.batch) * kvSeqlen_;
@@ -640,8 +482,7 @@ private:
         const uint32_t s2Start = static_cast<uint32_t>(c.s2) * kvBlockSize_;
         const uint64_t totalS1Start = qBatchStart + s1Start;
         const uint64_t totalS2Start = kvBatchStart + s2Start;
-        const uint64_t qHeadIdx =
-            static_cast<uint64_t>(c.n2) * groupNum_ + c.g;
+        const uint64_t qHeadIdx = static_cast<uint64_t>(c.n2) * groupNum_ + c.g;
 
         block.blockId = blockId;
         block.batchIdx = static_cast<uint32_t>(c.batch);
@@ -657,14 +498,10 @@ private:
         block.s2Extend = Min(kvBlockSize_, s2Len - s2Start);
         block.totalS1Start = totalS1Start;
         block.totalS2Start = totalS2Start;
-        block.qOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
-        block.kOffset =
-            (totalS2Start * kvHeadNum_ + c.n2) * qkHeadDim_;
-        block.vOffset =
-            (totalS2Start * kvHeadNum_ + c.n2) * vHeadDim_;
-        block.doutOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        block.qOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset = (totalS2Start * kvHeadNum_ + c.n2) * qkHeadDim_;
+        block.vOffset = (totalS2Start * kvHeadNum_ + c.n2) * vHeadDim_;
+        block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
         block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
         // BN2S2 treats every task as its own residency/accumulate group: the
         // shared C1/C2 stages reload K^T/V^T each task and dk/dv flush per
@@ -685,32 +522,24 @@ private:
                 block.detFoldS2Extend[p] = 0;
                 continue;
             }
-            const uint32_t foldS2Start =
-                static_cast<uint32_t>(c.foldS2[p]) * kvBlockSize_;
+            const uint32_t foldS2Start = static_cast<uint32_t>(c.foldS2[p]) * kvBlockSize_;
             // Packed row start of the fold column's batch: for TND it is the
             // cumulative length (batches may differ), for BSND it is the
             // uniform batch stride.  Fold buffers other than the task's own
             // column (p == 1) only occur for the BSND causal zip.
             uint64_t foldKvStart = 0;
             if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
-                foldKvStart = c.foldBatch[p] == 0
-                    ? 0
-                    : static_cast<uint64_t>(
-                        cuSeqKvPtr_[c.foldBatch[p] - 1]);
+                foldKvStart = c.foldBatch[p] == 0 ? 0 : static_cast<uint64_t>(cuSeqKvPtr_[c.foldBatch[p] - 1]);
             } else {
-                foldKvStart =
-                    static_cast<uint64_t>(c.foldBatch[p]) * kvSeqlen_;
+                foldKvStart = static_cast<uint64_t>(c.foldBatch[p]) * kvSeqlen_;
             }
             block.detFoldS2Start[p] = foldKvStart + foldS2Start;
-            block.detFoldS2Extend[p] =
-                Min(kvBlockSize_, s2Len - foldS2Start);
+            block.detFoldS2Extend[p] = Min(kvBlockSize_, s2Len - foldS2Start);
         }
     }
 
     CATLASS_DEVICE
-    bool DecodeBlock(
-        uint64_t blockId,
-        FAGBlockInfo &block)
+    bool DecodeBlock(uint64_t blockId, FAGBlockInfo& block)
     {
         if constexpr (IS_DTM) {
             if (detBn2s2_) {
@@ -721,35 +550,23 @@ private:
                 bool ok = false;
                 if (detKind_ == static_cast<uint32_t>(fag_det::KIND_TND_DENSE)) {
                     ok = cuSeqQPtr_ != nullptr && cuSeqKvPtr_ != nullptr &&
-                        fag_det::CalTNDDenseSwizzleIndex(
-                            detShape_, cuSeqQPtr_, cuSeqKvPtr_,
-                            tiling_->tndPrefix,
-                            static_cast<int64_t>(core) + 1,
-                            static_cast<int64_t>(round) + 1, c);
-                } else if (detKind_ ==
-                           static_cast<uint32_t>(fag_det::KIND_TND_GQA_DENSE)) {
+                         fag_det::CalTNDDenseSwizzleIndex(detShape_, cuSeqQPtr_, cuSeqKvPtr_, tiling_->tndPrefix,
+                                                          static_cast<int64_t>(core) + 1,
+                                                          static_cast<int64_t>(round) + 1, c);
+                } else if (detKind_ == static_cast<uint32_t>(fag_det::KIND_TND_GQA_DENSE)) {
                     ok = cuSeqQPtr_ != nullptr && cuSeqKvPtr_ != nullptr &&
-                        fag_det::CalTNDDenseGqaIndex(
-                            detShape_, cuSeqQPtr_, cuSeqKvPtr_,
-                            tiling_->tndPrefix,
-                            static_cast<int64_t>(core) + 1,
-                            static_cast<int64_t>(round) + 1,
-                            static_cast<int64_t>(tiling_->detMaxRound), c);
-                } else if (detKind_ ==
-                           static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
+                         fag_det::CalTNDDenseGqaIndex(detShape_, cuSeqQPtr_, cuSeqKvPtr_, tiling_->tndPrefix,
+                                                      static_cast<int64_t>(core) + 1, static_cast<int64_t>(round) + 1,
+                                                      static_cast<int64_t>(tiling_->detMaxRound), c);
+                } else if (detKind_ == static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
                     ok = cuSeqQPtr_ != nullptr && cuSeqKvPtr_ != nullptr &&
-                        fag_det::CalTNDCausalIndex(
-                            detShape_, cuSeqQPtr_, cuSeqKvPtr_,
-                            tiling_->tndPrefix, tiling_->tndCausalP1,
-                            tiling_->tndCausalP2,
-                            static_cast<int64_t>(tiling_->detMaxRound),
-                            static_cast<int64_t>(core) + 1,
-                            static_cast<int64_t>(round) + 1, c);
+                         fag_det::CalTNDCausalIndex(detShape_, cuSeqQPtr_, cuSeqKvPtr_, tiling_->tndPrefix,
+                                                    tiling_->tndCausalP1, tiling_->tndCausalP2,
+                                                    static_cast<int64_t>(tiling_->detMaxRound),
+                                                    static_cast<int64_t>(core) + 1, static_cast<int64_t>(round) + 1, c);
                 } else {
-                    ok = fag_det::Decode(
-                        static_cast<fag_det::Kind>(detKind_), detShape_,
-                        static_cast<int64_t>(round) + 1,
-                        static_cast<int64_t>(core) + 1, c);
+                    ok = fag_det::Decode(static_cast<fag_det::Kind>(detKind_), detShape_,
+                                         static_cast<int64_t>(round) + 1, static_cast<int64_t>(core) + 1, c);
                 }
                 if (!ok) {
                     return false;
@@ -763,11 +580,9 @@ private:
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
                     const int64_t diagOffset =
-                        static_cast<int64_t>(block.curBatchS2) -
-                        static_cast<int64_t>(block.curBatchS1);
+                        static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
                     if (static_cast<int64_t>(block.s2Start) >
-                        static_cast<int64_t>(block.s1Start) +
-                            static_cast<int64_t>(block.s1Extend) - 1 + diagOffset) {
+                        static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(block.s1Extend) - 1 + diagOffset) {
                         return false;
                     }
                 }
@@ -775,8 +590,7 @@ private:
             }
         }
         // ------------bIdx------------
-        while (decoderBatchIdx_ < batchNum_ &&
-               blockId >= decoderBatchBlockBegin_ + decoderBatchBlockNum_) {
+        while (decoderBatchIdx_ < batchNum_ && blockId >= decoderBatchBlockBegin_ + decoderBatchBlockNum_) {
             decoderBatchBlockBegin_ += decoderBatchBlockNum_;
             ++decoderBatchIdx_;
             if (decoderBatchIdx_ < batchNum_) {
@@ -788,12 +602,9 @@ private:
         }
         // ------------n2Idx------------
         const uint64_t blockNumPerN2 =
-            static_cast<uint64_t>(groupNum_) *
-            (IS_DTM ? decoderValidS2PerN2_ : decoderValidS1PerN2_);
-        const uint64_t blockInBatch =
-            blockId - decoderBatchBlockBegin_;
-        const uint32_t n2Idx =
-            static_cast<uint32_t>(blockInBatch / blockNumPerN2);
+            static_cast<uint64_t>(groupNum_) * (IS_DTM ? decoderValidS2PerN2_ : decoderValidS1PerN2_);
+        const uint64_t blockInBatch = blockId - decoderBatchBlockBegin_;
+        const uint32_t n2Idx = static_cast<uint32_t>(blockInBatch / blockNumPerN2);
         const uint64_t blockInN2 = blockInBatch % blockNumPerN2;
         if (n2Idx != decoderN2Idx_) {
             decoderN2Idx_ = n2Idx;
@@ -809,13 +620,9 @@ private:
             // ------------s1Idx------------
             uint32_t validS2Num = 0;
             while (decoderS1BlockIdx_ < decoderS1BlockNum_) {
-                validS2Num = ValidS2BlockNum(
-                    decoderS1Length_, decoderS2Length_,
-                    decoderS1BlockIdx_);
-                const uint64_t s1BlockTasks =
-                    static_cast<uint64_t>(groupNum_) * validS2Num;
-                if (blockInN2 <
-                    decoderS1BlockBegin_ + s1BlockTasks) {
+                validS2Num = ValidS2BlockNum(decoderS1Length_, decoderS2Length_, decoderS1BlockIdx_);
+                const uint64_t s1BlockTasks = static_cast<uint64_t>(groupNum_) * validS2Num;
+                if (blockInN2 < decoderS1BlockBegin_ + s1BlockTasks) {
                     break;
                 }
                 decoderS1BlockBegin_ += s1BlockTasks;
@@ -825,12 +632,9 @@ private:
                 return false;
             }
             // ------------gIdx & s2Idx------------
-            const uint64_t blockInS1 =
-                blockInN2 - decoderS1BlockBegin_;
-            const uint32_t groupIdx =
-                static_cast<uint32_t>(blockInS1 / validS2Num);
-            const uint32_t s2BlockIdx =
-                static_cast<uint32_t>(blockInS1 % validS2Num);
+            const uint64_t blockInS1 = blockInN2 - decoderS1BlockBegin_;
+            const uint32_t groupIdx = static_cast<uint32_t>(blockInS1 / validS2Num);
+            const uint32_t s2BlockIdx = static_cast<uint32_t>(blockInS1 % validS2Num);
             FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
             return true;
         }
@@ -838,14 +642,10 @@ private:
         uint32_t firstValidS1 = 0;
         uint32_t validS1Num = 0;
         while (decoderS2BlockIdx_ < decoderS2BlockNum_) {
-            firstValidS1 = FirstValidS1Block(
-                decoderS1Length_, decoderS2Length_,
-                decoderS2BlockIdx_);
+            firstValidS1 = FirstValidS1Block(decoderS1Length_, decoderS2Length_, decoderS2BlockIdx_);
             validS1Num = decoderS1BlockNum_ - firstValidS1;
-            const uint64_t s2BlockTasks =
-                static_cast<uint64_t>(groupNum_) * validS1Num;
-            if (blockInN2 <
-                decoderS2BlockBegin_ + s2BlockTasks) {
+            const uint64_t s2BlockTasks = static_cast<uint64_t>(groupNum_) * validS1Num;
+            if (blockInN2 < decoderS2BlockBegin_ + s2BlockTasks) {
                 break;
             }
             decoderS2BlockBegin_ += s2BlockTasks;
@@ -855,13 +655,9 @@ private:
             return false;
         }
         // ------------gIdx & s1Idx------------
-        const uint64_t blockInS2 =
-            blockInN2 - decoderS2BlockBegin_;
-        const uint32_t groupIdx =
-            static_cast<uint32_t>(blockInS2 / validS1Num);
-        const uint32_t s1BlockIdx =
-            firstValidS1 +
-            static_cast<uint32_t>(blockInS2 % validS1Num);
+        const uint64_t blockInS2 = blockInN2 - decoderS2BlockBegin_;
+        const uint32_t groupIdx = static_cast<uint32_t>(blockInS2 / validS1Num);
+        const uint32_t s1BlockIdx = firstValidS1 + static_cast<uint32_t>(blockInS2 % validS1Num);
         FillBlockInfo(blockId, n2Idx, groupIdx, s1BlockIdx, decoderS2BlockIdx_, block);
         return true;
     }
@@ -871,7 +667,7 @@ private:
     // keep the accumulator open, a later column (or the end of the schedule)
     // closes it.  Both cube and vector sides evaluate it identically.
     CATLASS_DEVICE
-    bool IsColumnEndBn2s2(uint32_t coreIdx, const FAGBlockInfo &cur)
+    bool IsColumnEndBn2s2(uint32_t coreIdx, const FAGBlockInfo& cur)
     {
         if (detBufNum_ > 1) {
             // Causal fold: the lane's two real columns interleave inside one
@@ -880,8 +676,7 @@ private:
             const uint32_t base = cur.issueRound / colRounds;
             for (uint32_t s = cur.issueRound + 1; s < totalRounds_; ++s) {
                 FAGBlockInfo next{};
-                if (DecodeBlock(
-                        static_cast<uint64_t>(s) * coreNum_ + coreIdx, next)) {
+                if (DecodeBlock(static_cast<uint64_t>(s) * coreNum_ + coreIdx, next)) {
                     return (s / colRounds) != base;
                 }
             }
@@ -891,12 +686,9 @@ private:
         // soon as the next valid task owns a different column.
         for (uint32_t s = cur.issueRound + 1; s < totalRounds_; ++s) {
             FAGBlockInfo next{};
-            if (DecodeBlock(
-                    static_cast<uint64_t>(s) * coreNum_ + coreIdx, next)) {
-                return next.batchIdx != cur.batchIdx ||
-                    next.n2Idx != cur.n2Idx ||
-                    next.groupIdx != cur.groupIdx ||
-                    next.s2BlockIdx != cur.s2BlockIdx;
+            if (DecodeBlock(static_cast<uint64_t>(s) * coreNum_ + coreIdx, next)) {
+                return next.batchIdx != cur.batchIdx || next.n2Idx != cur.n2Idx || next.groupIdx != cur.groupIdx ||
+                       next.s2BlockIdx != cur.s2BlockIdx;
             }
         }
         return true;
@@ -911,9 +703,7 @@ private:
     // ordering primitive the schedule needs.
     // ------------------------------------------------------------------
     CATLASS_DEVICE
-    void RunTasksBn2s2(
-        uint32_t coreIdx,
-        uint32_t subBlockIdx)
+    void RunTasksBn2s2(uint32_t coreIdx, uint32_t subBlockIdx)
     {
 #ifdef __DAV_CUBE__
         BlockMmadSdP mm12(resource, Mm12L1Offset());
@@ -931,8 +721,7 @@ private:
         FAGBlockInfo pending{};
         for (uint32_t step = 0; step < totalRounds_; ++step) {
             FAGBlockInfo block{};
-            const bool valid = DecodeBlock(
-                static_cast<uint64_t>(step) * coreNum_ + coreIdx, block);
+            const bool valid = DecodeBlock(static_cast<uint64_t>(step) * coreNum_ + coreIdx, block);
             if (valid) {
                 block.taskId = taskId;
                 block.issueRound = step;
@@ -958,8 +747,7 @@ private:
             }
 #endif
             if (hasPending) {
-                const bool colEnd =
-                    IsColumnEndBn2s2(coreIdx, pending);
+                const bool colEnd = IsColumnEndBn2s2(coreIdx, pending);
 #ifdef __DAV_CUBE__
                 ProcessC5StageBn2s2(pending, true, mm345, colEnd);
                 ProcessC34StageBn2s2(pending, true, mm345, colEnd);
@@ -977,10 +765,8 @@ private:
                 ++taskId;
             }
 #ifdef __DAV_CUBE__
-            AscendC::CrossCoreSetFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
-                SYNC_DQ_ROUND_FLAG);
-            AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
-                SYNC_DQ_ROUND_FLAG);
+            AscendC::CrossCoreSetFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(SYNC_DQ_ROUND_FLAG);
+            AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(SYNC_DQ_ROUND_FLAG);
 #endif
         }
         if (hasPending) {
@@ -1012,12 +798,9 @@ private:
     }
 
     CATLASS_DEVICE
-    void RunTasks(
-        uint32_t coreIdx,
-        uint32_t subBlockIdx)
+    void RunTasks(uint32_t coreIdx, uint32_t subBlockIdx)
     {
-        if (coreIdx >= coreNum_ || coreNum_ == 0 ||
-            qBlockSize_ == 0 || kvBlockSize_ == 0) {
+        if (coreIdx >= coreNum_ || coreNum_ == 0 || qBlockSize_ == 0 || kvBlockSize_ == 0) {
             return;
         }
         if constexpr (IS_DTM) {
@@ -1049,20 +832,16 @@ private:
             uint32_t s1Length = 0;
             uint32_t s2Length = 0;
             GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
-            const uint32_t s1BlockNum =
-                static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
-            const uint32_t s2BlockNum =
-                static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+            const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+            const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
 
             for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
-                for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum;
-                     ++s2BlockIdx, ++kvGroupId) {
+                for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx, ++kvGroupId) {
                     if ((kvGroupId % coreNum_) != coreIdx) {
                         continue;
                     }
 
-                    const uint32_t firstValidS1 = FirstValidS1Block(
-                        s1Length, s2Length, s2BlockIdx);
+                    const uint32_t firstValidS1 = FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
                     if (firstValidS1 >= s1BlockNum) {
                         continue;
                     }
@@ -1075,14 +854,11 @@ private:
 
                     uint32_t taskInGroup = 0;
                     for (uint32_t groupIdx = 0; groupIdx < groupNum_; ++groupIdx) {
-                        for (uint32_t s1Ord = 0; s1Ord < validS1Num;
-                             ++s1Ord, ++taskInGroup) {
+                        for (uint32_t s1Ord = 0; s1Ord < validS1Num; ++s1Ord, ++taskInGroup) {
                             FAGBlockInfo block{};
                             const uint32_t s1BlockIdx = firstValidS1 + s1Ord;
-                            FillBlockInfoFrom(
-                                batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx,
-                                qBatchStart, kvBatchStart, s1Length, s2Length,
-                                block);
+                            FillBlockInfoFrom(batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx, qBatchStart,
+                                              kvBatchStart, s1Length, s2Length, block);
                             block.taskId = taskId;
                             block.loadKv = (taskInGroup == 0);
                             block.initDkv = (taskInGroup == 0);
@@ -1119,7 +895,8 @@ private:
                             hasPrev = true;
                             ++taskId;
                         }
-                    }                }
+                    }
+                }
             }
         }
 
@@ -1148,24 +925,15 @@ private:
     }
 
     CATLASS_DEVICE
-    void FillBlockInfoFrom(
-        uint32_t batchIdx,
-        uint32_t n2Idx,
-        uint32_t groupIdx,
-        uint32_t s1BlockIdx,
-        uint32_t s2BlockIdx,
-        uint64_t qBatchStart,
-        uint64_t kvBatchStart,
-        uint32_t s1Length,
-        uint32_t s2Length,
-        FAGBlockInfo &block)
+    void FillBlockInfoFrom(uint32_t batchIdx, uint32_t n2Idx, uint32_t groupIdx, uint32_t s1BlockIdx,
+                           uint32_t s2BlockIdx, uint64_t qBatchStart, uint64_t kvBatchStart, uint32_t s1Length,
+                           uint32_t s2Length, FAGBlockInfo& block)
     {
         const uint32_t s1Start = s1BlockIdx * qBlockSize_;
         const uint32_t s2Start = s2BlockIdx * kvBlockSize_;
         const uint64_t totalS1Start = qBatchStart + s1Start;
         const uint64_t totalS2Start = kvBatchStart + s2Start;
-        const uint64_t qHeadIdx =
-            static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
+        const uint64_t qHeadIdx = static_cast<uint64_t>(n2Idx) * groupNum_ + groupIdx;
 
         block.batchIdx = batchIdx;
         block.n2Idx = n2Idx;
@@ -1180,14 +948,10 @@ private:
         block.s2Extend = Min(kvBlockSize_, s2Length - s2Start);
         block.totalS1Start = totalS1Start;
         block.totalS2Start = totalS2Start;
-        block.qOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
-        block.kOffset =
-            (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
-        block.vOffset =
-            (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
-        block.doutOffset =
-            (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
+        block.qOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * qkHeadDim_;
+        block.kOffset = (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
+        block.vOffset = (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
+        block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
         block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
     }
 
@@ -1201,15 +965,11 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
         // mm12/mm345 L1 slots + RES_K half-slot token (L1_EVENT_COUNT).
-        for (uint32_t eventId = 0;
-             eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT;
-             ++eventId) {
+        for (uint32_t eventId = 0; eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT; ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
         // One availability token for every physical 64-KB L0C slot.
-        for (uint32_t eventId = 0;
-             eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
-             ++eventId) {
+        for (uint32_t eventId = 0; eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM; ++eventId) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(eventId);
         }
     }
@@ -1220,134 +980,94 @@ private:
         for (uint32_t eventId = 0; eventId < 4; ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(eventId);
         }
-        for (uint32_t eventId = 0;
-             eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT;
-             ++eventId) {
+        for (uint32_t eventId = 0; eventId < Catlass::Gemm::Ascend950FagL1Layout::L1_EVENT_COUNT; ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
         }
-        for (uint32_t eventId = 0;
-             eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
-             ++eventId) {
+        for (uint32_t eventId = 0; eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM; ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(eventId);
         }
     }
 
     CATLASS_DEVICE
-    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC1Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
-        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
-            qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
-            qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend,
-            vHeadDim_, kvHeadNum_ * vHeadDim_);
-        auto sLayout = tla::MakeLayout(
-            tla::MakeShape(block.s1Extend, block.s2Extend),
-            tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
-        auto s = tla::MakeTensor(
-            ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
+        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto sLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
+                                       tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+        auto s = tla::MakeTensor(ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
         // Prefetch V^T on the group’s first task so MTE2 overlaps S cube.
-        mm12.ComputeS(q, k, s, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, qkHeadDim_),
-            block.loadKv, slot, block.loadKv, v, block.s2Extend, vHeadDim_);
+        mm12.ComputeS(q, k, s, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv, slot,
+                      block.loadKv, v, block.s2Extend, vHeadDim_);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-            flagId + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC2Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
-        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
-            vHeadDim_, qHeadNum_ * vHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend,
-            vHeadDim_, kvHeadNum_ * vHeadDim_);
-        auto dpLayout = tla::MakeLayout(
-            tla::MakeShape(block.s1Extend, block.s2Extend),
-            tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
-        auto dp = tla::MakeTensor(
-            ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
+        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend, vHeadDim_, qHeadNum_ * vHeadDim_);
+        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto dpLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
+                                        tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+        auto dp = tla::MakeTensor(ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
         // VT already prefetched in C1 when loadKv; only wait on first use.
-        mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(
-            block.s1Extend, block.s2Extend, vHeadDim_),
-            /*loadV=*/false, /*waitV=*/block.loadKv, slot);
+        mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(block.s1Extend, block.s2Extend, vHeadDim_),
+                       /*loadV=*/false, /*waitV=*/block.loadKv, slot);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-            flagId + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC5Stage(
-        FAGBlockInfo const &block,
-        bool returnL1,
-        BlockMmaddQKV &mm345)
+    void ProcessC5Stage(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345)
     {
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
-            block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
 
         // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
         // with dv cube; subsequent C34 tasks in the group reuse it.
         if (block.initDkv && qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
-                qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
 
         // Reuse L1 dY from C2. Single AIC owns (b,n2,s2) → no GM atomic on dv.
-        mm345.ComputeDv(l1PTensor[slot], dv,
-            Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-            slot, block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
+        mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
+                        block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
         if (returnL1) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
     }
 
     CATLASS_DEVICE
-    void ProcessC34Stage(
-        FAGBlockInfo const &block,
-        bool returnL1,
-        BlockMmaddQKV &mm345)
+    void ProcessC34Stage(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345)
     {
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V2_TO_C34_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
-            qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
-            block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
-            block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
         // D<=128: waitResidentK on first task (C5 prefetched); later tasks hit
         // resident K. D>128: ComputeDqDk streams K via DY scratch.
-        mm345.ComputeDqDk(
-            l1dSTensor[slot], k, dq, dk,
-            Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-            slot,
-            /*waitResidentK=*/block.initDkv,
-            /*enAtomicDq=*/true,
-            block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
+        mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk, Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
+                          slot,
+                          /*waitResidentK=*/block.initDkv,
+                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
         if (returnL1) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C34_TO_V2_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
     }
 
@@ -1360,29 +1080,21 @@ private:
     // (stale data from the previous column), the rest atomic-add.  At the
     // column end the buffer is published to the paired AIVs for conversion.
     CATLASS_DEVICE
-    void ProcessC5StageBn2s2(
-        FAGBlockInfo const &block,
-        bool returnL1,
-        BlockMmaddQKV &mm345,
-        bool colEnd)
+    void ProcessC5StageBn2s2(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345, bool colEnd)
     {
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t parity = block.detParity & 1U;
-        const uint64_t bufIdx =
-            static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + parity;
+        const uint64_t bufIdx = static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + parity;
         if (detPrivDkv_) {
             if (!dvAnyOpen_) {
                 if (dvColumnStarted_) {
                     // Reuse gate: the previous column's cast must have drained the
                     // private buffers before the first overwrite.
-                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                        SYNC_V6_TO_C5_FLAG);
-                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                        SYNC_V6_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_V6_TO_C5_FLAG);
+                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_V6_TO_C5_FLAG +
+                                                                               V0_V1_FLAG_ID_OFFSET);
                 }
                 dvAnyOpen_ = true;
                 dvColumnStarted_ = true;
@@ -1391,46 +1103,36 @@ private:
         const bool firstOfBuf = detPrivDkv_ && !dvBufOpen_[parity];
         dvBufOpen_[parity] = true;
 
-        const uint32_t slot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         // Prefetch RowMajor K for the following C34 (D<=128).  Per-task group:
         // the previous C34 released the resident slot on its flush.
         if (qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
-                qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
         // dY is already in L1 DY[slot] from C2; release it here.
         if (detPrivDkv_) {
-            auto dv = MakeGmTensor(dvPrivGm_, bufIdx * dvPrivSlotElems_,
-                block.s2Extend, vHeadDim_, vHeadDimAlign_);
-            mm345.ComputeDv(l1PTensor[slot], dv,
-                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                slot, /*initDv=*/true, /*flushDv=*/true,
-                /*enAtomicDv=*/!firstOfBuf);
+            auto dv = MakeGmTensor(dvPrivGm_, bufIdx * dvPrivSlotElems_, block.s2Extend, vHeadDim_, vHeadDimAlign_);
+            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
+                            /*initDv=*/true, /*flushDv=*/true,
+                            /*enAtomicDv=*/!firstOfBuf);
         } else {
-            auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
-                block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-            mm345.ComputeDv(l1PTensor[slot], dv,
-                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-                slot, /*initDv=*/true, /*flushDv=*/true, /*enAtomicDv=*/true);
+            auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
+                            /*initDv=*/true, /*flushDv=*/true, /*enAtomicDv=*/true);
         }
 
         if (detPrivDkv_ && colEnd) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                SYNC_C5_TO_V6_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                SYNC_C5_TO_V6_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_C5_TO_V6_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_C5_TO_V6_FLAG + V0_V1_FLAG_ID_OFFSET);
             dvAnyOpen_ = false;
             dvBufOpen_[0] = false;
             dvBufOpen_[1] = false;
         }
 
         if (returnL1) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
     }
 
@@ -1438,27 +1140,19 @@ private:
     // (round-ordered by the mode-0 barrier); dk follows the same private
     // per-column scheme as dv.
     CATLASS_DEVICE
-    void ProcessC34StageBn2s2(
-        FAGBlockInfo const &block,
-        bool returnL1,
-        BlockMmaddQKV &mm345,
-        bool colEnd)
+    void ProcessC34StageBn2s2(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345, bool colEnd)
     {
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V2_TO_C34_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-            SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t parity = block.detParity & 1U;
-        const uint64_t bufIdx =
-            static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + parity;
+        const uint64_t bufIdx = static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + parity;
         if (detPrivDkv_) {
             if (!dkAnyOpen_) {
                 if (dkColumnStarted_) {
-                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                        SYNC_V5_TO_C34_FLAG);
-                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                        SYNC_V5_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_V5_TO_C34_FLAG);
+                    AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_V5_TO_C34_FLAG +
+                                                                               V0_V1_FLAG_ID_OFFSET);
                 }
                 dkAnyOpen_ = true;
                 dkColumnStarted_ = true;
@@ -1467,58 +1161,44 @@ private:
         const bool firstOfBuf = detPrivDkv_ && !dkBufOpen_[parity];
         dkBufOpen_[parity] = true;
 
-        const uint32_t slot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend,
-            qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend,
-            qkHeadDim_, qHeadNum_ * qkHeadDim_);
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
         // Q is read from L1 Q[slot] (loaded by C1), K from the resident slot
         // (prefetched by C5) for D<=128; D>128 streams K through DY scratch.
         if (detPrivDkv_) {
-            auto dk = MakeGmTensor(dkPrivGm_, bufIdx * dkPrivSlotElems_,
-                block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
-            mm345.ComputeDqDk(
-                l1dSTensor[slot], k, dq, dk,
-                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                slot, /*waitResidentK=*/true, /*enAtomicDq=*/true,
-                /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/!firstOfBuf);
+            auto dk = MakeGmTensor(dkPrivGm_, bufIdx * dkPrivSlotElems_, block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
+            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+                              /*waitResidentK=*/true, /*enAtomicDq=*/true,
+                              /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/!firstOfBuf);
         } else {
-            auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
-                block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-            mm345.ComputeDqDk(
-                l1dSTensor[slot], k, dq, dk,
-                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                slot, /*waitResidentK=*/true, /*enAtomicDq=*/true,
-                /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/true);
+            auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+                              /*waitResidentK=*/true, /*enAtomicDq=*/true,
+                              /*initDk=*/true, /*flushDk=*/true, /*enAtomicDk=*/true);
         }
 
         if (detPrivDkv_ && colEnd) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                SYNC_C34_TO_V5_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
-                SYNC_C34_TO_V5_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_C34_TO_V5_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(SYNC_C34_TO_V5_FLAG + V0_V1_FLAG_ID_OFFSET);
             dkAnyOpen_ = false;
             dkBufOpen_[0] = false;
             dkBufOpen_[1] = false;
         }
 
         if (returnL1) {
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C34_TO_V2_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
-                SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG);
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
     }
 
     template <class GlobalTensor>
-    CATLASS_DEVICE
-    auto MakeGmTensor(GlobalTensor &gm, uint64_t offset,
-        uint32_t rows, uint64_t cols, uint64_t rowStride)
+    CATLASS_DEVICE auto MakeGmTensor(GlobalTensor& gm, uint64_t offset, uint32_t rows, uint64_t cols,
+                                     uint64_t rowStride)
     {
-        auto layout = tla::MakeLayout(
-            tla::MakeShape(rows, cols),
-            tla::MakeStride(rowStride, tla::Int<1>{}));
+        auto layout = tla::MakeLayout(tla::MakeShape(rows, cols), tla::MakeStride(rowStride, tla::Int<1>{}));
         return tla::MakeTensor(gm[offset], layout, Catlass::Arch::PositionGM{});
     }
 
@@ -1570,40 +1250,26 @@ private:
     // store into the strided output rows.  The MTE3_MTE2 token alternates
     // across chunks and flush points (armed once in SetVecEvents).
     CATLASS_DEVICE
-    void CastRegionRows(
-        uint64_t totalS2Start,
-        uint32_t n2Idx,
-        uint32_t s2Extend,
-        uint32_t subBlockIdx,
-        AscendC::GlobalTensor<float> &src,
-        uint64_t srcOffset,
-        uint64_t srcRowStride,
-        uint64_t headDim,
-        AscendC::GlobalTensor<DataType> &dst,
-        bool applyScale)
+    void CastRegionRows(uint64_t totalS2Start, uint32_t n2Idx, uint32_t s2Extend, uint32_t subBlockIdx,
+                        AscendC::GlobalTensor<float>& src, uint64_t srcOffset, uint64_t srcRowStride, uint64_t headDim,
+                        AscendC::GlobalTensor<DataType>& dst, bool applyScale)
     {
         if (s2Extend == 0U) {
             return;
         }
         const uint32_t firstHalf = (s2Extend + 1U) / 2U;
         const uint32_t rowBegin = subBlockIdx * firstHalf;
-        const uint32_t rowLimit =
-            (rowBegin + firstHalf < s2Extend) ? rowBegin + firstHalf : s2Extend;
+        const uint32_t rowLimit = (rowBegin + firstHalf < s2Extend) ? rowBegin + firstHalf : s2Extend;
         uint32_t row = rowBegin;
         while (row < rowLimit) {
-            const uint32_t rows =
-                (rowLimit - row < castChunkRows_) ? rowLimit - row : castChunkRows_;
+            const uint32_t rows = (rowLimit - row < castChunkRows_) ? rowLimit - row : castChunkRows_;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
-            AscendC::DataCopyExtParams inParams{
-                static_cast<uint16_t>(rows),
-                static_cast<uint32_t>(headDim * sizeof(float)),
-                static_cast<int64_t>((srcRowStride - headDim) * sizeof(float)),
-                0, 0};
+            AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rows),
+                                                static_cast<uint32_t>(headDim * sizeof(float)),
+                                                static_cast<int64_t>((srcRowStride - headDim) * sizeof(float)), 0, 0};
             AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
-            AscendC::DataCopyPad(
-                castInUb_,
-                src[srcOffset + static_cast<uint64_t>(row) * srcRowStride],
-                inParams, padParams);
+            AscendC::DataCopyPad(castInUb_, src[srcOffset + static_cast<uint64_t>(row) * srcRowStride], inParams,
+                                 padParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(castMte2ToV_);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(castMte2ToV_);
             const uint32_t elems = rows * static_cast<uint32_t>(headDim);
@@ -1611,20 +1277,14 @@ private:
                 AscendC::Muls(castInUb_, castInUb_, scaleValue_, elems);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::Cast(castOutUb_, castInUb_,
-                AscendC::RoundMode::CAST_RINT, elems);
+            AscendC::Cast(castOutUb_, castInUb_, AscendC::RoundMode::CAST_RINT, elems);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(castVToMte3_);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(castVToMte3_);
-            const uint64_t outOffset =
-                (totalS2Start + row) * kvHeadNum_ * headDim + n2Idx * headDim;
+            const uint64_t outOffset = (totalS2Start + row) * kvHeadNum_ * headDim + n2Idx * headDim;
             AscendC::DataCopyExtParams outParams{
-                static_cast<uint16_t>(rows),
-                static_cast<uint32_t>(headDim * sizeof(DataType)),
-                0,
-                static_cast<int64_t>(
-                    (kvHeadNum_ - 1U) * headDim * sizeof(DataType)),
-                0};
+                static_cast<uint16_t>(rows), static_cast<uint32_t>(headDim * sizeof(DataType)), 0,
+                static_cast<int64_t>((kvHeadNum_ - 1U) * headDim * sizeof(DataType)), 0};
             AscendC::DataCopyPad(dst[outOffset], castOutUb_, outParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
             row += rows;
@@ -1636,10 +1296,7 @@ private:
     // column end, wait for the cube-side publish, convert each used private
     // buffer and release it for the next column.
     CATLASS_DEVICE
-    void ProcessDkvCastStage(
-        FAGBlockInfo const &block,
-        uint32_t subBlockIdx,
-        bool colEnd)
+    void ProcessDkvCastStage(FAGBlockInfo const& block, uint32_t subBlockIdx, bool colEnd)
     {
         if (!detPrivDkv_) {
             return;
@@ -1651,8 +1308,7 @@ private:
             return;
         }
 
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(
-            SYNC_C34_TO_V5_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(SYNC_C34_TO_V5_FLAG);
         for (uint32_t p = 0; p < detBufNum_; ++p) {
             if (!dkHasData_[p]) {
                 continue;
@@ -1661,18 +1317,13 @@ private:
             if (block.detFoldValid[p] == 0U) {
                 continue;
             }
-            CastRegionRows(
-                block.detFoldS2Start[p], block.detFoldN2[p],
-                block.detFoldS2Extend[p], subBlockIdx, dkPrivGm_,
-                (static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + p) *
-                    dkPrivSlotElems_,
-                qkHeadDimAlign_, qkHeadDim_, dkGm_, true);
+            CastRegionRows(block.detFoldS2Start[p], block.detFoldN2[p], block.detFoldS2Extend[p], subBlockIdx,
+                           dkPrivGm_, (static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + p) * dkPrivSlotElems_,
+                           qkHeadDimAlign_, qkHeadDim_, dkGm_, true);
         }
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-            SYNC_V5_TO_C34_FLAG);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V5_TO_C34_FLAG);
 
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(
-            SYNC_C5_TO_V6_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(SYNC_C5_TO_V6_FLAG);
         for (uint32_t p = 0; p < detBufNum_; ++p) {
             if (!dvHasData_[p]) {
                 continue;
@@ -1681,38 +1332,27 @@ private:
             if (block.detFoldValid[p] == 0U) {
                 continue;
             }
-            CastRegionRows(
-                block.detFoldS2Start[p], block.detFoldN2[p],
-                block.detFoldS2Extend[p], subBlockIdx, dvPrivGm_,
-                (static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + p) *
-                    dvPrivSlotElems_,
-                vHeadDimAlign_, vHeadDim_, dvGm_, false);
+            CastRegionRows(block.detFoldS2Start[p], block.detFoldN2[p], block.detFoldS2Extend[p], subBlockIdx,
+                           dvPrivGm_, (static_cast<uint64_t>(coreIdxBn2s2_) * detBufNum_ + p) * dvPrivSlotElems_,
+                           vHeadDimAlign_, vHeadDim_, dvGm_, false);
         }
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-            SYNC_V6_TO_C5_FLAG);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V6_TO_C5_FLAG);
     }
 
     CATLASS_DEVICE
-    void ProcessV1Stage(
-        FAGBlockInfo const &block,
-        uint32_t subBlockIdx)
+    void ProcessV1Stage(FAGBlockInfo const& block, uint32_t subBlockIdx)
     {
-        const uint32_t flagSlot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(
-            SYNC_C1_TO_V1_FLAG[flagSlot]);
+        const uint32_t flagSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C1_TO_V1_FLAG[flagSlot]);
 
         // Before task 1 and later overwrite P in L1, C5 must return ownership
         // of the buffer used by the preceding task.
         if (block.taskId != 0) {
-            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-                SYNC_C5_TO_V1_FLAG);
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C5_TO_V1_FLAG);
         }
 
-        auto attenMaskLayout = tla::MakeLayout<
-            uint8_t, Catlass::layout::RowMajor>(256, 256);
-        auto attenMaskGmTensor = tla::MakeTensor(
-            attenMaskGm_, attenMaskLayout, Catlass::Arch::PositionGM{});
+        auto attenMaskLayout = tla::MakeLayout<uint8_t, Catlass::layout::RowMajor>(256, 256);
+        auto attenMaskGmTensor = tla::MakeTensor(attenMaskGm_, attenMaskLayout, Catlass::Arch::PositionGM{});
 
         uint64_t lseRows = 0;
         uint64_t lseColumns = 0;
@@ -1720,9 +1360,7 @@ private:
         uint64_t lseColOffset = 0;
         const uint64_t n1Idx = static_cast<uint64_t>(block.n2Idx) * groupNum_ + block.groupIdx;
         const uint64_t subBlockS1Offset = subBlockIdx * block.firstHalfRealS1;
-        const uint64_t subBlockRealS1 = subBlockIdx ?
-            block.s1Extend - block.firstHalfRealS1 :
-            block.firstHalfRealS1;
+        const uint64_t subBlockRealS1 = subBlockIdx ? block.s1Extend - block.firstHalfRealS1 : block.firstHalfRealS1;
         if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
             // TND:  [N1, totalS1]
             lseRows = qHeadNum_;
@@ -1736,12 +1374,9 @@ private:
             lseRowOffset = static_cast<uint64_t>(block.batchIdx) * qHeadNum_ + n1Idx;
             lseColOffset = block.s1Start + subBlockS1Offset;
         }
-        auto softmaxLseLayout = tla::MakeLayout<
-            float, Catlass::layout::RowMajor>(lseRows, lseColumns);
+        auto softmaxLseLayout = tla::MakeLayout<float, Catlass::layout::RowMajor>(lseRows, lseColumns);
         auto softmaxLseGmTensor = tla::MakeTensor(
-            softmaxLseGm_, softmaxLseLayout,
-            tla::MakeCoord(lseRowOffset, lseColOffset),
-            Catlass::Arch::PositionGM{});
+            softmaxLseGm_, softmaxLseLayout, tla::MakeCoord(lseRowOffset, lseColOffset), Catlass::Arch::PositionGM{});
 
         event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
         event_t vToMte2Event = flagSlot ? lseMte2WaitVPong : lseMte2WaitVPing;
@@ -1749,45 +1384,27 @@ private:
         event_t mte3ToVEvent = flagSlot ? pVWaitMte3Pong : pVWaitMte3Ping;
         if (subBlockRealS1 != 0U) {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            epilogueScaledMaskSoftmax_(
-                block,
-                attenMaskGmTensor,
-                softmaxLseGmTensor,
-                attenMaskUbTensor[flagSlot],
-                lseUbTensor[flagSlot],
-                ubMm1ResTensor[flagSlot],
-                ubPTensor[flagSlot],
-                l1PTensor[flagSlot],
-                mte2ToVEvent,
-                vToMte3Event,
-                mte3ToVEvent,
-                softcapInputScale_,
-                softcapValue_,
-                subBlockRealS1,
-                subBlockIdx);
+            epilogueScaledMaskSoftmax_(block, attenMaskGmTensor, softmaxLseGmTensor, attenMaskUbTensor[flagSlot],
+                                       lseUbTensor[flagSlot], ubMm1ResTensor[flagSlot], ubPTensor[flagSlot],
+                                       l1PTensor[flagSlot], mte2ToVEvent, vToMte3Event, mte3ToVEvent,
+                                       softcapInputScale_, softcapValue_, subBlockRealS1, subBlockIdx);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
         }
 
         // Notify C5 only after this vector sub-block has finished writing P.
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-            SYNC_V1_TO_C5_FLAG);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V1_TO_C5_FLAG);
     }
 
     CATLASS_DEVICE
-    void ProcessV2Stage(
-        FAGBlockInfo const &block,
-        uint32_t subBlockIdx)
+    void ProcessV2Stage(FAGBlockInfo const& block, uint32_t subBlockIdx)
     {
-        const uint32_t flagSlot =
-            static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(
-            SYNC_C2_TO_V2_FLAG[flagSlot]);
+        const uint32_t flagSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C2_TO_V2_FLAG[flagSlot]);
 
         // Before task 1 and later overwrite dS in L1, C3/C4 must return
         // ownership of the buffer used by the preceding task.
         if (block.taskId != 0) {
-            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-                SYNC_C34_TO_V2_FLAG);
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C34_TO_V2_FLAG);
         }
         const uint32_t bufferId = flagSlot;
         event_t mte2ToVEvent = flagSlot ? vWaitMte2Pong : vWaitMte2Ping;
@@ -1795,57 +1412,39 @@ private:
         event_t vToMte3Event = flagSlot ? mte3WaitVPong : mte3WaitVPing;
         event_t mte3ToVEvent = flagSlot ? dSVWaitMte3Pong : dSVWaitMte3Ping;
 
-        const uint32_t subBlockRealS1 = subBlockIdx ?
-            block.s1Extend - block.firstHalfRealS1 :
-            block.firstHalfRealS1;
+        const uint32_t subBlockRealS1 = subBlockIdx ? block.s1Extend - block.firstHalfRealS1 : block.firstHalfRealS1;
         if (subBlockRealS1 != 0U) {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            epilogueSubMul_(
-                block,
-                ubMm2ResTensor[bufferId],
-                ubPTensor[bufferId],
-                ubMm1ResTensor[bufferId],
-                ubDSTensor[bufferId],
-                deltaUbTensor[bufferId],
-                l1dSTensor[bufferId],
-                mte2ToVEvent,
-                vToMte3Event,
-                mte3ToVEvent,
-                subBlockIdx);
+            epilogueSubMul_(block, ubMm2ResTensor[bufferId], ubPTensor[bufferId], ubMm1ResTensor[bufferId],
+                            ubDSTensor[bufferId], deltaUbTensor[bufferId], l1dSTensor[bufferId], mte2ToVEvent,
+                            vToMte3Event, mte3ToVEvent, subBlockIdx);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
         }
 
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
-            SYNC_V2_TO_C34_FLAG);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V2_TO_C34_FLAG);
     }
-    
+
     CATLASS_DEVICE
     void ProcessVecDTMStage(uint32_t issueRound)
     {
-        epilogueDetAdd_(
-            AscendC::GetBlockIdx(), issueRound, totalBlockNum_
-        );
+        epilogueDetAdd_(AscendC::GetBlockIdx(), issueRound, totalBlockNum_);
     }
 #endif
 
-private:
+  private:
     Catlass::Arch::Resource<Catlass::Arch::Ascend950> resource;
 #ifdef __DAV_VEC__
-    Catlass::Epilogue::Block::FagPre<
-        Catlass::Arch::Ascend950, TilingData> epiloguePre_;
-    Catlass::Epilogue::Block::FagSoftmaxGradFront<
-        DataType, Catlass::Arch::Ascend950,
-        TilingData> epilogueSoftmaxGradFront_;
+    Catlass::Epilogue::Block::FagPre<Catlass::Arch::Ascend950, TilingData> epiloguePre_;
+    Catlass::Epilogue::Block::FagSoftmaxGradFront<DataType, Catlass::Arch::Ascend950, TilingData>
+        epilogueSoftmaxGradFront_;
     EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
     EpilogueSubMul epilogueSubMul_;
-    Catlass::Epilogue::Block::FagDeterministicAdd<
-        DataType, Catlass::Arch::Ascend950, TilingData> epilogueDetAdd_;
-    Catlass::Epilogue::Block::FagPost<
-        DataType, Catlass::Arch::Ascend950, TilingData> epiloguePost_;
+    Catlass::Epilogue::Block::FagDeterministicAdd<DataType, Catlass::Arch::Ascend950, TilingData> epilogueDetAdd_;
+    Catlass::Epilogue::Block::FagPost<DataType, Catlass::Arch::Ascend950, TilingData> epiloguePost_;
 #endif
 
-    const __gm__ TilingData *tiling_ = nullptr;
+    const __gm__ TilingData* tiling_ = nullptr;
 
     AscendC::GlobalTensor<DataType> doutGm_;
     AscendC::GlobalTensor<DataType> qGm_;
@@ -1855,12 +1454,12 @@ private:
     AscendC::GlobalTensor<float> softmaxLseGm_;
     AscendC::GlobalTensor<int32_t> cuSeqQGm_;
     AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
-    __gm__ int32_t *cuSeqQPtr_ = nullptr;
-    __gm__ int32_t *cuSeqKvPtr_ = nullptr;
+    __gm__ int32_t* cuSeqQPtr_ = nullptr;
+    __gm__ int32_t* cuSeqKvPtr_ = nullptr;
     AscendC::GlobalTensor<float> dqWorkspaceGm_;
     AscendC::GlobalTensor<float> dkWorkspaceGm_;
     AscendC::GlobalTensor<float> dvWorkspaceGm_;
-    
+
     AscendC::GlobalTensor<float> dqDetWorkspaceGm_;
     AscendC::GlobalTensor<float> dkDetWorkspaceGm_;
     AscendC::GlobalTensor<float> dvDetWorkspaceGm_;
@@ -1868,7 +1467,7 @@ private:
     AscendC::GlobalTensor<float> dvPrivGm_;
     AscendC::GlobalTensor<DataType> dkGm_;
     AscendC::GlobalTensor<DataType> dvGm_;
-    
+
     // Det slot geometry (fp32 elements) and uniform round count (IS_DTM).
     uint64_t qkHeadDimAlign_ = 0;
     uint64_t vHeadDimAlign_ = 0;
@@ -1945,7 +1544,7 @@ private:
     uint32_t kvBlockSize_ = 0;
     uint32_t coreNum_ = 0;
     uint32_t continuousBlockNum_ = 0;
-    uint32_t dtmVecCoreNum_ = 0;  // IS_DTM: dqVecNum + dkVecNum + dvVecNum
+    uint32_t dtmVecCoreNum_ = 0; // IS_DTM: dqVecNum + dkVecNum + dvVecNum
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
     float softcapValue_ = 0.0f;
@@ -1972,84 +1571,42 @@ private:
     FAGBlockInfo previousBlock_{};
 };
 
-template <
-    typename DataType,
-    FAGTiling950::Layout INPUT_LAYOUT,
-    bool IS_CAUSAL,
-    bool IS_DETERMINISTIC,
-    bool IS_SOFTCAP>
-CATLASS_GLOBAL void FlashAttentionV3Bwd950(
-    GM_ADDR dout,
-    GM_ADDR q,
-    GM_ADDR k,
-    GM_ADDR v,
-    GM_ADDR out,
-    GM_ADDR mask,
-    GM_ADDR softmax_lse,
-    GM_ADDR cu_seqlens_q,
-    GM_ADDR cu_seqlens_k,
-    GM_ADDR dq,
-    GM_ADDR dk,
-    GM_ADDR dv,
-    GM_ADDR workspace,
-    GM_ADDR tiling)
+template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP>
+CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
+                                           GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k, GM_ADDR dq,
+                                           GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
     using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<128>, tla::Int<128>>;
 
     using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagSdP<2, 2, false>;
-    using TileCopySdP = Catlass::Gemm::Tile::PackedTileCopyTlaToUB<
-        ArchTag,
-        DataType, Catlass::layout::RowMajor,
-        DataType, Catlass::layout::ColumnMajor,
-        float, Catlass::layout::RowMajor,
-        void, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
-    using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<
-        DispatchPolicySdP, L1TileShape, L0TileShape,
-        DataType, DataType, float, void, TileCopySdP>;
+    using TileCopySdP =
+        Catlass::Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
+                                                   Catlass::layout::ColumnMajor, float, Catlass::layout::RowMajor, void,
+                                                   Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
+    using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicySdP, L1TileShape, L0TileShape, DataType,
+                                                            DataType, float, void, TileCopySdP>;
 
     using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagdQKV<2, 2, false>;
-    using TileCopydQKV = Catlass::Gemm::Tile::PackedTileCopyTla<
-        ArchTag,
-        DataType, Catlass::layout::RowMajor,
-        DataType, Catlass::layout::RowMajor,
-        float, Catlass::layout::RowMajor>;
-    using BlockMmaddQKV = Catlass::Gemm::Block::BlockMmadTla<
-        DispatchPolicydQKV, L1TileShape, L0TileShape,
-        DataType, DataType, float, void, TileCopydQKV>;
+    using TileCopydQKV =
+        Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
+                                               Catlass::layout::RowMajor, float, Catlass::layout::RowMajor>;
+    using BlockMmaddQKV = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicydQKV, L1TileShape, L0TileShape, DataType,
+                                                             DataType, float, void, TileCopydQKV>;
 
     using DispatchPolicyScaledMaskSoftmax =
-        Catlass::Epilogue::EpilogueAscend950FAGScaledMaskSoftmax<
-            INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP>;
-    using EpilogueScaledMaskSoftmax =
-        Catlass::Epilogue::Block::BlockEpilogue<
-            DispatchPolicyScaledMaskSoftmax,
-            DataType,
-            float,
-            FAGTiling950::FAGTilingData>;
-    using DispatchPolicySubMul =
-        Catlass::Epilogue::EpilogueAscend950FAGSubMul<
-            INPUT_LAYOUT, IS_SOFTCAP>;
-    using EpilogueSubMul =
-        Catlass::Epilogue::Block::BlockEpilogue<
-            DispatchPolicySubMul,
-            DataType,
-            DataType,
-            float,
-            FAGTiling950::FAGTilingData>;
-    using FAGKernel950 = FlashAttentionScoreGrad950<
-        DataType,
-        BlockMmadSdP,
-        BlockMmaddQKV,
-        EpilogueScaledMaskSoftmax,
-        EpilogueSubMul,
-        INPUT_LAYOUT,
-        IS_CAUSAL,
-        IS_DETERMINISTIC,
-        IS_SOFTCAP>;
-    FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
-        cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
+        Catlass::Epilogue::EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP>;
+    using EpilogueScaledMaskSoftmax = Catlass::Epilogue::Block::BlockEpilogue<DispatchPolicyScaledMaskSoftmax, DataType,
+                                                                              float, FAGTiling950::FAGTilingData>;
+    using DispatchPolicySubMul = Catlass::Epilogue::EpilogueAscend950FAGSubMul<INPUT_LAYOUT, IS_SOFTCAP>;
+    using EpilogueSubMul = Catlass::Epilogue::Block::BlockEpilogue<DispatchPolicySubMul, DataType, DataType, float,
+                                                                   FAGTiling950::FAGTilingData>;
+    using FAGKernel950 =
+        FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
+                                   INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>;
+    FAGKernelParams params{dout,         q,  k,  v,  out,       mask,  softmax_lse, cu_seqlens_q,
+                           cu_seqlens_k, dq, dk, dv, workspace, tiling};
     FAGKernel950 fag;
     fag(params);
 }

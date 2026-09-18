@@ -29,21 +29,15 @@ using AscendC::TQue;
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    class ElementVecDtype,
-    class TilingData>
-class BlockEpilogue<
-    EpilogueAtlasA2FAGPost,
-    ElementVecDtype,
-    TilingData>
-{
-public:
+template <class ElementVecDtype, class TilingData>
+class BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, TilingData> {
+  public:
     using DispatchPolicy = EpilogueAtlasA2FAGPost;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     constexpr static uint32_t POST_BUFFER_NUM = 1;
 
-    AscendC::TPipe *pipe;
+    AscendC::TPipe* pipe;
     TBuf<QuePosition::VECIN> inBuffer;
     TBuf<QuePosition::VECOUT> outBuffer;
 
@@ -65,13 +59,13 @@ public:
     float scaleValue;
 
     CATLASS_DEVICE
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *dq,
-    __gm__ uint8_t *dk, __gm__ uint8_t *dv, __gm__ uint8_t *workspace, __gm__ uint8_t * tiling_in)
+    BlockEpilogue(Arch::Resource<ArchTag>& resource, AscendC::TPipe* pipe_in, __gm__ uint8_t* dq, __gm__ uint8_t* dk,
+                  __gm__ uint8_t* dv, __gm__ uint8_t* workspace, __gm__ uint8_t* tiling_in)
     {
         cBlockIdx = GetBlockIdx();
         pipe = pipe_in;
 
-        __gm__ TilingData *tilingData = reinterpret_cast<__gm__ TilingData *>(tiling_in);
+        __gm__ TilingData* tilingData = reinterpret_cast<__gm__ TilingData*>(tiling_in);
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
         int64_t dkWorkSpaceOffset = tilingData->dkWorkSpaceOffset;
         int64_t dvWorkSpaceOffset = tilingData->dvWorkSpaceOffset;
@@ -80,19 +74,18 @@ public:
         uint32_t coreNum = tilingData->coreNum;
         scaleValue = tilingData->scaleValue;
 
+        dqGm.SetGlobalBuffer((__gm__ ElementVecDtype*)dq);
+        dkGm.SetGlobalBuffer((__gm__ ElementVecDtype*)dk);
+        dvGm.SetGlobalBuffer((__gm__ ElementVecDtype*)dv);
 
-        dqGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dq);
-        dkGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dk);
-        dvGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dv);
-
-        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + tilingData->dqWorkSpaceOffset / sizeof(float));
-        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + tilingData->dkWorkSpaceOffset / sizeof(float));
-        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + tilingData->dvWorkSpaceOffset / sizeof(float));
+        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + tilingData->dqWorkSpaceOffset / sizeof(float));
+        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + tilingData->dkWorkSpaceOffset / sizeof(float));
+        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + tilingData->dvWorkSpaceOffset / sizeof(float));
 
         // compute tiling
         constexpr static uint32_t POST_COEX_NODE = 3;
         constexpr static uint32_t WORKSPACE_NUM_ALIGN = 256;
-        uint32_t curPostCoexNode =  POST_COEX_NODE;
+        uint32_t curPostCoexNode = POST_COEX_NODE;
         uint32_t ubSize = ArchTag::UB_SIZE;
         ubBaseSize = ubSize / curPostCoexNode / POST_BUFFER_NUM;
         ubBaseSize = ubBaseSize / WORKSPACE_NUM_ALIGN * WORKSPACE_NUM_ALIGN;
@@ -122,9 +115,7 @@ public:
     }
 
     CATLASS_DEVICE
-    ~BlockEpilogue()
-    {
-    }
+    ~BlockEpilogue() {}
 
     CATLASS_DEVICE
     void operator()()
@@ -211,6 +202,6 @@ public:
     }
 };
 
-}
+} // namespace Catlass::Epilogue::Block
 
 #endif // CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_FAG_POST_HPP

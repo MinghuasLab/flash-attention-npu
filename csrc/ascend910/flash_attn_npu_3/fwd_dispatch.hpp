@@ -30,34 +30,35 @@ struct FwdLaunchArgs {
     bool is_bf16;
     bool paged_KV;
     bool is_causal;
-    bool is_local;              // sliding-window attention (MASK_SWA)
+    bool is_local; // sliding-window attention (MASK_SWA)
     bool flashDecodeFlag;
     bool has_softcap;
-    uint8_t *qDevice;
-    uint8_t *kDevice;
-    uint8_t *vDevice;
-    uint8_t *kNewDevice;          // may be nullptr when append-KV is disabled
-    uint8_t *vNewDevice;          // may be nullptr when append-KV is disabled
-    uint8_t *maskDevice;          // may be nullptr when is_causal is false
-    uint8_t *blockTableDevice;    // may be nullptr when paged_KV is false
-    uint8_t *oDevice;
-    uint8_t *softmaxLseDevice;
-    uint8_t *qSeqDevice;
-    uint8_t *kvSeqDevice;
-    uint8_t *workspaceDevice;
-    uint8_t *tilingDevice;
+    uint8_t* qDevice;
+    uint8_t* kDevice;
+    uint8_t* vDevice;
+    uint8_t* kNewDevice;       // may be nullptr when append-KV is disabled
+    uint8_t* vNewDevice;       // may be nullptr when append-KV is disabled
+    uint8_t* maskDevice;       // may be nullptr when is_causal is false
+    uint8_t* blockTableDevice; // may be nullptr when paged_KV is false
+    uint8_t* oDevice;
+    uint8_t* softmaxLseDevice;
+    uint8_t* qSeqDevice;
+    uint8_t* kvSeqDevice;
+    uint8_t* workspaceDevice;
+    uint8_t* tilingDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp
 // via fwd_dispatch_impl.hpp. Each TU instantiates one launch_fwd_dtype<DType, IS_TND>.
 template <typename DType, bool IS_TND>
-void launch_fwd_dtype(const FwdLaunchArgs &a);
+void launch_fwd_dtype(const FwdLaunchArgs& a);
 
 // Runtime entry: IS_TND (false => BSND, true => TND) is fixed at the call site,
 // then the matching dtype's launcher is selected. launch_fwd_dtype is explicitly
 // instantiated per (dtype, IS_TND) in the autogen TUs.
 template <bool IS_TND>
-inline void launch_fwd(const FwdLaunchArgs &a) {
+inline void launch_fwd(const FwdLaunchArgs& a)
+{
     if (a.is_bf16) {
         launch_fwd_dtype<bfloat16_t, IS_TND>(a);
     } else {

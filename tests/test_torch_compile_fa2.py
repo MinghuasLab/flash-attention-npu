@@ -10,9 +10,7 @@ from torch_compile_utils import (
 def test_fa2_910_scheduler_metadata_torch_compile_correctness():
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu.flash_attn_npu_interface")
 
     run_metadata_compile_test(
         api,
@@ -29,9 +27,7 @@ def test_fa2_910_scheduler_metadata_torch_compile_correctness():
 def test_fa2_910_varlen_torch_compile_correctness():
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu.flash_attn_npu_interface")
 
     run_varlen_compile_test(
         api,
@@ -40,7 +36,6 @@ def test_fa2_910_varlen_torch_compile_correctness():
 
 
 def test_fa2_910_fixed_torch_compile_correctness():
-
     """
     Verify FA2 fixed-length API correctness.
 
@@ -49,12 +44,9 @@ def test_fa2_910_fixed_torch_compile_correctness():
 
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu.flash_attn_npu_interface")
 
     run_fixed_compile_test(
         api,
         backward=True,
     )
-

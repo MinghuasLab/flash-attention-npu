@@ -2,7 +2,6 @@
 
 import ctypes
 
-import numpy as np
 import pytest
 import torch
 import torch_npu
@@ -118,7 +117,7 @@ def _metadata(
 def _per_batch_alibi_slopes(batch_size, num_heads):
     """[B, H] slopes with genuinely different per-batch rows, so a wrong batch
     stride (every batch reading batch 0's slopes) changes the result."""
-    base = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    base = torch.tensor([0.5 / (2**h) for h in range(num_heads)], dtype=torch.float32)
     scales = 1.0 + torch.arange(batch_size, dtype=torch.float32)
     return base.unsqueeze(0) * scales.unsqueeze(1)
 
@@ -126,9 +125,15 @@ def _per_batch_alibi_slopes(batch_size, num_heads):
 def _make_paged_cache(batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type):
     max_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
     num_blocks = batch_size * max_blocks_per_seq
-    key_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
-    value_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
-    block_table = torch.arange(num_blocks, dtype=torch.int32).reshape(batch_size, max_blocks_per_seq).npu()
+    key_cache = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
+    value_cache = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
+    block_table = (
+        torch.arange(num_blocks, dtype=torch.int32).reshape(batch_size, max_blocks_per_seq).npu()
+    )
     return key_cache, value_cache, block_table
 
 
@@ -163,7 +168,9 @@ def _assert_bsnd_matches_ref(
     )
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
+    assert_fa_close(
+        softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse"
+    )
 
 
 def _assert_tnd_matches_ref(
@@ -188,9 +195,17 @@ def _assert_tnd_matches_ref(
     key_cpu = key_cpu.reshape(batch_size, key_cpu.shape[1], key_cpu.shape[2], key_cpu.shape[3])
     value_cpu = value_cpu.reshape_as(key_cpu)
     mask = _attn_mask(q_offsets[1], key_cpu.shape[1], is_causal, window_size)
-    golden_out_ref, golden_lse_batched_ref, golden_out_pt, golden_lse_batched_pt = ref_flash_attention_pair(
-        query_cpu, key_cpu, value_cpu, scale, mask, data_type, softcap=softcap,
-        alibi_slopes=alibi_slopes,
+    golden_out_ref, golden_lse_batched_ref, golden_out_pt, golden_lse_batched_pt = (
+        ref_flash_attention_pair(
+            query_cpu,
+            key_cpu,
+            value_cpu,
+            scale,
+            mask,
+            data_type,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+        )
     )
     golden_out_ref = golden_out_ref.reshape(q_offsets[-1], num_heads, head_size)
     golden_out_pt = golden_out_pt.reshape(q_offsets[-1], num_heads, head_size)
@@ -199,7 +214,9 @@ def _assert_tnd_matches_ref(
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
     if softmax_lse_npu is not None:
-        assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
+        assert_fa_close(
+            softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse"
+        )
 
 
 @pytest.fixture
@@ -208,6 +225,7 @@ def metadata_spy(monkeypatch):
     through the AICPU scheduler-metadata path internally (official flash-attn
     only exposes scheduler_metadata on flash_attn_with_kvcache)."""
     from flash_attn_npu import flash_attn_npu_interface as interface
+
     calls = []
     original = interface.get_scheduler_metadata
 
@@ -277,6 +295,7 @@ ALIBI_VARLEN_CASES = [
     (torch.float16, 2, 4, 4, 512, 512, 128, False),
 ]
 
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -287,13 +306,24 @@ ALIBI_VARLEN_CASES = [
     ],
 )
 def test_flash_attn_func_metadata_bsnd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
     metadata_spy,
 ):
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
     key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
-    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
-    scale = 1.0 / (head_size ** 0.5)
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
+    )
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_func(
         query,
@@ -333,7 +363,14 @@ def test_flash_attn_func_metadata_bsnd(
     ],
 )
 def test_flash_attn_varlen_func_metadata_tnd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
     metadata_spy,
 ):
     q_lengths = [q_seqlen] * batch_size
@@ -346,7 +383,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
     query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
     key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
     value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_varlen_func(
         query,
@@ -369,8 +406,10 @@ def test_flash_attn_varlen_func_metadata_tnd(
         output_npu,
         softmax_lse_npu,
         query,
-        (key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
-         value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size)),
+        (
+            key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+            value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+        ),
         q_offsets=q_offsets,
         batch_size=batch_size,
         num_heads=num_heads,
@@ -392,13 +431,26 @@ def test_flash_attn_varlen_func_metadata_tnd(
     ],
 )
 def test_flash_attn_func_metadata_swa_softcap(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size, softcap, metadata_spy,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
+    window_size,
+    softcap,
+    metadata_spy,
 ):
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
     key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
-    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
-    scale = 1.0 / (head_size ** 0.5)
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
+    )
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_func(
         query,
@@ -442,8 +494,17 @@ def test_flash_attn_func_metadata_swa_softcap(
     ],
 )
 def test_flash_attn_varlen_func_metadata_swa_softcap(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, window_size, softcap, metadata_spy,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
+    window_size,
+    softcap,
+    metadata_spy,
 ):
     q_lengths = [q_seqlen] * batch_size
     kv_lengths = [kv_seqlen] * batch_size
@@ -455,7 +516,7 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
     query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
     key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
     value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_varlen_func(
         query,
@@ -479,8 +540,10 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
         output_npu,
         softmax_lse_npu,
         query,
-        (key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
-         value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size)),
+        (
+            key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+            value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+        ),
         q_offsets=q_offsets,
         batch_size=batch_size,
         num_heads=num_heads,
@@ -492,6 +555,7 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
         softcap=softcap,
     )
 
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     ALIBI_FUNC_CASES,
@@ -501,16 +565,27 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
     ],
 )
 def test_flash_attn_func_metadata_alibi(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
     metadata_spy,
 ):
     """Per-batch ALiBi slopes must flow through the internal metadata path with
     the batch stride baked into the tiling (the kernel reads it from there)."""
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
     key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
-    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
+    )
     slopes = _per_batch_alibi_slopes(batch_size, num_heads)
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_func(
         query,
@@ -552,7 +627,14 @@ def test_flash_attn_func_metadata_alibi(
     ],
 )
 def test_flash_attn_varlen_func_metadata_alibi(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
     metadata_spy,
 ):
     """Varlen + per-batch ALiBi slopes: the internal metadata call must bake the
@@ -568,7 +650,7 @@ def test_flash_attn_varlen_func_metadata_alibi(
     key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
     value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
     slopes = _per_batch_alibi_slopes(batch_size, num_heads)
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, _ = flash_attn_varlen_func(
         query,
@@ -593,8 +675,10 @@ def test_flash_attn_varlen_func_metadata_alibi(
         output_npu,
         softmax_lse_npu,
         query,
-        (key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
-         value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size)),
+        (
+            key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+            value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+        ),
         q_offsets=q_offsets,
         batch_size=batch_size,
         num_heads=num_heads,
@@ -614,13 +698,11 @@ def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
     query = make_random_tensor(
         (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
     )
-    key = make_random_tensor(
-        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
-    )
+    key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
     value = make_random_tensor(
         (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
     )
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, softmax_lse_npu, s_dmask = flash_attn_func(
         query,
@@ -639,8 +721,9 @@ def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
     # The host patches the AICPU tiling dropout fields on the scheduler-metadata path.
     tiling = _tiling_from_metadata(meta, has_mask=False)
     expected_keep = 1.0 / (1.0 - dropout_p)
-    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, \
+    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, (
         f"dropoutValue={tiling.dropoutValue} 期望 {expected_keep}"
+    )
     assert tiling.dropMaskDevice != 0, "dropMaskDevice 未被补写（nullptr）"
     assert tiling.pDevice != 0, "pDevice 未被补写（return_attn_probs 时应非空）"
 
@@ -648,13 +731,18 @@ def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
     drop_mask = (s_dmask > 0).to(torch.float32).cpu()
     query_cpu, key_cpu, value_cpu = query.cpu(), key.cpu(), value.cpu()
     golden_ref, golden_lse_ref, golden_pt, golden_lse_pt = ref_flash_attention_pair(
-        query_cpu, key_cpu, value_cpu, scale, None, data_type, 0.0,
-        drop_mask=drop_mask, dropout_p=dropout_p,
+        query_cpu,
+        key_cpu,
+        value_cpu,
+        scale,
+        None,
+        data_type,
+        0.0,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
     )
     assert_fa_close(output_npu, golden_ref, golden_pt, name="out")
-    assert_fa_close(
-        softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse"
-    )
+    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
 
 
 def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
@@ -664,16 +752,10 @@ def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
     q_offsets = [0, 512, 812, 940]
     kv_offsets = [0, 1024, 1536, 1792]
     dropout_p = 0.3
-    query = make_random_tensor(
-        (q_offsets[-1], num_heads, head_size), data_type, device="npu"
-    )
-    key = make_random_tensor(
-        (kv_offsets[-1], kv_heads, head_size), data_type, device="npu"
-    )
-    value = make_random_tensor(
-        (kv_offsets[-1], kv_heads, head_size), data_type, device="npu"
-    )
-    scale = 1.0 / (head_size ** 0.5)
+    query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
+    scale = 1.0 / (head_size**0.5)
 
     output_npu, lse_npu, s_dmask = flash_attn_varlen_func(
         query,
@@ -695,8 +777,9 @@ def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
 
     tiling = _tiling_from_metadata(meta, has_mask=False)
     expected_keep = 1.0 / (1.0 - dropout_p)
-    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, \
+    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, (
         f"dropoutValue={tiling.dropoutValue} 期望 {expected_keep}"
+    )
     assert tiling.dropMaskDevice != 0, "dropMaskDevice 未被补写（nullptr）"
     assert tiling.pDevice != 0, "pDevice 未被补写（return_attn_probs 时应非空）"
 
@@ -717,7 +800,7 @@ def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
             None,
             data_type,
             0.0,
-            drop_mask=drop_mask[i:i + 1, :, :qe - qs, :ke - ks],
+            drop_mask=drop_mask[i : i + 1, :, : qe - qs, : ke - ks],
             dropout_p=dropout_p,
         )
         golden_ref[qs:qe] = gout_ref[0]
@@ -741,15 +824,26 @@ def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
     ],
 )
 def test_flash_attn_kvcache_metadata_bsnd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    block_size, is_causal, window_size, softcap
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    block_size,
+    is_causal,
+    window_size,
+    softcap,
 ):
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     scheduler_metadata = _metadata(
         batch_size=batch_size,
@@ -804,10 +898,14 @@ def test_flash_attn_kvcache_metadata_bsnd(
 
 class _CoreNode(ctypes.Structure):
     _fields_ = [
-        ("startBIdx", ctypes.c_int), ("startN1Idx", ctypes.c_int),
-        ("startS1Idx", ctypes.c_int), ("startS2Idx", ctypes.c_int),
-        ("endBIdx", ctypes.c_int), ("endN1Idx", ctypes.c_int),
-        ("endS1Idx", ctypes.c_int), ("endS2Idx", ctypes.c_int),
+        ("startBIdx", ctypes.c_int),
+        ("startN1Idx", ctypes.c_int),
+        ("startS1Idx", ctypes.c_int),
+        ("startS2Idx", ctypes.c_int),
+        ("endBIdx", ctypes.c_int),
+        ("endN1Idx", ctypes.c_int),
+        ("endS1Idx", ctypes.c_int),
+        ("endS2Idx", ctypes.c_int),
         ("firstSplitKVTaskLseOffset", ctypes.c_int64),
         ("firstSplitKVTaskOOffset", ctypes.c_int64),
     ]
@@ -815,36 +913,55 @@ class _CoreNode(ctypes.Structure):
 
 class _SplitNode(ctypes.Structure):
     _fields_ = [
-        ("batchIdx", ctypes.c_int), ("headStartIdx", ctypes.c_int),
-        ("headEndIdx", ctypes.c_int), ("qStartIdx", ctypes.c_int),
-        ("qEndIdx", ctypes.c_int), ("splitNum", ctypes.c_int),
-        ("lseTaskOffset", ctypes.c_int64), ("oTaskOffset", ctypes.c_int64),
+        ("batchIdx", ctypes.c_int),
+        ("headStartIdx", ctypes.c_int),
+        ("headEndIdx", ctypes.c_int),
+        ("qStartIdx", ctypes.c_int),
+        ("qEndIdx", ctypes.c_int),
+        ("splitNum", ctypes.c_int),
+        ("lseTaskOffset", ctypes.c_int64),
+        ("oTaskOffset", ctypes.c_int64),
     ]
 
 
 class _FAInferTilingData(ctypes.Structure):
     """Mirror of csrc/ascend910/flash_attn_npu/tilingdata.h for flag checks."""
+
     _fields_ = [
-        ("numHeads", ctypes.c_uint32), ("embeddingSize", ctypes.c_uint32),
-        ("embeddingSizeV", ctypes.c_uint32), ("numBlocks", ctypes.c_uint32),
-        ("blockSize", ctypes.c_uint32), ("maxQSeqlen", ctypes.c_uint32),
-        ("maxKvSeqlen", ctypes.c_uint32), ("kvHeads", ctypes.c_uint32),
-        ("batch", ctypes.c_uint32), ("maxNumBlocksPerBatch", ctypes.c_uint32),
-        ("firstBatchTaskNum", ctypes.c_uint32), ("totalTaskNum", ctypes.c_uint32),
+        ("numHeads", ctypes.c_uint32),
+        ("embeddingSize", ctypes.c_uint32),
+        ("embeddingSizeV", ctypes.c_uint32),
+        ("numBlocks", ctypes.c_uint32),
+        ("blockSize", ctypes.c_uint32),
+        ("maxQSeqlen", ctypes.c_uint32),
+        ("maxKvSeqlen", ctypes.c_uint32),
+        ("kvHeads", ctypes.c_uint32),
+        ("batch", ctypes.c_uint32),
+        ("maxNumBlocksPerBatch", ctypes.c_uint32),
+        ("firstBatchTaskNum", ctypes.c_uint32),
+        ("totalTaskNum", ctypes.c_uint32),
         ("maskType", ctypes.c_uint32),
-        ("mm1OutSize", ctypes.c_uint64), ("smOnlineOutSize", ctypes.c_uint64),
-        ("mm2OutSize", ctypes.c_uint64), ("UpdateSize", ctypes.c_uint64),
+        ("mm1OutSize", ctypes.c_uint64),
+        ("smOnlineOutSize", ctypes.c_uint64),
+        ("mm2OutSize", ctypes.c_uint64),
+        ("UpdateSize", ctypes.c_uint64),
         ("workSpaceSize", ctypes.c_uint64),
-        ("scaleValue", ctypes.c_float), ("softcapValue", ctypes.c_float),
+        ("scaleValue", ctypes.c_float),
+        ("softcapValue", ctypes.c_float),
         ("dropoutValue", ctypes.c_float),
         ("alibiSlopesBatchStride", ctypes.c_int64),
-        ("padding1", ctypes.c_uint64), ("padding2", ctypes.c_uint64),
+        ("padding1", ctypes.c_uint64),
+        ("padding2", ctypes.c_uint64),
         ("padding3", ctypes.c_uint32),
-        ("windowSizeLeft", ctypes.c_int64), ("windowSizeRight", ctypes.c_int64),
-        ("splitLseTotalSize", ctypes.c_uint64), ("splitOTotalSize", ctypes.c_uint64),
-        ("totalSplitNodeNum", ctypes.c_uint32), ("needCoreNum", ctypes.c_uint32),
+        ("windowSizeLeft", ctypes.c_int64),
+        ("windowSizeRight", ctypes.c_int64),
+        ("splitLseTotalSize", ctypes.c_uint64),
+        ("splitOTotalSize", ctypes.c_uint64),
+        ("totalSplitNodeNum", ctypes.c_uint32),
+        ("needCoreNum", ctypes.c_uint32),
         ("flashDecodeFlag", ctypes.c_uint32),
-        ("kvNewSeqlen", ctypes.c_uint32), ("kvCacheSeqlen", ctypes.c_uint32),
+        ("kvNewSeqlen", ctypes.c_uint32),
+        ("kvCacheSeqlen", ctypes.c_uint32),
         ("coreInfo", _CoreNode * 25),
         ("splitInfo", _SplitNode * 25),
         ("pDevice", ctypes.c_uint64),
@@ -855,7 +972,7 @@ class _FAInferTilingData(ctypes.Structure):
 def _tiling_from_metadata(scheduler_metadata, has_mask):
     raw = scheduler_metadata.cpu().numpy()
     mask_bytes = 2048 * 2048 if has_mask else 0
-    blob = raw[mask_bytes:mask_bytes + ctypes.sizeof(_FAInferTilingData)]
+    blob = raw[mask_bytes : mask_bytes + ctypes.sizeof(_FAInferTilingData)]
     tiling = _FAInferTilingData.from_buffer_copy(blob)
     return tiling
 
@@ -867,12 +984,14 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     q_seqlen, kv_seqlen, head_size, block_size = 1, 4096, 128, 128
     data_type = torch.bfloat16
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     scheduler_metadata = _metadata(
         batch_size=batch_size,
@@ -929,9 +1048,9 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
 @pytest.mark.parametrize(
     "meta_causal, meta_window, call_causal, call_window",
     [
-        (False, (-1, -1), True, (-1, -1)),     # call needs a causal mask, metadata has none
+        (False, (-1, -1), True, (-1, -1)),  # call needs a causal mask, metadata has none
         (False, (-1, -1), False, (128, 128)),  # call needs a band mask, metadata has none
-        (True, (-1, -1), False, (-1, -1)),     # metadata has a causal mask, call needs none
+        (True, (-1, -1), False, (-1, -1)),  # metadata has a causal mask, call needs none
     ],
 )
 def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
@@ -942,7 +1061,9 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -980,7 +1101,9 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -1027,7 +1150,9 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -1064,13 +1189,15 @@ def test_flash_attn_kvcache_metadata_alibi_bsnd():
     batch_size, num_heads, kv_heads = 2, 4, 2
     q_seqlen, kv_seqlen, head_size, block_size = 128, 1024, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
     slopes = _per_batch_alibi_slopes(batch_size, num_heads)
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
 
     scheduler_metadata = _metadata(
         batch_size=batch_size,
@@ -1127,7 +1254,9 @@ def test_flash_attn_kvcache_metadata_alibi_mismatch_rejected():
     batch_size, num_heads, kv_heads = 2, 4, 2
     q_seqlen, kv_seqlen, head_size, block_size = 128, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -1163,7 +1292,9 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -1199,7 +1330,9 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+    )
     key_cache, value_cache, block_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )

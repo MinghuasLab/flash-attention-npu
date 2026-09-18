@@ -34,7 +34,7 @@ struct EpilogueAscend950FAGSubMul {
     static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 };
 
-}  // namespace Catlass::Epilogue
+} // namespace Catlass::Epilogue
 
 namespace Catlass::Gemm {
 struct Ascend950FagL0CLayout {
@@ -65,16 +65,17 @@ struct Ascend950FagL1Layout {
     static constexpr uint32_t L1_EVENT_COUNT = 7;
 
     CATLASS_DEVICE
-    static constexpr uint32_t QSlot(uint32_t taskPing) {
+    static constexpr uint32_t QSlot(uint32_t taskPing)
+    {
         return taskPing ? SLOT_Q1 : SLOT_Q0;
     }
 
     CATLASS_DEVICE
-    static constexpr uint32_t DySlot(uint32_t taskPing) {
+    static constexpr uint32_t DySlot(uint32_t taskPing)
+    {
         return taskPing ? SLOT_DY1 : SLOT_DY0;
     }
 };
-
 
 // Ascend950 / Arch3501 FAG dQKV
 // Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.
@@ -103,7 +104,7 @@ struct MmadAscend950FagSdP {
     static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 };
 
-}
+} // namespace Catlass::Gemm
 // namespace Catlass::Gemm
 
-#endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H
+#endif // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H

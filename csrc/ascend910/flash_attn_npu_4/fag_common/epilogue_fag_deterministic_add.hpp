@@ -20,7 +20,6 @@ using AscendC::QuePosition;
 using AscendC::RoundMode;
 using AscendC::TBuf;
 using AscendC::TQue;
-using AscendC::TQue;
 
 namespace Catlass::Epilogue::Block {
 
@@ -32,14 +31,9 @@ struct IndexParams {
     int64_t s1oIdx;
 };
 
-template <
-    uint32_t INPUT_LAYOUT_
->
-class BlockEpilogue<
-    EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>
->
-{
-public:
+template <uint32_t INPUT_LAYOUT_>
+class BlockEpilogue<EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>> {
+  public:
     using DispatchPolicy = EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     static constexpr uint32_t INPUT_LAYOUT = INPUT_LAYOUT_;
@@ -74,8 +68,8 @@ public:
 
     uint32_t pingpongIdx = 1;
 
-    __gm__ uint8_t *actual_seq_qlen_addr;
-    __gm__ uint8_t *actual_seq_kvlen_addr;
+    __gm__ uint8_t* actual_seq_qlen_addr;
+    __gm__ uint8_t* actual_seq_kvlen_addr;
 
     constexpr static uint32_t ENABLE = 1;
 
@@ -84,18 +78,18 @@ public:
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
     constexpr static uint32_t ADDR_ALIGN_SIZE = 512;
 
-    constexpr static int8_t OUTIDX= -1;
+    constexpr static int8_t OUTIDX = -1;
 
-    __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
+    __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
     {
         if (unlikely(bIdx == 0)) {
-            actualSeqQlen = ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
-            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
+            actualSeqQlen = ((__gm__ int32_t*)actual_seq_qlen_addr)[0];
+            actualSeqKvlen = ((__gm__ int32_t*)actual_seq_kvlen_addr)[0];
         } else {
             actualSeqQlen =
-                ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
+                ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx - 1];
             actualSeqKvlen =
-                ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
+                ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx - 1];
         }
         return;
     }
@@ -103,7 +97,7 @@ public:
     CATLASS_DEVICE
     void GetIndex(int64_t baseIdx, IndexParams& idx)
     {
-        if constexpr(INPUT_LAYOUT == TND) {
+        if constexpr (INPUT_LAYOUT == TND) {
             int32_t actualSeqQlen = 0;
             int32_t actualSeqKvlen = 0;
             int64_t resbaseIdx = baseIdx;
@@ -128,7 +122,7 @@ public:
         } else {
             idx.bIdx = baseIdx / (n2 * s2Outer * g * s1Outer);
             int64_t bDimTail = baseIdx % (n2 * s2Outer * g * s1Outer);
-            idx.n2Idx  = bDimTail / (s2Outer * g * s1Outer);
+            idx.n2Idx = bDimTail / (s2Outer * g * s1Outer);
             int64_t n2DimTail = baseIdx % (s2Outer * g * s1Outer);
             idx.s2oIdx = n2DimTail / (g * s1Outer);
             int64_t s2oDimTail = n2DimTail % (g * s1Outer);
@@ -138,15 +132,16 @@ public:
     }
 
     CATLASS_DEVICE
-    void CalcDqReduce(DBParams& dbParam,
-    GlobalTensor<float> &srcTensor, GlobalTensor<float> &dstTensor, int64_t d, int64_t dAlign, uint32_t vecCalBlockNum)
+    void CalcDqReduce(DBParams& dbParam, GlobalTensor<float>& srcTensor, GlobalTensor<float>& dstTensor, int64_t d,
+                      int64_t dAlign, uint32_t vecCalBlockNum)
     {
         pingpongIdx = dbParam.taskId % 2;
         uint32_t s1CalcInner = (s1CvInner + vecCalBlockNum - 1) / vecCalBlockNum;
         int64_t singleCoreDataNum = s1CalcInner * dAlign;
 
         LocalTensor<float> dqRes = unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, 0);
-        LocalTensor<float> inBuf = unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, singleCoreDataNum * sizeof(float));
+        LocalTensor<float> inBuf =
+            unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, singleCoreDataNum * sizeof(float));
 
         for (int8_t groupId = 0; groupId < cubeCoreNum; groupId++) {
             if (dbParam.blockIdArr[groupId] == -1) {
@@ -178,9 +173,10 @@ public:
 
                     //copyOut & add
                     uint64_t srcOffset = pingpongIdx * cubeCoreNum * s1CvInner * dAlign + coreId * s1CvInner * dAlign +
-                                    cBlockIdx % vecCalBlockNum * s1CalcInner * d;
+                                         cBlockIdx % vecCalBlockNum * s1CalcInner * d;
 
-                    event_t eventIdVToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
+                    event_t eventIdVToMTE2 =
+                        static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventIdVToMTE2);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventIdVToMTE2);
                     DataCopy(inBuf, srcTensor[srcOffset], s1CalcExtend * d);
@@ -189,7 +185,7 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
                     Add(dqRes, dqRes, inBuf, s1CalcExtend * d);
                     event_t mte2WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV);  // 循环间的反向同步
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV); // 循环间的反向同步
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV);
                 }
             }
@@ -202,12 +198,20 @@ public:
 
                 if constexpr (INPUT_LAYOUT == TND) {
                     if (idx.bIdx > 0) {
-                        dstOffset = ((__gm__ int32_t *)actual_seq_qlen_addr)[idx.bIdx - 1] * n2 * g * d;
+                        dstOffset = ((__gm__ int32_t*)actual_seq_qlen_addr)[idx.bIdx - 1] * n2 * g * d;
                     }
-                    dstOffset += (((idx.s1oIdx * s1CvInner + cBlockIdx % vecCalBlockNum * s1CalcInner) * n2 + idx.n2Idx) * g + idx.gIdx) * d;
+                    dstOffset +=
+                        (((idx.s1oIdx * s1CvInner + cBlockIdx % vecCalBlockNum * s1CalcInner) * n2 + idx.n2Idx) * g +
+                         idx.gIdx) *
+                        d;
                     copyOutDstStride = n2 * g * d - d;
                 } else if constexpr (INPUT_LAYOUT == BSND) {
-                    dstOffset = (((idx.bIdx * s1 + idx.s1oIdx * s1CvInner + cBlockIdx % vecCalBlockNum * s1CalcInner) * n2 + idx.n2Idx) * g + idx.gIdx) * d;
+                    dstOffset =
+                        (((idx.bIdx * s1 + idx.s1oIdx * s1CvInner + cBlockIdx % vecCalBlockNum * s1CalcInner) * n2 +
+                          idx.n2Idx) *
+                             g +
+                         idx.gIdx) *
+                        d;
                     copyOutDstStride = n2 * g * d - d;
                 }
 
@@ -217,22 +221,23 @@ public:
                 AscendC::SetAtomicAdd<float>();
                 DataCopyPad(dstTensor[dstOffset], dqRes,
                             {static_cast<uint16_t>(maxS1Extend), static_cast<uint32_t>(d * sizeof(float)), 0,
-                            static_cast<uint32_t>(copyOutDstStride * sizeof(float)), 0});
+                             static_cast<uint32_t>(copyOutDstStride * sizeof(float)), 0});
                 AscendC::SetAtomicNone();
             }
         }
     }
 
     CATLASS_DEVICE
-    void CalcDkvReduce(DBParams& dbParam,
-    GlobalTensor<float> &srcTensor, GlobalTensor<float> &dstTensor, int64_t d, int64_t dAlign, uint32_t vecCalBlockNum)
+    void CalcDkvReduce(DBParams& dbParam, GlobalTensor<float>& srcTensor, GlobalTensor<float>& dstTensor, int64_t d,
+                       int64_t dAlign, uint32_t vecCalBlockNum)
     {
         pingpongIdx = dbParam.taskId % 2;
         uint32_t s2CalcInner = (s2CvInner + vecCalBlockNum - 1) / vecCalBlockNum;
         int64_t singleCoreDataNum = s2CalcInner * dAlign;
 
         LocalTensor<float> resBuf = unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, 0);
-        LocalTensor<float> inBuf = unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, singleCoreDataNum * sizeof(float));
+        LocalTensor<float> inBuf =
+            unifiedBuffer.GetWithOffset<float>(singleCoreDataNum, singleCoreDataNum * sizeof(float));
 
         // 按gs1方向连续分核，dk、dv需要累加的数据是连续的
         for (int8_t groupId = 0; groupId < cubeCoreNum; groupId++) {
@@ -264,9 +269,10 @@ public:
                     maxS2Extend = maxS2Extend > s2CalcExtend ? maxS2Extend : s2CalcExtend;
 
                     uint64_t srcOffset = pingpongIdx * cubeCoreNum * s2CvInner * dAlign + coreId * s2CvInner * dAlign +
-                                    cBlockIdx % vecCalBlockNum * s2CalcInner * d;
+                                         cBlockIdx % vecCalBlockNum * s2CalcInner * d;
 
-                    event_t eventIdVToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
+                    event_t eventIdVToMTE2 =
+                        static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventIdVToMTE2);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventIdVToMTE2);
                     DataCopy(inBuf, srcTensor[srcOffset], s2CalcExtend * d);
@@ -275,9 +281,8 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
                     Add(resBuf, resBuf, inBuf, s2CalcExtend * d);
                     event_t mte2WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV);  // 循环间的反向同步
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV); // 循环间的反向同步
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(mte2WaitV);
-                    
                 }
             }
             //copyOut
@@ -289,12 +294,16 @@ public:
 
                 if constexpr (INPUT_LAYOUT == TND) {
                     if (idx.bIdx > 0) {
-                        dstOffset = ((__gm__ int32_t *)actual_seq_kvlen_addr)[idx.bIdx - 1] * n2 * d;
+                        dstOffset = ((__gm__ int32_t*)actual_seq_kvlen_addr)[idx.bIdx - 1] * n2 * d;
                     }
-                    dstOffset += ((idx.s2oIdx * s2CvInner + cBlockIdx % vecCalBlockNum * s2CalcInner) * n2 + idx.n2Idx) * d;
+                    dstOffset +=
+                        ((idx.s2oIdx * s2CvInner + cBlockIdx % vecCalBlockNum * s2CalcInner) * n2 + idx.n2Idx) * d;
                     copyOutDstStride = n2 * d - d;
                 } else if constexpr (INPUT_LAYOUT == BSND) {
-                    dstOffset = ((idx.bIdx * s2 + idx.s2oIdx * s2CvInner + cBlockIdx % vecCalBlockNum * s2CalcInner) * n2 + idx.n2Idx) * d;
+                    dstOffset =
+                        ((idx.bIdx * s2 + idx.s2oIdx * s2CvInner + cBlockIdx % vecCalBlockNum * s2CalcInner) * n2 +
+                         idx.n2Idx) *
+                        d;
                     copyOutDstStride = n2 * d - d;
                 }
 
@@ -302,23 +311,24 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(mte3WaitV);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(mte3WaitV);
                 AscendC::SetAtomicAdd<float>();
-                DataCopyPad(dstTensor[dstOffset], resBuf, 
-                    {static_cast<uint16_t>(maxS2Extend), static_cast<uint32_t>(d * sizeof(float)), 0,
-                    static_cast<uint32_t>(copyOutDstStride * sizeof(float)), 0});
+                DataCopyPad(dstTensor[dstOffset], resBuf,
+                            {static_cast<uint16_t>(maxS2Extend), static_cast<uint32_t>(d * sizeof(float)), 0,
+                             static_cast<uint32_t>(copyOutDstStride * sizeof(float)), 0});
                 AscendC::SetAtomicNone();
             }
         }
     }
 
     CATLASS_DEVICE
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling_in, TBuf<>& buf)
+    BlockEpilogue(Arch::Resource<ArchTag>& resource, __gm__ uint8_t* actual_seq_qlen, __gm__ uint8_t* actual_seq_kvlen,
+                  __gm__ uint8_t* workspace, __gm__ uint8_t* tiling_in, TBuf<>& buf)
     {
         unifiedBuffer = buf;
         cBlockIdx = GetBlockIdx();
         cCubeBlockIdx = cBlockIdx / 2;
         cSubIdx = cBlockIdx % 2;
 
-        __gm__ FAGTilingData *tilingData = reinterpret_cast<__gm__ FAGTilingData *>(tiling_in);
+        __gm__ FAGTilingData* tilingData = reinterpret_cast<__gm__ FAGTilingData*>(tiling_in);
 
         coreNum = tilingData->coreNum;
         cubeCoreNum = coreNum / 2;
@@ -347,13 +357,12 @@ public:
     }
 
     CATLASS_DEVICE
-    ~BlockEpilogue()
-    {
-    }
+    ~BlockEpilogue() {}
 
     CATLASS_DEVICE
-    void operator()(DBParams& dbParam, GlobalTensor<float>& dqWorkSpaceGm, GlobalTensor<float>& dkWorkSpaceGm, GlobalTensor<float>& dvWorkSpaceGm,
-        GlobalTensor<float>& dqDtmWsGm, GlobalTensor<float>& dkDtmWsGm, GlobalTensor<float>& dvDtmWsGm)
+    void operator()(DBParams& dbParam, GlobalTensor<float>& dqWorkSpaceGm, GlobalTensor<float>& dkWorkSpaceGm,
+                    GlobalTensor<float>& dvWorkSpaceGm, GlobalTensor<float>& dqDtmWsGm, GlobalTensor<float>& dkDtmWsGm,
+                    GlobalTensor<float>& dvDtmWsGm)
     {
         int64_t s1CalcInner = (s1CvInner + vecBlockNum - 1) / vecBlockNum;
         int64_t s2CalcInner = (s2CvInner + vecBlockNum - 1) / vecBlockNum;
@@ -362,7 +371,7 @@ public:
         // coreNum` as vecCalBlockNum to ensure global deterministic accumulation and stable numerical precision.
         // workspace不足，计算降为全核reduction，用coreNum作为vecCalBlockNum来确保全局确定性累加和数值精度稳定
         if (unlikely(s1CalcInner * dAlign * sizeof(float) * 2 > TOTAL_SIZE ||
-            s2CalcInner * dAlign * sizeof(float) * 2 > TOTAL_SIZE)) {
+                     s2CalcInner * dAlign * sizeof(float) * 2 > TOTAL_SIZE)) {
             CalcDqReduce(dbParam, dqDtmWsGm, dqWorkSpaceGm, d, dAlign, coreNum);
             CalcDkvReduce(dbParam, dkDtmWsGm, dkWorkSpaceGm, d, dAlign, coreNum);
             CalcDkvReduce(dbParam, dvDtmWsGm, dvWorkSpaceGm, value_d, value_dAlign, coreNum);
@@ -378,6 +387,6 @@ public:
     }
 };
 
-}
+} // namespace Catlass::Epilogue::Block
 
 #endif // FAG_COMMON_EPILOGUE_FAG_DETERMINISTIC_ADD_HPP

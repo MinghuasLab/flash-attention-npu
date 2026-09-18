@@ -23,7 +23,7 @@ DTYPE_MAP = {
 # layout key -> (display name, IS_TND bool token)
 LAYOUTS = [
     ("bsnd", "BSND", "false"),
-    ("tnd",  "TND",  "true"),
+    ("tnd", "TND", "true"),
 ]
 
 PRELUDE = (
@@ -46,8 +46,7 @@ def fwd_kernel(dtype_key: str, layout: tuple) -> Kernel:
     ctype = DTYPE_MAP[dtype_key]
     layout_key, display, is_tnd = layout
     content = (
-        PRELUDE
-        + f"// v3 (950) forward FAInfer dispatch, {dtype_key} x {display} variant.\n"
+        PRELUDE + f"// v3 (950) forward FAInfer dispatch, {dtype_key} x {display} variant.\n"
         "// One explicit instantiation per translation unit so the FAInfer / FAInferDn\n"
         "// kernel templates compile in parallel across cores; head_dim is a runtime\n"
         "// tiling axis (not a template parameter), so it is not a generation axis.\n\n"
@@ -82,9 +81,10 @@ if __name__ == "__main__":
         "(per dtype x layout; head_dim is a runtime axis and is not generated).",
     )
     parser.add_argument(
-        "-o", "--output_dir", required=False,
-        help="Where to generate the dispatch .cpp stubs; "
-             "defaults to this script's directory.",
+        "-o",
+        "--output_dir",
+        required=False,
+        help="Where to generate the dispatch .cpp stubs; defaults to this script's directory.",
     )
     args = parser.parse_args()
     main(args.output_dir)

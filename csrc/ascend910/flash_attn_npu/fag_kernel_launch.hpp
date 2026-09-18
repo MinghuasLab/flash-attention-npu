@@ -50,23 +50,22 @@
 // (no free identifiers), and every runtime argument is read from the
 // FagGeneralLaunchArgs `a` of the enclosing combo launcher. The drop_mask
 // kernel arg is a.dropMaskDevice (nullptr when dropout is off).
-#define FAG_KERNEL_LAUNCH(DTYPE, KINPUTLAYOUT, DT_ALIGNED, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP)   \
-    FAG_BOOL_SWITCH(a.has_alibi, IsAlibi, {                                                             \
-        ::FAGGeneral<DTemplateType::DT_ALIGNED, DTYPE, KINPUTLAYOUT, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IsAlibi> \
-            <<<a.blockDim, nullptr, a.aclStream>>>(                                                  \
-                a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice,                           \
-                a.outDevice, a.dropMaskDevice, a.attenMaskDevice, a.softMaxLseDevice,                \
-                a.cuSeqQlenDevice, a.cuSeqKvlenDevice, a.dqDevice, a.dkDevice,                       \
-                a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice);                  \
+#define FAG_KERNEL_LAUNCH(DTYPE, KINPUTLAYOUT, DT_ALIGNED, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP)                     \
+    FAG_BOOL_SWITCH(a.has_alibi, IsAlibi, {                                                                            \
+        ::FAGGeneral<DTemplateType::DT_ALIGNED, DTYPE, KINPUTLAYOUT, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IsAlibi>  \
+            <<<a.blockDim, nullptr, a.aclStream>>>(                                                                    \
+                a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice, a.outDevice, a.dropMaskDevice,              \
+                a.attenMaskDevice, a.softMaxLseDevice, a.cuSeqQlenDevice, a.cuSeqKvlenDevice, a.dqDevice, a.dkDevice,  \
+                a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice);                                   \
     });
 
-#define FAG_BOOL_SWITCH(COND, CONST_NAME, ...)             \
-    do {                                                   \
-        if (COND) {                                        \
-            constexpr bool CONST_NAME = true;              \
-            __VA_ARGS__                                    \
-        } else {                                           \
-            constexpr bool CONST_NAME = false;             \
-            __VA_ARGS__                                    \
-        }                                                  \
+#define FAG_BOOL_SWITCH(COND, CONST_NAME, ...)                                                                         \
+    do {                                                                                                               \
+        if (COND) {                                                                                                    \
+            constexpr bool CONST_NAME = true;                                                                          \
+            __VA_ARGS__                                                                                                \
+        } else {                                                                                                       \
+            constexpr bool CONST_NAME = false;                                                                         \
+            __VA_ARGS__                                                                                                \
+        }                                                                                                              \
     } while (0)

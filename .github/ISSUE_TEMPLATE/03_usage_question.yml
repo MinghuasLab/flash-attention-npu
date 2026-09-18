@@ -8,7 +8,9 @@ body:
   - type: markdown
     attributes:
       value: >
-        #### Before submitting an issue, please make sure the issue hasn't been already open or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+        #### Before submitting an issue, please make sure the issue hasn't been already open or
+        addressed by searching through
+        [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
   - type: checkboxes
     id: preflight
     attributes:
@@ -34,7 +36,9 @@ body:
     id: question
     attributes:
       label: What is your question or problem?
-      description: Describe your question or the problem you encountered. Include any relevant error messages or unexpected behavior.
+      description: >-
+        Describe your question or the problem you encountered. Include any relevant error messages
+        or unexpected behavior.
     validations:
       required: true
 

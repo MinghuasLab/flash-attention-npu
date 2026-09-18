@@ -14,10 +14,10 @@ struct FAGTilingData {
     int64_t batch;
     int64_t qSeqlen;
     int64_t qHeadNum;
-    int64_t qkHeadDim;   // query, key dim
+    int64_t qkHeadDim; // query, key dim
     int64_t kvSeqlen;
     int64_t kvHeadNum;
-    int64_t vHeadDim;    // value dim
+    int64_t vHeadDim; // value dim
     int64_t g;
     uint32_t s1Align = 0;
     uint32_t s2Align;
@@ -137,7 +137,7 @@ struct DBParams {
     int32_t actualS2Len{0};
     int64_t s1Stride;
     int64_t s2Stride;
-    int64_t blockIdArr[24];  //确定性计算预留
+    int64_t blockIdArr[24]; //确定性计算预留
     int32_t s1CvExtendArr[24];
     int32_t s2CvExtendArr[24];
     int8_t dqGroupId[24];
@@ -163,42 +163,16 @@ struct FAGKernelParams {
     GM_ADDR tiling;
     // Methods
     CATLASS_DEVICE
-    FAGKernelParams() {
-    }
+    FAGKernelParams() {}
     CATLASS_DEVICE
-    FAGKernelParams(GM_ADDR dout_,
-                    GM_ADDR q_,
-                    GM_ADDR k_,
-                    GM_ADDR v_,
-                    GM_ADDR out_,
+    FAGKernelParams(GM_ADDR dout_, GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR out_,
                     GM_ADDR drop_mask_, // nullptr
-                    GM_ADDR atten_mask_,
-                    GM_ADDR softmax_lse_,
-                    GM_ADDR cu_seq_qlen_,
-                    GM_ADDR cu_seq_kvlen_,
-                    GM_ADDR dq_,
-                    GM_ADDR dk_,
-                    GM_ADDR dv_,
-                    GM_ADDR alibi_slopes_,
-                    GM_ADDR workspace_,
-                    GM_ADDR tiling_)
-        : dout(dout_)
-        , q(q_)
-        , k(k_)
-        , v(v_)
-        , out(out_)
-        , drop_mask(drop_mask_)
-        , atten_mask(atten_mask_)
-        , softmax_lse(softmax_lse_)
-        , cu_seq_qlen(cu_seq_qlen_)
-        , cu_seq_kvlen(cu_seq_kvlen_)
-        , dq(dq_)
-        , dk(dk_)
-        , dv(dv_)
-        , alibi_slopes(alibi_slopes_)
-        , workspace(workspace_)
-        , tiling(tiling_){
-    }
+                    GM_ADDR atten_mask_, GM_ADDR softmax_lse_, GM_ADDR cu_seq_qlen_, GM_ADDR cu_seq_kvlen_, GM_ADDR dq_,
+                    GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_, GM_ADDR workspace_, GM_ADDR tiling_)
+        : dout(dout_), q(q_), k(k_), v(v_), out(out_), drop_mask(drop_mask_), atten_mask(atten_mask_),
+          softmax_lse(softmax_lse_), cu_seq_qlen(cu_seq_qlen_), cu_seq_kvlen(cu_seq_kvlen_), dq(dq_), dk(dk_), dv(dv_),
+          alibi_slopes(alibi_slopes_), workspace(workspace_), tiling(tiling_)
+    {}
 };
 
 inline int64_t CeilCommon(int64_t num1, int64_t num2)
@@ -209,7 +183,8 @@ inline int64_t CeilCommon(int64_t num1, int64_t num2)
     return (num1 + num2 - 1) / num2;
 }
 
-template <class T> inline T AlignTo(const T n, const T alignSize)
+template <class T>
+inline T AlignTo(const T n, const T alignSize)
 {
     if (alignSize == 0) {
         return 0;
@@ -217,7 +192,8 @@ template <class T> inline T AlignTo(const T n, const T alignSize)
     return (n + alignSize - 1) & (~(alignSize - 1));
 }
 
-template <typename T> inline T AlignUp(T num1, T num2)
+template <typename T>
+inline T AlignUp(T num1, T num2)
 {
     if (num2 == 0) {
         return 0;

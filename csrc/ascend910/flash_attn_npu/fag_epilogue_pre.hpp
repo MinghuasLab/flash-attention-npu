@@ -18,19 +18,13 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    class ElementVecDtype,
-    class TilingData>
-class BlockEpilogue<
-    EpilogueAtlasA2FAGPre,
-    ElementVecDtype,
-    TilingData>
-{
-public:
+template <class ElementVecDtype, class TilingData>
+class BlockEpilogue<EpilogueAtlasA2FAGPre, ElementVecDtype, TilingData> {
+  public:
     using DispatchPolicy = EpilogueAtlasA2FAGPre;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
-    AscendC::TPipe *pipe;
+    AscendC::TPipe* pipe;
     AscendC::GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm;
 
     uint32_t cBlockIdx;
@@ -47,14 +41,14 @@ public:
     int64_t dkvOffset;
 
     CATLASS_DEVICE
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *dq,
-    __gm__ uint8_t *dk, __gm__ uint8_t *dv, __gm__ uint8_t *drop_mask, __gm__ uint8_t *workspace, __gm__ uint8_t * tiling_in)
+    BlockEpilogue(Arch::Resource<ArchTag>& resource, AscendC::TPipe* pipe_in, __gm__ uint8_t* dq, __gm__ uint8_t* dk,
+                  __gm__ uint8_t* dv, __gm__ uint8_t* drop_mask, __gm__ uint8_t* workspace, __gm__ uint8_t* tiling_in)
     {
         cBlockIdx = AscendC::GetBlockIdx();
         pipe = pipe_in;
         (void)drop_mask;
 
-        __gm__ TilingData *tilingData = reinterpret_cast<__gm__ TilingData *>(tiling_in);
+        __gm__ TilingData* tilingData = reinterpret_cast<__gm__ TilingData*>(tiling_in);
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
         int64_t dkWorkSpaceOffset = tilingData->dkWorkSpaceOffset;
         int64_t dvWorkSpaceOffset = tilingData->dvWorkSpaceOffset;
@@ -73,9 +67,9 @@ public:
         int64_t kvPreTailNumTmp = kvSize % kvPreBlockFactor;
         kvPreBlockTail = kvPreTailNumTmp == 0 ? kvPreBlockFactor : kvPreTailNumTmp;
 
-        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dqWorkSpaceOffset / sizeof(float));
-        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dkWorkSpaceOffset / sizeof(float));
-        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dvWorkSpaceOffset / sizeof(float));
+        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + dqWorkSpaceOffset / sizeof(float));
+        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + dkWorkSpaceOffset / sizeof(float));
+        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float*)workspace + dvWorkSpaceOffset / sizeof(float));
 
         initdqSize = cBlockIdx == qPreBlockTotal - 1 ? qPreBlockTail : qPreBlockFactor;
         dqOffset = ((int64_t)cBlockIdx) * qPreBlockFactor;
@@ -84,9 +78,7 @@ public:
     }
 
     CATLASS_DEVICE
-    ~BlockEpilogue()
-    {
-    }
+    ~BlockEpilogue() {}
 
     CATLASS_DEVICE
     void operator()()
@@ -102,6 +94,6 @@ public:
     }
 };
 
-}
+} // namespace Catlass::Epilogue::Block
 
 #endif // CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_FAG_PRE_HPP

@@ -30,9 +30,9 @@ struct FAGInfo {
     int64_t valueShape_1;
 };
 
-int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *tilingHost, uint64_t& workspaceSize)
+int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t& blockDim, int64_t* tilingHost, uint64_t& workspaceSize)
 {
-    auto *fagV2TilingData = reinterpret_cast<FAGv2TilingData *>(tilingHost);
+    auto* fagV2TilingData = reinterpret_cast<FAGv2TilingData*>(tilingHost);
     std::memset(fagV2TilingData, 0, sizeof(FAGv2TilingData));
 
     uint64_t g = fagInfo.queryShape_1 / fagInfo.keyShape_1;
@@ -48,21 +48,19 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     std::vector<uint32_t> softmaxShape = {s1VecSize, s2VecSize};
 
     SoftMaxTiling softmaxTilingData;
-    SoftMaxTilingFunc(
-        softmaxShape, sizeof(float), tmpBufferSize, softmaxTilingData);
+    SoftMaxTilingFunc(softmaxShape, sizeof(float), tmpBufferSize, softmaxTilingData);
 
     // softmaxGrad tiling
     constexpr uint32_t inputBufferLen = 24 * 1024;
     constexpr uint32_t castBufferLen = 48 * 1024; // castBuffer 48K*2=96K
-    uint32_t outputBufferLen = (castBufferLen + fagInfo.queryShape_2 - 1) /  fagInfo.queryShape_2 * 8;
+    uint32_t outputBufferLen = (castBufferLen + fagInfo.queryShape_2 - 1) / fagInfo.queryShape_2 * 8;
     uint32_t tempBufferLen = 40 * 1024 - outputBufferLen;
 
     int64_t singleLoopNBurstNum = inputBufferLen / sizeof(float) / fagInfo.queryShape_2;
     std::vector<int64_t> softmaxGradShape = {singleLoopNBurstNum, fagInfo.queryShape_2};
 
     SoftMaxTiling softmaxGradTilingData;
-    SoftMaxGradTilingFunc(softmaxGradShape, sizeof(float), tempBufferLen, 
-        softmaxGradTilingData);
+    SoftMaxGradTilingFunc(softmaxGradShape, sizeof(float), tempBufferLen, softmaxGradTilingData);
 
     // put SoftMaxData in Tiling
     uint32_t coreNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
@@ -81,7 +79,7 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     fagV2TilingData->kvSize = kvSize;
     fagV2TilingData->alibiSlopesBatchStride = fagInfo.alibiSlopesBatchStride;
 
-    // TODO set workspace offset 
+    // TODO set workspace offset
     constexpr size_t WORKSPACE_RSV_BYTE = 16 * 1024 * 1024;
     constexpr size_t GM_ALIGN = 512;
     constexpr size_t DB_NUM = 2;
@@ -90,38 +88,32 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     size_t workspaceOffset = WORKSPACE_RSV_BYTE;
     // matmal3 q
     fagV2TilingData->dqWorkSpaceOffset = workspaceOffset;
-    workspaceOffset =
-        (workspaceOffset + qSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + qSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     // matmal3 k
     fagV2TilingData->dkWorkSpaceOffset = workspaceOffset;
-    workspaceOffset =
-        (workspaceOffset + kvSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + kvSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     // matmal3 v
     fagV2TilingData->dvWorkSpaceOffset = workspaceOffset;
-    workspaceOffset =
-        (workspaceOffset + kvSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + kvSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     // sfmg workspace
     fagV2TilingData->sfmgPreBeginAddr = workspaceOffset;
-    workspaceOffset =
-        (workspaceOffset + sfmgSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + sfmgSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     // matmal1/matmal2 workspace size
     fagV2TilingData->mm1WorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
+    workspaceOffset =
         (workspaceOffset + coreNum * matmulSize * sizeof(float) * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     fagV2TilingData->mm2WorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
+    workspaceOffset =
         (workspaceOffset + coreNum * matmulSize * sizeof(float) * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     constexpr uint32_t size_of_half = 2;
     fagV2TilingData->pWorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
-        (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     fagV2TilingData->dsWorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
-        (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceOffset = (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     workspaceSize = workspaceOffset;
 
     std::memcpy(&(fagV2TilingData->softmaxTilingData), &softmaxTilingData, sizeof(SoftMaxTiling));
@@ -129,4 +121,4 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     return 0;
 }
 
-} // namespace UnpadFATiling
+} // namespace FAGTiling

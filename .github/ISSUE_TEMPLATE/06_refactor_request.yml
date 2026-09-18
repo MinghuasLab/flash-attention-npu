@@ -7,7 +7,9 @@ body:
   - type: markdown
     attributes:
       value: >
-        #### Thanks for helping improve maintainability! Before submitting an issue, please make sure the issue hasn't been already open or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+        #### Thanks for helping improve maintainability! Before submitting an issue, please make sure
+        the issue hasn't been already open or addressed by searching through
+        [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
   - type: textarea
     id: target
     attributes:
@@ -19,7 +21,9 @@ body:
     id: current
     attributes:
       label: Current state & problem
-      description: What does it look like currently, and why is that a problem (readability, duplication, performance, correctness risk)?
+      description: >-
+        What does it look like currently, and why is that a problem (readability, duplication,
+        performance, correctness risk)?
     validations:
       required: true
   - type: textarea

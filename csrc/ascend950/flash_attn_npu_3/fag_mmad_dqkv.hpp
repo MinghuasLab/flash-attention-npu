@@ -20,31 +20,11 @@
 
 namespace Catlass::Gemm::Block {
 
-template <
-    uint32_t L1A_STAGES_,
-    uint32_t L1B_STAGES_,
-    bool ENABLE_UNIT_FLAG_,
-    class L1TileShape_,
-    class L0TileShape_,
-    class ElementA_,
-    class ElementB_,
-    class ElementC_,
-    class ElementBias_,
-    class TileCopy_,
-    class TileMmad_
->
-struct BlockMmadTla <
-    MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>,
-    L1TileShape_,
-    L0TileShape_,
-    ElementA_,
-    ElementB_,
-    ElementC_,
-    ElementBias_,
-    TileCopy_,
-    TileMmad_
-> {
-public:
+template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, bool ENABLE_UNIT_FLAG_, class L1TileShape_, class L0TileShape_,
+          class ElementA_, class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>, L1TileShape_, L0TileShape_,
+                    ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
+  public:
     using DispatchPolicy = MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
@@ -69,17 +49,17 @@ public:
     using L1BAlignHelper = typename TileCopy::L1BAlignHelper;
 
     // ColumnMajor-A TileCopy for dk/dv (dS^T / P^T)
-    using TileCopyCol = Gemm::Tile::PackedTileCopyTla<
-        ArchTag, ElementA, layout::ColumnMajor, ElementB, layout::RowMajor, ElementC, layout::RowMajor>;
+    using TileCopyCol = Gemm::Tile::PackedTileCopyTla<ArchTag, ElementA, layout::ColumnMajor, ElementB,
+                                                      layout::RowMajor, ElementC, layout::RowMajor>;
     using LayoutTagL1ACol = typename TileCopyCol::LayoutTagL1A; // nZ
     using LayoutTagL0ACol = typename TileCopyCol::LayoutTagL0A; // zN
     using CopyL1ToL0ACol = typename TileCopyCol::CopyL1ToL0A;
     using TileMmadCol = Gemm::Tile::TileMmadTla<ArchTag, ElementA, LayoutTagL1ACol>;
 
     static_assert(tla::is_tuple<L1TileShape>::value && tla::is_static<L1TileShape>::value,
-        "L1TileShape must be tla::tuple and static!");
+                  "L1TileShape must be tla::tuple and static!");
     static_assert(tla::is_tuple<L0TileShape>::value && tla::is_static<L0TileShape>::value,
-        "L0TileShape must be tla::tuple and static!");
+                  "L0TileShape must be tla::tuple and static!");
     static_assert(std::is_same_v<ArchTag, Arch::Ascend950>, "Requires Ascend950");
 
     static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
@@ -105,17 +85,15 @@ public:
 
     static constexpr uint32_t L1_TILE_MAX = BASE * 256 * sizeof(ElementA);
     static constexpr uint32_t L1_TILE_HALF = BASE * BASE * sizeof(ElementA);
-    static constexpr uint32_t L1_KT_OFFSET =
-        Ascend950FagL1Layout::SLOT_RES_KT * L1_TILE_MAX;
+    static constexpr uint32_t L1_KT_OFFSET = Ascend950FagL1Layout::SLOT_RES_KT * L1_TILE_MAX;
     // RowMajor K packs into the upper half of the RES_KT 64KB slot when D<=BASE
     // (lower half holds K^T for C1). D>BASE keeps streaming K via DY scratch.
     static constexpr uint32_t L1_K_OFFSET = L1_KT_OFFSET + L1_TILE_HALF;
     static constexpr uint32_t L1_EVENT_K = Ascend950FagL1Layout::L1_EVENT_K;
-    static_assert(
-        Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX +
-            2 * Ascend950FagL1Layout::TASK_PINGPONG * BASE * BASE * sizeof(ElementA) <=
-            ArchTag::L1_SIZE,
-        "L1 overflow");
+    static_assert(Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX +
+                          2 * Ascend950FagL1Layout::TASK_PINGPONG * BASE * BASE * sizeof(ElementA) <=
+                      ArchTag::L1_SIZE,
+                  "L1 overflow");
     static_assert(L0C_STAGES * L0C_BUF_SIZE <= ArchTag::L0C_SIZE, "L0C overflow");
     static_assert(L1_TILE_HALF * 2 == L1_TILE_MAX, "RES_K half-slot packing assumes 64KB tiles");
 
@@ -124,10 +102,10 @@ public:
     {
         l1K = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_K_OFFSET);
         for (uint32_t i = 0; i < Ascend950FagL1Layout::TASK_PINGPONG; ++i) {
-            l1Q[i] = resource.l1Buf.template GetBufferByByte<ElementB>(
-                l1BufAddrStart + Ascend950FagL1Layout::QSlot(i) * L1_TILE_MAX);
-            l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementB>(
-                l1BufAddrStart + Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
+            l1Q[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart +
+                                                                       Ascend950FagL1Layout::QSlot(i) * L1_TILE_MAX);
+            l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart +
+                                                                        Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
         }
 
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
@@ -154,8 +132,7 @@ public:
     /// Prefetch RowMajor K into the RES_KT upper half (D<=BASE only).
     /// Prefer calling from C5 so MTE2 overlaps dv cube work.
     template <class TensorK>
-    CATLASS_DEVICE
-    void LoadResidentK(TensorK& k, uint32_t skvActual, uint32_t dActual)
+    CATLASS_DEVICE void LoadResidentK(TensorK& k, uint32_t skvActual, uint32_t dActual)
     {
         if (dActual > BASE) {
             return;
@@ -163,7 +140,7 @@ public:
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
         CopyGmToL1B(l1K, k, skvActual, dActual, skvRound, dRound,
-            /*eventIdx=*/0, /*useKEvent=*/true);
+                    /*eventIdx=*/0, /*useKEvent=*/true);
     }
 
     CATLASS_DEVICE
@@ -179,25 +156,18 @@ public:
      * D>BASE: K streams into DY[taskPing] scratch after C5.
      */
     template <class TensorK, class TensorDq, class TensorDk>
-    CATLASS_DEVICE
-    void ComputeDqDk(
-        AscendC::LocalTensor<ElementA> dsNz,
-        TensorK& k,
-        TensorDq& dq, TensorDk& dk,
-        GemmCoord const& actualShape,
-        uint32_t taskPing, bool waitResidentK, bool enAtomicDq,
-        bool initDk, bool flushDk, bool enAtomicDk)
+    CATLASS_DEVICE void ComputeDqDk(AscendC::LocalTensor<ElementA> dsNz, TensorK& k, TensorDq& dq, TensorDk& dk,
+                                    GemmCoord const& actualShape, uint32_t taskPing, bool waitResidentK,
+                                    bool enAtomicDq, bool initDk, bool flushDk, bool enAtomicDk)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dActual <= BASE) {
-            ComputeDqDkSmallHeadDim(dsNz, dq, dk,
-                sqActual, skvActual, dActual, taskPing, waitResidentK, enAtomicDq,
-                initDk, flushDk, enAtomicDk);
+            ComputeDqDkSmallHeadDim(dsNz, dq, dk, sqActual, skvActual, dActual, taskPing, waitResidentK, enAtomicDq,
+                                    initDk, flushDk, enAtomicDk);
         } else {
-            ComputeDqDkLargeHeadDim(dsNz, k, dq, dk,
-                sqActual, skvActual, dActual, taskPing, enAtomicDq);
+            ComputeDqDkLargeHeadDim(dsNz, k, dq, dk, sqActual, skvActual, dActual, taskPing, enAtomicDq);
         }
     }
 
@@ -206,48 +176,37 @@ public:
      * After this stage the DY slot is released (D>BASE C34 may reuse as K scratch).
      */
     template <class TensorDv>
-    CATLASS_DEVICE
-    void ComputeDv(
-        AscendC::LocalTensor<ElementA> pNz,
-        TensorDv& dv,
-        GemmCoord const& actualShape,
-        uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv)
+    CATLASS_DEVICE void ComputeDv(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, GemmCoord const& actualShape,
+                                  uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dvActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dvActual <= BASE) {
-            ComputeDvSmallHeadDim(pNz, dv,
-                sqActual, skvActual, dvActual, taskPing, initDv, flushDv, enAtomicDv);
+            ComputeDvSmallHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, initDv, flushDv, enAtomicDv);
         } else {
-            ComputeDvLargeHeadDim(pNz, dv,
-                sqActual, skvActual, dvActual, taskPing);
+            ComputeDvLargeHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing);
         }
     }
 
-protected:
+  protected:
     template <class TensorDq, class TensorDk>
-    CATLASS_DEVICE
-    void ComputeDqDkSmallHeadDim(
-        AscendC::LocalTensor<ElementA> dsNz,
-        TensorDq& dq, TensorDk& dk,
-        uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
-        uint32_t taskPing, bool waitResidentK, bool enAtomicDq,
-        bool initDk, bool flushDk, bool enAtomicDk)
+    CATLASS_DEVICE void ComputeDqDkSmallHeadDim(AscendC::LocalTensor<ElementA> dsNz, TensorDq& dq, TensorDk& dk,
+                                                uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
+                                                uint32_t taskPing, bool waitResidentK, bool enAtomicDq, bool initDk,
+                                                bool flushDk, bool enAtomicDk)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
         const uint32_t qEvent = Ascend950FagL1Layout::QSlot(taskPing);
         // K resident in RES_KT upper half — no per-task GM load.
-        GemmRow(dsNz, l1K, l0CTensorList[SLOT_DQ],
-            sqRound, dRound, skvRound, sqActual, dActual, skvActual,
-            true, 0b11, SLOT_DQ, L1_EVENT_K, /*waitB=*/waitResidentK, /*releaseB=*/false,
-            /*useKEvent=*/true);
+        GemmRow(dsNz, l1K, l0CTensorList[SLOT_DQ], sqRound, dRound, skvRound, sqActual, dActual, skvActual, true, 0b11,
+                SLOT_DQ, L1_EVENT_K, /*waitB=*/waitResidentK, /*releaseB=*/false,
+                /*useKEvent=*/true);
         FixpipeTla(dq, l0CTensorList[SLOT_DQ], sqActual, dActual, sqRound, enAtomicDq, SLOT_DQ);
-        GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK],
-            skvRound, dRound, sqRound, skvActual, dActual, sqActual,
-            initDk, 0b11, SLOT_DK, qEvent, /*waitB=*/false, /*releaseB=*/true);
+        GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK], skvRound, dRound, sqRound, skvActual, dActual, sqActual,
+                 initDk, 0b11, SLOT_DK, qEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDk) {
             FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK);
             ReleaseResidentK();
@@ -255,31 +214,25 @@ protected:
     }
 
     template <class TensorDv>
-    CATLASS_DEVICE
-    void ComputeDvSmallHeadDim(
-        AscendC::LocalTensor<ElementA> pNz, TensorDv& dv,
-        uint32_t sqActual, uint32_t skvActual, uint32_t dvActual,
-        uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv)
+    CATLASS_DEVICE void ComputeDvSmallHeadDim(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, uint32_t sqActual,
+                                              uint32_t skvActual, uint32_t dvActual, uint32_t taskPing, bool initDv,
+                                              bool flushDv, bool enAtomicDv)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dvActual);
         const uint32_t dyEvent = Ascend950FagL1Layout::DySlot(taskPing);
-        GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV],
-            skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
-            initDv, 0b11, SLOT_DV, dyEvent, /*waitB=*/false, /*releaseB=*/true);
+        GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV], skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
+                 initDv, 0b11, SLOT_DV, dyEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDv) {
             FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV);
         }
     }
 
     template <class TensorK, class TensorDq, class TensorDk>
-    CATLASS_DEVICE
-    void ComputeDqDkLargeHeadDim(
-        AscendC::LocalTensor<ElementA> dsNz,
-        TensorK& k, TensorDq& dq, TensorDk& dk,
-        uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
-        uint32_t taskPing, bool enAtomicDq)
+    CATLASS_DEVICE void ComputeDqDkLargeHeadDim(AscendC::LocalTensor<ElementA> dsNz, TensorK& k, TensorDq& dq,
+                                                TensorDk& dk, uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
+                                                uint32_t taskPing, bool enAtomicDq)
     {
         // D>BASE: Fixpipe each D-slice. Q is full in L1 from C1; K streams
         // slice-by-slice into the DY scratch slot.
@@ -299,27 +252,20 @@ protected:
             auto dqTile = GetTile(dq, tla::MakeCoord(0u, nOff), tla::MakeShape(sqActual, nAct));
             auto dkTile = GetTile(dk, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
             CopyGmToL1B(l1Dy[taskPing], kTile, skvActual, nAct, skvRound, nRound, dyEvent);
-            GemmRow(dsNz, l1Dy[taskPing], l0CTensorList[slotDq],
-                sqRound, nRound, skvRound, sqActual, nAct, skvActual,
-                true, 0b11, slotDq, dyEvent, /*waitB=*/true, /*releaseB=*/true);
-            FixpipeTla(dqTile, l0CTensorList[slotDq],
-                sqActual, nAct, sqRound, enAtomicDq, slotDq);
-            GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK],
-                skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                true, 0b11, SLOT_DK, qEvent,
-                /*waitB=*/false, /*releaseB=*/lastSlice,
-                /*bNOff=*/nOff, /*bNFull=*/dFullRound);
-            FixpipeTla(dkTile, l0CTensorList[SLOT_DK],
-                skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DK);
+            GemmRow(dsNz, l1Dy[taskPing], l0CTensorList[slotDq], sqRound, nRound, skvRound, sqActual, nAct, skvActual,
+                    true, 0b11, slotDq, dyEvent, /*waitB=*/true, /*releaseB=*/true);
+            FixpipeTla(dqTile, l0CTensorList[slotDq], sqActual, nAct, sqRound, enAtomicDq, slotDq);
+            GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK], skvRound, nRound, sqRound, skvActual, nAct, sqActual,
+                     true, 0b11, SLOT_DK, qEvent,
+                     /*waitB=*/false, /*releaseB=*/lastSlice,
+                     /*bNOff=*/nOff, /*bNFull=*/dFullRound);
+            FixpipeTla(dkTile, l0CTensorList[SLOT_DK], skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DK);
         }
     }
 
     template <class TensorDv>
-    CATLASS_DEVICE
-    void ComputeDvLargeHeadDim(
-        AscendC::LocalTensor<ElementA> pNz, TensorDv& dv,
-        uint32_t sqActual, uint32_t skvActual, uint32_t dvActual,
-        uint32_t taskPing)
+    CATLASS_DEVICE void ComputeDvLargeHeadDim(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, uint32_t sqActual,
+                                              uint32_t skvActual, uint32_t dvActual, uint32_t taskPing)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
@@ -332,22 +278,18 @@ protected:
             const uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(nAct);
             const bool lastSlice = (dIdx + 1 == dvLoops);
             auto dvTile = GetTile(dv, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
-            GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV],
-                skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                true, 0b11, SLOT_DV, dyEvent,
-                /*waitB=*/false, /*releaseB=*/lastSlice,
-                /*bNOff=*/nOff, /*bNFull=*/dvFullRound);
-            FixpipeTla(dvTile, l0CTensorList[SLOT_DV],
-                skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DV);
+            GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV], skvRound, nRound, sqRound, skvActual, nAct, sqActual,
+                     true, 0b11, SLOT_DV, dyEvent,
+                     /*waitB=*/false, /*releaseB=*/lastSlice,
+                     /*bNOff=*/nOff, /*bNFull=*/dvFullRound);
+            FixpipeTla(dvTile, l0CTensorList[SLOT_DV], skvActual, nAct, skvRound, /*enAtomic=*/true, SLOT_DV);
         }
     }
 
     template <class TensorGm>
-    CATLASS_DEVICE
-    void CopyGmToL1B(
-        AscendC::LocalTensor<ElementB> l1Buf, TensorGm& gm,
-        uint32_t kActual, uint32_t nActual, uint32_t kRound, uint32_t nRound,
-        uint32_t eventIdx, bool useKEvent = false)
+    CATLASS_DEVICE void CopyGmToL1B(AscendC::LocalTensor<ElementB> l1Buf, TensorGm& gm, uint32_t kActual,
+                                    uint32_t nActual, uint32_t kRound, uint32_t nRound, uint32_t eventIdx,
+                                    bool useKEvent = false)
     {
         using CopyGmToL1BOp = typename TileCopy::template CopyGmToL1B<TensorGm>;
         CopyGmToL1BOp copyGmToL1B;
@@ -363,14 +305,10 @@ protected:
     }
 
     CATLASS_DEVICE
-    void GemmRow(
-        AscendC::LocalTensor<ElementA> l1A,
-        AscendC::LocalTensor<ElementB> l1B,
-        AscendC::LocalTensor<ElementAccumulator> l0C,
-        uint32_t mRound, uint32_t nRound, uint32_t kRound,
-        uint32_t mActual, uint32_t nActual, uint32_t kActual,
-        bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-        uint32_t l1BEvent, bool waitB, bool releaseB, bool useKEvent = false)
+    void GemmRow(AscendC::LocalTensor<ElementA> l1A, AscendC::LocalTensor<ElementB> l1B,
+                 AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
+                 uint32_t mActual, uint32_t nActual, uint32_t kActual, bool initC, uint8_t unitFlag, uint32_t l0cSlot,
+                 uint32_t l1BEvent, bool waitB, bool releaseB, bool useKEvent = false)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0A>(mRound, kRound);
@@ -418,15 +356,10 @@ protected:
     }
 
     CATLASS_DEVICE
-    void GemmColA(
-        AscendC::LocalTensor<ElementA> l1A,
-        AscendC::LocalTensor<ElementB> l1B,
-        AscendC::LocalTensor<ElementAccumulator> l0C,
-        uint32_t mRound, uint32_t nRound, uint32_t kRound,
-        uint32_t mActual, uint32_t nActual, uint32_t kActual,
-        bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-        uint32_t l1BEvent, bool waitB, bool releaseB,
-        uint32_t bNOff = 0, uint32_t bNFull = 0)
+    void GemmColA(AscendC::LocalTensor<ElementA> l1A, AscendC::LocalTensor<ElementB> l1B,
+                  AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
+                  uint32_t mActual, uint32_t nActual, uint32_t kActual, bool initC, uint8_t unitFlag, uint32_t l0cSlot,
+                  uint32_t l1BEvent, bool waitB, bool releaseB, uint32_t bNOff = 0, uint32_t bNFull = 0)
     {
         const uint32_t nLayout = (bNFull == 0) ? nRound : bNFull;
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1ACol>(mRound, kRound);
@@ -473,12 +406,8 @@ protected:
     }
 
     template <class TensorGm>
-    CATLASS_DEVICE
-    void FixpipeTla(
-        TensorGm& gmC,
-        AscendC::LocalTensor<ElementAccumulator> l0C,
-        uint32_t mActual, uint32_t nActual, uint32_t mRound,
-        bool enAtomic, uint32_t l0cSlot)
+    CATLASS_DEVICE void FixpipeTla(TensorGm& gmC, AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mActual,
+                                   uint32_t nActual, uint32_t mRound, bool enAtomic, uint32_t l0cSlot)
     {
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nActual);
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});

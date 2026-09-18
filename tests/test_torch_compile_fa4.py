@@ -11,9 +11,7 @@ from torch_compile_utils import (
 def test_fa4_910_scheduler_metadata_torch_compile_correctness():
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
 
     run_metadata_compile_test(
         api,
@@ -30,9 +28,7 @@ def test_fa4_910_scheduler_metadata_torch_compile_correctness():
 def test_fa4_910_varlen_torch_compile_correctness():
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
 
     run_varlen_compile_test(
         api,
@@ -44,9 +40,7 @@ def test_fa4_950_scheduler_metadata_torch_compile_correctness():
     pytest.skip("Ascend950 does not support scheduler metadata currently")
     require_soc("950")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface_950"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
 
     run_metadata_compile_test(
         api,
@@ -57,21 +51,18 @@ def test_fa4_950_scheduler_metadata_torch_compile_correctness():
 def test_fa4_950_varlen_torch_compile_correctness():
     require_soc("950")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface_950"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
 
     run_varlen_compile_test(
         api,
         backward=False,
     )
 
+
 def test_fa4_950_varlen_asymmetric_causal_torch_compile_correctness():
     require_soc("950")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface_950"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
 
     run_varlen_compile_test(
         api,
@@ -81,20 +72,17 @@ def test_fa4_950_varlen_asymmetric_causal_torch_compile_correctness():
         causal=True,
     )
 
-def test_fa4_910_fixed_torch_compile_correctness():
 
+def test_fa4_910_fixed_torch_compile_correctness():
     """
     Verify FA4 fixed-length API correctness.
     """
 
     require_soc("910")
 
-    api = load_api(
-        "flash_attn_npu_4.flash_attn_npu_interface"
-    )
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
 
     run_fixed_compile_test(
         api,
         backward=True,
     )
-

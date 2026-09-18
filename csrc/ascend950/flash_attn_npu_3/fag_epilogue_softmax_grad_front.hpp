@@ -11,19 +11,14 @@ namespace Catlass::Epilogue::Block {
 
 template <typename DataType, class ArchTag, class TilingData>
 class FagSoftmaxGradFront {
-public:
-    CATLASS_DEVICE void Init(
-        Catlass::Arch::Resource<ArchTag> &resource,
-        GM_ADDR dout,
-        GM_ADDR out,
-        GM_ADDR workspace,
-        GM_ADDR tiling)
+  public:
+    CATLASS_DEVICE void Init(Catlass::Arch::Resource<ArchTag>& resource, GM_ADDR dout, GM_ADDR out, GM_ADDR workspace,
+                             GM_ADDR tiling)
     {
-        tiling_ = reinterpret_cast<const __gm__ TilingData *>(tiling);
-        doutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(dout));
-        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType *>(out));
-        deltaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
-            workspace + tiling_->deltaOffset));
+        tiling_ = reinterpret_cast<const __gm__ TilingData*>(tiling);
+        doutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(dout));
+        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(out));
+        deltaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->deltaOffset));
 
         constexpr uint32_t tileRows = 64U;
         constexpr uint32_t maxAlignedD = 256U;
@@ -37,24 +32,20 @@ public:
         }
     }
 
-    CATLASS_DEVICE void operator()(
-        uint32_t vectorCoreId,
-        uint32_t vectorCoreNum,
-        event_t mte3ToMte2Ping,
-        event_t mte3ToMte2Pong,
-        event_t mte2ToVPing,
-        event_t mte2ToVPong,
-        event_t vToMte3Ping,
-        event_t vToMte3Pong)
+    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t mte3ToMte2Ping,
+                                   event_t mte3ToMte2Pong, event_t mte2ToVPing, event_t mte2ToVPong,
+                                   event_t vToMte3Ping, event_t vToMte3Pong)
     {
         constexpr uint32_t tileRows = 64U;
         const uint32_t realD = static_cast<uint32_t>(tiling_->vHeadDim);
         const uint32_t alignedD = (realD + 15U) / 16U * 16U;
         const uint64_t totalRows = tiling_->totalQ * tiling_->qHeadNum;
-        if (vectorCoreNum == 0U) return;
+        if (vectorCoreNum == 0U)
+            return;
         const uint64_t perCore = (totalRows + vectorCoreNum - 1U) / vectorCoreNum;
         const uint64_t rangeBegin = static_cast<uint64_t>(vectorCoreId) * perCore;
-        if (rangeBegin >= totalRows) return;
+        if (rangeBegin >= totalRows)
+            return;
         const uint64_t rangeCount = totalRows - rangeBegin < perCore ? totalRows - rangeBegin : perCore;
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Ping);
@@ -67,38 +58,27 @@ public:
             const event_t mte2ToVEvent = slot == 0U ? mte2ToVPing : mte2ToVPong;
             const event_t vToMte3Event = slot == 0U ? vToMte3Ping : vToMte3Pong;
             const uint64_t remaining = rangeCount - done;
-            const uint32_t rows = static_cast<uint32_t>(
-                remaining < tileRows ? remaining : tileRows);
+            const uint32_t rows = static_cast<uint32_t>(remaining < tileRows ? remaining : tileRows);
             const uint64_t rowBegin = rangeBegin + done;
             const uint64_t inputOffset = rowBegin * realD;
-            AscendC::DataCopyExtParams copyParams{
-                static_cast<uint16_t>(rows),
-                static_cast<uint32_t>(realD * sizeof(DataType)),
-                0, 0, 0};
-            AscendC::DataCopyPadExtParams<DataType> padParams{
-                false, 0, 0, 0};
+            AscendC::DataCopyExtParams copyParams{static_cast<uint16_t>(rows),
+                                                  static_cast<uint32_t>(realD * sizeof(DataType)), 0, 0, 0};
+            AscendC::DataCopyPadExtParams<DataType> padParams{false, 0, 0, 0};
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
-            AscendC::DataCopyPad(
-                doutUb_[slot], doutGm_[inputOffset], copyParams, padParams);
-            AscendC::DataCopyPad(
-                outUb_[slot], outGm_[inputOffset], copyParams, padParams);
+            AscendC::DataCopyPad(doutUb_[slot], doutGm_[inputOffset], copyParams, padParams);
+            AscendC::DataCopyPad(outUb_[slot], outGm_[inputOffset], copyParams, padParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
-            SoftmaxGradFrontVF(
-                reinterpret_cast<__ubuf__ DataType *>(doutUb_[slot].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ DataType *>(outUb_[slot].GetPhyAddr()),
-                reinterpret_cast<__ubuf__ float *>(deltaUb_[slot].GetPhyAddr()),
-                rows, realD, alignedD);
+            SoftmaxGradFrontVF(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                               reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                               reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), rows, realD, alignedD);
             AscendC::PipeBarrier<PIPE_V>();
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
-            AscendC::DataCopyExtParams outputParams{
-                1, static_cast<uint32_t>(rows * sizeof(float)),
-                0, 0, 0};
-            AscendC::DataCopyPad(
-                deltaGm_[rowBegin], deltaUb_[slot], outputParams);
+            AscendC::DataCopyExtParams outputParams{1, static_cast<uint32_t>(rows * sizeof(float)), 0, 0, 0};
+            AscendC::DataCopyPad(deltaGm_[rowBegin], deltaUb_[slot], outputParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
             done += rows;
             pingPongIdx = 1U - pingPongIdx;
@@ -107,14 +87,10 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Pong);
     }
 
-private:
-    __simd_vf__ inline static void SoftmaxGradFrontVF(
-        __ubuf__ DataType *dout,
-        __ubuf__ DataType *out,
-        __ubuf__ float *delta,
-        uint32_t rows,
-        uint32_t realD,
-        uint32_t rowStride)
+  private:
+    __simd_vf__ inline static void SoftmaxGradFrontVF(__ubuf__ DataType* dout, __ubuf__ DataType* out,
+                                                      __ubuf__ float* delta, uint32_t rows, uint32_t realD,
+                                                      uint32_t rowStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<DataType> doutPacked0, outPacked0;
@@ -125,12 +101,10 @@ private:
         UnalignReg storeState;
         MaskReg packedMask = CreateMask<DataType, MaskPattern::ALL>();
         MaskReg fullFp32Mask = CreateMask<float, MaskPattern::ALL>();
-        constexpr static CastTrait b16ToFp32Even = {
-            RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
-            AscendC::RoundMode::UNKNOWN};
-        constexpr static CastTrait b16ToFp32Odd = {
-            RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
-            AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait b16ToFp32Even = {RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait b16ToFp32Odd = {RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                                   AscendC::RoundMode::UNKNOWN};
 
         for (uint16_t row = 0; row < static_cast<uint16_t>(rows); ++row) {
             const uint32_t firstValid = realD < 128U ? realD : 128U;
@@ -148,8 +122,7 @@ private:
             Mul(productEven, doutEven, outEven, firstPairMask);
             Mul(productOdd, doutOdd, outOdd, firstOddMask);
             Add(productSum, productEven, productOdd, firstPairMask);
-            Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(
-                reduced0, productSum, firstPairMask);
+            Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(reduced0, productSum, firstPairMask);
 
             Duplicate(reduced1, 0.0F);
             if (realD > 128U) {
@@ -167,18 +140,15 @@ private:
                 Mul(productEven, doutEven, outEven, secondPairMask);
                 Mul(productOdd, doutOdd, outOdd, secondOddMask);
                 Add(productSum, productEven, productOdd, secondPairMask);
-                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(
-                    reduced1, productSum, secondPairMask);
+                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(reduced1, productSum, secondPairMask);
             }
             Add(reduced, reduced0, reduced1, fullFp32Mask);
-            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(
-                delta, reduced, storeState, 1);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(delta, reduced, storeState, 1);
         }
-        StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(
-            delta, storeState, 0);
+        StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(delta, storeState, 0);
     }
 
-    const __gm__ TilingData *tiling_ = nullptr;
+    const __gm__ TilingData* tiling_ = nullptr;
     AscendC::GlobalTensor<DataType> doutGm_;
     AscendC::GlobalTensor<DataType> outGm_;
     AscendC::GlobalTensor<float> deltaGm_;
@@ -187,6 +157,6 @@ private:
     AscendC::LocalTensor<float> deltaUb_[2];
 };
 
-}  // namespace Catlass::Epilogue::Block
+} // namespace Catlass::Epilogue::Block
 
 #endif

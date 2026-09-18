@@ -15,20 +15,38 @@ constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
 
 // The mask buffer is present whenever the final mask type is not NO_MASK
 // (causal or band/SWA); the tiling blob sits right after it.
-inline uint64_t TilingOffset(bool has_mask) { return has_mask ? MASK_BYTES : 0; }
-inline uint64_t MetadataBytes(bool has_mask) { return TilingOffset(has_mask) + sizeof(FAInferTilingData); }
+inline uint64_t TilingOffset(bool has_mask)
+{
+    return has_mask ? MASK_BYTES : 0;
+}
+inline uint64_t MetadataBytes(bool has_mask)
+{
+    return TilingOffset(has_mask) + sizeof(FAInferTilingData);
+}
 
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;
-inline uint64_t Mm1OutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM; }
-inline uint64_t SmOnlineOutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 2 * PRELAUNCH_NUM; }
-inline uint64_t Mm2OutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM; }
-inline uint64_t UpdateOutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM; }
+inline uint64_t Mm1OutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM;
+}
+inline uint64_t SmOnlineOutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * 2 * PRELAUNCH_NUM;
+}
+inline uint64_t Mm2OutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM;
+}
+inline uint64_t UpdateOutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM;
+}
 inline uint64_t WorkSpaceSize(uint64_t blockDim)
 {
     return Mm1OutSize(blockDim) + SmOnlineOutSize(blockDim) + Mm2OutSize(blockDim) + UpdateOutSize(blockDim);
 }
-}
+} // namespace fa_metadata
 
 struct FAMetadataArgs {
     uint64_t cuSeqlensQAddr;

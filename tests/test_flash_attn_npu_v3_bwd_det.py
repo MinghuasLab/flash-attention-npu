@@ -41,8 +41,8 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
-from flash_attn_npu_3.flash_attn_npu_interface_950 import _flash_attn_backward
-from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
+from flash_attn_npu_3.flash_attn_npu_interface_950 import _flash_attn_backward  # noqa: E402
+from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd  # noqa: E402
 
 INPUT_LIMIT = 2.0
 DTYPE = torch.bfloat16
@@ -56,59 +56,99 @@ GTYPE = torch.float64
 # (name, bsz, seqlen_q, seqlen_k, nheads_q, nheads_kv, headdim, causal, large)
 BSND_CASES = [
     # ---- small ----
-    ("bsnd_small_mha_causal",      1, 128, 128, 2, 2, 128, True,  False),
-    ("bsnd_small_mha_nc",          1, 128, 128, 2, 2, 128, False, False),
-    ("bsnd_small_gqa_tail_causal", 2, 200, 300, 4, 2, 64,  True,  False),
-    ("bsnd_small_mqa_tail_nc",     2, 300, 500, 4, 1, 64,  False, False),
-    ("bsnd_tiny_unaligned_causal", 2, 33,  77,  4, 4, 64,  True,  False),
+    ("bsnd_small_mha_causal", 1, 128, 128, 2, 2, 128, True, False),
+    ("bsnd_small_mha_nc", 1, 128, 128, 2, 2, 128, False, False),
+    ("bsnd_small_gqa_tail_causal", 2, 200, 300, 4, 2, 64, True, False),
+    ("bsnd_small_mqa_tail_nc", 2, 300, 500, 4, 1, 64, False, False),
+    ("bsnd_tiny_unaligned_causal", 2, 33, 77, 4, 4, 64, True, False),
     # ---- mid ----
-    ("bsnd_mid_mha_square_causal", 1, 1024, 1024, 8, 8, 128, True,  False),
-    ("bsnd_mid_mha_square_nc",     1, 1024, 1024, 8, 8, 128, False, False),
-    ("bsnd_mid_mha_rect_causal",   2, 333,  777,  4, 4, 64,  True,  False),
-    ("bsnd_mid_mha_rect_nc",       2, 777,  333,  4, 4, 64,  False, False),
-    ("bsnd_mid_gqa_square_causal", 1, 1024, 1024, 8, 2, 128, True,  False),
-    ("bsnd_mid_gqa_square_nc",     1, 1024, 1024, 8, 2, 128, False, False),
-    ("bsnd_mid_mqa_causal",        2, 300,  500,  4, 1, 64,  True,  False),
-    ("bsnd_mid_mqa_nc",            2, 300,  500,  4, 1, 64,  False, False),
-    ("bsnd_mid_gqa_rect_causal",   2, 500,  900,  6, 3, 128, True,  False),
-    ("bsnd_mid_gqa_rect_nc",       2, 500,  900,  6, 3, 128, False, False),
-    ("bsnd_mid_mha_hd64_nc",       2, 777,  333,  6, 3, 64,  False, False),
+    ("bsnd_mid_mha_square_causal", 1, 1024, 1024, 8, 8, 128, True, False),
+    ("bsnd_mid_mha_square_nc", 1, 1024, 1024, 8, 8, 128, False, False),
+    ("bsnd_mid_mha_rect_causal", 2, 333, 777, 4, 4, 64, True, False),
+    ("bsnd_mid_mha_rect_nc", 2, 777, 333, 4, 4, 64, False, False),
+    ("bsnd_mid_gqa_square_causal", 1, 1024, 1024, 8, 2, 128, True, False),
+    ("bsnd_mid_gqa_square_nc", 1, 1024, 1024, 8, 2, 128, False, False),
+    ("bsnd_mid_mqa_causal", 2, 300, 500, 4, 1, 64, True, False),
+    ("bsnd_mid_mqa_nc", 2, 300, 500, 4, 1, 64, False, False),
+    ("bsnd_mid_gqa_rect_causal", 2, 500, 900, 6, 3, 128, True, False),
+    ("bsnd_mid_gqa_rect_nc", 2, 500, 900, 6, 3, 128, False, False),
+    ("bsnd_mid_mha_hd64_nc", 2, 777, 333, 6, 3, 64, False, False),
     # ---- long / large ----
-    ("bsnd_long_mha_causal",       1, 2048, 2048, 8, 8, 128, True,  True),
-    ("bsnd_long_mha_nc",           1, 2048, 2048, 8, 8, 128, False, True),
-    ("bsnd_long_gqa_causal",       1, 2048, 2048, 8, 2, 128, True,  True),
-    ("bsnd_large_mha_causal",      1, 4096, 4096, 4, 4, 128, True,  True),
-    ("bsnd_large_mha_nc",          1, 4096, 4096, 4, 4, 128, False, True),
+    ("bsnd_long_mha_causal", 1, 2048, 2048, 8, 8, 128, True, True),
+    ("bsnd_long_mha_nc", 1, 2048, 2048, 8, 8, 128, False, True),
+    ("bsnd_long_gqa_causal", 1, 2048, 2048, 8, 2, 128, True, True),
+    ("bsnd_large_mha_causal", 1, 4096, 4096, 4, 4, 128, True, True),
+    ("bsnd_large_mha_nc", 1, 4096, 4096, 4, 4, 128, False, True),
 ]
 
 # (name, cu_seqlens_q, cu_seqlens_k, nheads_q, nheads_kv, headdim, causal, large)
 VARLEN_CASES = [
     # ---- small / ragged ----
-    ("tnd_small_mha_causal",   [0, 256, 640],          [0, 256, 640],         4, 4, 128, True,  False),
-    ("tnd_small_mha_nc",       [0, 256, 640],          [0, 256, 640],         4, 4, 128, False, False),
-    ("tnd_ragged_mqa_causal",  [0, 100, 900],          [0, 300, 1600],        4, 1, 64,  True,  False),
-    ("tnd_ragged_mqa_nc",      [0, 100, 900],          [0, 300, 700],         4, 1, 64,  False, False),
-    ("tnd_ragged_mha_nc",      [0, 100, 900],          [0, 300, 700],         4, 4, 64,  False, False),
-    ("tnd_ragged_gqa_causal",  [0, 512, 1536],         [0, 768, 2048],        4, 2, 128, True,  False),
-    ("tnd_ragged_gqa_nc",      [0, 512, 1536],         [0, 768, 2048],        4, 2, 128, False, False),
+    ("tnd_small_mha_causal", [0, 256, 640], [0, 256, 640], 4, 4, 128, True, False),
+    ("tnd_small_mha_nc", [0, 256, 640], [0, 256, 640], 4, 4, 128, False, False),
+    ("tnd_ragged_mqa_causal", [0, 100, 900], [0, 300, 1600], 4, 1, 64, True, False),
+    ("tnd_ragged_mqa_nc", [0, 100, 900], [0, 300, 700], 4, 1, 64, False, False),
+    ("tnd_ragged_mha_nc", [0, 100, 900], [0, 300, 700], 4, 4, 64, False, False),
+    ("tnd_ragged_gqa_causal", [0, 512, 1536], [0, 768, 2048], 4, 2, 128, True, False),
+    ("tnd_ragged_gqa_nc", [0, 512, 1536], [0, 768, 2048], 4, 2, 128, False, False),
     # ---- equal-length (left-up causal schedule) ----
-    ("tnd_eq_mha_causal",      [0, 2048, 4096],        [0, 2048, 4096],       8, 8, 128, True,  True),
-    ("tnd_eq_mha_nc",          [0, 2048, 4096],        [0, 2048, 4096],       8, 8, 128, False, True),
-    ("tnd_eq_gqa_causal",      [0, 1024, 2048],        [0, 1024, 2048],       8, 2, 128, True,  True),
-    ("tnd_eq_gqa_nc",          [0, 1024, 2048],        [0, 1024, 2048],       8, 2, 128, False, True),
+    ("tnd_eq_mha_causal", [0, 2048, 4096], [0, 2048, 4096], 8, 8, 128, True, True),
+    ("tnd_eq_mha_nc", [0, 2048, 4096], [0, 2048, 4096], 8, 8, 128, False, True),
+    ("tnd_eq_gqa_causal", [0, 1024, 2048], [0, 1024, 2048], 8, 2, 128, True, True),
+    ("tnd_eq_gqa_nc", [0, 1024, 2048], [0, 1024, 2048], 8, 2, 128, False, True),
     # ---- pack (multi-sequence) ----
-    ("tnd_pack8_mha_causal",   [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
-                               [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096], 8, 8, 128, True,  True),
-    ("tnd_pack8_mha_nc",       [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
-                               [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096], 8, 8, 128, False, True),
+    (
+        "tnd_pack8_mha_causal",
+        [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
+        [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
+        8,
+        8,
+        128,
+        True,
+        True,
+    ),
+    (
+        "tnd_pack8_mha_nc",
+        [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
+        [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096],
+        8,
+        8,
+        128,
+        False,
+        True,
+    ),
     # ---- large single ----
-    ("tnd_large4_mha_causal",  [0, 2048, 4096, 6144, 8192],
-                               [0, 2048, 4096, 6144, 8192],                       4, 4, 128, True,  True),
-    ("tnd_large_mha_nc",       [0, 4096],              [0, 4096],             4, 4, 128, False, True),
-    ("tnd_large4_gqa_causal",  [0, 1024, 2048, 3072, 4096],
-                               [0, 1024, 2048, 3072, 4096],                       8, 2, 128, True,  True),
-    ("tnd_large4_mqa_causal",  [0, 2048, 4096, 6144, 8192],
-                               [0, 2048, 4096, 6144, 8192],                       4, 1, 64,  True,  True),
+    (
+        "tnd_large4_mha_causal",
+        [0, 2048, 4096, 6144, 8192],
+        [0, 2048, 4096, 6144, 8192],
+        4,
+        4,
+        128,
+        True,
+        True,
+    ),
+    ("tnd_large_mha_nc", [0, 4096], [0, 4096], 4, 4, 128, False, True),
+    (
+        "tnd_large4_gqa_causal",
+        [0, 1024, 2048, 3072, 4096],
+        [0, 1024, 2048, 3072, 4096],
+        8,
+        2,
+        128,
+        True,
+        True,
+    ),
+    (
+        "tnd_large4_mqa_causal",
+        [0, 2048, 4096, 6144, 8192],
+        [0, 2048, 4096, 6144, 8192],
+        4,
+        1,
+        64,
+        True,
+        True,
+    ),
 ]
 
 
@@ -137,9 +177,9 @@ def torch_ref_fwd_bsnd(q, k, v, scale, causal):
         j = torch.arange(sk).unsqueeze(0)
         allow = j <= i + (sk - sq)
         s = s.masked_fill(~allow, float("-inf"))
-    lse = torch.logsumexp(s, dim=-1)                     # (B,Hq,Sq) fp32
+    lse = torch.logsumexp(s, dim=-1)  # (B,Hq,Sq) fp32
     p = torch.softmax(s, dim=-1)
-    o = torch.matmul(p, vb)                              # (B,Hq,Sq,D)
+    o = torch.matmul(p, vb)  # (B,Hq,Sq,D)
     out = o.permute(0, 2, 1, 3).to(q.dtype)
     return out.to(q.device), lse.to(q.device)
 
@@ -151,9 +191,9 @@ def torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal):
     """
     outs, lses = [], []
     for i in range(len(cu_q) - 1):
-        qi = q[cu_q[i]:cu_q[i + 1]].unsqueeze(0)
-        ki = k[cu_k[i]:cu_k[i + 1]].unsqueeze(0)
-        vi = v[cu_k[i]:cu_k[i + 1]].unsqueeze(0)
+        qi = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0)
+        ki = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
+        vi = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
         oi, li = torch_ref_fwd_bsnd(qi, ki, vi, scale, causal)
         outs.append(oi.squeeze(0))
         lses.append(li.squeeze(0))
@@ -163,24 +203,58 @@ def torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal):
 def run_bwd_bsnd(q, k, v, dout, out, lse, scale, causal, det):
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
-        dout, q, k, v, out, lse,
-        None, None, None, None, None, None,
-        dq, dk, dv,
-        scale, causal, -1, -1, SOFTCAP, det, 0,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        dq,
+        dk,
+        dv,
+        scale,
+        causal,
+        -1,
+        -1,
+        SOFTCAP,
+        det,
+        0,
     )
     torch.npu.synchronize()
     return dq, dk, dv
 
 
-def run_bwd_varlen(q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk,
-                   scale, causal, det):
+def run_bwd_varlen(q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det):
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
-        dout, q, k, v, out, lse,
-        cu_q_t, cu_k_t, None, None,
-        max_sq, max_sk,
-        dq, dk, dv,
-        scale, causal, -1, -1, SOFTCAP, det, 0,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        cu_q_t,
+        cu_k_t,
+        None,
+        None,
+        max_sq,
+        max_sk,
+        dq,
+        dk,
+        dv,
+        scale,
+        causal,
+        -1,
+        -1,
+        SOFTCAP,
+        det,
+        0,
     )
     torch.npu.synchronize()
     return dq, dk, dv
@@ -192,13 +266,11 @@ def max_diff(a, b):
 
 def check_golden(name, mode, actual, golden):
     try:
-        torch.testing.assert_close(
-            actual.cpu(), golden.cpu(), rtol=RTOL_GOLDEN, atol=ATOL_GOLDEN)
+        torch.testing.assert_close(actual.cpu(), golden.cpu(), rtol=RTOL_GOLDEN, atol=ATOL_GOLDEN)
         return True
     except AssertionError:
         diff = (actual.float().cpu() - golden.float().cpu()).abs()
-        print(f"[FAIL] {name} [{mode}]: grad 与 golden 不符, "
-              f"max|diff|={diff.max().item():.6e}")
+        print(f"[FAIL] {name} [{mode}]: grad 与 golden 不符, max|diff|={diff.max().item():.6e}")
         return False
 
 
@@ -221,8 +293,10 @@ def check_case(name, run_bwd, golden_fn, repeat, modes):
             cur = run_bwd(True)
             for gname, a, b in zip(("dq", "dk", "dv"), cur, base):
                 if not torch.equal(a, b):
-                    print(f"[FAIL] {name} [det] iter {it}: {gname} 不一致, "
-                          f"max|diff|={max_diff(a, b):.6e}")
+                    print(
+                        f"[FAIL] {name} [det] iter {it}: {gname} 不一致, "
+                        f"max|diff|={max_diff(a, b):.6e}"
+                    )
                     ok = False
                     break
             if not ok:
@@ -234,20 +308,19 @@ def check_case(name, run_bwd, golden_fn, repeat, modes):
         print(f"[INFO] {name} [nd] 两次运行 max|diff|={d:.6e}")
 
     if "det" in results and "nd" in results:
-        for gname, a, b in zip(("dq", "dk", "dv"),
-                               results["det"], results["nd"]):
+        for gname, a, b in zip(("dq", "dk", "dv"), results["det"], results["nd"]):
             try:
-                torch.testing.assert_close(
-                    a.cpu(), b.cpu(), rtol=RTOL_GOLDEN, atol=ATOL_GOLDEN)
+                torch.testing.assert_close(a.cpu(), b.cpu(), rtol=RTOL_GOLDEN, atol=ATOL_GOLDEN)
             except AssertionError:
-                print(f"[FAIL] {name}: det vs nondet {gname} 不符, "
-                      f"max|diff|={max_diff(a, b):.6e}")
+                print(f"[FAIL] {name}: det vs nondet {gname} 不符, max|diff|={max_diff(a, b):.6e}")
                 ok = False
 
     if ok:
-        print(f"[PASS] {name}: golden 一致"
-              + (f" + {repeat} 次 det 逐位一致" if "det" in results else "")
-              + (" + det/nondet 互相一致" if len(results) == 2 else ""))
+        print(
+            f"[PASS] {name}: golden 一致"
+            + (f" + {repeat} 次 det 逐位一致" if "det" in results else "")
+            + (" + det/nondet 互相一致" if len(results) == 2 else "")
+        )
     return ok
 
 
@@ -265,8 +338,8 @@ def run_bsnd_case(case, repeat, modes):
 
     def golden_fn():
         return golden_bsnd_bwd_from_fwd(
-            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P,
-            causal, -1, -1, gtype=GTYPE)
+            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P, causal, -1, -1, gtype=GTYPE
+        )
 
     return check_case(name, run_bwd, golden_fn, repeat, modes)
 
@@ -287,30 +360,43 @@ def run_varlen_case(case, repeat, modes):
 
     def run_bwd(det):
         return run_bwd_varlen(
-            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk,
-            scale, causal, det)
+            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det
+        )
 
     def golden_fn():
         seqlens_q = [cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)]
         seqlens_k = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
         return golden_tnd_bwd_from_fwd(
-            q, k, v, dout, out, lse, hq, hkv, seqlens_q, seqlens_k,
-            scale, SOFTCAP, DROPOUT_P, causal, -1, -1, gtype=GTYPE)
+            q,
+            k,
+            v,
+            dout,
+            out,
+            lse,
+            hq,
+            hkv,
+            seqlens_q,
+            seqlens_k,
+            scale,
+            SOFTCAP,
+            DROPOUT_P,
+            causal,
+            -1,
+            -1,
+            gtype=GTYPE,
+        )
 
     return check_case(name, run_bwd, golden_fn, repeat, modes)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repeat", type=int, default=20,
-                        help="det 模式重复次数（逐位一致检查）")
-    parser.add_argument("--only", type=str, default=None,
-                        help="只跑名字包含该子串的用例")
-    parser.add_argument("--mode", type=str, default="both",
-                        choices=("both", "det", "nd"),
-                        help="跑 det / nd / 两者")
-    parser.add_argument("--quick", action="store_true",
-                        help="跳过 large 用例（4096 级）")
+    parser.add_argument("--repeat", type=int, default=20, help="det 模式重复次数（逐位一致检查）")
+    parser.add_argument("--only", type=str, default=None, help="只跑名字包含该子串的用例")
+    parser.add_argument(
+        "--mode", type=str, default="both", choices=("both", "det", "nd"), help="跑 det / nd / 两者"
+    )
+    parser.add_argument("--quick", action="store_true", help="跳过 large 用例（4096 级）")
     args = parser.parse_args()
 
     modes = {"both": (True, False), "det": (True,), "nd": (False,)}[args.mode]

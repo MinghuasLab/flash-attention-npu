@@ -78,9 +78,9 @@ def _seed_per_case(request):
     """
     import torch
     import zlib
+
     env_seed = os.environ.get("CI_TORCH_SEED")
-    seed = int(env_seed) if env_seed else zlib.crc32(
-        request.node.nodeid.encode("utf-8"))
+    seed = int(env_seed) if env_seed else zlib.crc32(request.node.nodeid.encode("utf-8"))
     torch.manual_seed(seed)
     if hasattr(torch, "npu") and hasattr(torch.npu, "manual_seed"):
         torch.npu.manual_seed(seed)

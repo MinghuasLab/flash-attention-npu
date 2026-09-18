@@ -17,9 +17,7 @@ def make_inputs(batch, q_len, kv_len, num_heads, kv_heads, head_size, *, seed):
     query = torch.randn(
         batch, q_len, num_heads, head_size, generator=generator, dtype=torch.float32
     )
-    key = torch.randn(
-        batch, kv_len, kv_heads, head_size, generator=generator, dtype=torch.float32
-    )
+    key = torch.randn(batch, kv_len, kv_heads, head_size, generator=generator, dtype=torch.float32)
     value = torch.randn(
         batch, kv_len, kv_heads, head_size, generator=generator, dtype=torch.float32
     )
@@ -88,9 +86,7 @@ def test_ref_flash_attention_forward_and_batch_equivalence():
     query, key, value = make_inputs(3, 5, 7, 4, 2, 8, seed=1234)
     scale = 1.0 / math.sqrt(query.shape[-1])
 
-    actual, actual_lse = ref_flash_attention(
-        query, key, value, scale, None, query.dtype
-    )
+    actual, actual_lse = ref_flash_attention(query, key, value, scale, None, query.dtype)
     expected, expected_lse = independent_attention(query, key, value, scale)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)
@@ -99,7 +95,7 @@ def test_ref_flash_attention_forward_and_batch_equivalence():
     per_batch_lse = []
     for index in range(query.shape[0]):
         output, lse = independent_attention(
-            query[index:index + 1], key[index:index + 1], value[index:index + 1], scale
+            query[index : index + 1], key[index : index + 1], value[index : index + 1], scale
         )
         per_batch.append(output)
         per_batch_lse.append(lse)
@@ -114,9 +110,7 @@ def test_ref_flash_attention_gqa_masks_and_fully_masked_rows():
     mask = causal_mask(query.shape[0], query.shape[1], key.shape[1])
     mask[0, 1] = True
 
-    actual, actual_lse = ref_flash_attention(
-        query, key, value, scale, mask, query.dtype
-    )
+    actual, actual_lse = ref_flash_attention(query, key, value, scale, mask, query.dtype)
     expected, expected_lse = independent_attention(query, key, value, scale, mask)
     actual, actual_lse = apply_fully_masked_contract(actual, actual_lse, mask)
     expected, expected_lse = apply_fully_masked_contract(expected, expected_lse, mask)
@@ -137,9 +131,7 @@ def test_ref_flash_attention_sink_and_pair():
     actual, actual_lse = ref_flash_attention(
         query, key, value, scale, mask, query.dtype, sink_matrix=sink
     )
-    expected, expected_lse = independent_attention(
-        query, key, value, scale, mask, sink=sink
-    )
+    expected, expected_lse = independent_attention(query, key, value, scale, mask, sink=sink)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)
 
@@ -147,12 +139,26 @@ def test_ref_flash_attention_sink_and_pair():
         query, key, value, scale, mask, query.dtype, sink_matrix=sink
     )
     direct_ref = ref_flash_attention(
-        query, key, value, scale, mask, query.dtype,
-        upcast=True, reorder_ops=False, sink_matrix=sink,
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        query.dtype,
+        upcast=True,
+        reorder_ops=False,
+        sink_matrix=sink,
     )
     direct_pt = ref_flash_attention(
-        query, key, value, scale, mask, query.dtype,
-        upcast=False, reorder_ops=True, sink_matrix=sink,
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        query.dtype,
+        upcast=False,
+        reorder_ops=True,
+        sink_matrix=sink,
     )
     torch.testing.assert_close(out_ref, direct_ref[0], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(lse_ref, direct_ref[1], rtol=1e-5, atol=1e-5)
@@ -174,8 +180,9 @@ def test_ref_flash_attention_backward():
     grad = torch.randn(actual.shape, generator=grad_generator, dtype=actual.dtype)
     actual_grads = torch.autograd.grad(actual, (query, key, value), grad)
 
-    query_ref, key_ref, value_ref = [tensor.detach().clone().requires_grad_()
-                                     for tensor in (query, key, value)]
+    query_ref, key_ref, value_ref = [
+        tensor.detach().clone().requires_grad_() for tensor in (query, key, value)
+    ]
     expected, _ = independent_attention(query_ref, key_ref, value_ref, scale, mask)
     expected_grads = torch.autograd.grad(expected, (query_ref, key_ref, value_ref), grad)
 

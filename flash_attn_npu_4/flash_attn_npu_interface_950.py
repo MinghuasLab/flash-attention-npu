@@ -72,23 +72,29 @@ def _flash_attn_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k = (_maybe_contiguous(x) for x in (q, k))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
-    cu_seqlens_q, cu_seqlens_k = (
-        _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)
-    )
+    cu_seqlens_q, cu_seqlens_k = (_maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k))
     seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
     page_table = _maybe_contiguous(page_table)
 
     out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_4_950.fwd(
-        q, k, v,
-        qv, out_,
-        cu_seqlens_q, cu_seqlens_k,
-        seqused_q, seqused_k,
-        max_seqlen_q, max_seqlen_k,
-        min_seqlen_k, page_table,
+        q,
+        k,
+        v,
+        qv,
+        out_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        min_seqlen_k,
+        page_table,
         gather_kv_indices,
         softmax_scale,
         causal,
-        window_size_left, window_size_right,
+        window_size_left,
+        window_size_right,
         softcap,
         num_splits,
         pack_gqa,
@@ -192,9 +198,7 @@ def _flash_attn_backward_op_fake(
         nheads = q.shape[2]
         seqlen_q = q.shape[1]
 
-    softmax_d = torch.empty(
-        (batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device
-    )
+    softmax_d = torch.empty((batch_size, nheads, seqlen_q), dtype=torch.float32, device=q.device)
     return softmax_d
 
 
@@ -248,9 +252,7 @@ def _flash_attn_backward(
     assert not pack_gqa, "flash_attn_npu_v4 950 bwd does not support pack_gqa=True"
     assert qv is None, "flash_attn_npu_v4 950 bwd does not support qv"
     assert page_table is None, "flash_attn_npu_v4 950 bwd does not support page_table"
-    assert gather_kv_indices is None, (
-        "flash_attn_npu_v4 950 bwd does not support gather_kv_indices"
-    )
+    assert gather_kv_indices is None, "flash_attn_npu_v4 950 bwd does not support gather_kv_indices"
     assert learnable_sink is None, "flash_attn_npu_v4 950 bwd does not support learnable_sink"
 
     if dq is None:
@@ -288,7 +290,6 @@ _flash_attn_bwd = _flash_attn_backward
 
 
 class FlashAttnFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -321,9 +322,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         batch_size = q.shape[0]
-        seqused_k = torch.full(
-            (batch_size,), k.shape[1], dtype=torch.int32, device=q.device
-        )
+        seqused_k = torch.full((batch_size,), k.shape[1], dtype=torch.int32, device=q.device)
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,
@@ -443,7 +442,6 @@ class FlashAttnFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -488,9 +486,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
         if seqused_k is not None and isinstance(seqused_k, int):
-            seqused_k = torch.full(
-                (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
-            )
+            seqused_k = torch.full((q.shape[0],), seqused_k, dtype=torch.int32, device=k.device)
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
 
@@ -669,8 +665,6 @@ def flash_attn_func(
     )
 
 
-
-
 @_torch_register_fake_wrapper("flash_attn_npu_4_C::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
@@ -705,13 +699,9 @@ def _flash_attn_forward_fake(
     if is_varlen_q:
         total_q = q.shape[0]
         num_heads = q.shape[1]
-        out = torch.empty(
-            (total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device
-        )
+        out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
         if return_lse:
-            softmax_lse = torch.empty(
-                (num_heads, total_q), dtype=torch.float32, device=q.device
-            )
+            softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
         else:
             softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
     else:

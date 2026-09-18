@@ -4,6 +4,7 @@ import os
 import torch
 
 from tests.common.golden_cache import get_or_compute_golden, register_retry
+
 """
   Shared FlashAttention NPU reference / golden implementation.
 
@@ -21,9 +22,9 @@ def softmax1(
     qk_result,
     is_first,
     gm,
-    interm_dtype = torch.float16,
-    rescale_threshold = 0.0,
-    ):
+    interm_dtype=torch.float16,
+    rescale_threshold=0.0,
+):
     sim = qk_result.to(interm_dtype)
     lm = torch.max(sim, dim=-1, keepdims=True)[0]
     if is_first:
@@ -80,9 +81,7 @@ def apply_attention_dropout(prob, drop_mask, dropout_p):
     if drop_mask.dim() == 3:
         drop_mask = drop_mask.unsqueeze(0)
     if drop_mask.dim() != 4:
-        raise ValueError(
-            f"drop_mask must be (B,H,Q,K) or (H,Q,K), got {tuple(drop_mask.shape)}"
-        )
+        raise ValueError(f"drop_mask must be (B,H,Q,K) or (H,Q,K), got {tuple(drop_mask.shape)}")
     return prob * drop_mask / (1.0 - dropout_p)
 
 
@@ -125,9 +124,7 @@ def softmax_with_sink(scores, sink_matrix, value_dtype):
         sink_matrix = sink_matrix.unsqueeze(0)
     expected_shape = (scores.shape[0], scores.shape[1], scores.shape[2], 1)
     if tuple(sink_matrix.shape) != expected_shape:
-        raise ValueError(
-            f"sink_matrix shape {tuple(sink_matrix.shape)} must be {expected_shape}"
-        )
+        raise ValueError(f"sink_matrix shape {tuple(sink_matrix.shape)} must be {expected_shape}")
     sink_matrix = sink_matrix.to(scores.dtype)
     row_max = torch.maximum(scores.amax(dim=-1, keepdim=True), sink_matrix)
     row_max_high = row_max.to(torch.float64)
@@ -187,7 +184,7 @@ def ref_flash_attention(
         gl = None
         go = None
         for kv_start in range(0, qk_result.shape[-1], context_size):
-            qk_chunk = qk_result[..., kv_start:kv_start + context_size]
+            qk_chunk = qk_result[..., kv_start : kv_start + context_size]
             p_chunk, row_sum, dm, gm = softmax1(
                 qk_chunk,
                 kv_start == 0,
@@ -197,7 +194,7 @@ def ref_flash_attention(
             )
             p_chunk = apply_attention_dropout(
                 p_chunk,
-                None if drop_mask is None else drop_mask[..., kv_start:kv_start + context_size],
+                None if drop_mask is None else drop_mask[..., kv_start : kv_start + context_size],
                 dropout_p,
             )
             # Match the NPU kernel's rescale-O path by accumulating go/lo/gl in fp32.
@@ -206,7 +203,7 @@ def ref_flash_attention(
             # would overflow to NaN, whereas fp32 accumulation remains safe.
             lo = pv_out(
                 p_chunk.to(torch.float32),
-                value[:, kv_start:kv_start + context_size].to(torch.float32),
+                value[:, kv_start : kv_start + context_size].to(torch.float32),
             )
             if kv_start == 0:
                 gl = row_sum.to(torch.float32)
@@ -247,17 +244,39 @@ def _ref_flash_attention_pair(
     """Return the two BSND golden references used by the comparator."""
     kwargs = {} if rescale_threshold is None else {"rescale_threshold": rescale_threshold}
     out_ref, lse_ref = ref_flash_attention(
-        query, key, value, scale, mask, data_type, softcap,
-        upcast=True, reorder_ops=False, sink_matrix=sink_matrix,
-        drop_mask=drop_mask, dropout_p=dropout_p,
-        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        data_type,
+        softcap,
+        upcast=True,
+        reorder_ops=False,
+        sink_matrix=sink_matrix,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes,
+        q_seqlens=q_seqlens,
+        kv_seqlens=kv_seqlens,
         **kwargs,
     )
     out_pt, lse_pt = ref_flash_attention(
-        query, key, value, scale, mask, data_type, softcap,
-        upcast=False, reorder_ops=True, sink_matrix=sink_matrix,
-        drop_mask=drop_mask, dropout_p=dropout_p,
-        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        data_type,
+        softcap,
+        upcast=False,
+        reorder_ops=True,
+        sink_matrix=sink_matrix,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes,
+        q_seqlens=q_seqlens,
+        kv_seqlens=kv_seqlens,
         **kwargs,
     )
     return out_ref, lse_ref, out_pt, lse_pt
@@ -300,14 +319,10 @@ def cached_ref_flash_attention_pair(
     metadata=None,
 ):
     """Cached wrapper for the two forward reference implementations."""
-    case_metadata = _golden_metadata(
-        query, key, value, scale, mask, data_type, softcap, metadata
-    )
+    case_metadata = _golden_metadata(query, key, value, scale, mask, data_type, softcap, metadata)
     case_metadata["rescale_threshold"] = rescale_threshold
     case_metadata["dropout_p"] = dropout_p
-    case_metadata["alibi_slopes_shape"] = (
-        None if alibi_slopes is None else list(alibi_slopes.shape)
-    )
+    case_metadata["alibi_slopes_shape"] = None if alibi_slopes is None else list(alibi_slopes.shape)
     case_metadata["q_seqlens"] = None if q_seqlens is None else list(q_seqlens)
     case_metadata["kv_seqlens"] = None if kv_seqlens is None else list(kv_seqlens)
     inputs = {
@@ -324,17 +339,31 @@ def cached_ref_flash_attention_pair(
 
     def compute():
         values = _ref_flash_attention_pair(
-            query, key, value, scale, mask, data_type, softcap,
-            rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
-            drop_mask=drop_mask, dropout_p=dropout_p,
-            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+            query,
+            key,
+            value,
+            scale,
+            mask,
+            data_type,
+            softcap,
+            rescale_threshold=rescale_threshold,
+            sink_matrix=sink_matrix,
+            drop_mask=drop_mask,
+            dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes,
+            q_seqlens=q_seqlens,
+            kv_seqlens=kv_seqlens,
         )
         return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
 
     cache_args = dict(
-        nodeid=nodeid or _current_nodeid(), metadata=case_metadata, inputs=inputs,
-        compute_fn=compute, expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
-        source_files=[__file__], test_source_files=_golden_test_source_files(),
+        nodeid=nodeid or _current_nodeid(),
+        metadata=case_metadata,
+        inputs=inputs,
+        compute_fn=compute,
+        expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
+        source_files=[__file__],
+        test_source_files=_golden_test_source_files(),
     )
     values, status = get_or_compute_golden(**cache_args, return_status=True)
     if status == "hit":
@@ -355,12 +384,16 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
         "metadata": _json_metadata(metadata),
         "output_shapes": [list(outputs[0].shape), list(outputs[1].shape)],
     }
-    caller_inputs = inputs if inputs is not None else {
-        "query": query,
-        "key": key,
-        "value": value,
-        "dout": dout,
-    }
+    caller_inputs = (
+        inputs
+        if inputs is not None
+        else {
+            "query": query,
+            "key": key,
+            "value": value,
+            "dout": dout,
+        }
+    )
     cache_inputs = {
         "caller_inputs": caller_inputs,
         "out_ref": outputs[0],
@@ -371,19 +404,24 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
         dq_ref, dk_ref, dv_ref = torch.autograd.grad(
             outputs[0], refs, dout.detach().cpu(), retain_graph=True
         )
-        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-            outputs[1], refs, dout.detach().cpu()
-        )
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(outputs[1], refs, dout.detach().cpu())
         return {
-            "dq_ref": dq_ref, "dk_ref": dk_ref, "dv_ref": dv_ref,
-            "dq_pt": dq_pt, "dk_pt": dk_pt, "dv_pt": dv_pt,
+            "dq_ref": dq_ref,
+            "dk_ref": dk_ref,
+            "dv_ref": dv_ref,
+            "dq_pt": dq_pt,
+            "dk_pt": dk_pt,
+            "dv_pt": dv_pt,
         }
 
     cache_args = dict(
-        nodeid=nodeid, metadata=case_metadata, inputs=cache_inputs,
+        nodeid=nodeid,
+        metadata=case_metadata,
+        inputs=cache_inputs,
         compute_fn=compute,
         expected_keys=("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"),
-        source_files=[__file__], test_source_files=_golden_test_source_files(),
+        source_files=[__file__],
+        test_source_files=_golden_test_source_files(),
     )
     values, status = get_or_compute_golden(**cache_args, return_status=True)
     if status == "hit":
@@ -428,19 +466,38 @@ def ref_flash_attention_pair(
     # separate gradient artifact is missing or being refreshed.  Forward-only
     # cases use the persistent cache below.
     if any(
-        isinstance(tensor, torch.Tensor) and tensor.requires_grad
-        for tensor in (query, key, value)
+        isinstance(tensor, torch.Tensor) and tensor.requires_grad for tensor in (query, key, value)
     ):
         return _ref_flash_attention_pair(
-            query, key, value, scale, mask, data_type, softcap,
-            rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
-            drop_mask=drop_mask, dropout_p=dropout_p,
-            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+            query,
+            key,
+            value,
+            scale,
+            mask,
+            data_type,
+            softcap,
+            rescale_threshold=rescale_threshold,
+            sink_matrix=sink_matrix,
+            drop_mask=drop_mask,
+            dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes,
+            q_seqlens=q_seqlens,
+            kv_seqlens=kv_seqlens,
         )
     return cached_ref_flash_attention_pair(
-        query, key, value, scale, mask, data_type, softcap,
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        data_type,
+        softcap,
         nodeid=_current_nodeid(),
-        rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
-        drop_mask=drop_mask, dropout_p=dropout_p,
-        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+        rescale_threshold=rescale_threshold,
+        sink_matrix=sink_matrix,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes,
+        q_seqlens=q_seqlens,
+        kv_seqlens=kv_seqlens,
     )

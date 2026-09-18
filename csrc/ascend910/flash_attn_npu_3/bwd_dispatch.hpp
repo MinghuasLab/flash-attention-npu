@@ -33,21 +33,21 @@ struct BwdLaunchArgs {
     bool is_softcap;
     bool has_attn_mask;
     bool deterministic;
-    uint32_t qk_headdim_kernel;  // 64 / 128 / 192 / 256
-    uint8_t *dOutDevice;
-    uint8_t *qDevice;
-    uint8_t *kDevice;
-    uint8_t *vDevice;
-    uint8_t *outDevice;
-    uint8_t *attenMaskDevice;    // may be nullptr when has_attn_mask is false
-    uint8_t *softMaxLseDevice;
-    uint8_t *cuSeqQlenDevice;    // may be nullptr in BSND mode
-    uint8_t *cuSeqKvlenDevice;   // may be nullptr in BSND mode
-    uint8_t *dqDevice;
-    uint8_t *dkDevice;
-    uint8_t *dvDevice;
-    uint8_t *workspaceDevice;
-    uint8_t *tilingDevice;
+    uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256
+    uint8_t* dOutDevice;
+    uint8_t* qDevice;
+    uint8_t* kDevice;
+    uint8_t* vDevice;
+    uint8_t* outDevice;
+    uint8_t* attenMaskDevice; // may be nullptr when has_attn_mask is false
+    uint8_t* softMaxLseDevice;
+    uint8_t* cuSeqQlenDevice;  // may be nullptr in BSND mode
+    uint8_t* cuSeqKvlenDevice; // may be nullptr in BSND mode
+    uint8_t* dqDevice;
+    uint8_t* dkDevice;
+    uint8_t* dvDevice;
+    uint8_t* workspaceDevice;
+    uint8_t* tilingDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in
@@ -56,13 +56,14 @@ struct BwdLaunchArgs {
 // mask x deterministic x headdim). kInputLayout is BSND (0) or TND (1) from
 // fag_kernel_common.hpp.
 template <typename DType, uint32_t kInputLayout>
-void bwd_dispatch_run(const BwdLaunchArgs &a);
+void bwd_dispatch_run(const BwdLaunchArgs& a);
 
 // Runtime entry: kInputLayout is fixed at the call site, then the matching
 // dtype's launcher is selected. bwd_dispatch_run is explicitly instantiated per
 // (dtype, kInputLayout) in the autogen TUs.
 template <uint32_t kInputLayout>
-inline void launch_bwd(const BwdLaunchArgs &a) {
+inline void launch_bwd(const BwdLaunchArgs& a)
+{
     if (a.is_bf16) {
         bwd_dispatch_run<bfloat16_t, kInputLayout>(a);
     } else {

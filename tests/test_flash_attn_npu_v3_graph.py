@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-import torch_npu
+import torch_npu  # noqa: F401
 
 from flash_attn_npu_3 import flash_attn_with_kvcache, get_scheduler_metadata
 from tests.common.attention_ref import ref_flash_attention_pair
@@ -18,7 +18,7 @@ Q_SEQLEN = 16
 KV_SEQLEN = 128
 HEAD_SIZE = 128
 BLOCK_SIZE = 128
-SCALE = 1.0 / (HEAD_SIZE ** 0.5)
+SCALE = 1.0 / (HEAD_SIZE**0.5)
 WINDOW_SIZE = (-1, -1)
 
 
@@ -51,8 +51,12 @@ def _run_flash_attn(
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_kvcache_graph(is_causal):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    key_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    value_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    key_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
+    value_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()

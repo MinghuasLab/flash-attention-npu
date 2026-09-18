@@ -8,7 +8,9 @@ body:
   - type: markdown
     attributes:
       value: >
-        #### Thanks for helping improve performance! Before submitting an issue, please make sure a similar discussion has not already been opened or addressed by searching through [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
+        #### Thanks for helping improve performance! Before submitting an issue, please make sure a
+        similar discussion has not already been opened or addressed by searching through
+        [existing issues](https://github.com/MinghuasLab/flash-attention-npu/issues).
 
   - type: textarea
     id: current_issue

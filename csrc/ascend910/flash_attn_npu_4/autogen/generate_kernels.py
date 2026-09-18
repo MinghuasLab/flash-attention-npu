@@ -29,7 +29,7 @@ DTYPE_MAP = {
 # layout key -> (display name, fwd IS_TND bool token)
 LAYOUTS = [
     ("bsnd", "BSND", "false"),
-    ("tnd",  "TND",  "true"),
+    ("tnd", "TND", "true"),
 ]
 
 PRELUDE = (
@@ -42,8 +42,7 @@ PRELUDE = (
 
 def _header(family_desc: str, layout_display: str) -> str:
     return (
-        PRELUDE
-        + f"// v4 {family_desc}, {layout_display} variant. One explicit instantiation per\n"
+        PRELUDE + f"// v4 {family_desc}, {layout_display} variant. One explicit instantiation per\n"
         "// translation unit so the kernel templates compile in parallel across\n"
         "// cores; head_dim is a runtime axis (switch/tiling inside the impl), not a\n"
         "// template parameter, so it is not a generation axis.\n\n"

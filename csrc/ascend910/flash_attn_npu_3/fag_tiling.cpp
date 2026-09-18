@@ -17,7 +17,7 @@
 using namespace std;
 namespace FAGTiling {
 
-float CalculateMaskRatio(FAGTilingData &fagTilingData)
+float CalculateMaskRatio(FAGTilingData& fagTilingData)
 {
     // calculate ratio of all mask
     float realS1 = 0;
@@ -25,10 +25,10 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
     if (fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK) ||
         fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND)) {
         if (fagTilingData.s1Token >= 0 && fagTilingData.s2Token >= 0) {
-            realS1 = fagTilingData.s1Token >= fagTilingData.qSeqlen ? static_cast<float>(fagTilingData.qSeqlen) :
-                                                                static_cast<float>(fagTilingData.s1Token);
-            realS2 = fagTilingData.s2Token >= fagTilingData.kvSeqlen ? static_cast<float>(fagTilingData.kvSeqlen) :
-                                                                static_cast<float>(fagTilingData.s2Token);
+            realS1 = fagTilingData.s1Token >= fagTilingData.qSeqlen ? static_cast<float>(fagTilingData.qSeqlen)
+                                                                    : static_cast<float>(fagTilingData.s1Token);
+            realS2 = fagTilingData.s2Token >= fagTilingData.kvSeqlen ? static_cast<float>(fagTilingData.kvSeqlen)
+                                                                     : static_cast<float>(fagTilingData.s2Token);
             return (realS1 + realS2) / static_cast<float>(fagTilingData.qSeqlen + fagTilingData.kvSeqlen);
         } else if (fagTilingData.s1Token < 0 && fagTilingData.s2Token >= 0) {
             realS2 = fagTilingData.s2Token >= fagTilingData.kvSeqlen ? fagTilingData.kvSeqlen : fagTilingData.s2Token;
@@ -48,7 +48,7 @@ float CalculateMaskRatio(FAGTilingData &fagTilingData)
     }
 }
 
-void AdjustCvInner(FAGTilingData &fagTilingData)
+void AdjustCvInner(FAGTilingData& fagTilingData)
 {
     if (fagTilingData.isDeterministic) {
         int64_t vecBlockNum = fagTilingData.coreNum / VEC_SPLIT_NUM;
@@ -60,7 +60,8 @@ void AdjustCvInner(FAGTilingData &fagTilingData)
             fagTilingData.s1CvInner = SAMEAB_S1_256;
             fagTilingData.s2CvInner = SAMEAB_S1_256;
         }
-        if (fagTilingData.qSeqlen <= fagTilingData.s1CvInner && fagTilingData.kvSeqlen <= fagTilingData.s2CvInner && fagTilingData.g == 1) {
+        if (fagTilingData.qSeqlen <= fagTilingData.s1CvInner && fagTilingData.kvSeqlen <= fagTilingData.s2CvInner &&
+            fagTilingData.g == 1) {
             // s小于基本块大小时，可以走回非确定性模板
             fagTilingData.isDeterministic = false;
         }
@@ -68,7 +69,8 @@ void AdjustCvInner(FAGTilingData &fagTilingData)
     }
     // calculate best cvInner
     if (fagTilingData.isSparse == false && fagTilingData.kvSeqlen < 4 * SAMEAB_S1_BASE) {
-        if (fagTilingData.qkHeadDim == 64 && fagTilingData.qSeqlen >= fagTilingData.s1CvInner && fagTilingData.kvSeqlen >= fagTilingData.s2CvInner) {
+        if (fagTilingData.qkHeadDim == 64 && fagTilingData.qSeqlen >= fagTilingData.s1CvInner &&
+            fagTilingData.kvSeqlen >= fagTilingData.s2CvInner) {
             // D=64时，mmbaseN=256, s1/s2足够大，不需要调整基本块
             return;
         }
@@ -119,7 +121,7 @@ void AdjustCvInner(FAGTilingData &fagTilingData)
     }
 }
 
-bool SetSparseParams(const FAGTilingData &fagTilingData)
+bool SetSparseParams(const FAGTilingData& fagTilingData)
 {
     if (fagTilingData.layoutType == TND) {
         return true;
@@ -127,41 +129,46 @@ bool SetSparseParams(const FAGTilingData &fagTilingData)
     return fagTilingData.maskType != static_cast<uint32_t>(MaskType::NO_MASK);
 }
 
-static void ProcessTokensInfo(FAGTilingData &fagTilingData)
+static void ProcessTokensInfo(FAGTilingData& fagTilingData)
 {
-    if (fagTilingData.layoutType != TND &&
-        (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) ||
-         fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND))) {
+    if (fagTilingData.layoutType != TND && (fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) ||
+                                            fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_BAND))) {
         fagTilingData.s1Token += fagTilingData.qSeqlen - fagTilingData.kvSeqlen;
         fagTilingData.s2Token += fagTilingData.kvSeqlen - fagTilingData.qSeqlen;
     }
 }
 
-void FillWorkSpaceTilingData(FAGTilingData &fagTilingData) {
-   // begin position
+void FillWorkSpaceTilingData(FAGTilingData& fagTilingData)
+{
+    // begin position
     size_t workspaceSize = MUL_CORE_SYNC_BUFFER;
     uint32_t s1Inner = std::min(INITIAL_S1_SPLIT_NUM, fagTilingData.s1Align);
 
     // matmal3 q
-    workspaceSize = (workspaceSize + static_cast<size_t>(fagTilingData.qSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceSize =
+        (workspaceSize + static_cast<size_t>(fagTilingData.qSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     // matmal3 k
-    workspaceSize = (workspaceSize + static_cast<size_t>(fagTilingData.kvSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceSize =
+        (workspaceSize + static_cast<size_t>(fagTilingData.kvSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     // matmal3 v
-    workspaceSize = (workspaceSize + static_cast<size_t>(fagTilingData.vSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceSize =
+        (workspaceSize + static_cast<size_t>(fagTilingData.vSize) * FP32_BYTES + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
     // mask bool workspace size
     if (fagTilingData.dropoutIsDivisibleBy8 == 0) {
-        workspaceSize = (workspaceSize + static_cast<size_t>(fagTilingData.dropMaskSize) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+        workspaceSize =
+            (workspaceSize + static_cast<size_t>(fagTilingData.dropMaskSize) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
     }
     // sfmg workspace
-    workspaceSize = workspaceSize + static_cast<size_t>(AlignTo(
-        fagTilingData.sfmgNormalAxisSize * SOFTMAX_REDUCE_SIZE * FP32_BYTES, static_cast<int64_t>(GM_ALIGN)));
+    workspaceSize =
+        workspaceSize + static_cast<size_t>(AlignTo(fagTilingData.sfmgNormalAxisSize * SOFTMAX_REDUCE_SIZE * FP32_BYTES,
+                                                    static_cast<int64_t>(GM_ALIGN)));
 
     // matmal1/matmal2 workspace size
     size_t vectorCoreNum = fagTilingData.coreNum;
     workspaceSize =
-        (workspaceSize + vectorCoreNum * fagTilingData.s1CvInner * fagTilingData.s2CvInner * FP32_BYTES * MATMUL_INPUT_NUM +
-         GM_ALIGN) /
+        (workspaceSize +
+         vectorCoreNum * fagTilingData.s1CvInner * fagTilingData.s2CvInner * FP32_BYTES * MATMUL_INPUT_NUM + GM_ALIGN) /
         GM_ALIGN * GM_ALIGN;
 
     workspaceSize += WORKSPACE_BUFFER;
@@ -180,7 +187,7 @@ void FillWorkSpaceTilingData(FAGTilingData &fagTilingData) {
     fagTilingData.workspaceSize = workspaceSize;
 }
 
-bool DoPreTiling(FAGTilingData &fagTilingData)
+bool DoPreTiling(FAGTilingData& fagTilingData)
 {
     uint32_t castBufferLen = 60 * 1024;
     uint32_t outputBufferLen = 30 * 1024;
@@ -226,7 +233,7 @@ bool DoPreTiling(FAGTilingData &fagTilingData)
     return true;
 }
 
-bool DoPostTiling(FAGTilingData &fagTilingData)
+bool DoPostTiling(FAGTilingData& fagTilingData)
 {
     int64_t workspaceOffsets = MUL_CORE_SYNC_BUFFER;
     fagTilingData.dqWorkSpaceOffset = workspaceOffsets;
@@ -240,7 +247,7 @@ bool DoPostTiling(FAGTilingData &fagTilingData)
     return true;
 }
 
-void DoPreSfmgTiling(FAGTilingData &fagTilingData)
+void DoPreSfmgTiling(FAGTilingData& fagTilingData)
 {
     int64_t value_dAlign = (fagTilingData.vHeadDim + FP16_BLOCK_NUMS - 1) / FP16_BLOCK_NUMS * FP16_BLOCK_NUMS;
     uint32_t inputBufferLen = 24 * 1024;                                    // castBuffer 24K*2=48K
@@ -287,7 +294,8 @@ void DoPreSfmgTiling(FAGTilingData &fagTilingData)
     fagTilingData.softmaxGradTilingData = softmaxGradTilingData;
 }
 
-int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivNum, uint64_t ubSize, FAGTilingData &fagTilingData)
+int64_t GetFAGTilingParam(const FAGInfo& fagInfo, uint32_t aicNum, uint32_t aivNum, uint64_t ubSize,
+                          FAGTilingData& fagTilingData)
 {
     fagTilingData.scaleValue = fagInfo.scaleValue;
     fagTilingData.softcapValue = fagInfo.softcapValue;
@@ -349,9 +357,11 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
         }
         fagTilingData.batch -= tailZeroCount;
         fagTilingData.t1 = actualSeqQlenTensor[seqQShapeSize - 1];
-        fagTilingData.t2 = actualSeqKvlenTensor[kvSeqShapeSize- 1];
-        fagTilingData.qSeqlen = *std::max_element(fagTilingData.actualSeqQlen.begin(), fagTilingData.actualSeqQlen.end());
-        fagTilingData.kvSeqlen = *std::max_element(fagTilingData.actualSeqKvlen.begin(), fagTilingData.actualSeqKvlen.end());
+        fagTilingData.t2 = actualSeqKvlenTensor[kvSeqShapeSize - 1];
+        fagTilingData.qSeqlen =
+            *std::max_element(fagTilingData.actualSeqQlen.begin(), fagTilingData.actualSeqQlen.end());
+        fagTilingData.kvSeqlen =
+            *std::max_element(fagTilingData.actualSeqKvlen.begin(), fagTilingData.actualSeqKvlen.end());
     } else {
         fagTilingData.layoutType = BSND;
     }
@@ -401,7 +411,8 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.s2Tail = s2TailTmp == 0 ? fagTilingData.s2Inner : s2TailTmp;
     fagTilingData.s1CvTail = s1CvTailTmp == 0 ? fagTilingData.s1CvInner : s1CvTailTmp;
     fagTilingData.s2CvTail = s2CvTailTmp == 0 ? fagTilingData.s2CvInner : s2CvTailTmp;
-    fagTilingData.sfmgNormalAxisSize = fagTilingData.batch * fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.qSeqlen;
+    fagTilingData.sfmgNormalAxisSize =
+        fagTilingData.batch * fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.qSeqlen;
 
     // Dropout is always handled in bit mode: the mask is the bit-packed output
     // of aclnnDropoutGenMask (ceil(seqlen/8) bytes per row, bit 1 = keep), the
@@ -416,7 +427,8 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.calBlockNum = FP32_BLOCK_NUMS;
 
     fagTilingData.blockOuter = fagTilingData.coreNum;
-    int64_t fusedOuter = fagTilingData.batch * fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.s1Outer * fagTilingData.s2Outer;
+    int64_t fusedOuter =
+        fagTilingData.batch * fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.s1Outer * fagTilingData.s2Outer;
     fagTilingData.blockFactor = (fusedOuter + fagTilingData.coreNum - 1) / fagTilingData.coreNum;
 
     if (fagTilingData.layoutType == TND) {
@@ -425,16 +437,17 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
         fagTilingData.vSize = fagTilingData.t2 * fagTilingData.kvHeadNum * 1 * fagTilingData.vHeadDim;
         fagTilingData.dropMaskSize = fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.sumS1S2Product;
     } else {
-        fagTilingData.qSize = fagInfo.batch * fagInfo.qHeadNum * fagInfo.qSeqlen *  fagInfo.qkHeadDim;
+        fagTilingData.qSize = fagInfo.batch * fagInfo.qHeadNum * fagInfo.qSeqlen * fagInfo.qkHeadDim;
         fagTilingData.kvSize = fagInfo.batch * fagInfo.kvHeadNum * fagInfo.kvSeqlen * fagInfo.qkHeadDim;
         fagTilingData.vSize = fagInfo.batch * fagInfo.kvHeadNum * fagInfo.kvSeqlen * fagInfo.vHeadDim;
         fagTilingData.dropMaskSize = fagInfo.batch * fagInfo.qHeadNum * fagInfo.kvSeqlen * fagInfo.qSeqlen;
     }
 
     fagTilingData.baseMN = fagTilingData.s1Inner * fagTilingData.s2Inner;
-    uint32_t tmpBufferSize = (fagTilingData.ubSize - fagTilingData.s1Inner * fagTilingData.s2Inner * BASIC_BLOCK_MULTIPLE -
-                              fagTilingData.s1Inner * SHAPE_INFO * fagTilingData.calTypeSize) /
-                             BYTE_BLOCK * BYTE_BLOCK;
+    uint32_t tmpBufferSize =
+        (fagTilingData.ubSize - fagTilingData.s1Inner * fagTilingData.s2Inner * BASIC_BLOCK_MULTIPLE -
+         fagTilingData.s1Inner * SHAPE_INFO * fagTilingData.calTypeSize) /
+        BYTE_BLOCK * BYTE_BLOCK;
     fagTilingData.tmpBufferSize = tmpBufferSize;
 
     // pre tiling_data
@@ -452,4 +465,4 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     return 0;
 }
 
-} // FAGTiling
+} // namespace FAGTiling
