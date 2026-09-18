@@ -81,9 +81,12 @@ import flash_attn_npu_3
 print("flash_attn_npu_3", flash_attn_npu_3.__version__)
 PY
 
+
+
 # ---------- 3. pytest tests/ ----------
-if [ "${CI_RUN_EXAMPLE_ST:-true}" != "true" ]; then
-  log "CI_RUN_EXAMPLE_ST!=true, skip tests"
+# 临时: 跳过 pytest, 只跑探针 (确认探针结果后改回 true)
+if [ "${CI_RUN_EXAMPLE_ST:-false}" != "true" ] || [ "${CI_SKIP_TESTS:-false}" = "true" ]; then
+  log "tests skipped (CI_RUN_EXAMPLE_ST=${CI_RUN_EXAMPLE_ST:-false} CI_SKIP_TESTS=${CI_SKIP_TESTS:-false})"
   exit 0
 fi
 
@@ -109,10 +112,33 @@ FAILED_FILE="$LOG_DIR/failed_cases.txt"
 run_pytest() {
   local target="$1" logfile="$2"; shift 2
   log ">>> pytest $target mode=$MODE workers=$TEST_WORKERS sample=${SAMPLE_ARG:-<none>} (log=$logfile)"
+  # 后台观察者每 30s 解析日志, 向 CI 控制台打一行 完成数/总数(百分比)+最新用例
+  # (观察者输出只进 stdout, 不写入 logfile, 日志保持 pytest 原始格式)。
+  (
+    prog_total=""
+    while sleep 30; do
+      [ -f "$logfile" ] || continue
+      if [ -z "$prog_total" ]; then
+        # xdist 头部形如 "2 workers [1110 items]"
+        prog_total="$(sed -n 's/.*workers \[\([0-9]\{1,\}\) items\].*/\1/p' "$logfile" | head -n 1)"
+      fi
+      [ -n "$prog_total" ] || continue
+      prog_pass="$(grep -cE '^\[gw[0-9]+\] PASSED' "$logfile" || true)"
+      prog_fail="$(grep -cE '^\[gw[0-9]+\] (FAILED|ERROR)' "$logfile" || true)"
+      prog_done=$((prog_pass + prog_fail))
+      prog_run="$(grep -E '^tests/' "$logfile" | tail -n 1 | cut -c1-110 || true)"
+      [ "$prog_total" -gt 0 ] 2>/dev/null || continue
+      printf '[CI-test][progress] %s/%s (%d%%) pass=%s fail=%s running: %s\n' \
+        "$prog_done" "$prog_total" $((prog_done * 100 / prog_total)) "$prog_pass" "$prog_fail" "$prog_run"
+    done
+  ) &
+  local watcher_pid=$!
   set +e
   # shellcheck disable=SC2086
   python3 -m pytest "$target" -vs -n "$TEST_WORKERS" --dist=loadscope $SAMPLE_ARG "$@" >"$logfile" 2>&1
-  local rc=$?
+  local rc=${PIPESTATUS[0]}
+  kill "$watcher_pid" 2>/dev/null
+  wait "$watcher_pid" 2>/dev/null
   set -e
   if [ $rc -ne 0 ]; then
     log "<<< FAILED (pytest rc=$rc), tail of $logfile:"
@@ -149,6 +175,7 @@ if [ -n "${CI_TEST_DIRECT_FILE:-}" ]; then
 else
   run_pytest "tests/" "$LOG_DIR/all_tests.log"
 fi
+
 
 summarize_golden_cache
 

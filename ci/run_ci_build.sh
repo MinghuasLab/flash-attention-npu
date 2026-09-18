@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #
 # 阶段1: 编译 (容器内执行, 不需要 NPU, 不加锁)
-#   1. bash ci/init_submodules.sh  (浅拉 + runner 磁盘缓存)
+#   1. git submodule update --init
 #   2. python setup.py build  (产物在 build/, 通过 volume 持久化供阶段2复用)
 #
 # 由 ci/run_ci_container.sh 阶段1通过 docker run 调用 (不绑卡)。
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(pwd)"
 
 log() { printf '[CI-build] %s\n' "$*"; }
@@ -22,10 +21,13 @@ log "build phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 
-# ---------- 1. 子模块 (浅拉 + runner 缓存) ----------
-log "init submodules: csrc/catlass (shallow + runner cache)"
-bash "$SCRIPT_DIR/init_submodules.sh" "$REPO_ROOT"
-export FLASH_ATTN_SKIP_SUBMODULE_INIT=1
+# ---------- 1. 子模块 ----------
+# 只初始化 catlass 本层: 编译只需要它的 include 头文件 (setup.py -I)。
+# 不加 --recursive, 跳过嵌套的 googletest / AscendNPU-IR / triton /
+# llvm-project (catlass TLA DSL 的开发依赖, github 直连慢且不稳,
+# 递归克隆曾在网络抖动时阻塞 CI 构建)。
+log "init submodules: csrc/catlass (no recursion, headers only)"
+git submodule update --init csrc/catlass
 
 # ---------- 2. 编译 (python setup.py build_ext --inplace) ----------
 # 用 --inplace 把 .so 直接放到源码目录, 避免从仓库根 import 时源码目录

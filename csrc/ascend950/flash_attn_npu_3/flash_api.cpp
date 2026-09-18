@@ -15,7 +15,7 @@
 #include "fa_metadata_args.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
-extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
+extern __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
@@ -51,7 +51,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
                           metadataDone = events.metadataDone, metaArgs, meta, seqlensQ, seqlensK]() mutable -> int {
         ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
         ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
-        ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
+        ComputeFAMetadataV3<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
         ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
         ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
         return 0;

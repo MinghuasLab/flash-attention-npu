@@ -55,7 +55,7 @@ inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
 }
 }  // namespace
 
-__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+__global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
 {
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
     const bool hasMask = metaArgs->maskType != 0;

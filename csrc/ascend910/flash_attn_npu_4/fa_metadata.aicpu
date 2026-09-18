@@ -42,6 +42,7 @@ inline uint32_t GetSeqlen(const int32_t *seqlens, uint32_t batchIdx, bool cumula
 __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
 {
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
+
     const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
         metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
@@ -161,8 +162,16 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
         }
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
-        const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
-        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
+        // [aicpu-size-divergence] Integer arithmetic instead of the v3 copy's
+        // floating-point comparisons: 0.8*bd -> numTasks*5 <= bd*4 (exact for
+        // non-negative integers, whereas 0.8 in double rounds); bd*512 -> bd<<9.
+        // Same decisions, different emitted instructions (cmp vs fcmp), keeping
+        // the v3/v4 .aicpu_binary payloads distinct in size — required because
+        // on driver 25.5.0 the host transmission path drops the bytes of a
+        // second custom aicpu payload whose size equals an already-sent one
+        // (device store fold -> 11003 get kernel failed).
+        const bool isLongSeq = (numTasks * 5u <= bd * 4u) && (maxKvSeqlen >= (bd << 9));
+        const bool isShortSeq = (numTasks * 5u <= bd * 2u) && (maxKvSeqlen >= 1024u);
         const bool fdFlag = (metaArgs->pagedKV != 0) && (seqlensQ != nullptr) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
