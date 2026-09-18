@@ -85,8 +85,8 @@ struct FAGInfo {
     float softcapValue = 0.0f;
 
     // TND only: host pointers to per-batch actual sequence lengths.
-    const int64_t *actualSeqQ = nullptr;
-    const int64_t *actualSeqKv = nullptr;
+    const int64_t* actualSeqQ = nullptr;
+    const int64_t* actualSeqKv = nullptr;
 };
 
 struct FAGTilingData {
@@ -120,13 +120,13 @@ struct FAGTilingData {
     uint32_t kvTile = 0;
 
     // BN2S2 deterministic schedule (detSchedule == BN2S2).
-    uint32_t detKind = 0;      // fag_det::Kind
-    uint32_t detColumnRounds = 0;    // rounds per owned column
-    uint32_t detBufNum = 1;    // private dk/dv buffers per core (2 for causal fold)
-    uint32_t detPrivDkv = 0;   // 1: per-core private dk/dv + early AIV cast (g == 1)
-    uint64_t detMaxRound = 0;  // total schedule rounds
-    uint64_t dkPrivOffset = 0;  // per-core dk fp32 accumulation region
-    uint64_t dvPrivOffset = 0;  // per-core dv fp32 accumulation region
+    uint32_t detKind = 0;         // fag_det::Kind
+    uint32_t detColumnRounds = 0; // rounds per owned column
+    uint32_t detBufNum = 1;       // private dk/dv buffers per core (2 for causal fold)
+    uint32_t detPrivDkv = 0;      // 1: per-core private dk/dv + early AIV cast (g == 1)
+    uint64_t detMaxRound = 0;     // total schedule rounds
+    uint64_t dkPrivOffset = 0;    // per-core dk fp32 accumulation region
+    uint64_t dvPrivOffset = 0;    // per-core dv fp32 accumulation region
     // TND BN2S2: exclusive end round of each batch (prefix[B] = detMaxRound).
     int64_t tndPrefix[TND_SWIZZLE_PREFIX_NUM] = {0};
     // TND causal (KIND_TND_CAUSAL): diagonal-band prefix tables p1/p2.
@@ -143,14 +143,12 @@ struct FAGTilingData {
     uint64_t workspaceSize = 0;
 };
 
-static_assert(std::is_standard_layout_v<FAGTilingData>,
-              "FAGTilingData must have a stable host/device layout");
-static_assert(std::is_trivially_copyable_v<FAGTilingData>,
-              "FAGTilingData must be byte-copyable to device");
+static_assert(std::is_standard_layout_v<FAGTilingData>, "FAGTilingData must have a stable host/device layout");
+static_assert(std::is_trivially_copyable_v<FAGTilingData>, "FAGTilingData must be byte-copyable to device");
 
-int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling);
+int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling);
 
-}  // namespace FAGTiling950
+} // namespace FAGTiling950
 
 struct FAGBlockInfo {
     uint64_t blockId = 0;
@@ -219,37 +217,13 @@ struct FAGKernelParams {
     FAGKernelParams() = default;
 
     CATLASS_DEVICE
-    FAGKernelParams(
-        GM_ADDR dout_,
-        GM_ADDR q_,
-        GM_ADDR k_,
-        GM_ADDR v_,
-        GM_ADDR out_,
-        GM_ADDR attenMask_,
-        GM_ADDR softmaxLse_,
-        GM_ADDR cuSeqQlen_,
-        GM_ADDR cuSeqKvlen_,
-        GM_ADDR dq_,
-        GM_ADDR dk_,
-        GM_ADDR dv_,
-        GM_ADDR workspace_,
-        GM_ADDR tiling_)
-        : dout(dout_),
-          q(q_),
-          k(k_),
-          v(v_),
-          out(out_),
-          attenMask(attenMask_),
-          softmaxLse(softmaxLse_),
-          cuSeqQlen(cuSeqQlen_),
-          cuSeqKvlen(cuSeqKvlen_),
-          dq(dq_),
-          dk(dk_),
-          dv(dv_),
-          workspace(workspace_),
+    FAGKernelParams(GM_ADDR dout_, GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR out_, GM_ADDR attenMask_,
+                    GM_ADDR softmaxLse_, GM_ADDR cuSeqQlen_, GM_ADDR cuSeqKvlen_, GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_,
+                    GM_ADDR workspace_, GM_ADDR tiling_)
+        : dout(dout_), q(q_), k(k_), v(v_), out(out_), attenMask(attenMask_), softmaxLse(softmaxLse_),
+          cuSeqQlen(cuSeqQlen_), cuSeqKvlen(cuSeqKvlen_), dq(dq_), dk(dk_), dv(dv_), workspace(workspace_),
           tiling(tiling_)
-    {
-    }
+    {}
 };
 
 #endif

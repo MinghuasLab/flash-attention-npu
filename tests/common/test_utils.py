@@ -9,7 +9,7 @@ CASE_SEED = 42
 
 def make_alibi_slopes(batch_size, num_heads):
     """Create the standard ALiBi slope table [batch_size, num_heads] on CPU fp32."""
-    slopes = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    slopes = torch.tensor([0.5 / (2**h) for h in range(num_heads)], dtype=torch.float32)
     return slopes.unsqueeze(0).repeat(batch_size, 1)
 
 
@@ -119,7 +119,9 @@ def make_varlen_seqlens(batch_size, max_seqlen_q, max_seqlen_k, seed=CASE_SEED):
         k_low = max(min_k, q_seqlen)
         if k_low > max_seqlen_k:
             k_low = max_seqlen_k
-        seqlens_k.append(int(torch.randint(k_low, max_seqlen_k + 1, (1,), generator=generator).item()))
+        seqlens_k.append(
+            int(torch.randint(k_low, max_seqlen_k + 1, (1,), generator=generator).item())
+        )
     return seqlens_q, seqlens_k
 
 
@@ -149,9 +151,10 @@ def make_packed_random_tensor(
 
 def pad_packed_tensor(packed, seqlens, max_seqlen):
     """Restore a packed TND tensor to a padded 4D tensor using ``seqlens``."""
-    valid = torch.arange(max_seqlen, device=packed.device) < torch.as_tensor(
-        seqlens, device=packed.device
-    )[:, None]
+    valid = (
+        torch.arange(max_seqlen, device=packed.device)
+        < torch.as_tensor(seqlens, device=packed.device)[:, None]
+    )
     padded = torch.zeros(
         (len(seqlens), max_seqlen, *packed.shape[1:]),
         dtype=packed.dtype,
@@ -175,8 +178,18 @@ def make_block_table(batch_size, kv_seqlen, block_size):
     ).reshape(batch_size, blocks_per_sequence)
 
 
-def make_paged_kv_cache(batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type,
-                        *, device="npu", requires_grad=False, generator=None):
+def make_paged_kv_cache(
+    batch_size,
+    kv_seqlen,
+    block_size,
+    kv_heads,
+    head_size,
+    data_type,
+    *,
+    device="npu",
+    requires_grad=False,
+    generator=None,
+):
     """Allocate paged K/V caches matching ``make_block_table``'s block count.
 
     ``make_block_table`` assigns ``ceil(kv_seqlen/block_size)`` physical blocks
@@ -187,10 +200,20 @@ def make_paged_kv_cache(batch_size, kv_seqlen, block_size, kv_heads, head_size, 
     0x800000) and cascading failures in later cases.
     """
     num_blocks = batch_size * ((kv_seqlen + block_size - 1) // block_size)
-    key_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
-                                   generator=generator, device=device, requires_grad=requires_grad)
-    value_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
-                                     generator=generator, device=device, requires_grad=requires_grad)
+    key_cache = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size),
+        data_type,
+        generator=generator,
+        device=device,
+        requires_grad=requires_grad,
+    )
+    value_cache = make_random_tensor(
+        (num_blocks, block_size, kv_heads, head_size),
+        data_type,
+        generator=generator,
+        device=device,
+        requires_grad=requires_grad,
+    )
     return key_cache, value_cache
 
 
@@ -307,8 +330,18 @@ def make_padded_varlen_mask(
         mask = mask | (diff < offsets - left) | (diff > offsets + right)
     return q_valid, k_valid, mask
 
-def check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
-                          k_new, v_new, cache_seqlens, block_tables, block_size):
+
+def check_kvcache_inplace(
+    key_cache_orig,
+    value_cache_orig,
+    key_cache,
+    value_cache,
+    k_new,
+    v_new,
+    cache_seqlens,
+    block_tables,
+    block_size,
+):
     """Validate the in-place append: cache[i][old:old+s_new] == k_new[i], the rest untouched.
     Non-paged: row-internal coordinates; paged: locate each token via the block table."""
     torch.npu.synchronize()
@@ -325,20 +358,33 @@ def check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cac
         if bt is not None:
             table = bt[i]
             ok_region = all(
-                torch.equal(kc[int(table[(old + j) // page_size]), (old + j) % page_size], kn[i, j]) and
-                torch.equal(vc[int(table[(old + j) // page_size]), (old + j) % page_size], vn[i, j])
-                for j in range(s_new))
+                torch.equal(kc[int(table[(old + j) // page_size]), (old + j) % page_size], kn[i, j])
+                and torch.equal(
+                    vc[int(table[(old + j) // page_size]), (old + j) % page_size], vn[i, j]
+                )
+                for j in range(s_new)
+            )
             ok_keep = all(
-                torch.equal(kc[int(table[j // page_size]), j % page_size], kc0[int(table[j // page_size]), j % page_size]) and
-                torch.equal(vc[int(table[j // page_size]), j % page_size], vc0[int(table[j // page_size]), j % page_size])
-                for j in range(old))
+                torch.equal(
+                    kc[int(table[j // page_size]), j % page_size],
+                    kc0[int(table[j // page_size]), j % page_size],
+                )
+                and torch.equal(
+                    vc[int(table[j // page_size]), j % page_size],
+                    vc0[int(table[j // page_size]), j % page_size],
+                )
+                for j in range(old)
+            )
         else:
-            ok_region = (torch.equal(kc[i, old:old + s_new], kn[i]) and
-                         torch.equal(vc[i, old:old + s_new], vn[i]))
-            ok_keep = (torch.equal(kc[i, :old], kc0[i, :old]) and
-                       torch.equal(vc[i, :old], vc0[i, :old]) and
-                       torch.equal(kc[i, old + s_new:], kc0[i, old + s_new:]) and
-                       torch.equal(vc[i, old + s_new:], vc0[i, old + s_new:]))
+            ok_region = torch.equal(kc[i, old : old + s_new], kn[i]) and torch.equal(
+                vc[i, old : old + s_new], vn[i]
+            )
+            ok_keep = (
+                torch.equal(kc[i, :old], kc0[i, :old])
+                and torch.equal(vc[i, :old], vc0[i, :old])
+                and torch.equal(kc[i, old + s_new :], kc0[i, old + s_new :])
+                and torch.equal(vc[i, old + s_new :], vc0[i, old + s_new :])
+            )
         if not (ok_region and ok_keep):
             n_fail += 1
     assert n_fail == 0, f"kvcache in-place append mismatch: {n_fail}/{len(sl)} batches"

@@ -28,9 +28,18 @@ enum Kind : uint32_t {
     KIND_TND_CAUSAL = 8,
 };
 
-inline int64_t HMin(int64_t a, int64_t b) { return a < b ? a : b; }
-inline int64_t HMax(int64_t a, int64_t b) { return a > b ? a : b; }
-inline int64_t HCeil(int64_t a, int64_t b) { return (a + b - 1) / b; }
+inline int64_t HMin(int64_t a, int64_t b)
+{
+    return a < b ? a : b;
+}
+inline int64_t HMax(int64_t a, int64_t b)
+{
+    return a > b ? a : b;
+}
+inline int64_t HCeil(int64_t a, int64_t b)
+{
+    return (a + b - 1) / b;
+}
 
 inline int64_t DenseMaxRound(int64_t k, int64_t m, int64_t n, int64_t b)
 {
@@ -43,8 +52,7 @@ inline int64_t GqaDenseMaxRound(int64_t k, int64_t m, int64_t n, int64_t b, int6
     return HMax(HMax(HCeil(b * n * g, kk), HCeil(n, m)), g) * m;
 }
 
-inline int64_t LeftUpCausalSwizzleMaxRound(
-    int64_t k, int64_t m, int64_t n, int64_t b)
+inline int64_t LeftUpCausalSwizzleMaxRound(int64_t k, int64_t m, int64_t n, int64_t b)
 {
     const int64_t pairCount = b >> 1;
     if (k <= 0 || m <= 0 || n <= 0 || pairCount <= 0) {
@@ -72,8 +80,7 @@ struct Selection {
 };
 
 // k = aicNum (cube cores).  BSND uniform layouts only.
-inline Selection SelectSchedule(
-    bool causal, int64_t batchBh, int64_t m, int64_t n, int64_t g, int64_t k)
+inline Selection SelectSchedule(bool causal, int64_t batchBh, int64_t m, int64_t n, int64_t g, int64_t k)
 {
     Selection sel;
     if (batchBh <= 0 || m <= 0 || n <= 0 || k <= 0) {
@@ -110,35 +117,34 @@ inline Selection SelectSchedule(
     return sel;
 }
 
-inline int64_t ScheduleMaxRound(
-    uint32_t kind, int64_t batchBh, int64_t m, int64_t n, int64_t g, int64_t k)
+inline int64_t ScheduleMaxRound(uint32_t kind, int64_t batchBh, int64_t m, int64_t n, int64_t g, int64_t k)
 {
     switch (kind) {
-        case KIND_DENSE_SWIZZLE:
-        case KIND_DENSE_INDEX:
-            return DenseMaxRound(k, m, n, batchBh);
-        case KIND_LEFT_UP_CAUSAL_SWIZZLE:
-        case KIND_CAUSAL_SWIZZLE:
-            return LeftUpCausalSwizzleMaxRound(k, m, n, batchBh);
-        case KIND_GQA_DENSE:
-            return GqaDenseMaxRound(k, m, n, batchBh, g);
-        default:
-            return 0;
+    case KIND_DENSE_SWIZZLE:
+    case KIND_DENSE_INDEX:
+        return DenseMaxRound(k, m, n, batchBh);
+    case KIND_LEFT_UP_CAUSAL_SWIZZLE:
+    case KIND_CAUSAL_SWIZZLE:
+        return LeftUpCausalSwizzleMaxRound(k, m, n, batchBh);
+    case KIND_GQA_DENSE:
+        return GqaDenseMaxRound(k, m, n, batchBh, g);
+    default:
+        return 0;
     }
 }
 
 inline int64_t ScheduleColumnRounds(uint32_t kind, int64_t m, int64_t n)
 {
     switch (kind) {
-        case KIND_DENSE_SWIZZLE:
-        case KIND_DENSE_INDEX:
-        case KIND_GQA_DENSE:
-            return m;
-        case KIND_CAUSAL_SWIZZLE:
-        case KIND_LEFT_UP_CAUSAL_SWIZZLE:
-            return (m > n) ? (2 * m - n + 1) : m;
-        default:
-            return 0;
+    case KIND_DENSE_SWIZZLE:
+    case KIND_DENSE_INDEX:
+    case KIND_GQA_DENSE:
+        return m;
+    case KIND_CAUSAL_SWIZZLE:
+    case KIND_LEFT_UP_CAUSAL_SWIZZLE:
+        return (m > n) ? (2 * m - n + 1) : m;
+    default:
+        return 0;
     }
 }
 
@@ -146,19 +152,16 @@ inline int64_t ScheduleColumnRounds(uint32_t kind, int64_t m, int64_t n)
 // fold two real columns into one round span, so both need their own accumulator.
 inline uint32_t ScheduleBufNum(uint32_t kind)
 {
-    return (kind == KIND_CAUSAL_SWIZZLE ||
-            kind == KIND_LEFT_UP_CAUSAL_SWIZZLE) ? 2U : 1U;
+    return (kind == KIND_CAUSAL_SWIZZLE || kind == KIND_LEFT_UP_CAUSAL_SWIZZLE) ? 2U : 1U;
 }
 
 // TND dense safety: within one round the active lanes enumerate consecutive
 // (n1, s2) columns whose s1 = (s2 + delta) % s1Outer must stay unique, so each
 // batch needs s1Outer >= min(k, s2Outer).  Also rejects empty sequences.
-inline bool TndDenseSafe(
-    int64_t batch, const int64_t *seqQ, const int64_t *seqKv, int64_t n1,
-    int64_t k, int64_t qTile, int64_t kvTile)
+inline bool TndDenseSafe(int64_t batch, const int64_t* seqQ, const int64_t* seqKv, int64_t n1, int64_t k, int64_t qTile,
+                         int64_t kvTile)
 {
-    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || n1 <= 0 ||
-        k <= 0 || qTile <= 0 || kvTile <= 0) {
+    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || n1 <= 0 || k <= 0 || qTile <= 0 || kvTile <= 0) {
         return false;
     }
     for (int64_t b = 0; b < batch; ++b) {
@@ -191,14 +194,12 @@ struct TndCausalParams {
     int64_t p2[FAGTiling950::TND_SWIZZLE_PREFIX_NUM] = {0};
 };
 
-inline TndCausalParams ComputeTndCausalParams(
-    int64_t batch, const int64_t *seqQ, const int64_t *seqKv, int64_t n2,
-    int64_t k, int64_t qTile, int64_t kvTile)
+inline TndCausalParams ComputeTndCausalParams(int64_t batch, const int64_t* seqQ, const int64_t* seqKv, int64_t n2,
+                                              int64_t k, int64_t qTile, int64_t kvTile)
 {
     TndCausalParams out{};
     // step = 1 layout needs batch + 3 prefix slots (p0 tail has two entries).
-    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || n2 <= 0 ||
-        k <= 0 || qTile <= 0 || kvTile <= 0 ||
+    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || n2 <= 0 || k <= 0 || qTile <= 0 || kvTile <= 0 ||
         batch + 2 >= static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM)) {
         return out;
     }
@@ -255,12 +256,11 @@ inline TndCausalParams ComputeTndCausalParams(
     return out;
 }
 
-inline int64_t TndDensePrefix(
-    int64_t batch, const int64_t *seqQ, const int64_t *seqKv, int64_t n1,
-    int64_t k, int64_t qTile, int64_t kvTile, int64_t *prefix)
+inline int64_t TndDensePrefix(int64_t batch, const int64_t* seqQ, const int64_t* seqKv, int64_t n1, int64_t k,
+                              int64_t qTile, int64_t kvTile, int64_t* prefix)
 {
-    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || prefix == nullptr ||
-        n1 <= 0 || k <= 0 || qTile <= 0 || kvTile <= 0) {
+    if (batch <= 0 || seqQ == nullptr || seqKv == nullptr || prefix == nullptr || n1 <= 0 || k <= 0 || qTile <= 0 ||
+        kvTile <= 0) {
         return 0;
     }
     prefix[0] = 0;
@@ -272,6 +272,6 @@ inline int64_t TndDensePrefix(
     return prefix[batch];
 }
 
-}  // namespace fag_det_host
+} // namespace fag_det_host
 
-#endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_DET_SCHEDULE_HOST_HPP
+#endif // FLASH_ATTN_NPU_ASCEND950_V3_FAG_DET_SCHEDULE_HOST_HPP

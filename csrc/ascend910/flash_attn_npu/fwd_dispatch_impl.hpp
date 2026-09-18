@@ -29,7 +29,8 @@
 #include "autogen/fwd_combo_decls.hpp"
 
 template <typename DType, bool IS_TND>
-void launch_fwd_impl(const FwdLaunchArgs &a) {
+void launch_fwd_impl(const FwdLaunchArgs& a)
+{
     if constexpr (std::is_same_v<DType, half>) {
         if constexpr (IS_TND) {
             FWD_SELECT_COMBO_8(fp16, tnd);

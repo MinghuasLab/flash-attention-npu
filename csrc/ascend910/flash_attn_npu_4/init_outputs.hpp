@@ -10,16 +10,9 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    class AttnOutType_,
-    class LseOutType_,
-    LseModeT LSE_MODE_>
-class BlockEpilogue<
-    EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>,
-    AttnOutType_,
-    LseOutType_>
-{
-public:
+template <class AttnOutType_, class LseOutType_, LseModeT LSE_MODE_>
+class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, LseOutType_> {
+  public:
     using DispatchPolicy = EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
@@ -39,8 +32,7 @@ public:
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
 
-    __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource)
+    __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource)
     {
         // Allocate UB space
         constexpr uint32_t ATTN_OUT_INIT_UB_TENSOR_OFFSET = 0;
@@ -50,13 +42,10 @@ public:
         lseOutUbTensor = resource.ubBuf.template GetBufferByByte<ElementLseOut>(LSE_OUT_INIT_UB_TENSOR_OFFSET);
     }
 
-    __aicore__ inline
-    void SubCoreCompute(
-        AscendC::GlobalTensor<ElementAttnOut> gOutput,
-        AscendC::GlobalTensor<ElementLseOut> gLse,
-        const LayoutAttnOut &layoutOutput,
-        const LayoutLseOut &layoutLse,
-        uint32_t qSThisSubBlock, uint32_t qNThisSubBlock)
+    __aicore__ inline void SubCoreCompute(AscendC::GlobalTensor<ElementAttnOut> gOutput,
+                                          AscendC::GlobalTensor<ElementLseOut> gLse, const LayoutAttnOut& layoutOutput,
+                                          const LayoutLseOut& layoutLse, uint32_t qSThisSubBlock,
+                                          uint32_t qNThisSubBlock)
     {
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
@@ -70,12 +59,9 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
         for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-            AscendC::DataCopyPad(
-                gOutput[qNIdx * embedV],
-                attnOutUbTensor,
-                AscendC::DataCopyExtParams(
-                    qSThisSubBlock, embedV * sizeof(ElementAttnOut),
-                    0, (oHiddenSize - embedV) * sizeof(ElementAttnOut), 0));
+            AscendC::DataCopyPad(gOutput[qNIdx * embedV], attnOutUbTensor,
+                                 AscendC::DataCopyExtParams(qSThisSubBlock, embedV * sizeof(ElementAttnOut), 0,
+                                                            (oHiddenSize - embedV) * sizeof(ElementAttnOut), 0));
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
@@ -85,26 +71,18 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             for (uint32_t sIdx = 0; sIdx < qSThisSubBlock; sIdx++) {
-                AscendC::DataCopyPad(
-                    gLse[sIdx],
-                    lseOutUbTensor[sIdx * FLOAT_BLOCK_SIZE],
-                    AscendC::DataCopyExtParams(
-                        qNThisSubBlock, sizeof(float),
-                        qSThisSubBlock - 1,
-                        (lseHeadStride - 1) * sizeof(float), 0));
+                AscendC::DataCopyPad(gLse[sIdx], lseOutUbTensor[sIdx * FLOAT_BLOCK_SIZE],
+                                     AscendC::DataCopyExtParams(qNThisSubBlock, sizeof(float), qSThisSubBlock - 1,
+                                                                (lseHeadStride - 1) * sizeof(float), 0));
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    __aicore__ inline
-    void operator()(
-        AscendC::GlobalTensor<ElementAttnOut> gOutput,
-        AscendC::GlobalTensor<ElementLseOut> gLse,
-        const LayoutAttnOut &layoutOutput,
-        const LayoutLseOut &layoutLse,
-        uint32_t qSBlockSize, uint32_t qNBlockSize)
+    __aicore__ inline void operator()(AscendC::GlobalTensor<ElementAttnOut> gOutput,
+                                      AscendC::GlobalTensor<ElementLseOut> gLse, const LayoutAttnOut& layoutOutput,
+                                      const LayoutLseOut& layoutLse, uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
         uint32_t rowNum = qSBlockSize * qNBlockSize;
         uint32_t oHiddenSize = layoutOutput.shape(1);
@@ -115,39 +93,34 @@ public:
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
 
         uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t qNThisSubBlock = (qNBlockSize == 1U) ? 1
-            : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock) : qNSplitSubBlock;
-        uint32_t rowSplitSubBlock =
-            (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
+        uint32_t qNThisSubBlock = (qNBlockSize == 1U)   ? 1
+                                  : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock)
+                                                        : qNSplitSubBlock;
+        uint32_t rowSplitSubBlock = (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
         uint32_t rowActualSubBlock = (subBlockIdx == 1U) ? (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
         uint32_t rowOffsetSubBlock = subBlockIdx * rowSplitSubBlock;
         uint32_t outRowOffsetSubBlock = (qNBlockSize == 1U) ? rowOffsetSubBlock : 0;
         uint32_t outColOffsetSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock * embedV;
         uint32_t qSThisSubBlock = (qNBlockSize == 1U) ? rowActualSubBlock : qSBlockSize;
-        int64_t outOffsetSubBlock =
-            layoutOutput.GetOffset(MatrixCoord(outRowOffsetSubBlock, outColOffsetSubBlock));
+        int64_t outOffsetSubBlock = layoutOutput.GetOffset(MatrixCoord(outRowOffsetSubBlock, outColOffsetSubBlock));
         auto gOutputSubBlock = gOutput[outOffsetSubBlock];
         auto layoutOutputSubBlock = layoutOutput;
 
-        uint32_t outLseRowOffsetSubBlock = (qNBlockSize == 1U) ?
-            0 : subBlockIdx * qNSplitSubBlock;
-        uint32_t outLseColOffsetSubBlock = (qNBlockSize == 1U) ?
-            rowOffsetSubBlock : 0;
-        int64_t lseOffsetSubBlock =
-            layoutLse.GetOffset(MatrixCoord(outLseRowOffsetSubBlock, outLseColOffsetSubBlock));
+        uint32_t outLseRowOffsetSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
+        uint32_t outLseColOffsetSubBlock = (qNBlockSize == 1U) ? rowOffsetSubBlock : 0;
+        int64_t lseOffsetSubBlock = layoutLse.GetOffset(MatrixCoord(outLseRowOffsetSubBlock, outLseColOffsetSubBlock));
         auto gLseThisSubBlock = gLse[lseOffsetSubBlock];
         auto layoutLseThisSubBlock = layoutLse;
 
         if (rowActualSubBlock > 0U) {
-            SubCoreCompute(
-                gOutputSubBlock, gLseThisSubBlock,
-                layoutOutputSubBlock, layoutLseThisSubBlock,
-                qSThisSubBlock, qNThisSubBlock);
+            SubCoreCompute(gOutputSubBlock, gLseThisSubBlock, layoutOutputSubBlock, layoutLseThisSubBlock,
+                           qSThisSubBlock, qNThisSubBlock);
         }
     }
-private:
+
+  private:
     AscendC::LocalTensor<ElementAttnOut> attnOutUbTensor;
     AscendC::LocalTensor<ElementLseOut> lseOutUbTensor;
 };
-}
+} // namespace Catlass::Epilogue::Block
 #endif // EPILOGUE_BLOCK_BLOCK_EPILOGUE_INIT_OUTPUTS_HPP_T

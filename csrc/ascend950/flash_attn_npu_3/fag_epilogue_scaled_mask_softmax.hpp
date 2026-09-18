@@ -15,23 +15,12 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    FAGTiling950::Layout INPUT_LAYOUT_,
-    bool IS_ATTEN_MASK_,
-    bool IS_SOFTCAP_,
-    class ElementP_,
-    class ElementS_,
-    class TilingData_>
-class BlockEpilogue<
-    EpilogueAscend950FAGScaledMaskSoftmax<
-        INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>,
-    ElementP_,
-    ElementS_,
-    TilingData_> {
-public:
-    using DispatchPolicy =
-        EpilogueAscend950FAGScaledMaskSoftmax<
-            INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>;
+template <FAGTiling950::Layout INPUT_LAYOUT_, bool IS_ATTEN_MASK_, bool IS_SOFTCAP_, class ElementP_, class ElementS_,
+          class TilingData_>
+class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>, ElementP_,
+                    ElementS_, TilingData_> {
+  public:
+    using DispatchPolicy = EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTEN_MASK_, IS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementP = ElementP_;
     using ElementS = ElementS_;
@@ -45,38 +34,18 @@ public:
     BlockEpilogue() = default;
 
     CATLASS_DEVICE
-    void Init(
-        Arch::Resource<ArchTag> &resource,
-        GM_ADDR tiling)
+    void Init(Arch::Resource<ArchTag>& resource, GM_ADDR tiling)
     {
-        tiling_ = reinterpret_cast<const __gm__ TilingData *>(tiling);
+        tiling_ = reinterpret_cast<const __gm__ TilingData*>(tiling);
     }
 
-    template <
-        class TensorAttenMaskGm,
-        class TensorAttenMaskUb,
-        class TensorSoftmaxLseGm,
-        class TensorLseUb,
-        class TensorS,
-        class TensorPUb,
-        class TensorPL1>
-    CATLASS_DEVICE
-    void operator()(
-        FAGBlockInfo const &block,
-        TensorAttenMaskGm const &attenMaskGm,
-        TensorSoftmaxLseGm const &softmaxLseGm,
-        TensorAttenMaskUb &attenMaskUbTensor,
-        TensorLseUb &lseUbTensor,
-        TensorS const &ubMm1Tensor,
-        TensorPUb &ubPTensor,
-        TensorPL1 &l1PTensor,
-        event_t mte2ToVEvent,
-        event_t vToMte3Event,
-        event_t mte3ToVEvent,
-        float scaleValue,
-        float softcapValue,
-        uint64_t s1RealSize,
-        uint32_t subBlockIdx)
+    template <class TensorAttenMaskGm, class TensorAttenMaskUb, class TensorSoftmaxLseGm, class TensorLseUb,
+              class TensorS, class TensorPUb, class TensorPL1>
+    CATLASS_DEVICE void
+    operator()(FAGBlockInfo const& block, TensorAttenMaskGm const& attenMaskGm, TensorSoftmaxLseGm const& softmaxLseGm,
+               TensorAttenMaskUb& attenMaskUbTensor, TensorLseUb& lseUbTensor, TensorS const& ubMm1Tensor,
+               TensorPUb& ubPTensor, TensorPL1& l1PTensor, event_t mte2ToVEvent, event_t vToMte3Event,
+               event_t mte3ToVEvent, float scaleValue, float softcapValue, uint64_t s1RealSize, uint32_t subBlockIdx)
     {
         // Intermediate row stride is always 128 elements. s2Extend is the
         // number of valid columns in this basic block.
@@ -88,55 +57,38 @@ public:
 
         // 1. Copy in attenMask (only support causal now)
         if constexpr (IS_ATTEN_MASK_) {
-            const int64_t diagOffset =
-                static_cast<int64_t>(block.curBatchS2) -
-                static_cast<int64_t>(block.curBatchS1);
+            const int64_t diagOffset = static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
             const int64_t rowStart =
-                static_cast<int64_t>(block.s1Start) +
-                static_cast<int64_t>(subBlockIdx) * block.firstHalfRealS1;
-            const int64_t colEnd =
-                static_cast<int64_t>(block.s2Start) + block.s2Extend;
+                static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(subBlockIdx) * block.firstHalfRealS1;
+            const int64_t colEnd = static_cast<int64_t>(block.s2Start) + block.s2Extend;
             if (colEnd - 1 > rowStart + diagOffset) {
                 // [maskRowStart, maskRowStart + s1RealSize)
                 // [maskColStart, maskColStart + s2Extend)
-                const int64_t delta =
-                    static_cast<int64_t>(block.s2Start) -
-                    rowStart - diagOffset;
+                const int64_t delta = static_cast<int64_t>(block.s2Start) - rowStart - diagOffset;
                 if (delta >= static_cast<int64_t>(s1RealSize)) {
                     // Whole slice above the causal diagonal (only reachable when
                     // a dense schedule feeds masked-invalid blocks): mask all
                     // rows; the 256x256 mask window would be out of range.
-                    AscendC::Duplicate(
-                        attenMaskUbTensor,
-                        static_cast<uint8_t>(1),
-                        static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
+                    AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(1),
+                                       static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
                 } else {
                     const uint32_t maskRowStart = Max(-delta, (int64_t)0);
                     const uint32_t maskColStart = Max(delta, (int64_t)0);
-                    const auto maskGmOffset = attenMaskGm.layout()(
-                        tla::MakeCoord(maskRowStart, maskColStart));
+                    const auto maskGmOffset = attenMaskGm.layout()(tla::MakeCoord(maskRowStart, maskColStart));
 
                     AscendC::DataCopyExtParams maskCopyParams{
-                        static_cast<uint16_t>(s1RealSize),
-                        static_cast<uint32_t>(S2_ROW_STRIDE * sizeof(uint8_t)),
-                        static_cast<int64_t>((256U - S2_ROW_STRIDE) * sizeof(uint8_t)),
-                        0, 0};
-                    AscendC::DataCopyPadExtParams<uint8_t> maskPadParams{
-                        false, 0, 0, 0};
-                    AscendC::DataCopyPad(
-                        attenMaskUbTensor,
-                        attenMaskGm.data()[maskGmOffset],
-                        maskCopyParams,
-                        maskPadParams);
+                        static_cast<uint16_t>(s1RealSize), static_cast<uint32_t>(S2_ROW_STRIDE * sizeof(uint8_t)),
+                        static_cast<int64_t>((256U - S2_ROW_STRIDE) * sizeof(uint8_t)), 0, 0};
+                    AscendC::DataCopyPadExtParams<uint8_t> maskPadParams{false, 0, 0, 0};
+                    AscendC::DataCopyPad(attenMaskUbTensor, attenMaskGm.data()[maskGmOffset], maskCopyParams,
+                                         maskPadParams);
                 }
             } else {
                 // This AIV slice lies completely below the causal diagonal.
                 // Clear the reusable ping/pong mask slot so a previous masked
                 // tile cannot leak into the current unmasked tile.
-                AscendC::Duplicate(
-                    attenMaskUbTensor,
-                    static_cast<uint8_t>(0),
-                    static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
+                AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(0),
+                                   static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
             }
         }
 
@@ -144,11 +96,7 @@ public:
         AscendC::DataCopyExtParams copyParams{1, static_cast<uint32_t>(s1RealSize * sizeof(float)), 0, 0, 0};
         AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
         const auto lseGmOffset = softmaxLseGm.layout()(softmaxLseGm.coord());
-        AscendC::DataCopyPad(
-            lseUbTensor,
-            softmaxLseGm.data()[lseGmOffset],
-            copyParams,
-            padParams);
+        AscendC::DataCopyPad(lseUbTensor, softmaxLseGm.data()[lseGmOffset], copyParams, padParams);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
@@ -156,14 +104,11 @@ public:
 
         // 3. scale + optional softcap + mask + exp(S-LSE) + Cast + Nd2Nz
         MulsMaskSimpleSoftmax<IS_ATTEN_MASK, IS_SOFTCAP>(
-            reinterpret_cast<__ubuf__ ElementP *>(ubPTensor.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ ElementS *>(ubMm1Tensor.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint8_t *>(attenMaskUbTensor.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ float *>(lseUbTensor.GetPhyAddr()),
-            static_cast<uint16_t>(s1RealSize),
-            block.s2Extend,
-            scaleValue,
-            softcapValue);
+            reinterpret_cast<__ubuf__ ElementP*>(ubPTensor.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ ElementS*>(ubMm1Tensor.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint8_t*>(attenMaskUbTensor.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(lseUbTensor.GetPhyAddr()), static_cast<uint16_t>(s1RealSize),
+            block.s2Extend, scaleValue, softcapValue);
         if constexpr (IS_SOFTCAP) {
             AscendC::PipeBarrier<PIPE_V>();
         }
@@ -184,7 +129,7 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
     }
 
-private:
+  private:
     /**
      * Rebuild P from the QK result and the LSE saved by forward:
      *
@@ -198,15 +143,9 @@ private:
      * valid columns in the current basic block.
      */
     template <bool HAS_ATTEN_MASK, bool HAS_SOFTCAP>
-    __simd_vf__ inline void MulsMaskSimpleSoftmax(
-        __ubuf__ ElementP *dstUb,
-        __ubuf__ ElementS *srcUb,
-        __ubuf__ uint8_t *maskUb,
-        __ubuf__ float *lseUb,
-        uint16_t m,
-        uint32_t n,
-        float scaleValue,
-        float softcapValue)
+    __simd_vf__ inline void MulsMaskSimpleSoftmax(__ubuf__ ElementP* dstUb, __ubuf__ ElementS* srcUb,
+                                                  __ubuf__ uint8_t* maskUb, __ubuf__ float* lseUb, uint16_t m,
+                                                  uint32_t n, float scaleValue, float softcapValue)
     {
         using namespace AscendC::MicroAPI;
 
@@ -281,24 +220,20 @@ private:
                 Mul(softcapGradVreg1, srcVreg1, srcVreg1, pregTail1);
                 Muls(softcapGradVreg1, softcapGradVreg1, -1.0f, pregTail1);
                 Adds(softcapGradVreg1, softcapGradVreg1, 1.0f, pregTail1);
-                StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2_ROW_STRIDE, softcapGradVreg0, pregTail0);
-                StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2_ROW_STRIDE + FP32_PER_VREG,
-                    softcapGradVreg1, pregTail1);
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2_ROW_STRIDE, softcapGradVreg0, pregTail0);
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2_ROW_STRIDE + FP32_PER_VREG, softcapGradVreg1,
+                                                            pregTail1);
 
                 Muls(srcVreg0, srcVreg0, softcapValue, pregTail0);
                 Muls(srcVreg1, srcVreg1, softcapValue, pregTail1);
             }
 
             if constexpr (HAS_ATTEN_MASK) {
-                __ubuf__ uint8_t *maskRow = maskUb + i * S2_ROW_STRIDE;
-                LoadAlign<uint32_t, PostLiteral::POST_MODE_UPDATE,
-                    MaskDist::DIST_DS>(maskVreg0,
-                    (__ubuf__ uint32_t *&)maskRow, FP32_PER_VREG); // 64Byte(512bit) --> DIST_DS --> 256bit
-                LoadAlign<uint32_t, PostLiteral::POST_MODE_UPDATE,
-                    MaskDist::DIST_DS>(maskVreg1,
-                    (__ubuf__ uint32_t *&)maskRow, FP32_PER_VREG);
+                __ubuf__ uint8_t* maskRow = maskUb + i * S2_ROW_STRIDE;
+                LoadAlign<uint32_t, PostLiteral::POST_MODE_UPDATE, MaskDist::DIST_DS>(
+                    maskVreg0, (__ubuf__ uint32_t*&)maskRow, FP32_PER_VREG); // 64Byte(512bit) --> DIST_DS --> 256bit
+                LoadAlign<uint32_t, PostLiteral::POST_MODE_UPDATE, MaskDist::DIST_DS>(
+                    maskVreg1, (__ubuf__ uint32_t*&)maskRow, FP32_PER_VREG);
                 // (dst, src0, src1, mask): 1->src0, 0->src1
                 Select(srcVreg0, minVreg, srcVreg0, maskVreg0);
                 Select(srcVreg1, minVreg, srcVreg1, maskVreg1);
@@ -316,36 +251,29 @@ private:
             DeInterleave(srcEvenVreg, srcOddVreg, srcVreg0, srcVreg1);
 
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
-                Cast<bfloat16_t, float, castTraitZero>(
-                    dstVreg0, srcEvenVreg, pregFull);
-                Cast<bfloat16_t, float, castTraitOne>(
-                    dstVreg1, srcOddVreg, pregFull);
+                Cast<bfloat16_t, float, castTraitZero>(dstVreg0, srcEvenVreg, pregFull);
+                Cast<bfloat16_t, float, castTraitOne>(dstVreg1, srcOddVreg, pregFull);
             } else {
-                Cast<half, float, castTraitZero>(
-                    dstVreg0, srcEvenVreg, pregFull);
-                Cast<half, float, castTraitOne>(
-                    dstVreg1, srcOddVreg, pregFull);
+                Cast<half, float, castTraitZero>(dstVreg0, srcEvenVreg, pregFull);
+                Cast<half, float, castTraitOne>(dstVreg1, srcOddVreg, pregFull);
             }
-            Or(
-                reinterpret_cast<RegTensor<uint16_t> &>(dstVreg),
-                reinterpret_cast<RegTensor<uint16_t> &>(dstVreg0),
-                reinterpret_cast<RegTensor<uint16_t> &>(dstVreg1),
-                pregFullP);
+            Or(reinterpret_cast<RegTensor<uint16_t>&>(dstVreg), reinterpret_cast<RegTensor<uint16_t>&>(dstVreg0),
+               reinterpret_cast<RegTensor<uint16_t>&>(dstVreg1), pregFullP);
             // Fused ND -> NZ scatter:
             //   [m, 128] -> [128 / C0, m + 1, C0].
-            StoreAlign<ElementP, DataCopyMode::DATA_BLOCK_COPY,
-                PostLiteral::POST_MODE_UPDATE>(
+            StoreAlign<ElementP, DataCopyMode::DATA_BLOCK_COPY, PostLiteral::POST_MODE_UPDATE>(
                 dstUb, dstVreg, nzBlockStride, 1, pregFullP);
         }
     }
-private:
+
+  private:
     static constexpr uint32_t S2_ROW_STRIDE = 128;
     static constexpr uint32_t FP32_PER_VREG = 64;
     static constexpr float MASKED_VALUE = -3.0e38f;
     static constexpr uint32_t NZ_C0_SIZE = 32U / sizeof(ElementP);
-    const __gm__ TilingData *tiling_ = nullptr;
+    const __gm__ TilingData* tiling_ = nullptr;
 };
 
-}  // namespace Catlass::Epilogue::Block
+} // namespace Catlass::Epilogue::Block
 
-#endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_EPILOGUE_SCALED_MASK_SOFTMAX_HPP
+#endif // FLASH_ATTN_NPU_ASCEND950_V3_FAG_EPILOGUE_SCALED_MASK_SOFTMAX_HPP

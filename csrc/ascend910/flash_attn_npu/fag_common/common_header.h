@@ -7,12 +7,10 @@
 #ifndef INCLUDE_COMMON_HEADER_H
 #define INCLUDE_COMMON_HEADER_H
 
-
 #include <limits>
 #include <type_traits>
 #include <cstdint>
 #include "kernel_operator.h"
-
 
 #define SET_FLAG(trigger, waiter, e) AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
 #define WAIT_FLAG(trigger, waiter, e) AscendC::WaitFlag<AscendC::HardEvent::trigger##_##waiter>((e))

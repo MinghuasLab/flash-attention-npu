@@ -11,27 +11,18 @@ namespace Catlass::Epilogue::Block {
 
 template <class ArchTag, class TilingData>
 class FagPre {
-public:
-    CATLASS_DEVICE void Init(
-        Catlass::Arch::Resource<ArchTag> &resource,
-        GM_ADDR workspace,
-        GM_ADDR tiling)
+  public:
+    CATLASS_DEVICE void Init(Catlass::Arch::Resource<ArchTag>& resource, GM_ADDR workspace, GM_ADDR tiling)
     {
-        tiling_ = reinterpret_cast<const __gm__ TilingData *>(tiling);
-        dqWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
-            workspace + tiling_->dqOffset));
-        dkWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
-            workspace + tiling_->dkOffset));
-        dvWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
-            workspace + tiling_->dvOffset));
+        tiling_ = reinterpret_cast<const __gm__ TilingData*>(tiling);
+        dqWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dqOffset));
+        dkWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dkOffset));
+        dvWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dvOffset));
         zeroUb_ = resource.ubBuf.template GetBufferByByte<float>(0);
         workspace_ = workspace;
     }
 
-    CATLASS_DEVICE void operator()(
-        uint32_t vectorCoreId,
-        uint32_t vectorCoreNum,
-        event_t vToMte3Event)
+    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event)
     {
         constexpr uint32_t tileElements = 20U * 1024U;
         AscendC::Duplicate(zeroUb_, 0.0F, tileElements);
@@ -44,8 +35,8 @@ public:
         // into the dk/dv/delta regions and race with FagSoftmaxGradFront's
         // delta writes (no barrier between the two epilogue calls).
         const uint64_t dqCount = tiling_->dqPostAbsorb
-            ? static_cast<uint64_t>(tiling_->qTile) * ((tiling_->qkHeadDim + 7U) / 8U * 8U)
-            : static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
+                                     ? static_cast<uint64_t>(tiling_->qTile) * ((tiling_->qkHeadDim + 7U) / 8U * 8U)
+                                     : static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
@@ -60,29 +51,28 @@ public:
             // counters, and use atomics so the zeroing is visible at L2 —
             // a scalar store could sit in this core's DCache and never reach
             // the L2 where the v2 AtomicAdd/poll operate.
-            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_), (uint64_t)0);                   // readyCounter
-            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_ + sizeof(uint64_t)), (uint64_t)0); // doneCounter
+            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t*>(workspace_), (uint64_t)0); // readyCounter
+            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t*>(workspace_ + sizeof(uint64_t)),
+                                (uint64_t)0); // doneCounter
         }
     }
 
-private:
-    CATLASS_DEVICE void ClearRegion(
-        AscendC::GlobalTensor<float> &dst,
-        uint64_t elementCount,
-        uint32_t vectorCoreId,
-        uint32_t vectorCoreNum)
+  private:
+    CATLASS_DEVICE void ClearRegion(AscendC::GlobalTensor<float>& dst, uint64_t elementCount, uint32_t vectorCoreId,
+                                    uint32_t vectorCoreNum)
     {
         constexpr uint32_t tileElements = 20U * 1024U;
-        if (vectorCoreNum == 0U) return;
+        if (vectorCoreNum == 0U)
+            return;
         const uint64_t perCore = (elementCount + vectorCoreNum - 1U) / vectorCoreNum;
         const uint64_t rangeBegin = static_cast<uint64_t>(vectorCoreId) * perCore;
-        if (rangeBegin >= elementCount) return;
+        if (rangeBegin >= elementCount)
+            return;
         const uint64_t rangeCount = elementCount - rangeBegin < perCore ? elementCount - rangeBegin : perCore;
         uint64_t done = 0;
         while (done < rangeCount) {
             const uint64_t remaining = rangeCount - done;
-            const uint32_t current = static_cast<uint32_t>(
-                remaining < tileElements ? remaining : tileElements);
+            const uint32_t current = static_cast<uint32_t>(remaining < tileElements ? remaining : tileElements);
             const uint64_t gmOffset = rangeBegin + done;
             const uint32_t aligned = current / 8U * 8U;
             if (aligned != 0U) {
@@ -90,16 +80,14 @@ private:
             }
             const uint32_t tail = current - aligned;
             if (tail != 0U) {
-                AscendC::DataCopyExtParams copyParams{
-                    1, static_cast<uint32_t>(tail * sizeof(float)),
-                    0, 0, 0};
+                AscendC::DataCopyExtParams copyParams{1, static_cast<uint32_t>(tail * sizeof(float)), 0, 0, 0};
                 AscendC::DataCopyPad(dst[gmOffset + aligned], zeroUb_, copyParams);
             }
             done += current;
         }
     }
 
-    const __gm__ TilingData *tiling_ = nullptr;
+    const __gm__ TilingData* tiling_ = nullptr;
     GM_ADDR workspace_ = nullptr;
     AscendC::GlobalTensor<float> dqWorkspace_;
     AscendC::GlobalTensor<float> dkWorkspace_;
@@ -107,6 +95,6 @@ private:
     AscendC::LocalTensor<float> zeroUb_;
 };
 
-}  // namespace Catlass::Epilogue::Block
+} // namespace Catlass::Epilogue::Block
 
 #endif

@@ -20,31 +20,11 @@
 
 namespace Catlass::Gemm::Block {
 
-template <
-    uint32_t L1A_STAGES_,
-    uint32_t L1B_STAGES_,
-    bool ENABLE_UNIT_FLAG_,
-    class L1TileShape_,
-    class L0TileShape_,
-    class ElementA_,
-    class ElementB_,
-    class ElementC_,
-    class ElementBias_,
-    class TileCopy_,
-    class TileMmad_
->
-struct BlockMmadTla<
-    MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>,
-    L1TileShape_,
-    L0TileShape_,
-    ElementA_,
-    ElementB_,
-    ElementC_,
-    ElementBias_,
-    TileCopy_,
-    TileMmad_
-> {
-public:
+template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, bool ENABLE_UNIT_FLAG_, class L1TileShape_, class L0TileShape_,
+          class ElementA_, class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>, L1TileShape_, L0TileShape_,
+                    ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
+  public:
     using DispatchPolicy = MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
@@ -69,9 +49,9 @@ public:
     using L1BAlignHelper = typename TileCopy::L1BAlignHelper;
 
     static_assert(tla::is_tuple<L1TileShape>::value && tla::is_static<L1TileShape>::value,
-        "L1TileShape must be tla::tuple and static!");
+                  "L1TileShape must be tla::tuple and static!");
     static_assert(tla::is_tuple<L0TileShape>::value && tla::is_static<L0TileShape>::value,
-        "L0TileShape must be tla::tuple and static!");
+                  "L0TileShape must be tla::tuple and static!");
     static_assert(std::is_same_v<ArchTag, Arch::Ascend950>, "Requires Ascend950");
 
     static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
@@ -96,18 +76,15 @@ public:
     static_assert(L0C_STAGES * L0C_BUF_SIZE <= ArchTag::L0C_SIZE / 2, "SdP L0C must stay in low 128KB");
 
     static constexpr uint32_t L1_TILE_MAX = BASE * 256 * sizeof(ElementA);
-    static constexpr uint32_t L1_KT_OFFSET =
-        Ascend950FagL1Layout::SLOT_RES_KT * L1_TILE_MAX;
-    static constexpr uint32_t L1_VT_OFFSET =
-        Ascend950FagL1Layout::SLOT_RES_VT * L1_TILE_MAX;
+    static constexpr uint32_t L1_KT_OFFSET = Ascend950FagL1Layout::SLOT_RES_KT * L1_TILE_MAX;
+    static constexpr uint32_t L1_VT_OFFSET = Ascend950FagL1Layout::SLOT_RES_VT * L1_TILE_MAX;
     static constexpr uint32_t L1_EVENT_KT = Ascend950FagL1Layout::SLOT_RES_KT;
     static constexpr uint32_t L1_EVENT_VT = Ascend950FagL1Layout::SLOT_RES_VT;
     // P/dS (2*2*128*128*2) + 6 cube slots must fit in 512KB L1.
-    static_assert(
-        Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX +
-            2 * Ascend950FagL1Layout::TASK_PINGPONG * BASE * BASE * sizeof(ElementA) <=
-            ArchTag::L1_SIZE,
-        "L1 overflow");
+    static_assert(Ascend950FagL1Layout::SLOT_COUNT * L1_TILE_MAX +
+                          2 * Ascend950FagL1Layout::TASK_PINGPONG * BASE * BASE * sizeof(ElementA) <=
+                      ArchTag::L1_SIZE,
+                  "L1 overflow");
     static_assert(Ascend950FagL0CLayout::L0C_SLOT_NUM * L0C_BUF_SIZE <= ArchTag::L0C_SIZE, "L0C overflow");
 
     CATLASS_DEVICE
@@ -121,10 +98,10 @@ public:
         l1KT = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_KT_OFFSET);
         l1VT = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_VT_OFFSET);
         for (uint32_t i = 0; i < Ascend950FagL1Layout::TASK_PINGPONG; ++i) {
-            l1Q[i] = resource.l1Buf.template GetBufferByByte<ElementA>(
-                l1BufAddrStart + Ascend950FagL1Layout::QSlot(i) * L1_TILE_MAX);
-            l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementA>(
-                l1BufAddrStart + Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
+            l1Q[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart +
+                                                                       Ascend950FagL1Layout::QSlot(i) * L1_TILE_MAX);
+            l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart +
+                                                                        Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
         }
 
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
@@ -156,10 +133,9 @@ public:
      * overlap with cube; ComputeDP should then use loadV=false, waitV=true.
      */
     template <class TensorA, class TensorB, class TensorC, class TensorV>
-    CATLASS_DEVICE
-    void ComputeS(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC,
-        GemmCoord const& actualShape, bool loadK, uint32_t taskPing,
-        bool prefetchV, TensorV& tensorV, uint32_t vSkvActual, uint32_t vDActual)
+    CATLASS_DEVICE void ComputeS(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape,
+                                 bool loadK, uint32_t taskPing, bool prefetchV, TensorV& tensorV, uint32_t vSkvActual,
+                                 uint32_t vDActual)
     {
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
@@ -181,10 +157,9 @@ public:
             CopyGmToL1BT(l1VT, tensorV, vDActual, vSkvActual, vDRound, vSkvRound, L1_EVENT_VT);
         }
         // Keep Q in L1 for C34; do not release A back to MTE2.
-        GemmABt(l1Q[taskPing], l1KT, l0CTensorList[slotC],
-            sqRound, skvRound, dRound, sqActual, skvActual, dActual,
-            slotC, qEvent, L1_EVENT_KT,
-            /*waitB=*/loadK, /*releaseB=*/false, /*releaseA=*/false);
+        GemmABt(l1Q[taskPing], l1KT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual,
+                slotC, qEvent, L1_EVENT_KT,
+                /*waitB=*/loadK, /*releaseB=*/false, /*releaseA=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
     }
@@ -195,9 +170,8 @@ public:
      * waitV must be true on the first use after a VT prefetch/load.
      */
     template <class TensorA, class TensorB, class TensorC>
-    CATLASS_DEVICE
-    void ComputeDP(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC,
-        GemmCoord const& actualShape, bool loadV, bool waitV, uint32_t taskPing)
+    CATLASS_DEVICE void ComputeDP(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape,
+                                  bool loadV, bool waitV, uint32_t taskPing)
     {
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
@@ -213,10 +187,9 @@ public:
         if (loadV) {
             CopyGmToL1BT(l1VT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_VT);
         }
-        GemmABt(l1Dy[taskPing], l1VT, l0CTensorList[slotC],
-            sqRound, skvRound, dRound, sqActual, skvActual, dActual,
-            slotC, dyEvent, L1_EVENT_VT,
-            /*waitB=*/waitV, /*releaseB=*/false, /*releaseA=*/false);
+        GemmABt(l1Dy[taskPing], l1VT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual,
+                slotC, dyEvent, L1_EVENT_VT,
+                /*waitB=*/waitV, /*releaseB=*/false, /*releaseA=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
     }
@@ -235,22 +208,18 @@ public:
 
     // Backward-compatible entry: always reload both operands.
     template <class TensorA, class TensorB, class TensorC>
-    CATLASS_DEVICE
-    void operator()(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape)
+    CATLASS_DEVICE void operator()(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape)
     {
         ComputeS(tensorA, tensorB, tensorC, actualShape, true, /*taskPing=*/0,
-            /*prefetchV=*/false, tensorB, actualShape.n(), actualShape.k());
-        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(
-            l1EventList[Ascend950FagL1Layout::QSlot(0)]);
+                 /*prefetchV=*/false, tensorB, actualShape.n(), actualShape.k());
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[Ascend950FagL1Layout::QSlot(0)]);
         ReleaseResidentKT();
     }
 
-protected:
+  protected:
     template <class TensorGm>
-    CATLASS_DEVICE
-    void CopyGmToL1A(
-        AscendC::LocalTensor<ElementA> l1Buf, TensorGm& gm,
-        uint32_t mActual, uint32_t kActual, uint32_t mRound, uint32_t kRound, uint32_t eventIdx)
+    CATLASS_DEVICE void CopyGmToL1A(AscendC::LocalTensor<ElementA> l1Buf, TensorGm& gm, uint32_t mActual,
+                                    uint32_t kActual, uint32_t mRound, uint32_t kRound, uint32_t eventIdx)
     {
         using CopyGmToL1AOp = typename TileCopy::template CopyGmToL1A<TensorGm>;
         CopyGmToL1AOp copyGmToL1A;
@@ -266,19 +235,13 @@ protected:
 
     /// Reload RowMajor GM [Skv, D] as ColumnMajor [D, Skv] (K^T / V^T) into L1 (nZ).
     template <class TensorGm>
-    CATLASS_DEVICE
-    void CopyGmToL1BT(
-        AscendC::LocalTensor<ElementB> l1Buf, TensorGm& gm,
-        uint32_t dActual, uint32_t skvActual, uint32_t dRound, uint32_t skvRound, uint32_t eventIdx)
+    CATLASS_DEVICE void CopyGmToL1BT(AscendC::LocalTensor<ElementB> l1Buf, TensorGm& gm, uint32_t dActual,
+                                     uint32_t skvActual, uint32_t dRound, uint32_t skvRound, uint32_t eventIdx)
     {
-        auto layoutCol = tla::MakeLayout(
-            tla::MakeShape(dActual, skvActual),
-            tla::MakeStride(
-                tla::Int<1>{},
-                static_cast<int64_t>(tla::get<0>(gm.stride()))),
-            tla::MakeShape(dActual, skvActual));
-        auto gmCol = tla::MakeTensor(
-            gm.data(), layoutCol, Arch::PositionGM{});
+        auto layoutCol = tla::MakeLayout(tla::MakeShape(dActual, skvActual),
+                                         tla::MakeStride(tla::Int<1>{}, static_cast<int64_t>(tla::get<0>(gm.stride()))),
+                                         tla::MakeShape(dActual, skvActual));
+        auto gmCol = tla::MakeTensor(gm.data(), layoutCol, Arch::PositionGM{});
 
         using CopyGmToL1BOp = typename TileCopy::template CopyGmToL1B<decltype(gmCol)>;
         CopyGmToL1BOp copyGmToL1B;
@@ -293,14 +256,10 @@ protected:
     }
 
     CATLASS_DEVICE
-    void GemmABt(
-        AscendC::LocalTensor<ElementA> l1A,
-        AscendC::LocalTensor<ElementB> l1B,
-        AscendC::LocalTensor<ElementAccumulator> l0C,
-        uint32_t mRound, uint32_t nRound, uint32_t kRound,
-        uint32_t mActual, uint32_t nActual, uint32_t kActual,
-        uint32_t l0cSlot, uint32_t l1AEvent, uint32_t l1BEvent,
-        bool waitB, bool releaseB, bool releaseA = true)
+    void GemmABt(AscendC::LocalTensor<ElementA> l1A, AscendC::LocalTensor<ElementB> l1B,
+                 AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
+                 uint32_t mActual, uint32_t nActual, uint32_t kActual, uint32_t l0cSlot, uint32_t l1AEvent,
+                 uint32_t l1BEvent, bool waitB, bool releaseB, bool releaseA = true)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, nRound);
@@ -364,12 +323,8 @@ protected:
     }
 
     template <class TensorUb>
-    CATLASS_DEVICE
-    void FixpipeUb(
-        TensorUb& ubC,
-        AscendC::LocalTensor<ElementAccumulator> l0C,
-        uint32_t mActual, uint32_t nActual, uint32_t mRound,
-        uint32_t l0cSlot)
+    CATLASS_DEVICE void FixpipeUb(TensorUb& ubC, AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mActual,
+                                  uint32_t nActual, uint32_t mRound, uint32_t l0cSlot)
     {
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nActual);
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});

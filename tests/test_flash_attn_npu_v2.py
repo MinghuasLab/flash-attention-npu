@@ -25,7 +25,7 @@ from tests.common.test_utils import (
     make_random_tensor,
     pad_packed_tensor,
     make_varlen_seqlens,
-    check_kvcache_inplace
+    check_kvcache_inplace,
 )
 
 # flash_attn_with_kvcache test parameters
@@ -130,7 +130,7 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
     (torch.bfloat16, 1, 13, 1, 17, 1, 1, 1, 128, False, 0, 0, 0.0, False, False),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
-    # ALiBi 
+    # ALiBi
     (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True, False),
     (torch.bfloat16, 2, 8, 8, 1024, 2077, 128, 0, 128, True, -1, -1, 0.0, True, False),
     (torch.float16, 4, 8, 2, 257, 257, 128, 0, 128, False, -1, -1, 0.0, True, False),
@@ -203,11 +203,32 @@ test_cases = [
     (torch.bfloat16, 5, 24, 4, 129, 511, 256, 0, 128, True, -1, -1, 0.0, False, True),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv", test_cases)
-def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv):
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv",
+    test_cases,
+)
+def test_fa_kvcache_ops(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    cache_mode,
+    block_size,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+    use_alibi,
+    new_kv,
+):
     block_size = 128
-    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type,
-                               device="npu", requires_grad=True)
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu", requires_grad=True
+    )
     key_cache = None
     value_cache = None
     block_tables = None
@@ -220,30 +241,48 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         )
         block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
-        key_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type,
-                                       device="npu")
-        value_cache = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type,
-                                         device="npu")
+        key_cache = make_random_tensor(
+            (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
+        )
+        value_cache = make_random_tensor(
+            (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu"
+        )
         block_tables = None
     kv_seqlen_list = [kv_seqlen] * batch_size
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
     is_rotary_interleaved = False
     num_splits = 0
     if new_kv:
         # Append-KV: per-batch old length (causal: old % 512 == 0).
         new_seqlen = min(q_seqlen, max(1, kv_seqlen // 2))
-        capacity = ((kv_seqlen + block_size - 1) // block_size) * block_size if cache_mode == 1 else kv_seqlen
+        capacity = (
+            ((kv_seqlen + block_size - 1) // block_size) * block_size
+            if cache_mode == 1
+            else kv_seqlen
+        )
         gen = torch.Generator().manual_seed(2026)
         # causal: the kernel mask assumes kv_total = old + new >= q; keep old aligned to 512.
         old_min = ((max(0, q_seqlen - new_seqlen) + 511) // 512) * 512 if is_causal else 0
         if old_min > capacity - new_seqlen:
             pytest.skip("causal append-KV needs capacity for old >= q - new")
-        old_lens = (torch.randint(0, (capacity - new_seqlen - old_min) // 512 + 1,
-                                  (batch_size,), generator=gen) * 512 + old_min) \
-            if is_causal else torch.randint(0, capacity - new_seqlen + 1, (batch_size,), generator=gen)
+        old_lens = (
+            (
+                torch.randint(
+                    0, (capacity - new_seqlen - old_min) // 512 + 1, (batch_size,), generator=gen
+                )
+                * 512
+                + old_min
+            )
+            if is_causal
+            else torch.randint(0, capacity - new_seqlen + 1, (batch_size,), generator=gen)
+        )
         cache_seqlens = old_lens.to(torch.int32).npu()
-        k_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
-        v_new = torch.randn(batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen).npu()
+        k_new = torch.randn(
+            batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen
+        ).npu()
+        v_new = torch.randn(
+            batch_size, new_seqlen, kv_heads, head_size, dtype=data_type, generator=gen
+        ).npu()
         key_cache_orig = key_cache.detach().clone()
         value_cache_orig = value_cache.detach().clone()
     else:
@@ -252,8 +291,6 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         v_new = None
     rotary_cos = None
     rotary_sin = None
-    cache_batch_idx = None
-    leftpad_k = None
     if use_alibi:
         alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
         alibi_slopes = alibi_slopes_cpu.npu()
@@ -269,16 +306,16 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
-    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
-    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    is_causal_golden = window_size_left_golden < 0 and window_size_right_golden == 0
+    is_local_golden = (
+        window_size_left_golden >= 0 or window_size_right_golden > 0
+    ) and not is_causal_golden
     # Tri Dao / NPU fwd: infinite side (-1) → seqlen_k so mask math has no bound
     if is_local_golden:
         if window_size_left_golden < 0:
             window_size_left_golden = kv_seqlen
         if window_size_right_golden < 0:
             window_size_right_golden = kv_seqlen
-    sparse_mode = 4 if is_local_golden else 0
-
     out_out, softmax_lse = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -295,7 +332,7 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         rotary_interleaved=is_rotary_interleaved,
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
-        return_softmax_lse=True
+        return_softmax_lse=True,
     )
     golden_out_ref = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
     golden_out_pt = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
@@ -338,16 +375,24 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
                     key_cache_cpu, value_cache_cpu, block_tables_cpu[i], old_i, block_size
                 )
             else:
-                key_batched_i, value_batched_i = key_cache_cpu[i][:old_i], value_cache_cpu[i][:old_i]
+                key_batched_i, value_batched_i = (
+                    key_cache_cpu[i][:old_i],
+                    value_cache_cpu[i][:old_i],
+                )
             key_batched_i = torch.cat([key_batched_i, k_new_cpu[i]], dim=0)
             value_batched_i = torch.cat([value_batched_i, v_new_cpu[i]], dim=0)
             atten_mask_i, is_causal_i, is_local_i = make_golden_attention_mask(
-                q_seqlen, kv_len_i, is_causal, window_size_left, window_size_right)
+                q_seqlen, kv_len_i, is_causal, window_size_left, window_size_right
+            )
             # ref_flash_attention_pair expects BSND (4D); build batch=1 slices.
             out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-                query_cpu[i : i + 1], key_batched_i.unsqueeze(0), value_batched_i.unsqueeze(0), scale,
+                query_cpu[i : i + 1],
+                key_batched_i.unsqueeze(0),
+                value_batched_i.unsqueeze(0),
+                scale,
                 atten_mask_i if (is_causal_i or is_local_i) else None,
-                data_type, softcap,
+                data_type,
+                softcap,
                 alibi_slopes=alibi_slopes_cpu[i] if use_alibi else None,
             )
             out_ref, out_pt = out_ref[0], out_pt[0]
@@ -372,7 +417,7 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             data_type,
             softcap,
             alibi_slopes=alibi_slopes_cpu,
-    )
+        )
         if atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)
             golden_out_ref[:, fully_masked] = 0
@@ -380,11 +425,24 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             golden_lseL_ref[:, :, fully_masked] = torch.inf
             golden_lseL_pt[:, :, fully_masked] = torch.inf
     assert_fa_close(out_out, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
+    assert_fa_close(
+        softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse"
+    )
     if new_kv:
-        check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
-                              k_new, v_new, cache_seqlens, block_tables, block_size)
+        check_kvcache_inplace(
+            key_cache_orig,
+            value_cache_orig,
+            key_cache,
+            value_cache,
+            k_new,
+            v_new,
+            cache_seqlens,
+            block_tables,
+            block_size,
+        )
     return
+
+
 # flash_attn_func test parameters
 # Single-option parameters: fixed values
 # batch_size: [4]
@@ -483,7 +541,7 @@ func_cases = [
     (torch.float16, 4, 4, 1, 513, 513, 128, False, False, -1, -1, 0.0, 0.0, True),
     (torch.bfloat16, 2, 10, 2, 256, 256, 128, False, True, -1, -1, 0.0, 0.0, True),
     (torch.float16, 1, 2, 2, 512, 1024, 128, False, False, -1, -1, 0.0, 0.0, True),
-    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True), 
+    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True),
     (torch.float16, 2, 4, 2, 513, 513, 128, True, True, -1, -1, 50.0, 0.0, True),
     (torch.bfloat16, 1, 4, 4, 512, 512, 256, True, False, -1, -1, 30.0, 0.0, True),
     # ALiBi with unaligned D and a 127/129 sequence boundary.
@@ -505,9 +563,27 @@ func_cases = [
     (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, True, -1, -1, 0.0, 0.0, False),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi", func_cases)
-def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi):
-    num_blocks = 64
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi",
+    func_cases,
+)
+def test_fa_func_ops(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    return_attn_probs,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+    dropout_p,
+    use_alibi,
+):
     query, key_cache, value_cache, dout = make_attention_inputs(
         (batch_size, q_seqlen, num_heads, head_size),
         (batch_size, kv_seqlen, kv_heads, head_size),
@@ -517,8 +593,7 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
         device="npu",
     )
 
-    scale = 1.0 / (head_size ** 0.5)
-    num_splits = 0
+    scale = 1.0 / (head_size**0.5)
     if use_alibi:
         alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
         alibi_slopes = alibi_slopes_cpu.npu()
@@ -532,10 +607,11 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
         value_cache,
         dropout_p,
         causal=is_causal,
-        window_size=[window_size_left,window_size_right],
+        window_size=[window_size_left, window_size_right],
         softcap=softcap,
         alibi_slopes=alibi_slopes,
-        return_attn_probs=return_attn_probs)
+        return_attn_probs=return_attn_probs,
+    )
     if not return_attn_probs:
         out_out = ret
         drop_mask = None
@@ -556,8 +632,16 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
         window_size_right,
     )
     golden_out_ref, golden_lseL_ref, golden_out_pt, golden_lseL_pt = ref_flash_attention_pair(
-        query_ref, key_ref, value_ref, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
+        query_ref,
+        key_ref,
+        value_ref,
+        scale,
+        atten_mask,
+        data_type,
+        softcap,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes_cpu,
     )
     if atten_mask is not None:
         fully_masked = atten_mask.all(dim=-1)
@@ -724,35 +808,76 @@ varlen_cases = [
     (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, -1, -1, 0.0, 1, 128, 0.0, False),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi", varlen_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi):
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi",
+    varlen_cases,
+)
+def test_fa_varlen_ops(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+    cache_mode,
+    block_size,
+    dropout_p,
+    use_alibi,
+):
     seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
     cu_q = make_cu_seqlens(seqlens_q)
     cu_k = make_cu_seqlens(seqlens_k)
-    total_q = int(cu_q[-1].item())
-    total_k = int(cu_k[-1].item())
     max_seqlen_q = max(seqlens_q)
     max_seqlen_k = max(seqlens_k)
-    query = make_packed_random_tensor(seqlens_q, max_seqlen_q, num_heads, head_size, data_type,
-                                      device="npu", requires_grad=True)
+    query = make_packed_random_tensor(
+        seqlens_q, max_seqlen_q, num_heads, head_size, data_type, device="npu", requires_grad=True
+    )
     block_table = None
     if cache_mode == 1:
         max_num_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
         num_blocks = max(batch_size * max_num_blocks_per_seq, 8)
-        key = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
-                                 device="npu", requires_grad=True)
-        value = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
-                                   device="npu", requires_grad=True)
+        key = make_random_tensor(
+            (num_blocks, block_size, kv_heads, head_size),
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
+        value = make_random_tensor(
+            (num_blocks, block_size, kv_heads, head_size),
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
         block_table = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
-        key = make_packed_random_tensor(seqlens_k, max_seqlen_k, kv_heads, head_size, data_type,
-                                        device="npu", requires_grad=True)
-        value = make_packed_random_tensor(seqlens_k, max_seqlen_k, kv_heads, head_size, data_type,
-                                          device="npu", requires_grad=True)
+        key = make_packed_random_tensor(
+            seqlens_k,
+            max_seqlen_k,
+            kv_heads,
+            head_size,
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
+        value = make_packed_random_tensor(
+            seqlens_k,
+            max_seqlen_k,
+            kv_heads,
+            head_size,
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
     actual_seq_len = cu_q.npu()
     actual_kv_len = cu_k.npu()
 
-    scale = 1.0 / (head_size ** 0.5)
+    scale = 1.0 / (head_size**0.5)
     if use_alibi:
         alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
         alibi_slopes = alibi_slopes_cpu.npu()
@@ -773,7 +898,7 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         dropout_p=dropout_p,
         softmax_scale=scale,
         causal=is_causal,
-        window_size=(window_size_left, window_size_right),# -1 means infinite context window
+        window_size=(window_size_left, window_size_right),  # -1 means infinite context window
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
@@ -799,19 +924,33 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     # cu_k to attend only to each sequence's actual length.
     mask_max_kv = kv_seqlen if cache_mode == 1 else max_seqlen_k
     q_valid, k_valid, atten_mask = make_padded_varlen_mask(
-        seqlens_q, seqlens_k, max_seqlen_q, mask_max_kv,
-        is_causal, window_size_left, window_size_right,
+        seqlens_q,
+        seqlens_k,
+        max_seqlen_q,
+        mask_max_kv,
+        is_causal,
+        window_size_left,
+        window_size_right,
     )
     if drop_mask is not None and drop_mask.shape[-1] != key_padded.shape[1]:
         padded_drop_mask = torch.zeros(
             (*drop_mask.shape[:-1], key_padded.shape[1]), dtype=drop_mask.dtype
         )
-        padded_drop_mask[..., :drop_mask.shape[-1]] = drop_mask
+        padded_drop_mask[..., : drop_mask.shape[-1]] = drop_mask
         drop_mask = padded_drop_mask
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
-        query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
-        q_seqlens=seqlens_q, kv_seqlens=seqlens_k,
+        query_padded,
+        key_padded,
+        value_padded,
+        scale,
+        atten_mask,
+        data_type,
+        softcap,
+        drop_mask=drop_mask,
+        dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes_cpu,
+        q_seqlens=seqlens_q,
+        kv_seqlens=seqlens_k,
     )
     fully_masked = atten_mask.all(dim=-1)
     golden_out_ref[fully_masked] = 0
@@ -823,12 +962,16 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_lseL_ref = golden_lse_ref.permute(0, 2, 1)[q_valid].transpose(0, 1)
     golden_lseL_pt = golden_lse_pt.permute(0, 2, 1)[q_valid].transpose(0, 1)
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
+    assert_fa_close(
+        softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse"
+    )
     # The current varlen backward kernel does not support paged KV cases.
     # Keep backward validation for the contiguous cases covered by the
     # original varlen backward tests.
     if cache_mode == 0:
-        dout = make_random_tensor(output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu")
+        dout = make_random_tensor(
+            output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu"
+        )
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_npu, (query, key, value), dout)
         dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
             os.environ.get("GOLDEN_CACHE_NODEID", "v2-varlen"),
@@ -862,22 +1005,31 @@ def test_fa_varlen_paged_swa_overprovisioned_block_table():
     generator = torch.Generator().manual_seed(196)
 
     query = make_packed_random_tensor(
-        seqlens_q, max_seqlen_q, num_heads, head_size, data_type,
-        generator=generator, device="npu",
+        seqlens_q,
+        max_seqlen_q,
+        num_heads,
+        head_size,
+        data_type,
+        generator=generator,
+        device="npu",
     )
     key = make_random_tensor(
-        (num_blocks, block_size, kv_heads, head_size), data_type,
-        generator=generator, device="npu",
+        (num_blocks, block_size, kv_heads, head_size),
+        data_type,
+        generator=generator,
+        device="npu",
     )
     value = make_random_tensor(
-        (num_blocks, block_size, kv_heads, head_size), data_type,
-        generator=generator, device="npu",
+        (num_blocks, block_size, kv_heads, head_size),
+        data_type,
+        generator=generator,
+        device="npu",
     )
-    block_table = torch.arange(num_blocks, dtype=torch.int32).reshape(
-        batch_size, block_table_width
-    ).npu()
+    block_table = (
+        torch.arange(num_blocks, dtype=torch.int32).reshape(batch_size, block_table_width).npu()
+    )
     cu_q, cu_k = make_cu_seqlens(seqlens_q), make_cu_seqlens(seqlens_k)
-    scale = head_size ** -0.5
+    scale = head_size**-0.5
     window_size = (max_seqlen_k, 0)
 
     output_npu = flash_attn_varlen_func(
@@ -940,16 +1092,31 @@ def test_fa_varlen_swa_invalid_prefix_clear_regression():
     softcap = 1.0
     generator = torch.Generator().manual_seed(146)
     query = make_packed_random_tensor(
-        seqlens_q, max_seqlen_q, num_heads, head_size, torch.bfloat16,
-        generator=generator, device="npu",
+        seqlens_q,
+        max_seqlen_q,
+        num_heads,
+        head_size,
+        torch.bfloat16,
+        generator=generator,
+        device="npu",
     )
     key = make_packed_random_tensor(
-        seqlens_k, max_seqlen_k, kv_heads, head_size, torch.bfloat16,
-        generator=generator, device="npu",
+        seqlens_k,
+        max_seqlen_k,
+        kv_heads,
+        head_size,
+        torch.bfloat16,
+        generator=generator,
+        device="npu",
     )
     value = make_packed_random_tensor(
-        seqlens_k, max_seqlen_k, kv_heads, head_size, torch.bfloat16,
-        generator=generator, device="npu",
+        seqlens_k,
+        max_seqlen_k,
+        kv_heads,
+        head_size,
+        torch.bfloat16,
+        generator=generator,
+        device="npu",
     )
     cu_q, cu_k = make_cu_seqlens(seqlens_q), make_cu_seqlens(seqlens_k)
 
@@ -985,7 +1152,7 @@ def test_fa_varlen_swa_invalid_prefix_clear_regression():
         *window_size,
     )
     fully_masked = atten_mask.all(dim=-1)
-    assert int(fully_masked[1, :seqlens_q[1]].sum()) == 20
+    assert int(fully_masked[1, : seqlens_q[1]].sum()) == 20
     golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
         query_padded,
         key_padded,

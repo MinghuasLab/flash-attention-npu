@@ -32,19 +32,11 @@ using namespace Catlass;
 
 namespace FAG {
 
-template <
-    class BlockMmadFAGCube1_,
-    class BlockMmadFAGCube2_,
-    class BlockMmadFAGCube3_,
-    class EpilogueFAGPre_,
-    class EpilogueFAGSfmg_,
-    class EpilogueFAGOp_,
-    class EpilogueFAGPost_,
-    MaskType maskType = MaskType::NO_MASK,
-    InputLayout inputLayout = InputLayout::TND
->
+template <class BlockMmadFAGCube1_, class BlockMmadFAGCube2_, class BlockMmadFAGCube3_, class EpilogueFAGPre_,
+          class EpilogueFAGSfmg_, class EpilogueFAGOp_, class EpilogueFAGPost_, MaskType maskType = MaskType::NO_MASK,
+          InputLayout inputLayout = InputLayout::TND>
 class FAGKernel {
-public:
+  public:
     using BlockMmadFAGCube1 = BlockMmadFAGCube1_;
     using ArchTag = typename BlockMmadFAGCube1::ArchTag;
     using L1TileShape = typename BlockMmadFAGCube1::L1TileShape;
@@ -70,13 +62,11 @@ public:
     using LayoutB3 = typename BlockMmadFAGCube3::LayoutB;
     using ElementC3 = typename BlockMmadFAGCube3::ElementC;
     using LayoutC3 = typename BlockMmadFAGCube3::LayoutC;
-    
+
     using EpilogueFAGPre = EpilogueFAGPre_;
     using EpilogueFAGSfmg = EpilogueFAGSfmg_;
     using EpilogueFAGOp = EpilogueFAGOp_;
     using EpilogueFAGPost = EpilogueFAGPost_;
-
-
 
     /// Parameters structure
     struct Params {
@@ -86,19 +76,19 @@ public:
         GM_ADDR v;
         GM_ADDR dout;
         GM_ADDR q_right;
-        GM_ADDR k_right; 
+        GM_ADDR k_right;
         GM_ADDR pse_shift;
         GM_ADDR drop_mask;
-        GM_ADDR padding_mask; 
+        GM_ADDR padding_mask;
         GM_ADDR atten_mask;
         GM_ADDR row_lse;
-        GM_ADDR row_in; 
+        GM_ADDR row_in;
         GM_ADDR out;
         GM_ADDR prefix;
-        GM_ADDR cu_seq_qlen; 
+        GM_ADDR cu_seq_qlen;
         GM_ADDR cu_seq_kvlen;
         GM_ADDR q_start_idx;
-        GM_ADDR kv_start_idx; 
+        GM_ADDR kv_start_idx;
         GM_ADDR dq;
         GM_ADDR dk;
         GM_ADDR dv;
@@ -112,35 +102,28 @@ public:
         Params() {}
 
         CATLASS_DEVICE
-        Params(
-            GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR dout_,
-            GM_ADDR q_right_, GM_ADDR k_right_, GM_ADDR pse_shift_,
-            GM_ADDR drop_mask_, GM_ADDR padding_mask_, GM_ADDR atten_mask_,
-            GM_ADDR row_lse_, GM_ADDR row_in_, 
-            GM_ADDR out_, GM_ADDR prefix_, GM_ADDR cu_seq_qlen_, 
-            GM_ADDR cu_seq_kvlen_, GM_ADDR q_start_idx_, GM_ADDR kv_start_idx_, 
-            GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_, GM_ADDR workspace_, GM_ADDR tiling_data_, GM_ADDR ptrDump_
-        ) : q(q_), k(k_), v(v_), dout(dout_),
-            q_right(q_right_), k_right(k_right_), pse_shift(pse_shift_),
-            drop_mask(drop_mask_), padding_mask(padding_mask_), atten_mask(atten_mask_),
-            row_lse(row_lse_), row_in(row_in_), 
-            out(out_), prefix(prefix_), cu_seq_qlen(cu_seq_qlen_), 
-            cu_seq_kvlen(cu_seq_kvlen_), q_start_idx(q_start_idx_), kv_start_idx(kv_start_idx_), 
-            dq(dq_), dk(dk_), dv(dv_), alibi_slopes(alibi_slopes_), workspace(workspace_), tiling_data(tiling_data_), ptrDump(ptrDump_)
-        {
-        }    
+        Params(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR dout_, GM_ADDR q_right_, GM_ADDR k_right_,
+               GM_ADDR pse_shift_, GM_ADDR drop_mask_, GM_ADDR padding_mask_, GM_ADDR atten_mask_, GM_ADDR row_lse_,
+               GM_ADDR row_in_, GM_ADDR out_, GM_ADDR prefix_, GM_ADDR cu_seq_qlen_, GM_ADDR cu_seq_kvlen_,
+               GM_ADDR q_start_idx_, GM_ADDR kv_start_idx_, GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_,
+               GM_ADDR alibi_slopes_, GM_ADDR workspace_, GM_ADDR tiling_data_, GM_ADDR ptrDump_)
+            : q(q_), k(k_), v(v_), dout(dout_), q_right(q_right_), k_right(k_right_), pse_shift(pse_shift_),
+              drop_mask(drop_mask_), padding_mask(padding_mask_), atten_mask(atten_mask_), row_lse(row_lse_),
+              row_in(row_in_), out(out_), prefix(prefix_), cu_seq_qlen(cu_seq_qlen_), cu_seq_kvlen(cu_seq_kvlen_),
+              q_start_idx(q_start_idx_), kv_start_idx(kv_start_idx_), dq(dq_), dk(dk_), dv(dv_),
+              alibi_slopes(alibi_slopes_), workspace(workspace_), tiling_data(tiling_data_), ptrDump(ptrDump_)
+        {}
     };
 
     // Methods
     CATLASS_DEVICE
     FAGKernel() {}
 
-
     CATLASS_DEVICE
-    void operator()(Params const &params)
+    void operator()(Params const& params)
     {
 #ifdef __DAV_C220_CUBE__
-        __gm__ FAGv2TilingData *tilingData = reinterpret_cast<__gm__ FAGv2TilingData *>(params.tiling_data);
+        __gm__ FAGv2TilingData* tilingData = reinterpret_cast<__gm__ FAGv2TilingData*>(params.tiling_data);
 
         int64_t batch = tilingData->batch;
         int64_t g = tilingData->g;
@@ -162,12 +145,12 @@ public:
         struct CubeAddrInfo cubeAddrInfo[2];
         int32_t taskId = 0;
         bool running = true;
-        __gm__ uint8_t * actucal_seq_q_addr = params.cu_seq_qlen;
-        __gm__ uint8_t * actucal_seq_k_addr = params.cu_seq_kvlen;
+        __gm__ uint8_t* actucal_seq_q_addr = params.cu_seq_qlen;
+        __gm__ uint8_t* actucal_seq_k_addr = params.cu_seq_kvlen;
 
-        if constexpr(inputLayout == InputLayout::TND) {
-            actucal_seq_q_addr = (__gm__ uint8_t *)((__gm__ int32_t *)params.cu_seq_qlen + 1);
-            actucal_seq_k_addr = (__gm__ uint8_t *)((__gm__ int32_t *)params.cu_seq_kvlen + 1);
+        if constexpr (inputLayout == InputLayout::TND) {
+            actucal_seq_q_addr = (__gm__ uint8_t*)((__gm__ int32_t*)params.cu_seq_qlen + 1);
+            actucal_seq_k_addr = (__gm__ uint8_t*)((__gm__ int32_t*)params.cu_seq_kvlen + 1);
         } else {
             seq_q_len = tilingData->t1 / batch;
             seq_k_len = tilingData->t2 / batch;
@@ -175,7 +158,7 @@ public:
 
         CubeAddr<maskType, inputLayout> cubeAddr;
         cubeAddr.init(batch, nheads, g, headdim, GetBlockIdx(), seq_q_len, seq_k_len, actucal_seq_q_addr,
-            actucal_seq_k_addr, mixCoreNum);
+                      actucal_seq_k_addr, mixCoreNum);
 
         uint32_t pingpongFlagL1A = 0;
         uint32_t pingpongFlagL1B = 0;
@@ -186,7 +169,7 @@ public:
         BlockMmadFAGCube1 blockMmadFAGCube1(resource, nheads, nheads_k, headdim);
         BlockMmadFAGCube2 blockMmadFAGCube2(resource, nheads, nheads_k, headdim);
         BlockMmadFAGCube3 blockMmadFAGCube3(resource, nheads, nheads_k, headdim);
-        
+
         while (running) {
             cubeAddrInfo[taskId % 2].taskId = taskId;
             cubeAddr.addr_mapping(&cubeAddrInfo[taskId % 2]);
@@ -194,11 +177,11 @@ public:
                 SetFlag();
                 CubeAddrInfo addrs = cubeAddrInfo[taskId % 2];
                 blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.q),
-                    (__gm__ ElementB1 *)(params.k), (__gm__ float*)(params.workspace + mm2WorkspaceOffset), 
-                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
+                                  (__gm__ ElementB1*)(params.k), (__gm__ float*)(params.workspace + mm2WorkspaceOffset),
+                                  pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.dout),
-                    (__gm__ ElementB1*)(params.v), (__gm__ float*)(params.workspace + mm1WorkspaceOffset), 
-                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
+                                  (__gm__ ElementB1*)(params.v), (__gm__ float*)(params.workspace + mm1WorkspaceOffset),
+                                  pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
                 AscendC::CrossCoreSetFlag<2, PIPE_FIX>(CUBE2VEC);
             }
@@ -206,21 +189,21 @@ public:
                 AscendC::WaitEvent(VEC2CUBE);
                 SetFlag();
                 blockMmadFAGCube2(cubeAddrInfo[(taskId - 1) % 2],
-                    (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB2*)(params.k),
-                    (__gm__ float*)(params.workspace + dqWorkSpaceOffset), 
-                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B);
+                                  (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset),
+                                  (__gm__ ElementB2*)(params.k), (__gm__ float*)(params.workspace + dqWorkSpaceOffset),
+                                  pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B);
                 WaitFlag();
                 SetFlag();
-                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
-                    (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout),
-                    (__gm__ float*)(params.workspace + dvWorkSpaceOffset), 
+                blockMmadFAGCube3(
+                    cubeAddrInfo[(taskId - 1) % 2], (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset),
+                    (__gm__ ElementB3*)(params.dout), (__gm__ float*)(params.workspace + dvWorkSpaceOffset),
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
                 SetFlag();
                 blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
-                    (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB3*)(params.q),
-                    (__gm__ float*)(params.workspace + dkWorkSpaceOffset), 
-                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
+                                  (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset),
+                                  (__gm__ ElementB3*)(params.q), (__gm__ float*)(params.workspace + dkWorkSpaceOffset),
+                                  pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
             }
             if (cubeAddrInfo[taskId % 2].blockLength == 0) {
@@ -233,7 +216,7 @@ public:
 
 #ifdef __DAV_C220_VEC__
 
-        __gm__ FAGv2TilingData *tilingData = reinterpret_cast<__gm__ FAGv2TilingData *>(params.tiling_data);
+        __gm__ FAGv2TilingData* tilingData = reinterpret_cast<__gm__ FAGv2TilingData*>(params.tiling_data);
 
         int64_t batch = tilingData->batch;
         int64_t g = tilingData->g;
@@ -242,15 +225,15 @@ public:
         int64_t headdim = tilingData->qkHeadDim;
         uint32_t coreNum = tilingData->coreNum;
         int64_t mixCoreNum = (coreNum + 1) / 2;
-        
+
         uint32_t seq_q_len = 0;
         uint32_t seq_k_len = 0;
-        __gm__ uint8_t * actucal_seq_q_addr = params.cu_seq_qlen;
-        __gm__ uint8_t * actucal_seq_k_addr = params.cu_seq_kvlen;
+        __gm__ uint8_t* actucal_seq_q_addr = params.cu_seq_qlen;
+        __gm__ uint8_t* actucal_seq_k_addr = params.cu_seq_kvlen;
 
-        if constexpr(inputLayout == InputLayout::TND) {
-            actucal_seq_q_addr = (__gm__ uint8_t *)((__gm__ int32_t *)params.cu_seq_qlen + 1);
-            actucal_seq_k_addr = (__gm__ uint8_t *)((__gm__ int32_t *)params.cu_seq_kvlen + 1);
+        if constexpr (inputLayout == InputLayout::TND) {
+            actucal_seq_q_addr = (__gm__ uint8_t*)((__gm__ int32_t*)params.cu_seq_qlen + 1);
+            actucal_seq_k_addr = (__gm__ uint8_t*)((__gm__ int32_t*)params.cu_seq_kvlen + 1);
         } else {
             seq_q_len = tilingData->t1 / batch;
             seq_k_len = tilingData->t2 / batch;
@@ -259,14 +242,14 @@ public:
         struct VecAddrInfo vecAddrInfo;
         AscendC::TPipe pipePre;
         EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, nullptr, params.workspace,
-            params.tiling_data);
+                                      params.tiling_data);
         epilogueFagPre();
         pipePre.Destroy();
 
         // vec SoftmaxGrad
         AscendC::TPipe pipeSoftmaxGrad;
         EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, actucal_seq_q_addr,
-            params.workspace, params.tiling_data);
+                                        params.workspace, params.tiling_data);
         epilogueFagSfmg();
         pipeSoftmaxGrad.Destroy();
 
@@ -274,12 +257,13 @@ public:
 
         // vector process
         AscendC::TPipe pipeVec;
-        EpilogueFAGOp epilogueFagOp(resource, &pipeVec, params.row_lse,
-            params.atten_mask, actucal_seq_q_addr, actucal_seq_k_addr, params.alibi_slopes, params.workspace, batch, params.tiling_data);
+        EpilogueFAGOp epilogueFagOp(resource, &pipeVec, params.row_lse, params.atten_mask, actucal_seq_q_addr,
+                                    actucal_seq_k_addr, params.alibi_slopes, params.workspace, batch,
+                                    params.tiling_data);
 
         VectorAddr<maskType, inputLayout> vector_addr;
         vector_addr.init(batch, nheads, g, headdim, GetBlockIdx() / 2, seq_q_len, seq_k_len, actucal_seq_q_addr,
-            actucal_seq_k_addr, mixCoreNum);
+                         actucal_seq_k_addr, mixCoreNum);
         int32_t taskId = 0;
         bool running = true;
         while (running) {
@@ -298,16 +282,15 @@ public:
         pipeVec.Destroy();
         AscendC::WaitEvent(CUBE2POST);
         AscendC::SyncAll();
-        
+
         // vector post process
         AscendC::TPipe pipePost;
         EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace,
-            params.tiling_data);
+                                        params.tiling_data);
         epilogueFagPost();
-        pipePost.Destroy(); 
+        pipePost.Destroy();
 #endif
     }
-
 
     CATLASS_DEVICE
     void SetFlag()
@@ -341,39 +324,31 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID6);
     }
 
-private:
+  private:
     Arch::Resource<ArchTag> resource;
 };
 
-template <
-    typename InputDtype = half,
-    MaskType maskType = MaskType::NO_MASK,
-    InputLayout inputLayout = InputLayout::TND,
-    bool HAS_SOFTCAP = false,
-    bool HAS_ALIBI = false>
-__global__ __aicore__
-void FAGVarlenOpt(uint64_t fftsAddr,
-        GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR dout,
-        GM_ADDR q_right, GM_ADDR k_right, 
-        GM_ADDR pse_shift, GM_ADDR drop_mask, GM_ADDR padding_mask, 
-        GM_ADDR atten_mask, GM_ADDR row_lse, GM_ADDR row_in, 
-        GM_ADDR out, GM_ADDR prefix, GM_ADDR cu_seq_qlen, 
-        GM_ADDR cu_seq_kvlen, GM_ADDR q_start_idx, GM_ADDR kv_start_idx, 
-        GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR alibi_slopes,
-        GM_ADDR workspace, GM_ADDR tiling_data, GM_ADDR ptrDump)
+template <typename InputDtype = half, MaskType maskType = MaskType::NO_MASK, InputLayout inputLayout = InputLayout::TND,
+          bool HAS_SOFTCAP = false, bool HAS_ALIBI = false>
+__global__ __aicore__ void FAGVarlenOpt(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR dout,
+                                        GM_ADDR q_right, GM_ADDR k_right, GM_ADDR pse_shift, GM_ADDR drop_mask,
+                                        GM_ADDR padding_mask, GM_ADDR atten_mask, GM_ADDR row_lse, GM_ADDR row_in,
+                                        GM_ADDR out, GM_ADDR prefix, GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
+                                        GM_ADDR q_start_idx, GM_ADDR kv_start_idx, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
+                                        GM_ADDR alibi_slopes, GM_ADDR workspace, GM_ADDR tiling_data, GM_ADDR ptrDump)
 {
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
 
-    #if defined(ENABLE_ASCENDC_DUMP)
-        AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
-    #endif
+#if defined(ENABLE_ASCENDC_DUMP)
+    AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
+#endif
 
     using ArchTag = Arch::AtlasA2;
     // Cube1 计算：左矩阵不转置，右矩阵转置。实现 (Q * K^T) 和 dP = dOut * V^T
-    using ElementA1 = InputDtype;               // q和dout
+    using ElementA1 = InputDtype; // q和dout
     using LayoutA1 = layout::RowMajor;
-    using ElementB1 = InputDtype;               // k和v
+    using ElementB1 = InputDtype; // k和v
     using LayoutB1 = layout::ColumnMajor;
     using ElementC1 = float;
     using LayoutC1 = layout::RowMajor;
@@ -384,12 +359,12 @@ void FAGVarlenOpt(uint64_t fftsAddr,
     using L1TileShapeCube1 = GemmShape<256, 128, 256>;
     using L0TileShapeCube1 = L1TileShapeCube1;
     using BlockMmadFAGCube1 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube1, L1TileShapeCube1, L0TileShapeCube1,
-        A1Type, B1Type, C1Type>;
+                                                              A1Type, B1Type, C1Type>;
 
     // Cube2 计算：左矩阵不转置，右矩阵不转置。实现 dQ = dS * K
-    using ElementA2 = InputDtype;           // ds
+    using ElementA2 = InputDtype; // ds
     using LayoutA2 = layout::RowMajor;
-    using ElementB2 = InputDtype;           // k
+    using ElementB2 = InputDtype; // k
     using LayoutB2 = layout::RowMajor;
     using ElementC2 = float;
     using LayoutC2 = layout::RowMajor;
@@ -402,12 +377,12 @@ void FAGVarlenOpt(uint64_t fftsAddr,
     using L0TileShapeCube2 = L1TileShapeCube2;
 
     using BlockMmadFAGCube2 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube2, L1TileShapeCube2, L0TileShapeCube2,
-        A2Type, B2Type, C2Type>;
+                                                              A2Type, B2Type, C2Type>;
 
     // Cube3 计算：左矩阵转置，右矩阵不转置。 实现 dK = dS^T * Q 和 dV = P^T * dOut
-    using ElementA3 = InputDtype;              // ds和p
+    using ElementA3 = InputDtype; // ds和p
     using LayoutA3 = layout::ColumnMajor;
-    using ElementB3 = InputDtype;              // q和dout
+    using ElementB3 = InputDtype; // q和dout
     using LayoutB3 = layout::RowMajor;
     using ElementC3 = float;
     using LayoutC3 = layout::RowMajor;
@@ -420,41 +395,43 @@ void FAGVarlenOpt(uint64_t fftsAddr,
     using L0TileShapeCube3 = L1TileShapeCube3;
 
     using BlockMmadFAGCube3 = Catlass::Gemm::Block::BlockMmad<DispatchPolicyCube3, L1TileShapeCube3, L0TileShapeCube3,
-        A3Type, B3Type, C3Type>;
+                                                              A3Type, B3Type, C3Type>;
 
     // Epilogue
     using ElementVecDtype = InputDtype;
 
     // VEC_Pre ：dQ/dOut/dV的workspace清零
     using EpilogueAtlasA2FAGPre = Catlass::Epilogue::EpilogueAtlasA2FAGPre;
-    using EpilogueFAGPre = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, ElementVecDtype, FAGv2TilingData>;
+    using EpilogueFAGPre =
+        Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
     using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<static_cast<uint32_t>(inputLayout)>;
-    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, FAGv2TilingData>;
+    using EpilogueFAGSfmg =
+        Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, ElementVecDtype, FAGv2TilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2FAGOp = Catlass::Epilogue::EpilogueAtlasA2FAGOp<static_cast<uint32_t>(maskType), HAS_SOFTCAP, HAS_ALIBI>;
-    using EpilogueFAGOp = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype, std::integral_constant<InputLayout, inputLayout>, FAGv2TilingData>;
+    using EpilogueAtlasA2FAGOp =
+        Catlass::Epilogue::EpilogueAtlasA2FAGOp<static_cast<uint32_t>(maskType), HAS_SOFTCAP, HAS_ALIBI>;
+    using EpilogueFAGOp =
+        Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGOp, ElementVecDtype,
+                                                std::integral_constant<InputLayout, inputLayout>, FAGv2TilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
     using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
-    using EpilogueFAGPost = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, FAGv2TilingData>;
+    using EpilogueFAGPost =
+        Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, FAGv2TilingData>;
 
     // Kernel level
     using FAGKernel = FAGKernel<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
-        EpilogueFAGSfmg, EpilogueFAGOp, EpilogueFAGPost, maskType, inputLayout>;
+                                EpilogueFAGSfmg, EpilogueFAGOp, EpilogueFAGPost, maskType, inputLayout>;
     typename FAGKernel::Params params{
-        q, k, v, dout,
-        q_right, k_right, pse_shift,
-        drop_mask, padding_mask, atten_mask,
-        row_lse, row_in, 
-        out, prefix, cu_seq_qlen, 
-        cu_seq_kvlen, q_start_idx, kv_start_idx, 
-        dq, dk, dv, alibi_slopes, workspace, tiling_data, ptrDump};
+        q,          k,       v,      dout,         q_right,   k_right,     pse_shift,    drop_mask,   padding_mask,
+        atten_mask, row_lse, row_in, out,          prefix,    cu_seq_qlen, cu_seq_kvlen, q_start_idx, kv_start_idx,
+        dq,         dk,      dv,     alibi_slopes, workspace, tiling_data, ptrDump};
 
     // call kernel
     FAGKernel fag;
     fag(params);
 }
-}
+} // namespace FAG

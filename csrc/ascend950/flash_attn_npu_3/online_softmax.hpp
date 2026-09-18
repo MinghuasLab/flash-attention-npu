@@ -20,19 +20,9 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    class OutputType_,
-    class LayoutS_,
-    class MaskType_,
-    class TileCopy_>
-class BlockEpilogue<
-    EpilogueFAOnlineSoftmax,
-    OutputType_,
-    Gemm::GemmType<float, LayoutS_>,
-    MaskType_,
-    TileCopy_>
-{
-public:
+template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_>
+class BlockEpilogue<EpilogueFAOnlineSoftmax, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_, TileCopy_> {
+  public:
     using DispatchPolicy = EpilogueFAOnlineSoftmax;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
@@ -79,8 +69,7 @@ public:
     static constexpr uint32_t SM_ROW_MAX_ELEM_NUM = 64;
     static constexpr uint32_t SM_COL_MAX_ELEM_NUM = 256;
 
-    __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
+    __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, float scaleValue_)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -90,10 +79,10 @@ public:
         constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 64 * sizeof(float);
         constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET +  64 * sizeof(float);
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET +  64 * sizeof(float);
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 64 * sizeof(float);
 
-        subBlockIdx_ = AscendC::GetSubBlockIdx(); 
+        subBlockIdx_ = AscendC::GetSubBlockIdx();
 
         scaleValue = static_cast<ElementInput>(scaleValue_);
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LS_UB_TENSOR_OFFSET);
@@ -106,14 +95,10 @@ public:
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
     }
 
-    __aicore__ inline
-    ~BlockEpilogue()
-    {
-    }
+    __aicore__ inline ~BlockEpilogue() {}
 
     template <class TensorDst, class TensorSrc>
-    __aicore__ inline
-    void CopyPUbToPL1(TensorDst const &dstTensor, TensorSrc const &srcTensor, uint32_t m)
+    __aicore__ inline void CopyPUbToPL1(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t m)
     {
         const uint32_t blockCount = tla::get<1, 1>(srcTensor.shape());
         const uint32_t blockLen = tla::get<0, 0>(srcTensor.shape()) * tla::get<0, 1>(srcTensor.shape());
@@ -133,8 +118,7 @@ public:
     }
 
     template <uint32_t MODE, pipe_t PIPE>
-    __aicore__ inline
-    void SetCrossCoreSync(Arch::CrossCoreFlag &crossCoreFlag)
+    __aicore__ inline void SetCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
     {
         // in mode 4, AIC set for 2 AIVs seperately
         if constexpr (MODE == 4U) {
@@ -143,30 +127,26 @@ public:
     }
 
     template <uint32_t MODE, pipe_t PIPE>
-    __aicore__ inline
-    void WaitCrossCoreSync(Arch::CrossCoreFlag &crossCoreFlag)
+    __aicore__ inline void WaitCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
     {
         // in mode 4, AIC wait for 2 AIVs seperately
         if constexpr (MODE == 4U) {
             Arch::CrossCoreWaitFlag<MODE, PIPE>(crossCoreFlag);
         }
     }
-    
+
     template <class TensorP>
-    __aicore__ inline
-    void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
-        uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-         uint32_t qSBlockSize, uint32_t qNBlockSize)
-    {   
+    __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+                                      uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+                                      Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize)
+    {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
         uint32_t totalRows = qSBlockSize * qNBlockSize;
         uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
         uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
         uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
-        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
-            (totalRows > splitRows ? totalRows - splitRows : 0U);
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows : (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -184,33 +164,37 @@ public:
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
-        __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float *lastMaxAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastMaxStartAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastSumAddr = (__ubuf__ float*) glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxStartAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowSumAddr = (__ubuf__ float*) llUbTensor.GetPhyAddr();
-        __ubuf__ float *expMaxUbAddr = (__ubuf__ float *)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
+                    nPadding, scaleValue, 128, blockStride, nRound);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
+                    nPadding, scaleValue, 128, blockStride, nRound);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
+                    scaleValue, 128, blockStride, nRound);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
+                    scaleValue, 128, blockStride, nRound);
             }
         }
 
@@ -219,12 +203,9 @@ public:
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM],
-            ubPLayoutTla, Arch::PositionUB{});
-        auto ubPTensorTlaTile = GetTile(ubPTensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(m, n));
-        auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
@@ -232,18 +213,17 @@ public:
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(
-                lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops, tailM);
+            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
+                                                tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
     template <class TensorP>
-    __aicore__ inline
-    void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
-        uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag, bool enableDn,
-         uint32_t qSBlockSize, uint32_t qNBlockSize)
+    __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+                                      uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+                                      Arch::CrossCoreFlag softmaxReadyFlag, bool enableDn, uint32_t qSBlockSize,
+                                      uint32_t qNBlockSize)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -251,8 +231,7 @@ public:
         uint32_t splitRows = (totalRows + 32U - 1U) / 32U * 32U / subBlockNum;
         uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
         uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
-        uint32_t n = subBlockIdx == 0U ? firstSubBlockRows :
-            (totalRows > splitRows ? totalRows - splitRows : 0U);
+        uint32_t n = subBlockIdx == 0U ? firstSubBlockRows : (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (n == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -270,19 +249,19 @@ public:
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
-        __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float *lastMaxAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastMaxStartAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastSumAddr = (__ubuf__ float*) glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxStartAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowSumAddr = (__ubuf__ float*) llUbTensor.GetPhyAddr();
-        __ubuf__ float *expMaxUbAddr = (__ubuf__ float *)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
-        
+
         uint32_t mAligendTile = mRound / 4;
         uint32_t mFirstTile = m % mAligendTile;
         uint32_t mAligned16TileNum = m / mAligendTile;
@@ -292,71 +271,67 @@ public:
         if (isFirstKvSTile) {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                    64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                    64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                    64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                    64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                    64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
             }
         } else {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64,
+                    blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64,
+                    blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64,
+                    blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64,
+                    blockStride, nRound, expMaxUbAddr, lastSumAddr);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64,
+                    blockStride, nRound, expMaxUbAddr, lastSumAddr);
             }
         }
-        
+
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM],
-            ubPLayoutTla, Arch::PositionUB{});
-        auto ubPTensorTlaTile = GetTile(ubPTensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(m, n));
-        auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
-        
+
         AscendC::DataCopyParams dataCopyParams;
         dataCopyParams.blockCount = nRound / 16; // 分两次搬运
         dataCopyParams.blockLen = mRound / 2;
         dataCopyParams.srcStride = 1;
         dataCopyParams.dstStride = mRound / 2;
-        DataCopy(l1PTensorTla.data()[mRound * rowStart],
-            lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], dataCopyParams);
+        DataCopy(l1PTensorTla.data()[mRound * rowStart], lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], dataCopyParams);
         DataCopy(l1PTensorTla.data()[mRound * 8 + mRound * rowStart],
-            lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM + blockStride * 64], dataCopyParams);
+                 lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM + blockStride * 64], dataCopyParams);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         // crossCoreSync after PIPE_MTE1 move
@@ -364,13 +339,12 @@ public:
     }
 
     template <class TensorP, class TensorMask>
-    __aicore__ inline
-    void operator()(TensorP &l1PTensorTla, TensorMask &gmMaskTensorTla, GemmCoord actualBlockShape,
-        uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-         int64_t triUp,  uint32_t triDown, uint32_t globalWindowSize,  uint32_t localWindowSize,
-         uint32_t kvSStartIdx, uint32_t kvSEndIdx, uint32_t maskType,
-         uint32_t qSBlockSize, uint32_t qNBlockSize)
+    __aicore__ inline void operator()(TensorP& l1PTensorTla, TensorMask& gmMaskTensorTla, GemmCoord actualBlockShape,
+                                      uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
+                                      Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
+                                      int64_t triUp, uint32_t triDown, uint32_t globalWindowSize,
+                                      uint32_t localWindowSize, uint32_t kvSStartIdx, uint32_t kvSEndIdx,
+                                      uint32_t maskType, uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -378,8 +352,7 @@ public:
         uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
         uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
         uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
-        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
-            (totalRows > splitRows ? totalRows - splitRows : 0U);
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows : (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -410,8 +383,7 @@ public:
                 maskColumn = kvSEndIdx - kvSStartIdx;
             } else {
                 gmOffsetMaskRow = 0;
-                gmOffsetMaskColumn = static_cast<uint32_t>(
-                    static_cast<int64_t>(kvSStartIdx) - triUp);
+                gmOffsetMaskColumn = static_cast<uint32_t>(static_cast<int64_t>(kvSStartIdx) - triUp);
                 maskColumn = n;
                 addMaskUbOffset = 0;
             }
@@ -430,16 +402,16 @@ public:
         auto ubMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(m, maskColumnRound);
         auto ubMaskTensorTla = tla::MakeTensor(maskUbTensor, ubMaskLayoutTla, Arch::PositionUB{});
 
-        __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float *lastMaxAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastMaxStartAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastSumAddr = (__ubuf__ float*) glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxStartAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowSumAddr = (__ubuf__ float*) llUbTensor.GetPhyAddr();
-        __ubuf__ float *expMaxUbAddr = (__ubuf__ float *)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementMask *maskUbAddr = (__ubuf__ ElementMask *)maskUbTensor.GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementMask* maskUbAddr = (__ubuf__ ElementMask*)maskUbTensor.GetPhyAddr();
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
         uint32_t groupRow = rowStart;
@@ -449,11 +421,10 @@ public:
             uint32_t localS = groupRow % qSBlockSize;
             uint32_t rowsThisHead = qSBlockSize - localS;
             rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-            auto gmMaskTile = GetTile(gmMaskTensorTla,
-                tla::MakeCoord(gmOffsetMaskRow + localS, gmOffsetMaskColumn),
-                tla::MakeShape(rowsThisHead, maskColumnRound));
-            auto ubMaskTile = GetTile(ubMaskTensorTla,
-                tla::MakeCoord(ubRowOffset, 0), tla::MakeShape(rowsThisHead, maskColumnRound));
+            auto gmMaskTile = GetTile(gmMaskTensorTla, tla::MakeCoord(gmOffsetMaskRow + localS, gmOffsetMaskColumn),
+                                      tla::MakeShape(rowsThisHead, maskColumnRound));
+            auto ubMaskTile =
+                GetTile(ubMaskTensorTla, tla::MakeCoord(ubRowOffset, 0), tla::MakeShape(rowsThisHead, maskColumnRound));
             copyGmToUbMask(ubMaskTile, gmMaskTile);
             groupRow += rowsThisHead;
             ubRowOffset += rowsThisHead;
@@ -466,22 +437,26 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
-        
+
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops,
+                    tailN, nPadding, scaleValue, 128, blockStride, nRound);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops,
+                    tailN, nPadding, scaleValue, 128, blockStride, nRound);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                    tailN, nPadding, scaleValue, 128, blockStride, nRound);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                    tailN, nPadding, scaleValue, 128, blockStride, nRound);
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -490,12 +465,9 @@ public:
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM],
-            ubPLayoutTla, Arch::PositionUB{});
-        auto ubPTensorTlaTile = GetTile(ubPTensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(m, n));
-        auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
@@ -503,23 +475,20 @@ public:
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(
-                lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops, tailM);
+            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
+                                                tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
     // SWA Pre/Next mask path. Trailing swaPathTag keeps arity distinct from causal mask overload.
     template <class TensorP, class TensorMask>
-    __aicore__ inline
-    void operator()(TensorP &l1PTensorTla, TensorMask &gmMaskTensorTla, GemmCoord actualBlockShape,
-        uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-        Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-        int32_t kvSStartIdx,
-        bool doTriUPreMask, bool doTriUNextMask,
-        int32_t preTokenStartLen, int32_t /*preTokenEndLen*/,
-        int32_t nextTokenStartLen, int32_t /*nextTokenEndLen*/,
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t /*swaPathTag*/)
+    __aicore__ inline void
+    operator()(TensorP& l1PTensorTla, TensorMask& gmMaskTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+               uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+               Arch::CrossCoreFlag softmaxReadyFlag, int32_t kvSStartIdx, bool doTriUPreMask, bool doTriUNextMask,
+               int32_t preTokenStartLen, int32_t /*preTokenEndLen*/, int32_t nextTokenStartLen,
+               int32_t /*nextTokenEndLen*/, uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t /*swaPathTag*/)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -527,8 +496,7 @@ public:
         uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
         uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
         uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
-        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
-            (totalRows > splitRows ? totalRows - splitRows : 0U);
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows : (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -577,8 +545,8 @@ public:
         // Next-band mask sits after Pre; sized for max online-softmax rows (m<=64
         // with kvS=128). qN>1 reuses the same S-band rows per head via localS fill.
         constexpr uint32_t MASK_NEXT_ELEM_OFFSET = MAX_UB_S_ELEM_NUM;
-        auto ubMaskNextTensorTla = tla::MakeTensor(
-            maskUbTensor[MASK_NEXT_ELEM_OFFSET], ubMaskLayoutTla, Arch::PositionUB{});
+        auto ubMaskNextTensorTla =
+            tla::MakeTensor(maskUbTensor[MASK_NEXT_ELEM_OFFSET], ubMaskLayoutTla, Arch::PositionUB{});
 
         // Fill Pre/Next mask by localS within each head segment (same mapping as causal).
         // This is the qN>=1 path: mid-head AIV splits still map localS correctly.
@@ -591,12 +559,11 @@ public:
                 uint32_t localS = groupRow % qSBlockSize;
                 uint32_t rowsThisHead = qSBlockSize - localS;
                 rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-                auto gMaskTile = GetTile(gmMaskTensorTla,
-                    tla::MakeCoord(gmOffsetMaskRowPre + localS, gmOffsetMaskColumnPre),
-                    tla::MakeShape(rowsThisHead, maskColumnRound));
-                auto ubMaskTile = GetTile(ubMaskTensorTla,
-                    tla::MakeCoord(ubRowOffset, 0),
-                    tla::MakeShape(rowsThisHead, maskColumnRound));
+                auto gMaskTile =
+                    GetTile(gmMaskTensorTla, tla::MakeCoord(gmOffsetMaskRowPre + localS, gmOffsetMaskColumnPre),
+                            tla::MakeShape(rowsThisHead, maskColumnRound));
+                auto ubMaskTile = GetTile(ubMaskTensorTla, tla::MakeCoord(ubRowOffset, 0),
+                                          tla::MakeShape(rowsThisHead, maskColumnRound));
                 copyGmToUbMask(ubMaskTile, gMaskTile);
                 groupRow += rowsThisHead;
                 ubRowOffset += rowsThisHead;
@@ -614,12 +581,11 @@ public:
                     uint32_t localS = groupRow % qSBlockSize;
                     uint32_t rowsThisHead = qSBlockSize - localS;
                     rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-                    auto gMaskTile = GetTile(gmMaskTensorTla,
-                        tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
-                        tla::MakeShape(rowsThisHead, maskColumnRound));
-                    auto ubMaskTile = GetTile(ubMaskNextTensorTla,
-                        tla::MakeCoord(ubRowOffset, 0),
-                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto gMaskTile =
+                        GetTile(gmMaskTensorTla, tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
+                                tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto ubMaskTile = GetTile(ubMaskNextTensorTla, tla::MakeCoord(ubRowOffset, 0),
+                                              tla::MakeShape(rowsThisHead, maskColumnRound));
                     copyGmToUbMask(ubMaskTile, gMaskTile);
                     groupRow += rowsThisHead;
                     ubRowOffset += rowsThisHead;
@@ -635,12 +601,11 @@ public:
                     uint32_t localS = groupRow % qSBlockSize;
                     uint32_t rowsThisHead = qSBlockSize - localS;
                     rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-                    auto gMaskTile = GetTile(gmMaskTensorTla,
-                        tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
-                        tla::MakeShape(rowsThisHead, maskColumnRound));
-                    auto ubMaskTile = GetTile(ubMaskTensorTla,
-                        tla::MakeCoord(ubRowOffset, 0),
-                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto gMaskTile =
+                        GetTile(gmMaskTensorTla, tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
+                                tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto ubMaskTile = GetTile(ubMaskTensorTla, tla::MakeCoord(ubRowOffset, 0),
+                                              tla::MakeShape(rowsThisHead, maskColumnRound));
                     copyGmToUbMask(ubMaskTile, gMaskTile);
                     groupRow += rowsThisHead;
                     ubRowOffset += rowsThisHead;
@@ -650,18 +615,17 @@ public:
             }
         }
 
-        __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float *lastMaxAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastMaxStartAddr = (__ubuf__ float *)gmUbTensor.GetPhyAddr();
-        __ubuf__ float *lastSumAddr = (__ubuf__ float*) glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowMaxStartAddr = (__ubuf__ float*) lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput *nowSumAddr = (__ubuf__ float*) llUbTensor.GetPhyAddr();
-        __ubuf__ float *expMaxUbAddr = (__ubuf__ float *)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementMask *maskUbAddr = (__ubuf__ ElementMask *)maskUbTensor.GetPhyAddr();
-        __ubuf__ ElementMask *maskNextUbAddr =
-            (__ubuf__ ElementMask *)maskUbTensor[MASK_NEXT_ELEM_OFFSET].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementMask* maskUbAddr = (__ubuf__ ElementMask*)maskUbTensor.GetPhyAddr();
+        __ubuf__ ElementMask* maskNextUbAddr = (__ubuf__ ElementMask*)maskUbTensor[MASK_NEXT_ELEM_OFFSET].GetPhyAddr();
 
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -675,66 +639,66 @@ public:
             if (isFirstKvSTile) {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr,
+                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr,
+                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr,
+                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr,
+                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             }
         } else if (doTriUPreMask) {
             if (isFirstKvSTile) {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
+                        nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
+                        nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                        tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                        tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             }
         } else {
             if (isFirstKvSTile) {
                 if (n > 64) {
                     ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
+                        nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
+                        nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                        tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 } else {
                     ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
+                        tailN, nPadding, scaleValue, 128, blockStride, nRound);
                 }
             }
         }
@@ -748,25 +712,22 @@ public:
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM],
-            ubPLayoutTla, Arch::PositionUB{});
-        auto ubPTensorTlaTile = GetTile(ubPTensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(m, n));
-        auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(
-                lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops, tailM);
+            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
+                                                tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
-    
-private:
+
+  private:
     ElementInput scaleValue;
     AscendC::LocalTensor<ElementInput> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
@@ -778,7 +739,7 @@ private:
     AscendC::LocalTensor<ElementInput> llUbTensor;
     uint32_t subBlockIdx_;
 
-    enum class MAligendTileNum  {
+    enum class MAligendTileNum {
         Zero = 0,
         One = 1,
         Two = 2,
@@ -787,8 +748,11 @@ private:
     };
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMax(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+                       __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+                       uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
+                       uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -811,12 +775,12 @@ private:
         RegTensor<half> vreg_exp_even_f16;
         RegTensor<half> vreg_exp_odd_f16;
         RegTensor<half> vreg_exp_f16;
-        
+
         MaskReg pregCompare;
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
-        
+
         constexpr static CastTrait castTraitZero = {
             RegLayout::ZERO,
             SatMode::SAT,
@@ -838,18 +802,16 @@ private:
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize, srcVreg, pregFull);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
+                                                        pregFull);
             Max(maxTmpVreg, srcVreg, srcVreg_unroll_new, pregFull);
             // [0, 1, 2, 4, 5, .., 63] -> reduce -> [63, 0, 0, .., 0]
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, maxTmpVreg, pregFull);
             StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            newMaxUb, maxUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
@@ -861,38 +823,44 @@ private:
 
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
-            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
-                srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
+                                                                           srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
             Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
-            expSumVreg, expSumVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
-                
+                expSumVreg, expSumVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
                 Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
-                (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
                 Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
-                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16, (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_f16, blockStride, 1, preg_all_b16);
+                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16,
+                   (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ half*&)expUb), vreg_exp_f16,
+                                                                             blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMax64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMax64(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+                         __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+                         uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
+                         uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -915,12 +883,12 @@ private:
         RegTensor<half> vreg_exp_even_f16;
         RegTensor<half> vreg_exp_odd_f16;
         RegTensor<half> vreg_exp_f16;
-        
+
         MaskReg pregCompare;
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
-        
+
         constexpr static CastTrait castTraitZero = {
             RegLayout::ZERO,
             SatMode::SAT,
@@ -940,14 +908,12 @@ private:
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             Select(srcVreg_unroll_new, srcVreg, minVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, srcVreg_unroll_new, pregFull);
             StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            newMaxUb, maxUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
@@ -962,29 +928,34 @@ private:
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
-            expSumVreg, expEvenVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
-                
+                expSumVreg, expEvenVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMask(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMaxMask(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+                           __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+                           __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding,
+                           ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1017,7 +988,7 @@ private:
         RegTensor<half> vreg_exp_even_f16;
         RegTensor<half> vreg_exp_odd_f16;
         RegTensor<half> vreg_exp_f16;
-        
+
         MaskReg pregCompare;
         MaskReg pregCompare_unroll;
         MaskReg pregFull1 = CreateMask<uint8_t, MaskPattern::ALL>();
@@ -1025,7 +996,7 @@ private:
         MaskReg pregTailN = UpdateMask<float>(tailN);
         // MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
         MaskReg preg_all_b16 = CreateMask<half, MaskPattern::ALL>();
-        
+
         constexpr static CastTrait castTraitZero = {
             RegLayout::ZERO,
             SatMode::SAT,
@@ -1044,7 +1015,7 @@ private:
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
-            
+
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             // mask
@@ -1053,7 +1024,7 @@ private:
             // 3. interleave  uint16_t 将128个数切分成前一半和后一半
             // 4. 分别 cast 成 64个元素的 fp32 mask 和 源数据对应
             LoadAlign<ElementMask, LoadDist::DIST_US_B8>(maskVreg, maskUb + i * 128);
-            
+
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Interleave(maskVregb16_new, maskVregb16_unroll_new, maskVregb16, maskVregb16);
             Cast<float, half, castTraitZero>(maskVregb32, maskVregb16_new, pregFull);
@@ -1064,17 +1035,15 @@ private:
             Select(srcVreg_mask_unroll, srcVreg_unroll, minVreg, pregCompare_unroll);
 
             Select(srcVreg_unroll_new, srcVreg_mask_unroll, minVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize, srcVreg_mask, pregFull);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_mask, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
+                                                        pregFull);
             Max(maxTmpVreg, srcVreg_mask, srcVreg_unroll_new, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, maxTmpVreg, pregFull);
             StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            newMaxUb, maxUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
@@ -1086,39 +1055,46 @@ private:
 
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
-            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
-                srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
+                                                                           srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
 
             Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
-            expSumVreg, expSumVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
-                
+                expSumVreg, expSumVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
                 Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
-                (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
                 Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
-                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16, (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_f16, blockStride, 1, preg_all_b16);
+                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16,
+                   (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ half*&)expUb), vreg_exp_f16,
+                                                                             blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMaxMaskInvert(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb,
+                                 __ubuf__ ElementS* newMaxUbStart, __ubuf__ ElementS* LastMaxUbStart,
+                                 __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, __ubuf__ ElementMask* maskUb,
+                                 uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
+                                 uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1152,10 +1128,10 @@ private:
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<half, MaskPattern::ALL>();
-        constexpr static CastTrait castTraitZero = {
-            RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
-        constexpr static CastTrait castTraitOne = {
-            RegLayout::ONE, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitZero = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitOne = {RegLayout::ONE, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                   AscendC::RoundMode::CAST_ROUND};
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
@@ -1173,8 +1149,8 @@ private:
             Select(srcVreg_mask_unroll, minVreg, srcVreg_unroll, pregCompare_unroll);
             Select(srcVreg_unroll_new, srcVreg_mask_unroll, minVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_mask, pregFull);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
+                                                        pregFull);
             Max(maxTmpVreg, srcVreg_mask, srcVreg_unroll_new, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, maxTmpVreg, pregFull);
@@ -1191,38 +1167,43 @@ private:
         LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
-            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
-                srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
+                                                                           srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
             Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 expSumVreg, expSumVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
                 Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
-                    (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
                 Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16,
-                    (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_f16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ half*&)expUb), vreg_exp_f16,
+                                                                             blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext(
+        __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+        __ubuf__ ElementMask* maskPreUb, __ubuf__ ElementMask* maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
+        uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1256,10 +1237,10 @@ private:
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<half, MaskPattern::ALL>();
-        constexpr static CastTrait castTraitZero = {
-            RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
-        constexpr static CastTrait castTraitOne = {
-            RegLayout::ONE, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitZero = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitOne = {RegLayout::ONE, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                   AscendC::RoundMode::CAST_ROUND};
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
@@ -1286,8 +1267,8 @@ private:
             Select(srcVreg_unroll, srcVreg_mask_unroll, minVreg, pregCompare_unroll);
             Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg, pregFull);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
+                                                        pregFull);
             Max(maxTmpVreg, srcVreg, srcVreg_unroll_new, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, maxTmpVreg, pregFull);
@@ -1304,38 +1285,44 @@ private:
         LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
-            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
-                srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
+                                                                           srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
             Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 expSumVreg, expSumVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
                 Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
-                    (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
                 Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
                 Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16,
-                    (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_f16, blockStride, 1, preg_all_b16);
+                   (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ half*&)expUb), vreg_exp_f16,
+                                                                             blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMask64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMaxMask64(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+                             __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+                             __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
+                             uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride,
+                             uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1363,12 +1350,12 @@ private:
         RegTensor<half> vreg_exp_even_f16;
         RegTensor<half> vreg_exp_odd_f16;
         RegTensor<half> vreg_exp_f16;
-        
+
         MaskReg pregCompare;
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
-        
+
         constexpr static CastTrait castTraitZero = {
             RegLayout::ZERO,
             SatMode::SAT,
@@ -1393,14 +1380,12 @@ private:
             Compares(pregCompare, maskVregb32, static_cast<float>(0), pregFull);
             Select(srcVreg_mask, srcVreg, minVreg, pregCompare);
             Select(srcVreg_unroll_new, srcVreg_mask, minVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(
-                    srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, srcVreg_unroll_new, pregFull);
             StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            newMaxUb, maxUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
@@ -1415,29 +1400,35 @@ private:
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
-            expSumVreg, expEvenVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
-                
+                expSumVreg, expEvenVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void
+    ComputeScaleAndMaxMaskInvert64(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb,
+                                   __ubuf__ ElementS* newMaxUbStart, __ubuf__ ElementS* LastMaxUbStart,
+                                   __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, __ubuf__ ElementMask* maskUb,
+                                   uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
+                                   uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1464,8 +1455,8 @@ private:
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
-        constexpr static CastTrait castTraitZero = {
-            RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitZero = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::CAST_ROUND};
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
@@ -1496,27 +1487,32 @@ private:
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 expSumVreg, expEvenVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext64(
+        __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
+        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
+        __ubuf__ ElementMask* maskPreUb, __ubuf__ ElementMask* maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
+        uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1543,8 +1539,8 @@ private:
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
-        constexpr static CastTrait castTraitZero = {
-            RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        constexpr static CastTrait castTraitZero = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::CAST_ROUND};
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
@@ -1580,28 +1576,33 @@ private:
             ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 expSumVreg, expEvenVreg, pregFull);
-            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                ((__ubuf__ float *&)expSumUb), expSumVreg, expSumUreg, 1);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
             if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                 Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
             } else {
                 Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
                 DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
             }
         }
-        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-            ((__ubuf__ float *&)expSumUb), expSumUreg, 0);
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate, MAligendTileNum mTileNum>
-    __simd_vf__ static inline void ComputeScaleAndMaxDn(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t mRound, uint16_t m, uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, uint16_t S2BaseSize, 
-        uint32_t blockStride, uint32_t repeatStride, __ubuf__ float *expMaxUb, __ubuf__ ElementS *lastExpSumUb)
+    __simd_vf__ static inline void
+    ComputeScaleAndMaxDn(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* LastMaxUbStart,
+                         __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t mRound, uint16_t m,
+                         uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, uint16_t S2BaseSize,
+                         uint32_t blockStride, uint32_t repeatStride, __ubuf__ float* expMaxUb,
+                         __ubuf__ ElementS* lastExpSumUb)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> src0Vreg;
@@ -1621,7 +1622,7 @@ private:
         RegTensor<float> exp2Fp32Vreg;
         RegTensor<float> exp3Fp32Vreg;
         RegTensor<float> exp4Fp32Vreg;
-        
+
         RegTensor<float> max0Vreg;
         RegTensor<float> max1Vreg;
         RegTensor<float> max2Vreg;
@@ -1673,14 +1674,13 @@ private:
         MaskReg pregTailN = UpdateMask<float>(tailN);
         uint32_t sreg_92 = (uint32_t)128ULL;
         MaskReg preg_136 = UpdateMask<uint16_t>(sreg_92);
-        std::conditional_t<AscendC::IsSameType<ElementP, bfloat16_t>::value, 
-                           __ubuf__ bfloat16_t*, 
-                           __ubuf__ half*> x_exp_1 = expUb + (mRound * 4);
-        __ubuf__ float *srcUb0 = srcUb;
-        __ubuf__ float *srcUb1 = srcUb0 + S2BaseSize;
-        __ubuf__ float *srcUb2 = srcUb0 + S2BaseSize * 2;
-        __ubuf__ float *srcUb3 = srcUb0 + S2BaseSize * 3;
-        __ubuf__ float *srcUb4 = srcUb0 + S2BaseSize * (m / 4) * 4;
+        std::conditional_t<AscendC::IsSameType<ElementP, bfloat16_t>::value, __ubuf__ bfloat16_t*, __ubuf__ half*>
+            x_exp_1 = expUb + (mRound * 4);
+        __ubuf__ float* srcUb0 = srcUb;
+        __ubuf__ float* srcUb1 = srcUb0 + S2BaseSize;
+        __ubuf__ float* srcUb2 = srcUb0 + S2BaseSize * 2;
+        __ubuf__ float* srcUb3 = srcUb0 + S2BaseSize * 3;
+        __ubuf__ float* srcUb4 = srcUb0 + S2BaseSize * (m / 4) * 4;
         Duplicate(max0Vreg, MIN_VALUE);
         Duplicate(max1Vreg, MIN_VALUE);
         Duplicate(max2Vreg, MIN_VALUE);
@@ -1714,7 +1714,7 @@ private:
             StoreAlign<float, StoreDist::DIST_NORM_B32>(LastMaxUbStart, max0Vreg, pregTailN);
         }
 
-        StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ float *&)newMaxUb, max0Vreg, pregFull);
+        StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ float*&)newMaxUb, max0Vreg, pregFull);
 
         Duplicate<float, AscendC::MicroAPI::MaskMergeMode::ZEROING, float>(sum0Vreg, 0, pregFull);
         Duplicate<float, AscendC::MicroAPI::MaskMergeMode::ZEROING, float>(sum1Vreg, 0, pregFull);
@@ -1743,9 +1743,11 @@ private:
                 DeInterleave(vreg_x_exp_bf16_pack, vreg_x_exp_bf16_packa, vreg_x_exp_even_bf16, vreg_x_exp_odd_bf16);
                 Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_even_bf16_1, exp1Fp32Vreg, pregFull);
                 Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_odd_bf16_1, exp3Fp32Vreg, pregFull);
-                DeInterleave(vreg_x_exp_bf16_1_pack, vreg_x_exp_bf16_1_packa, vreg_x_exp_even_bf16_1, vreg_x_exp_odd_bf16_1);
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)expUb), vreg_x_exp_bf16_pack, blockStride, 1, preg_136); 
+                DeInterleave(vreg_x_exp_bf16_1_pack, vreg_x_exp_bf16_1_packa, vreg_x_exp_even_bf16_1,
+                             vreg_x_exp_odd_bf16_1);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_x_exp_bf16_pack, blockStride, 1, preg_136);
 
                 if constexpr (mTileNum >= MAligendTileNum::Zero) {
                     Add(sum0Vreg, exp0Fp32Vreg, sum0Vreg, pregTailN);
@@ -1753,8 +1755,9 @@ private:
                 if constexpr (mTileNum >= MAligendTileNum::Two) {
                     Add(sum2Vreg, exp2Fp32Vreg, sum2Vreg, pregTailN);
                 }
-                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ bfloat16_t *&)x_exp_1), vreg_x_exp_bf16_1_pack, blockStride, 1, preg_136);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)x_exp_1), vreg_x_exp_bf16_1_pack, blockStride, 1, preg_136);
                 if constexpr (mTileNum >= MAligendTileNum::One) {
                     Add(sum1Vreg, exp1Fp32Vreg, sum1Vreg, pregTailN);
                 }
@@ -1767,18 +1770,21 @@ private:
                 DeInterleave(vreg_x_exp_f16_pack, vreg_x_exp_f16_packa, vreg_x_exp_even_f16, vreg_x_exp_odd_f16);
                 Cast<half, float, castTraitZero>(vreg_x_exp_even_f16_1, exp1Fp32Vreg, pregFull);
                 Cast<half, float, castTraitZero>(vreg_x_exp_odd_f16_1, exp3Fp32Vreg, pregFull);
-                DeInterleave(vreg_x_exp_f16_1_pack, vreg_x_exp_f16_1_packa, vreg_x_exp_even_f16_1, vreg_x_exp_odd_f16_1);
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)expUb), vreg_x_exp_f16_pack, blockStride, 1, preg_136); 
-                
+                DeInterleave(vreg_x_exp_f16_1_pack, vreg_x_exp_f16_1_packa, vreg_x_exp_even_f16_1,
+                             vreg_x_exp_odd_f16_1);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_x_exp_f16_pack, blockStride, 1, preg_136);
+
                 if constexpr (mTileNum >= MAligendTileNum::Zero) {
                     Add(sum0Vreg, exp0Fp32Vreg, sum0Vreg, pregTailN);
                 }
                 if constexpr (mTileNum >= MAligendTileNum::Two) {
                     Add(sum2Vreg, exp2Fp32Vreg, sum2Vreg, pregTailN);
                 }
-                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                    ((__ubuf__ half *&)x_exp_1), vreg_x_exp_f16_1_pack, blockStride, 1, preg_136);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)x_exp_1), vreg_x_exp_f16_1_pack, blockStride, 1, preg_136);
                 if constexpr (mTileNum >= MAligendTileNum::One) {
                     Add(sum1Vreg, exp1Fp32Vreg, sum1Vreg, pregTailN);
                 }
@@ -1803,16 +1809,19 @@ private:
                 FusedExpSub(exp1Fp32Vreg, src1Fp32Vreg, max0Vreg, pregTailN);
                 FusedExpSub(exp2Fp32Vreg, src2Fp32Vreg, max0Vreg, pregTailN);
                 FusedExpSub(exp3Fp32Vreg, src3Fp32Vreg, max0Vreg, pregTailN);
-                
+
                 if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
                     Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_even_bf16, exp0Fp32Vreg, pregFull);
                     Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_odd_bf16, exp2Fp32Vreg, pregFull);
-                    DeInterleave(vreg_x_exp_bf16_pack, vreg_x_exp_bf16_packa, vreg_x_exp_even_bf16, vreg_x_exp_odd_bf16);
+                    DeInterleave(vreg_x_exp_bf16_pack, vreg_x_exp_bf16_packa, vreg_x_exp_even_bf16,
+                                 vreg_x_exp_odd_bf16);
                     Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_even_bf16_1, exp1Fp32Vreg, pregFull);
                     Cast<bfloat16_t, float, castTraitZero>(vreg_x_exp_odd_bf16_1, exp3Fp32Vreg, pregFull);
-                    DeInterleave(vreg_x_exp_bf16_1_pack, vreg_x_exp_bf16_1_packa, vreg_x_exp_even_bf16_1, vreg_x_exp_odd_bf16_1);
-                    StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                        ((__ubuf__ bfloat16_t *&)expUb), vreg_x_exp_bf16_pack, blockStride, 1, preg_136); 
+                    DeInterleave(vreg_x_exp_bf16_1_pack, vreg_x_exp_bf16_1_packa, vreg_x_exp_even_bf16_1,
+                                 vreg_x_exp_odd_bf16_1);
+                    StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                               AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                        ((__ubuf__ bfloat16_t*&)expUb), vreg_x_exp_bf16_pack, blockStride, 1, preg_136);
 
                     if constexpr (mTileNum > MAligendTileNum::Zero) {
                         Add(sum0Vreg, exp0Fp32Vreg, sum0Vreg, pregTailN);
@@ -1820,8 +1829,9 @@ private:
                     if constexpr (mTileNum > MAligendTileNum::Two) {
                         Add(sum2Vreg, exp2Fp32Vreg, sum2Vreg, pregTailN);
                     }
-                    StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                        ((__ubuf__ bfloat16_t *&)x_exp_1), vreg_x_exp_bf16_1_pack, blockStride, 1, preg_136);
+                    StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                               AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                        ((__ubuf__ bfloat16_t*&)x_exp_1), vreg_x_exp_bf16_1_pack, blockStride, 1, preg_136);
                     if constexpr (mTileNum > MAligendTileNum::One) {
                         Add(sum1Vreg, exp1Fp32Vreg, sum1Vreg, pregTailN);
                     }
@@ -1831,9 +1841,11 @@ private:
                     DeInterleave(vreg_x_exp_f16_pack, vreg_x_exp_f16_packa, vreg_x_exp_even_f16, vreg_x_exp_odd_f16);
                     Cast<half, float, castTraitZero>(vreg_x_exp_even_f16_1, exp1Fp32Vreg, pregFull);
                     Cast<half, float, castTraitZero>(vreg_x_exp_odd_f16_1, exp3Fp32Vreg, pregFull);
-                    DeInterleave(vreg_x_exp_f16_1_pack, vreg_x_exp_f16_1_packa, vreg_x_exp_even_f16_1, vreg_x_exp_odd_f16_1);
-                    StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                        ((__ubuf__ half *&)expUb), vreg_x_exp_f16_pack, blockStride, 1, preg_136); 
+                    DeInterleave(vreg_x_exp_f16_1_pack, vreg_x_exp_f16_1_packa, vreg_x_exp_even_f16_1,
+                                 vreg_x_exp_odd_f16_1);
+                    StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                               AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                        ((__ubuf__ half*&)expUb), vreg_x_exp_f16_pack, blockStride, 1, preg_136);
 
                     if constexpr (mTileNum > MAligendTileNum::Zero) {
                         Add(sum0Vreg, exp0Fp32Vreg, sum0Vreg, pregTailN);
@@ -1841,8 +1853,9 @@ private:
                     if constexpr (mTileNum > MAligendTileNum::Two) {
                         Add(sum2Vreg, exp2Fp32Vreg, sum2Vreg, pregTailN);
                     }
-                    StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
-                        ((__ubuf__ half *&)x_exp_1), vreg_x_exp_f16_1_pack, blockStride, 1, preg_136);
+                    StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                               AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                        ((__ubuf__ half*&)x_exp_1), vreg_x_exp_f16_1_pack, blockStride, 1, preg_136);
                     if constexpr (mTileNum > MAligendTileNum::One) {
                         Add(sum1Vreg, exp1Fp32Vreg, sum1Vreg, pregTailN);
                     }
@@ -1856,14 +1869,13 @@ private:
             Add(updateExpSumVreg, updateExpSumVreg, sum0Vreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(lastExpSumUb, updateExpSumVreg, pregFull);
         }
-        StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>(
-            (__ubuf__ float *&)expSumUb, sum0Vreg, pregFull);
+        StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ float*&)expSumUb, sum0Vreg, pregFull);
     }
 
     template <typename ElementS>
-    __simd_vf__ static inline void CastExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *maxUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementS *nowMaxUb,
-        uint16_t mLoops, uint32_t tailM)
+    __simd_vf__ static inline void CastExpSumAndExpMax(__ubuf__ float* sumUb, __ubuf__ float* maxUb,
+                                                       __ubuf__ ElementS* expSumUb, __ubuf__ ElementS* nowMaxUb,
+                                                       uint16_t mLoops, uint32_t tailM)
     {
         using namespace AscendC::MicroAPI;
 
@@ -1908,9 +1920,9 @@ private:
     }
 
     template <typename ElementS>
-    __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *expMaxUb,
-        __ubuf__ float *maxUb, __ubuf__ ElementS *expSumUb, __ubuf__ ElementS *nowMaxUb,
-        uint16_t mLoops, uint32_t tailM)
+    __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float* sumUb, __ubuf__ float* expMaxUb,
+                                                         __ubuf__ float* maxUb, __ubuf__ ElementS* expSumUb,
+                                                         __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM)
     {
         using namespace AscendC::MicroAPI;
 
@@ -1949,6 +1961,6 @@ private:
         StoreAlign<float, StoreDist::DIST_NORM_B32>(sumUb, updateExpSumVreg, pregFull);
     }
 };
-}
+} // namespace Catlass::Epilogue::Block
 
-#endif  // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HPP_T
+#endif // EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HPP_T

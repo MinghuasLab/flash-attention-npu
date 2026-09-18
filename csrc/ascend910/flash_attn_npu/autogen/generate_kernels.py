@@ -43,7 +43,7 @@ DTYPE_MAP = {
 # layout key -> (display name, fwd IS_TND bool token, fag layout enum token)
 LAYOUTS = [
     ("bsnd", "BSND", "false", "BSND"),
-    ("tnd",  "TND",  "true",  "TND"),
+    ("tnd", "TND", "true", "TND"),
 ]
 
 # headdim values of the FAGGeneral runtime switch (v2 fag variant axis)
@@ -67,8 +67,7 @@ def _feature_suffix(*features: tuple) -> str:
 def _header(family_desc: str, dtype_key: str, layout_display: Optional[str]) -> str:
     layout_note = f", {layout_display} variant" if layout_display else " variant (always TND)"
     return (
-        PRELUDE
-        + f"// v2 {family_desc}{layout_note}. One explicit instantiation per\n"
+        PRELUDE + f"// v2 {family_desc}{layout_note}. One explicit instantiation per\n"
         "// translation unit so the kernel templates compile in parallel across\n"
         "// cores; head_dim is a runtime axis (switch inside the impl), not a\n"
         "// template parameter, so it is not a generation axis.\n\n"
@@ -93,7 +92,9 @@ def fwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
     )
 
 
-def fwd_combo(dtype_key: str, layout: tuple, softcap: int, return_softmax: int, dropout: int) -> "Kernel":
+def fwd_combo(
+    dtype_key: str, layout: tuple, softcap: int, return_softmax: int, dropout: int
+) -> "Kernel":
     ctype, _ = DTYPE_MAP[dtype_key]
     layout_key, display, _, _ = layout
     layout_token = f"FaiKenel::inputLayout::{display}"
@@ -105,8 +106,7 @@ def fwd_combo(dtype_key: str, layout: tuple, softcap: int, return_softmax: int, 
     )
     symbol = f"fwd_combo_{dtype_key}_{layout_key}{suffix}"
     body = (
-        PRELUDE
-        + f"// v2 forward FAInfer combo, {display} variant, softcap={sc} "
+        PRELUDE + f"// v2 forward FAInfer combo, {display} variant, softcap={sc} "
         f"return_softmax={rs} dropout={do}.\n"
         + "// Fixes the (softcap, return_softmax, dropout) triple at compile time and\n"
         + "// switches over paged x mask (6 FAInfer instantiations) so the 48 variants\n"
@@ -170,7 +170,8 @@ def fag_kernel_variant(dtype_key: str, layout: tuple, headdim: int, softcap: int
         + "            FAG_BOOL_SWITCH(a.deterministic, IsDtm, {\n"
         + "                FAG_BOOL_SWITCH(a.has_dropout, IsDrop, {\n"
         + f"                    FAG_KERNEL_LAUNCH({ctype}, {enum}, Aligned{headdim}, "
-        + "IsAttenMask, IsDrop, IsDtm, " + f"{sc});\n"
+        + "IsAttenMask, IsDrop, IsDtm, "
+        + f"{sc});\n"
         + "                });\n"
         + "            });\n"
         + "        });\n"

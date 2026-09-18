@@ -19,7 +19,7 @@ constexpr uint32_t FP32_BYTES = 4;
 constexpr uint32_t FP32_BLOCK_NUMS = 8;
 constexpr uint32_t BASIC_BLOCK_MULTIPLE = 15;
 constexpr uint32_t SHAPE_INFO = 32;
-constexpr uint32_t BYTE_BLOCK = 32;     // 32 B in block
+constexpr uint32_t BYTE_BLOCK = 32; // 32 B in block
 constexpr int64_t GM_ALIGN = 512;
 constexpr uint32_t MUL_CORE_SYNC_BUFFER = 64 * 1024;
 constexpr uint32_t BOOL_BLOCK_NUMS = 32;
@@ -67,8 +67,8 @@ struct FAGInfo {
     int64_t vHeadDim = 0;
     int64_t window_size_left;
     int64_t window_size_right;
-    int32_t *qSeqlenList{nullptr};
-    int32_t *kvSeqlenList{nullptr};
+    int32_t* qSeqlenList{nullptr};
+    int32_t* kvSeqlenList{nullptr};
     bool isDeterministic = false;
     int64_t alibiSlopesBatchStride = 0;
 };

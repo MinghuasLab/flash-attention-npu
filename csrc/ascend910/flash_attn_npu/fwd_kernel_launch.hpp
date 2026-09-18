@@ -31,14 +31,13 @@
 // RETURN_SOFTMAX and DROPOUT are the forward's optional epilogue / dropout
 // template axes. All runtime arguments are read from the FwdLaunchArgs `a`.
 // Preserve upstream ALiBi and append-KV arguments in each split compile unit.
-#define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT) \
-    FWD_BOOL_SWITCH(a.alibiSlopesDevice != nullptr, HasAlibi, {                            \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT,                        \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT, HasAlibi> \
-        <<<a.blockDim, nullptr, a.aclStream>>>(                                              \
-            a.fftsAddr, a.qDevice, a.kDevice, a.vDevice, a.maskDevice, a.blockTableDevice,   \
-            a.oDevice, a.softmaxLseDevice, a.qSeqDevice, a.kvSeqDevice,                      \
-            a.workspaceDevice, a.tilingDevice, a.alibiSlopesDevice, a.kNewDevice, a.vNewDevice); \
+#define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT)                           \
+    FWD_BOOL_SWITCH(a.alibiSlopesDevice != nullptr, HasAlibi, {                                                        \
+        SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY,       \
+                           SOFTCAP, RETURN_SOFTMAX, DROPOUT, HasAlibi><<<a.blockDim, nullptr, a.aclStream>>>(          \
+            a.fftsAddr, a.qDevice, a.kDevice, a.vDevice, a.maskDevice, a.blockTableDevice, a.oDevice,                  \
+            a.softmaxLseDevice, a.qSeqDevice, a.kvSeqDevice, a.workspaceDevice, a.tilingDevice, a.alibiSlopesDevice,   \
+            a.kNewDevice, a.vNewDevice);                                                                               \
     });
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
@@ -47,30 +46,30 @@
 // (no lambda/return) to match the statement-style macros already used here;
 // both branches are compiled, so the set of FAInfer instantiations is
 // unchanged.
-#define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
-    do {                                                   \
-        if (COND) {                                        \
-            constexpr bool CONST_NAME = true;              \
-            __VA_ARGS__                                    \
-        } else {                                           \
-            constexpr bool CONST_NAME = false;             \
-            __VA_ARGS__                                    \
-        }                                                  \
+#define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)                                                                         \
+    do {                                                                                                               \
+        if (COND) {                                                                                                    \
+            constexpr bool CONST_NAME = true;                                                                          \
+            __VA_ARGS__                                                                                                \
+        } else {                                                                                                       \
+            constexpr bool CONST_NAME = false;                                                                         \
+            __VA_ARGS__                                                                                                \
+        }                                                                                                              \
     } while (0)
 
 // Three-way mask selection with the original precedence: local (MASK_SWA) >
 // causal (MASK_CAUSAL) > NO_MASK. Fixes the chosen enum as a named constexpr
 // so the launch reads MaskType instead of a bare enumerator token.
-#define FWD_MASK_SWITCH(IS_LOCAL, IS_CAUSAL, CONST_NAME, ...)             \
-    do {                                                                  \
-        if (IS_LOCAL) {                                                   \
-            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_SWA;     \
-            __VA_ARGS__                                                   \
-        } else if (IS_CAUSAL) {                                           \
-            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_CAUSAL;  \
-            __VA_ARGS__                                                   \
-        } else {                                                          \
-            constexpr auto CONST_NAME = FaiKenel::MaskType::NO_MASK;      \
-            __VA_ARGS__                                                   \
-        }                                                                 \
+#define FWD_MASK_SWITCH(IS_LOCAL, IS_CAUSAL, CONST_NAME, ...)                                                          \
+    do {                                                                                                               \
+        if (IS_LOCAL) {                                                                                                \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_SWA;                                                  \
+            __VA_ARGS__                                                                                                \
+        } else if (IS_CAUSAL) {                                                                                        \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::MASK_CAUSAL;                                               \
+            __VA_ARGS__                                                                                                \
+        } else {                                                                                                       \
+            constexpr auto CONST_NAME = FaiKenel::MaskType::NO_MASK;                                                   \
+            __VA_ARGS__                                                                                                \
+        }                                                                                                              \
     } while (0)

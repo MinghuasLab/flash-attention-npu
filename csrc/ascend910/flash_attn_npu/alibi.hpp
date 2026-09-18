@@ -6,28 +6,26 @@
 #ifndef COMMON_ALIBI_BIAS_HPP
 #define COMMON_ALIBI_BIAS_HPP
 
-__aicore__ inline void RescaleBiasRow(AscendC::LocalTensor<float> &workUb,
-                                      float slope, float preSlope, int32_t count)
+__aicore__ inline void RescaleBiasRow(AscendC::LocalTensor<float>& workUb, float slope, float preSlope, int32_t count)
 {
-    AscendC::Muls<float>(workUb, workUb, slope / preSlope, count);  
+    AscendC::Muls<float>(workUb, workUb, slope / preSlope, count);
     AscendC::PipeBarrier<PIPE_V>();
 }
 
-__aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb, 
-    int64_t baseColIdx, float slope, int32_t count, 
-    AscendC::TEventID eventIdSToV, AscendC::TEventID eventIdVToS)
+__aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float>& workUb, int64_t baseColIdx, float slope,
+                                         int32_t count, AscendC::TEventID eventIdSToV, AscendC::TEventID eventIdVToS)
 {
     AscendC::SetFlag<AscendC::HardEvent::V_S>(eventIdVToS);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(eventIdVToS);
 
-    int n = 8;  // FLOAT_PER_DATABLOCK，only use scalar operation for the first datablock
+    int n = 8; // FLOAT_PER_DATABLOCK，only use scalar operation for the first datablock
     for (int i = 0; i < n; i++) {
         workUb.SetValue(i, static_cast<float>(baseColIdx + i) * slope);
     }
 
-    AscendC::SetFlag<AscendC::HardEvent::S_V>(eventIdSToV);  
+    AscendC::SetFlag<AscendC::HardEvent::S_V>(eventIdSToV);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(eventIdSToV);
-    
+
     while (n < count) {
         if (2 * n < count) {
             AscendC::Adds(workUb[n], workUb, static_cast<float>(n) * slope, n);
@@ -39,29 +37,25 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
             break;
         }
     }
-    
+
     if (baseColIdx < 0) {
-        AscendC::Abs(workUb, workUb,
-            AscendC::Std::min(-baseColIdx, static_cast<int64_t>(count)));
+        AscendC::Abs(workUb, workUb, AscendC::Std::min(-baseColIdx, static_cast<int64_t>(count)));
         AscendC::PipeBarrier<PIPE_V>();
     }
 }
 
-__aicore__ inline void SubBiasToScoreRow(AscendC::LocalTensor<float> &scoreUb, uint32_t rowOff,
-                                    AscendC::LocalTensor<float> &workUb, int32_t count)
+__aicore__ inline void SubBiasToScoreRow(AscendC::LocalTensor<float>& scoreUb, uint32_t rowOff,
+                                         AscendC::LocalTensor<float>& workUb, int32_t count)
 {
     AscendC::Sub<float>(scoreUb[rowOff], scoreUb[rowOff], workUb, count);
     AscendC::PipeBarrier<PIPE_V>();
 }
 
-__aicore__ inline void ApplyAlibi(
-    AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
-    uint32_t rowStride, uint32_t columnNum,
-    int64_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qSBlockBaseIdx, 
-    int64_t qNBlockBaseIdx, int64_t alibiDiffS, 
-    AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
-    AscendC::LocalTensor<float> &workUb, int64_t kvSStartIdx)
+__aicore__ inline void ApplyAlibi(AscendC::LocalTensor<float>& scoreUb, uint32_t scoreOffset, uint32_t rowStride,
+                                  uint32_t columnNum, int64_t absRowStart, uint32_t rowNumCurLoop, uint32_t qSBlockSize,
+                                  int64_t qSBlockBaseIdx, int64_t qNBlockBaseIdx, int64_t alibiDiffS,
+                                  AscendC::GlobalTensor<float>& slopesGm, int64_t slopesBatchOffset,
+                                  AscendC::LocalTensor<float>& workUb, int64_t kvSStartIdx)
 {
     if (rowNumCurLoop == 0 || columnNum == 0) {
         return;

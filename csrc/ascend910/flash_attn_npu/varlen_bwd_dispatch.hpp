@@ -24,25 +24,25 @@ struct VarlenBwdLaunchArgs {
     bool is_causal;
     bool is_softcap;
     bool has_alibi;
-    uint8_t *qDevice;
-    uint8_t *kDevice;
-    uint8_t *vDevice;
-    uint8_t *dOutDevice;
-    uint8_t *attenMaskDevice;   // may be nullptr when is_causal is false
-    uint8_t *softMaxLseDevice;
-    uint8_t *outDevice;
-    uint8_t *cuSeqQlenDevice;
-    uint8_t *cuSeqKvlenDevice;
-    uint8_t *dqDevice;
-    uint8_t *dkDevice;
-    uint8_t *dvDevice;
-    uint8_t *alibiSlopesDevice;
-    uint8_t *workspaceDevice;
-    uint8_t *tilingDevice;
+    uint8_t* qDevice;
+    uint8_t* kDevice;
+    uint8_t* vDevice;
+    uint8_t* dOutDevice;
+    uint8_t* attenMaskDevice; // may be nullptr when is_causal is false
+    uint8_t* softMaxLseDevice;
+    uint8_t* outDevice;
+    uint8_t* cuSeqQlenDevice;
+    uint8_t* cuSeqKvlenDevice;
+    uint8_t* dqDevice;
+    uint8_t* dkDevice;
+    uint8_t* dvDevice;
+    uint8_t* alibiSlopesDevice;
+    uint8_t* workspaceDevice;
+    uint8_t* tilingDevice;
 };
 
 // Per-dtype implementation, defined in autogen/varlen_bwd_dispatch_<dtype>.cpp.
 // Each TU instantiates only its dtype's FAGVarlenOpt variants (causal / no-mask,
 // plus the dump variant). (Always TND layout, so no layout axis is generated.)
 template <typename DType>
-void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a);
+void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs& a);

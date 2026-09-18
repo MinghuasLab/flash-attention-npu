@@ -11,30 +11,15 @@
 #include "runtime/rt_ffts.h"
 #include "fag_general_dispatch.hpp"
 
-std::vector<at::Tensor> launch_fag_general(
-    const at::Tensor &dout,
-    const at::Tensor &q,
-    const at::Tensor &k,
-    const at::Tensor &v,
-    const at::Tensor &out,
-    const at::Tensor &softmax_lse,
-    at::Tensor &dq,
-    at::Tensor &dk,
-    at::Tensor &dv,
-    const std::optional<at::Tensor> &cu_seqlens_q,
-    const std::optional<at::Tensor> &cu_seqlens_k,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
-    float softmax_scale,
-    float softcap,
-    bool is_causal,
-    int64_t window_size_left,
-    int64_t window_size_right,
-    bool deterministic,
-    float p_dropout,
-    const std::optional<at::Tensor> &rng_state,
-    uint8_t *alibi_slopes_ptr,           
-    int64_t alibi_slopes_batch_stride)
+std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
+                                           const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,
+                                           at::Tensor& dq, at::Tensor& dk, at::Tensor& dv,
+                                           const std::optional<at::Tensor>& cu_seqlens_q,
+                                           const std::optional<at::Tensor>& cu_seqlens_k, int64_t max_seqlen_q,
+                                           int64_t max_seqlen_k, float softmax_scale, float softcap, bool is_causal,
+                                           int64_t window_size_left, int64_t window_size_right, bool deterministic,
+                                           float p_dropout, const std::optional<at::Tensor>& rng_state,
+                                           uint8_t* alibi_slopes_ptr, int64_t alibi_slopes_batch_stride)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -60,8 +45,8 @@ std::vector<at::Tensor> launch_fag_general(
     const int64_t expected_dim = is_varlen_q ? 3 : 4;
     TORCH_CHECK(q.dim() == expected_dim && k.dim() == expected_dim && v.dim() == expected_dim &&
                     dout.dim() == expected_dim && out.dim() == expected_dim,
-                "launch_fag_general: q/k/v/dout/out must be ", expected_dim, "-D (",
-                (is_varlen_q ? "TND" : "BSND"), ")");
+                "launch_fag_general: q/k/v/dout/out must be ", expected_dim, "-D (", (is_varlen_q ? "TND" : "BSND"),
+                ")");
     TORCH_CHECK(dout_sizes == out_sizes, "launch_fag_general: out and dout must have the same shape");
     TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
                 "launch_fag_general: dq/dk/dv must match q/k/v shapes");
@@ -82,12 +67,10 @@ std::vector<at::Tensor> launch_fag_general(
     TORCH_CHECK(qsizes == dout_sizes, "launch_fag_general: q and dout must have the same shape");
     TORCH_CHECK(ksizes == vsizes, "launch_fag_general: k and v must have the same shape");
     if (is_varlen_q) {
-        TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k,
-                    "launch_fag_general: v nheads_k must match k");
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k, "launch_fag_general: v nheads_k must match k");
     } else {
         TORCH_CHECK(qsizes[0] == ksizes[0], "launch_fag_general: q and k must share the same batch size");
-        TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k,
-                    "launch_fag_general: v nheads_k must match k");
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "launch_fag_general: v nheads_k must match k");
     }
     uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
@@ -95,7 +78,7 @@ std::vector<at::Tensor> launch_fag_general(
     uint32_t tilingSize = sizeof(FAGTilingData);
     at::Tensor tiling_cpu_tensor = at::empty({static_cast<long>(tilingSize)}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
-    
+
     bool has_softcap = (softcap > 0.0f);
     if (has_softcap) {
         fagInfo.scaleValue = softmax_scale / softcap;
@@ -149,8 +132,8 @@ std::vector<at::Tensor> launch_fag_general(
     if (is_varlen_q) {
         cu_seqlens_q_cpu_for_tiling = cu_seqlens_q_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
         cu_seqlens_k_cpu_for_tiling = cu_seqlens_k_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        fagInfo.qSeqlenList = static_cast<int32_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
-        fagInfo.kvSeqlenList = static_cast<int32_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
+        fagInfo.qSeqlenList = static_cast<int32_t*>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
+        fagInfo.kvSeqlenList = static_cast<int32_t*>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
     }
 
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
@@ -172,25 +155,24 @@ std::vector<at::Tensor> launch_fag_general(
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
         const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
-        mask_gpu_tensor = at::triu(
-            at::ones({mask_dim, mask_dim}, at::device(at::kPrivateUse1).dtype(at::kByte)), 1);
+        mask_gpu_tensor = at::triu(at::ones({mask_dim, mask_dim}, at::device(at::kPrivateUse1).dtype(at::kByte)), 1);
     }
 
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
     rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
-    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.storage().data()));
-    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.storage().data()));
-    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.storage().data()));
-    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
-    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
-    uint8_t *attenMaskDevice = nullptr;
+    auto qDevice = static_cast<uint8_t*>(const_cast<void*>(q.storage().data()));
+    auto kDevice = static_cast<uint8_t*>(const_cast<void*>(k.storage().data()));
+    auto vDevice = static_cast<uint8_t*>(const_cast<void*>(v.storage().data()));
+    auto outDevice = static_cast<uint8_t*>(const_cast<void*>(out.storage().data()));
+    auto dOutDevice = static_cast<uint8_t*>(const_cast<void*>(dout.storage().data()));
+    uint8_t* attenMaskDevice = nullptr;
     if (mask_gpu_tensor.defined()) {
-        attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
+        attenMaskDevice = static_cast<uint8_t*>(const_cast<void*>(mask_gpu_tensor.storage().data()));
     }
 
     at::Tensor softmax_lse_kernel = softmax_lse;
-        if (!is_varlen_q) {
+    if (!is_varlen_q) {
         TORCH_CHECK(softmax_lse.dim() == 3, "launch_fag_general: softmax_lse for BSND must be a 3D tensor.");
         TORCH_CHECK(softmax_lse.size(1) == nheads && softmax_lse.size(2) == max_seqlen_q,
                     "launch_fag_general: softmax_lse must be BNS in BSND mode.");
@@ -206,23 +188,23 @@ std::vector<at::Tensor> launch_fag_general(
             softmax_lse_kernel = softmax_lse.contiguous();
         }
     }
-    auto softMaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_lse_kernel.storage().data()));
+    auto softMaxLseDevice = static_cast<uint8_t*>(const_cast<void*>(softmax_lse_kernel.storage().data()));
 
-    auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
-    auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));
-    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.storage().data()));
-    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.storage().data()));
-    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.storage().data()));
+    auto workspaceDevice = static_cast<uint8_t*>(const_cast<void*>(workspace_tensor.storage().data()));
+    auto tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.storage().data()));
+    auto dqDevice = static_cast<uint8_t*>(const_cast<void*>(dq.storage().data()));
+    auto dkDevice = static_cast<uint8_t*>(const_cast<void*>(dk.storage().data()));
+    auto dvDevice = static_cast<uint8_t*>(const_cast<void*>(dv.storage().data()));
 
-    uint8_t *cuSeqQlenDevice = nullptr;
-    uint8_t *cuSeqKvlenDevice = nullptr;
+    uint8_t* cuSeqQlenDevice = nullptr;
+    uint8_t* cuSeqKvlenDevice = nullptr;
     at::Tensor seqlenq_gpu_tensor;
     at::Tensor seqlenk_gpu_tensor;
     if (is_varlen_q) {
         seqlenq_gpu_tensor = cu_seqlens_q_tensor.slice(0, 1, cu_seqlens_q_tensor.size(0)).contiguous();
         seqlenk_gpu_tensor = cu_seqlens_k_tensor.slice(0, 1, cu_seqlens_k_tensor.size(0)).contiguous();
-        cuSeqQlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenq_gpu_tensor.data_ptr()));
-        cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.data_ptr()));
+        cuSeqQlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenq_gpu_tensor.data_ptr()));
+        cuSeqKvlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenk_gpu_tensor.data_ptr()));
     }
 
     // Regenerate the dropout bit-mask from the forward's rng_state (seed,
@@ -232,12 +214,11 @@ std::vector<at::Tensor> launch_fag_general(
     // element-wise as the forward.
     at::Tensor drop_mask_npu_tensor;
     if (has_dropout) {
-        TORCH_CHECK(rng_state.has_value(),
-                    "launch_fag_general: rng_state must be provided when p_dropout > 0.");
-        const at::Tensor &rng_state_tensor = rng_state.value();
+        TORCH_CHECK(rng_state.has_value(), "launch_fag_general: rng_state must be provided when p_dropout > 0.");
+        const at::Tensor& rng_state_tensor = rng_state.value();
         TORCH_CHECK(rng_state_tensor.is_cpu() && rng_state_tensor.numel() == 2,
                     "launch_fag_general: rng_state must be a CPU tensor of 2 int64 (seed, offset).");
-        const uint64_t *rng_state_ptr = reinterpret_cast<const uint64_t *>(rng_state_tensor.data_ptr());
+        const uint64_t* rng_state_ptr = reinterpret_cast<const uint64_t*>(rng_state_tensor.data_ptr());
         int64_t drop_mask_bit_num =
             static_cast<int64_t>(batch_size) * nheads * max_seqlen_q * ((max_seqlen_k + 7) / 8 * 8);
         drop_mask_npu_tensor = at_npu::native::npu_dropout_gen_mask(
@@ -258,7 +239,7 @@ std::vector<at::Tensor> launch_fag_general(
     gen_args.is_softcap = has_softcap;
     gen_args.has_dropout = has_dropout;
     gen_args.dropMaskDevice =
-        has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr;
+        has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr;
     gen_args.has_alibi = has_alibi;
     gen_args.alibiSlopesDevice = alibi_slopes_ptr;
     gen_args.deterministic = deterministic;

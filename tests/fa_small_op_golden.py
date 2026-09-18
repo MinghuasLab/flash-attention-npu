@@ -63,9 +63,7 @@ def _resolve_atten_mask(q, k, atten_mask, is_causal, window_size_left, window_si
         return atten_mask
     seq_q = q.shape[2]
     seq_k = k.shape[2]
-    return make_window_atten_mask(
-        seq_q, seq_k, is_causal, window_size_left, window_size_right
-    )
+    return make_window_atten_mask(seq_q, seq_k, is_causal, window_size_left, window_size_right)
 
 
 def tsoftmax_grad(dp, softmax_res):
@@ -92,13 +90,11 @@ def sum_gqa_grad(dk_or_dv, nheads, nheads_k, batch, seq_k, headdim):
     if nheads == nheads_k:
         return dk_or_dv
     g = nheads // nheads_k
-    return (
-        torch.sum(
-            dk_or_dv.reshape(batch, nheads_k, g, seq_k, headdim),
-            dim=2,
-            keepdim=True,
-        ).reshape(batch, nheads_k, seq_k, headdim)
-    )
+    return torch.sum(
+        dk_or_dv.reshape(batch, nheads_k, g, seq_k, headdim),
+        dim=2,
+        keepdim=True,
+    ).reshape(batch, nheads_k, seq_k, headdim)
 
 
 def softmax_res_from_fa_lse_bsnd(

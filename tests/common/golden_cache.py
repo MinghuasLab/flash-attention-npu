@@ -28,7 +28,9 @@ _DEFAULT_CACHE_DIR = "/var/cache/flash-attention-npu/golden_cache"
 _RETRY_HANDLERS: dict[int, Callable[[], bool]] = {}
 
 
-def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]) -> None:
+def register_retry(
+    values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]
+) -> None:
     """Associate cached tensors with a one-shot refresh callback."""
     used = False
 
@@ -80,7 +82,10 @@ def _record_cache_event(event: str, nodeid: str) -> None:
 
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, "1" if default else "0").strip().lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -120,9 +125,7 @@ def input_digest(inputs: Any) -> Any:
 
 
 def _sha256_json(value: Any) -> str:
-    encoded = json.dumps(
-        _json_value(value), sort_keys=True, separators=(",", ":")
-    ).encode()
+    encoded = json.dumps(_json_value(value), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -143,7 +146,10 @@ def _cache_root() -> Path:
 
 def _cache_enabled() -> bool:
     return os.environ.get("GOLDEN_CACHE_MODE", "off").strip().lower() not in {
-        "off", "0", "false", "disabled"
+        "off",
+        "0",
+        "false",
+        "disabled",
     }
 
 
@@ -304,9 +310,7 @@ def get_or_compute_golden(
     common_hash = _sha256_json(
         {"source": case_metadata["source_digest"], "runtime": case_metadata["runtime"]}
     )[:16]
-    seed = _safe_name(
-        str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case")))
-    )
+    seed = _safe_name(str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case"))))
     test_hash = _sha256_json(
         {
             "test_file": nodeid.split("::", 1)[0],
@@ -340,8 +344,7 @@ def get_or_compute_golden(
     values = dict(compute_fn())
     if set(values) != set(value_names):
         raise ValueError(
-            f"computed golden tensors {sorted(values)} do not match "
-            f"expected {value_names}"
+            f"computed golden tensors {sorted(values)} do not match expected {value_names}"
         )
     try:
         with _exclusive_lock(root):

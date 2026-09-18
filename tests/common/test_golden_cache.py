@@ -48,9 +48,7 @@ def test_golden_cache_records_events_outside_worker_stdout(tmp_path, monkeypatch
     get_or_compute_golden(**kwargs)
 
     events = [line.split("\t", 2)[:2] for line in stats_file.read_text().splitlines()]
-    assert [event for event, scope in events if scope == "test"] == [
-        "miss", "write_ok", "hit"
-    ]
+    assert [event for event, scope in events if scope == "test"] == ["miss", "write_ok", "hit"]
 
 
 def test_golden_cache_source_change_recomputes(tmp_path, monkeypatch):
@@ -114,8 +112,10 @@ def test_cached_mismatch_recomputes_once(tmp_path, monkeypatch):
 
     kwargs = dict(
         nodeid="tests/example.py::test_retry",
-        metadata={"seed": 0}, inputs={"q": torch.ones(1)},
-        compute_fn=compute, expected_keys=("out",),
+        metadata={"seed": 0},
+        inputs={"q": torch.ones(1)},
+        compute_fn=compute,
+        expected_keys=("out",),
     )
     get_or_compute_golden(**kwargs)
     values, status = get_or_compute_golden(**kwargs, return_status=True)
@@ -123,7 +123,9 @@ def test_cached_mismatch_recomputes_once(tmp_path, monkeypatch):
     register_retry(values, lambda: get_or_compute_golden(**kwargs, force_refresh=True))
     assert_fa_close(torch.tensor([2.0]), values["out"], values["out"], name="out")
     assert calls["count"] == 2
-    assert not __import__("tests.common.golden_cache", fromlist=["retry_cached_value"]).retry_cached_value(values["out"])
+    assert not __import__(
+        "tests.common.golden_cache", fromlist=["retry_cached_value"]
+    ).retry_cached_value(values["out"])
     assert calls["count"] == 2
 
 

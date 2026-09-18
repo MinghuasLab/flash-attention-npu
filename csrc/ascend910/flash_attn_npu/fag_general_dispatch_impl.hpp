@@ -39,28 +39,31 @@
 #include "autogen/fag_decls.hpp"
 
 template <typename DType, uint32_t kInputLayout>
-void launch_fag_general_dispatch_impl(const FagGeneralLaunchArgs &a) {
+void launch_fag_general_dispatch_impl(const FagGeneralLaunchArgs& a)
+{
     if constexpr (std::is_same_v<DType, half>) {
         if constexpr (kInputLayout == TND) {
             FAG_SELECT_VARIANT_16(fp16, tnd);
-        } else {  // BSND
+        } else { // BSND
             FAG_SELECT_VARIANT_16(fp16, bsnd);
         }
     } else {
         if constexpr (kInputLayout == TND) {
             FAG_SELECT_VARIANT_16(bf16, tnd);
-        } else {  // BSND
+        } else { // BSND
             FAG_SELECT_VARIANT_16(bf16, bsnd);
         }
     }
 }
 
 template <uint32_t kInputLayout>
-void launch_fag_general_dispatch_bf16(const FagGeneralLaunchArgs &a) {
+void launch_fag_general_dispatch_bf16(const FagGeneralLaunchArgs& a)
+{
     launch_fag_general_dispatch_impl<bfloat16_t, kInputLayout>(a);
 }
 
 template <uint32_t kInputLayout>
-void launch_fag_general_dispatch_fp16(const FagGeneralLaunchArgs &a) {
+void launch_fag_general_dispatch_fp16(const FagGeneralLaunchArgs& a)
+{
     launch_fag_general_dispatch_impl<half, kInputLayout>(a);
 }

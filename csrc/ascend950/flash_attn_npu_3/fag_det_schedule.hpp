@@ -37,11 +37,20 @@ namespace fag_det {
 // Scalar helpers (host/device shared; no std/device intrinsic dependency).
 // ---------------------------------------------------------------------------
 
-FAG_DET_AICORE int64_t DetMin(int64_t a, int64_t b) { return a < b ? a : b; }
-FAG_DET_AICORE int64_t DetMax(int64_t a, int64_t b) { return a > b ? a : b; }
+FAG_DET_AICORE int64_t DetMin(int64_t a, int64_t b)
+{
+    return a < b ? a : b;
+}
+FAG_DET_AICORE int64_t DetMax(int64_t a, int64_t b)
+{
+    return a > b ? a : b;
+}
 
 // Positive ceil-division, matching opst's Ceil<int64_t> usage in deter.h.
-FAG_DET_AICORE int64_t DetCeil(int64_t a, int64_t b) { return (a + b - 1) / b; }
+FAG_DET_AICORE int64_t DetCeil(int64_t a, int64_t b)
+{
+    return (a + b - 1) / b;
+}
 
 FAG_DET_AICORE int64_t DetGcd(int64_t a, int64_t b)
 {
@@ -60,14 +69,14 @@ FAG_DET_AICORE int64_t DetGcd(int64_t a, int64_t b)
 
 enum Kind : uint32_t {
     KIND_NONE = 0,
-    KIND_DENSE_SWIZZLE = 1,       // opst CalDenseSwizzleIndex (MHA)
-    KIND_DENSE_INDEX = 2,         // opst CalDenseIndex (MHA)
-    KIND_CAUSAL_SWIZZLE = 3,      // opst CalCausalSwizzleIndex (MHA)
-    KIND_LEFT_UP_CAUSAL_SWIZZLE = 4,  // opst CalLeftUpCausalSwizzleIndex (MHA)
-    KIND_GQA_DENSE = 5,           // opst CalGQADenseIndex
-    KIND_TND_DENSE = 6,           // opst CalTNDDenseSwizzleIndex (ragged MHA)
-    KIND_TND_GQA_DENSE = 7,       // opst CalTNDDenseIndex !IS_N_EQUAL (ragged GQA)
-    KIND_TND_CAUSAL = 8,          // opst CalTNDCausalIndex (ragged causal MHA)
+    KIND_DENSE_SWIZZLE = 1,          // opst CalDenseSwizzleIndex (MHA)
+    KIND_DENSE_INDEX = 2,            // opst CalDenseIndex (MHA)
+    KIND_CAUSAL_SWIZZLE = 3,         // opst CalCausalSwizzleIndex (MHA)
+    KIND_LEFT_UP_CAUSAL_SWIZZLE = 4, // opst CalLeftUpCausalSwizzleIndex (MHA)
+    KIND_GQA_DENSE = 5,              // opst CalGQADenseIndex
+    KIND_TND_DENSE = 6,              // opst CalTNDDenseSwizzleIndex (ragged MHA)
+    KIND_TND_GQA_DENSE = 7,          // opst CalTNDDenseIndex !IS_N_EQUAL (ragged GQA)
+    KIND_TND_CAUSAL = 8,             // opst CalTNDCausalIndex (ragged causal MHA)
 };
 
 struct Shape {
@@ -81,24 +90,31 @@ struct Shape {
     int64_t kvTile = 128;
     int64_t coreNum = 0;
 
-    FAG_DET_AICORE int64_t M() const { return DetCeil(qSeqLen, qTile); }
-    FAG_DET_AICORE int64_t N() const { return DetCeil(kvSeqLen, kvTile); }
-    FAG_DET_AICORE int64_t Bh() const { return batch * kvHeadNum; }
+    FAG_DET_AICORE int64_t M() const
+    {
+        return DetCeil(qSeqLen, qTile);
+    }
+    FAG_DET_AICORE int64_t N() const
+    {
+        return DetCeil(kvSeqLen, kvTile);
+    }
+    FAG_DET_AICORE int64_t Bh() const
+    {
+        return batch * kvHeadNum;
+    }
 };
 
 // opst raw coordinate: w is the 1-based combined (b, n2, g) index, 0 = invalid.
 struct RawCoord {
     int64_t w = 0;
-    int64_t s1 = 0;  // 1-based q block
-    int64_t s2 = 0;  // 1-based kv block
+    int64_t s1 = 0; // 1-based q block
+    int64_t s2 = 0; // 1-based kv block
 };
 
 // ---------------------------------------------------------------------------
 // opst CalDenseIndex: non-swizzle dense column rotation (safe for k > m).
 // ---------------------------------------------------------------------------
-FAG_DET_AICORE void CalDenseIndex(
-    int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r,
-    RawCoord &c)
+FAG_DET_AICORE void CalDenseIndex(int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r, RawCoord& c)
 {
     c.w = 0;
     k = DetMin(k, b * m);
@@ -128,9 +144,7 @@ FAG_DET_AICORE void CalDenseIndex(
 // opst CalDenseSwizzleIndex: consecutive KV columns per lane, s1 rotates.
 // Requires k <= b*m for the intra-round dq safety property.
 // ---------------------------------------------------------------------------
-FAG_DET_AICORE void CalDenseSwizzleIndex(
-    int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r,
-    RawCoord &c)
+FAG_DET_AICORE void CalDenseSwizzleIndex(int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r, RawCoord& c)
 {
     c.w = 0;
     j = j - 1;
@@ -167,14 +181,13 @@ FAG_DET_AICORE void CalDenseSwizzleIndex(
 // private dk/dv accumulator and flush both at the column end.
 // ---------------------------------------------------------------------------
 struct FoldInfo {
-    int64_t w[2] = {0, 0};   // 1-based combined (b,n2,g) index, 0 = absent
-    int64_t s2[2] = {0, 0};  // 1-based kv block, 0 = absent
-    int64_t parity = 0;      // accumulation buffer of this task
+    int64_t w[2] = {0, 0};  // 1-based combined (b,n2,g) index, 0 = absent
+    int64_t s2[2] = {0, 0}; // 1-based kv block, 0 = absent
+    int64_t parity = 0;     // accumulation buffer of this task
 };
 
-FAG_DET_AICORE void CalCausalSwizzleIndex(
-    int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r,
-    RawCoord &c, FoldInfo *fold = nullptr)
+FAG_DET_AICORE void CalCausalSwizzleIndex(int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r, RawCoord& c,
+                                          FoldInfo* fold = nullptr)
 {
     c.w = 0;
     // Adjacent B or N are concatenated into one full S1S2 rectangle.
@@ -238,9 +251,8 @@ FAG_DET_AICORE void CalCausalSwizzleIndex(
 // ---------------------------------------------------------------------------
 // opst CalLeftUpCausalSwizzleIndex (LEFT_UP_CAUSAL / top-left aligned causal).
 // ---------------------------------------------------------------------------
-FAG_DET_AICORE void CalLeftUpCausalSwizzleIndex(
-    int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r,
-    RawCoord &c, FoldInfo *fold = nullptr)
+FAG_DET_AICORE void CalLeftUpCausalSwizzleIndex(int64_t k, int64_t m, int64_t n, int64_t b, int64_t j, int64_t r,
+                                                RawCoord& c, FoldInfo* fold = nullptr)
 {
     c.w = 0;
     int64_t pairCount = b >> 1;
@@ -305,15 +317,12 @@ FAG_DET_AICORE void CalLeftUpCausalSwizzleIndex(
 // columns are distributed so that each lane rotates s1 inside one group
 // column per round span.
 // ---------------------------------------------------------------------------
-FAG_DET_AICORE void CalGQADenseIndex(
-    int64_t k, int64_t m, int64_t n, int64_t b, int64_t coreId, int64_t roundId,
-    int64_t g, RawCoord &c, int64_t denseRound = 0)
+FAG_DET_AICORE void CalGQADenseIndex(int64_t k, int64_t m, int64_t n, int64_t b, int64_t coreId, int64_t roundId,
+                                     int64_t g, RawCoord& c, int64_t denseRound = 0)
 {
     c.w = 0;
     k = DetMin(DetMin(k, b * g * m), b * n);
-    int64_t R = denseRound > 0
-        ? denseRound
-        : DetMax(DetMax(DetCeil(b * n * g, k), DetCeil(n, m)), g);
+    int64_t R = denseRound > 0 ? denseRound : DetMax(DetMax(DetCeil(b * n * g, k), DetCeil(n, m)), g);
     if (coreId < 1 || coreId > k || roundId < 1 || roundId > R * m) {
         return;
     }
@@ -381,8 +390,8 @@ struct Coord {
     int64_t s2 = 0;
     bool valid = false;
 
-    uint32_t parity = 0;       // accumulation buffer of this task
-    uint32_t foldCount = 1;    // number of real columns in this round span
+    uint32_t parity = 0;    // accumulation buffer of this task
+    uint32_t foldCount = 1; // number of real columns in this round span
     uint32_t foldValid[2] = {1, 0};
     int64_t foldBatch[2] = {0, 0};
     int64_t foldN2[2] = {0, 0};
@@ -390,9 +399,7 @@ struct Coord {
     int64_t foldS2[2] = {0, 0};
 };
 
-FAG_DET_AICORE void RawToCoordTriple(
-    const Shape &s, int64_t w, int64_t &batchIdx, int64_t &n2Idx,
-    int64_t &gIdx)
+FAG_DET_AICORE void RawToCoordTriple(const Shape& s, int64_t w, int64_t& batchIdx, int64_t& n2Idx, int64_t& gIdx)
 {
     const int64_t n1 = s.groupNum * s.kvHeadNum;
     batchIdx = (w - 1) / n1;
@@ -401,8 +408,7 @@ FAG_DET_AICORE void RawToCoordTriple(
     gIdx = n1Idx % s.groupNum;
 }
 
-FAG_DET_AICORE void RawToCoord(
-    const Shape &s, const RawCoord &raw, Coord &out)
+FAG_DET_AICORE void RawToCoord(const Shape& s, const RawCoord& raw, Coord& out)
 {
     out.valid = false;
     if (raw.w < 1 || raw.s1 < 1 || raw.s2 < 1) {
@@ -412,9 +418,7 @@ FAG_DET_AICORE void RawToCoord(
     const int64_t n1Idx = (raw.w - 1) % (s.groupNum * s.kvHeadNum);
     const int64_t n2Idx = n1Idx / s.groupNum;
     const int64_t gIdx = n1Idx % s.groupNum;
-    if (batchIdx < 0 || batchIdx >= s.batch ||
-        n2Idx < 0 || n2Idx >= s.kvHeadNum ||
-        gIdx < 0 || gIdx >= s.groupNum ||
+    if (batchIdx < 0 || batchIdx >= s.batch || n2Idx < 0 || n2Idx >= s.kvHeadNum || gIdx < 0 || gIdx >= s.groupNum ||
         raw.s1 > s.M() || raw.s2 > s.N()) {
         return;
     }
@@ -433,13 +437,11 @@ FAG_DET_AICORE void RawToCoord(
 // and lanes beyond the batch's column count are holes.
 // ---------------------------------------------------------------------------
 template <typename CuPtr, typename PrefixPtr>
-FAG_DET_AICORE bool CalTNDDenseSwizzleIndex(
-    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr prefix,
-    int64_t j, int64_t r, Coord &out)
+FAG_DET_AICORE bool CalTNDDenseSwizzleIndex(const Shape& s, CuPtr cuQ, CuPtr cuK, PrefixPtr prefix, int64_t j,
+                                            int64_t r, Coord& out)
 {
     out = Coord{};
-    if (cuQ == nullptr || cuK == nullptr || prefix == nullptr ||
-        j < 1 || j > s.coreNum || r < 1) {
+    if (cuQ == nullptr || cuK == nullptr || prefix == nullptr || j < 1 || j > s.coreNum || r < 1) {
         return false;
     }
     j -= 1;
@@ -449,10 +451,8 @@ FAG_DET_AICORE bool CalTNDDenseSwizzleIndex(
         if (r >= prefix[bIdx + 1]) {
             continue;
         }
-        const int64_t qStart =
-            bIdx == 0 ? 0 : static_cast<int64_t>(cuQ[bIdx - 1]);
-        const int64_t kvStart =
-            bIdx == 0 ? 0 : static_cast<int64_t>(cuK[bIdx - 1]);
+        const int64_t qStart = bIdx == 0 ? 0 : static_cast<int64_t>(cuQ[bIdx - 1]);
+        const int64_t kvStart = bIdx == 0 ? 0 : static_cast<int64_t>(cuK[bIdx - 1]);
         const int64_t s1Len = static_cast<int64_t>(cuQ[bIdx]) - qStart;
         const int64_t s2Len = static_cast<int64_t>(cuK[bIdx]) - kvStart;
         if (s1Len <= 0 || s2Len <= 0) {
@@ -495,13 +495,11 @@ FAG_DET_AICORE bool CalTNDDenseSwizzleIndex(
 // keeps the same-round (batch, n2, g, s1) keys distinct across lanes.
 // ---------------------------------------------------------------------------
 template <typename CuPtr, typename PrefixPtr>
-FAG_DET_AICORE bool CalTNDDenseGqaIndex(
-    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr areaPrefix,
-    int64_t j, int64_t r, int64_t maxRound, Coord &out)
+FAG_DET_AICORE bool CalTNDDenseGqaIndex(const Shape& s, CuPtr cuQ, CuPtr cuK, PrefixPtr areaPrefix, int64_t j,
+                                        int64_t r, int64_t maxRound, Coord& out)
 {
     out = Coord{};
-    if (cuQ == nullptr || cuK == nullptr || areaPrefix == nullptr ||
-        j < 1 || j > s.coreNum || r < 1 || r > maxRound) {
+    if (cuQ == nullptr || cuK == nullptr || areaPrefix == nullptr || j < 1 || j > s.coreNum || r < 1 || r > maxRound) {
         return false;
     }
     const int64_t n1 = s.kvHeadNum * s.groupNum;
@@ -593,7 +591,7 @@ FAG_DET_AICORE bool CalTNDDenseGqaIndex(
 //
 // step = 1 only (batch <= 128); the host falls back to dense+mask otherwise.
 // ---------------------------------------------------------------------------
-FAG_DET_AICORE void CalVirtualIndex(int64_t flag, int64_t &m, int64_t &n)
+FAG_DET_AICORE void CalVirtualIndex(int64_t flag, int64_t& m, int64_t& n)
 {
     if (m < n) {
         n = m;
@@ -609,8 +607,7 @@ FAG_DET_AICORE void CalVirtualIndex(int64_t flag, int64_t &m, int64_t &n)
     }
 }
 
-FAG_DET_AICORE void CalCausalPosWholeBatch(
-    int64_t m, int64_t n, int64_t a, int64_t &x, int64_t &y)
+FAG_DET_AICORE void CalCausalPosWholeBatch(int64_t m, int64_t n, int64_t a, int64_t& x, int64_t& y)
 {
     const int64_t n1 = n / 2 * 2;
     const int64_t L = 2 * m - n1 + 1;
@@ -634,14 +631,11 @@ FAG_DET_AICORE void CalCausalPosWholeBatch(
 // Inner decode (flag picks the virtual rectangle).  Outputs the 1-based
 // combined head index comb = batch * n1 + deltaN and the virtual (x, y).
 template <typename CuPtr, typename PrefixPtr>
-FAG_DET_AICORE bool CalTNDDenseCausalIndex(
-    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr prefix,
-    int64_t deterMaxRound, int64_t innerN1, int64_t flag,
-    int64_t j, int64_t r, int64_t &comb, int64_t &x, int64_t &y,
-    int64_t &realM, int64_t &realN)
+FAG_DET_AICORE bool CalTNDDenseCausalIndex(const Shape& s, CuPtr cuQ, CuPtr cuK, PrefixPtr prefix,
+                                           int64_t deterMaxRound, int64_t innerN1, int64_t flag, int64_t j, int64_t r,
+                                           int64_t& comb, int64_t& x, int64_t& y, int64_t& realM, int64_t& realN)
 {
-    if (cuQ == nullptr || cuK == nullptr || prefix == nullptr ||
-        j < 1 || j > s.coreNum || r < 1 || r > deterMaxRound) {
+    if (cuQ == nullptr || cuK == nullptr || prefix == nullptr || j < 1 || j > s.coreNum || r < 1 || r > deterMaxRound) {
         return false;
     }
     const int64_t ID = (j - 1) * deterMaxRound + r;
@@ -694,32 +688,30 @@ FAG_DET_AICORE bool CalTNDDenseCausalIndex(
 }
 
 template <typename CuPtr>
-FAG_DET_AICORE int64_t TndBatchOuterQ(const Shape &s, CuPtr cuQ, int64_t bIdx)
+FAG_DET_AICORE int64_t TndBatchOuterQ(const Shape& s, CuPtr cuQ, int64_t bIdx)
 {
     const int64_t qs = bIdx == 0 ? 0 : static_cast<int64_t>(cuQ[bIdx - 1]);
     return DetCeil(static_cast<int64_t>(cuQ[bIdx]) - qs, s.qTile);
 }
 
 template <typename CuPtr>
-FAG_DET_AICORE int64_t TndBatchOuterK(const Shape &s, CuPtr cuK, int64_t bIdx)
+FAG_DET_AICORE int64_t TndBatchOuterK(const Shape& s, CuPtr cuK, int64_t bIdx)
 {
     const int64_t ks = bIdx == 0 ? 0 : static_cast<int64_t>(cuK[bIdx - 1]);
     return DetCeil(static_cast<int64_t>(cuK[bIdx]) - ks, s.kvTile);
 }
 
 template <typename CuPtr, typename PrefixPtr>
-FAG_DET_AICORE bool CalTNDCausalIndex(
-    const Shape &s, CuPtr cuQ, CuPtr cuK, PrefixPtr p0, PrefixPtr p1,
-    PrefixPtr p2, int64_t maxRound, int64_t j, int64_t r, Coord &out)
+FAG_DET_AICORE bool CalTNDCausalIndex(const Shape& s, CuPtr cuQ, CuPtr cuK, PrefixPtr p0, PrefixPtr p1, PrefixPtr p2,
+                                      int64_t maxRound, int64_t j, int64_t r, Coord& out)
 {
     out = Coord{};
-    if (p0 == nullptr || maxRound <= 0 ||
-        j < 1 || j > s.coreNum || r < 1 || r > maxRound) {
+    if (p0 == nullptr || maxRound <= 0 || j < 1 || j > s.coreNum || r < 1 || r > maxRound) {
         return false;
     }
-    const int64_t N1 = s.kvHeadNum * s.groupNum;   // g == 1 -> kvHeadNum
-    const int64_t N11 = (s.kvHeadNum % s.coreNum) / 2;   // inner n2 (segment 2)
-    const int64_t maxIdx = s.batch + 1;            // step == 1
+    const int64_t N1 = s.kvHeadNum * s.groupNum;       // g == 1 -> kvHeadNum
+    const int64_t N11 = (s.kvHeadNum % s.coreNum) / 2; // inner n2 (segment 2)
+    const int64_t maxIdx = s.batch + 1;                // step == 1
     const int64_t R01 = p0[maxIdx];
     const int64_t R02 = p0[maxIdx + 1];
     const int64_t R0 = R01 + R02;
@@ -732,7 +724,6 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
     int64_t y = 0;
     int64_t realM = 0;
     int64_t realN = 0;
-
 
     if (r <= R01) {
         const int64_t N10 = N1 / s.coreNum;
@@ -769,8 +760,7 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
         int64_t cy = 0;
         CalCausalPosWholeBatch(m, n, a0, cx, cy);
         int64_t ww = (a - 1) / roundBatch * s.coreNum + j;
-        ww = ((ww - 1) / s.coreNum) * s.coreNum +
-             ((cy - 1 + (ww - 1)) % s.coreNum) + 1;
+        ww = ((ww - 1) / s.coreNum) * s.coreNum + ((cy - 1 + (ww - 1)) % s.coreNum) + 1;
         const int64_t head = w * N1 + ww;
         batch = (head - 1) / N1;
         hn2 = (head - 1) % N1 + 1;
@@ -783,8 +773,7 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
         int64_t cx = 0;
         int64_t cy = 0;
         if (r <= R0) {
-            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p0, R02, N11, 0,
-                                        j, r - R01, comb, cx, cy, realM, realN)) {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p0, R02, N11, 0, j, r - R01, comb, cx, cy, realM, realN)) {
                 return false;
             }
             const int64_t b1 = DetCeil(comb, N11);
@@ -805,8 +794,7 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
             batch = (head - 1) / N1;
             hn2 = (head - 1) % N1 + 1;
         } else if (r <= R0 + R1) {
-            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p1, R1, 1, 1,
-                                        j, r - R0, comb, cx, cy, realM, realN)) {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p1, R1, 1, 1, j, r - R0, comb, cx, cy, realM, realN)) {
                 return false;
             }
             const int64_t m = realM;
@@ -822,8 +810,7 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
             batch = (head - 1) / N1;
             hn2 = (head - 1) % N1 + 1;
         } else {
-            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p2, R2, 1, 2,
-                                        j, r - R0 - R1, comb, cx, cy, realM, realN)) {
+            if (!CalTNDDenseCausalIndex(s, cuQ, cuK, p2, R2, 1, 2, j, r - R0 - R1, comb, cx, cy, realM, realN)) {
                 return false;
             }
             int64_t n = (realM < realN) ? realM : realN;
@@ -861,8 +848,7 @@ FAG_DET_AICORE bool CalTNDCausalIndex(
 }
 
 // Decode the task of (round, core).  round and core are 1-based.
-FAG_DET_AICORE bool Decode(
-    Kind kind, const Shape &s, int64_t round, int64_t core, Coord &out)
+FAG_DET_AICORE bool Decode(Kind kind, const Shape& s, int64_t round, int64_t core, Coord& out)
 {
     out = Coord{};
     if (kind == KIND_NONE || round < 1 || core < 1 || core > s.coreNum) {
@@ -870,36 +856,30 @@ FAG_DET_AICORE bool Decode(
     }
     RawCoord raw;
     FoldInfo fold;
-    const FoldInfo *foldPtr = nullptr;
+    const FoldInfo* foldPtr = nullptr;
     switch (kind) {
-        case KIND_DENSE_SWIZZLE:
-            CalDenseSwizzleIndex(
-                s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw);
-            break;
-        case KIND_DENSE_INDEX:
-            CalDenseIndex(
-                s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw);
-            break;
-        case KIND_LEFT_UP_CAUSAL_SWIZZLE:
-            foldPtr = &fold;
-            CalLeftUpCausalSwizzleIndex(
-                s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw, &fold);
-            break;
-        case KIND_CAUSAL_SWIZZLE:
-            foldPtr = &fold;
-            CalCausalSwizzleIndex(
-                s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw, &fold);
-            break;
-        case KIND_GQA_DENSE: {
-            // opst tunes denseRound on the host; without the tuning pass use
-            // the default R formula (CalGQADenseIndexNoTune).
-            CalGQADenseIndex(
-                s.coreNum, s.M(), s.N(), s.Bh(), core, round, s.groupNum,
-                raw);
-            break;
-        }
-        default:
-            return false;
+    case KIND_DENSE_SWIZZLE:
+        CalDenseSwizzleIndex(s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw);
+        break;
+    case KIND_DENSE_INDEX:
+        CalDenseIndex(s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw);
+        break;
+    case KIND_LEFT_UP_CAUSAL_SWIZZLE:
+        foldPtr = &fold;
+        CalLeftUpCausalSwizzleIndex(s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw, &fold);
+        break;
+    case KIND_CAUSAL_SWIZZLE:
+        foldPtr = &fold;
+        CalCausalSwizzleIndex(s.coreNum, s.M(), s.N(), s.Bh(), core, round, raw, &fold);
+        break;
+    case KIND_GQA_DENSE: {
+        // opst tunes denseRound on the host; without the tuning pass use
+        // the default R formula (CalGQADenseIndexNoTune).
+        CalGQADenseIndex(s.coreNum, s.M(), s.N(), s.Bh(), core, round, s.groupNum, raw);
+        break;
+    }
+    default:
+        return false;
     }
     RawToCoord(s, raw, out);
     if (!out.valid) {
@@ -926,9 +906,7 @@ FAG_DET_AICORE bool Decode(
             int64_t n2Idx = 0;
             int64_t gIdx = 0;
             RawToCoordTriple(s, fold.w[p], bIdx, n2Idx, gIdx);
-            if (bIdx < 0 || bIdx >= s.batch ||
-                n2Idx < 0 || n2Idx >= s.kvHeadNum ||
-                gIdx < 0 || gIdx >= s.groupNum ||
+            if (bIdx < 0 || bIdx >= s.batch || n2Idx < 0 || n2Idx >= s.kvHeadNum || gIdx < 0 || gIdx >= s.groupNum ||
                 fold.s2[p] > s.N()) {
                 out.foldValid[p] = 0;
                 continue;
@@ -944,6 +922,6 @@ FAG_DET_AICORE bool Decode(
     return true;
 }
 
-}  // namespace fag_det
+} // namespace fag_det
 
-#endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_DET_SCHEDULE_HPP
+#endif // FLASH_ATTN_NPU_ASCEND950_V3_FAG_DET_SCHEDULE_HPP

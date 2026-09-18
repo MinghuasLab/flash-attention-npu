@@ -36,9 +36,7 @@ def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
     assert torch.equal(actual_inf, ref_inf), f"{name}: actual/ref inf mask mismatch"
     assert torch.equal(pt_inf, ref_inf), f"{name}: pt/ref inf mask mismatch"
     if ref_inf.any():
-        assert torch.equal(actual[ref_inf], ref[ref_inf]), (
-            f"{name}: actual/ref inf value mismatch"
-        )
+        assert torch.equal(actual[ref_inf], ref[ref_inf]), f"{name}: actual/ref inf value mismatch"
         assert torch.equal(pt[ref_inf], ref[ref_inf]), f"{name}: pt/ref inf value mismatch"
 
     # For tensors mixing finite values and infinities, compare numerical error
@@ -71,10 +69,14 @@ def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
         total = actual.numel()
         lo = max(0, fi - 3)
         hi = min(total, fi + 4)
-        print(f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
-              f"num_bad(>{tolerance:.3g})={num_bad} num_loose(>0.5)={num_loose}")
-        print(f"    max_diff={max_diff} flat={fi}/{total} ({100.0*fi/total:.1f}%) "
-              f"actual={actual[fi].item()} ref={ref[fi].item()} pt={pt[fi].item()}")
+        print(
+            f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
+            f"num_bad(>{tolerance:.3g})={num_bad} num_loose(>0.5)={num_loose}"
+        )
+        print(
+            f"    max_diff={max_diff} flat={fi}/{total} ({100.0 * fi / total:.1f}%) "
+            f"actual={actual[fi].item()} ref={ref[fi].item()} pt={pt[fi].item()}"
+        )
         print(f"    actual[{lo}:{hi}]={actual[lo:hi].tolist()}")
         print(f"    ref   [{lo}:{hi}]={ref[lo:hi].tolist()}")
     assert max_diff <= tolerance, (

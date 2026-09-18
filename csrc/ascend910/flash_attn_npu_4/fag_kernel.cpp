@@ -51,21 +51,11 @@ enum class DTemplateType {
     DTemplateBottom
 };
 
-template <
-    class BlockMmad_,
-    class BlockMmad2_,
-    class BlockMmad3_,
-    class EpilogueFAGPre_,
-    class EpilogueFAGSfmg_,
-    class EpilogueFAGSabVec_,
-    class EpilogueFAGPost_,
-    class EpilogueFAGDtmAdd_,
-    const uint32_t INPUT_LAYOUT,
-    const bool IS_ATTEN_MASK,
-    const uint32_t IS_DTM
->
+template <class BlockMmad_, class BlockMmad2_, class BlockMmad3_, class EpilogueFAGPre_, class EpilogueFAGSfmg_,
+          class EpilogueFAGSabVec_, class EpilogueFAGPost_, class EpilogueFAGDtmAdd_, const uint32_t INPUT_LAYOUT,
+          const bool IS_ATTEN_MASK, const uint32_t IS_DTM>
 class FlashAttentionScoreGrad {
-public:
+  public:
     using BlockMmad = BlockMmad_;
     using ArchTag = typename BlockMmad::ArchTag;
     using ElementA = typename BlockMmad::ElementA;
@@ -101,20 +91,20 @@ public:
     AscendC::GlobalTensor<float> mm1WorkspaceGm, mm2WorkspaceGm;
     AscendC::GlobalTensor<ElementA> dropWorkSpaceGm, mulWorkSpaceGm;
 
-    __gm__ uint8_t *actual_seq_qlen_addr;
-    __gm__ uint8_t *actual_seq_kvlen_addr;
+    __gm__ uint8_t* actual_seq_qlen_addr;
+    __gm__ uint8_t* actual_seq_kvlen_addr;
 
     constexpr static uint32_t ENABLE = 1;
-    constexpr static int8_t OUTIDX= -1;
+    constexpr static int8_t OUTIDX = -1;
     constexpr static uint32_t INPUT_NUMS = 2;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
 
-    __aicore__ inline void Init(FAGKernelParams const &params, __gm__ FAGTilingData *fagTilingData)
+    __aicore__ inline void Init(FAGKernelParams const& params, __gm__ FAGTilingData* fagTilingData)
     {
-        queryGm.SetGlobalBuffer((__gm__ ElementA *)params.q);
-        keyGm.SetGlobalBuffer((__gm__ ElementA *)params.k);
-        valueGm.SetGlobalBuffer((__gm__ ElementA *)params.v);
-        dxGm.SetGlobalBuffer((__gm__ ElementA *)params.dout);
+        queryGm.SetGlobalBuffer((__gm__ ElementA*)params.q);
+        keyGm.SetGlobalBuffer((__gm__ ElementA*)params.k);
+        valueGm.SetGlobalBuffer((__gm__ ElementA*)params.v);
+        dxGm.SetGlobalBuffer((__gm__ ElementA*)params.dout);
 
         coreNum = fagTilingData->coreNum;
         cubeCoreNum = coreNum / 2;
@@ -154,62 +144,65 @@ public:
             sfmgOutputSize = ((__gm__ int32_t*)params.cu_seq_qlen)[b - 1] * n2 * g * 8;
         }
 
-        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
-                                    fagTilingData->dqWorkSpaceOffset / sizeof(float));
-        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
-                                    fagTilingData->dkWorkSpaceOffset / sizeof(float));
-        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
-                                    fagTilingData->dvWorkSpaceOffset / sizeof(float));
+        dqWorkSpaceGm.SetGlobalBuffer((__gm__ float*)params.workspace +
+                                      fagTilingData->dqWorkSpaceOffset / sizeof(float));
+        dkWorkSpaceGm.SetGlobalBuffer((__gm__ float*)params.workspace +
+                                      fagTilingData->dkWorkSpaceOffset / sizeof(float));
+        dvWorkSpaceGm.SetGlobalBuffer((__gm__ float*)params.workspace +
+                                      fagTilingData->dvWorkSpaceOffset / sizeof(float));
 
         int64_t workspaceOffsets =
-            (fagTilingData->sfmgPreBeginAddr + sfmgOutputSize * sizeof(float) + ADDR_ALIGN_SIZE) /
-            ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
+            (fagTilingData->sfmgPreBeginAddr + sfmgOutputSize * sizeof(float) + ADDR_ALIGN_SIZE) / ADDR_ALIGN_SIZE *
+            ADDR_ALIGN_SIZE;
 
         // matmul1 and matmul2 workspace size
         uint32_t matmulWorkspaceSize = cubeBaseMN * sizeof(float);
-        mm1WorkspaceGm.SetGlobalBuffer((__gm__ float *)(params.workspace + workspaceOffsets +
-                                                    cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
-        mm2WorkspaceGm.SetGlobalBuffer(
-            (__gm__ float *)(params.workspace + workspaceOffsets + cubeCoreNum * matmulWorkspaceSize * GM_DOUBLE_BUFFER +
-                        cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
+        mm1WorkspaceGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets +
+                                                       cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
+        mm2WorkspaceGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets +
+                                                       cubeCoreNum * matmulWorkspaceSize * GM_DOUBLE_BUFFER +
+                                                       cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
 
         // drop workspace offset 和 mm2WorkspaceGm 地址相同
-        dropWorkSpaceGm.SetGlobalBuffer(
-            (__gm__ ElementA *)(params.workspace + workspaceOffsets + cubeCoreNum * matmulWorkspaceSize * GM_DOUBLE_BUFFER +
-                        cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
+        dropWorkSpaceGm.SetGlobalBuffer((__gm__ ElementA*)(params.workspace + workspaceOffsets +
+                                                           cubeCoreNum * matmulWorkspaceSize * GM_DOUBLE_BUFFER +
+                                                           cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
 
         // mul workspace offset 和 mm1WorkspaceGm 地址相同
-        mulWorkSpaceGm.SetGlobalBuffer((__gm__ ElementA *)(params.workspace + workspaceOffsets +
-                                                    cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
+        mulWorkSpaceGm.SetGlobalBuffer((__gm__ ElementA*)(params.workspace + workspaceOffsets +
+                                                          cCubeBlockIdx * matmulWorkspaceSize * GM_DOUBLE_BUFFER));
 
         if constexpr (IS_DTM == ENABLE) {
-            uint64_t pseAlibiAddr = (workspaceOffsets + cubeCoreNum * matmulWorkspaceSize * INPUT_NUMS *
-                                                    GM_DOUBLE_BUFFER + ADDR_ALIGN_SIZE) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
-            workspaceOffsets = (pseAlibiAddr + ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE *
-                        ADDR_ALIGN_SIZE;
+            uint64_t pseAlibiAddr =
+                (workspaceOffsets + cubeCoreNum * matmulWorkspaceSize * INPUT_NUMS * GM_DOUBLE_BUFFER +
+                 ADDR_ALIGN_SIZE) /
+                ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
+            workspaceOffsets = (pseAlibiAddr + ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
 
-            dqDtmWsGm.SetGlobalBuffer((__gm__ float *)(params.workspace + workspaceOffsets));
+            dqDtmWsGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets));
             workspaceOffsets = (workspaceOffsets + s1CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DOUBLE_BUFFER +
-                                ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
-    
-            dkDtmWsGm.SetGlobalBuffer((__gm__ float *)(params.workspace + workspaceOffsets));
+                                ADDR_ALIGN_SIZE - 1) /
+                               ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
+
+            dkDtmWsGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets));
             workspaceOffsets = (workspaceOffsets + s2CvInner * dAlign * sizeof(float) * cubeCoreNum * GM_DOUBLE_BUFFER +
-                                ADDR_ALIGN_SIZE - 1) / ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
-    
-            dvDtmWsGm.SetGlobalBuffer((__gm__ float *)(params.workspace + workspaceOffsets));
-        }                                                    
+                                ADDR_ALIGN_SIZE - 1) /
+                               ADDR_ALIGN_SIZE * ADDR_ALIGN_SIZE;
+
+            dvDtmWsGm.SetGlobalBuffer((__gm__ float*)(params.workspace + workspaceOffsets));
+        }
     }
 
-    __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
+    __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
     {
         if (unlikely(bIdx == 0)) {
-            actualSeqQlen = ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
-            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
+            actualSeqQlen = ((__gm__ int32_t*)actual_seq_qlen_addr)[0];
+            actualSeqKvlen = ((__gm__ int32_t*)actual_seq_kvlen_addr)[0];
         } else {
             actualSeqQlen =
-                ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
+                ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx - 1];
             actualSeqKvlen =
-                ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
+                ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx - 1];
         }
         return;
     }
@@ -280,7 +273,7 @@ public:
         }
         int32_t actualSeqQlen = s1;
         int32_t actualSeqKvlen = s2;
-        if constexpr(INPUT_LAYOUT == TND) {
+        if constexpr (INPUT_LAYOUT == TND) {
             UpdateToken(bDimIdx);
             GetSeqQlenKvlenByBidx(bDimIdx, actualSeqQlen, actualSeqKvlen);
             s1Outer = (actualSeqQlen + s1CvInner - 1) / s1CvInner;
@@ -333,8 +326,9 @@ public:
             int64_t s2RightIdx = dbParam.s1oIdx * s1CvInner + dbParam.s1CvExtend + actualCalcS2Token;
             s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
             s2RightIdx = (s2RightIdx + 7) / 8 * 8;
-            dbParam.s2CvExtend = s2RightIdx > (dbParam.s2oIdx * s2CvInner + dbParam.s2CvExtend) ?
-                                dbParam.s2CvExtend : s2RightIdx - dbParam.s2oIdx * s2CvInner;
+            dbParam.s2CvExtend = s2RightIdx > (dbParam.s2oIdx * s2CvInner + dbParam.s2CvExtend)
+                                     ? dbParam.s2CvExtend
+                                     : s2RightIdx - dbParam.s2oIdx * s2CvInner;
             dbParam.s2CvExtend = dbParam.s2CvExtend > 0 ? dbParam.s2CvExtend : 0;
             dbParam.s1CvExtendAlign = (dbParam.s1CvExtend + 15) / 16 * 16;
             dbParam.s2CvExtendAlign = (dbParam.s2CvExtend + 15) / 16 * 16;
@@ -343,7 +337,8 @@ public:
         // -----确定性计算，计算kvGroupId和dqGroupId
         if constexpr (IS_DTM == ENABLE) {
             int8_t kvGroupId = startCoreId;
-            if (startCoreId > 0 && kvOutIdx == kvOutArr[startCoreId - 1] && dbParam.kvGroupId[startCoreId - 1] != OUTIDX) {
+            if (startCoreId > 0 && kvOutIdx == kvOutArr[startCoreId - 1] &&
+                dbParam.kvGroupId[startCoreId - 1] != OUTIDX) {
                 kvGroupId = dbParam.kvGroupId[startCoreId - 1];
             }
             uint32_t s2CvExtend = (s2oCvDimIdx == s2Outer - 1) ? s2CvTail : s2CvInner;
@@ -356,11 +351,13 @@ public:
                 kvOutArr[i] = kvOutIdx;
                 dbParam.blockIdArr[i] = baseIdx + i - startCoreId;
                 dbParam.s1CvExtendArr[i] = (s1oDimIdx + i - startCoreId) == (s1Outer - 1) ? s1CvTail : s1CvInner;
-                int64_t s2RightIdx = (s1oDimIdx + i - startCoreId) * s1CvInner + dbParam.s1CvExtendArr[i] + actualCalcS2Token;
+                int64_t s2RightIdx =
+                    (s1oDimIdx + i - startCoreId) * s1CvInner + dbParam.s1CvExtendArr[i] + actualCalcS2Token;
                 s2RightIdx = s2RightIdx > 0 ? s2RightIdx : 0;
                 s2RightIdx = (s2RightIdx + 7) / 8 * 8;
-                dbParam.s2CvExtendArr[i] = s2RightIdx > (s2oCvDimIdx * s2CvInner + s2CvExtend) ?
-                                        s2CvExtend : (s2RightIdx - s2oCvDimIdx * s2CvInner);
+                dbParam.s2CvExtendArr[i] = s2RightIdx > (s2oCvDimIdx * s2CvInner + s2CvExtend)
+                                               ? s2CvExtend
+                                               : (s2RightIdx - s2oCvDimIdx * s2CvInner);
                 dbParam.kvGroupId[i] = kvGroupId;
                 dbParam.dqGroupId[i] = i;
                 if (s2oCvDimIdx == 0) {
@@ -411,15 +408,16 @@ public:
             dbParam.aTensorOffsetCv = 0;
             dbParam.bTensorOffsetCv = 0;
             if (dbParam.bIdx > 0) {
-                dbParam.aTensorOffsetCv = ((__gm__ int32_t *)actual_seq_qlen_addr)[dbParam.bIdx - 1] * n2 * g * d;
-                dbParam.bTensorOffsetCv  = ((__gm__ int32_t *)actual_seq_kvlen_addr)[dbParam.bIdx - 1] * n2 * d;
+                dbParam.aTensorOffsetCv = ((__gm__ int32_t*)actual_seq_qlen_addr)[dbParam.bIdx - 1] * n2 * g * d;
+                dbParam.bTensorOffsetCv = ((__gm__ int32_t*)actual_seq_kvlen_addr)[dbParam.bIdx - 1] * n2 * d;
             }
             dbParam.aTensorOffsetCv += ((dbParam.s1oIdx * s1CvInner * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * d;
             dbParam.bTensorOffsetCv += (dbParam.s2oIdx * s2CvInner * n2 + dbParam.n2Idx) * d;
             dbParam.s1Stride = n2 * g * d;
             dbParam.s2Stride = n2 * d;
         } else if constexpr (INPUT_LAYOUT == BSND) {
-            dbParam.aTensorOffsetCv = (((dbParam.bIdx * s1 + dbParam.s1oIdx * s1CvInner) * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * d;
+            dbParam.aTensorOffsetCv =
+                (((dbParam.bIdx * s1 + dbParam.s1oIdx * s1CvInner) * n2 + dbParam.n2Idx) * g + dbParam.gIdx) * d;
             dbParam.bTensorOffsetCv = ((dbParam.bIdx * s2 + dbParam.s2oIdx * s2CvInner) * n2 + dbParam.n2Idx) * d;
             dbParam.s1Stride = n2 * g * d;
             dbParam.s2Stride = n2 * d;
@@ -436,15 +434,14 @@ public:
         // mm-dyv
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, dbParam.s2CvExtend, value_d);
         LayoutA layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), specify_for_v_s1Stride};
-        LayoutB layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), specify_for_v_s2Stride}; // ColumnMajor shape=(d,s2)  stride=n2*g*d
+        LayoutB layoutB1{actualBlockShape1.k(), actualBlockShape1.n(),
+                         specify_for_v_s2Stride}; // ColumnMajor shape=(d,s2)  stride=n2*g*d
         LayoutC layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dbParam.s2CvExtendAlign};
 
         {
             BlockMmad blockMmadDyV(resource);
-            blockMmadDyV(dxGm[specify_for_v_aTensorOffsetCv], layoutA1,
-                    valueGm[specify_for_v_bTensorOffsetCv], layoutB1,
-                    mm1WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC1,
-                    actualBlockShape1);
+            blockMmadDyV(dxGm[specify_for_v_aTensorOffsetCv], layoutA1, valueGm[specify_for_v_bTensorOffsetCv],
+                         layoutB1, mm1WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC1, actualBlockShape1);
         }
 
         // fixpipe GM write done before reusing L1 for q*k
@@ -456,10 +453,8 @@ public:
         LayoutB layoutB{actualBlockShape.k(), actualBlockShape.n(), dbParam.s2Stride};
         LayoutC layoutC{actualBlockShape.m(), actualBlockShape.n(), dbParam.s2CvExtendAlign};
         BlockMmad blockMmadQk(resource);
-        blockMmadQk(queryGm[dbParam.aTensorOffsetCv], layoutA,
-                keyGm[dbParam.bTensorOffsetCv], layoutB,
-                mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC,
-                actualBlockShape);
+        blockMmadQk(queryGm[dbParam.aTensorOffsetCv], layoutA, keyGm[dbParam.bTensorOffsetCv], layoutB,
+                    mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC, actualBlockShape);
     }
 
     __aicore__ inline void ComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
@@ -518,7 +513,7 @@ public:
         uint32_t valueDLoops = (value_d + dSplitSize - 1) / dSplitSize;
         uint32_t valueDTail = value_d - (valueDLoops - 1) * dSplitSize;
         uint32_t gmBaseBlockOffset = 0;
-        
+
         // ///////////////////////////////////////////////////////////////
         // // Matmal4 dq
         // ///////////////////////////////////////////////////////////////
@@ -526,14 +521,11 @@ public:
         GemmCoord actualBlockShape1(dbParam.s1CvExtend, d, dbParam.s2CvExtend);
         LayoutA2 layoutA1{actualBlockShape1.m(), actualBlockShape1.k(), s2_size}; // RowMajor  shape=(s1,s2)  stride=s2
         LayoutB2 layoutB1{actualBlockShape1.k(), actualBlockShape1.n(), dbParam.s2Stride};
-        LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc}; 
+        LayoutC2 layoutC1{actualBlockShape1.m(), actualBlockShape1.n(), dqKc};
         {
             BlockMmad2 blockMmad2(resource);
-            blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    keyGm[dbParam.bTensorOffsetCv],
-                    dqWorkSpaceGm[dqOffset],
-                    layoutA1, layoutB1, layoutC1,
-                    actualBlockShape1, true);
+            blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], keyGm[dbParam.bTensorOffsetCv],
+                       dqWorkSpaceGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, true);
         }
 
         // dq GM write done; blockMmad3 reuses same L1
@@ -543,13 +535,12 @@ public:
         // ///////////////////////////////////////////////////////////////
         // // left [B, N2, G, S1, S2] right [B, N2, 1, S1, D] output [B, N2, G, S2, D]
         GemmCoord actualBlockShape2(dbParam.s2CvExtend, d, dbParam.s1CvExtend);
-        LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(), s2_size}; // ColumnMajor  origin shape=(s2,s1), so stride=s2
+        LayoutA3 layoutA2{actualBlockShape2.m(), actualBlockShape2.k(),
+                          s2_size}; // ColumnMajor  origin shape=(s2,s1), so stride=s2
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
-        blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                queryGm[dbParam.aTensorOffsetCv],
-                dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                actualBlockShape2, true);
+        blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], queryGm[dbParam.aTensorOffsetCv],
+                   dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, true);
 
         AscendC::PipeBarrier<PIPE_MTE3>();
 
@@ -561,12 +552,9 @@ public:
         LayoutA3 layoutA3{actualBlockShape3.m(), actualBlockShape3.k(), s2_size};
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
-        blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                dxGm[dbParam.aTensorOffsetCv / d * value_d],
-                dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                actualBlockShape3, true);
+        blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                   dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, true);
     }
-
 
     __aicore__ inline void DTMComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
     {
@@ -615,17 +603,11 @@ public:
         {
             BlockMmad2 blockMmad2(resource);
             if (dbParam.dqGroupId[cCubeBlockIdx] == OUTIDX) {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
-                        dqWorkSpaceGm[dqOffset],
-                        layoutA1, layoutB1, layoutC1,
-                        actualBlockShape1, false);
+                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], keyGm[dbParam.bTensorOffsetCv],
+                           dqWorkSpaceGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, false);
             } else {
-                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                        keyGm[dbParam.bTensorOffsetCv],
-                        dqDtmWsGm[dqOffset],
-                        layoutA1, layoutB1, layoutC1,
-                        actualBlockShape1, false);
+                blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], keyGm[dbParam.bTensorOffsetCv],
+                           dqDtmWsGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, false);
             }
         }
 
@@ -643,15 +625,11 @@ public:
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), dbParam.s1Stride};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    queryGm[dbParam.aTensorOffsetCv],
-                    dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                    actualBlockShape2, false);
+            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], queryGm[dbParam.aTensorOffsetCv],
+                       dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, false);
         } else {
-            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    queryGm[dbParam.aTensorOffsetCv],
-                    dkDtmWsGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                    actualBlockShape2, false);
+            blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], queryGm[dbParam.aTensorOffsetCv],
+                       dkDtmWsGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, false);
         }
 
         AscendC::PipeBarrier<PIPE_MTE3>();
@@ -665,15 +643,11 @@ public:
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), dbParam.s1Stride / d * value_d};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         if (dbParam.kvGroupId[cCubeBlockIdx] == OUTIDX) {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    dxGm[dbParam.aTensorOffsetCv / d * value_d],
-                    dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                    actualBlockShape3, false);
+            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                       dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, false);
         } else {
-            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
-                    dxGm[dbParam.aTensorOffsetCv / d * value_d],
-                    dvDtmWsGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                    actualBlockShape3, false);
+            blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], dxGm[dbParam.aTensorOffsetCv / d * value_d],
+                       dvDtmWsGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, false);
         }
     }
 
@@ -685,14 +659,12 @@ public:
     ~FlashAttentionScoreGrad() {}
 
     template <int32_t CORE_TYPE = g_coreType>
-    CATLASS_DEVICE
-    void operator()(FAGKernelParams const &params);
+    CATLASS_DEVICE void operator()(FAGKernelParams const& params);
 
     template <>
-    CATLASS_DEVICE
-    void operator()<AscendC::AIC>(FAGKernelParams const &params)
+    CATLASS_DEVICE void operator()<AscendC::AIC>(FAGKernelParams const& params)
     {
-        __gm__ FAGTilingData *fagTilingData = reinterpret_cast<__gm__ FAGTilingData *>(params.tiling);
+        __gm__ FAGTilingData* fagTilingData = reinterpret_cast<__gm__ FAGTilingData*>(params.tiling);
         cCubeBlockIdx = AscendC::GetBlockIdx();
         cBlockIdx = cCubeBlockIdx * 2;
         Init(params, fagTilingData);
@@ -702,7 +674,7 @@ public:
         while (!isFinish) {
             isFinish = CalcValidBlock(blockStartIdx, startCoreId, dbParams[0]);
         }
-        
+
         dbParams[0].taskId = 0;
         if (dbParams[0].blockId != -1) {
             ComputeMM1(dbParams[0]);
@@ -731,7 +703,8 @@ public:
                     AscendC::CrossCoreWaitFlag(SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                     ComputeMMDqkv(dbParams[(taskId - 1) % 3], dbParams[(taskId) % 3].blockId);
                     if (dbParams[(taskId) % 3].blockId == -1) {
-                        AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_C2_V1_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
+                        AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(
+                            SYNC_C2_V1_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                     }
                 }
             }
@@ -762,18 +735,19 @@ public:
     }
 
     template <>
-    CATLASS_DEVICE
-    void operator()<AscendC::AIV>(FAGKernelParams const &params)
+    CATLASS_DEVICE void operator()<AscendC::AIV>(FAGKernelParams const& params)
     {
         // pre compute
         AscendC::TPipe pipePre;
-        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask, params.workspace, params.tiling);
+        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask,
+                                      params.workspace, params.tiling);
         epilogueFagPre();
         pipePre.Destroy();
 
         // vec SoftmaxGrad
         AscendC::TPipe pipeSoftmaxGrad;
-        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, params.cu_seq_qlen, params.workspace, params.tiling);
+        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, params.cu_seq_qlen,
+                                        params.workspace, params.tiling);
         epilogueFagSfmg();
         pipeSoftmaxGrad.Destroy();
 
@@ -782,7 +756,7 @@ public:
         cCubeBlockIdx = cBlockIdx / 2;
         cSubIdx = cBlockIdx % 2;
 
-        __gm__ FAGTilingData *fagTilingData = reinterpret_cast<__gm__ FAGTilingData *>(params.tiling);
+        __gm__ FAGTilingData* fagTilingData = reinterpret_cast<__gm__ FAGTilingData*>(params.tiling);
         Init(params, fagTilingData);
 
         // vector process
@@ -790,11 +764,13 @@ public:
         int8_t extraLoopNum = 1;
         AscendC::TPipe pipeVec;
         TBuf<> unifiedBuffer;
-        EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
-            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, nullptr,
-            params.workspace, params.tiling, unifiedBuffer);
+        EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout,
+                                            params.drop_mask, params.atten_mask, params.out, params.softmax_lse,
+                                            params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv,
+                                            nullptr, params.workspace, params.tiling, unifiedBuffer);
 
-        EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
+        EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace,
+                                            params.tiling, unifiedBuffer);
 
         bool isFinish = false;
         int64_t startCoreId = 0;
@@ -818,7 +794,8 @@ public:
 
                 if (taskId > 0 && dbParams[(taskId - 1) % 3].blockId != -1) {
                     epilogueFAGSabVec(dbParams[(taskId - 1) % 3]);
-                    AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);        
+                    AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(
+                        SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                 }
                 if constexpr (IS_DTM != ENABLE) {
                     if (dbParams[(taskId) % 3].blockId == -1) {
@@ -833,7 +810,8 @@ public:
                 }
                 if (taskId > 1) {
                     SyncAll();
-                    epilogueFAGDtmAdd(dbParams[(taskId - 2) % 3], dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, dqDtmWsGm, dkDtmWsGm, dvDtmWsGm);
+                    epilogueFAGDtmAdd(dbParams[(taskId - 2) % 3], dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm,
+                                      dqDtmWsGm, dkDtmWsGm, dvDtmWsGm);
                     SyncAll();
                 }
             }
@@ -847,12 +825,13 @@ public:
 
         // post compute
         AscendC::TPipe pipePost;
-        EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace, params.tiling);
+        EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace,
+                                        params.tiling);
         epilogueFagPost();
         pipePost.Destroy();
     }
 
-private:
+  private:
     Arch::Resource<ArchTag> resource;
     constexpr static uint64_t SYNC_MODE2 = 2;
     static constexpr uint64_t SYNC_V1_C2_FLAG[3] = {4, 5, 6};
@@ -895,8 +874,8 @@ private:
 
     int64_t dqOutBase{0};
     int64_t kvOutBase{0};
-    int64_t dqOutIdx{0};   // bn2gs1o
-    int64_t kvOutIdx{0};   // bn2s2o
+    int64_t dqOutIdx{0}; // bn2gs1o
+    int64_t kvOutIdx{0}; // bn2s2o
     int64_t dqOutArr[24];
     int64_t kvOutArr[24];
 
@@ -983,25 +962,21 @@ struct TypeSelector<DTemplateType::Aligned256> {
     using L0TileShapeCube2 = GemmShape<128, 256, 64>;
 };
 
-template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
-          const uint32_t INPUT_LAYOUT = BSND, const bool IS_ATTEN_MASK = 0,
-          const bool IS_DROP = 0,
+template <const DTemplateType DTEMPLATETYPE, typename DataType = half, const uint32_t INPUT_LAYOUT = BSND,
+          const bool IS_ATTEN_MASK = 0, const bool IS_DROP = 0,
           const bool IS_DTM = 0, // 是否开启确定性计算
-          const bool HAS_SOFTCAP = 0
-          >
-CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
-                        GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
-                        GM_ADDR atten_mask, GM_ADDR softmax_lse,
-                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
-                        GM_ADDR dk_, GM_ADDR dv_,
-                        GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
-) {
+          const bool HAS_SOFTCAP = 0>
+CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
+                               GM_ADDR drop_mask, GM_ADDR atten_mask, GM_ADDR softmax_lse, GM_ADDR cu_seq_qlen,
+                               GM_ADDR cu_seq_kvlen, GM_ADDR dq_, GM_ADDR dk_, GM_ADDR dv_, GM_ADDR workspace,
+                               GM_ADDR tiling, GM_ADDR ptrDump = nullptr)
+{
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
 
-    #if defined(ENABLE_ASCENDC_DUMP)
-        AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
-    #endif
+#if defined(ENABLE_ASCENDC_DUMP)
+    AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
+#endif
 
     using ArchTag = Arch::AtlasA2;
 
@@ -1026,21 +1001,23 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using L0TileShapeCube3 = L0TileShapeCube2;
 
     // Cube1 计算：左矩阵不转置，右矩阵转置。实现 (Q * K^T) 和 dP = dOut * V^T
-    using ElementA1 = DataType;               // q和dout
+    using ElementA1 = DataType; // q和dout
     using LayoutA1 = layout::RowMajor;
-    using ElementB1 = DataType;               // k和v
+    using ElementB1 = DataType; // k和v
     using LayoutB1 = layout::ColumnMajor;
     using ElementC1 = float;
     using LayoutC1 = layout::RowMajor;
     using A1Type = Catlass::Gemm::GemmType<ElementA1, LayoutA1>;
     using B1Type = Catlass::Gemm::GemmType<ElementB1, LayoutB1>;
     using C1Type = Catlass::Gemm::GemmType<ElementC1, LayoutC1>;
-    using BlockMmadFAGCube1 = Catlass::Gemm::Block::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1, L0TileShapeCube1, A1Type, B1Type, C1Type>;
+    using BlockMmadFAGCube1 =
+        Catlass::Gemm::Block::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1, L0TileShapeCube1,
+                                              A1Type, B1Type, C1Type>;
 
     // Cube2 计算：左矩阵不转置，右矩阵不转置。实现 dQ = dS * K
-    using ElementA2 = DataType;           // ds
+    using ElementA2 = DataType; // ds
     using LayoutA2 = layout::RowMajor;
-    using ElementB2 = DataType;           // k
+    using ElementB2 = DataType; // k
     using LayoutB2 = layout::RowMajor;
     using ElementC2 = float;
     using LayoutC2 = layout::RowMajor;
@@ -1049,12 +1026,14 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B2Type = Catlass::Gemm::GemmType<ElementB2, LayoutB2>;
     using C2Type = Catlass::Gemm::GemmType<ElementC2, LayoutC2>;
 
-    using BlockMmadFAGCube2 = Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2, L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>;
+    using BlockMmadFAGCube2 =
+        Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2,
+                                           L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>;
 
     // Cube3 计算：左矩阵转置，右矩阵不转置。 实现 dK = dS^T * Q 和 dV = P^T * dOut
-    using ElementA3 = DataType;              // ds和p
+    using ElementA3 = DataType; // ds和p
     using LayoutA3 = layout::ColumnMajor;
-    using ElementB3 = DataType;              // q和dout
+    using ElementB3 = DataType; // q和dout
     using LayoutB3 = layout::RowMajor;
     using ElementC3 = float;
     using LayoutC3 = layout::RowMajor;
@@ -1063,7 +1042,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B3Type = Catlass::Gemm::GemmType<ElementB3, LayoutB3>;
     using C3Type = Catlass::Gemm::GemmType<ElementC3, LayoutC3>;
 
-    using BlockMmadFAGCube3 = Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3, L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>;
+    using BlockMmadFAGCube3 =
+        Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3,
+                                           L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>;
 
     // Epilogue
     using ElementOutput = float;
@@ -1084,13 +1065,15 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
 
     // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
     using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT>;
-    
+
     // 使用模板特化根据INPUT_LAYOUT选择布局标签
     using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, InputType, FAGTilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2SameAbVec = Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>;
-    using EpilogueFAGSabVec = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
+    using EpilogueAtlasA2SameAbVec =
+        Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>;
+    using EpilogueFAGSabVec =
+        Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
     using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
@@ -1101,8 +1084,11 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using EpilogueFAGDtmAdd = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGDtmAdd>;
 
     // Kernel level
-    using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
-    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, nullptr, workspace, tiling};
+    using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
+                                              EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd,
+                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
+    FAGKernelParams params{dout,         q,   k,   v,   out,     drop_mask, atten_mask, softmax_lse, cu_seq_qlen,
+                           cu_seq_kvlen, dq_, dk_, dv_, nullptr, workspace, tiling};
 
     // call kernel
     FAGKernel flashAttn;

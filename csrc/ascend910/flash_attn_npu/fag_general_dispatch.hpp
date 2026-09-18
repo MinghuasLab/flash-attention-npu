@@ -35,23 +35,23 @@ struct FagGeneralLaunchArgs {
     bool deterministic;
     bool is_softcap;
     bool has_dropout = false;
-    uint8_t *dropMaskDevice = nullptr;
+    uint8_t* dropMaskDevice = nullptr;
     uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256
-    uint8_t *dOutDevice;
-    uint8_t *qDevice;
-    uint8_t *kDevice;
-    uint8_t *vDevice;
-    uint8_t *outDevice;
-    uint8_t *attenMaskDevice;     // may be nullptr when is_causal is false
-    uint8_t *softMaxLseDevice;
-    uint8_t *cuSeqQlenDevice;
-    uint8_t *cuSeqKvlenDevice;
-    uint8_t *dqDevice;
-    uint8_t *dkDevice;
-    uint8_t *dvDevice;
-    uint8_t *alibiSlopesDevice;
-    uint8_t *workspaceDevice;
-    uint8_t *tilingDevice;
+    uint8_t* dOutDevice;
+    uint8_t* qDevice;
+    uint8_t* kDevice;
+    uint8_t* vDevice;
+    uint8_t* outDevice;
+    uint8_t* attenMaskDevice; // may be nullptr when is_causal is false
+    uint8_t* softMaxLseDevice;
+    uint8_t* cuSeqQlenDevice;
+    uint8_t* cuSeqKvlenDevice;
+    uint8_t* dqDevice;
+    uint8_t* dkDevice;
+    uint8_t* dvDevice;
+    uint8_t* alibiSlopesDevice;
+    uint8_t* workspaceDevice;
+    uint8_t* tilingDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in
@@ -59,14 +59,15 @@ struct FagGeneralLaunchArgs {
 // its dtype's FAGGeneral variants for the requested layout (causal x
 // deterministic x headdim => 16 per layout). Defined via fag_general_dispatch_impl.hpp.
 template <uint32_t kInputLayout>
-void launch_fag_general_dispatch_bf16(const FagGeneralLaunchArgs &a);
+void launch_fag_general_dispatch_bf16(const FagGeneralLaunchArgs& a);
 template <uint32_t kInputLayout>
-void launch_fag_general_dispatch_fp16(const FagGeneralLaunchArgs &a);
+void launch_fag_general_dispatch_fp16(const FagGeneralLaunchArgs& a);
 
 // Runtime entry: pick dtype, dispatch to the matching dtype TU. kInputLayout
 // (TND / BSND) is fixed at the call site.
 template <uint32_t kInputLayout>
-inline void launch_fag_general_dispatch(bool is_bf16, const FagGeneralLaunchArgs &a) {
+inline void launch_fag_general_dispatch(bool is_bf16, const FagGeneralLaunchArgs& a)
+{
     if (is_bf16) {
         launch_fag_general_dispatch_bf16<kInputLayout>(a);
     } else {

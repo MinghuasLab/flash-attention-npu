@@ -19,28 +19,11 @@
 
 namespace Catlass::Gemm::Block {
 
-template <
-    bool PAGED_CACHE_FLAG_,
-    bool ENABLE_UNIT_FLAG_,
-    class L1TileShape_,
-    class L0TileShape_,
-    class AType_,
-    class BType_,
-    class CType_,
-    class BiasType_,
-    class TileCopy_,
-    class TileMmad_>
-struct BlockMmad<
-    MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>,
-    L1TileShape_,
-    L0TileShape_,
-    AType_,
-    BType_,
-    CType_,
-    BiasType_,
-    TileCopy_,
-    TileMmad_> {
-public:
+template <bool PAGED_CACHE_FLAG_, bool ENABLE_UNIT_FLAG_, class L1TileShape_, class L0TileShape_, class AType_,
+          class BType_, class CType_, class BiasType_, class TileCopy_, class TileMmad_>
+struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1TileShape_, L0TileShape_, AType_, BType_,
+                 CType_, BiasType_, TileCopy_, TileMmad_> {
+  public:
     // Type Aliases
     using DispatchPolicy = MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
@@ -89,25 +72,23 @@ public:
 
     static_assert(std::is_same_v<LayoutC, layout::RowMajor>, "LayoutC only support RowMajor yet!");
 
-    __aicore__ inline
-    BlockMmad() {}
+    __aicore__ inline BlockMmad() {}
 
-    __aicore__ inline
-    ~BlockMmad() {}
-    __aicore__ inline
-    void SetPingPongState(BlockPingPongState *state) { pingPongState = state; }
+    __aicore__ inline ~BlockMmad() {}
+    __aicore__ inline void SetPingPongState(BlockPingPongState* state)
+    {
+        pingPongState = state;
+    }
 
-    __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn,
-              uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0,
-              uint32_t ndCopyBufAddr = 0)
+    __aicore__ inline void init(Arch::Resource<ArchTag>& resource, uint32_t nDyn, uint32_t kDyn,
+                                uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0, uint32_t ndCopyBufAddr = 0)
     {
         maxKVStackLen = KVStackLen;
         // Allocate L1 memory space
         l1ATensor = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart);
         for (uint32_t i = 0; i < STAGES; i++) {
-            l1BTensor[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart +
-                L1TileShape::M * kDyn * sizeof(ElementA) + nDyn * kDyn * sizeof(ElementB) * i);
+            l1BTensor[i] = resource.l1Buf.template GetBufferByByte<ElementB>(
+                l1BufAddrStart + L1TileShape::M * kDyn * sizeof(ElementA) + nDyn * kDyn * sizeof(ElementB) * i);
             l0ATensor[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
             l0BTensor[i] = resource.l0BBuf.template GetBufferByByte<ElementB>(L0B_PINGPONG_BUF_SIZE * i);
             l0CTensor[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(L0C_PINGPONG_BUF_SIZE * i);
@@ -121,11 +102,8 @@ public:
         }
     }
 
-    __aicore__ inline
-    void loadQGM(
-        AscendC::GlobalTensor<ElementA> gA,
-        LayoutA layoutA,
-        uint32_t rowNum, uint32_t &singleGroupHeads, uint32_t &qHeads)
+    __aicore__ inline void loadQGM(AscendC::GlobalTensor<ElementA> gA, LayoutA layoutA, uint32_t rowNum,
+                                   uint32_t& singleGroupHeads, uint32_t& qHeads)
     {
         uint32_t embed = layoutA.shape(1);
         uint32_t rowNumRound = RoundUp(rowNum, L1AAlignHelper::M_ALIGNED);
@@ -135,26 +113,21 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
         if (singleGroupHeads == 1U) {
             LayoutA denseSrc(rowNum, embed, qHeads * embed);
-            copyGmToL1A(
-                l1ATensor, gA,
-                layoutAInL1, denseSrc);
+            copyGmToL1A(l1ATensor, gA, layoutAInL1, denseSrc);
         } else {
-            copyGmToL1A(
-                l1ATensor, gA,
-                layoutAInL1, layoutSingleANd,
-                tokenNumPerGroup, qHeads * embed, tokenNumPerGroup, BLOCK_SIZE, rowNumRound);
+            copyGmToL1A(l1ATensor, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, qHeads * embed, tokenNumPerGroup,
+                        BLOCK_SIZE, rowNumRound);
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
     }
 
-    __aicore__ inline
-    void setBlockParam(uint32_t stackSeqTile, uint32_t &blockStart, uint32_t &blockEnd, uint32_t &curBlockTotalNum,
-        uint32_t blockSize)
+    __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
+                                         uint32_t& curBlockTotalNum, uint32_t blockSize)
     {
-        if(stackSeqTile >= blockStart && blockSize != 0) {
-            blockEnd = ((stackSeqTile - blockStart) % blockSize == 0) ?
-                blockSize : (stackSeqTile - blockStart) % blockSize;
+        if (stackSeqTile >= blockStart && blockSize != 0) {
+            blockEnd =
+                ((stackSeqTile - blockStart) % blockSize == 0) ? blockSize : (stackSeqTile - blockStart) % blockSize;
             curBlockTotalNum = (((stackSeqTile - blockStart) + blockSize - 1) / blockSize) + 1;
         } else {
             curBlockTotalNum = 1;
@@ -162,9 +135,9 @@ public:
             blockEnd = stackSeqTile + blockStartOffset;
         }
     }
-    
-    __aicore__ inline
-    void getBlockShape(GemmCoord &actualShape, uint32_t nL1Idx, uint32_t nL1Loop, uint32_t stackSeqTile)
+
+    __aicore__ inline void getBlockShape(GemmCoord& actualShape, uint32_t nL1Idx, uint32_t nL1Loop,
+                                         uint32_t stackSeqTile)
     {
         uint32_t nSplitSize = l1NDynamic;
         if (nL1Idx == nL1Loop - 1U) {
@@ -173,60 +146,50 @@ public:
         actualShape[COORD_DIM1] = nSplitSize;
     }
 
-    __aicore__ inline
-    void getBlockShape(GemmCoord &actualShape, uint32_t& blockStartOffset, uint32_t& l1NResDynamic, uint32_t& kvL1Len,
-        uint32_t& nowLen, uint32_t& blockSize)
+    __aicore__ inline void getBlockShape(GemmCoord& actualShape, uint32_t& blockStartOffset, uint32_t& l1NResDynamic,
+                                         uint32_t& kvL1Len, uint32_t& nowLen, uint32_t& blockSize)
     {
-        nowLen = (blockSize - blockStartOffset < l1NResDynamic - kvL1Len) ?
-                blockSize - blockStartOffset :
-                l1NResDynamic - kvL1Len;
+        nowLen = (blockSize - blockStartOffset < l1NResDynamic - kvL1Len) ? blockSize - blockStartOffset
+                                                                          : l1NResDynamic - kvL1Len;
         actualShape[COORD_DIM1] = nowLen;
     }
 
-    __aicore__ inline
-    void getKVOffset(uint32_t &kOffset, uint32_t nIdx, uint32_t nowNIdx, uint32_t strideKV)
+    __aicore__ inline void getKVOffset(uint32_t& kOffset, uint32_t nIdx, uint32_t nowNIdx, uint32_t strideKV)
     {
         kOffset = nIdx * maxKVStackLen * strideKV + nowNIdx * l1NDynamic * strideKV;
     }
 
-    __aicore__ inline
-    void getKVOffset(AscendC::GlobalTensor<int32_t> &gBlockTable, uint32_t &kOffset, uint32_t nowNIdx, 
-        uint32_t startOffset, uint32_t strideKV, uint32_t blockSize)
+    __aicore__ inline void getKVOffset(AscendC::GlobalTensor<int32_t>& gBlockTable, uint32_t& kOffset, uint32_t nowNIdx,
+                                       uint32_t startOffset, uint32_t strideKV, uint32_t blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
         kOffset = blockTableId * blockSize * strideKV + startOffset * strideKV;
     }
 
-    __aicore__ inline
-    void resetBlockStart(uint32_t kvStart, uint32_t pagedBlockSize)
+    __aicore__ inline void resetBlockStart(uint32_t kvStart, uint32_t pagedBlockSize)
     {
         blockStartOffset = kvStart * maxKVStackLen % pagedBlockSize;
     }
 
-    __aicore__ inline
-    void updateBlockOffset(uint32_t nowLen, uint32_t &curBlockIdx, uint32_t blockSize)
+    __aicore__ inline void updateBlockOffset(uint32_t nowLen, uint32_t& curBlockIdx, uint32_t blockSize)
     {
-        if(blockStartOffset + nowLen == blockSize){
+        if (blockStartOffset + nowLen == blockSize) {
             blockStartOffset = 0;
             curBlockIdx++;
-        } else{
+        } else {
             blockStartOffset += nowLen;
         }
     }
 
-    __aicore__ inline
-    void operator()(AscendC::GlobalTensor<ElementA> gA,
-                    AscendC::GlobalTensor<ElementB> gB,
-                    AscendC::GlobalTensor<ElementC> gC,
-                    AscendC::GlobalTensor<int32_t> gBlockTable,
-                    LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
-                    uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV,
-                    bool doCopyback = false,
-                    AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
-                    uint64_t cacheRowBase = 0,
-                    AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
-                    uint32_t cachePageSize = 0,
-                    uint32_t cacheTableBase = 0)
+    __aicore__ inline void operator()(AscendC::GlobalTensor<ElementA> gA, AscendC::GlobalTensor<ElementB> gB,
+                                      AscendC::GlobalTensor<ElementC> gC, AscendC::GlobalTensor<int32_t> gBlockTable,
+                                      LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
+                                      uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV,
+                                      bool doCopyback = false,
+                                      AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
+                                      uint64_t cacheRowBase = 0,
+                                      AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
+                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0)
     {
         (void)doCopyback;
         (void)gBCache;
@@ -252,7 +215,7 @@ public:
 
         uint32_t tileNNumPerBaseBlock = blockSize / l1NDynamic;
         uint32_t nL1Loop = CeilDiv(stackSeqTile, l1NDynamic);
-        uint32_t curBlockIdx =  0;
+        uint32_t curBlockIdx = 0;
         uint32_t blockStart = 0;
         uint32_t blockEnd = 0;
         uint32_t curBlockTotalNum = 0;
@@ -282,13 +245,14 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KPingPongFlag);
                     writebackK(gB, gBOffset, nL1Idx, nActual, kActual, strideKV);
                 } else {
-                    uint32_t l1NResDynamic = (nL1Idx < (nL1Loop-1)) ? l1NDynamic : (stackSeqTile - nL1Idx * l1NDynamic);
+                    uint32_t l1NResDynamic =
+                        (nL1Idx < (nL1Loop - 1)) ? l1NDynamic : (stackSeqTile - nL1Idx * l1NDynamic);
                     layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(embed, l1NResDynamic);
                     uint32_t kvL1Len = 0;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1KPingPongFlag);
-                    while(kvL1Len < l1NResDynamic){
+                    while (kvL1Len < l1NResDynamic) {
                         uint32_t nowLen = 0;
-                        uint32_t curBlockSize = (curBlockIdx < (curBlockTotalNum-1)) ? blockSize : blockEnd;
+                        uint32_t curBlockSize = (curBlockIdx < (curBlockTotalNum - 1)) ? blockSize : blockEnd;
                         uint32_t nowNIdx = nIdx * maxKVStackLen / blockSize + curBlockIdx;
                         getBlockShape(actualShape, blockStartOffset, l1NResDynamic, kvL1Len, nowLen, curBlockSize);
                         getKVOffset(gBlockTable, gBOffset, nowNIdx, blockStartOffset, strideKV, blockSize);
@@ -353,13 +317,8 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
                     bool initMmad = (kL0Idx == 0U);
                     uint32_t mL0Align = (mL0Actual + BLOCK_SIZE - 1U) / BLOCK_SIZE * BLOCK_SIZE;
-                    tileMmad(l0CTensor[l0CPingPongFlag],
-                        l0ATensor[l0ABPingPongFlag],
-                        l0BTensor[l0ABPingPongFlag],
-                        mL0Align,
-                        nActual,
-                        kL0Actual,
-                        initMmad);
+                    tileMmad(l0CTensor[l0CPingPongFlag], l0ATensor[l0ABPingPongFlag], l0BTensor[l0ABPingPongFlag],
+                             mL0Align, nActual, kL0Actual, initMmad);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
                 }
@@ -376,15 +335,14 @@ public:
 
     // stage the new-K sub-tile in ND layout and write it back to the
     // cache at row appendCacheRowBase + nL1Idx*l1NDynamic
-    __aicore__ inline
-    void writebackK(AscendC::GlobalTensor<ElementB> &gB, uint32_t gBOffset,
-                    uint32_t nL1Idx, uint32_t nActual, uint32_t kActual, uint32_t strideKV)
+    __aicore__ inline void writebackK(AscendC::GlobalTensor<ElementB>& gB, uint32_t gBOffset, uint32_t nL1Idx,
+                                      uint32_t nActual, uint32_t kActual, uint32_t strideKV)
     {
         if (!appendDoCopyback) {
             return;
         }
         AscendC::DataCopyParams ndLoadParams(nActual, kActual / BLOCK_SIZE,
-            strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE, 0);
+                                             strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE, 0);
         AscendC::DataCopy(ndCopyTensor, gB[gBOffset], ndLoadParams);
         AscendC::PipeBarrier<PIPE_ALL>();
         storeKToCache(appendCacheRowBase + nL1Idx * l1NDynamic, nActual, kActual, strideKV);
@@ -392,12 +350,11 @@ public:
     }
 
     // Copy the ND-staged new-K sub-tile into the cache
-    __aicore__ inline
-    void storeKToCache(uint64_t rowBase, uint32_t nActual, uint32_t kActual, uint32_t strideKV)
+    __aicore__ inline void storeKToCache(uint64_t rowBase, uint32_t nActual, uint32_t kActual, uint32_t strideKV)
     {
         if (appendCachePageSize == 0U) {
-            AscendC::DataCopyParams ndStoreParams(nActual, kActual / BLOCK_SIZE,
-                0, strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
+            AscendC::DataCopyParams ndStoreParams(nActual, kActual / BLOCK_SIZE, 0,
+                                                  strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
             AscendC::DataCopy(appendGBCache[rowBase * strideKV], ndCopyTensor, ndStoreParams);
             return;
         }
@@ -408,17 +365,16 @@ public:
             const uint32_t pageOff = segRow % appendCachePageSize;
             const uint32_t segLen = AscendC::Std::min(nActual - segSrc, appendCachePageSize - pageOff);
             const uint32_t pageBase = static_cast<uint32_t>(appendGCacheTable.GetValue(pageIdx)) * appendCachePageSize;
-            AscendC::DataCopyParams ndStoreParams(segLen, kActual / BLOCK_SIZE,
-                0, strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
-            AscendC::DataCopy(
-                appendGBCache[(uint64_t)(pageBase + pageOff) * strideKV],
-                ndCopyTensor[segSrc * kActual], ndStoreParams);
+            AscendC::DataCopyParams ndStoreParams(segLen, kActual / BLOCK_SIZE, 0,
+                                                  strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
+            AscendC::DataCopy(appendGBCache[(uint64_t)(pageBase + pageOff) * strideKV], ndCopyTensor[segSrc * kActual],
+                              ndStoreParams);
             segRow += segLen;
             segSrc += segLen;
         }
     }
 
-protected:
+  protected:
     /// Data members
     AscendC::LocalTensor<ElementA> l1ATensor;
     AscendC::LocalTensor<ElementB> l1BTensor[STAGES];
@@ -433,7 +389,7 @@ protected:
     CopyL1ToL0B copyL1ToL0B;
     CopyL0CToGm copyL0CToGm;
 
-    BlockPingPongState *pingPongState = nullptr;
+    BlockPingPongState* pingPongState = nullptr;
     uint32_t l1KPingPongFlag = 0;
     uint32_t l0ABPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;
@@ -455,6 +411,6 @@ protected:
     uint32_t appendCacheTableBase = 0;
 };
 
-}
+} // namespace Catlass::Gemm::Block
 
 #endif

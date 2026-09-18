@@ -22,7 +22,7 @@ constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint32_t SIZE_OF_16BIT = 2;
 constexpr uint32_t SIZE_OF_32BIT = 4;
 constexpr uint32_t PRELAUNCH_NUM = 3;
-constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4;  // 128 MiB
+constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
 
 // The mask buffer is present whenever the final mask type is not NO_MASK
 // (causal or band/SWA); the tiling blob sits right after it, then kvCum.
@@ -73,10 +73,9 @@ inline uint64_t UpdateOutSize(uint64_t blockDim)
 
 inline uint64_t WorkSpaceSize(uint64_t blockDim)
 {
-    return Mm1OutSize(blockDim) + SmOnlineOutSize(blockDim) +
-           Mm2OutSize(blockDim) + UpdateOutSize(blockDim);
+    return Mm1OutSize(blockDim) + SmOnlineOutSize(blockDim) + Mm2OutSize(blockDim) + UpdateOutSize(blockDim);
 }
-}  // namespace fa_metadata
+} // namespace fa_metadata
 
 struct FwdMaskDerivation {
     bool is_causal;
@@ -91,9 +90,7 @@ struct FwdMaskDerivation {
 // (max_seqlen_k / cache capacity) instead of the device-side actual max KV
 // seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
 // allowed. Both metadata creation and fwd consumption use the same derivation.
-inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left,
-                                       int64_t window_right,
-                                       int64_t /*max_seqlen_q*/,
+inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
                                        int64_t max_seqlen_k_bound)
 {
     if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
@@ -118,8 +115,7 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left,
     }
     derived.window_left = window_left;
     derived.window_right = window_right;
-    derived.maskType = derived.is_local ? 4u
-        : (derived.is_causal ? 1u : 0u);
+    derived.maskType = derived.is_local ? 4u : (derived.is_causal ? 1u : 0u);
     return derived;
 }
 
