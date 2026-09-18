@@ -22,8 +22,12 @@ log "build phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 
 # ---------- 1. 子模块 ----------
-log "init submodules: csrc/catlass"
-git submodule update --init --recursive csrc/catlass
+# 只初始化 catlass 本层: 编译只需要它的 include 头文件 (setup.py -I)。
+# 不加 --recursive, 跳过嵌套的 googletest / AscendNPU-IR / triton /
+# llvm-project (catlass TLA DSL 的开发依赖, github 直连慢且不稳,
+# 递归克隆曾在网络抖动时阻塞 CI 构建)。
+log "init submodules: csrc/catlass (no recursion, headers only)"
+git submodule update --init csrc/catlass
 
 # ---------- 2. 编译 (python setup.py build_ext --inplace) ----------
 # 用 --inplace 把 .so 直接放到源码目录, 避免从仓库根 import 时源码目录

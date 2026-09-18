@@ -126,8 +126,6 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left,
 struct FAMetadataArgs {
     uint64_t seqlensQAddr;
     uint64_t seqlensKAddr;
-    uint32_t isSeqlensQCumulative;
-    uint32_t isSeqlensKCumulative;
     uint64_t metaOutAddr;
     uint32_t batch;
     uint32_t numHeads;
@@ -142,6 +140,10 @@ struct FAMetadataArgs {
     int32_t windowSizeLeft;
     int32_t windowSizeRight;
     uint32_t blockDim;
+    // Layout note: keep at the offsets isVarlen/isVarlenKv occupied on main
+    // (cross-module common-prefix compatibility; see the 910 v3 copy).
+    uint32_t isSeqlensQCumulative;
+    uint32_t isSeqlensKCumulative;
     uint32_t pagedKV;
     float softmaxScale;
 };

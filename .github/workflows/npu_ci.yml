@@ -227,7 +227,8 @@ jobs:
     timeout-minutes: 240
     env:
       CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
-      CI_RUN_EXAMPLE_ST: "true"
+      # debug 轮: 只跑 [FAMETA-*] 探针, 跳过 pytest (探针结论确认后改回 "true")
+      CI_RUN_EXAMPLE_ST: "false"
       CI_TEST_WORKERS: ${{ needs.prepare.outputs.workers }}
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
