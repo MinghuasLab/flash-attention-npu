@@ -997,6 +997,42 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
 
 
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
+@pytest.mark.parametrize(
+    "max_seqlen_k", [128, 2, 192], ids=["max_length", "head_count", "total_tokens"]
+)
+def test_flash_attn_kvcache_metadata_tnd_max_seqlen_k(monkeypatch, max_seqlen_k):
+    from flash_attn_npu_3 import flash_attn_npu_interface as interface
+
+    scheduler_metadata = torch.empty(0, dtype=torch.uint8)
+    scheduler_metadata._fa_scheduler_params = dict(
+        causal=False,
+        window_size=WINDOW_SIZE,
+        softcap=0.0,
+        softmax_scale=128 ** (-0.5),
+        varlen_q=True,
+        num_splits=0,
+        max_seqlen_q=16,
+        max_seqlen_k=max_seqlen_k,
+        page_size=None,
+    )
+    query = torch.empty(32, 4, 128)
+    key_cache = torch.empty(192, 2, 128)
+    value_cache = torch.empty_like(key_cache)
+    monkeypatch.setattr(interface, "_flash_attn_forward", lambda *args, **kwargs: (args[0], None))
+    kwargs = dict(
+        cache_seqlens=torch.tensor([64, 128], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 16, 32], dtype=torch.int32),
+        max_seqlen_q=16,
+        scheduler_metadata=scheduler_metadata,
+    )
+    if max_seqlen_k == 128:
+        assert interface.flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs) is query
+    else:
+        with pytest.raises(ValueError, match="max_seqlen_k"):
+            interface.flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs)
+
+
+@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     """Paged geometry baked into the tiling must match the call's cache/page table."""
     data_type = torch.bfloat16

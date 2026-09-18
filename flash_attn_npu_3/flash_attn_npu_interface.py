@@ -1279,6 +1279,7 @@ def flash_attn_with_kvcache(
             num_splits=num_splits,
             page_table=page_table,
             k_cache=k_cache,
+            cache_seqlens=cache_seqlens,
         )
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
@@ -1332,6 +1333,7 @@ def _validate_scheduler_metadata(
     num_splits,
     page_table,
     k_cache,
+    cache_seqlens,
 ):
     """Reject scheduler_metadata created with arguments that do not match this
     call; the AICPU-written tiling bakes in the mask layout, paged geometry,
@@ -1359,7 +1361,12 @@ def _validate_scheduler_metadata(
         expected["max_seqlen_k"] = int(k_cache.shape[1]) * int(page_table.shape[1])
     else:
         expected["page_size"] = None
-        expected["max_seqlen_k"] = int(k_cache.shape[1])
+        if varlen_q and k_cache.dim() == 3:
+            if cache_seqlens is None:
+                raise ValueError("cache_seqlens must be provided for a non-paged TND KV cache")
+            expected["max_seqlen_k"] = int(cache_seqlens.max().item())
+        else:
+            expected["max_seqlen_k"] = int(k_cache.shape[1])
     mismatches = []
     for key, call_val in expected.items():
         meta_val = params.get(key, "<missing>")
