@@ -18,9 +18,9 @@ def test_fa2_910_scheduler_metadata_torch_compile_correctness():
         api,
         expected_sizes={
             "NO_MASK": 2416,
-            "CAUSAL": 4196720,
-            "LOCAL_LEFT": 4196720,
-            "LOCAL_RIGHT": 4196720,
+            "CAUSAL": 2416,
+            "LOCAL_LEFT": 2416,
+            "LOCAL_RIGHT": 2416,
             "FULL_WINDOW_COLLAPSE": 2416,
         },
     )

@@ -155,19 +155,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->pvOutSize = fa_metadata::Mm2OutSize(blockDim);
     tilingData->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
 
-    if (hasMask) {
-        // Same triu(1) mask the host path uploads for both causal and band/SWA;
-        // the band restriction is applied by the kernel from windowSizeLeft/Right.
-        int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
-        const uint32_t maskDim = fa_metadata::MASK_DIM;
-        for (uint32_t row = 0; row < maskDim; ++row) {
-            int8_t *maskRow = maskBase + static_cast<uint64_t>(row) * maskDim;
-            for (uint32_t col = 0; col < maskDim; ++col) {
-                maskRow[col] = (col > row) ? static_cast<int8_t>(1) : static_cast<int8_t>(0);
-            }
-        }
-    }
-
     AscendC::DataStoreBarrier();
     return 0;
 }

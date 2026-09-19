@@ -13,10 +13,10 @@ namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
 
-// The mask buffer is present whenever the final mask type is not NO_MASK
-// (causal or band/SWA); the tiling blob sits right after it.
-inline uint64_t TilingOffset(bool has_mask) { return has_mask ? MASK_BYTES : 0; }
-inline uint64_t MetadataBytes(bool has_mask) { return TilingOffset(has_mask) + sizeof(FAInferTilingData); }
+// scheduler_metadata is tiling-only. The 2048x2048 compressed triu(1) mask is a
+// process-wide per-device NPU cache (see CachedCompressedTriuMask).
+inline uint64_t TilingOffset(bool /*has_mask*/) { return 0; }
+inline uint64_t MetadataBytes(bool /*has_mask*/) { return sizeof(FAInferTilingData); }
 
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;

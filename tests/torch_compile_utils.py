@@ -166,7 +166,14 @@ def run_metadata_compile_test(api, expected_sizes=None):
         assert not eager.requires_grad
 
         if expected_sizes is not None:
-            assert eager.numel() == expected_sizes[case_name]
+            assert eager.numel() == expected_sizes[case_name], (
+                f"{case_name}: scheduler_metadata numel={eager.numel()}, "
+                f"expected {expected_sizes[case_name]}. "
+                "Tiling-only metadata is sizeof(FAInferTilingData) for every "
+                "mask type; a ~4MB larger causal/SWA blob means the installed "
+                "extension still packs the 2048x2048 triu into metadata and "
+                "needs a rebuild."
+            )
 
         eager_fp = getattr(
             eager,
@@ -209,11 +216,12 @@ def run_metadata_compile_test(api, expected_sizes=None):
         == observed_sizes["FULL_WINDOW_COLLAPSE"]
     )
 
+    # scheduler_metadata is tiling-only; the 2048x2048 triu lives in a
+    # process-wide device cache, so causal/SWA blobs match NO_MASK size.
     base = observed_sizes["NO_MASK"]
-
-    assert observed_sizes["CAUSAL"] > base
-    assert observed_sizes["LOCAL_LEFT"] > base
-    assert observed_sizes["LOCAL_RIGHT"] > base
+    assert observed_sizes["CAUSAL"] == base
+    assert observed_sizes["LOCAL_LEFT"] == base
+    assert observed_sizes["LOCAL_RIGHT"] == base
 
 
 def varlen_kwargs(api, cu_q, cu_k, max_seq):

@@ -29,6 +29,7 @@
 #include "tiling.cpp"
 #include "tilingdata.h"
 #include "fa_metadata_args.h"
+#include "cached_triu_mask.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -289,8 +290,8 @@ mha_fwd(at::Tensor q,
                     "scheduler_metadata must be an NPU tensor");
         // Derive the mask axes from this call's arguments the same way
         // get_scheduler_metadata did when producing the buffer, so the
-        // template selection and the tiling offset match the AICPU-written
-        // tiling. No D2H is needed, so NPUGraph capture keeps working.
+        // template selection matches the AICPU-written tiling. The compressed
+        // triu mask is a static per-device NPU cache, not packed into metadata.
         int64_t kvSeqlenBound = 0;
         if (is_varlen_kv) {
             kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
@@ -313,7 +314,10 @@ mha_fwd(at::Tensor q,
 
         metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        maskDevice = hasMask ? metaBase : nullptr;
+        if (hasMask) {
+            mask_npu_tensor = CachedCompressedTriuMask();
+            maskDevice = static_cast<uint8_t *>(mask_npu_tensor.data_ptr());
+        }
     } else {
         at::Tensor cu_seqlen_q_cpu;
         if (is_varlen_q) {
@@ -410,10 +414,7 @@ mha_fwd(at::Tensor q,
         tilingDevice = static_cast<uint8_t *>(tiling_dev.data_ptr());
 
         if (is_causal || is_local) {
-            at::Tensor mask_cpu_tensor =
-                at::triu(at::ones({2048, 2048},
-                                  at::device(c10::kCPU).dtype(at::kByte)), 1);
-            mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            mask_npu_tensor = CachedCompressedTriuMask();
             maskDevice = static_cast<uint8_t *>(mask_npu_tensor.data_ptr());
         }
     }

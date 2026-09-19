@@ -958,10 +958,9 @@ class _FAInferTilingData(ctypes.Structure):
     ]
 
 
-def _tiling_from_metadata(scheduler_metadata, has_mask):
+def _tiling_from_metadata(scheduler_metadata, has_mask=False):
     raw = scheduler_metadata.cpu().numpy()
-    mask_bytes = 2048 * 2048 if has_mask else 0
-    blob = raw[mask_bytes:mask_bytes + ctypes.sizeof(_FAInferTilingData)]
+    blob = raw[:ctypes.sizeof(_FAInferTilingData)]
     tiling = _FAInferTilingData.from_buffer_copy(blob)
     return tiling
 

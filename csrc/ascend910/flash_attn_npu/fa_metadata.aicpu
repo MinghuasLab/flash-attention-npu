@@ -15,6 +15,7 @@
 #include "fa_split.h"
 #include "tilingdata.h"
 #include <cstdint>
+#include <cstring>
 
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
@@ -50,10 +51,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
-    uint8_t *tilingBytes = reinterpret_cast<uint8_t *>(tilingData);
-    for (uint64_t i = 0; i < sizeof(FAInferTilingData); ++i) {
-        tilingBytes[i] = 0;
-    }
+    std::memset(tilingData, 0, sizeof(FAInferTilingData));
 
     tilingData->batch = metaArgs->batch;
     tilingData->numHeads = metaArgs->numHeads;
@@ -181,20 +179,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
             fa_split::splitBN2S1GS2(tilingData, ctx);
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
-        }
-    }
-
-    if (hasMask) {
-        // Same triu(1) mask the host path uploads for both causal and band/SWA;
-        // the band restriction itself is applied by the kernel from
-        // windowSizeLeft/Right in the tiling data.
-        int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
-        const uint32_t maskDim = fa_metadata::MASK_DIM;
-        for (uint32_t row = 0; row < maskDim; ++row) {
-            int8_t *maskRow = maskBase + static_cast<uint64_t>(row) * maskDim;
-            for (uint32_t col = 0; col < maskDim; ++col) {
-                maskRow[col] = (col > row) ? static_cast<int8_t>(1) : static_cast<int8_t>(0);
-            }
         }
     }
 
