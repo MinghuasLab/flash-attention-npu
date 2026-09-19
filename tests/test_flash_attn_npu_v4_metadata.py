@@ -14,6 +14,7 @@ from tests.common.test_utils import (
     gather_paged_kv_batch,
     make_golden_attention_mask,
     make_random_tensor,
+    make_varlen_seqlens_with_unused,
 )
 from flash_attn_npu_4 import (
     flash_attn_func,
@@ -78,9 +79,9 @@ def _metadata(
     num_heads,
     kv_heads,
     head_size,
-    cache_seqlens,
+    seqlens_q,
+    seqlens_k,
     data_type,
-    cu_seqlens_q=None,
     page_size=None,
     is_causal=False,
     window_size=WINDOW_SIZE,
@@ -95,9 +96,9 @@ def _metadata(
         num_heads_q=num_heads,
         num_heads_kv=kv_heads,
         headdim=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
         qkv_dtype=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=page_size,
         causal=is_causal,
         window_size=window_size,
@@ -313,16 +314,25 @@ def test_flash_attn_func_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
 )
+@pytest.mark.parametrize("add_unused_qkv", [False, True])
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
-    metadata_spy,
+    metadata_spy, add_unused_qkv,
 ):
-    q_lengths = [q_seqlen] * batch_size
-    kv_lengths = [kv_seqlen] * batch_size
+    if add_unused_qkv:
+        q_lengths, kv_lengths, used_q_lengths, used_k_lengths = make_varlen_seqlens_with_unused(
+            batch_size, q_seqlen, kv_seqlen, is_causal
+        )
+    else:
+        q_lengths = used_q_lengths = [q_seqlen] * batch_size
+        kv_lengths = used_k_lengths = [kv_seqlen] * batch_size
     q_offsets = _prefix_sums(q_lengths)
     kv_offsets = _prefix_sums(kv_lengths)
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
+
+    seqused_q = _int32_npu(used_q_lengths) if add_unused_qkv else None
+    seqused_k = _int32_npu(used_k_lengths) if add_unused_qkv else None
 
     query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
     key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
@@ -335,6 +345,8 @@ def test_flash_attn_varlen_func_metadata_tnd(
         value,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
         max_seqlen_q=q_seqlen,
         max_seqlen_k=kv_seqlen,
         softmax_scale=scale,
@@ -344,20 +356,38 @@ def test_flash_attn_varlen_func_metadata_tnd(
     )
     assert len(metadata_spy) == 1
 
-    _assert_tnd_matches_ref(
-        output_npu,
-        None,
-        query,
-        (key.reshape(batch_size, kv_seqlen, kv_heads, head_size).detach().cpu(),
-         value.reshape(batch_size, kv_seqlen, kv_heads, head_size).detach().cpu()),
-        q_offsets=q_offsets,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        head_size=head_size,
-        scale=scale,
-        data_type=data_type,
-        is_causal=is_causal,
-    )
+    if add_unused_qkv:
+        output_eager = flash_attn_varlen_func(
+            query, key, value,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q, seqused_k=seqused_k,
+            max_seqlen_q=q_seqlen, max_seqlen_k=kv_seqlen,
+            softmax_scale=scale, causal=is_causal, window_size=WINDOW_SIZE,
+            num_splits=1, disable_scheduler_metadata=True,
+        )
+        assert len(metadata_spy) == 1
+
+    # Physical offsets come from allocated lengths; compare only used prefixes.
+    for batch_idx in range(batch_size):
+        q_start, k_start = q_offsets[batch_idx], kv_offsets[batch_idx]
+        used_q, used_k = used_q_lengths[batch_idx], used_k_lengths[batch_idx]
+        output_batch = output_npu[q_start:q_start + used_q]
+        if add_unused_qkv:
+            torch.testing.assert_close(output_batch, output_eager[q_start:q_start + used_q])
+        _assert_tnd_matches_ref(
+            output_batch,
+            None,
+            query[q_start:q_start + used_q],
+            (key[k_start:k_start + used_k].detach().cpu().unsqueeze(0),
+             value[k_start:k_start + used_k].detach().cpu().unsqueeze(0)),
+            q_offsets=[0, used_q],
+            batch_size=1,
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            data_type=data_type,
+            is_causal=is_causal,
+        )
 
 
 @pytest.mark.parametrize(
@@ -381,7 +411,8 @@ def test_flash_attn_kvcache_metadata_bsnd(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_k=cache_seqlens,
+        seqlens_q=None,
         data_type=data_type,
         page_size=block_size,
         is_causal=is_causal,
@@ -442,9 +473,9 @@ def test_flash_attn_kvcache_metadata_tnd(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_k=cache_seqlens,
+        seqlens_q=_int32_npu([q_seqlen] * batch_size),
         data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=block_size,
         is_causal=is_causal,
     )
@@ -502,9 +533,9 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_k=cache_seqlens,
+        seqlens_q=_int32_npu([q_seqlen] * batch_size),
         data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=block_size,
         is_causal=is_causal,
     )
@@ -742,7 +773,8 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         num_heads=num_heads,
         kv_heads=kv_heads,
         head_size=head_size,
-        cache_seqlens=cache_seqlens,
+        seqlens_k=cache_seqlens,
+        seqlens_q=None,
         data_type=data_type,
         page_size=block_size,
         is_causal=is_causal,

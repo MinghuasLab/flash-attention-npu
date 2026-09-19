@@ -1,11 +1,9 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  *
- * Ascend950 FlashAttention v3 backward scaffold.
- *
- * The host ABI matches the Python v3 backward entry. The device kernel is a
- * no-op placeholder; replace the implementation in fag_kernel.cpp when the
- * real backward algorithm lands.
+ * Ascend950 FlashAttention v3 backward host entry.
+ * TND cumulative lengths describe physical storage; seqused_q/k optionally
+ * restrict the effective sequence lengths used by the device kernel.
  */
 
 #include <cmath>
@@ -57,8 +55,8 @@ mha_bwd(
 
     TORCH_CHECK(is_varlen == cu_seqlens_k_.has_value(),
                 "Ascend950 v3 bwd: cu_seqlens_q and cu_seqlens_k must be provided together");
-    TORCH_CHECK(!seqused_q_.has_value() && !seqused_k_.has_value(),
-                "Ascend950 v3 bwd does not support seqused_q/seqused_k now");
+    TORCH_CHECK(is_varlen || (!seqused_q_.has_value() && !seqused_k_.has_value()),
+                "seqused_q/seqused_k backward requires TND layout");
     TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
                 "Ascend950 v3 bwd does not support sliding-window attention now");
     TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0 &&
@@ -237,6 +235,24 @@ mha_bwd(
         }
     }
 
+    auto validate_used = [&](const std::optional<at::Tensor>& used, const at::Tensor& cu) {
+        if (!used.has_value()) return;
+        TORCH_CHECK(used->device() == q.device() && used->scalar_type() == at::kInt &&
+                    used->dim() == 1 && used->numel() == batch_size,
+                    "seqused must be an int32 NPU vector of length B");
+        auto cpu = used->to(at::Device(at::kCPU)).contiguous();
+        const auto* values = cpu.data_ptr<int32_t>();
+        const auto* offsets = cu.data_ptr<int32_t>();
+        for (int64_t i = 0; i < batch_size; ++i) {
+            TORCH_CHECK(values[i] >= 0 && values[i] <= offsets[i + 1] - offsets[i],
+                        "seqused must lie within the allocated sequence length");
+        }
+    };
+    validate_used(seqused_q_, cu_q_cpu);
+    validate_used(seqused_k_, cu_k_cpu);
+    if (seqused_q_.has_value()) seqused_q_ = seqused_q_->contiguous();
+    if (seqused_k_.has_value()) seqused_k_ = seqused_k_->contiguous();
+
     uint64_t ub_size = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(
         platform_ascendc::CoreMemType::UB, ub_size);
@@ -350,7 +366,9 @@ mha_bwd(
         IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP><<<aic_num, nullptr, stream>>>( \
             ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask,                  \
             ptr(softmax_lse), cu_q, cu_k, ptr(dq), ptr(dk), ptr(dv),            \
-            ptr(workspace), ptr(tiling_device))
+            ptr(workspace), ptr(tiling_device), \
+            seqused_q_.has_value() ? ptr(*seqused_q_) : nullptr, \
+            seqused_k_.has_value() ? ptr(*seqused_k_) : nullptr)
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                               \
     do {                                                                         \

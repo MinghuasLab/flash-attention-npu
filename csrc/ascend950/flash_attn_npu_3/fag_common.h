@@ -214,6 +214,8 @@ struct FAGKernelParams {
     GM_ADDR dv;
     GM_ADDR workspace;
     GM_ADDR tiling;
+    GM_ADDR seqUsedQ;
+    GM_ADDR seqUsedKv;
 
     CATLASS_DEVICE
     FAGKernelParams() = default;
@@ -233,7 +235,7 @@ struct FAGKernelParams {
         GM_ADDR dk_,
         GM_ADDR dv_,
         GM_ADDR workspace_,
-        GM_ADDR tiling_)
+        GM_ADDR tiling_, GM_ADDR seqUsedQ_, GM_ADDR seqUsedKv_)
         : dout(dout_),
           q(q_),
           k(k_),
@@ -247,7 +249,7 @@ struct FAGKernelParams {
           dk(dk_),
           dv(dv_),
           workspace(workspace_),
-          tiling(tiling_)
+          tiling(tiling_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_)
     {
     }
 };

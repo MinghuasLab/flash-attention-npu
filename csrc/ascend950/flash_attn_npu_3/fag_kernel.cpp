@@ -102,6 +102,8 @@ public:
     CATLASS_DEVICE
     void Init(FAGKernelParams const &params)
     {
+        seqUsedQ_ = reinterpret_cast<__gm__ int32_t *>(params.seqUsedQ);
+        seqUsedKv_ = reinterpret_cast<__gm__ int32_t *>(params.seqUsedKv);
         tiling_ = reinterpret_cast<const __gm__ TilingData *>(params.tiling);
 
         doutGm_.SetGlobalBuffer((__gm__ DataType *)params.dout);
@@ -429,6 +431,9 @@ private:
                           cuSeqKvGm_.GetValue(batchIdx - 1));
             s1Length = static_cast<uint32_t>(qEnd - qBatchStart);
             s2Length = static_cast<uint32_t>(kvEnd - kvBatchStart);
+            // Physical offsets remain cumulative; only task bounds use effective lengths.
+            if (seqUsedQ_ != nullptr) s1Length = seqUsedQ_[batchIdx];
+            if (seqUsedKv_ != nullptr) s2Length = seqUsedKv_[batchIdx];
         } else {
             s1Length = qSeqlen_;
             s2Length = kvSeqlen_;
@@ -1853,6 +1858,8 @@ private:
     AscendC::GlobalTensor<DataType> vGm_;
     AscendC::GlobalTensor<uint8_t> attenMaskGm_;
     AscendC::GlobalTensor<float> softmaxLseGm_;
+    __gm__ int32_t *seqUsedQ_ = nullptr;
+    __gm__ int32_t *seqUsedKv_ = nullptr;
     AscendC::GlobalTensor<int32_t> cuSeqQGm_;
     AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
     __gm__ int32_t *cuSeqQPtr_ = nullptr;
@@ -1992,7 +1999,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
     GM_ADDR dk,
     GM_ADDR dv,
     GM_ADDR workspace,
-    GM_ADDR tiling)
+    GM_ADDR tiling, GM_ADDR seq_used_q, GM_ADDR seq_used_k)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -2049,7 +2056,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(
         IS_DETERMINISTIC,
         IS_SOFTCAP>;
     FAGKernelParams params{dout, q, k, v, out, mask, softmax_lse,
-        cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling};
+        cu_seqlens_q, cu_seqlens_k, dq, dk, dv, workspace, tiling, seq_used_q, seq_used_k};
     FAGKernel950 fag;
     fag(params);
 }

@@ -53,9 +53,10 @@ def test_flash_attn_kvcache_graph(is_causal):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
     key_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
     value_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    seqlens_q = torch.tensor([Q_SEQLEN], dtype=torch.int32).npu()
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
-    page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()
+    page_table = torch.tensor([[0]], dtype=torch.int32).npu()
 
     scheduler_metadata = get_scheduler_metadata(
         batch_size=BATCH_SIZE,
@@ -64,9 +65,9 @@ def test_flash_attn_kvcache_graph(is_causal):
         num_heads_q=NUM_HEADS,
         num_heads_kv=NUM_KV_HEADS,
         headdim=HEAD_SIZE,
-        cache_seqlens=cache_seqlens,
+        seqlens_q=seqlens_q,
+        seqlens_k=cache_seqlens,
         qkv_dtype=DATA_TYPE,
-        cu_seqlens_q=cu_seqlens_q,
         page_size=BLOCK_SIZE,
         causal=is_causal,
         window_size=WINDOW_SIZE,
