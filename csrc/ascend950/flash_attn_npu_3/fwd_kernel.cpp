@@ -31,6 +31,7 @@
 #include "tla/layout.hpp"
 
 #include "kernel_common.hpp"
+#include "fa_block.h"
 #include "rescale_o.hpp"
 #include "online_softmax.hpp"
 #include "init_outputs.hpp"
@@ -124,6 +125,7 @@ public:
         firstBatchTaskNum_ = faiTilingData->firstBatchTaskNum;
         totalTaskNum_ = faiTilingData->totalTaskNum;
         scaleValue_ = faiTilingData->scaleValue;
+        softcapValue_ = faiTilingData->softcapValue;
         // base tile info
         qBaseTile_ = faiTilingData->qBaseTile;
         kvBaseTile_ = faiTilingData->kvBaseTile;
@@ -218,7 +220,7 @@ public:
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_);
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, softcapValue_);
         EpilogueRescaleO epilogueRescaleO(resource);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
@@ -937,6 +939,7 @@ private:
     uint32_t firstBatchTaskNum_;
     uint32_t totalTaskNum_;
     float scaleValue_;
+    float softcapValue_;
     uint32_t maxNumBlocksPerBatch_;
     uint32_t blockSize_;
     uint32_t numBlocks_;
@@ -977,7 +980,7 @@ private:
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -1018,7 +1021,7 @@ CATLASS_GLOBAL void FAInfer(
     using BlockMmadQK = Gemm::Block::BlockMmadTla<
         DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK, ElementS, void, TileCopyQK>;
    // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
-    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmax;
+    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap>;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<
         ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
@@ -1052,7 +1055,7 @@ CATLASS_GLOBAL void FAInfer(
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -1086,7 +1089,7 @@ CATLASS_GLOBAL void FAInferDn(
     using BlockMmadQK = Gemm::Block::BlockMmadTla<
         DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementK, ElementQ, ElementS, void, TileCopyQK>;
    // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
-    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmax;
+    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap>;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<
         ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;

@@ -45,9 +45,9 @@
         }                                                                      \
     } while (0)
 
-#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE)  \
+#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP)  \
     KERNEL<DType, float, kFormat, kFormat, CACHE_MODE_V, PAGE_SHAPE_V,             \
-           MASK_CAT, kCacheLayout, LSE_MODE>                                       \
+           MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP>                          \
         <<<a.block_dim, nullptr, a.stream>>>(                                      \
             a.q_device, a.k_device, a.v_device, a.mask_device,                     \
             a.block_table_device, a.o_device, a.lse_device, a.q_seq_device,        \
@@ -75,13 +75,15 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
                     // masked FAInferDn instantiations from this TU.
                     constexpr bool kUseDnFastPath =
                         (MaskCat == MaskCategory::NO_MASK) && IsDN;
-                    if constexpr (kUseDnFastPath) {
-                        FWD_KERNEL_LAUNCH(FAInferDn, MaskCat,
-                                          CacheModeV, PageShapeV, LseMode);
-                    } else {
-                        FWD_KERNEL_LAUNCH(FAInfer, MaskCat,
-                                          CacheModeV, PageShapeV, LseMode);
-                    }
+                    FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
+                        if constexpr (kUseDnFastPath) {
+                            FWD_KERNEL_LAUNCH(FAInferDn, MaskCat,
+                                              CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                        } else {
+                            FWD_KERNEL_LAUNCH(FAInfer, MaskCat,
+                                              CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                        }
+                    });
                 });
             });
         });

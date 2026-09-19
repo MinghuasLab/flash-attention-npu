@@ -113,7 +113,6 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(!q_descale_.has_value() && !k_descale_.has_value()
                 && !v_descale_.has_value(),
                 "950 backend (v3) does not support FP8 descales");
-    TORCH_CHECK(softcap == 0.0f, "950 backend (v3) does not support softcap");
     TORCH_CHECK(attention_chunk == 0,
                 "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
@@ -127,11 +126,12 @@ mha_fwd(at::Tensor q,
                 "950 backend (v3) does not support pack_gqa");
 
     // ============================================================
-    // 3. paged / varlen mode + per-tensor checks
+    // 3. paged / varlen mode + per-tensor + softcap checks
     // ============================================================
     const bool paged_KV    = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+    const bool is_softcap = softcap > 0.0f;
 
     TORCH_CHECK(!k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value() &&
                     !cu_seqlens_k_new_.has_value() && !kv_batch_idx_.has_value(),
@@ -181,6 +181,7 @@ mha_fwd(at::Tensor q,
                 "seqused_k must be on NPU");
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
     TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
 
     // ============================================================
     // 4. Shape extraction and output tensor
@@ -385,6 +386,7 @@ mha_fwd(at::Tensor q,
             batch_size, seqlen_q, num_heads, num_heads_k,
             head_size_q, head_size_v,
             softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
+            softcap,
             return_softmax_lse,
             is_varlen_q);
         ctx.flashDecodeFlag = flash_decode;
@@ -505,7 +507,7 @@ mha_fwd(at::Tensor q,
 
     const FwdLaunchArgs fwdArgs{
         is_bf16, fmt, mask_category, paged_KV,
-        enableDN, return_softmax_lse, flashDecodeEnabled,
+        enableDN, return_softmax_lse, is_softcap, flashDecodeEnabled,
         combineBlockDim, launchBlockDim, aclStream,
         qDev, kDev, vDev, maskDevice, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,

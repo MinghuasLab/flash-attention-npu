@@ -85,6 +85,7 @@ at::Tensor get_scheduler_metadata(
         std::optional<int64_t> max_num_blocks_per_seq,
         bool causal,
         double softmax_scale,
+        double softcapValue,
         int64_t num_splits,
         int64_t max_seqlen_k,
         int64_t window_size_left,
@@ -156,7 +157,12 @@ at::Tensor get_scheduler_metadata(
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
-    args.softmaxScale = static_cast<float>(softmax_scale);
+    if (softcapValue == 0.0f) {
+        args.softmaxScale = static_cast<float>(softmax_scale);
+    } else {
+        args.softmaxScale = static_cast<float>(softmax_scale) / static_cast<float>(softcapValue);
+    }
+    args.softcapValue = static_cast<float>(softcapValue);
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, cu_seqlens_k);
 }
 
