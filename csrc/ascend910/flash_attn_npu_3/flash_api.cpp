@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 
 // mha_fwd_kvcache.cpp (SplitFuse::FAInfer) and fag_kernel.cpp (FAGGeneral) are
 // compiled separately in the autogen dispatch TUs; flash_api.cpp only needs
@@ -31,6 +32,7 @@ using namespace KernelCommon;
 
 #include "fag_tiling.cpp"
 #include "fa_metadata_args.h"
+#include "cached_triu_mask.h"
 #include "fa_split.h"
 #include "fwd_dispatch.hpp"
 #include "bwd_dispatch.hpp"
@@ -388,7 +390,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                     "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        maskDevice = hasMask ? metaBase : nullptr;
+        if (hasMask) {
+            mask_gpu_tensor = CachedCompressedTriuMask();
+            c10_npu::NPUCachingAllocator::recordStream(mask_gpu_tensor.storage().data_ptr(),
+                                                       c10_npu::getCurrentNPUStream());
+            maskDevice = static_cast<uint8_t *>(mask_gpu_tensor.data_ptr());
+        }
         int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
         int64_t wsSplit = 0;
         if (paged_KV && is_varlen_q && !is_local) {
@@ -584,9 +591,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         tiling_cpu_ptr->set_UpdateSize(UpdateSize);
         tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
         if (is_causal || is_local) {
-            at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-            mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            mask_gpu_tensor = CachedCompressedTriuMask();
+            c10_npu::NPUCachingAllocator::recordStream(mask_gpu_tensor.storage().data_ptr(),
+                                                       c10_npu::getCurrentNPUStream());
         }
         tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
@@ -954,13 +961,9 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     at::Tensor workspace_tensor =
         at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
-    // alloc custom attn_mask
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
-        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
-        mask_gpu_tensor = at::triu(
-            at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
-            .to(at::Device(at::kPrivateUse1));
+        mask_gpu_tensor = CachedCompressedTriuMask();
     }
 
     uint64_t fftsAddr{0};
@@ -1055,5 +1058,5 @@ PYBIND11_MODULE(flash_attn_npu_3, m)
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");
     m.def("bwd", &mha_bwd, "Backward pass");
-    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling + mask) on AICPU");
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
 }

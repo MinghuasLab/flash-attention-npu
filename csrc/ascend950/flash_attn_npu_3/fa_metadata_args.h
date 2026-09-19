@@ -24,16 +24,13 @@ constexpr uint32_t SIZE_OF_32BIT = 4;
 constexpr uint32_t PRELAUNCH_NUM = 3;
 constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4;  // 128 MiB
 
-// The mask buffer is present whenever the final mask type is not NO_MASK
-// (causal or band/SWA); the tiling blob sits right after it, then kvCum.
-inline uint64_t TilingOffset(bool hasMask)
-{
-    return hasMask ? MASK_BYTES : 0;
-}
+// scheduler_metadata is tiling + kvCum. The 2048x2048 compressed triu(1) mask
+// is a process-wide per-device NPU cache (see CachedCompressedTriuMask).
+inline uint64_t TilingOffset(bool /*hasMask*/) { return 0; }
 
-inline uint64_t MetadataBytes(bool hasMask)
+inline uint64_t MetadataBytes(bool /*hasMask*/)
 {
-    return TilingOffset(hasMask) + sizeof(FAInferTilingData);
+    return sizeof(FAInferTilingData);
 }
 
 inline uint64_t KvSeqlenOffset(bool hasMask)

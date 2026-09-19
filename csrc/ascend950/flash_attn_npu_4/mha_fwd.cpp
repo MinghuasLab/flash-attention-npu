@@ -29,6 +29,7 @@
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"
+#include "cached_triu_mask.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
@@ -419,11 +420,8 @@ mha_fwd(at::Tensor q,
         : nullptr;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
-    at::Tensor mask_cpu_tensor;
     if (is_causal || is_local) {
-        mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        mask_npu_tensor = CachedCompressedTriuMask();
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
