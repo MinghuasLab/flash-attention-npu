@@ -191,8 +191,8 @@ def _get_scheduler_metadata_op(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -202,6 +202,8 @@ def _get_scheduler_metadata_op(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
     return flash_attn_npu_4.get_scheduler_metadata(
         batch_size,
@@ -212,8 +214,8 @@ def _get_scheduler_metadata_op(
         headdim,
         headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         page_size,
         causal,
         window_size_left,
@@ -223,6 +225,8 @@ def _get_scheduler_metadata_op(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
 
 
@@ -238,8 +242,8 @@ def _get_scheduler_metadata_fake(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -249,12 +253,14 @@ def _get_scheduler_metadata_fake(
     pack_gqa: Optional[bool],
     sm_margin: int,
     softmax_scale: Optional[float],
+    is_seqlens_q_cumulative: bool,
+    is_seqlens_k_cumulative: bool,
 ) -> torch.Tensor:
 
     return torch.empty(
         (_SCHEDULER_METADATA_TILING_BYTES,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=seqlens_k.device,
     )
 
 
@@ -265,10 +271,10 @@ def get_scheduler_metadata(
     num_heads_q,
     num_heads_kv,
     headdim,
-    cache_seqlens: torch.Tensor,
+    seqlens_q: Optional[torch.Tensor],
+    seqlens_k: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
@@ -277,6 +283,8 @@ def get_scheduler_metadata(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    is_seqlens_q_cumulative=False,
+    is_seqlens_k_cumulative=False,
 ):
     """Precompute scheduler metadata (tiling) on the AICPU.
 
@@ -285,7 +293,8 @@ def get_scheduler_metadata(
     passed back to ``flash_attn_func`` / ``flash_attn_varlen_func`` through the
     ``scheduler_metadata`` argument.
     """
-    cache_seqlens = maybe_contiguous(cache_seqlens)
+    seqlens_q = maybe_contiguous(seqlens_q)
+    seqlens_k = maybe_contiguous(seqlens_k)
     if headdim_v is None:
         headdim_v = headdim
     scheduler_metadata = _get_scheduler_metadata_op(
@@ -297,8 +306,8 @@ def get_scheduler_metadata(
         headdim,
         headdim_v,
         qkv_dtype,
-        cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
+        seqlens_k,
         page_size,
         causal,
         window_size[0],
@@ -308,6 +317,8 @@ def get_scheduler_metadata(
         pack_gqa,
         sm_margin,
         softmax_scale,
+        is_seqlens_q_cumulative,
+        is_seqlens_k_cumulative,
     )
     return scheduler_metadata
 @_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_forward")
@@ -380,6 +391,8 @@ def _flash_attn_backward_op(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -405,8 +418,8 @@ def _flash_attn_backward_op(
         dv,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,  # seqused_q
-        None,  # seqused_k
+        maybe_contiguous(seqused_q),
+        maybe_contiguous(seqused_k),
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
@@ -430,6 +443,8 @@ def _flash_attn_backward_op_fake(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -531,8 +546,6 @@ def _flash_attn_backward(
     assert aux_scalars is None, "flash_attn_npu_v4 bwd does not support aux_scalars"
     assert block_sparse_tensors is None, "flash_attn_npu_v4 bwd does not support block_sparse_tensors"
     assert dlse is None, "flash_attn_npu_v4 bwd does not support dlse"
-    assert seqused_q is None, "flash_attn_npu_v4 bwd does not support seqused_q"
-    assert seqused_k is None, "flash_attn_npu_v4 bwd does not support seqused_k"
     assert not pack_gqa, "flash_attn_npu_v4 bwd does not support pack_gqa=True"
     assert qv is None, "flash_attn_npu_v4 bwd does not support qv"
     assert page_table is None, "flash_attn_npu_v4 bwd does not support page_table"
@@ -555,6 +568,8 @@ def _flash_attn_backward(
         lse,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         dq,
@@ -621,7 +636,8 @@ class FlashAttnFunc(torch.autograd.Function):
             num_heads,
             num_heads_k,
             head_size,
-            cache_seqlens,
+            seqlens_q=None,
+            seqlens_k=cache_seqlens,
             qkv_dtype=q.dtype,
             headdim_v=head_size_v,
             causal=causal,
@@ -798,8 +814,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         if seqused_k is not None and isinstance(seqused_k, int):
+            batch_size = cu_seqlens_q.shape[0] - 1 if cu_seqlens_q is not None else q.shape[0]
             seqused_k = torch.full(
-                (q.shape[0],), seqused_k, dtype=torch.int32, device=k.device
+                (batch_size,), seqused_k, dtype=torch.int32, device=k.device
             )
             seqused_k = maybe_contiguous(seqused_k)
 
@@ -830,10 +847,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 num_heads,
                 num_heads_k,
                 head_size,
-                cache_seqlens,
+                seqlens_q=seqused_q if seqused_q is not None else cu_seqlens_q,
+                seqlens_k=seqused_k if seqused_k is not None else cu_seqlens_k,
+                is_seqlens_q_cumulative=seqused_q is None,
+                is_seqlens_k_cumulative=seqused_k is None,
                 qkv_dtype=q.dtype,
                 headdim_v=head_size_v,
-                cu_seqlens_q=cu_seqlens_q,
                 page_size=k.shape[1] if (page_table is not None and k.dim() == 4) else None,
                 causal=causal,
                 window_size=window_size,
