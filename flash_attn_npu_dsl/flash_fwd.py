@@ -701,7 +701,7 @@ def flex_attention_kernel(
                                             True,
                                             True,
                                         )
-                                    else:
+                                    elif tla.const_expr(score_mod is not None):
                                         process_score_tile_simd(
                                             ub_s,
                                             m,
@@ -747,10 +747,15 @@ def flex_attention_kernel(
                                     )
                                     tla.pipe_barrier(tla.pipes.ALL)
                                 scores_are_scaled = use_simt
-                                if tla.const_expr(
-                                    use_simd_modifiers
-                                    or window_left is not None
-                                    or window_right is not None
+                                if tla.const_expr(use_simd_modifiers):
+                                    # Full blocks without a score callback leave scaling
+                                    # and KV-tail masking to the softmax load pass.
+                                    if tla.const_expr(score_mod is None):
+                                        scores_are_scaled = block_kind == 0
+                                    else:
+                                        scores_are_scaled = True
+                                elif tla.const_expr(
+                                    window_left is not None or window_right is not None
                                 ):
                                     scores_are_scaled = True
                             if scores_are_scaled:

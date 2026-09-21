@@ -530,6 +530,8 @@ def test_device_regression_metadata_contains_only_safe_active_prefixes(shape):
         (torch.float16, 64, True, _regression_mask, _regression_vector_score),
         (torch.bfloat16, 96, False, _regression_vector_mask, _regression_score),
         (torch.bfloat16, 128, True, _regression_vector_mask, _regression_vector_score),
+        (torch.float16, 64, False, _regression_vector_mask, None),
+        (torch.bfloat16, 96, True, _regression_vector_mask, None),
     ],
 )
 def test_direct_sparse_device_ordinals_tail_broadcast_and_rebinding(
@@ -561,7 +563,9 @@ def test_direct_sparse_device_ordinals_tail_broadcast_and_rebinding(
 
     q_ref, k_ref, v_ref = (tensor.detach().float().cpu() for tensor in (q, k, v))
     k_ref, v_ref = (tensor.repeat_interleave(2, dim=2) for tensor in (k_ref, v_ref))
-    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) / dim**0.5 * 0.75
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_ref, k_ref) / dim**0.5
+    if score is not None:
+        scores *= 0.75
 
     interface._compiled_kernels.clear()
     try:
