@@ -1469,7 +1469,7 @@ def _get_scheduler_metadata_op(
         "page_size": None if page_size is None else int(page_size),
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
-        "varlen_q": cu_seqlens_q is not None,
+        "varlen_q": seqlens_q is not None,
         "num_splits": int(num_splits),
     }
     return scheduler_metadata
