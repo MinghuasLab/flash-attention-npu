@@ -34,6 +34,39 @@ def simd_causal_mask(b, h, q, kv, info, tensors):
     return tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "le")
 
 
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
+@pytest.mark.parametrize(
+    "mask,batch,grid",
+    [(right_causal_mask, 5, 1), (simd_causal_mask, 5, 1), (simd_causal_mask, 65536, None)],
+)
+def test_classifier_covers_rows_beyond_launch_grid(monkeypatch, mask, batch, grid):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    if grid is not None:
+        compile_kernel = classifier._compile_kernel
+
+        def compile_with_small_grid(*args, **kwargs):
+            compiled = compile_kernel(*args, **kwargs)
+
+            def launch(*args, **kwargs):
+                kwargs["block_num"] = grid
+                return compiled(*args, **kwargs)
+
+            return launch
+
+        monkeypatch.setattr(classifier, "_compile_kernel", compile_with_small_grid)
+    blocks = classifier.compute_block_sparsity(128, 128, batch, 1, 1, 1, mask, None, device)
+    torch.npu.synchronize()
+    assert torch.count_nonzero(blocks.mask_block_cnt.cpu()).item() == 0
+    assert torch.all(blocks.full_block_cnt.cpu() == 1).item()
+    assert torch.count_nonzero(blocks.full_block_idx.cpu()).item() == 0
+
+
 @pytest.fixture
 def shape(monkeypatch):
     monkeypatch.setattr(block_sparsity, "_require_npu", lambda device: torch.device("cpu"))

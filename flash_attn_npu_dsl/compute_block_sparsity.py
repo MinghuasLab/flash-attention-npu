@@ -40,79 +40,79 @@ def flex_attention_classify_blocks_kernel(
 ) -> None:
     """Exact any/all classification with O(128) scratch, not a dense mask.
 
-    One SIMT block owns one [batch, query-head, query-tile] row. All threads
+    Each SIMT block visits [batch, query-head, query-tile] rows by grid stride. All threads
     join all barriers, including physical tails. Invalid coordinates are
     clamped before callback invocation and excluded from the visible count.
     """
-    work = tla.arch.block_idx()
     row_count_ptr = tla.allocate(128, tla.Int32, tla.AddressSpace.ub, 256)
     row_counts = tla.make_tensor(
         row_count_ptr, tla.make_layout(tla.make_shape(128), tla.make_stride(1))
     )
     info = create_seqlen_info(tla.Int32(seqlen_q), tla.Int32(seqlen_k))
-    with tla.vector():
-        with tla.vec.func(mode="simt", thread_block_dim=128):
-            tid, _, _ = tla.arch.thread_idx()
-            q_tile = work % q_tiles
-            head = (work // q_tiles) % num_heads_q
-            batch = work // (q_tiles * num_heads_q)
-            q_idx = q_tile * 128 + tid
-            q_in_bounds = q_idx < seqlen_q
-            safe_q = tla.where(q_in_bounds, q_idx, tla.Int32(seqlen_q - 1))
-            if tid == 0:
-                mask_counts[work] = 0
-                full_counts[work] = 0
-                for slot in tla.range(0, kv_tiles, 1):
-                    mask_indices[work, slot] = 0
-                    full_indices[work, slot] = 0
-            tla.arch.sync_threads()
-
-            for kv_tile in tla.range(0, kv_tiles, 1):
-                visible_count = tla.Int32(0)
-                for local_k in tla.range(0, 128, 1):
-                    kv_idx = kv_tile * 128 + local_k
-                    kv_in_bounds = kv_idx < seqlen_k
-                    safe_k = tla.where(kv_in_bounds, kv_idx, tla.Int32(seqlen_k - 1))
-                    keep = call_mask_mod(
-                        mask_mod,
-                        batch,
-                        head,
-                        safe_q,
-                        safe_k,
-                        info,
-                        aux_tensors,
-                        aux_scalars,
-                    )
-                    visible_count = visible_count + tla.where(
-                        q_in_bounds & kv_in_bounds & keep, tla.Int32(1), tla.Int32(0)
-                    )
-                row_counts[tid] = visible_count
+    for work in tla.range(tla.arch.block_idx(), mask_counts.shape[0], tla.arch.block_num()):
+        with tla.vector():
+            with tla.vec.func(mode="simt", thread_block_dim=128):
+                tid, _, _ = tla.arch.thread_idx()
+                q_tile = work % q_tiles
+                head = (work // q_tiles) % num_heads_q
+                batch = work // (q_tiles * num_heads_q)
+                q_idx = q_tile * 128 + tid
+                q_in_bounds = q_idx < seqlen_q
+                safe_q = tla.where(q_in_bounds, q_idx, tla.Int32(seqlen_q - 1))
+                if tid == 0:
+                    mask_counts[work] = 0
+                    full_counts[work] = 0
+                    for slot in tla.range(0, kv_tiles, 1):
+                        mask_indices[work, slot] = 0
+                        full_indices[work, slot] = 0
                 tla.arch.sync_threads()
 
-                for offset in (64, 32, 16, 8, 4, 2, 1):
-                    if tid < offset:
-                        row_counts[tid] = row_counts[tid] + row_counts[tid + offset]
+                for kv_tile in tla.range(0, kv_tiles, 1):
+                    visible_count = tla.Int32(0)
+                    for local_k in tla.range(0, 128, 1):
+                        kv_idx = kv_tile * 128 + local_k
+                        kv_in_bounds = kv_idx < seqlen_k
+                        safe_k = tla.where(kv_in_bounds, kv_idx, tla.Int32(seqlen_k - 1))
+                        keep = call_mask_mod(
+                            mask_mod,
+                            batch,
+                            head,
+                            safe_q,
+                            safe_k,
+                            info,
+                            aux_tensors,
+                            aux_scalars,
+                        )
+                        visible_count = visible_count + tla.where(
+                            q_in_bounds & kv_in_bounds & keep, tla.Int32(1), tla.Int32(0)
+                        )
+                    row_counts[tid] = visible_count
                     tla.arch.sync_threads()
 
-                if tid == 0:
-                    visible_total = row_counts[0]
-                    if visible_total > 0:
-                        valid_q = seqlen_q - q_tile * 128
-                        if valid_q > 128:
-                            valid_q = tla.Int32(128)
-                        valid_k = seqlen_k - kv_tile * 128
-                        if valid_k > 128:
-                            valid_k = tla.Int32(128)
-                        if visible_total == valid_q * valid_k:
-                            full_count = full_counts[work]
-                            full_indices[work, full_count] = kv_tile
-                            full_counts[work] = full_count + 1
-                        else:
-                            partial_count = mask_counts[work]
-                            mask_indices[work, partial_count] = kv_tile
-                            mask_counts[work] = partial_count + 1
-                tla.arch.sync_threads()
-        tla.pipe_barrier(tla.pipes.ALL)
+                    for offset in (64, 32, 16, 8, 4, 2, 1):
+                        if tid < offset:
+                            row_counts[tid] = row_counts[tid] + row_counts[tid + offset]
+                        tla.arch.sync_threads()
+
+                    if tid == 0:
+                        visible_total = row_counts[0]
+                        if visible_total > 0:
+                            valid_q = seqlen_q - q_tile * 128
+                            if valid_q > 128:
+                                valid_q = tla.Int32(128)
+                            valid_k = seqlen_k - kv_tile * 128
+                            if valid_k > 128:
+                                valid_k = tla.Int32(128)
+                            if visible_total == valid_q * valid_k:
+                                full_count = full_counts[work]
+                                full_indices[work, full_count] = kv_tile
+                                full_counts[work] = full_count + 1
+                            else:
+                                partial_count = mask_counts[work]
+                                mask_indices[work, partial_count] = kv_tile
+                                mask_counts[work] = partial_count + 1
+                    tla.arch.sync_threads()
+            tla.pipe_barrier(tla.pipes.ALL)
 
 
 @tla.kernel
@@ -136,62 +136,62 @@ def flex_attention_classify_blocks_simd_kernel(
     include valid rows only; padded KV lanes are clamped for callback safety
     then excluded from counting. Unused public index slots are unspecified.
     """
-    work = tla.arch.block_idx()
-    q_tile = work % q_tiles
-    head = (work // q_tiles) % num_heads_q
-    batch = work // (q_tiles * num_heads_q)
-    valid_q = min(128, seqlen_q - q_tile * 128)
     info = create_seqlen_info(tla.Int32(seqlen_q), tla.Int32(seqlen_k))
     totals_ptr = tla.allocate(kv_tiles, tla.Int32, tla.AddressSpace.ub, 256)
     totals = tla.make_tensor(
         totals_ptr, tla.make_layout(tla.make_shape(kv_tiles), tla.make_stride(1))
     )
     vector_done = tla.flag("classifier_vector_done", tla.arch.VECTOR, tla.arch.SCALAR)
-    with tla.vector():
-        with tla.vec.func(mode="simd"):
-            zero = tla.full(0, tla.Int32)
-            one = tla.full(1, tla.Int32)
-            last_k = tla.full(seqlen_k - 1, tla.Int32)
-            full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Int32)
-            b = zero + batch
-            h = zero + head
-            for kv_tile in tla.range(kv_tiles):
-                visible = zero
-                for row in tla.range(valid_q):
-                    q = zero + (q_tile * 128 + row)
-                    for chunk in tla.range_constexpr(2):
-                        kv = tla.arange(kv_tile * 128 + chunk * 64, dtype=tla.Int32)
-                        valid_k = tla.cmp(kv, seqlen_k, "lt")
-                        safe_k = tla.where(valid_k, kv, last_k)
-                        keep = call_mask_mod(
-                            mask_mod, b, h, q, safe_k, info, aux_tensors, aux_scalars
-                        )
-                        _validate_mask_vector(keep)
-                        keep = tla.bitwise_and(keep, valid_k)
-                        visible = visible + tla.where(keep, one, zero)
-                total = visible.reduce(tla.ReductionOp.ADD, mask=full_mask)
-                slot = tla.tile_view(totals, tla.make_shape(1), tla.make_coord(kv_tile))
-                slot.store(total, params=tla.params.UnalignStoreParams())
-        # Complete SIMD UB stores before the scalar pipe launches the recording
-        # VF. This is a cross-pipe dependency, not just an intra-SIMT barrier.
-        tla.set_flag(vector_done)
-        tla.wait_flag(vector_done)
-        with tla.vec.func(mode="simt", thread_block_dim=1):
-            partial_count = tla.Int32(0)
-            full_count = tla.Int32(0)
-            for kv_tile in tla.range(kv_tiles):
-                visible_total = totals[kv_tile]
-                if visible_total > 0:
-                    valid_k = min(128, seqlen_k - kv_tile * 128)
-                    if visible_total == valid_q * valid_k:
-                        full_indices[work, full_count] = kv_tile
-                        full_count = full_count + 1
-                    else:
-                        mask_indices[work, partial_count] = kv_tile
-                        partial_count = partial_count + 1
-            mask_counts[work] = partial_count
-            full_counts[work] = full_count
-        tla.pipe_barrier(tla.pipes.ALL)
+    for work in tla.range(tla.arch.block_idx(), mask_counts.shape[0], tla.arch.block_num()):
+        q_tile = work % q_tiles
+        head = (work // q_tiles) % num_heads_q
+        batch = work // (q_tiles * num_heads_q)
+        valid_q = min(128, seqlen_q - q_tile * 128)
+        with tla.vector():
+            with tla.vec.func(mode="simd"):
+                zero = tla.full(0, tla.Int32)
+                one = tla.full(1, tla.Int32)
+                last_k = tla.full(seqlen_k - 1, tla.Int32)
+                full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Int32)
+                b = zero + batch
+                h = zero + head
+                for kv_tile in tla.range(kv_tiles):
+                    visible = zero
+                    for row in tla.range(valid_q):
+                        q = zero + (q_tile * 128 + row)
+                        for chunk in tla.range_constexpr(2):
+                            kv = tla.arange(kv_tile * 128 + chunk * 64, dtype=tla.Int32)
+                            valid_k = tla.cmp(kv, seqlen_k, "lt")
+                            safe_k = tla.where(valid_k, kv, last_k)
+                            keep = call_mask_mod(
+                                mask_mod, b, h, q, safe_k, info, aux_tensors, aux_scalars
+                            )
+                            _validate_mask_vector(keep)
+                            keep = tla.bitwise_and(keep, valid_k)
+                            visible = visible + tla.where(keep, one, zero)
+                    total = visible.reduce(tla.ReductionOp.ADD, mask=full_mask)
+                    slot = tla.tile_view(totals, tla.make_shape(1), tla.make_coord(kv_tile))
+                    slot.store(total, params=tla.params.UnalignStoreParams())
+            # Complete SIMD UB stores before the scalar pipe launches the recording
+            # VF. This is a cross-pipe dependency, not just an intra-SIMT barrier.
+            tla.set_flag(vector_done)
+            tla.wait_flag(vector_done)
+            with tla.vec.func(mode="simt", thread_block_dim=1):
+                partial_count = tla.Int32(0)
+                full_count = tla.Int32(0)
+                for kv_tile in tla.range(kv_tiles):
+                    visible_total = totals[kv_tile]
+                    if visible_total > 0:
+                        valid_k = min(128, seqlen_k - kv_tile * 128)
+                        if visible_total == valid_q * valid_k:
+                            full_indices[work, full_count] = kv_tile
+                            full_count = full_count + 1
+                        else:
+                            mask_indices[work, partial_count] = kv_tile
+                            partial_count = partial_count + 1
+                mask_counts[work] = partial_count
+                full_counts[work] = full_count
+            tla.pipe_barrier(tla.pipes.ALL)
 
 
 def compute_block_sparsity(
@@ -277,7 +277,8 @@ def compute_block_sparsity(
         compiled = _compile_kernel(
             classifier, key, lambda: (*outputs, *constants, runtime_aux, aux_scalars)
         )
-        compiled(*outputs, runtime_aux, aux_scalars, block_num=num_works)
+        # Logical rows beyond the launch grid are covered by the kernel's grid stride.
+        compiled(*outputs, runtime_aux, aux_scalars, block_num=min(num_works, 65535))
         return BlockSparseTensorsTorch(
             mask_counts, mask_indices, full_counts, full_indices, block_size=(128, 128)
         )
