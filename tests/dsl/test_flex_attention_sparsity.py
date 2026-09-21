@@ -376,8 +376,9 @@ def test_public_builder_selects_mode_and_direct_compile(monkeypatch, shape, call
         finally:
             events.append("exit")
 
-    def compile(actual_kernel, key, *args):
+    def compile(actual_kernel, key, compile_args):
         assert actual_kernel is kernel
+        args = compile_args()
         assert len(args) == 12
         assert args[4] is callback and args[-2] == [] and args[-1] is None
         events.append("compile")

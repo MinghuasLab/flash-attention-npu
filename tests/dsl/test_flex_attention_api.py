@@ -128,7 +128,20 @@ def test_invalid_aux(tensors, scalars, error):
 
 @pytest.fixture
 def host(monkeypatch):
-    state = SimpleNamespace(compiled=[], launched=[], current="previous")
+    state = SimpleNamespace(compiled=[], launched=[], converted=[], current="previous")
+
+    class HostTensor:
+        def __init__(self, tensor, *, layout_tag):
+            self.owner = tensor
+            self.dynamic_mode = None
+            state.converted.append(tensor)
+
+        def mark_compact_shape_dynamic(self, mode):
+            self.dynamic_mode = mode
+            return self
+
+        def data_ptr(self):
+            return self.owner.data_ptr()
 
     @contextmanager
     def guard(device):
@@ -144,7 +157,7 @@ def host(monkeypatch):
         return lambda *args, **kwargs: state.launched.append((args, kwargs))
 
     monkeypatch.setattr(interface, "_validate_inputs", lambda *args: None)
-    monkeypatch.setattr(interface, "from_dlpack", lambda tensor, *, layout_tag: tensor)
+    monkeypatch.setattr(interface, "from_dlpack", HostTensor)
     monkeypatch.setattr(interface.tla, "compile", compile)
     monkeypatch.setenv("CATLASS_DSL_CACHE", "1")
     monkeypatch.setenv("CATLASS_DSL_FORCE_RECOMPILE", "0")
@@ -184,6 +197,9 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
     assert (args[6] is None) == (tensors is None)
     assert args[7] == (tuple(scalars) if scalars else None)
     assert args[6] is host.compiled[0][6]
+    dynamic = tensors is None and not scalars
+    assert all(tensor.dynamic_mode == (0 if dynamic else None) for tensor in host.compiled[0][:4])
+    assert host.compiled[0][11:13] == ((None, None) if dynamic else (17, 65))
     assert host.compiled[0][-2:] == (96, None)
     assert out.shape == host.inputs[0].shape
     assert (result_lse is None) == (not lse)
@@ -210,7 +226,7 @@ def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host):
     assert args[0].data_ptr() == inputs[0].data_ptr()
     assert args[0].data_ptr() != host.launched[0][0][0].data_ptr()
     assert args[3].data_ptr() == second.data_ptr() != first.data_ptr()
-    assert args[6][0] is updated_aux and args[7] == (0.75,)
+    assert args[6][0].owner is updated_aux and args[7] == (0.75,)
 
     variants = (
         (inputs, {"softmax_scale": 0.5}),
@@ -229,6 +245,66 @@ def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host):
         assert len(host.launched) == expected + 1
 
 
+@pytest.mark.parametrize("options", [{}, {"causal": True}, {"window_size": (7, 3)}])
+def test_public_call_reuses_dynamic_lengths_with_current_buffers(host, monkeypatch, options):
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("cache hits must not construct DLPack compilation samples")
+
+    for q_len, kv_len in ((512, 257), (768, 513), (1024, 1024), (512, 257)):
+        inputs = (
+            torch.empty(1, q_len, 4, 96, dtype=torch.bfloat16),
+            torch.empty(1, kv_len, 2, 96, dtype=torch.bfloat16),
+            torch.empty(1, kv_len, 2, 96, dtype=torch.bfloat16),
+        )
+        with monkeypatch.context() as context:
+            if host.compiled:
+                context.setattr(interface, "from_dlpack", unexpected_conversion)
+            out, lse = interface.flash_attn_func(*inputs, **options)
+        assert len(host.compiled) == 1
+        assert host.compiled[0][11:13] == (None, None)
+        assert all(tensor.dynamic_mode == 0 for tensor in host.compiled[0][:4])
+        args = host.launched[-1][0]
+        for argument, tensor in zip(args[:4], (*inputs, out)):
+            assert argument.tensor is tensor
+            assert argument.build_memref_launch_fields()[0] == tensor.data_ptr()
+        assert args[0].build_memref_launch_fields()[3:5] == (q_len, 4 * 96)
+        assert args[1].build_memref_launch_fields()[3:5] == (kv_len, 2 * 96)
+        assert out.shape == inputs[0].shape and lse is None
+        assert len(host.converted) == 4
+
+    out, lse = interface.flash_attn_func(*inputs, return_lse=True, **options)
+    assert len(host.compiled) == 2
+    assert lse.shape == (1, 4, q_len)
+    args = host.launched[-1][0]
+    assert args[4].tensor is lse
+    assert args[4].build_memref_launch_fields()[0] == lse.data_ptr()
+    assert args[4].build_memref_launch_fields()[3:5] == (4 * q_len, 1)
+    with monkeypatch.context() as context:
+        context.setattr(interface, "from_dlpack", unexpected_conversion)
+        interface.flash_attn_func(*host.inputs, return_lse=True, **options)
+    assert len(host.compiled) == 2
+    assert len(host.converted) == 9
+
+
+def test_dynamic_length_cache_keeps_batch_heads_dimension_and_dtype(host):
+    variants = (
+        (1, 4, 2, 96, torch.bfloat16),
+        (2, 4, 2, 96, torch.bfloat16),
+        (1, 8, 2, 96, torch.bfloat16),
+        (1, 4, 1, 96, torch.bfloat16),
+        (1, 4, 2, 64, torch.bfloat16),
+        (1, 4, 2, 96, torch.float16),
+    )
+    for count, (batch, q_heads, kv_heads, dim, dtype) in enumerate(variants, start=1):
+        q = torch.empty(batch, 17, q_heads, dim, dtype=dtype)
+        k = torch.empty(batch, 65, kv_heads, dim, dtype=dtype)
+        interface.flash_attn_func(q, k, torch.empty_like(k))
+        assert len(host.compiled) == count
+        argument = host.launched[-1][0][0]
+        assert argument.tensor is q
+        assert argument.build_memref_launch_fields()[3:5] == (batch * 17, q_heads * dim)
+
+
 @pytest.mark.parametrize(
     "cache,force,compilations",
     [(" 0 ", "0", 2), ("1", " 1 ", 2), ("1", " 0 ", 1)],
@@ -239,6 +315,7 @@ def test_public_call_respects_cache_environment(host, monkeypatch, cache, force,
     interface.flash_attn_func(*host.inputs)
     interface.flash_attn_func(*host.inputs)
     assert len(host.compiled) == compilations and len(host.launched) == 2
+    assert len(host.converted) == 4 * compilations
 
 
 @pytest.mark.parametrize(
@@ -266,6 +343,7 @@ def test_public_callbacks_select_independent_modes_and_mask_overrides_window(
     assert args[15] is mask and args[16] is score
     assert args[17:19] == expected and args[19:21] == modes
     assert args[21:] == (96, None)
+    assert args[11:13] == ((None, None) if mask is None and score is None else (17, 65))
     assert host.launched[0][0][5] is None
 
 

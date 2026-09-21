@@ -274,7 +274,9 @@ def compute_block_sparsity(
         )
         constants = (mask_mod, num_heads, q_tiles, kv_tiles, seqlen_q, seqlen_k)
         key = _compilation_key(tensors, aux_tensors, aux_scalars, constants, device)
-        compiled = _compile_kernel(classifier, key, *outputs, *constants, runtime_aux, aux_scalars)
+        compiled = _compile_kernel(
+            classifier, key, lambda: (*outputs, *constants, runtime_aux, aux_scalars)
+        )
         compiled(*outputs, runtime_aux, aux_scalars, block_num=num_works)
         return BlockSparseTensorsTorch(
             mask_counts, mask_indices, full_counts, full_indices, block_size=(128, 128)

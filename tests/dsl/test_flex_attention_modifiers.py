@@ -74,12 +74,23 @@ def _lower(
     tensors=None,
     scalars=None,
     schedule=False,
+    dynamic=False,
+    lengths=(17, 129),
+    window=(None, None),
 ):
     from flash_attn_npu_dsl.flash_fwd import flex_attention_kernel
 
     def fake(element, size):
         return make_fake_tensor(element, (size,), (1,), layout_tag=tla.arch.RowMajor)
 
+    def root(element, rows, columns):
+        if not dynamic:
+            return fake(element, rows * columns)
+        return make_fake_tensor(
+            element, (rows, columns), (columns, 1), layout_tag=tla.arch.RowMajor
+        ).mark_compact_shape_dynamic(0)
+
+    q_len, kv_len = lengths
     sparse, sparse_strides = None, None
     if schedule:
         partial_capacity, full_capacity = (2, 2) if schedule is True else schedule
@@ -102,30 +113,41 @@ def _lower(
         options=dict(flex_attention_kernel.options),
         location=flex_attention_kernel.decorator_location,
         type_args=(
-            fake(dtype, 17 * 2 * dim),
-            fake(dtype, 129 * dim),
-            fake(dtype, 129 * dim),
-            fake(dtype, 17 * 2 * dim),
-            fake(tla.Float32, 34) if lse else None,
+            root(dtype, q_len, 2 * dim),
+            root(dtype, kv_len, dim),
+            root(dtype, kv_len, dim),
+            root(dtype, q_len, 2 * dim),
+            root(tla.Float32, 2 * q_len, 1) if lse else None,
             sparse,
             tensors,
             scalars,
             1,
             2,
             1,
-            17,
-            129,
+            None if dynamic else q_len,
+            None if dynamic else kv_len,
             dim**-0.5,
             dtype == tla.Float16,
             mask,
             score,
-            None,
-            None,
+            *window,
             *validate_modifiers(mask, score),
             dim,
             sparse_strides,
         ),
     )
+
+
+@pytest.mark.parametrize("window,lse", [((None, None), False), ((None, 0), True), ((7, 3), False)])
+def test_dynamic_attention_lowering_does_not_specialize_sequence_lengths(window, lse):
+    first = _lower(dynamic=True, lengths=(17, 129), window=window, lse=lse)
+    second = _lower(dynamic=True, lengths=(257, 65), window=window, lse=lse)
+    for tree in first.argument_trees[:4]:
+        assert [binding.kind for binding in tree.bindings] == ["dynamic_gm"]
+    assert first.argument_trees[4].runtime_leaf_count == int(lse)
+    assert "memref.dim" in first.asm()
+    assert ("tla.log" in first.asm()) == lse
+    assert first.asm() == second.asm()
 
 
 @pytest.mark.parametrize(

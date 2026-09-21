@@ -16,7 +16,39 @@ _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
 
 
-def _compilation_key(tensors, aux_tensors, aux_scalars, constants, device):
+class _DynamicTensorArgument:
+    """Bind a contiguous Torch tensor as a dynamic (rows, columns) GM root.
+
+    The owner is held through launch. Columns are fixed by the compiled BSND
+    specification; rows and the address are read from the current tensor.
+    """
+
+    __slots__ = ("tensor", "columns")
+
+    def __init__(self, tensor, columns):
+        self.tensor = tensor
+        self.columns = columns
+
+    def compile_sample(self):
+        return from_dlpack(
+            self.tensor.reshape(-1, self.columns), layout_tag=tla.arch.RowMajor
+        ).mark_compact_shape_dynamic(0)
+
+    def build_memref_launch_fields(self):
+        address = self.tensor.data_ptr()
+        if not address:
+            raise RuntimeError("Tensor buffer is not bound")
+        columns = self.columns
+        rows = self.tensor.numel() // columns
+        # Canonical GM fields: allocated/aligned/offset, sizes[4], strides[4],
+        # origin[2]. The TLA RowMajor view uses (columns, 1), including one-row
+        # views, regardless of DLPack's singleton-stride normalization.
+        return (address, address, 0, rows, columns, 1, 1, columns, 1, 1, 1, rows, columns)
+
+
+def _compilation_key(
+    tensors, aux_tensors, aux_scalars, constants, device, *, dynamic_lengths=False
+):
     """Build a cache key from device, Tensor layouts and compile-time constants.
 
     Tensor addresses/contents and auxiliary scalar values are excluded; auxiliary
@@ -33,24 +65,29 @@ def _compilation_key(tensors, aux_tensors, aux_scalars, constants, device):
 
     return (
         str(device),
-        tuple(tensor_spec(tensor) for tensor in tensors),
+        tuple(
+            (tensor.ndim, tensor.dtype)
+            if dynamic_lengths and tensor is not None
+            else tensor_spec(tensor)
+            for tensor in tensors
+        ),
         None if aux_tensors is None else tuple(map(tensor_spec, aux_tensors)),
         None if aux_scalars is None else tuple(map(type, aux_scalars)),
         tuple((type(value), value.hex() if type(value) is float else value) for value in constants),
     )
 
 
-def _compile_kernel(kernel, key, *compile_args):
+def _compile_kernel(kernel, key, compile_args):
     """Reuse only the executable; every call supplies fresh launch arguments."""
     truthy = {"1", "true", "yes", "on", "y"}
     cache_enabled = os.getenv("CATLASS_DSL_CACHE", "1").strip().lower() in truthy
     force_recompile = os.getenv("CATLASS_DSL_FORCE_RECOMPILE", "0").strip().lower() in truthy
     if not cache_enabled or force_recompile:
-        return tla.compile(kernel, *compile_args, options="--npu-arch 3510")
+        return tla.compile(kernel, *compile_args(), options="--npu-arch 3510")
     key = (kernel.fn, key)
     with _compile_lock:
         if key not in _compiled_kernels:
-            _compiled_kernels[key] = tla.compile(kernel, *compile_args, options="--npu-arch 3510")
+            _compiled_kernels[key] = tla.compile(kernel, *compile_args(), options="--npu-arch 3510")
             if len(_compiled_kernels) > 128:
                 _compiled_kernels.popitem(last=False)
         _compiled_kernels.move_to_end(key)
@@ -192,12 +229,23 @@ def flash_attn_func(
         )
         tensors = (q, k, v, out, lse)
         sparse_tensors = sparse.tensors if sparse is not None else ()
-        runtime_args = tuple(
-            from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
-            if tensor is not None
-            else None
-            for tensor in tensors
-        ) + (
+        dynamic_lengths = (
+            mask_mod is None
+            and score_mod is None
+            and sparse is None
+            and aux_tensors is None
+            and aux_scalars is None
+        )
+
+        def bind_tensor(tensor):
+            if tensor is None:
+                return None
+            if dynamic_lengths:
+                columns = tensor.shape[-2] * head_dim if tensor.ndim == 4 else 1
+                return _DynamicTensorArgument(tensor, columns)
+            return from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
+
+        runtime_args = tuple(bind_tensor(tensor) for tensor in tensors) + (
             tuple(
                 from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
                 if tensor is not None
@@ -215,8 +263,8 @@ def flash_attn_func(
             batch,
             q_heads,
             kv_heads,
-            q_len,
-            kv_len,
+            None if dynamic_lengths else q_len,
+            None if dynamic_lengths else kv_len,
             scale,
             q.dtype == torch.float16,
             mask_mod,
@@ -229,9 +277,24 @@ def flash_attn_func(
             sparse.strides if sparse is not None else None,
         )
         key = _compilation_key(
-            (*tensors, *sparse_tensors), aux_tensors, aux_scalars, constants, q.device
+            (*tensors, *sparse_tensors),
+            aux_tensors,
+            aux_scalars,
+            constants,
+            q.device,
+            dynamic_lengths=dynamic_lengths,
         )
-        compiled = _compile_kernel(flex_attention_kernel, key, *runtime_args, *constants)
+
+        def compile_args():
+            bindings = (
+                tuple(arg.compile_sample() if arg is not None else None for arg in runtime_args[:5])
+                + runtime_args[5:]
+                if dynamic_lengths
+                else runtime_args
+            )
+            return (*bindings, *constants)
+
+        compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
         tasks = batch * q_heads * ((q_len + 127) // 128)
         cores = torch.npu.get_device_properties(q.device.index).cube_core_num
         compiled(*runtime_args, block_num=min(tasks, max(1, int(cores))))

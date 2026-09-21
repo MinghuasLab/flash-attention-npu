@@ -73,8 +73,8 @@ def flex_attention_kernel(
     batch: tla.Constexpr[int],
     q_heads: tla.Constexpr[int],
     kv_heads: tla.Constexpr[int],
-    q_len: tla.Constexpr[int],
-    kv_len: tla.Constexpr[int],
+    q_len: tla.Constexpr[int | None],
+    kv_len: tla.Constexpr[int | None],
     scale: tla.Constexpr[float],
     is_fp16: tla.Constexpr[bool],
     mask_mod: tla.Constexpr,
@@ -86,6 +86,10 @@ def flex_attention_kernel(
     head_dim: tla.Constexpr[int] = 128,
     sparse_strides: tla.Constexpr = None,
 ) -> None:
+    if tla.const_expr(q_len is None):
+        # Contiguous BSND roots use (B*S, H*D); B/H/D stay compile-time facts.
+        q_len = query.shape[0] // batch
+        kv_len = key.shape[0] // batch
     mixed_modifiers = (
         mask_mod is not None and score_mod is not None and mask_uses_simd != score_uses_simd
     )
@@ -271,10 +275,9 @@ def flex_attention_kernel(
     for work in tla.range(tla.arch.block_idx(), total_tasks, tla.arch.block_num()):
         q_tile = work // (batch * q_heads)
         batch_head = work % (batch * q_heads)
-        task = batch_head * q_tiles + q_tile
-        qSTileIdx = task % q_tiles
-        qHeadIdx = (task // q_tiles) % q_heads
-        curBatch = task // (q_tiles * q_heads)
+        qSTileIdx = q_tile
+        qHeadIdx = batch_head % q_heads
+        curBatch = batch_head // q_heads
         kvHeadIdx = qHeadIdx // (q_heads // kv_heads)
         qBOffset = curBatch * q_len * qSOffset
         kBOffset = curBatch * kv_len * kSOffset
