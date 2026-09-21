@@ -8,7 +8,7 @@
 - 回调支持普通 Python 函数和 `@tla.jit` helper，按声明使用 SIMT 或显式 SIMD，
   内联到 attention 内核；需要跳过空块时，可显式建块并传入稀疏元数据。
 
-当前实现面向 Ascend 950 的定长推理前向，支持 BSND、FP16/BF16、D64/96/128 和 GQA。
+当前实现面向 Ascend 950 的定长推理前向，支持 BSND、FP16/BF16、D8/16/32/64/80/96/128 和 GQA。
 通过独立的 `flash_attn_npu_dsl` 包使用，不替换现有 V2/V3/V4 的 C++ 后端。
 
 ## 安装、运行与最小调用
@@ -77,7 +77,7 @@ out, lse = flash_attn_func(q, k, v, mask_mod=causal_mask, return_lse=True)
 
 Q/K/V 为同设备、同 dtype、连续的 FP16 或 BF16 NPU 张量，采用 BSND 布局。
 Q 为 `(B, Sq, Hq, D)`，K/V 为 `(B, Sk, Hkv, D)`；所有维度为正，
-`D` 支持 64/96/128，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
+`D` 支持 8/16/32/64/80/96/128，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
 仅支持推理前向，不支持梯度、packed/变长序列或 paged KV；未实现的选项必须保持默认值。
 
 `flash_attn_func` 始终返回 `(out, lse)`。O 与 Q 的形状和 dtype 相同；
@@ -85,9 +85,12 @@ Q 为 `(B, Sq, Hq, D)`，K/V 为 `(B, Sk, Hkv, D)`；所有维度为正，
 完全被 mask 的行返回精确零 O 和 `-inf` LSE。
 
 - `softmax_scale`：基础分数缩放，默认 `1 / sqrt(D)`。
+- `softcap`：默认 0（关闭）；正值 `c` 将缩放后分数变为 `c * tanh(score / c)`，
+  然后再应用 mask。内部使用 SIMD score helper，不可与显式 `score_mod` 同用；
+  full 稀疏块仍执行 softcap。
 - `causal=True`：右对齐因果掩码，保留 `kv <= q + Sk - Sq`。
 - `window_size=(left, right)`：保留 `[q + Sk - Sq - left, q + Sk - Sq + right]`；
-  `None` 表示该侧无界，两侧均为负值时关闭窗口；`causal=True` 将右边界设为 0。
+  每侧的 `None` 或负值均表示该侧无界；`causal=True` 将右边界设为 0。
 - `score_mod` / `mask_mod`：自定义分数与掩码回调。自定义 `mask_mod` 覆盖上述内置掩码。
 - `aux_tensors` / `aux_scalars`：传给回调的辅助张量与运行时标量。
 - `block_sparse_tensors`：显式块元数据，见下文。

@@ -18,6 +18,10 @@ if find_spec("catlass") is None:
 @pytest.mark.parametrize(
     "dtype,dim,q_len,kv_len,extra",
     [
+        ("fp16", 32, 63, 65, ["--simd", "--sparse"]),
+        ("bf16", 80, 129, 257, ["--simd-mask", "--sparse"]),
+        ("fp16", 16, 1, 257, ["--simd", "--sparse", "--no-lse"]),
+        ("bf16", 8, 257, 129, ["--simd", "--sparse"]),
         ("fp16", 64, 1, 257, ["--no-lse"]),
         ("bf16", 96, 129, 257, []),
         ("fp16", 128, 257, 129, ["--sparse"]),

@@ -10,7 +10,7 @@ from catlass.tla.runtime import from_dlpack
 
 from .block_sparsity import validate_block_sparse
 from .flash_fwd import flex_attention_kernel
-from .modifiers import validate_modifiers
+from .modifiers import softcap_score_mod, validate_modifiers
 
 _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
@@ -131,8 +131,12 @@ def _validate_inputs(q, k, v):
             raise TypeError("q, k and v must use FP16 or BF16")
         if tensor.dtype != q.dtype:
             raise TypeError("q, k and v must have the same dtype")
-        if tensor.shape[-1] not in (64, 96, 128) or any(size <= 0 for size in tensor.shape):
-            raise ValueError("head dimension must be 64, 96 or 128 and dimensions nonempty")
+        if tensor.shape[-1] not in (8, 16, 32, 64, 80, 96, 128) or any(
+            size <= 0 for size in tensor.shape
+        ):
+            raise ValueError(
+                "head dimension must be 8, 16, 32, 64, 80, 96 or 128 and dimensions nonempty"
+            )
         if tensor.requires_grad:
             raise ValueError("this implementation supports inference forward only")
     if k.shape != v.shape or q.shape[0] != k.shape[0]:
@@ -147,8 +151,8 @@ def _resolve_window(causal, window_size, mask_mod):
     left, right = window_size
     if mask_mod is not None:
         return None, None
-    if left is not None and right is not None and left < 0 and right < 0:
-        left, right = None, None
+    left = None if left is None or left < 0 else left
+    right = None if right is None or right < 0 else right
     if causal:
         right = 0
     return left, right
@@ -189,7 +193,6 @@ def flash_attn_func(
         ("qv", qv is None),
         ("gather_kv_indices", gather_kv_indices is None),
         ("learnable_sink", learnable_sink is None),
-        ("softcap", softcap == 0.0),
         ("num_splits", num_splits == 1),
         ("pack_gqa", pack_gqa is None),
         ("deterministic", deterministic is False),
@@ -199,6 +202,13 @@ def flash_attn_func(
         if not supported:
             raise NotImplementedError(f"{name} is not supported by this forward implementation")
     _validate_inputs(q, k, v)
+    softcap = float(softcap)
+    if not math.isfinite(softcap) or softcap < 0:
+        raise ValueError("softcap must be finite and nonnegative")
+    if softcap:
+        if score_mod is not None:
+            raise ValueError("softcap and score_mod cannot be used together")
+        score_mod = softcap_score_mod(softcap)
     window_left, window_right = _resolve_window(causal, window_size, mask_mod)
     batch, q_len, q_heads, head_dim = q.shape
     kv_len, kv_heads = k.shape[1:3]

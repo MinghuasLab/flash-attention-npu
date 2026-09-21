@@ -29,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
-    parser.add_argument("--head-dim", type=int, choices=(64, 96, 128), default=128)
+    parser.add_argument("--head-dim", type=int, choices=(8, 16, 32, 64, 80, 96, 128), default=128)
     parser.add_argument("--q-len", type=int, default=129)
     parser.add_argument("--kv-len", type=int, default=257)
     parser.add_argument(

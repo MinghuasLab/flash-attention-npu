@@ -67,7 +67,16 @@ def test_public_exports():
 
 
 @pytest.mark.parametrize(
-    "dim,dtype", [(64, torch.float16), (96, torch.bfloat16), (128, torch.float16)]
+    "dim,dtype",
+    [
+        (8, torch.float16),
+        (16, torch.bfloat16),
+        (32, torch.float16),
+        (64, torch.float16),
+        (80, torch.bfloat16),
+        (96, torch.bfloat16),
+        (128, torch.float16),
+    ],
 )
 def test_supported_shapes(dim, dtype):
     interface._validate_inputs(*_inputs(dim, dtype))
@@ -78,7 +87,7 @@ def test_supported_shapes(dim, dtype):
     [
         ((17, 4, 128), "rank-4"),
         ((1, 0, 4, 128), "nonempty"),
-        ((1, 17, 4, 80), "head dimension"),
+        ((1, 17, 4, 72), "head dimension"),
         ((1, 17, 4, 64), "dimensions must match"),
         ((1, 17, 3, 128), "divisible"),
         ((2, 17, 4, 128), "batch sizes"),
@@ -354,8 +363,44 @@ def test_nonfinite_scale_rejected(host, scale):
     assert not host.compiled and not host.launched
 
 
-@pytest.mark.parametrize("option,value", [("qv", object()), ("num_splits", 2), ("softcap", 1.0)])
+@pytest.mark.parametrize(
+    "window,expected",
+    [
+        ((-1, 3), (None, 3)),
+        ((7, -1), (7, None)),
+        ((None, -1), (None, None)),
+        ((0, 0), (0, 0)),
+        ((None, 3), (None, 3)),
+    ],
+)
+def test_window_sides_normalize_independently(host, window, expected):
+    interface.flash_attn_func(*host.inputs, window_size=window)
+    assert host.compiled[0][17:19] == expected
+
+
+@pytest.mark.parametrize("option,value", [("qv", object()), ("num_splits", 2)])
 def test_unsupported_options_rejected_before_compile(host, option, value):
     with pytest.raises(NotImplementedError, match=option):
         interface.flash_attn_func(*host.inputs, **{option: value})
     assert not host.compiled and not host.launched
+
+
+@pytest.mark.parametrize("cap", [-1.0, float("nan"), float("inf")])
+def test_invalid_softcap_rejected(host, cap):
+    with pytest.raises(ValueError, match="softcap"):
+        interface.flash_attn_func(*host.inputs, softcap=cap)
+    assert not host.compiled and not host.launched
+
+
+def test_softcap_uses_stable_vector_callback_and_separate_variants(host):
+    interface.flash_attn_func(*host.inputs, softcap=2.0)
+    interface.flash_attn_func(*host.inputs, softcap=2.0)
+    assert len(host.compiled) == 1
+    callback = host.compiled[0][16]
+    assert callback._use_simd is True
+    interface.flash_attn_func(*host.inputs, softcap=50.0)
+    assert len(host.compiled) == 2 and host.compiled[1][16] is not callback
+    interface.flash_attn_func(*host.inputs, softcap=0.0)
+    assert len(host.compiled) == 3 and host.compiled[2][16] is None
+    with pytest.raises(ValueError, match="softcap and score_mod"):
+        interface.flash_attn_func(*host.inputs, softcap=2.0, score_mod=scale_score)

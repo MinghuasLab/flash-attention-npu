@@ -21,7 +21,14 @@ from flash_attn_npu_dsl import interface
 )
 @pytest.mark.parametrize(
     "mode,dtype,dim",
-    [("dense", torch.float16, 128), ("causal", torch.bfloat16, 96), ("window", torch.float16, 64)],
+    [
+        ("dense", torch.float16, 128),
+        ("causal", torch.bfloat16, 96),
+        ("window", torch.float16, 64),
+        ("left_window", torch.bfloat16, 96),
+        ("right_window", torch.float16, 64),
+        ("zero_window", torch.float16, 128),
+    ],
 )
 def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
     import torch_npu  # noqa: F401
@@ -41,12 +48,18 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
     monkeypatch.setenv("CATLASS_DSL_CACHE", "1")
     monkeypatch.setenv("CATLASS_DSL_FORCE_RECOMPILE", "0")
     interface._compiled_kernels.clear()
+    windows = {
+        "window": (64, 16),
+        "left_window": (0, -1),
+        "right_window": (-1, 0),
+        "zero_window": (0, 0),
+    }
     options = (
         {}
         if mode == "dense"
         else {"causal": True}
         if mode == "causal"
-        else {"window_size": (64, 16)}
+        else {"window_size": windows[mode]}
     )
     try:
         for sq, sk in [(512, 512), (768, 1024), (1024, 768), (512, 512), (1, 257), (257, 1)]:
@@ -65,8 +78,12 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
             keep = torch.ones(sq, sk, dtype=torch.bool)
             if mode == "causal":
                 keep = ki <= qi + sk - sq
-            elif mode == "window":
-                keep = (ki >= qi + sk - sq - 64) & (ki <= qi + sk - sq + 16)
+            elif mode in windows:
+                left, right = windows[mode]
+                if left >= 0:
+                    keep &= ki >= qi + sk - sq - left
+                if right >= 0:
+                    keep &= ki <= qi + sk - sq + right
             scores.masked_fill_(~keep, float("-inf"))
             expected_lse = torch.logsumexp(scores, dim=-1)
             expected = (scores.softmax(-1).nan_to_num(0) @ v.float().permute(0, 2, 1, 3)).permute(

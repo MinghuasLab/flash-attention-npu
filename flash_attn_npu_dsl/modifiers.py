@@ -1,6 +1,7 @@
 """Explicit scalar/vector callback contracts and score/mask stages."""
 
 import inspect
+from functools import lru_cache
 
 import catlass.tla as tla
 from catlass.core_api import (
@@ -25,6 +26,24 @@ def simd(fn):
 
 def uses_simd(fn) -> bool:
     return getattr(fn, "_use_simd", False) is True
+
+
+@lru_cache(maxsize=128)
+def softcap_score_mod(cap):
+    """Keep a stable callback identity for each compile-time softcap value."""
+
+    @simd
+    def capped_score(
+        score, b, h, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars=None, limit=cap
+    ):
+        scaled = score / limit
+        # exp(-2*abs(x)) stays in [0, 1], including saturated large scores.
+        decay = tla.exp(-2.0 * tla.abs(scaled))
+        one = tla.full(1.0, tla.Float32)
+        magnitude = ((one - decay) / (one + decay)) * limit
+        return tla.where(tla.cmp(scaled, 0.0, "lt"), magnitude * -1.0, magnitude)
+
+    return capped_score
 
 
 def validate_callback(fn, kind: str) -> None:
