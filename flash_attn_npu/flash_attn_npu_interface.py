@@ -1628,13 +1628,14 @@ def flash_attn_with_kvcache(
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
+           Values greater than 1 are supported only by the paged-KV BSND kvcache path.
            Don't change this unless you know what you are doing.
         scheduler_metadata: Optional scheduler metadata precomputed on the AICPU by
             get_scheduler_metadata. When given, the forward consumes the AICPU-computed
             tiling (and optional mask) directly and skips the host-side computation
             (which would otherwise sync on cache_seqlens). The creation arguments are
-            validated against this call: causal / window_size / softcap / softmax_scale
-            must match, and max_seqlen_k must equal the effective KV cache capacity seen
+            validated against this call: causal / window_size / softcap / softmax_scale /
+            num_splits must match, and max_seqlen_k must equal the effective KV cache capacity seen
             by the forward (block_table: page_block_size * block_table.shape[1];
             otherwise k_cache.shape[1]) — do not overprovision it. Pass the tensor
             returned by get_scheduler_metadata unchanged (do not clone/copy it).
@@ -1666,6 +1667,7 @@ def flash_attn_with_kvcache(
             softcap=softcap,
             softmax_scale=softmax_scale,
             seqlen_q=q.shape[1],
+            num_splits=num_splits,
             block_table=block_table,
             k_cache=k_cache,
             alibi_slopes=alibi_slopes,
@@ -1697,11 +1699,11 @@ def flash_attn_with_kvcache(
 
 
 def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, softcap,
-                                 softmax_scale, seqlen_q, block_table, k_cache,
+                                 softmax_scale, seqlen_q, num_splits, block_table, k_cache,
                                  alibi_slopes=None):
     """Reject scheduler_metadata created with arguments that do not match this
     call; the AICPU-written tiling bakes in the mask layout, paged geometry and
-    softcap-divided softmax scale."""
+    softcap-divided softmax scale, including the requested split schedule."""
     params = getattr(scheduler_metadata, "_fa_scheduler_params", None)
     if params is None:
         raise RuntimeError(
@@ -1714,6 +1716,7 @@ def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, sof
         "softcap": float(softcap),
         "softmax_scale": float(softmax_scale),
         "max_seqlen_q": int(seqlen_q),
+        "num_splits": int(num_splits),
         # The kernel reads the per-batch ALiBi stride from the baked tiling, so
         # it must match how this call indexes alibi_slopes.
         "alibi_slopes_batch_stride": (
@@ -1775,6 +1778,7 @@ def _get_scheduler_metadata_op(
     softcap: float,
     softmax_scale: Optional[float],
     alibi_slopes_batch_stride: int,
+    num_splits: int,
 ) -> torch.Tensor:
     scheduler_metadata = flash_attn_npu.get_scheduler_metadata(
         batch_size,
@@ -1794,6 +1798,7 @@ def _get_scheduler_metadata_op(
         softcap,
         softmax_scale,
         alibi_slopes_batch_stride,
+        num_splits,
     )
     # Keep this side effect inside the opaque custom op so Dynamo does not
     # trace the setattr while still attaching the runtime fingerprint.
@@ -1808,6 +1813,7 @@ def _get_scheduler_metadata_op(
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
         "alibi_slopes_batch_stride": int(alibi_slopes_batch_stride),
+        "num_splits": int(num_splits),
     }
     return scheduler_metadata
 @_torch_register_fake_wrapper(
@@ -1831,6 +1837,7 @@ def _get_scheduler_metadata_fake(
     softcap: float,
     softmax_scale: Optional[float],
     alibi_slopes_batch_stride: int,
+    num_splits: int,
 ) -> torch.Tensor:
     return torch.empty(
         (_SCHEDULER_METADATA_TILING_BYTES,),
@@ -1849,6 +1856,7 @@ def get_scheduler_metadata(
     softcap=0.0,   # 0.0 means deactivated
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
     alibi_slopes_batch_stride=0,
+    num_splits=0,  # 0 = auto, 1 = no KV split, >1 = requested KV split count
 ):
     """Precompute the forward scheduler metadata (tiling, and for paged KV cache
     the flash-decode split schedule) on the AICPU. Pass the
@@ -1877,5 +1885,6 @@ def get_scheduler_metadata(
         softcap,
         softmax_scale,
         alibi_slopes_batch_stride,
+        num_splits,
     )
     return scheduler_metadata

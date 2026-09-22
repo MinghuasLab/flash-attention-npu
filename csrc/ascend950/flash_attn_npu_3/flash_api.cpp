@@ -79,8 +79,10 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(cache_seqlens.is_contiguous(), "cache_seqlens must be contiguous");
     TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be an NPU tensor");
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
+    TORCH_CHECK(num_heads_q % num_heads_kv == 0,
+                "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(num_splits >= 0,
+                "950 backend (v3) requires num_splits to be non-negative");
 
     const bool is_varlen_q = cu_seqlens_q.has_value();
     const bool is_varlen_kv = cu_seqlens_k.has_value();
@@ -99,8 +101,17 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
         TORCH_CHECK(cache_seqlens.numel() == batch_size, "cache_seqlens must have batch_size elements");
     }
 
-    const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
-    const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
+    const uint32_t blockDim =
+        platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(num_splits <= static_cast<int64_t>(blockDim),
+                "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
+    if (num_splits > 1) {
+        TORCH_CHECK(page_size.has_value() && is_varlen_q,
+                    "950 backend (v3) metadata num_splits>1 requires paged KV "
+                    "cache and TND varlen query");
+    }
+    const uint32_t ps = page_size.has_value()
+        ? static_cast<uint32_t>(page_size.value()) : 128;
 
     FAMetadataArgs args{};
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q.value().data_ptr()) : 0;
@@ -123,6 +134,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
+    args.numSplits = static_cast<uint32_t>(num_splits);
     args.softmaxScale = static_cast<float>(softmax_scale);
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, cu_seqlens_k);
 }

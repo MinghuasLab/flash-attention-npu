@@ -385,6 +385,144 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
                               k_new, v_new, cache_seqlens, block_tables, block_size)
     return
+
+
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
+def test_fa_kvcache_fd_num_splits(num_splits):
+    """The BSND paged-KV FD path supports auto, no-split and fixed-split schedules."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 4, 1
+    q_seqlen, kv_seqlen, head_size, block_size = 1, 4096, 128, 128
+    scale = 1.0 / (head_size ** 0.5)
+
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
+    key_cache, value_cache = make_paged_kv_cache(
+        batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type, device="npu"
+    )
+    block_table = make_block_table(batch_size, kv_seqlen, block_size).npu()
+    cache_seqlens = torch.full(
+        (batch_size,), kv_seqlen, dtype=torch.int32, device="npu"
+    )
+
+    output_npu, softmax_lse_npu = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=scale,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+
+    key_batched, value_batched = gather_paged_kv_batch(
+        key_cache.cpu(), value_cache.cpu(), block_table.cpu(), kv_seqlen, block_size
+    )
+    output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
+        query.cpu(), key_batched, value_batched, scale, None, data_type, 0.0
+    )
+    assert_fa_close(output_npu, output_ref, output_pt, name=f"out num_splits={num_splits}")
+    assert_fa_close(
+        softmax_lse_npu, lse_ref, lse_pt, name=f"softmax_lse num_splits={num_splits}"
+    )
+
+
+@pytest.mark.parametrize("num_splits", [0, 1])
+def test_fa_kvcache_fd_append_tail_regression(num_splits):
+    """The final core must compute and write back the separate new-KV block."""
+    data_type = torch.bfloat16
+    head_size, block_size = 128, 128
+    cores = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    # On 20 cores: 10239 old tokens + 1 new token require 21 KV blocks.
+    old_length = cores * 512 - 1
+    capacity = old_length + 1
+    scale = head_size ** -0.5
+    query = torch.ones((1, 1, 1, head_size), dtype=data_type, device="npu")
+    block_table = make_block_table(1, capacity, block_size).npu()
+    cache_shape = (capacity // block_size, block_size, 1, head_size)
+    key_cache = torch.zeros(cache_shape, dtype=data_type, device="npu")
+    value_cache = torch.zeros_like(key_cache)
+    key_orig, value_orig = key_cache.clone(), value_cache.clone()
+    cache_seqlens = torch.tensor([old_length], dtype=torch.int32, device="npu")
+    # Make the appended token dominate attention so dropping it cannot be
+    # hidden by the error tolerance on a long sequence.
+    k_new = torch.full_like(query, 2)
+    v_new = torch.ones_like(query)
+    key_ref = torch.cat((
+        torch.zeros((1, old_length, 1, head_size), dtype=data_type), k_new.cpu()
+    ), dim=1)
+    value_ref = torch.cat((
+        torch.zeros((1, old_length, 1, head_size), dtype=data_type), v_new.cpu()
+    ), dim=1)
+    output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
+        query.cpu(), key_ref, value_ref, scale, None, data_type, 0.0
+    )
+
+    output, lse = flash_attn_with_kvcache(
+        query, key_cache, value_cache, k_new, v_new,
+        cache_seqlens=cache_seqlens, block_table=block_table,
+        softmax_scale=scale, num_splits=num_splits, return_softmax_lse=True,
+    )
+    check_kvcache_inplace(
+        key_orig, value_orig, key_cache, value_cache,
+        k_new, v_new, cache_seqlens, block_table, block_size,
+    )
+    assert_fa_close(output, output_ref, output_pt, name="append-tail out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="append-tail softmax_lse")
+
+
+@pytest.mark.parametrize("num_splits", [0, 1, 20])
+def test_fa_kvcache_fd_gqa_tail_regression(num_splits):
+    """Uneven batches and a partial head group must not lose the final KV tasks."""
+    cores = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    if cores != 20:
+        pytest.skip("This GQA tail reproducer requires 20 cube cores; host tests cover it too")
+    data_type = torch.bfloat16
+    batch_size, q_length, heads, head_size, block_size = 2, 6, 21, 128, 128
+    lengths = [4607, 1537]
+    capacity = max(lengths)
+    scale = head_size ** -0.5
+    query = torch.zeros(
+        (batch_size, q_length, heads, head_size), dtype=data_type, device="npu"
+    )
+    block_table_cpu = make_block_table(batch_size, capacity, block_size)
+    blocks_per_batch = block_table_cpu.shape[1]
+    key_cpu = torch.zeros(
+        (batch_size * blocks_per_batch, block_size, 1, head_size), dtype=data_type
+    )
+    value_cpu = torch.zeros_like(key_cpu)
+    # Uniform attention over values 0,1,2,... per 512-token block exposes
+    # truncated KV ranges. Batch 1 starts at 1, so an unwritten zero also fails.
+    for batch, length in enumerate(lengths):
+        values = (torch.arange(length) // 512 + batch).to(data_type)
+        value_cpu[batch * blocks_per_batch:(batch + 1) * blocks_per_batch].view(
+            -1, 1, head_size
+        )[:length] = values[:, None, None]
+    output, lse = flash_attn_with_kvcache(
+        query, key_cpu.npu(), value_cpu.npu(),
+        cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device="npu"),
+        block_table=block_table_cpu.npu(), softmax_scale=scale,
+        num_splits=num_splits, return_softmax_lse=True,
+    )
+    query_cpu = query.cpu()
+    for batch, length in enumerate(lengths):
+        key, value = gather_paged_kv(
+            key_cpu, value_cpu, block_table_cpu[batch], length, block_size
+        )
+        output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
+            query_cpu[batch:batch + 1], key.unsqueeze(0), value.unsqueeze(0),
+            scale, None, data_type, 0.0,
+        )
+        assert_fa_close(
+            output[batch:batch + 1], output_ref, output_pt, name=f"gqa-tail out batch={batch}"
+        )
+        assert_fa_close(
+            lse[batch:batch + 1], lse_ref, lse_pt, name=f"gqa-tail softmax_lse batch={batch}"
+        )
+
+
 # flash_attn_func test parameters
 # Single-option parameters: fixed values
 # batch_size: [4]

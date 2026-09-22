@@ -92,10 +92,10 @@ public:
         AscendC::SetMaskNorm();
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
 
-        int64_t vectorsubBlockNum = AscendC::GetSubBlockNum();
-        int64_t vectorsubBlockID = AscendC::GetSubBlockIdx();
-        int64_t subBlockNum = 40;
-        int64_t subBlockID = AscendC::GetBlockIdx();
+        const int64_t vectorsubBlockNum = AscendC::GetSubBlockNum();
+        const int64_t vectorsubBlockID = AscendC::GetSubBlockIdx();
+        const int64_t subBlockNum = AscendC::GetBlockNum() * vectorsubBlockNum;
+        const int64_t subBlockID = AscendC::GetBlockIdx();
 
         for (uint32_t process = subBlockID; process < kvSplitCoreNum * 2; process += subBlockNum) {
             uint32_t batchIdx = splitInfo[process/2].batchIdx;
