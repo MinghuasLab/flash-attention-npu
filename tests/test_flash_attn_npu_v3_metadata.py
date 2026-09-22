@@ -19,11 +19,6 @@ from tests.common.test_utils import (
 )
 
 
-def _is_ascend910():
-    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    return "Ascend910" in name
-
-
 def _is_ascend950():
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     return "Ascend950" in name
@@ -327,7 +322,6 @@ def metadata_spy_950(monkeypatch):
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_bsnd(
     data_type,
     batch_size,
@@ -381,7 +375,6 @@ def test_flash_attn_func_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type,
     batch_size,
@@ -442,7 +435,6 @@ def test_flash_attn_varlen_func_metadata_tnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_bsnd(
     data_type,
     batch_size,
@@ -515,7 +507,6 @@ def test_flash_attn_kvcache_metadata_bsnd(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_tnd(
     data_type,
     batch_size,
@@ -589,7 +580,6 @@ def test_flash_attn_kvcache_metadata_tnd(
 
 
 @pytest.mark.parametrize("is_causal", [False])
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     """FD + metadata path with idle cores (needCoreNum < blockDim)."""
     batch_size, num_heads, kv_heads = 1, 1, 1
@@ -699,7 +689,6 @@ KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES = [
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_swa(
     data_type,
     batch_size,
@@ -755,7 +744,6 @@ def test_flash_attn_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_func_metadata_softcap_scale(
     data_type,
     batch_size,
@@ -813,7 +801,6 @@ def test_flash_attn_func_metadata_softcap_scale(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_varlen_func_metadata_swa(
     data_type,
     batch_size,
@@ -878,7 +865,6 @@ def test_flash_attn_varlen_func_metadata_swa(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type,
     batch_size,
@@ -959,7 +945,6 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,
     ids=["noncausal-window-collapses", "causal-window-collapses"],
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap,
@@ -1061,7 +1046,6 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
         (True, (-1, -1), False, (-1, -1)),  # metadata has a causal mask, call needs none
     ],
 )
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     meta_causal, meta_window, call_causal, call_window
 ):
@@ -1105,7 +1089,6 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 @pytest.mark.parametrize(
     "max_seqlen_k", [128, 2, 192], ids=["max_length", "head_count", "total_tokens"]
 )
@@ -1141,7 +1124,6 @@ def test_flash_attn_kvcache_metadata_tnd_max_seqlen_k(monkeypatch, max_seqlen_k)
             interface.flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs)
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     """Paged geometry baked into the tiling must match the call's cache/page table."""
     data_type = torch.bfloat16
@@ -1191,7 +1173,6 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
         call_with(unpaged)
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     """softcap/softmax_scale are baked into the tiling; mismatches must be rejected."""
     data_type = torch.bfloat16
@@ -1230,7 +1211,6 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     """A copied metadata tensor loses its creation-argument fingerprint."""
     data_type = torch.bfloat16
@@ -1267,7 +1247,6 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
         )
 
 
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     """A hand-crafted buffer with a forged fingerprint but the wrong size must be
     rejected by the C++ exact-size check (defense in depth behind the Python
@@ -1306,6 +1285,155 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
             page_table=page_table,
             scheduler_metadata=bad,
         )
+
+
+@pytest.fixture
+def kvcache_metadata_wrapper_950(monkeypatch):
+    """Exercise Python routing/validation with the device custom ops mocked."""
+    if not _is_ascend950():
+        pytest.skip("Ascend950 only")
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as interface
+
+    calls = {"metadata": [], "forward": []}
+
+    def metadata_op(*args):
+        metadata = torch.empty(0, dtype=torch.uint8)
+        calls["metadata"].append(metadata)
+        return metadata
+
+    def forward(*args, **kwargs):
+        calls["forward"].append(kwargs["scheduler_metadata"])
+        return args[0], None
+
+    monkeypatch.setattr(interface, "_get_scheduler_metadata_op", metadata_op)
+    monkeypatch.setattr(interface, "_flash_attn_forward", forward)
+
+    def make_case(layout="paged_tnd", sq=8, num_splits=0, window_size=WINDOW_SIZE):
+        varlen = layout != "bsnd"
+        paged = layout != "nonpaged_tnd"
+        query = torch.empty((sq, 2, 64) if varlen else (1, sq, 2, 64), dtype=torch.float16)
+        key = torch.empty((8, 128, 1, 64) if paged else (1024, 1, 64), dtype=query.dtype)
+        lengths = torch.tensor([1024], dtype=torch.int32)
+        cu_q = torch.tensor([0, sq], dtype=torch.int32) if varlen else None
+        inputs = dict(
+            q=query, k_cache=key, v_cache=torch.empty_like(key),
+            cache_seqlens=lengths, cu_seqlens_q=cu_q, max_seqlen_q=sq,
+            page_table=torch.arange(8, dtype=torch.int32).reshape(1, 8) if paged else None,
+            num_splits=num_splits, window_size=window_size,
+        )
+        metadata_args = dict(
+            batch_size=1, max_seqlen_q=sq, max_seqlen_k=1024,
+            num_heads_q=2, num_heads_kv=1, headdim=64,
+            cache_seqlens=lengths, cu_seqlens_q=cu_q, qkv_dtype=query.dtype,
+            page_size=128 if paged else None,
+            num_splits=num_splits, window_size=window_size,
+        )
+        return inputs, metadata_args
+
+    return interface, make_case, calls
+
+
+@pytest.mark.parametrize("explicit_metadata", [False, True])
+@pytest.mark.parametrize(
+    "layout,sq,num_splits,window_size,host_tiling",
+    [
+        ("paged_tnd", 8, 0, WINDOW_SIZE, True),
+        ("paged_tnd", 8, 2, WINDOW_SIZE, True),
+        ("paged_tnd", 8, 1, WINDOW_SIZE, False),
+        ("paged_tnd", 32, 0, WINDOW_SIZE, False),
+        ("bsnd", 8, 0, WINDOW_SIZE, False),
+        ("nonpaged_tnd", 8, 0, WINDOW_SIZE, False),
+        ("paged_tnd", 8, 0, (128, -1), True),
+        ("paged_tnd", 32, 0, (128, -1), False),
+    ],
+)
+def test_kvcache_metadata_950_routing(
+    kvcache_metadata_wrapper_950, explicit_metadata,
+    layout, sq, num_splits, window_size, host_tiling,
+):
+    interface, make_case, calls = kvcache_metadata_wrapper_950
+    inputs, metadata_args = make_case(layout, sq, num_splits, window_size)
+    metadata = interface.get_scheduler_metadata(**metadata_args) if explicit_metadata else None
+    if explicit_metadata and not host_tiling:
+        # Ordinary non-FD calls must still accept metadata without a fingerprint.
+        metadata = metadata.clone()
+    calls["metadata"].clear()
+    result = interface.flash_attn_with_kvcache(**inputs, scheduler_metadata=metadata)
+    assert result is inputs["q"]
+    if explicit_metadata or host_tiling:
+        assert calls["metadata"] == []
+        assert calls["forward"][0] is metadata
+    else:
+        assert len(calls["metadata"]) == 1
+        assert calls["forward"][0] is calls["metadata"][0]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_splits", 1),
+        ("batch_size", 2),
+        ("max_seqlen_q", 16),
+        ("num_heads_q", 4),
+        ("num_heads_kv", 2),
+        ("headdim", 128),
+        ("headdim_v", 128),
+        ("qkv_dtype", torch.bfloat16),
+        ("page_size", 64),
+        ("num_blocks", 16),
+        ("max_num_blocks_per_seq", 16),
+        ("causal", True),
+        ("window_size", (128, 0)),
+        ("softmax_scale", 0.25),
+    ],
+)
+def test_kvcache_metadata_950_fd_mismatch_rejected(kvcache_metadata_wrapper_950, field, value):
+    interface, make_case, calls = kvcache_metadata_wrapper_950
+    inputs, metadata_args = make_case(num_splits=2)
+    metadata_args[field] = value
+    metadata = interface.get_scheduler_metadata(**metadata_args)
+    with pytest.raises(ValueError, match=field):
+        interface.flash_attn_with_kvcache(**inputs, scheduler_metadata=metadata)
+    assert calls["forward"] == []
+
+
+@pytest.mark.parametrize("change", ["no_split", "long_q", "nonpaged"])
+def test_kvcache_metadata_950_fd_reuse_cannot_bypass_validation(kvcache_metadata_wrapper_950, change):
+    interface, make_case, calls = kvcache_metadata_wrapper_950
+    inputs, metadata_args = make_case(num_splits=2)
+    metadata = interface.get_scheduler_metadata(**metadata_args)
+    if change == "no_split":
+        inputs["num_splits"] = 1
+    elif change == "long_q":
+        inputs, _ = make_case(sq=32)
+    else:
+        inputs, _ = make_case(layout="nonpaged_tnd")
+    with pytest.raises(ValueError, match="FD scheduler_metadata arguments"):
+        interface.flash_attn_with_kvcache(**inputs, scheduler_metadata=metadata)
+    assert calls["forward"] == []
+
+
+@pytest.mark.parametrize("change", ["clone", "device", "window_bound"])
+def test_kvcache_metadata_950_fd_invalid_metadata(kvcache_metadata_wrapper_950, change):
+    interface, make_case, calls = kvcache_metadata_wrapper_950
+    inputs, metadata_args = make_case(num_splits=2)
+    if change == "window_bound":
+        inputs["window_size"] = metadata_args["window_size"] = (512, -1)
+        metadata_args.update(max_seqlen_k=128, max_num_blocks_per_seq=8)
+    metadata = interface.get_scheduler_metadata(**metadata_args)
+    if change == "clone":
+        metadata = metadata.clone()
+        error, message = RuntimeError, "fingerprint"
+    elif change == "device":
+        moved = torch.empty(0, dtype=torch.uint8, device="meta")
+        moved._fa_scheduler_params = metadata._fa_scheduler_params
+        metadata = moved
+        error, message = ValueError, "same device"
+    else:
+        error, message = ValueError, "normalized_window_size"
+    with pytest.raises(error, match=message):
+        interface.flash_attn_with_kvcache(**inputs, scheduler_metadata=metadata)
+    assert calls["forward"] == []
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")

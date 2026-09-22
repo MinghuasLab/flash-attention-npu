@@ -10,7 +10,7 @@
 
 #include "fwd_dispatch.hpp"
 #include "fwd_kernel.cpp"
-#include "fd_combine.hpp"
+#include "combine_scale.hpp"
 
 // ─── SWITCH / LAUNCH macros ───────────────────────────────────────
 // Three flat macros; none of them expands another. They are composed only at

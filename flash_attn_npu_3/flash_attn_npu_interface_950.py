@@ -1,6 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -339,6 +340,97 @@ def _get_scheduler_metadata_fake(
         device=cache_seqlens.device,
     )
 
+def _is_fd_candidate(num_splits, paged, varlen_q, max_seqlen_q):
+    # Preserve the pre-metadata-FD host routing. The runtime tiler still decides
+    # whether these candidates actually enable FD or fall back to normal FA.
+    return num_splits > 1 or (
+        num_splits == 0 and paged and varlen_q
+        and max_seqlen_q is not None and max_seqlen_q <= 16
+    )
+
+
+def _metadata_window_size(causal, window_size, max_seqlen_k):
+    # Mirror DeriveFwdMask in fa_metadata_args.h without reading device lengths.
+    left, right = window_size
+    if max_seqlen_k > 0:
+        if left >= max_seqlen_k:
+            left = -1
+        if right >= max_seqlen_k:
+            right = -1
+    if causal:
+        right = 0
+    is_local = (left >= 0 or right >= 0) and not (left < 0 and right == 0)
+    if is_local:
+        left = max_seqlen_k if left < 0 else left
+        right = max_seqlen_k if right < 0 else right
+    return (left, right)
+
+
+def _validate_fd_scheduler_metadata(
+    scheduler_metadata, *, q, k_cache, v_cache, page_table, cu_seqlens_q,
+    max_seqlen_q, causal, window_size, softmax_scale, num_splits,
+):
+    params = getattr(scheduler_metadata, "_fa_scheduler_params", None)
+    call_is_fd_candidate = _is_fd_candidate(
+        num_splits, page_table is not None, cu_seqlens_q is not None, max_seqlen_q
+    )
+    # A changed num_splits/layout must not bypass validation of an FD schedule.
+    # Normal-FA metadata retains its existing acceptance rules, including raw
+    # tensors without a Python fingerprint.
+    if not call_is_fd_candidate and not (params and params.get("fd_candidate")):
+        return
+    if params is None:
+        raise RuntimeError(
+            "FD scheduler_metadata has no creation-argument fingerprint; pass "
+            "the unchanged tensor returned by get_scheduler_metadata"
+        )
+    if scheduler_metadata.device != q.device:
+        raise ValueError("FD scheduler_metadata must be on the same device as q")
+
+    varlen_q = cu_seqlens_q is not None
+    paged = page_table is not None
+    kv_bound = (
+        k_cache.shape[1] * page_table.shape[1] if paged
+        else k_cache.shape[0] if varlen_q else k_cache.shape[1]
+    )
+    expected = {
+        "backend": "ascend950",
+        "version": 1,
+        "device": str(q.device),
+        "batch_size": cu_seqlens_q.numel() - 1 if varlen_q else q.shape[0],
+        "max_seqlen_q": max_seqlen_q if varlen_q else q.shape[1],
+        "num_heads_q": q.shape[-2],
+        "num_heads_kv": k_cache.shape[-2],
+        "headdim": q.shape[-1],
+        "headdim_v": v_cache.shape[-1],
+        "qkv_dtype": q.dtype,
+        "varlen_q": varlen_q,
+        "varlen_kv": False,
+        "page_size": k_cache.shape[1] if paged else None,
+        "num_blocks": k_cache.shape[0] if paged else None,
+        "max_num_blocks_per_seq": page_table.shape[1] if paged else None,
+        "causal": bool(causal),
+        "window_size": tuple(window_size),
+        "normalized_window_size": _metadata_window_size(causal, window_size, kv_bound),
+        "softmax_scale": float(softmax_scale),
+        "num_splits": int(num_splits),
+    }
+    mismatches = []
+    for key, call_value in expected.items():
+        meta_value = params.get(key, "<missing>")
+        same = (
+            math.isclose(meta_value, call_value, rel_tol=1e-6)
+            if key == "softmax_scale" and isinstance(meta_value, float)
+            else meta_value == call_value
+        )
+        if not same:
+            mismatches.append(f"{key}: metadata={meta_value!r} vs call={call_value!r}")
+    if mismatches:
+        raise ValueError(
+            "FD scheduler_metadata arguments do not match this call: " + "; ".join(mismatches)
+        )
+
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
@@ -370,7 +462,9 @@ def get_scheduler_metadata(
     ``scheduler_metadata`` argument to avoid per-call host tiling and H2D/D2H
     copies. It depends on shapes, dtype-independent tiling constants, causal
     flag, and the actual per-batch sequence lengths; re-create it whenever those
-    change.
+    change. For FD candidates, pass this tensor unchanged (do not clone/copy it):
+    the Python wrapper checks its creation arguments against the consuming call.
+    This check does not detect changes to the contents of sequence-length tensors.
     """
     cache_seqlens = _maybe_contiguous(cache_seqlens)
     if cu_seqlens_q is not None:
@@ -413,6 +507,36 @@ def get_scheduler_metadata(
         window_size[0],
         window_size[1],
     )
+    # Attach after the custom-op boundary, which does not preserve Python attrs.
+    # Record normal-FA arguments too, so reusing that metadata for an FD call
+    # can be checked without imposing new checks on ordinary non-FD calls.
+    scheduler_metadata._fa_scheduler_params = {
+        "backend": "ascend950",
+        "version": 1,
+        "device": str(cache_seqlens.device),
+        "fd_candidate": _is_fd_candidate(
+            num_splits, page_size is not None, cu_seqlens_q is not None, max_seqlen_q
+        ),
+        "batch_size": int(batch_size),
+        "max_seqlen_q": int(max_seqlen_q),
+        "num_heads_q": int(num_heads_q),
+        "num_heads_kv": int(num_heads_kv),
+        "headdim": int(headdim),
+        "headdim_v": int(headdim_v),
+        "qkv_dtype": qkv_dtype,
+        "varlen_q": cu_seqlens_q is not None,
+        "varlen_kv": cu_seqlens_k is not None,
+        "page_size": page_size,
+        "num_blocks": num_blocks if page_size is not None else None,
+        "max_num_blocks_per_seq": max_num_blocks_per_seq if page_size is not None else None,
+        "causal": bool(causal),
+        "window_size": tuple(window_size),
+        "normalized_window_size": _metadata_window_size(
+            causal, window_size, max_seqlen_k if max_seqlen_k is not None else 0
+        ),
+        "softmax_scale": float(softmax_scale),
+        "num_splits": int(num_splits),
+    }
     return scheduler_metadata
 
 
@@ -830,6 +954,12 @@ def flash_attn_with_kvcache(
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
+        scheduler_metadata: Optional metadata returned by get_scheduler_metadata.
+            For FD candidates (explicit splits, or auto-split paged TND with
+            max_seqlen_q <= 16), None selects host tiling; an unchanged metadata
+            tensor selects the precomputed AICPU schedule. Other calls retain
+            automatic metadata generation. FD creation arguments must match this
+            call; regenerate metadata whenever the actual sequence lengths change.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -851,19 +981,17 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
 
-    # FlashDecode schedules depend on the runtime KV lengths and are produced
-    # by the host tiler.  Keep the upstream metadata path for normal FA, but
-    # do not pre-build metadata for explicit FD or for the narrow auto-FD
-    # candidate shape.
-    auto_fd_candidate = (
-        num_splits == 0
-        and page_table is not None
-        and cu_seqlens_q is not None
-        and max_seqlen_q is not None
-        and max_seqlen_q <= 16
+    use_host_tiling = _is_fd_candidate(
+        num_splits, page_table is not None, cu_seqlens_q is not None, max_seqlen_q
     )
-    use_host_tiling = num_splits > 1 or auto_fd_candidate
-    if scheduler_metadata is None and not use_host_tiling:
+    if scheduler_metadata is not None:
+        _validate_fd_scheduler_metadata(
+            scheduler_metadata, q=q, k_cache=k_cache, v_cache=v_cache,
+            page_table=page_table, cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q, causal=causal, window_size=window_size,
+            softmax_scale=softmax_scale, num_splits=num_splits,
+        )
+    elif not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:
                 raise ValueError(
