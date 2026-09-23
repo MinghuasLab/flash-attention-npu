@@ -4,7 +4,12 @@ import os
 import torch
 import torch_npu
 import pytest
-from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention, ref_flash_attention_pair
+from tests.common.attention_ref import (
+    _ref_flash_attention_pair,
+    cached_autograd_grads,
+    ref_flash_attention,
+    ref_flash_attention_pair,
+)
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
@@ -711,16 +716,28 @@ def test_flash_attn_func(
 
     dout = make_random_tensor(out.shape, out.dtype, low=-0.5, high=0.5, device="npu")
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out, (query, key, value), dout)
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-        golden_out_ref,
+
+    def _recompute_live_goldens():
+        # Forward-cache HIT returns detached goldens.  Rebuild a live graph
+        # only on a gradient-cache miss (same path as v2/v3/v4 kvcache).
+        out_ref, _, out_pt, _ = _ref_flash_attention_pair(
+            query_ref, key_ref, value_ref, scale, atten_mask, data_type
+        )
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            out_ref = out_ref.clone()
+            out_pt = out_pt.clone()
+            out_ref[:, fully_masked] = 0
+            out_pt[:, fully_masked] = 0
+        return out_ref, out_pt
+
+    dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+        os.environ.get("GOLDEN_CACHE_NODEID", "v4-func"),
+        (golden_out_ref, golden_out_pt),
         (query_ref, key_ref, value_ref),
         dout.detach().cpu(),
-        retain_graph=True,
-    )
-    dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-        golden_out_pt,
-        (query_ref, key_ref, value_ref),
-        dout.detach().cpu(),
+        metadata={"version": 4, "kind": "func"},
+        recompute_fn=_recompute_live_goldens,
     )
     assert_fa_close(dq_ag, dq_ref, dq_pt, name="dQ")
     assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")
