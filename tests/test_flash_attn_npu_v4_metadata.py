@@ -5,8 +5,8 @@ import torch
 import torch_npu
 
 _device_name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-if "Ascend910" not in _device_name:
-    pytest.skip("flash_attn_func / flash_attn_varlen_func / get_scheduler_metadata only on Ascend910", allow_module_level=True)
+if "Ascend910" not in _device_name and "Ascend950" not in _device_name:
+    pytest.skip("FA4 metadata tests require Ascend910 or Ascend950", allow_module_level=True)
 
 from tests.common.attention_ref import ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
@@ -250,12 +250,71 @@ KV_CACHE_TND_CASES = [
 ]
 
 
+def test_flash_attn_varlen_metadata_flashdecode_matches_host_tiling():
+    """Automatic AICPU metadata must preserve the paged FlashDecode path.
+
+    ``num_splits > 1`` used to force host tiling because the metadata producer
+    did not populate the FlashDecode schedules. Compare the new automatic
+    metadata path against the explicit host-tiling fallback.
+    """
+    data_type = torch.bfloat16
+    batch_size, q_seqlen, kv_seqlen = 2, 8, 2048
+    num_heads = kv_heads = 8
+    head_size = 64
+    block_size = 128
+    query = make_random_tensor(
+        (batch_size * q_seqlen, num_heads, head_size), data_type, device="npu"
+    )
+    key_cache, value_cache, page_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+    cu_seqlens_q = _int32_npu([0, q_seqlen, 2 * q_seqlen])
+    scale = head_size ** -0.5
+
+    out_metadata, lse_metadata, *_ = flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        softmax_scale=scale,
+        num_splits=2,
+        return_lse=True,
+    )
+    out_host, lse_host, *_ = flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        softmax_scale=scale,
+        num_splits=2,
+        return_lse=True,
+        disable_scheduler_metadata=True,
+    )
+
+    assert out_metadata.shape == out_host.shape
+    assert lse_metadata.shape == lse_host.shape
+    assert_fa_close(out_metadata, out_host, out_host, name="metadata FlashDecode out")
+    assert_fa_close(lse_metadata, lse_host, lse_host, name="metadata FlashDecode lse")
+
+
 @pytest.fixture
 def metadata_spy(monkeypatch):
     """Spy on get_scheduler_metadata to prove the training interfaces route
     through the AICPU scheduler-metadata path internally (official flash-attn
     only exposes scheduler_metadata on flash_attn_with_kvcache)."""
-    from flash_attn_npu_4 import flash_attn_npu_interface as interface
+    if "Ascend950" in _device_name:
+        from flash_attn_npu_4 import flash_attn_npu_interface_950 as interface
+    else:
+        from flash_attn_npu_4 import flash_attn_npu_interface as interface
     calls = []
     original = interface.get_scheduler_metadata
 
@@ -630,6 +689,8 @@ def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, softcap, softmax_scale, metadata_spy,
 ):
+    if "Ascend950" in _device_name and softcap != 0.0:
+        pytest.skip("Ascend950 FA4 kernel does not support softcap")
     query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
     key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
     value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
@@ -728,6 +789,8 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap
 ):
+    if "Ascend950" in _device_name and softcap != 0.0:
+        pytest.skip("Ascend950 FA4 kernel does not support softcap")
     query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
@@ -794,6 +857,8 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     block_size, is_causal, window_size, softcap,
 ):
     """Metadata path must follow actual cache_seqlens, not page capacity."""
+    if "Ascend950" in _device_name and softcap != 0.0:
+        pytest.skip("Ascend950 FA4 kernel does not support softcap")
     query = make_random_tensor(
         (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
     )
