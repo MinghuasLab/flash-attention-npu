@@ -276,7 +276,7 @@ class BishengBuildExt(build_ext):
 
     def _build_aicpu_metadata(self, ext_fullpath, ext_name):
         """Compile fa_metadata.aicpu (host AICPU object) for the extensions
-        that carry the scheduler-metadata feature (910 v2/v3 and 950 v3). This
+        that carry the scheduler-metadata feature (910 v2/v3/v4 and 950 v3/v4). This
         is a separate `bisheng -x aicpu` invocation (host CPU code
         cross-compiled with hcc, not ASC device code); the resulting object is
         linked into the extension alongside the ASC device objects. Returns the
@@ -287,6 +287,7 @@ class BishengBuildExt(build_ext):
             "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
             "flash_attn_npu_3_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_3"),
             "flash_attn_npu_4.flash_attn_npu_4": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_4"),
+            "flash_attn_npu_4_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_4"),
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:
@@ -296,7 +297,7 @@ class BishengBuildExt(build_ext):
             return None
         aicpu_obj = os.path.join(
             os.path.dirname(ext_fullpath),
-            "fa_metadata_950.o" if ext_name == "flash_attn_npu_3_950" else "fa_metadata.o",
+            "fa_metadata_950.o" if ext_name.endswith("_950") else "fa_metadata.o",
         )
         # Incremental: aicpu is a host-code cross-compile (hcc) with no depfile,
         # so mtime-on-source only. Skip if the object is already up-to-date.
