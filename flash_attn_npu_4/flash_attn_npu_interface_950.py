@@ -49,6 +49,59 @@ def _window_to_npu(window_size: Optional[int]) -> int:
     return -1 if window_size is None else int(window_size)
 
 
+def get_scheduler_metadata(
+    batch_size,
+    max_seqlen_q,
+    max_seqlen_k,
+    num_heads_q,
+    num_heads_kv,
+    headdim,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,   # 0.0 means deactivated
+    num_splits=0,  # Can be tuned for speed
+    pack_gqa=None,  # Can be tuned for speed
+    sm_margin=0,
+    softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+):
+    """Precompute scheduler metadata (tiling + mask) on the AICPU.
+
+    This avoids the device->host->device round trip in the eager tiling path by
+    running the tiling/mask derivation on the NPU. The returned byte tensor is
+    passed back to ``flash_attn_func`` / ``flash_attn_varlen_func`` through the
+    ``scheduler_metadata`` argument.
+    """
+    cache_seqlens = _maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+    return flash_attn_npu_4_950.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        page_size,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        softmax_scale,
+    )
+
+
 @_torch_custom_op_wrapper(
     "flash_attn_npu_4_C::_flash_attn_forward", mutates_args=(), device_types="npu"
 )
@@ -76,6 +129,7 @@ def _flash_attn_forward(
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k = (_maybe_contiguous(x) for x in (q, k))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -107,6 +161,7 @@ def _flash_attn_forward(
         pack_gqa,
         learnable_sink,
         return_lse,
+        scheduler_metadata,
     )
 
     if out_accum is None:
@@ -323,6 +378,8 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors=None,
         block_sparse_tensors_bwd=None,
         return_lse=False,
+        scheduler_metadata=None,
+        disable_scheduler_metadata=False,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -332,6 +389,28 @@ class FlashAttnFunc(torch.autograd.Function):
 
         batch_size = q.shape[0]
         seqused_k = torch.full((batch_size,), k.shape[1], dtype=torch.int32, device=q.device)
+
+        # Precompute the scheduler metadata, including FlashDecode schedules
+        # when eligible, on the AICPU so the forward launch needs no
+        # device->host->device round trip.
+        if scheduler_metadata is None and not disable_scheduler_metadata:
+            scheduler_metadata = get_scheduler_metadata(
+                batch_size,
+                q.shape[1],
+                k.shape[1],
+                q.shape[2],
+                k.shape[2],
+                q.shape[3],
+                seqused_k,
+                qkv_dtype=q.dtype,
+                headdim_v=v.shape[-1],
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                softmax_scale=softmax_scale,
+            )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,
@@ -357,6 +436,7 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits,
             pack_gqa,
             True,
+            scheduler_metadata,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -447,6 +527,8 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # block_sparse_tensors
             None,  # block_sparse_tensors_bwd
             None,  # return_lse
+            None,  # scheduler_metadata
+            None,  # disable_scheduler_metadata
         )
 
 
@@ -482,6 +564,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors=None,
         aux_scalars=None,
         return_lse=False,
+        scheduler_metadata=None,
+        disable_scheduler_metadata=False,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -499,6 +583,53 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
 
+        # Precompute the scheduler metadata, including FlashDecode schedules
+        # when eligible, on the AICPU so the forward launch needs no
+        # device->host->device round trip.
+        batch_size = (
+            cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
+        )
+        kv_seqlens = seqused_k
+        if kv_seqlens is None and cu_seqlens_k is not None:
+            kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        # The forward launch normalizes the SWA window against max_seqlen_k. A
+        # declared bound can be looser than the actual lengths (paged KV: the
+        # page capacity), so when the caller does not pin it, use the actual
+        # max KV length for both the metadata and the forward launch. Otherwise
+        # a finite window that covers the real lengths but not the capacity
+        # fails to collapse and produces the wrong mask.
+        fwd_max_seqlen_k = max_seqlen_k
+        if scheduler_metadata is None and not disable_scheduler_metadata and kv_seqlens is not None:
+            kv_seqlens = _maybe_contiguous(kv_seqlens)
+            if max_seqlen_q is None:
+                metadata_max_seqlen_q = q.shape[0] if q.dim() == 3 else q.shape[1]
+            else:
+                metadata_max_seqlen_q = max_seqlen_q
+            if max_seqlen_k is None:
+                metadata_max_seqlen_k = int(kv_seqlens.max().item())
+                fwd_max_seqlen_k = metadata_max_seqlen_k
+            else:
+                metadata_max_seqlen_k = max_seqlen_k
+            scheduler_metadata = get_scheduler_metadata(
+                batch_size,
+                metadata_max_seqlen_q,
+                metadata_max_seqlen_k,
+                q.shape[1] if q.dim() == 3 else q.shape[2],
+                k.shape[1] if k.dim() == 3 else k.shape[2],
+                q.shape[-1],
+                kv_seqlens,
+                qkv_dtype=q.dtype,
+                headdim_v=v.shape[-1],
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=k.shape[1] if page_table is not None and k.dim() == 4 else None,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                softmax_scale=softmax_scale,
+            )
+
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,
             k,
@@ -508,7 +639,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
-            max_seqlen_k,
+            fwd_max_seqlen_k,
             min_seqlen_k,
             seqused_q,
             seqused_k,
@@ -523,6 +654,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits,
             pack_gqa,
             True,
+            scheduler_metadata,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
@@ -623,6 +755,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # aux_tensors
             None,  # aux_scalars
             None,  # return_lse
+            None,  # scheduler_metadata
+            None,  # disable_scheduler_metadata
         )
 
 
@@ -648,6 +782,8 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    disable_scheduler_metadata: bool = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -671,6 +807,8 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        scheduler_metadata,
+        disable_scheduler_metadata,
     )
 
 
@@ -699,6 +837,7 @@ def _flash_attn_forward_fake(
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
     is_varlen_q = cu_seqlens_q is not None
@@ -766,6 +905,8 @@ def flash_attn_varlen_func(
     aux_tensors=None,
     aux_scalars=None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    disable_scheduler_metadata: bool = False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -796,4 +937,6 @@ def flash_attn_varlen_func(
         aux_tensors,
         aux_scalars,
         return_lse,
+        scheduler_metadata,
+        disable_scheduler_metadata,
     )

@@ -5,8 +5,8 @@ import torch
 import torch_npu
 
 _device_name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-if "Ascend910" not in _device_name:
-    pytest.skip("flash_attn_varlen_func / get_scheduler_metadata only on Ascend910", allow_module_level=True)
+if "Ascend910" not in _device_name and "Ascend950" not in _device_name:
+    pytest.skip("FA4 graph tests require Ascend910 or Ascend950", allow_module_level=True)
 
 from flash_attn_npu_4 import flash_attn_varlen_func, get_scheduler_metadata
 from tests.common.attention_ref import ref_flash_attention_pair
