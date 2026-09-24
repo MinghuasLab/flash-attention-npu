@@ -717,6 +717,7 @@ def flash_attn_varlen_func(
         - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
         - 不支持 pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices。
         - cu_seqlens_* / seqused_* / page_table 若传入须为 int32。
+        - 在 Ascend 950 上，分页 KV Cache 的 page_size 仅支持 128、256、512 或 1024。
         - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
 
     返回：
