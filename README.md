@@ -759,6 +759,7 @@ def flash_attn_varlen_func(
         - softcap >= 0 (0.0 disables; not supported on Ascend 950).
         - pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices not supported.
         - cu_seqlens_* / seqused_* / page_table must be int32 when provided.
+        - On Ascend 950, paged KV cache page_size must be one of 128, 256, 512, or 1024.
         - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
 
     Return:
