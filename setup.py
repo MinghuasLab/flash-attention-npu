@@ -299,10 +299,31 @@ class BishengBuildExt(build_ext):
             "fa_metadata_950.o" if ext_name == "flash_attn_npu_3_950" else "fa_metadata.o",
         )
         # Incremental: aicpu is a host-code cross-compile (hcc) with no depfile,
-        # so mtime-on-source only. Skip if the object is already up-to-date.
+        # so track mtimes of the source plus its locally-included headers
+        # (transitively). The struct ABI (fa_metadata_args.h) is shared with the
+        # host objects, which DO track headers via -MMD; a stale kernel object
+        # here would pair a new host layout with an old kernel layout, so
+        # over-triggering a rebuild is safe while under-triggering is not.
+        aicpu_dep_mtimes = [os.path.getmtime(aicpu_src)]
+        aicpu_seen, aicpu_queue = set(), [aicpu_src]
+        while aicpu_queue:
+            aicpu_dep = aicpu_queue.pop()
+            if aicpu_dep in aicpu_seen:
+                continue
+            aicpu_seen.add(aicpu_dep)
+            try:
+                with open(aicpu_dep, "r", errors="replace") as f:
+                    aicpu_dep_src = f.read()
+            except OSError:
+                continue
+            for m in re.finditer(r'#include\s+"([^"]+)"', aicpu_dep_src):
+                aicpu_dep_path = os.path.join(src_dir, m.group(1))
+                if os.path.exists(aicpu_dep_path):
+                    aicpu_dep_mtimes.append(os.path.getmtime(aicpu_dep_path))
+                    aicpu_queue.append(aicpu_dep_path)
         if not self._force_rebuild() and os.path.exists(aicpu_obj) and \
-                os.path.getmtime(aicpu_src) <= os.path.getmtime(aicpu_obj):
-            print("[compile-aicpu-skip]", aicpu_src, "(obj up-to-date)")
+                max(aicpu_dep_mtimes) <= os.path.getmtime(aicpu_obj):
+            print("[compile-aicpu-skip]", aicpu_src, "(obj up-to-date incl. headers)")
             return aicpu_obj
         cann_arch_dir = get_cann_arch_dir()
         aicpu_inc = os.path.join(ascend_home, cann_arch_dir, "asc/include/aicpu_api")

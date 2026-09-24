@@ -147,15 +147,14 @@ mha_fwd(at::Tensor q,
         TORCH_CHECK(!paged_KV,
                     "If cu_seqlens_k is passed in, paged table is not supported");
     }
-    TORCH_CHECK(seqused_k_.has_value(),
-                "950 backend (v4) requires seqused_k (per-batch KV seqlen) — the "
-                "Python wrapper passes cache_seqlens through this argument");
-    seqlens_k = seqused_k_.value();
-    CHECK_CONTIGUOUS(seqlens_k);
-    TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1,
-                "seqused_k must be on NPU");
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
-    TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    if (seqused_k_.has_value()) {
+        seqlens_k = seqused_k_.value();
+        CHECK_CONTIGUOUS(seqlens_k);
+        TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1,
+                    "seqused_k must be on NPU");
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    }
 
     // ============================================================
     // 4. Shape extraction
@@ -198,6 +197,20 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(seqlen_q > 0 && num_heads > 0,
                 "query sequence length and head count must be positive");
+    if (!seqused_k_.has_value()) {
+        TORCH_CHECK(!paged_KV,
+                    "950 backend (v4) paged KV forward requires seqused_k");
+        TORCH_CHECK(!is_varlen_q || is_varlen_kv,
+                    "950 backend (v4) TND forward requires seqused_k or cu_seqlens_k");
+        if (is_varlen_kv) {
+            seqlens_k = cu_seqlens_k.slice(0, 1, cu_seqlens_k.size(0))
+                      - cu_seqlens_k.slice(0, 0, cu_seqlens_k.size(0) - 1);
+            seqlens_k = seqlens_k.to(torch::kInt32);
+        } else {
+            seqlens_k = at::full({batch_size}, static_cast<int64_t>(k.size(1)),
+                                 at::dtype(torch::kInt32).device(k.device()));
+        }
+    }
     TORCH_CHECK(seqlens_k.numel() == batch_size || seqlens_k.numel() == batch_size + 1,
                 "seqused_k must contain per-batch lengths or batch_size + 1 cumulative offsets");
     TORCH_CHECK(k.size(-1) == head_size_q,
@@ -246,6 +259,10 @@ mha_fwd(at::Tensor q,
     if (is_varlen_q) {
         cu_seqlen_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU));
     }
+    at::Tensor seqused_q_cpu;
+    if (is_varlen_q && seqused_q_.has_value()) {
+        seqused_q_cpu = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+    }
     at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
     int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
@@ -253,11 +270,14 @@ mha_fwd(at::Tensor q,
     int64_t max_kv_seqlen = 0;
     const int32_t *q_cu_ptr = is_varlen_q ?
         cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
+    const int32_t *q_used_ptr = seqused_q_cpu.defined() ?
+        seqused_q_cpu.data_ptr<int32_t>() : nullptr;
     const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
     for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const int64_t q_len = is_varlen_q ?
+        const int64_t q_len = q_used_ptr != nullptr ?
+            static_cast<int64_t>(q_used_ptr[batch_idx]) : (is_varlen_q ?
             static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
-            seqlen_q;
+            seqlen_q);
         const int64_t kv_len = kv_len_ptr[batch_idx];
         TORCH_CHECK(q_len > 0 && kv_len > 0,
                     "950 backend (v4) requires positive Q and KV lengths");
@@ -303,6 +323,7 @@ mha_fwd(at::Tensor q,
         ctx, scratch,
         q, k, v,
         is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+        seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr,
         &seqlens_k_cpu,
         paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
         is_causal,
@@ -414,6 +435,10 @@ mha_fwd(at::Tensor q,
     }
     auto qSeqDev  = static_cast<uint8_t*>(q_seq_i64.data_ptr());
     auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
+    auto seqUsedQDev = seqused_q_.has_value()
+        ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
+    auto seqUsedKvDev = seqused_k_.has_value()
+        ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV
         ? static_cast<uint8_t*>(page_table.data_ptr())
         : nullptr;
@@ -437,7 +462,7 @@ mha_fwd(at::Tensor q,
         enableDN, return_lse, flashDecodeEnabled,
         tilingData.fdCombineBlockDim, launchBlockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
-        oDev, lseDev, qSeqDev, kvSeqDev,
+        oDev, lseDev, qSeqDev, kvSeqDev, seqUsedQDev, seqUsedKvDev,
         wsDev, tilDev};
     launch_fwd(fwdArgs);
 

@@ -51,7 +51,8 @@
         <<<a.block_dim, nullptr, a.stream>>>(                                      \
             a.q_device, a.k_device, a.v_device, a.mask_device,                     \
             a.block_table_device, a.o_device, a.lse_device, a.q_seq_device,        \
-            a.kv_seq_device, a.workspace_device, a.tiling_device)
+            a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,             \
+            a.workspace_device, a.tiling_device)
 
 template <typename DType, bool IS_TND>
 void launch_fwd_impl(const FwdLaunchArgs &a) {
@@ -90,7 +91,8 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
         FAFlashDecodeCombine<DType><<<a.combine_block_dim, nullptr, a.stream>>>(
             a.q_device, a.k_device, a.v_device, a.mask_device,
             a.block_table_device, a.o_device, a.lse_device, a.q_seq_device,
-            a.kv_seq_device, a.workspace_device, a.tiling_device);
+            a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,
+            a.workspace_device, a.tiling_device);
     }
 }
 

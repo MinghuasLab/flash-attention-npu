@@ -93,6 +93,7 @@ inline void fill_inference_context(
     const at::Tensor& k,
     const at::Tensor& v,
     const at::Tensor* cu_seqlens_q_cpu_int32,   // nullable: !is_varlen_q
+    const at::Tensor* seqused_q_cpu_int32,       // nullable: use cu_seqlens_q when absent
     const at::Tensor* seqused_k_cpu_int32,      // nullable: caller must pass per-batch seqlen
     bool paged_KV,
     int  page_block_size,
@@ -117,7 +118,14 @@ inline void fill_inference_context(
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr,
                     "fill_inference_context: varlen Q requires cu_seqlens_q");
-        if (is_tnd) {
+        if (seqused_q_cpu_int32 != nullptr) {
+            auto q_per_batch = widen_int32_to_int64(*seqused_q_cpu_int32, batch_size);
+            if (is_tnd) {
+                scratch.q = cumulate_int64(q_per_batch);
+            } else {
+                scratch.q = std::move(q_per_batch);
+            }
+        } else if (is_tnd) {
             scratch.q = widen_cu_seqlens_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
         } else {
             scratch.q = decumulate_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);

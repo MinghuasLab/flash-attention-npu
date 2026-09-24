@@ -31,7 +31,7 @@ inline uint64_t WorkSpaceSize(uint64_t blockDim)
 }
 
 struct FAMetadataArgs {
-    uint64_t cuSeqlensQAddr;
+    uint64_t seqlensQAddr;
     uint64_t seqlensKAddr;
     uint64_t metaOutAddr;
     uint32_t batch;
@@ -45,8 +45,12 @@ struct FAMetadataArgs {
     uint32_t maxQSeqlen;
     uint32_t maskType;
     uint32_t blockDim;
-    uint32_t isVarlen;
-    uint32_t isVarlenKv;
+    // Layout note: keep these two flags at the offsets isVarlen/isVarlenKv
+    // occupied on main -- all modules' FAMetadataArgs share a common prefix
+    // at identical offsets, so an accidental cross-module kernel lookup stays
+    // benign instead of reading garbage pointers.
+    uint32_t isSeqlensQCumulative;
+    uint32_t isSeqlensKCumulative;
     uint32_t pagedKV;
     uint32_t numSplits;
     float scaleValue;
