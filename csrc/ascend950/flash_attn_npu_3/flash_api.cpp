@@ -66,13 +66,26 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     return meta;
 }
 
-at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t num_heads_q, int64_t num_heads_kv,
-                                  int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
-                                  std::optional<at::Tensor> cu_seqlens_q, std::optional<at::Tensor> cu_seqlens_k,
-                                  std::optional<int64_t> page_size, std::optional<int64_t> num_blocks,
-                                  std::optional<int64_t> max_num_blocks_per_seq, bool causal, double softmax_scale,
-                                  int64_t num_splits, int64_t max_seqlen_k, int64_t window_size_left,
-                                  int64_t window_size_right)
+at::Tensor get_scheduler_metadata(
+        int64_t batch_size,
+        int64_t max_seqlen_q,
+        int64_t num_heads_q,
+        int64_t num_heads_kv,
+        int64_t headdim,
+        int64_t headdim_v,
+        at::Tensor cache_seqlens,
+        std::optional<at::Tensor> cu_seqlens_q,
+        std::optional<at::Tensor> cu_seqlens_k,
+        std::optional<int64_t> page_size,
+        std::optional<int64_t> num_blocks,
+        std::optional<int64_t> max_num_blocks_per_seq,
+        bool causal,
+        double softmax_scale,
+        double softcapValue,
+        int64_t num_splits,
+        int64_t max_seqlen_k,
+        int64_t window_size_left,
+        int64_t window_size_right)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
@@ -127,7 +140,12 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
-    args.softmaxScale = static_cast<float>(softmax_scale);
+    if (softcapValue == 0.0f) {
+        args.softmaxScale = static_cast<float>(softmax_scale);
+    } else {
+        args.softmaxScale = static_cast<float>(softmax_scale) / static_cast<float>(softcapValue);
+    }
+    args.softcapValue = static_cast<float>(softcapValue);
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, cu_seqlens_k);
 }
 

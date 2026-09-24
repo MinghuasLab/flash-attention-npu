@@ -140,6 +140,7 @@ struct FAMetadataArgs {
     uint32_t isVarlenKv;
     uint32_t pagedKV;
     float softmaxScale;
+    float softcapValue;
 };
 
 #endif

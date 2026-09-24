@@ -72,6 +72,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
     tilingData->maskType = metaArgs->maskType;
     tilingData->scaleValue = metaArgs->softmaxScale;
+    tilingData->softcapValue = metaArgs->softcapValue;
     tilingData->sparseMode = 0;
     tilingData->preToken = 0;
     tilingData->nextToken = 0;

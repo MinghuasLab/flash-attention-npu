@@ -14,6 +14,7 @@
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
+#include "fa_block.h"
 #include "kernel_common.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
@@ -27,16 +28,17 @@ template <
     class ElementS_,
     class LayoutS_,
     class MaskType_,
-    class TileCopy_>
+    class TileCopy_,
+    bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueFAOnlineSoftmax,
+    EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>,
     OutputType_,
     Gemm::GemmType<ElementS_, LayoutS_>,
     MaskType_,
     TileCopy_>
 {
 public:
-    using DispatchPolicy = EpilogueFAOnlineSoftmax;
+    using DispatchPolicy = EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = float;
@@ -83,7 +85,7 @@ public:
     static constexpr uint32_t SM_COL_MAX_ELEM_NUM = 256;
 
     __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_, float rescaleThreshold_ = 0.0f)
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, float rescaleThreshold_ = 0.0f)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -99,6 +101,7 @@ public:
         subBlockIdx_ = AscendC::GetSubBlockIdx(); 
 
         scaleValue = static_cast<ElementInput>(scaleValue_);
+        softcapValue = static_cast<ElementInput>(softcapValue_);
         rescaleThreshold = rescaleThreshold_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
@@ -203,18 +206,18 @@ public:
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             }
         }
 
@@ -296,45 +299,45 @@ public:
         if (isFirstKvSTile) {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             }
         } else {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, softcapValue, 64, blockStride, nRound,
                     expMaxUbAddr, lastSumAddr, rescaleThreshold);
             }
         }
@@ -473,18 +476,18 @@ public:
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -679,21 +682,21 @@ public:
                 if (n > 64) {
                     ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             }
         } else if (doTriUPreMask) {
@@ -701,21 +704,21 @@ public:
                 if (n > 64) {
                     ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             }
         } else {
@@ -723,21 +726,21 @@ public:
                 if (n > 64) {
                     ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
                         sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             } else {
                 if (n > 64) {
                     ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 } else {
                     ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
                         sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr,
-                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
+                        maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound, rescaleThreshold);
                 }
             }
         }
@@ -771,6 +774,7 @@ public:
 
 private:
     ElementInput scaleValue;
+    ElementInput softcapValue;
     float rescaleThreshold{0.0f};
     AscendC::LocalTensor<ElementInput> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
@@ -790,9 +794,22 @@ private:
         Four = 4
     };
 
+    template <typename Reg, typename Mask>
+    __simd_callee__ static inline void ApplySoftcap(Reg &srcVreg, Reg &softcapVreg, Mask &maskVreg, float softcapValue) {
+        using namespace AscendC::MicroAPI;
+        Maxs(srcVreg, srcVreg, -8.8f, maskVreg);
+        Muls(srcVreg, srcVreg, -2.0f, maskVreg);
+        Exp(srcVreg, srcVreg, maskVreg);
+        Adds(srcVreg, srcVreg, 1.0f, maskVreg);
+        Duplicate(softcapVreg, 2 * softcapValue);
+        static constexpr DivSpecificMode mode = {MaskMergeMode::ZEROING, true};
+        Div<float, &mode>(srcVreg, softcapVreg, srcVreg, maskVreg);
+        Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
+    }
+
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMax(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -805,6 +822,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
 
@@ -841,6 +859,10 @@ private:
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
+                ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
             Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(
                     srcUb + i * S2BaseSize, srcVreg, pregFull);
@@ -897,7 +919,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMax64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -910,6 +932,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
 
@@ -944,6 +967,9 @@ private:
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             Muls(srcVreg, srcVreg, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
+            }
             Select(srcVreg_unroll_new, srcVreg, minVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(
                     srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
@@ -990,7 +1016,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMask(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1005,6 +1031,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
 
@@ -1053,6 +1080,10 @@ private:
             
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
+                ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
             // mask
             // 1. 数据下采样重复搬2次 load 256 个 uint8_t  vl
             // 2. cast to uint16_t  128个完整mask   vl/2
@@ -1125,7 +1156,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1140,6 +1171,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
         RegTensor<uint8_t> maskVreg;
@@ -1169,6 +1201,10 @@ private:
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
+                ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
             LoadAlign<ElementMask, LoadDist::DIST_US_B8>(maskVreg, maskUb + i * 128);
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Interleave(maskVregb16_new, maskVregb16_unroll_new, maskVregb16, maskVregb16);
@@ -1230,7 +1266,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1245,6 +1281,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
         RegTensor<uint8_t> maskVreg;
@@ -1274,6 +1311,10 @@ private:
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
+                ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
             LoadAlign<ElementMask, LoadDist::DIST_US_B8>(maskVreg, maskPreUb + i * 128);
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Interleave(maskVregb16_new, maskVregb16_unroll_new, maskVregb16, maskVregb16);
@@ -1344,7 +1385,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMask64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1357,6 +1398,7 @@ private:
         RegTensor<float> expEvenVreg;
         RegTensor<float> expOddVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
 
@@ -1396,6 +1438,9 @@ private:
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             Muls(srcVreg, srcVreg, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
+            }
             LoadAlign<ElementMask, LoadDist::DIST_UNPACK4_B8>(maskVreg, maskUb + i * 128);
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Cast<float, half, castTraitZero>(maskVregb32, maskVregb16, pregFull);
@@ -1447,7 +1492,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1458,6 +1503,7 @@ private:
         RegTensor<float> maxBrcVreg;
         RegTensor<float> expEvenVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
         RegTensor<uint8_t> maskVreg;
@@ -1480,6 +1526,9 @@ private:
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             Muls(srcVreg, srcVreg, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
+            }
             LoadAlign<ElementMask, LoadDist::DIST_UNPACK4_B8>(maskVreg, maskUb + i * 128);
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Cast<float, half, castTraitZero>(maskVregb32, maskVregb16, pregFull);
@@ -1527,7 +1576,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskPreUb, __ubuf__ ElementMask *maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1538,6 +1587,7 @@ private:
         RegTensor<float> maxBrcVreg;
         RegTensor<float> expEvenVreg;
         RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
         UnalignRegForStore maxUreg;
         UnalignRegForStore expSumUreg;
         RegTensor<uint8_t> maskVreg;
@@ -1560,6 +1610,9 @@ private:
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             Muls(srcVreg, srcVreg, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
+            }
             LoadAlign<ElementMask, LoadDist::DIST_UNPACK4_B8>(maskVreg, maskPreUb + i * 128);
             Cast<half, ElementMask, castTraitZero>(maskVregb16, maskVreg, preg_all_b16);
             Cast<float, half, castTraitZero>(maskVregb32, maskVregb16, pregFull);
@@ -1612,7 +1665,7 @@ private:
 
     template <typename ElementS, typename ElementP, bool isUpdate, MAligendTileNum mTileNum>
     __simd_vf__ static inline void ComputeScaleAndMaxDn(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t mRound, uint16_t m, uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, uint16_t S2BaseSize, 
+        __ubuf__ ElementS *expSumUb, uint16_t mRound, uint16_t m, uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, 
         uint32_t blockStride, uint32_t repeatStride, __ubuf__ float *expMaxUb, __ubuf__ ElementS *lastExpSumUb, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
@@ -1647,6 +1700,7 @@ private:
         RegTensor<float> sum2Vreg;
         RegTensor<float> sum3Vreg;
         RegTensor<float> lastExpSumVreg;
+        RegTensor<float> softcapVreg;
 
         RegTensor<half> vreg_x_exp_even_f16;
         RegTensor<half> vreg_x_exp_odd_f16;
@@ -1715,6 +1769,9 @@ private:
             Max(max0Vreg, max0Vreg, src4Vreg, pregTailN);
         }
         Muls(max0Vreg, max0Vreg, dScale, pregTailN);
+        if constexpr (HAS_SOFTCAP_) {
+            ApplySoftcap(max0Vreg, softcapVreg, pregTailN, dSoftcap);
+        }
 
         if constexpr (isUpdate) {
             LoadAlign(max1Vreg, LastMaxUbStart);
@@ -1744,6 +1801,13 @@ private:
             Muls(src1Fp32Vreg, src1Fp32Vreg, dScale, pregTailN);
             Muls(src2Fp32Vreg, src2Fp32Vreg, dScale, pregTailN);
             Muls(src3Fp32Vreg, src3Fp32Vreg, dScale, pregTailN);
+
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(src0Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                ApplySoftcap(src1Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                ApplySoftcap(src2Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                ApplySoftcap(src3Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+            }
 
             FusedExpSub(exp0Fp32Vreg, src0Fp32Vreg, max0Vreg, pregTailN);
             FusedExpSub(exp1Fp32Vreg, src1Fp32Vreg, max0Vreg, pregTailN);
@@ -1811,6 +1875,13 @@ private:
                 Muls(src1Fp32Vreg, src1Fp32Vreg, dScale, pregTailN);
                 Muls(src2Fp32Vreg, src2Fp32Vreg, dScale, pregTailN);
                 Muls(src3Fp32Vreg, src3Fp32Vreg, dScale, pregTailN);
+
+                if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap(src0Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                    ApplySoftcap(src1Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                    ApplySoftcap(src2Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                    ApplySoftcap(src3Fp32Vreg, softcapVreg, pregTailN, dSoftcap);
+                }
 
                 FusedExpSub(exp0Fp32Vreg, src0Fp32Vreg, max0Vreg, pregTailN);
                 FusedExpSub(exp1Fp32Vreg, src1Fp32Vreg, max0Vreg, pregTailN);

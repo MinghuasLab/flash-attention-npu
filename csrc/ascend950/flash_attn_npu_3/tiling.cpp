@@ -65,7 +65,8 @@ namespace optiling{
         const int32_t *qSeqlenList{nullptr};
         const int32_t *kvSeqlenList{nullptr};
         float scaleValue = 0.0;
-        size_t* workspaces{nullptr};
+        float softcapValue = 0.0;
+        size_t *workspaces{nullptr};
         MaskType maskType = MaskType::MASK_SPEC;
         DataType dataType = DataType::FP16;
         bool pagedCacheFlag = true;
@@ -166,6 +167,7 @@ namespace optiling{
         faTilingData.set_maxNumBlocksPerBatch(faInfo_.maxNumBlocksPerBatch);
         faTilingData.set_maskType(static_cast<uint32_t>(faInfo_.maskType));
         faTilingData.set_scaleValue(faInfo_.scaleValue);
+        faTilingData.set_softcapValue(faInfo_.softcapValue);
         faTilingData.set_sparseMode(faInfo_.sparseMode);
         faTilingData.set_cacheLayout(0U);
         faTilingData.set_flashDecodeFlag(faInfo_.flashDecodeFlag ? 1U : 0U);

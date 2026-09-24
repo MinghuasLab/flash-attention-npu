@@ -340,6 +340,7 @@ def _get_scheduler_metadata_op(
     max_num_blocks_per_seq: Optional[int],
     causal: bool,
     softmax_scale: float,
+    softcap: float,
     num_splits: int,
     max_seqlen_k: int,
     window_left: int,
@@ -360,6 +361,7 @@ def _get_scheduler_metadata_op(
         max_num_blocks_per_seq,
         causal,
         softmax_scale,
+        softcap,
         num_splits,
         max_seqlen_k,
         window_left,
@@ -383,6 +385,7 @@ def _get_scheduler_metadata_fake(
     max_num_blocks_per_seq: Optional[int],
     causal: bool,
     softmax_scale: float,
+    softcap: float,
     num_splits: int,
     max_seqlen_k: int,
     window_left: int,
@@ -418,7 +421,7 @@ def get_scheduler_metadata(
     num_splits=0,
     window_size=(-1, -1),
     attention_chunk=0,
-    has_softcap=False,
+    softcap=0.0,
     pack_gqa=None,
     sm_margin=0,  # 910-compatible parameter; unused on Ascend 950
 ):
@@ -448,8 +451,6 @@ def get_scheduler_metadata(
         num_blocks = batch_size * max_num_blocks_per_seq
     if attention_chunk != 0:
         raise ValueError("Ascend 950 does not support attention_chunk")
-    if has_softcap:
-        raise ValueError("Ascend 950 does not support softcap")
     if pack_gqa is not None and pack_gqa:
         raise ValueError("Ascend 950 does not support pack_gqa")
     scheduler_metadata = _get_scheduler_metadata_op(
@@ -467,6 +468,7 @@ def get_scheduler_metadata(
         max_num_blocks_per_seq,
         causal,
         softmax_scale,
+        softcap,
         num_splits,
         max_seqlen_k if max_seqlen_k is not None else 0,
         window_size[0],
@@ -484,6 +486,7 @@ def _training_forward(
     max_seqlen_q,
     max_seqlen_k,
     softmax_scale,
+    softcap,
     causal,
     window_size,
     scheduler_metadata,
@@ -527,7 +530,7 @@ def _training_forward(
         window_size[0],
         window_size[1],
         0,
-        0.0,
+        softcap,
         True,
         scheduler_metadata,
         1,
@@ -562,10 +565,8 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         if any(x is not None for x in (qv, q_descale, k_descale, v_descale)):
             raise NotImplementedError("Ascend950 v3 training scaffold only supports q/k/v inputs")
-        if attention_chunk != 0 or softcap != 0.0:
-            raise NotImplementedError(
-                "Ascend950 v3 training scaffold does not support attention_chunk or softcap"
-            )
+        if attention_chunk != 0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support attention_chunk")
         if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
             raise NotImplementedError(
                 "Ascend950 v3 training scaffold does not support split/pack/sm tuning"
@@ -590,11 +591,12 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
+                softcap=softcap,
                 num_splits=num_splits,
             )
 
         out, softmax_lse, _, _ = _training_forward(
-            q, k, v, None, None, None, None, softmax_scale, causal, window_size, scheduler_metadata
+            q, k, v, None, None, None, None, softmax_scale, softcap, causal, window_size, scheduler_metadata
         )
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
@@ -630,9 +632,7 @@ class FlashAttnFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
-            -1,
-            -1,
-            0.0,
+            -1, -1, ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
         )
@@ -668,24 +668,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         scheduler_metadata,
     ):
-        if any(
-            x is not None
-            for x in (
-                seqused_q,
-                seqused_k,
-                qv,
-                q_descale,
-                k_descale,
-                v_descale,
-            )
-        ):
-            raise NotImplementedError(
-                "Ascend950 v3 varlen training scaffold does not support optional tensor inputs"
-            )
-        if attention_chunk != 0 or softcap != 0.0:
-            raise NotImplementedError(
-                "Ascend950 v3 training scaffold does not support attention_chunk or softcap"
-            )
+        if any(x is not None for x in (
+            seqused_q, seqused_k, qv, q_descale, k_descale, v_descale,
+        )):
+            raise NotImplementedError("Ascend950 v3 varlen training scaffold does not support optional tensor inputs")
+        if attention_chunk != 0:
+            raise NotImplementedError("Ascend950 v3 training scaffold does not support attention_chunk")
         if num_splits not in (0, 1) or pack_gqa not in (None, False) or sm_margin != 0:
             raise NotImplementedError(
                 "Ascend950 v3 training scaffold does not support split/pack/sm tuning"
@@ -710,20 +698,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
+                softcap=softcap,
                 num_splits=num_splits,
             )
 
         out, softmax_lse, _, _ = _training_forward(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            window_size,
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            softmax_scale, softcap, causal, window_size,
             scheduler_metadata,
         )
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
@@ -762,9 +745,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
-            -1,
-            -1,
-            0.0,
+            -1, -1, ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
         )
@@ -1063,9 +1044,9 @@ def flash_attn_with_kvcache(
             window_size=window_size,
             max_seqlen_k=max_seqlen_k_bound,
             softmax_scale=softmax_scale,
+            softcap=softcap,
             num_splits=num_splits,
         )
-
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,

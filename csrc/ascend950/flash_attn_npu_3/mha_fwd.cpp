@@ -87,7 +87,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                 "950 backend (v3) does not support rotary embedding");
     TORCH_CHECK(!q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value(),
                 "950 backend (v3) does not support FP8 descales");
-    TORCH_CHECK(softcap == 0.0f, "950 backend (v3) does not support softcap");
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
@@ -98,11 +97,12 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "950 backend (v3) does not support pack_gqa");
 
     // ============================================================
-    // 3. paged / varlen mode + per-tensor checks
+    // 3. paged / varlen mode + per-tensor + softcap checks
     // ============================================================
     const bool paged_KV = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+    const bool is_softcap = softcap > 0.0f;
 
     TORCH_CHECK(!k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value() && !cu_seqlens_k_new_.has_value() &&
                     !kv_batch_idx_.has_value(),
@@ -141,6 +141,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1, "seqused_k must be on NPU");
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
     TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
 
     // ============================================================
     // 4. Shape extraction and output tensor
@@ -318,13 +319,23 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
         const bool flash_decode = num_splits != 1 && fd_shape_supported;
 
-        fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr, &seqlens_k_cpu,
-                               paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
-                               /* window_size_left= */ is_local ? window_size_left : 0,
-                               /* window_size_right= */ is_local ? window_size_right : 0, is_varlen_q, is_bf16,
-                               batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
-                               softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-                               return_softmax_lse, is_varlen_q);
+        fill_inference_context(
+            ctx, scratch,
+            q, k, v,
+            is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+            &seqlens_k_cpu,
+            paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
+            is_causal,
+            is_local,
+            /* window_size_left= */ is_local ? window_size_left : 0,
+            /* window_size_right= */ is_local ? window_size_right : 0,
+            is_varlen_q, is_bf16,
+            batch_size, seqlen_q, num_heads, num_heads_k,
+            head_size_q, head_size_v,
+            softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
+            softcap,
+            return_softmax_lse,
+            is_varlen_q);
         ctx.flashDecodeFlag = flash_decode;
         ctx.numSplits = static_cast<uint32_t>(num_splits);
 
@@ -423,27 +434,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
 
-    const FwdLaunchArgs fwdArgs{is_bf16,
-                                fmt,
-                                mask_category,
-                                paged_KV,
-                                enableDN,
-                                return_softmax_lse,
-                                flashDecodeEnabled,
-                                combineBlockDim,
-                                launchBlockDim,
-                                aclStream,
-                                qDev,
-                                kDev,
-                                vDev,
-                                maskDevice,
-                                blockTableDev,
-                                oDev,
-                                lseDev,
-                                qSeqDev,
-                                kvSeqDev,
-                                wsDev,
-                                tilDev};
+    const FwdLaunchArgs fwdArgs{
+        is_bf16, fmt, mask_category, paged_KV,
+        enableDN, return_softmax_lse, is_softcap, flashDecodeEnabled,
+        combineBlockDim, launchBlockDim, aclStream,
+        qDev, kDev, vDev, maskDevice, blockTableDev,
+        oDev, lseDev, qSeqDev, kvSeqDev,
+        wsDev, tilDev};
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

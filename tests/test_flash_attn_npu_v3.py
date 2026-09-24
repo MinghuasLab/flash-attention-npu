@@ -243,8 +243,6 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if not (1 <= head_size <= 256):
         pytest.skip("head_size must be in [1, 256]")
-    if "Ascend950" in name and (softcap != 0.0):
-        pytest.skip("Ascend950 support softcap")
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     if new_kv:
@@ -645,8 +643,6 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name and "Ascend950" not in name:
         pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
-    if "Ascend950" in name and (softcap != 0.0):
-        pytest.skip("Ascend950 does not support softcap")
     query, key_cache, value_cache, dout = make_attention_inputs(
         (batch_size, q_seqlen, num_heads, head_size),
         (batch_size, kv_seqlen, kv_heads, head_size),
@@ -821,8 +817,6 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name and "Ascend950" not in name:
         pytest.skip("flash_attn_varlen_func only supports Ascend910/Ascend950")
-    if "Ascend950" in name and (softcap != 0.0):
-        pytest.skip("Ascend950 does not support softcap")
     seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
     cu_q = make_cu_seqlens(seqlens_q)
     cu_k = make_cu_seqlens(seqlens_k)

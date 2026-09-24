@@ -113,6 +113,7 @@ inline void fill_inference_context(
     int  head_size_q,
     int  head_size_v,
     float softmax_scale,
+    float softcapValue,
     bool lse_flag,
     bool is_tnd)                                // true: TND (varlen), false: BSND
 {
@@ -180,7 +181,12 @@ inline void fill_inference_context(
     ctx.qSeqlenList  = scratch.q.data();
     ctx.kvSeqlenList = scratch.kv.data();
 
-    ctx.scaleValue = softmax_scale;
+    if (softcapValue > 0.0f) {
+        ctx.scaleValue = softmax_scale / softcapValue;
+    } else {
+        ctx.scaleValue = softmax_scale;
+    }
+    ctx.softcapValue = softcapValue;
     if (is_local) {
         ctx.maskType = optiling::MaskType::MASK_BAND;
         ctx.windowSizeLeft = window_size_left;
