@@ -3,7 +3,9 @@
 """Numerical comparison rules shared by the attention tests."""
 
 import torch
+import time
 from tests.common.golden_cache import retry_cached_value
+from tests.common.timing import add
 
 
 def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
@@ -86,10 +88,19 @@ def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
 
 def assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
     """Compare results, refreshing a cached golden once after a mismatch."""
+    state = getattr(assert_fa_close, "_ci_timing_state", None)
+    started = time.perf_counter()
     try:
         _assert_fa_close(actual, ref, pt, softcap=softcap, name=name)
     except AssertionError:
-        if not retry_cached_value(ref) and not retry_cached_value(pt):
+        refreshed = retry_cached_value(ref) or retry_cached_value(pt)
+        if not refreshed:
             raise
+        state = getattr(assert_fa_close, "_ci_timing_state", None)
+        if state is not None:
+            state["events"].append("fallback=mismatch_refresh")
         print(f"[golden-cache] mismatch for {name}; recomputed golden and retrying")
         _assert_fa_close(actual, ref, pt, softcap=softcap, name=name)
+    finally:
+        if state is not None:
+            add(state, "compare", time.perf_counter() - started)

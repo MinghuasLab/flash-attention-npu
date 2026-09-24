@@ -387,7 +387,14 @@ class BishengBuildExt(build_ext):
         # concurrently regardless of which extension owns them. TUs per extension
         # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
         # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
-        max_workers = min(len(tasks), os.cpu_count() or 1)
+        # AscendC compilation is memory/process intensive.  Launching one
+        # compiler per host CPU can overwhelm bisheng and result in opaque
+        # exit-code-1 failures with no useful stderr.  Keep it bounded while
+        # allowing CI/build machines to override the limit explicitly.
+        default_workers = min(8, os.cpu_count() or 1)
+        max_workers = min(
+            len(tasks), int(os.environ.get("FA_BUILD_JOBS", default_workers))
+        )
         objs_by_ext = {ext.name: [] for ext in self.extensions}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(compile_one, t): t for t in tasks}

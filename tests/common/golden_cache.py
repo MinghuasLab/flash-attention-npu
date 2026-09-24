@@ -16,11 +16,13 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import torch
+from tests.common.timing import add
 
 
 _FORMAT_VERSION = 1
@@ -283,9 +285,15 @@ def get_or_compute_golden(
     ``GOLDEN_CACHE_REFRESH=1`` is set.  Returned tensors are detached CPU
     tensors on a cache hit and retain the caller's tensors on a miss.
     """
+    timing_state = getattr(get_or_compute_golden, "_ci_timing_state", None)
+    started = time.perf_counter()
     if not _cache_enabled():
         _record_cache_event("disabled", nodeid)
+        compute_started = time.perf_counter()
         result = dict(compute_fn())
+        if timing_state is not None:
+            add(timing_state, "ref", time.perf_counter() - compute_started, "golden=disabled")
+            add(timing_state, "golden", time.perf_counter() - started)
         return (result, "disabled") if return_status else result
 
     value_names = sorted(set(expected_keys))
@@ -328,16 +336,25 @@ def get_or_compute_golden(
             result = _load_artifact(artifact, case_metadata)
             _record_cache_event("hit", nodeid)
             print(f"[golden-cache] hit {nodeid}")
+            if timing_state is not None:
+                add(timing_state, "golden", time.perf_counter() - started, "golden=hit")
             return (result, "hit") if return_status else result
         except Exception as exc:  # cache is an optimization, never a test failure
             _record_cache_event("read_error", nodeid)
+            if timing_state is not None:
+                timing_state["events"].append("golden=read_error")
             warnings.warn(
                 f"golden cache read failed for {nodeid}: {exc}; recomputing",
                 RuntimeWarning,
             )
 
     _record_cache_event("refresh" if refresh else "miss", nodeid)
+    compute_started = time.perf_counter()
     values = dict(compute_fn())
+    if timing_state is not None:
+        mode = "refresh" if refresh else "miss"
+        add(timing_state, "ref", time.perf_counter() - compute_started,
+            "golden=" + ("read_error->" if "read_error" in timing_state["events"] else "") + mode)
     if set(values) != set(value_names):
         raise ValueError(
             f"computed golden tensors {sorted(values)} do not match "
@@ -356,6 +373,9 @@ def get_or_compute_golden(
             RuntimeWarning,
         )
     status = "refresh" if refresh else "miss"
+    if timing_state is not None:
+        add(timing_state, "golden", time.perf_counter() - started,
+            "golden=" + status)
     return (values, status) if return_status else values
 
 

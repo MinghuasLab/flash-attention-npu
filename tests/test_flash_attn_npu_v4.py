@@ -4,7 +4,7 @@ import os
 import torch
 import torch_npu
 import pytest
-from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention, ref_flash_attention_pair
+from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
@@ -571,27 +571,15 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     golden_out_gpu_ref, golden_lse_gpu_ref, golden_out_gpu_pt, golden_lse_gpu_pt = ref_flash_attention_pair(
         query_padded, key_padded, value_padded, scale, atten_mask, data_type, rescale_threshold=4.0
     )
-    golden_out_plain, golden_lse_plain = ref_flash_attention(
-        query_padded.detach(),
-        key_padded.detach(),
-        value_padded.detach(),
-        scale,
-        atten_mask,
-        data_type,
-    )
     fully_masked = atten_mask.all(dim=-1)
     golden_out_gpu_ref[fully_masked] = 0
     golden_out_gpu_pt[fully_masked] = 0
-    golden_out_plain[fully_masked] = 0
     golden_lse_gpu_ref = golden_lse_gpu_ref.masked_fill(fully_masked[:, None, :], torch.inf)
     golden_lse_gpu_pt = golden_lse_gpu_pt.masked_fill(fully_masked[:, None, :], torch.inf)
-    golden_lse_plain = golden_lse_plain.masked_fill(fully_masked[:, None, :], torch.inf)
     golden_out_gpu_ref = golden_out_gpu_ref[q_valid]
     golden_out_gpu_pt = golden_out_gpu_pt[q_valid]
-    golden_out_plain = golden_out_plain[q_valid]
     golden_lse_gpu_ref = golden_lse_gpu_ref.permute(0, 2, 1)[q_valid].transpose(0, 1)
     golden_lse_gpu_pt = golden_lse_gpu_pt.permute(0, 2, 1)[q_valid].transpose(0, 1)
-    golden_lse_plain = golden_lse_plain.permute(0, 2, 1)[q_valid].transpose(0, 1)
     assert_fa_close(out_out, golden_out_gpu_ref, golden_out_gpu_pt, name="out")
     assert_fa_close(softmax_lse, golden_lse_gpu_ref, golden_lse_gpu_pt, name="softmax_lse")
     if bwd_supported:

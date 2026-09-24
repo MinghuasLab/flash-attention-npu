@@ -2,7 +2,11 @@
 
 """Shared data, paged-KV, and mask construction utilities for attention tests."""
 
+import os
 import torch
+import time
+
+from tests.common.timing import record
 
 CASE_SEED = 42
 
@@ -28,11 +32,17 @@ def make_random_tensor(
     Random values are generated on CPU before moving to the target device to
     preserve the existing random-number order and reproducibility.
     """
+    started = time.perf_counter()
     tensor = low + (high - low) * torch.rand(shape, generator=generator)
     tensor = tensor.to(data_type)
+    record("input_cpu", time.perf_counter() - started)
     if device is not None:
         if device == "npu":
+            started = time.perf_counter()
             tensor = tensor.npu()
+            if os.environ.get("CI_TIMING_SYNC", "0") == "1":
+                torch.npu.synchronize()
+            record("h2d", time.perf_counter() - started)
         else:
             tensor = tensor.to(device)
     return tensor.requires_grad_(requires_grad)
@@ -140,10 +150,19 @@ def make_packed_random_tensor(
         data_type,
         generator=generator,
     )
+    started = time.perf_counter()
     valid = torch.arange(max_seqlen) < torch.tensor(seqlens)[:, None]
     packed = padded[valid]
+    record("pack", time.perf_counter() - started)
     if device is not None:
-        packed = packed.npu() if device == "npu" else packed.to(device)
+        if device == "npu":
+            started = time.perf_counter()
+            packed = packed.npu()
+            if os.environ.get("CI_TIMING_SYNC", "0") == "1":
+                torch.npu.synchronize()
+            record("h2d", time.perf_counter() - started)
+        else:
+            packed = packed.to(device)
     return packed.detach().requires_grad_(requires_grad)
 
 

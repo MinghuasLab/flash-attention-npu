@@ -108,11 +108,94 @@ FAILED_FILE="$LOG_DIR/failed_cases.txt"
 
 run_pytest() {
   local target="$1" logfile="$2"; shift 2
+  local progress_file="$LOG_DIR/pytest_progress.events"
   log ">>> pytest $target mode=$MODE workers=$TEST_WORKERS sample=${SAMPLE_ARG:-<none>} (log=$logfile)"
+  : > "$progress_file"
+  export CI_PROGRESS_FILE="$progress_file"
+  (
+    local total=0 done=0 passed=0 failed=0 skipped=0 events_seen=0 last_line=0 last_progress=0
+    local started_at="$(date +%s)"
+    local kind value duration encoded details nodeid running="" log_total log_pass log_fail log_skip
+    while :; do
+      if [ -f "$progress_file" ]; then
+        while IFS='|' read -r kind value duration encoded details; do
+          case "$kind" in
+            total) total="$value" ;;
+            start)
+              running="$(printf '%s' "$value" | base64 -d 2>/dev/null || true)"
+              ;;
+            result)
+              events_seen=1
+              nodeid="$(printf '%s' "$encoded" | base64 -d 2>/dev/null || true)"
+              done=$((done + 1))
+              if [ "$value" = "passed" ]; then
+                passed=$((passed + 1))
+                timing="$(printf '%s' "$details" | base64 -d 2>/dev/null || true)"
+                case_file="${nodeid%%::*}"
+                case_file="${case_file##*/}"
+                case_name="${nodeid#*::}"
+                case_base="${case_name%%[*}"
+                case_params="${case_name#"$case_base"}"
+                if [ -n "$case_params" ] && [ "$case_params" != "$case_name" ]; then
+                  printf '[CI-test][case] PASS %s::%s | %s | params=%s\n' \
+                    "$case_file" "$case_base" "$timing" "$case_params"
+                else
+                  printf '[CI-test][case] PASS %s::%s | %s\n' \
+                    "$case_file" "$case_base" "$timing"
+                fi
+              elif [ "$value" = "failed" ] || [ "$value" = "error" ]; then
+                failed=$((failed + 1))
+              else
+                skipped=$((skipped + 1))
+              fi
+              [ "$running" = "$nodeid" ] && running=""
+              ;;
+          esac
+        done < <(tail -n +$((last_line + 1)) "$progress_file")
+        last_line="$(wc -l < "$progress_file")"
+      fi
+      # Fallback compatible with the proven feat-branch display: use pytest's
+      # xdist log when structured events are unavailable in this environment.
+      if [ "$total" -eq 0 ] 2>/dev/null && [ -f "$logfile" ]; then
+        log_total="$(sed -n 's/.*workers \[\([0-9][0-9]*\) items\].*/\1/p' "$logfile" | head -n 1)"
+        [ -n "$log_total" ] && total="$log_total"
+      fi
+      if [ "$events_seen" -eq 0 ] && [ "$total" -gt 0 ] && [ -f "$logfile" ]; then
+        log_pass="$(grep -cE '^\[gw[0-9]+\] PASSED' "$logfile" || true)"
+        log_fail="$(grep -cE '^\[gw[0-9]+\] (FAILED|ERROR)' "$logfile" || true)"
+        log_skip="$(grep -cE '^\[gw[0-9]+\] SKIPPED' "$logfile" || true)"
+        passed="$log_pass"
+        failed="$log_fail"
+        skipped="$log_skip"
+        done=$((passed + failed + skipped))
+      fi
+      if [ -z "$running" ] && [ -f "$logfile" ]; then
+        running="$(grep -E '^tests/' "$logfile" | tail -n 1 | cut -c1-110 || true)"
+      fi
+      now="$(date +%s)"
+      if [ $((now - last_progress)) -ge "${CI_PROGRESS_INTERVAL:-30}" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+        pending=$((total - done))
+        printf '\n========== CI TEST PROGRESS ==========\n'
+        printf '[CI-test][progress] completed=%s/%s passed=%s failed=%s skipped=%s pending=%s elapsed=%ss\n' \
+          "$done" "$total" "$passed" "$failed" "$skipped" "$pending" "$((now - started_at))"
+        printf '[CI-test][progress] running=%s\n' "${running:-<idle>}"
+        printf '======================================\n\n'
+        last_progress="$now"
+      fi
+      if [ "$events_seen" -gt 0 ] && [ "$last_line" -gt 0 ] && [ "$done" -ge "$total" ] 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+  ) &
+  local watcher_pid=$!
   set +e
   # shellcheck disable=SC2086
-  python3 -m pytest "$target" -vs -n "$TEST_WORKERS" --dist=loadscope $SAMPLE_ARG "$@" >"$logfile" 2>&1
+  python3 -m pytest "$target" -vs -n "$TEST_WORKERS" --dist=loadscope -p ci.pytest_ci_reporter $SAMPLE_ARG "$@" >"$logfile" 2>&1
   local rc=$?
+  sleep 1
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
   set -e
   if [ $rc -ne 0 ]; then
     log "<<< FAILED (pytest rc=$rc), tail of $logfile:"
