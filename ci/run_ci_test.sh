@@ -4,7 +4,8 @@
 #   1. NPU 可用性自检
 #   2. python setup.py install (复用阶段1 build/ 产物, 快速安装)
 #   3. import 校验
-#   4. pytest tests/ (quick 每测试函数随机采样至多 N 个, full 全量)
+#   4. 扫描 tests/ 下可跑的 test_*.py, 按文件 pytest
+#      (quick 每测试函数随机采样至多 N 个, full 全量)
 #
 # 由 ci/run_ci_container.sh 阶段2通过 docker run 调用 (绑卡 + 加锁)。
 #
@@ -15,7 +16,7 @@
 #   CI_TEST_WORKERS             xdist -n (默认 2)
 #   CI_QUICK_SAMPLE             quick 每函数采样数 (默认 30)
 #   CI_RANDOM_SEED              采样 seed (默认 0, 可复现)
-#   CI_TEST_DIRECT_FILE         指定时只跑该文件 (绕过 tests/)
+#   CI_TEST_DIRECT_FILE         指定文件时只跑该文件; 指定目录时同样按文件扫描
 #   CI_TEST_DIRECT_FILTER       直接模式的 -k 过滤
 #   CI_CONTAINER_DEVICE         容器内逻辑设备号 (默认 0)
 #   GOLDEN_CACHE_MODE/DIR       golden reference cache mode and container path
@@ -81,7 +82,7 @@ import flash_attn_npu_3
 print("flash_attn_npu_3", flash_attn_npu_3.__version__)
 PY
 
-# ---------- 3. pytest tests/ ----------
+# ---------- 3. 按文件 pytest ----------
 if [ "${CI_RUN_EXAMPLE_ST:-true}" != "true" ]; then
   log "CI_RUN_EXAMPLE_ST!=true, skip tests"
   exit 0
@@ -123,6 +124,84 @@ run_pytest() {
   fi
 }
 
+# 目录目标: 收集 test_*.py, 用 --collect-only 判断当前设备能否跑, 再逐文件执行。
+# 收集失败 (导入/语法错误) 记为失败; 模块级 skip 或 0 个用例视为不可跑并跳过。
+pytest_log_name() {
+  local rel="${1#./}"
+  rel="${rel%.py}"
+  printf '%s\n' "${rel//\//_}.log"
+}
+
+file_is_runnable() {
+  local file="$1" collect_log="$2" rc=0
+  shift 2
+  # 不用 set -e: 非 0 返回会冒泡到调用方, 把「不可跑」误判成脚本失败。
+  # shellcheck disable=SC2086
+  python3 -m pytest "$file" --collect-only -q "$@" >"$collect_log" 2>&1 || rc=$?
+  if grep -q '::' "$collect_log"; then
+    return 0
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
+    return 2
+  fi
+  return 1
+}
+
+run_pytest_scanned() {
+  local root="$1"; shift
+  local files=() file collect_log logfile probe_rc
+  local runnable_files=() skipped_files=() collect_failed_files=()
+  while IFS= read -r file; do
+    [ -n "$file" ] && files+=("$file")
+  done < <(find "$root" -type f -name 'test_*.py' | sort)
+  if [ "${#files[@]}" -eq 0 ]; then
+    log "no test_*.py under $root"
+    echo "$root" >> "$FAILED_FILE"
+    return
+  fi
+  log "scan $root: discovered ${#files[@]} test file(s)"
+  for file in "${files[@]}"; do
+    log "  discovered: $file"
+  done
+  for file in "${files[@]}"; do
+    collect_log="$LOG_DIR/collect_$(pytest_log_name "$file")"
+    probe_rc=0
+    file_is_runnable "$file" "$collect_log" "$@" || probe_rc=$?
+    case "$probe_rc" in
+      0)
+        runnable_files+=("$file")
+        ;;
+      2)
+        collect_failed_files+=("$file")
+        log "collect failed: $file"
+        tail -n 20 "$collect_log" 2>/dev/null | sed 's/^/    /'
+        echo "$file" >> "$FAILED_FILE"
+        ;;
+      *)
+        skipped_files+=("$file")
+        ;;
+    esac
+  done
+  log "runnable ${#runnable_files[@]}, skip ${#skipped_files[@]}, collect-failed ${#collect_failed_files[@]}"
+  if [ "${#runnable_files[@]}" -gt 0 ]; then
+    for file in "${runnable_files[@]}"; do
+      log "  will run: $file"
+    done
+  fi
+  if [ "${#skipped_files[@]}" -gt 0 ]; then
+    for file in "${skipped_files[@]}"; do
+      log "  skip (no runnable tests on this device): $file"
+    done
+  fi
+  if [ "${#runnable_files[@]}" -gt 0 ]; then
+    for file in "${runnable_files[@]}"; do
+      logfile="$LOG_DIR/$(pytest_log_name "$file")"
+      run_pytest "$file" "$logfile" "$@"
+    done
+  fi
+  log "files finished: ran=${#runnable_files[@]} skipped=${#skipped_files[@]} collect_failed=${#collect_failed_files[@]} discovered=${#files[@]}"
+}
+
 summarize_golden_cache() {
   local artifacts_after
   artifacts_after="$(cache_artifact_count)"
@@ -143,11 +222,12 @@ summarize_golden_cache() {
 
 log "running pytest (mode=$MODE workers=$TEST_WORKERS sample=${SAMPLE_ARG:-<none>})"
 
-# 直接模式: CI_TEST_DIRECT_FILE 指定时, 只跑指定文件 (绕过 tests/)
-if [ -n "${CI_TEST_DIRECT_FILE:-}" ]; then
+# 直接模式: 文件只跑该文件; 目录 (含默认 tests/) 先扫描可跑文件再逐文件执行。
+if [ -n "${CI_TEST_DIRECT_FILE:-}" ] && [ ! -d "${CI_TEST_DIRECT_FILE}" ]; then
+  log "single file (no scan): $CI_TEST_DIRECT_FILE"
   run_pytest "$CI_TEST_DIRECT_FILE" "$LOG_DIR/direct.log" ${CI_TEST_DIRECT_FILTER:+-k "$CI_TEST_DIRECT_FILTER"}
 else
-  run_pytest "tests/" "$LOG_DIR/all_tests.log"
+  run_pytest_scanned "${CI_TEST_DIRECT_FILE:-tests}" ${CI_TEST_DIRECT_FILTER:+-k "$CI_TEST_DIRECT_FILTER"}
 fi
 
 summarize_golden_cache
