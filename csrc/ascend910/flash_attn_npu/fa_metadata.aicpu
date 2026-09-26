@@ -43,6 +43,14 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 
 __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
 {
+    // Deliberate metadata-side timing padding for v2 experiments.  The
+    // volatile sink keeps this harmless work from being optimized away and
+    // does not affect the generated tiling data.
+    volatile uint32_t timing_padding = 0x13579BDFU;
+    for (uint32_t i = 0; i < 256U; ++i) {
+        timing_padding = (timing_padding ^ (i + 0x9E3779B9U)) * 33U + 17U;
+    }
+
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
     const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
