@@ -49,6 +49,97 @@ def _window_to_npu(window_size: Optional[int]) -> int:
     return -1 if window_size is None else int(window_size)
 
 
+# Ascend950 FA4 metadata contains only the serialized FAInferTilingData.  Keep
+# this in sync with fa_metadata::MetadataBytes(false) in
+# csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
+# metadata, its size does not depend on the input sequence lengths or mask.
+_SCHEDULER_METADATA_TILING_BYTES = 3584
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_4_950::_get_scheduler_metadata",
+    mutates_args=(),
+    device_types="npu",
+)
+def _get_scheduler_metadata_op(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    page_size: Optional[int],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    # Keep the raw pybind call behind a torch.library op.  Calling a pybind
+    # function directly from a torch.compile graph is treated as an opaque
+    # Python/C++ builtin and causes a Dynamo graph break.
+    return flash_attn_npu_4_950.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads_q,
+        num_heads_kv,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        page_size,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        softmax_scale,
+    )
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4_950::_get_scheduler_metadata")
+def _get_scheduler_metadata_fake(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    page_size: Optional[int],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    sm_margin: int,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    # The metadata is an opaque byte buffer during tracing.  Ascend950 FA4
+    # always serializes one fixed-size FAInferTilingData object, so returning
+    # a static shape lets Dynamo keep the custom op in the graph.
+    return torch.empty(
+        (_SCHEDULER_METADATA_TILING_BYTES,),
+        dtype=torch.uint8,
+        device=cache_seqlens.device,
+    )
+
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
@@ -79,7 +170,7 @@ def get_scheduler_metadata(
     cache_seqlens = _maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    return flash_attn_npu_4_950.get_scheduler_metadata(
+    return _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
         max_seqlen_k,
