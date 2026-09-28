@@ -12,6 +12,7 @@
 
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
+#include "quant_attention.hpp"
 #include "fa_metadata_args.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
@@ -131,4 +132,6 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
+    m.def("npu_quant_attention", &npu_quant_attention,
+          "Quantized dense/block-sparse attention (Ascend 950, internal)");
 }
