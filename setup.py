@@ -130,6 +130,17 @@ def _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
     return prev == _cmdhash(compile_common)
 
 
+def _inputs_signature(paths):
+    """Return a stable signature for source/header inputs used by a link step."""
+    digest = hashlib.md5()
+    for path in sorted(os.path.abspath(p) for p in paths if os.path.exists(p)):
+        stat = os.stat(path)
+        digest.update(path.encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(str(stat.st_size).encode("ascii"))
+    return digest.hexdigest()
+
+
 class BishengBuildExt(build_ext):
     _toolchains = None
 
@@ -297,12 +308,29 @@ class BishengBuildExt(build_ext):
             return None
         aicpu_obj = os.path.join(
             os.path.dirname(ext_fullpath),
-            "fa_metadata_950.o" if ext_name.endswith("_950") else "fa_metadata.o",
+            # All extensions share the build output directory.  Keep the
+            # AICPU objects per extension; otherwise the later 950 build
+            # overwrites the object already queued for the earlier one.
+            f"fa_metadata_{ext_name.replace('.', '_')}.o",
         )
-        # Incremental: aicpu is a host-code cross-compile (hcc) with no depfile,
-        # so mtime-on-source only. Skip if the object is already up-to-date.
+        # Incremental AICPU compilation must also track the local headers.  In
+        # particular, fa_metadata.aicpu includes tilingdata.h and metadata
+        # helpers whose changes otherwise leave a stale object after a branch
+        # switch or stash re-apply.
+        aicpu_stamp = aicpu_obj + ".inputs"
+        aicpu_inputs = [aicpu_src]
+        for name in ("tilingdata.h", "fa_metadata_args.h"):
+            header = os.path.join(src_dir, name)
+            if os.path.exists(header):
+                aicpu_inputs.append(header)
+        expected_signature = _inputs_signature(aicpu_inputs)
+        try:
+            with open(aicpu_stamp) as stamp:
+                current_signature = stamp.read().strip()
+        except OSError:
+            current_signature = ""
         if not self._force_rebuild() and os.path.exists(aicpu_obj) and \
-                os.path.getmtime(aicpu_src) <= os.path.getmtime(aicpu_obj):
+                current_signature == expected_signature:
             print("[compile-aicpu-skip]", aicpu_src, "(obj up-to-date)")
             return aicpu_obj
         cann_arch_dir = get_cann_arch_dir()
@@ -340,6 +368,8 @@ class BishengBuildExt(build_ext):
             result = subprocess.run(aicpu_cmd, capture_output=True, text=True, check=True)
             if result.stdout:
                 print(result.stdout)
+            with open(aicpu_stamp, "w") as stamp:
+                stamp.write(expected_signature)
             print(f"AICPU compilation successful! output: {aicpu_obj}")
         except subprocess.CalledProcessError as e:
             print(f"AICPU compilation failed! Error output:\n{e.stderr}")
@@ -414,7 +444,22 @@ class BishengBuildExt(build_ext):
         for ext in self.extensions:
             ext_fullpath = self.get_ext_fullpath(ext.name)
             objs = objs_by_ext[ext.name]
+            link_stamp = ext_fullpath + ".inputs"
+            link_inputs = [src for src in ext.sources]
+            link_inputs.extend(
+                os.path.join(os.path.dirname(src), name)
+                for src in ext.sources
+                for name in ("tilingdata.h", "fa_metadata_args.h")
+                if os.path.exists(os.path.join(os.path.dirname(src), name))
+            )
+            expected_link_signature = _inputs_signature(link_inputs)
+            try:
+                with open(link_stamp) as stamp:
+                    current_link_signature = stamp.read().strip()
+            except OSError:
+                current_link_signature = ""
             if not force and os.path.exists(ext_fullpath) and \
+                    current_link_signature == expected_link_signature and \
                     all(os.path.exists(o) and os.path.getmtime(o) <= os.path.getmtime(ext_fullpath)
                         for o in objs):
                 print("[link-skip]", ext_fullpath, "(.so up-to-date)")
@@ -427,6 +472,8 @@ class BishengBuildExt(build_ext):
                 result = subprocess.run(link_cmd, capture_output=True, text=True, check=True)
                 if result.stdout:
                     print(result.stdout)
+                with open(link_stamp, "w") as stamp:
+                    stamp.write(expected_link_signature)
                 print(f"Link successful! output: {ext_fullpath}")
             except subprocess.CalledProcessError as e:
                 print(f"Link failed! Error output:\n{e.stderr}")
