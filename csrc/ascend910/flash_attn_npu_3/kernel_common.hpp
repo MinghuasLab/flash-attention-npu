@@ -25,6 +25,8 @@ namespace KernelCommon {
     constexpr uint32_t NUM_128 = 128;
     constexpr uint32_t NUM_256 = 256;
     constexpr int64_t WINDOW_SIZE_INT_MAX = 2147483647;
+    constexpr uint32_t L1_HEAD_DIM_SLICE = NUM_128;
+    constexpr uint32_t L1_D512_KV_TILE = NUM_256;
 
     template <typename T>
     __aicore__ inline
