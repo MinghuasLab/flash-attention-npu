@@ -82,7 +82,6 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
 
     __gm__ uint8_t* actual_seq_qlen_addr;
     __gm__ uint8_t* actual_seq_kvlen_addr;
-    // Per-batch *used* lengths (seqused_q / seqused_k); nullptr when absent.
     __gm__ uint8_t* seqUsedQAddr;
     __gm__ uint8_t* seqUsedKvAddr;
     bool hasSeqUsedQ;
@@ -301,10 +300,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         compressMode = tilingData->attenMaskCompressMode;
 
-        int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
-        if constexpr (INPUT_LAYOUT == TND) {
-            sfmgOutputSize = ((__gm__ int32_t*)actual_seq_qlen)[b - 1] * n2 * g * 8;
-        }
+        // From tiling: cu[b - 1] would undercount after used-length tail trimming.
+        int64_t sfmgOutputSize = static_cast<int64_t>(tilingData->sfmgNormalAxisSize) * 8;
 
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
         int64_t dkWorkSpaceOffset = tilingData->dkWorkSpaceOffset;
@@ -344,9 +341,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     CATLASS_DEVICE
     void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
     {
-        // Region (cu-based) lengths. Use for workspace layout strides such as
-        // sfmgOffset: the Sfmg epilogue writes D densely over the packed
-        // region rows, so the reader stride must stay region-based.
+        // Region (cu) lengths; sfmgOffset strides must match Sfmg's region-dense D.
         if (unlikely(bIdx == 0)) {
             actualSeqQlen = ((__gm__ int32_t*)actual_seq_qlen_addr)[0];
             actualSeqKvlen = ((__gm__ int32_t*)actual_seq_kvlen_addr)[0];
@@ -362,9 +357,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     CATLASS_DEVICE
     void GetUsedSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
     {
-        // *Used* lengths: consult seqused_q/seqused_k when provided, else fall
-        // back to the region diff. Use for attention-extent math (mask window,
-        // causal delta, alibi) so it matches the forward's seqused semantics.
+        // *Used* lengths (seqused-aware) for mask/causal/alibi extent math.
         if (unlikely(bIdx == 0)) {
             actualSeqQlen = hasSeqUsedQ ? ((__gm__ int32_t*)seqUsedQAddr)[0]
                                         : ((__gm__ int32_t*)actual_seq_qlen_addr)[0];

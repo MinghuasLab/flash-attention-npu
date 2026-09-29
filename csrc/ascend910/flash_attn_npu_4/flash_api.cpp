@@ -763,8 +763,7 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!is_varlen_q || is_varlen_kv, "If cu_seqlens_q is provided in bwd, cu_seqlens_k must also be provided");
-    // seqused_q/seqused_k only cap the *used* lengths; the packed region layout
-    // (offsets, workspace sizing) still follows the cu arrays.
+    // seqused caps used lengths only; offsets and sizing still follow cu.
     TORCH_CHECK(!seqused_q_.has_value() || is_varlen_q, "seqused_q requires cu_seqlens_q in bwd");
     TORCH_CHECK(!seqused_k_.has_value() || is_varlen_q, "seqused_k requires cu_seqlens_q in bwd");
     TORCH_CHECK(sm_margin == 0, "mha_bwd does not support sm_margin yet.");
@@ -887,17 +886,23 @@ mha_bwd(at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
+    at::Tensor seqused_q_cpu_for_tiling;
+    at::Tensor seqused_k_cpu_for_tiling;
     if (is_varlen_q) {
         cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
         cu_seqlens_k_cpu_for_tiling = cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        // Tiling keeps the *region* cumulative lists: qSize/kvSize/vSize and
-        // t1/t2 must cover the full packed tensors (unused rows still need
-        // zeroed gradients), and the kernel derives offsets from the same cu
-        // arrays. seqused_q/seqused_k are consumed kernel-side as lengths and
-        // must NOT shrink these lists.
+        // Region lists only: sizes must cover the full packed tensors; seqused never shrinks them.
         // Tiling expects cumulative seqlens with length B and no leading zero.
         fagInfo.qSeqlenList = static_cast<int32_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
         fagInfo.kvSeqlenList = static_cast<int32_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
+        if (seqused_q_.has_value()) {
+            seqused_q_cpu_for_tiling = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            fagInfo.qUsedLenList = static_cast<int32_t *>(seqused_q_cpu_for_tiling.data_ptr());
+        }
+        if (seqused_k_.has_value()) {
+            seqused_k_cpu_for_tiling = seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            fagInfo.kvUsedLenList = static_cast<int32_t *>(seqused_k_cpu_for_tiling.data_ptr());
+        }
     }
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     uint64_t ubSize = 0;

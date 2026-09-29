@@ -155,9 +155,7 @@ struct FAGKernelParams {
     GM_ADDR softmax_lse;
     GM_ADDR cu_seq_qlen;
     GM_ADDR cu_seq_kvlen;
-    // Per-batch *used* lengths (seqused_q / seqused_k); nullptr when absent.
-    // The cu arrays above stay the region (packed) layout: batch offsets and
-    // workspace strides keep following them, only lengths consult seqused.
+    // Per-batch *used* lengths (seqused); nullptr when absent, cu arrays stay region.
     GM_ADDR seqUsedQ;
     GM_ADDR seqUsedKv;
     GM_ADDR dq;

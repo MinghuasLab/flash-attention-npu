@@ -103,8 +103,6 @@ public:
 
     __gm__ uint8_t *actual_seq_qlen_addr;
     __gm__ uint8_t *actual_seq_kvlen_addr;
-    // Per-batch *used* lengths (seqused_q / seqused_k); nullptr when absent.
-    // Offsets / workspace strides keep following the cu arrays above.
     __gm__ uint8_t *seqUsedQAddr;
     __gm__ uint8_t *seqUsedKvAddr;
     bool hasSeqUsedQ;
@@ -159,10 +157,8 @@ public:
         hasSeqUsedQ = params.seqUsedQ != nullptr;
         hasSeqUsedKv = params.seqUsedKv != nullptr;
 
-        int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
-        if constexpr (INPUT_LAYOUT == TND) {
-            sfmgOutputSize = ((__gm__ int32_t*)params.cu_seq_qlen)[b - 1] * n2 * g * 8;
-        }
+        // From tiling: cu[b - 1] would undercount after used-length tail trimming.
+        int64_t sfmgOutputSize = static_cast<int64_t>(fagTilingData->sfmgNormalAxisSize) * 8;
 
         dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
                                     fagTilingData->dqWorkSpaceOffset / sizeof(float));
@@ -212,9 +208,7 @@ public:
 
     __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
     {
-        // *Used* lengths: consult seqused_q/seqused_k when provided, else diff
-        // the cu arrays (region lengths). Task partitioning, window tokens and
-        // tile extents all follow the used lengths, matching the forward.
+        // *Used* lengths (seqused-aware); task partitioning and window math follow.
         if (unlikely(bIdx == 0)) {
             actualSeqQlen = hasSeqUsedQ ? ((__gm__ int32_t *)seqUsedQAddr)[0]
                                         : ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
@@ -231,18 +225,6 @@ public:
                                    - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
         }
         return;
-    }
-
-    __aicore__ inline void UpdateToken(int64_t bIdx)
-    {
-        if constexpr (IS_ATTEN_MASK != ENABLE) {
-            return;
-        }
-        int32_t actualS1Len = 0;
-        int32_t actualS2Len = 0;
-        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
-        actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
-        actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
     }
 
     __aicore__ inline void UpdateIndex()
@@ -300,12 +282,20 @@ public:
         int32_t actualSeqQlen = s1;
         int32_t actualSeqKvlen = s2;
         if constexpr(INPUT_LAYOUT == TND) {
-            UpdateToken(bDimIdx);
-            GetSeqQlenKvlenByBidx(bDimIdx, actualSeqQlen, actualSeqKvlen);
-            s1Outer = (actualSeqQlen + s1CvInner - 1) / s1CvInner;
-            s2Outer = (actualSeqKvlen + s2CvInner - 1) / s2CvInner;
-            s1CvTail = actualSeqQlen - (s1Outer - 1) * s1CvInner;
-            s2CvTail = actualSeqKvlen - (s2Outer - 1) * s2CvInner;
+            if (static_cast<uint32_t>(bDimIdx) != cachedBatch) {
+                cachedBatch = static_cast<uint32_t>(bDimIdx);
+                GetSeqQlenKvlenByBidx(bDimIdx, cachedActualSeqQlen, cachedActualSeqKvlen);
+                if constexpr (IS_ATTEN_MASK == ENABLE) {
+                    actualCalcS1Token = s1Token + cachedActualSeqQlen - cachedActualSeqKvlen;
+                    actualCalcS2Token = s2Token - cachedActualSeqQlen + cachedActualSeqKvlen;
+                }
+                s1Outer = (cachedActualSeqQlen + s1CvInner - 1) / s1CvInner;
+                s2Outer = (cachedActualSeqKvlen + s2CvInner - 1) / s2CvInner;
+                s1CvTail = cachedActualSeqQlen - (s1Outer - 1) * s1CvInner;
+                s2CvTail = cachedActualSeqKvlen - (s2Outer - 1) * s2CvInner;
+            }
+            actualSeqQlen = cachedActualSeqQlen;
+            actualSeqKvlen = cachedActualSeqKvlen;
         }
         dqOutIdx = dqOutBase + (n2DimIdx * g + gDimIdx) * s1Outer + s1oDimIdx;
         kvOutIdx = kvOutBase + n2DimIdx * s2Outer + s2oCvDimIdx;
@@ -425,8 +415,9 @@ public:
         dbParam.s2Stride = 0;
 
         if constexpr (INPUT_LAYOUT == TND) {
-            UpdateToken(dbParam.bIdx);
-            GetSeqQlenKvlenByBidx(dbParam.bIdx, dbParam.actualS1Len, dbParam.actualS2Len);
+            // Lengths from the batch-once cache; offsets read per task like the forward.
+            dbParam.actualS1Len = cachedActualSeqQlen;
+            dbParam.actualS2Len = cachedActualSeqKvlen;
             dbParam.aTensorOffsetCv = 0;
             dbParam.bTensorOffsetCv = 0;
             if (dbParam.bIdx > 0) {
@@ -886,6 +877,11 @@ private:
     int64_t gDimIdx{0};
     int64_t s1oDimIdx{0};
     int64_t s2oCvDimIdx{0};
+
+    // Batch-once per-batch cache; safe in MM1 because it runs before the next walk.
+    uint32_t cachedBatch = 0xFFFFFFFFU;
+    int32_t cachedActualSeqQlen = 0;
+    int32_t cachedActualSeqKvlen = 0;
 
     // split info
     int64_t s1Outer;

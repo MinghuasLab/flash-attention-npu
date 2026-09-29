@@ -69,6 +69,9 @@ struct FAGInfo {
     int64_t window_size_right;
     int32_t *qSeqlenList{nullptr};
     int32_t *kvSeqlenList{nullptr};
+    // Optional per-batch *used* lengths; heuristics only, sizes stay region-based.
+    int32_t *qUsedLenList{nullptr};
+    int32_t *kvUsedLenList{nullptr};
     bool isDeterministic = false;
     int64_t alibiSlopesBatchStride = 0;
 };
