@@ -77,6 +77,20 @@ FLASH_ATTN_BUILD_NPU=910 python setup.py install
 FLASH_ATTN_BUILD_NPU=950 python setup.py install
 ```
 
+### CATLASS DSL（可选）
+
+`flash_attn_npu_dsl` 聚焦通过 `score_mod` 和 `mask_mod` 定制 Ascend 950 上的注意力前向。
+回调以内联方式在 attention 内核中执行，可选择 SIMT 或显式 SIMD；配套的可选建块支持稀疏执行。
+支持 BSND、FP16/BF16、D64/96/128 和 GQA，不替换 V2/V3/V4 的入口。
+
+该可选包要求 Python `>=3.10,<3.14`、CANN `>=9.1.0`，并需单独安装 CATLASS DSL
+运行时、准备配套的 bitcode 模板（BC）。详见[安装与使用指南](flash_attn_npu_dsl/README.md)。
+依赖准备完成后，在源码仓根目录运行：
+
+```bash
+python -m flash_attn_npu_dsl.example --device 0
+```
+
 ## 测试
 
 运行测试脚本：
