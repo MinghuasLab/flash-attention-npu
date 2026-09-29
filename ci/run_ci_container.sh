@@ -17,6 +17,7 @@
 #   CI_DOCKER_IMAGE          (默认 fa-npu-ci:910b-cann9.1-torch2.9)
 #   CI_SKIP_BUILD            (默认 false)  true=跳过阶段1 (已有 build/ 产物)
 #   CI_CONTAINER_SCOPE       当前 CI job 的唯一容器归属标识
+#   FLASH_ATTN_BUILD_NPU     (默认 all)    仅构建 910 或 950 后端
 #   CI_NPU_WAIT_MAX_SEC      (默认 600)    所有卡忙时最长等待秒数
 #   CI_NPU_WAIT_INTERVAL_SEC (默认 30)     所有卡忙时重探间隔秒数
 #   ASCEND_RT_VISIBLE_DEVICES               手动指定宿主机物理卡时跳过自动选卡
@@ -43,6 +44,7 @@ CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
+FLASH_ATTN_BUILD_NPU="${FLASH_ATTN_BUILD_NPU:-all}"
 CI_LOG_SCOPE="${CI_CONTAINER_SCOPE//[^A-Za-z0-9_.-]/_}"
 CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs/$CI_LOG_SCOPE}"
 GOLDEN_CACHE_HOST_DIR="${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
@@ -50,6 +52,7 @@ GOLDEN_CACHE_DIR="${GOLDEN_CACHE_DIR:-/var/cache/flash-attention-npu/golden_cach
 GOLDEN_CACHE_MODE="${GOLDEN_CACHE_MODE:-cache}"
 
 # shellcheck source=ci/docker_proxy.sh
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/docker_proxy.sh"
 git_proxy_init "$GOLDEN_CACHE_HOST_DIR"
 
@@ -126,6 +129,7 @@ run_build_phase() {
     "${cache_mount_args[@]}" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
+    -e FLASH_ATTN_BUILD_NPU="${FLASH_ATTN_BUILD_NPU}" \
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \
@@ -200,6 +204,7 @@ run_docker_test() {
     -e GOLDEN_CACHE_MAX_DIRS="${GOLDEN_CACHE_MAX_DIRS:-5}" \
     -e GOLDEN_CACHE_MAX_TEST_DIRS="${GOLDEN_CACHE_MAX_TEST_DIRS:-32}" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
+    -e FLASH_ATTN_BUILD_NPU="${FLASH_ATTN_BUILD_NPU}" \
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \

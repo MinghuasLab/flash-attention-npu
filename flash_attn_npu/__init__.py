@@ -1,6 +1,18 @@
-__version__ = "0.4.2"
+from ._version import __version__
 
 import torch_npu
+
+__all__ = [
+    "__version__",
+    "flash_attn_func",
+    "flash_attn_kvpacked_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_varlen_func",
+    "flash_attn_varlen_kvpacked_func",
+    "flash_attn_varlen_qkvpacked_func",
+    "flash_attn_with_kvcache",
+    "get_scheduler_metadata",
+]
 
 
 def is_ascend910() -> bool:

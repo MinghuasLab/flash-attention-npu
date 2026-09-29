@@ -1,0 +1,280 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: true
+        default: "main"
+        type: string
+      release_tag:
+        description: "Version tag to validate (blank uses v<package version>)"
+        required: false
+        default: ""
+        type: string
+      matrix_filter:
+        description: "Optional substring selecting matrix rows"
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "Create/update the GitHub Release and upload wheels"
+        required: false
+        default: false
+        type: boolean
+      publish_pypi:
+        description: "Upload the source distribution to PyPI"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.event_name == 'push' && github.ref || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare_release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish_release: ${{ steps.mode.outputs.publish_release }}
+      publish_pypi: ${{ steps.mode.outputs.publish_pypi }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          package_version="$(python3 ci/validate_release_version.py)"
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$PUSH_TAG"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$package_version"
+          fi
+          python3 ci/validate_release_version.py --tag "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve publication mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE: ${{ inputs.publish_release }}
+          INPUT_PYPI: ${{ inputs.publish_pypi }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_RELEASE" = "true" ]; then
+            echo "publish_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_PYPI" = "true" ]; then
+            echo "publish_pypi=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_pypi=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate publication ref
+        if: steps.mode.outputs.publish_release == 'true' || steps.mode.outputs.publish_pypi == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "$TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$head_commit" = "$tag_commit" || {
+            echo "ref HEAD $head_commit does not match $TAG ($tag_commit)" >&2
+            exit 1
+          }
+
+      - name: Build dynamic matrix
+        id: matrix
+        run: python3 ci/release_matrix.py --filter '${{ inputs.matrix_filter }}' --github-output "$GITHUB_OUTPUT"
+
+      - name: Create or reuse GitHub Release
+        if: steps.mode.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git rev-parse "$TAG^{commit}" >/dev/null
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Reusing existing release $TAG"
+          else
+            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          fi
+
+  build_wheels:
+    name: Wheel (${{ matrix.name }})
+    needs: prepare_release
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare_release.outputs.matrix) }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 360
+    env:
+      CI_CONTAINER_SCOPE: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}
+    steps:
+      - name: Prepare self-hosted workspace
+        env:
+          CI_DOCKER_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/workspace" "$CI_DOCKER_IMAGE" \
+            bash -c 'chmod -R a+rwX /workspace 2>/dev/null || true'
+          git config --global --add safe.directory "$PWD"
+          git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
+          proxy_file="${PROXY_CONFIG_FILE:-/home/FA_NPU_CI_DATA/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            git_proxy="$(sed -n 's/^\(GIT_PROXY\|HTTPS_PROXY\|https_proxy\)=//p' "$proxy_file" | tail -n1)"
+            if [ -n "$git_proxy" ]; then
+              git config --global http.https://github.com.proxy "$git_proxy"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Clear temporary checkout proxy
+        run: git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
+
+      - name: Build and validate wheel
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_PY_TAG: ${{ matrix.py_tag }}
+          MATRIX_TORCH_VERSION: ${{ matrix.torch_version }}
+          MATRIX_TORCH_NPU_VERSION: ${{ matrix.torch_npu_version }}
+          MATRIX_CANN_VERSION: ${{ matrix.cann_version }}
+          MATRIX_NPU: ${{ matrix.npu }}
+          MATRIX_BUILD_VERSION: ${{ matrix.build_version }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          CI_DOCKER_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$CI_DOCKER_IMAGE" >/dev/null
+          docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            --privileged \
+            --ipc host \
+            --network host \
+            -v "$PWD:/workspace/flash-attention-npu" \
+            -w /workspace/flash-attention-npu \
+            -e MATRIX_NAME -e MATRIX_PY_TAG -e MATRIX_TORCH_VERSION \
+            -e MATRIX_TORCH_NPU_VERSION -e MATRIX_CANN_VERSION -e MATRIX_NPU \
+            -e MATRIX_BUILD_VERSION -e MATRIX_ABI -e MATRIX_ARCH \
+            -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
+            "$CI_DOCKER_IMAGE" bash ci/build_release_wheel.sh
+          docker run --rm -v "$PWD:/workspace" "$CI_DOCKER_IMAGE" \
+            bash -c 'chmod -R a+rwX /workspace 2>/dev/null || true'
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/${{ matrix.name }}/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload wheel to GitHub Release
+        if: needs.prepare_release.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          wheel="$(find "dist/${{ matrix.name }}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          bash ci/upload_release_asset.sh "$TAG" "$wheel"
+
+      - name: Clean up release containers
+        if: always()
+        run: bash ci/cleanup_ci_containers.sh
+
+  publish_package:
+    name: Build and publish source distribution
+    needs: [prepare_release, build_wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download and count wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      - name: Verify complete wheel set
+        env:
+          MATRIX_JSON: ${{ needs.prepare_release.outputs.matrix }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          expected = len(json.loads(os.environ["MATRIX_JSON"])["include"])
+          wheels = list(Path("dist/wheels").glob("*.whl"))
+          if len(wheels) != expected:
+              raise SystemExit(f"expected {expected} wheels, found {len(wheels)}")
+          PY
+
+      - name: Build and validate source distribution
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade build twine
+          FLASH_ATTN_SKIP_NPU_BUILD=TRUE python3 -m build --sdist --outdir dist/sdist
+          python3 -m twine check dist/sdist/*
+          tar -tf dist/sdist/*.tar.gz | sort > dist/sdist/contents.txt
+          temp_dir="$(mktemp -d)"
+          tar -xf dist/sdist/*.tar.gz -C "$temp_dir"
+          extracted="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          sdist_version="$(cd "$extracted" && python3 setup.py --version)"
+          test "v$sdist_version" = "${{ needs.prepare_release.outputs.tag }}"
+
+      - name: Upload source distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-distribution
+          path: dist/sdist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish source distribution to PyPI
+        if: needs.prepare_release.outputs.publish_pypi == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: python3 -m twine upload dist/sdist/*.tar.gz
