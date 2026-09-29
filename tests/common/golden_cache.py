@@ -28,7 +28,9 @@ _DEFAULT_CACHE_DIR = "/var/cache/flash-attention-npu/golden_cache"
 _RETRY_HANDLERS: dict[int, Callable[[], bool]] = {}
 
 
-def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]) -> None:
+def register_retry(
+    values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]
+) -> None:
     """Associate cached tensors with a one-shot refresh callback."""
     used = False
 
@@ -80,7 +82,10 @@ def _record_cache_event(event: str, nodeid: str) -> None:
 
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, "1" if default else "0").strip().lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -98,14 +103,38 @@ def _json_value(value: Any) -> Any:
     return repr(value)
 
 
+# Full-content hashes of long-KV tensors (tens to hundreds of MB) made every
+# cache lookup do a D2H copy + SHA256.  That made a HIT as expensive as a MISS
+# on the cases the cache was meant to accelerate.  Small tensors still hash
+# every byte.  Large tensors hash three windows (head/mid/tail) so per-batch
+# slices with the same shape do not collide, without hashing the full payload.
+_MAX_DIGEST_BYTES = 64 * 1024
+_LARGE_DIGEST_WINDOWS = 3
+
+
 def _tensor_digest(tensor: torch.Tensor) -> dict[str, Any]:
-    cpu = tensor.detach().to(device="cpu").contiguous()
-    data = cpu.view(torch.uint8).numpy().tobytes()
-    return {
-        "dtype": str(cpu.dtype),
-        "shape": list(cpu.shape),
-        "sha256": hashlib.sha256(data).hexdigest(),
+    info = {
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "numel": int(tensor.numel()),
     }
+    element_size = max(int(tensor.element_size()), 1)
+    nbytes = int(tensor.numel()) * element_size
+    hasher = hashlib.sha256()
+    detached = tensor.detach()
+    if nbytes <= _MAX_DIGEST_BYTES:
+        cpu = detached.to(device="cpu").contiguous()
+        hasher.update(cpu.view(torch.uint8).numpy().tobytes())
+    else:
+        flat = detached.reshape(-1)
+        window = max(1, _MAX_DIGEST_BYTES // (_LARGE_DIGEST_WINDOWS * element_size))
+        numel = int(flat.numel())
+        starts = (0, max(0, (numel - window) // 2), max(0, numel - window))
+        for start in starts:
+            chunk = flat[start : start + window].to(device="cpu").contiguous()
+            hasher.update(chunk.view(torch.uint8).numpy().tobytes())
+    info["sha256"] = hasher.hexdigest()
+    return info
 
 
 def input_digest(inputs: Any) -> Any:
@@ -120,9 +149,7 @@ def input_digest(inputs: Any) -> Any:
 
 
 def _sha256_json(value: Any) -> str:
-    encoded = json.dumps(
-        _json_value(value), sort_keys=True, separators=(",", ":")
-    ).encode()
+    encoded = json.dumps(_json_value(value), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -143,7 +170,10 @@ def _cache_root() -> Path:
 
 def _cache_enabled() -> bool:
     return os.environ.get("GOLDEN_CACHE_MODE", "off").strip().lower() not in {
-        "off", "0", "false", "disabled"
+        "off",
+        "0",
+        "false",
+        "disabled",
     }
 
 
@@ -232,9 +262,13 @@ def _write_artifact(
             for name, value in values.items():
                 if not isinstance(value, torch.Tensor):
                     raise TypeError(f"golden value {name!r} is not a tensor")
+                # Clone a contiguous CPU copy so torch.save does not persist
+                # the backing storage of a view (e.g. a permute of a large
+                # attention score tensor).
+                saved = value.detach().to(device="cpu").contiguous().clone()
                 with Path(temp, f"{_safe_name(name)}.pt").open("wb") as stream:
-                    torch.save(value.detach().to(device="cpu"), stream)
-            with tarfile.open(temp_path, "w:gz") as archive:
+                    torch.save(saved, stream)
+            with tarfile.open(temp_path, "w:gz", compresslevel=1) as archive:
                 for child in sorted(Path(temp).iterdir()):
                     archive.add(child, arcname=child.name)
         os.replace(temp_path, path)
@@ -304,9 +338,7 @@ def get_or_compute_golden(
     common_hash = _sha256_json(
         {"source": case_metadata["source_digest"], "runtime": case_metadata["runtime"]}
     )[:16]
-    seed = _safe_name(
-        str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case")))
-    )
+    seed = _safe_name(str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case"))))
     test_hash = _sha256_json(
         {
             "test_file": nodeid.split("::", 1)[0],
@@ -340,8 +372,7 @@ def get_or_compute_golden(
     values = dict(compute_fn())
     if set(values) != set(value_names):
         raise ValueError(
-            f"computed golden tensors {sorted(values)} do not match "
-            f"expected {value_names}"
+            f"computed golden tensors {sorted(values)} do not match expected {value_names}"
         )
     try:
         with _exclusive_lock(root):
