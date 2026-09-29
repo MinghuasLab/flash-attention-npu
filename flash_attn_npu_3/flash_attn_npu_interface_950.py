@@ -333,8 +333,7 @@ def _get_scheduler_metadata_op(
     headdim: int,
     headdim_v: int,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
     num_blocks: Optional[int],
     max_num_blocks_per_seq: Optional[int],
@@ -354,8 +353,7 @@ def _get_scheduler_metadata_op(
         headdim,
         headdim_v,
         cache_seqlens,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        seqlens_q,
         page_size,
         num_blocks,
         max_num_blocks_per_seq,
@@ -378,8 +376,7 @@ def _get_scheduler_metadata_fake(
     headdim: int,
     headdim_v: int,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
     num_blocks: Optional[int],
     max_num_blocks_per_seq: Optional[int],
@@ -411,8 +408,7 @@ def get_scheduler_metadata(
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
     max_seqlen_k=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqlens_q: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     num_blocks: Optional[int] = None,
     max_num_blocks_per_seq: Optional[int] = None,
@@ -435,10 +431,8 @@ def get_scheduler_metadata(
     change.
     """
     cache_seqlens = _maybe_contiguous(cache_seqlens)
-    if cu_seqlens_q is not None:
-        cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
-    if cu_seqlens_k is not None:
-        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
+    if seqlens_q is not None:
+        seqlens_q = _maybe_contiguous(seqlens_q)
     if headdim_v is None:
         headdim_v = headdim
     if softmax_scale is None:
@@ -461,8 +455,7 @@ def get_scheduler_metadata(
         headdim,
         headdim_v,
         cache_seqlens,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        seqlens_q,
         page_size,
         num_blocks,
         max_num_blocks_per_seq,
@@ -683,6 +676,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         if scheduler_metadata is None:
             meta_seqused_k = _maybe_contiguous(cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+            meta_seqlens_q = _maybe_contiguous(cu_seqlens_q[1:] - cu_seqlens_q[:-1])
             scheduler_metadata = get_scheduler_metadata(
                 batch_size=cu_seqlens_q.numel() - 1,
                 max_seqlen_q=max_seqlen_q,
@@ -693,8 +687,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 headdim_v=v.shape[2],
                 cache_seqlens=meta_seqused_k,
                 qkv_dtype=q.dtype,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
+                seqlens_q=meta_seqlens_q,
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
@@ -1036,7 +1029,7 @@ def flash_attn_with_kvcache(
             headdim_v=headdim_v,
             cache_seqlens=cache_seqlens,
             qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
+            seqlens_q=(cu_seqlens_q[1:] - cu_seqlens_q[:-1]) if cu_seqlens_q is not None else None,
             page_size=page_size,
             num_blocks=num_blocks,
             max_num_blocks_per_seq=max_blocks,

@@ -70,7 +70,7 @@ def test_flash_attn_varlen_graph(is_causal):
         headdim=HEAD_SIZE,
         cache_seqlens=cache_seqlens,
         qkv_dtype=DATA_TYPE,
-        cu_seqlens_q=cu_seqlens_q,
+        seqlens_q=torch.tensor([Q_SEQLEN], dtype=torch.int32).npu(),
         page_size=BLOCK_SIZE,
         causal=is_causal,
         window_size=WINDOW_SIZE,

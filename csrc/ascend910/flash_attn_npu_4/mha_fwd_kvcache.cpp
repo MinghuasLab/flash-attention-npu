@@ -40,6 +40,8 @@ namespace SplitFuse {
         class CombineScale = void>
     class FAInferKernel {
     public:
+        bool hasSeqUsedQ = false;
+        bool hasSeqUsedKv = false;
         using ArchTag = typename BlockMmadQK::ArchTag;
         using L1TileShape = typename BlockMmadQK::L1TileShape;
         using ElementQ = typename BlockMmadQK::ElementA;
@@ -77,6 +79,28 @@ namespace SplitFuse {
         using LseTypeInit = Gemm::GemmType<ElementLse, LayoutLse>;
         using EpilogueInitOut = Epilogue::Block::BlockEpilogue<InitOutDispatchPolicy, OTypeInit, LseTypeInit>;
 
+        // Per-batch Q length: seqused_q when provided, else cu prefix diff.
+        __aicore__ inline uint32_t QSeqLenOf(uint32_t bIdx,
+                                             AscendC::GlobalTensor<int32_t> &gCuSeq,
+                                             AscendC::GlobalTensor<int32_t> &gSeqUsed) const
+        {
+            if (hasSeqUsedQ) {
+                return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
+            }
+            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
+        }
+
+        // Per-batch KV length: seqused_k when provided, else cu prefix diff.
+        __aicore__ inline uint32_t KvSeqLenOf(uint32_t bIdx,
+                                                  AscendC::GlobalTensor<int32_t> &gCuSeq,
+                                                  AscendC::GlobalTensor<int32_t> &gSeqUsed) const
+        {
+            if (hasSeqUsedKv) {
+                return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
+            }
+            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
+        }
+
         struct GlobalTensorBundle {
             AscendC::GlobalTensor<ElementQ>& gQ;
             AscendC::GlobalTensor<ElementK>& gK;
@@ -85,6 +109,8 @@ namespace SplitFuse {
             AscendC::GlobalTensor<int32_t>& gBlockTable;
             AscendC::GlobalTensor<int32_t>& gActualQseqlen;
             AscendC::GlobalTensor<int32_t>& gActualKvseqlen;
+            AscendC::GlobalTensor<int32_t>& gSeqUsedQ;
+            AscendC::GlobalTensor<int32_t>& gSeqUsedKv;
             AscendC::GlobalTensor<ElementO>& gO;
             AscendC::GlobalTensor<ElementLse>& gLse;
             AscendC::GlobalTensor<ElementLse>& gLseFD;
@@ -101,6 +127,8 @@ namespace SplitFuse {
         __aicore__ inline
         void operator()(FAIKernelParams const &params)
         {
+            hasSeqUsedQ = params.seqUsedQ != nullptr;
+            hasSeqUsedKv = params.seqUsedKv != nullptr;
             __gm__ FAInferTilingData *fATilingData = reinterpret_cast<__gm__ FAInferTilingData *>(params.tiling);
             mm1OutSize = fATilingData->mm1OutSize;
             smOnlineOutSize = fATilingData->smOnlineOutSize;
@@ -147,6 +175,10 @@ namespace SplitFuse {
             gActualQseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualQseqlen);
             AscendC::GlobalTensor<int32_t> gActualKvseqlen;
             gActualKvseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualKvseqlen);
+            AscendC::GlobalTensor<int32_t> gSeqUsedQ;
+            gSeqUsedQ.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedQ);
+            AscendC::GlobalTensor<int32_t> gSeqUsedKv;
+            gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedKv);
             AscendC::GlobalTensor<ElementO> gO;
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<ElementLse> gLse;
@@ -172,7 +204,7 @@ namespace SplitFuse {
 
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gMask, gBlockTable,
-                gActualQseqlen, gActualKvseqlen,
+                gActualQseqlen, gActualKvseqlen, gSeqUsedQ, gSeqUsedKv,
                 gO, gLse, gLseFD, gOFD,
                 gS, gP, gOTmp, gOUpdate
             };
@@ -270,11 +302,9 @@ namespace SplitFuse {
                     uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
                     uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
                     if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        uint32_t prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
-                        qSeqlenCur = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1)) - prevQSeqlenSum;
+                        qSeqlenCur = QSeqLenOf(BIdx, gActualQseqlen, gSeqUsedQ);
                         if constexpr (!PAGED_CACHE_FLAG) {
-                            uint32_t prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
-                            kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) - prevKvSeqlenSum;
+                            kvSeqlenCur = KvSeqLenOf(BIdx, gActualKvseqlen, gSeqUsedKv);
                         }
                     }
 
@@ -303,7 +333,7 @@ namespace SplitFuse {
                                 (enS2IdxNow - stS2IdxNow) < static_cast<int32_t>(curKSBlockNumTmp);
 
                             runMainLoop(
-                                coreIdx, BIdx, (uint32_t)n1Idx, (uint32_t)s1Idx,
+                                coreIdx, BIdx, qSeqlenCur, kvSeqlenCur, (uint32_t)n1Idx, (uint32_t)s1Idx,
                                 isSplitKV, stS2IdxNow, enS2IdxNow,
                                 gmOffsetLseFD, gmOffsetOFD,
                                 globalTensors
@@ -332,11 +362,9 @@ namespace SplitFuse {
                         uint32_t qSeqlenTmp = fATilingData->maxQSeqlen;
                         uint32_t kvSeqlenTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
                         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                            uint32_t prevQSeqlenSumTmp = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
-                            qSeqlenTmp = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumTmp;
+                            qSeqlenTmp = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                             if constexpr (!PAGED_CACHE_FLAG) {
-                                uint32_t prevKvSeqlenSumTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
-                                kvSeqlenTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp + 1)) - prevKvSeqlenSumTmp;
+                                kvSeqlenTmp = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
                             }
                         }
 
@@ -351,11 +379,9 @@ namespace SplitFuse {
                     uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
                     uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
                     if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        uint32_t prevQSeqlenSumCur = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
-                        qSeqlenCur = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumCur;
+                        qSeqlenCur = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                         if constexpr (!PAGED_CACHE_FLAG) {
-                            uint32_t prevKvSeqlenSumCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
-                            kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp + 1)) - prevKvSeqlenSumCur;
+                            kvSeqlenCur = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
                         }
                     }
                     uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
@@ -367,7 +393,7 @@ namespace SplitFuse {
                     uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
 
                     runMainLoop(
-                        coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur,
+                        coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur,
                         false, 0, 0,
                         0, 0,
                         globalTensors
@@ -444,6 +470,8 @@ namespace SplitFuse {
         __aicore__ inline void runMainLoop(
             uint32_t coreIdx,
             uint32_t BIdx,
+            uint32_t qSeqlen,
+            uint32_t kvSeqlen,
             uint32_t qNBlockIdx,
             uint32_t qSBlockIdx,
             bool isSplitKV,
@@ -469,17 +497,13 @@ namespace SplitFuse {
             auto& gOTmp = globalTensors.gOTmp;
             auto& gOUpdate = globalTensors.gOUpdate;
 
-            uint32_t qSeqlen = maxQSeqlen;
-            uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
             uint32_t prevQSeqlenSum = 0;
             uint32_t prevKvSeqlenSum = 0;
 
             if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
                 prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
-                qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1)) - prevQSeqlenSum;
                 if constexpr (!PAGED_CACHE_FLAG) {
                     prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
-                    kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) - prevKvSeqlenSum;
                 }
             } else {
                 // BSND: Q/O/LSE per-batch storage step is maxQSeqlen.
@@ -1055,7 +1079,9 @@ namespace SplitFuse {
         GM_ADDR actualKvseqlen,
         GM_ADDR workspace,
         GM_ADDR tiling,
-        uint64_t blockTableStride)
+        uint64_t blockTableStride,
+        GM_ADDR seqUsedQ = nullptr,
+        GM_ADDR seqUsedKv = nullptr)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1119,7 +1145,7 @@ namespace SplitFuse {
                           PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
         FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling,
-                              blockTableStride};
+                              blockTableStride, seqUsedQ, seqUsedKv};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

@@ -192,7 +192,7 @@ def _get_scheduler_metadata_op(
     headdim_v: int,
     qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -213,7 +213,7 @@ def _get_scheduler_metadata_op(
         headdim_v,
         qkv_dtype,
         cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
         page_size,
         causal,
         window_size_left,
@@ -239,7 +239,7 @@ def _get_scheduler_metadata_fake(
     headdim_v: int,
     qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
     causal: bool,
     window_size_left: int,
@@ -268,7 +268,7 @@ def get_scheduler_metadata(
     cache_seqlens: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
+    seqlens_q: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
@@ -298,7 +298,7 @@ def get_scheduler_metadata(
         headdim_v,
         qkv_dtype,
         cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
         page_size,
         causal,
         window_size[0],
@@ -380,6 +380,8 @@ def _flash_attn_backward_op(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -405,8 +407,8 @@ def _flash_attn_backward_op(
         dv,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,  # seqused_q
-        None,  # seqused_k
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
@@ -430,6 +432,8 @@ def _flash_attn_backward_op_fake(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -531,8 +535,6 @@ def _flash_attn_backward(
     assert aux_scalars is None, "flash_attn_npu_v4 bwd does not support aux_scalars"
     assert block_sparse_tensors is None, "flash_attn_npu_v4 bwd does not support block_sparse_tensors"
     assert dlse is None, "flash_attn_npu_v4 bwd does not support dlse"
-    assert seqused_q is None, "flash_attn_npu_v4 bwd does not support seqused_q"
-    assert seqused_k is None, "flash_attn_npu_v4 bwd does not support seqused_k"
     assert not pack_gqa, "flash_attn_npu_v4 bwd does not support pack_gqa=True"
     assert qv is None, "flash_attn_npu_v4 bwd does not support qv"
     assert page_table is None, "flash_attn_npu_v4 bwd does not support page_table"
@@ -555,6 +557,8 @@ def _flash_attn_backward(
         lse,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         dq,
@@ -814,6 +818,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 cache_seqlens = seqused_k
             else:
                 cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            if seqused_q is not None:
+                seqlens_q_arg = seqused_q
+            else:
+                seqlens_q_arg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
             metadata_max_seqlen_k = max_seqlen_k
             if metadata_max_seqlen_k is None and page_table is not None and k.dim() == 4:
                 # Paged KV: normalize the SWA window against the actual max KV
@@ -833,7 +841,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 cache_seqlens,
                 qkv_dtype=q.dtype,
                 headdim_v=head_size_v,
-                cu_seqlens_q=cu_seqlens_q,
+                seqlens_q=seqlens_q_arg,
                 page_size=k.shape[1] if (page_table is not None and k.dim() == 4) else None,
                 causal=causal,
                 window_size=window_size,

@@ -103,6 +103,12 @@ public:
 
     __gm__ uint8_t *actual_seq_qlen_addr;
     __gm__ uint8_t *actual_seq_kvlen_addr;
+    // Per-batch *used* lengths (seqused_q / seqused_k); nullptr when absent.
+    // Offsets / workspace strides keep following the cu arrays above.
+    __gm__ uint8_t *seqUsedQAddr;
+    __gm__ uint8_t *seqUsedKvAddr;
+    bool hasSeqUsedQ;
+    bool hasSeqUsedKv;
 
     constexpr static uint32_t ENABLE = 1;
     constexpr static int8_t OUTIDX= -1;
@@ -148,6 +154,10 @@ public:
 
         actual_seq_qlen_addr = params.cu_seq_qlen;
         actual_seq_kvlen_addr = params.cu_seq_kvlen;
+        seqUsedQAddr = params.seqUsedQ;
+        seqUsedKvAddr = params.seqUsedKv;
+        hasSeqUsedQ = params.seqUsedQ != nullptr;
+        hasSeqUsedKv = params.seqUsedKv != nullptr;
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
         if constexpr (INPUT_LAYOUT == TND) {
@@ -202,14 +212,23 @@ public:
 
     __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
     {
+        // *Used* lengths: consult seqused_q/seqused_k when provided, else diff
+        // the cu arrays (region lengths). Task partitioning, window tokens and
+        // tile extents all follow the used lengths, matching the forward.
         if (unlikely(bIdx == 0)) {
-            actualSeqQlen = ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
-            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
+            actualSeqQlen = hasSeqUsedQ ? ((__gm__ int32_t *)seqUsedQAddr)[0]
+                                        : ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
+            actualSeqKvlen = hasSeqUsedKv ? ((__gm__ int32_t *)seqUsedKvAddr)[0]
+                                          : ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
         } else {
             actualSeqQlen =
-                ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
+                hasSeqUsedQ ? ((__gm__ int32_t *)seqUsedQAddr)[bIdx]
+                            : ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx]
+                                  - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
             actualSeqKvlen =
-                ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
+                hasSeqUsedKv ? ((__gm__ int32_t *)seqUsedKvAddr)[bIdx]
+                             : ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx]
+                                   - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
         }
         return;
     }
@@ -791,7 +810,8 @@ public:
         AscendC::TPipe pipeVec;
         TBuf<> unifiedBuffer;
         EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
-            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, nullptr,
+            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen,
+            params.seqUsedQ, params.seqUsedKv, params.dq, params.dk, params.dv, nullptr,
             params.workspace, params.tiling, unifiedBuffer);
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
@@ -992,7 +1012,8 @@ template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
                         GM_ADDR atten_mask, GM_ADDR softmax_lse,
-                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
+                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
+                        GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_,
                         GM_ADDR dk_, GM_ADDR dv_,
                         GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
 ) {
@@ -1102,7 +1123,8 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
 
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
-    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, nullptr, workspace, tiling};
+    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen,
+                           seqUsedQ, seqUsedKv, dq_, dk_, dv_, nullptr, workspace, tiling};
 
     // call kernel
     FAGKernel flashAttn;

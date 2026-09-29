@@ -45,6 +45,8 @@ struct FwdLaunchArgs {
     uint8_t *kvSeqDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
+    uint8_t *sequsedQDevice;
+    uint8_t *sequsedKVDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp

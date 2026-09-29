@@ -21,13 +21,14 @@
 #include "mha_fwd_kvcache.cpp"
 
 // 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                  \
+#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)  \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE,         \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>             \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>\
         <<<launchBlockDim, nullptr, aclStream>>>(                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
-            workspaceDevice, tilingDevice, a.blockTableStride)
+            workspaceDevice, tilingDevice, a.blockTableStride,                     \
+            sequsedQDevice, sequsedKVDevice)
 
 #define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
     do {                                                   \
@@ -77,6 +78,8 @@ void launch_fwd_dtype(const FwdLaunchArgs &a) {
     uint8_t *kvSeqDevice = a.kvSeqDevice;
     uint8_t *workspaceDevice = a.workspaceDevice;
     uint8_t *tilingDevice = a.tilingDevice;
+    uint8_t *sequsedQDevice = a.sequsedQDevice;
+    uint8_t *sequsedKVDevice = a.sequsedKVDevice;
     (void)flashDecodeFlag;
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
