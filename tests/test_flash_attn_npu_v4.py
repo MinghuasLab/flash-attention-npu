@@ -672,8 +672,20 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
 
     golden_out_gpu_ref, golden_out_gpu_pt, golden_lse_gpu_ref, golden_lse_gpu_pt = reference_pair(
         query_ref, key_ref, value_ref)
-    assert_fa_close(out_out, golden_out_gpu_ref, golden_out_gpu_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse, golden_lse_gpu_ref, golden_lse_gpu_pt, softcap=softcap, name="softmax_lse")
+    # Compare/slice output: unused rows have unspecified values and gradients.
+    output_compare = out_out
+    output_lse_compare = softmax_lse
+    if add_unused_qkv:
+        output_compare = torch.cat([
+            out_out[int(new_q_seqlen_list_cpu[i]):int(new_q_seqlen_list_cpu[i]) + used_q_lengths[i]]
+            for i in range(batch_size)
+        ])
+        output_lse_compare = torch.cat([
+            softmax_lse[:, int(new_q_seqlen_list_cpu[i]):int(new_q_seqlen_list_cpu[i]) + used_q_lengths[i]]
+            for i in range(batch_size)
+        ], dim=1)
+    assert_fa_close(output_compare, golden_out_gpu_ref, golden_out_gpu_pt, softcap=softcap, name="out")
+    assert_fa_close(output_lse_compare, golden_lse_gpu_ref, golden_lse_gpu_pt, softcap=softcap, name="softmax_lse")
     if bwd_supported:
         dout = make_random_tensor(output_compare.shape, out_out.dtype, low=-0.5, high=0.5, device="npu")
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_compare, (query, key_cache, value_cache), dout)

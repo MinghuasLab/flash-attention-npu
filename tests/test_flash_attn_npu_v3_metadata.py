@@ -678,6 +678,7 @@ def test_flash_attn_kvcache_metadata_flash_decode(
     value_cache = _rand_npu(key_cache.shape, data_type, WIDE_RANGE)
     page_table = _int32_npu(list(range(capacity // block_size))).reshape(1, -1)
     cu_seqlens_q = _int32_npu([0, q_seqlen])
+    q_seqlens = _int32_npu([q_seqlen])
     cache_seqlens = _int32_npu([old_length])
     k_new = _rand_npu((1, new_length, 1, head_size), data_type, SMALL_RANGE) if new_length else None
     v_new = _rand_npu((1, new_length, 1, head_size), data_type, WIDE_RANGE) if new_length else None
@@ -692,8 +693,8 @@ def test_flash_attn_kvcache_metadata_flash_decode(
         metadata = _metadata(
             batch_size=1, q_seqlen=q_seqlen, kv_seqlen=capacity,
             num_heads=num_heads, kv_heads=1, head_size=head_size,
-            seqlens_k=cache_seqlens, data_type=data_type,
-            seqlens_q=_int32_npu([q_seqlen]), page_size=block_size,
+            cache_seqlens=cache_seqlens, data_type=data_type,
+            seqlens_q=q_seqlens, page_size=block_size,
             is_causal=is_causal, softcap=softcap, softmax_scale=scale,
             num_splits=num_splits, max_seqlen_k_new=new_length,
         ) if use_metadata else None
@@ -731,12 +732,13 @@ def test_flash_attn_kvcache_metadata_fd_constant_value(data_type, num_splits):
     keys = torch.zeros((sk // page_size, page_size, 1, dim), dtype=data_type, device="npu")
     values = torch.full_like(keys, -80)
     lengths = _int32_npu([sk])
+    q_seqlens = _int32_npu([sq])
     cu = _int32_npu([0, sq])
     table = _int32_npu(list(range(sk // page_size))).reshape(1, -1)
     metadata = _metadata(
         batch_size=1, q_seqlen=sq, kv_seqlen=sk, num_heads=1, kv_heads=1,
         head_size=dim, cache_seqlens=lengths, data_type=data_type,
-        cu_seqlens_q=cu, page_size=page_size, num_splits=num_splits,
+        seqlens_q=q_seqlens, page_size=page_size, num_splits=num_splits,
     )
     output, lse, *_ = flash_attn_with_kvcache(
         query, keys, values, cache_seqlens=lengths, page_table=table,
@@ -1554,6 +1556,7 @@ def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
     q_offsets = [0, q_seqlen, q_seqlen * 2]
     cu_seqlens_q = _int32_npu(q_offsets)
     cache_seqlens = _int32_npu([kv_seqlen] * batch)
+    q_seqlens = _int32_npu([q_seqlen] * batch)
     scale = 1.0 / (head**0.5)
 
     scheduler_metadata = get_scheduler_metadata(
@@ -1562,7 +1565,7 @@ def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
         num_heads_q=heads,
         num_heads_kv=kv_heads,
         headdim=head,
-        seqlens_q=_int32_npu([q_seqlen] * batch),
+        seqlens_q=q_seqlens,
         cache_seqlens=cache_seqlens,
         qkv_dtype=data_type,
         causal=False,

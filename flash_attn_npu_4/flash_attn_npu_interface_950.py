@@ -131,6 +131,8 @@ def _flash_attn_backward_op(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -158,8 +160,8 @@ def _flash_attn_backward_op(
         dv,
         cu_seqlens_q,
         cu_seqlens_k,
-        None,
-        None,
+        seqused_q,
+        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
@@ -256,8 +258,6 @@ def _flash_attn_backward(
     assert block_sparse_tensors is None, (
         "flash_attn_npu_v4 950 bwd does not support block_sparse_tensors"
     )
-    assert seqused_q is None, "flash_attn_npu_v4 950 bwd does not support seqused_q"
-    assert seqused_k is None, "flash_attn_npu_v4 950 bwd does not support seqused_k"
     assert not pack_gqa, "flash_attn_npu_v4 950 bwd does not support pack_gqa=True"
     assert qv is None, "flash_attn_npu_v4 950 bwd does not support qv"
     assert page_table is None, "flash_attn_npu_v4 950 bwd does not support page_table"
@@ -271,6 +271,8 @@ def _flash_attn_backward(
     if dv is None:
         dv = torch.empty_like(v)
 
+    seqused_q_c = _full_contiguous(seqused_q) if seqused_q is not None else None
+    seqused_k_c = _full_contiguous(seqused_k) if seqused_k is not None else None
     _flash_attn_backward_op(
         dout,
         q,
@@ -280,6 +282,8 @@ def _flash_attn_backward(
         lse,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqused_q_c,
+        seqused_k_c,
         max_seqlen_q,
         max_seqlen_k,
         dq,
@@ -525,7 +529,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             True,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k,
+                              _full_contiguous(seqused_q), _full_contiguous(seqused_k))
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -552,7 +557,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         dlse = args[0] if ctx.return_lse and len(args) > 0 else None
         if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
             dlse = None
@@ -576,8 +581,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=win_r,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            seqused_q=None,
-            seqused_k=None,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,

@@ -109,6 +109,11 @@ class FlashAttentionScoreGrad950 {
         softmaxLseGm_.SetGlobalBuffer((__gm__ float*)params.softmaxLse);
         cuSeqQGm_.SetGlobalBuffer((__gm__ int32_t*)params.cuSeqQlen);
         cuSeqKvGm_.SetGlobalBuffer((__gm__ int32_t*)params.cuSeqKvlen);
+        // *Used* lengths (seqused); cu tensors above stay the region layout.
+        seqUsedQGm_.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedQ);
+        seqUsedKvGm_.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedKv);
+        hasSeqUsedQ_ = params.seqUsedQ != nullptr;
+        hasSeqUsedKv_ = params.seqUsedKv != nullptr;
 
         dqWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dqOffset));
         dkWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkOffset));
@@ -335,8 +340,11 @@ class FlashAttentionScoreGrad950 {
             const uint64_t kvEnd = static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx));
             qBatchStart = batchIdx == 0 ? 0 : static_cast<uint64_t>(cuSeqQGm_.GetValue(batchIdx - 1));
             kvBatchStart = batchIdx == 0 ? 0 : static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx - 1));
-            s1Length = static_cast<uint32_t>(qEnd - qBatchStart);
-            s2Length = static_cast<uint32_t>(kvEnd - kvBatchStart);
+            // *Used* lengths from seqused when provided; batch starts stay on cu.
+            s1Length = hasSeqUsedQ_ ? static_cast<uint32_t>(seqUsedQGm_.GetValue(batchIdx))
+                                    : static_cast<uint32_t>(qEnd - qBatchStart);
+            s2Length = hasSeqUsedKv_ ? static_cast<uint32_t>(seqUsedKvGm_.GetValue(batchIdx))
+                                     : static_cast<uint32_t>(kvEnd - kvBatchStart);
         } else {
             s1Length = qSeqlen_;
             s2Length = kvSeqlen_;
@@ -1481,6 +1489,10 @@ class FlashAttentionScoreGrad950 {
     AscendC::GlobalTensor<float> softmaxLseGm_;
     AscendC::GlobalTensor<int32_t> cuSeqQGm_;
     AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
+    AscendC::GlobalTensor<int32_t> seqUsedQGm_;
+    AscendC::GlobalTensor<int32_t> seqUsedKvGm_;
+    bool hasSeqUsedQ_ = false;
+    bool hasSeqUsedKv_ = false;
     __gm__ int32_t* cuSeqQPtr_ = nullptr;
     __gm__ int32_t* cuSeqKvPtr_ = nullptr;
     AscendC::GlobalTensor<float> dqWorkspaceGm_;
@@ -1600,7 +1612,8 @@ class FlashAttentionScoreGrad950 {
 
 template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
-                                           GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k, GM_ADDR dq,
+                                           GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
+                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq,
                                            GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
 {
     using ArchTag = Catlass::Arch::Ascend950;
@@ -1633,7 +1646,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
         FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
                                    INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>;
     FAGKernelParams params{dout,         q,  k,  v,  out,       mask,  softmax_lse, cu_seqlens_q,
-                           cu_seqlens_k, dq, dk, dv, workspace, tiling};
+                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk, dv, workspace, tiling};
     FAGKernel950 fag;
     fag(params);
 }

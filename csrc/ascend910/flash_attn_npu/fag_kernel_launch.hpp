@@ -56,7 +56,8 @@
             <<<a.blockDim, nullptr, a.aclStream>>>(                                                  \
                 a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice,                           \
                 a.outDevice, a.dropMaskDevice, a.attenMaskDevice, a.softMaxLseDevice,                \
-                a.cuSeqQlenDevice, a.cuSeqKvlenDevice, a.dqDevice, a.dkDevice,                       \
+                a.cuSeqQlenDevice, a.cuSeqKvlenDevice,                                               \
+                nullptr, nullptr, a.dqDevice, a.dkDevice,                                            \
                 a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice);                  \
     });
 

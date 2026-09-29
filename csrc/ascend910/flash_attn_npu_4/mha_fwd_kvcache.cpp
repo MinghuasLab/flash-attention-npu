@@ -40,8 +40,6 @@ namespace SplitFuse {
         class CombineScale = void>
     class FAInferKernel {
     public:
-        bool hasSeqUsedQ = false;
-        bool hasSeqUsedKv = false;
         using ArchTag = typename BlockMmadQK::ArchTag;
         using L1TileShape = typename BlockMmadQK::L1TileShape;
         using ElementQ = typename BlockMmadQK::ElementA;
@@ -79,28 +77,6 @@ namespace SplitFuse {
         using LseTypeInit = Gemm::GemmType<ElementLse, LayoutLse>;
         using EpilogueInitOut = Epilogue::Block::BlockEpilogue<InitOutDispatchPolicy, OTypeInit, LseTypeInit>;
 
-        // Per-batch Q length: seqused_q when provided, else cu prefix diff.
-        __aicore__ inline uint32_t QSeqLenOf(uint32_t bIdx,
-                                             AscendC::GlobalTensor<int32_t> &gCuSeq,
-                                             AscendC::GlobalTensor<int32_t> &gSeqUsed) const
-        {
-            if (hasSeqUsedQ) {
-                return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
-            }
-            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
-        }
-
-        // Per-batch KV length: seqused_k when provided, else cu prefix diff.
-        __aicore__ inline uint32_t KvSeqLenOf(uint32_t bIdx,
-                                                  AscendC::GlobalTensor<int32_t> &gCuSeq,
-                                                  AscendC::GlobalTensor<int32_t> &gSeqUsed) const
-        {
-            if (hasSeqUsedKv) {
-                return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
-            }
-            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
-        }
-
         struct GlobalTensorBundle {
             AscendC::GlobalTensor<ElementQ>& gQ;
             AscendC::GlobalTensor<ElementK>& gK;
@@ -109,8 +85,6 @@ namespace SplitFuse {
             AscendC::GlobalTensor<int32_t>& gBlockTable;
             AscendC::GlobalTensor<int32_t>& gActualQseqlen;
             AscendC::GlobalTensor<int32_t>& gActualKvseqlen;
-            AscendC::GlobalTensor<int32_t>& gSeqUsedQ;
-            AscendC::GlobalTensor<int32_t>& gSeqUsedKv;
             AscendC::GlobalTensor<ElementO>& gO;
             AscendC::GlobalTensor<ElementLse>& gLse;
             AscendC::GlobalTensor<ElementLse>& gLseFD;
@@ -119,7 +93,29 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementP>& gP;
             AscendC::GlobalTensor<ElementOTmp>& gOTmp;
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
+            AscendC::GlobalTensor<int32_t>& gSeqUsedQ;
+            AscendC::GlobalTensor<int32_t>& gSeqUsedKv;
         };
+
+        bool hasSeqUsedQ = false;
+        bool hasSeqUsedKv = false;
+
+        // *Used* lengths from seqused; cu uses the forward's leading-zero format.
+        __aicore__ inline uint32_t QSeqLenOf(uint32_t bIdx,
+            AscendC::GlobalTensor<int32_t>& gCuSeq,
+            AscendC::GlobalTensor<int32_t>& gSeqUsed) const
+        {
+            if (hasSeqUsedQ) return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
+            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
+        }
+
+        __aicore__ inline uint32_t KvSeqLenOf(uint32_t bIdx,
+            AscendC::GlobalTensor<int32_t>& gCuSeq,
+            AscendC::GlobalTensor<int32_t>& gSeqUsed) const
+        {
+            if (hasSeqUsedKv) return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
+            return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
+        }
 
         __aicore__ inline
         FAInferKernel() {}
@@ -127,8 +123,6 @@ namespace SplitFuse {
         __aicore__ inline
         void operator()(FAIKernelParams const &params)
         {
-            hasSeqUsedQ = params.seqUsedQ != nullptr;
-            hasSeqUsedKv = params.seqUsedKv != nullptr;
             __gm__ FAInferTilingData *fATilingData = reinterpret_cast<__gm__ FAInferTilingData *>(params.tiling);
             mm1OutSize = fATilingData->mm1OutSize;
             smOnlineOutSize = fATilingData->smOnlineOutSize;
@@ -175,10 +169,12 @@ namespace SplitFuse {
             gActualQseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualQseqlen);
             AscendC::GlobalTensor<int32_t> gActualKvseqlen;
             gActualKvseqlen.SetGlobalBuffer((__gm__ int32_t *)params.actualKvseqlen);
-            AscendC::GlobalTensor<int32_t> gSeqUsedQ;
-            gSeqUsedQ.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedQ);
-            AscendC::GlobalTensor<int32_t> gSeqUsedKv;
-            gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedKv);
+        AscendC::GlobalTensor<int32_t> gSeqUsedQ;
+        gSeqUsedQ.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedQ);
+        AscendC::GlobalTensor<int32_t> gSeqUsedKv;
+        gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t *)params.seqUsedKv);
+        hasSeqUsedQ = params.seqUsedQ != nullptr;
+        hasSeqUsedKv = params.seqUsedKv != nullptr;
             AscendC::GlobalTensor<ElementO> gO;
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<ElementLse> gLse;
@@ -204,9 +200,10 @@ namespace SplitFuse {
 
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gMask, gBlockTable,
-                gActualQseqlen, gActualKvseqlen, gSeqUsedQ, gSeqUsedKv,
+                gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate
+                gS, gP, gOTmp, gOUpdate,
+                gSeqUsedQ, gSeqUsedKv
             };
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -352,41 +349,32 @@ namespace SplitFuse {
                     }
                 }
             } else if (flashDecodeFlag == 0U) {
-                uint32_t curBatchTmp = 0;
+                uint32_t curBatchTmp = 0xFFFFFFFFU;
                 uint32_t preTotalTaskNumTmp = 0;
-                uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
+                uint32_t curTotalTaskNumTmp = 0;
+                uint32_t qSeqlenCur = 0;
+                uint32_t kvSeqlenCur = 0;
+                uint32_t curQNBlockNumCur = 0;
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
-                        uint32_t qSeqlenTmp = fATilingData->maxQSeqlen;
-                        uint32_t kvSeqlenTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
+                        qSeqlenCur = fATilingData->maxQSeqlen;
+                        kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
                         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                            qSeqlenTmp = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
+                            qSeqlenCur = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                             if constexpr (!PAGED_CACHE_FLAG) {
-                                kvSeqlenTmp = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
+                                kvSeqlenCur = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
                             }
                         }
 
-                        uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
+                        uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
                         uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
-                        uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp);
-                        uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenTmp, curQSBlockTileTmp);
-                        curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
+                        curQNBlockNumCur = qNBlockNumPerGroupTmp * kvHeads;
+                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                        uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
+                        curTotalTaskNumTmp += curQNBlockNumCur * curQSBlockNumTmp;
                     }
-
-                    uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
-                    uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
-                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        qSeqlenCur = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
-                        if constexpr (!PAGED_CACHE_FLAG) {
-                            kvSeqlenCur = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
-                        }
-                    }
-                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
-                    uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
-                    uint32_t curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
 
                     uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
                     uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
@@ -496,7 +484,6 @@ namespace SplitFuse {
             auto& gP = globalTensors.gP;
             auto& gOTmp = globalTensors.gOTmp;
             auto& gOUpdate = globalTensors.gOUpdate;
-
             uint32_t prevQSeqlenSum = 0;
             uint32_t prevKvSeqlenSum = 0;
 
@@ -1080,8 +1067,7 @@ namespace SplitFuse {
         GM_ADDR workspace,
         GM_ADDR tiling,
         uint64_t blockTableStride,
-        GM_ADDR seqUsedQ = nullptr,
-        GM_ADDR seqUsedKv = nullptr)
+        GM_ADDR seqUsedQ, GM_ADDR seqUsedKv)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 

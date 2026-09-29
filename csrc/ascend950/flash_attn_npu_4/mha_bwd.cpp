@@ -34,8 +34,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
 
     TORCH_CHECK(is_varlen == cu_seqlens_k_.has_value(),
                 "Ascend950 v4 bwd: cu_seqlens_q and cu_seqlens_k must be provided together");
-    TORCH_CHECK(!seqused_q_.has_value() && !seqused_k_.has_value(),
-                "Ascend950 v4 bwd does not support seqused_q/seqused_k now");
+    // seqused caps used lengths only; offsets and sizing still follow cu.
+    TORCH_CHECK(!seqused_q_.has_value() || is_varlen, "Ascend950 v4 bwd: seqused_q requires cu_seqlens_q");
+    TORCH_CHECK(!seqused_k_.has_value() || is_varlen, "Ascend950 v4 bwd: seqused_k requires cu_seqlens_q");
     TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
                 "Ascend950 v4 bwd does not support sliding-window attention now");
     TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0 && softcap <= std::numeric_limits<float>::max(),
@@ -64,6 +65,24 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     const int64_t v_head_dim = v_sizes.back();
 
     TORCH_CHECK(batch_size > 0, "Ascend950 v4 bwd: batch size must be positive");
+    if (seqused_q_.has_value()) {
+        const at::Tensor& used_q = seqused_q_.value();
+        TORCH_CHECK(used_q.dtype() == at::kInt, "Ascend950 v4 bwd: seqused_q must have dtype int32");
+        TORCH_CHECK(used_q.dim() == 1 && used_q.size(0) == batch_size,
+                    "Ascend950 v4 bwd: seqused_q must be 1D of length B");
+        TORCH_CHECK(used_q.is_contiguous(), "Ascend950 v4 bwd: seqused_q must be contiguous");
+        TORCH_CHECK(used_q.device().type() == at::kPrivateUse1, "Ascend950 v4 bwd: seqused_q must be on NPU");
+    }
+    if (seqused_k_.has_value()) {
+        const at::Tensor& used_k = seqused_k_.value();
+        TORCH_CHECK(used_k.dtype() == at::kInt, "Ascend950 v4 bwd: seqused_k must have dtype int32");
+        TORCH_CHECK(used_k.dim() == 1 && used_k.size(0) == batch_size,
+                    "Ascend950 v4 bwd: seqused_k must be 1D of length B");
+        TORCH_CHECK(used_k.is_contiguous(), "Ascend950 v4 bwd: seqused_k must be contiguous");
+        TORCH_CHECK(used_k.device().type() == at::kPrivateUse1, "Ascend950 v4 bwd: seqused_k must be on NPU");
+    }
+    TORCH_CHECK(!deterministic || (!seqused_q_.has_value() && !seqused_k_.has_value()),
+                "Ascend950 v4 bwd: seqused_q/seqused_k with deterministic is not supported yet");
     TORCH_CHECK(q_seqlen > 0 && kv_seqlen > 0, "Ascend950 v4 bwd: sequence lengths must be positive");
     TORCH_CHECK(num_heads > 0 && num_heads_kv > 0 && num_heads % num_heads_kv == 0,
                 "Ascend950 v4 bwd: KV heads must divide query heads");
@@ -157,6 +176,36 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(q_lengths[batch_size] == static_cast<int64_t>(fag_info.totalQ) &&
                         kv_lengths[batch_size] == static_cast<int64_t>(fag_info.totalKv),
                     "Ascend950 v4 bwd: final cu_seqlens values must match packed tensor lengths");
+        at::Tensor used_q_cpu = seqused_q_.has_value()
+            ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        at::Tensor used_k_cpu = seqused_k_.has_value()
+            ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        const int32_t* used_q = used_q_cpu.defined() ? used_q_cpu.data_ptr<int32_t>() : nullptr;
+        const int32_t* used_kv = used_k_cpu.defined() ? used_k_cpu.data_ptr<int32_t>() : nullptr;
+        for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+            if (used_q != nullptr) {
+                TORCH_CHECK(used_q[batch_idx] >= 0 && used_q[batch_idx] <= actual_seq_q[batch_idx],
+                            "Ascend950 v4 bwd: seqused_q must lie within the allocated sequence length");
+            }
+            if (used_kv != nullptr) {
+                TORCH_CHECK(used_kv[batch_idx] >= 0 && used_kv[batch_idx] <= actual_seq_kv[batch_idx],
+                            "Ascend950 v4 bwd: seqused_k must lie within the allocated sequence length");
+            }
+        }
+        if (used_q != nullptr || used_kv != nullptr) {
+            // Used-based trailing trim; totalQ/totalKv stay region totals.
+            uint64_t tail_zero = 0;
+            for (int64_t i = batch_size - 1; i >= 1; --i) {
+                const bool q_empty = used_q != nullptr ? used_q[i] <= 0 : actual_seq_q[i] <= 0;
+                const bool kv_empty = used_kv != nullptr ? used_kv[i] <= 0 : actual_seq_kv[i] <= 0;
+                if (q_empty && kv_empty) {
+                    ++tail_zero;
+                } else {
+                    break;
+                }
+            }
+            fag_info.batch -= tail_zero;
+        }
         // TND BN2S2: hand the per-batch lengths to the tiler, which
         // serializes the round/area prefix table.  MHA needs the swizzle's
         // intra-round uniqueness condition; GQA uses opst's flat partition.
@@ -238,6 +287,14 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         cu_q = ptr(cu_q_device);
         cu_k = ptr(cu_k_device);
     }
+    uint8_t* seq_used_q = nullptr;
+    uint8_t* seq_used_k = nullptr;
+    if (seqused_q_.has_value()) {
+        seq_used_q = ptr(seqused_q_.value());
+    }
+    if (seqused_k_.has_value()) {
+        seq_used_k = ptr(seqused_k_.value());
+    }
 
     at::Tensor mask_cpu_tensor;
     at::Tensor mask_npu_tensor;
@@ -264,7 +321,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
 #define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
     FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>         \
         <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device))
+                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace), \
+                                            ptr(tiling_device))
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
     do {                                                                                                               \

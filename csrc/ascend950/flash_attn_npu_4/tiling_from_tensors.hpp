@@ -93,6 +93,7 @@ inline void fill_inference_context(
     const at::Tensor& k,
     const at::Tensor& v,
     const at::Tensor* cu_seqlens_q_cpu_int32,   // nullable: !is_varlen_q
+    const at::Tensor* seqused_q_cpu_int32,      // nullable: *used* Q lengths, region cu when absent
     const at::Tensor* seqused_k_cpu_int32,      // nullable: caller must pass per-batch seqlen
     bool paged_KV,
     int  page_block_size,
@@ -118,7 +119,18 @@ inline void fill_inference_context(
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr,
                     "fill_inference_context: varlen Q requires cu_seqlens_q");
-        if (is_tnd) {
+        if (seqused_q_cpu_int32 != nullptr) {
+            // Tiling follows the *used* lengths; offsets stay on the cu region.
+            auto q_per_batch = widen_int32_to_int64(*seqused_q_cpu_int32, batch_size);
+            if (is_tnd) {
+                scratch.q.assign(batch_size + 1, 0);
+                for (int i = 0; i < batch_size; ++i) {
+                    scratch.q[i + 1] = scratch.q[i] + q_per_batch[i];
+                }
+            } else {
+                scratch.q = std::move(q_per_batch);
+            }
+        } else if (is_tnd) {
             scratch.q = widen_cu_seqlens_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
         } else {
             scratch.q = decumulate_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
