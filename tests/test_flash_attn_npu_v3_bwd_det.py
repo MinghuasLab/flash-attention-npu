@@ -34,6 +34,7 @@ sq > sk 时前 sq-sk 行没有任何可见 key，参考前向/标杆自身 NaN�
 """
 
 import pytest
+import time
 import torch
 import torch_npu
 
@@ -43,7 +44,9 @@ if "Ascend950" not in (torch_npu.npu.get_device_name() if torch_npu.npu.device_c
     pytest.skip("flash_attn_npu_3 950 backward tests require Ascend950", allow_module_level=True)
 
 from flash_attn_npu_3.flash_attn_npu_interface_950 import _flash_attn_backward
+from tests import fa_small_op_golden
 from tests.fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
+from tests.common.golden_cache import get_or_compute_golden
 
 INPUT_LIMIT = 2.0
 DTYPE = torch.bfloat16
@@ -54,6 +57,33 @@ DROPOUT_P = 0.0
 SOFTCAP = 0.0
 GTYPE = torch.float64
 REPEAT = 20  # det 模式逐位一致的重复次数
+
+from tests.common import timing as _timing
+
+# 归因计时, kernel 调用记入 backward, 逐位与容差校验记入 compare
+_raw_flash_attn_backward = _flash_attn_backward
+
+
+def _flash_attn_backward(*args, **kwargs):
+    started = time.perf_counter()
+    out = _raw_flash_attn_backward(*args, **kwargs)
+    _timing.record("backward", time.perf_counter() - started)
+    return out
+
+
+def _timed_equal(a, b):
+    started = time.perf_counter()
+    out = torch.equal(a, b)
+    _timing.record("compare", time.perf_counter() - started)
+    return out
+
+
+def _gold_close(got, gold, *, msg):
+    started = time.perf_counter()
+    try:
+        torch.testing.assert_close(got.cpu(), gold.cpu(), rtol=RTOL_GOLDEN, atol=ATOL_GOLDEN, msg=msg)
+    finally:
+        _timing.record("compare", time.perf_counter() - started)
 
 # (name, bsz, seqlen_q, seqlen_k, nheads_q, nheads_kv, headdim, causal, large)
 BSND_CASES = [
@@ -162,6 +192,24 @@ def _is_ascend950():
 def rand_inputs(shape, seed):
     g = torch.Generator().manual_seed(seed)
     return (INPUT_LIMIT * (torch.rand(shape, generator=g) - 0.5)).to(DTYPE).to(DEVICE)
+
+
+def _cached_case_golden(nodeid, params, q, k, v, dout, compute):
+    """按 case 缓存 CPU 参考前向 out/lse 与 golden 梯度, 命中时跳过全部 CPU 计算。"""
+    def compute_fn():
+        out, lse, dq, dk, dv = compute()
+        keys = ("out", "lse", "dq", "dk", "dv")
+        return {name: t.detach().to("cpu") for name, t in zip(keys, (out, lse, dq, dk, dv))}
+
+    return get_or_compute_golden(
+        nodeid=nodeid,
+        metadata=params,
+        inputs={"q": q, "k": k, "v": v, "dout": dout},
+        compute_fn=compute_fn,
+        expected_keys=("out", "lse", "dq", "dk", "dv"),
+        source_files=(fa_small_op_golden.__file__,),
+        test_source_files=(__file__,),
+    )
 
 
 def torch_ref_fwd_bsnd(q, k, v, scale, causal):
@@ -281,18 +329,12 @@ def _check_case(name, run_bwd, golden_fn):
 
     for tag, grad in grads.items():
         for gname, got, gold in zip(("dq", "dk", "dv"), grad, golden):
-            torch.testing.assert_close(
-                got.cpu(),
-                gold.cpu(),
-                rtol=RTOL_GOLDEN,
-                atol=ATOL_GOLDEN,
-                msg=f"{name} [{tag}] {gname} vs golden",
-            )
+            _gold_close(got, gold, msg=f"{name} [{tag}] {gname} vs golden")
 
     for it in range(REPEAT):
         cur = run_bwd(True)
         for gname, a, b in zip(("dq", "dk", "dv"), cur, grads["det"]):
-            assert torch.equal(a, b), (
+            assert _timed_equal(a, b), (
                 f"{name} [det] iter {it + 1}/{REPEAT}: {gname} 不一致, "
                 f"max|diff|={max_diff(a, b):.6e}"
             )
@@ -302,13 +344,7 @@ def _check_case(name, run_bwd, golden_fn):
     print(f"[INFO] {name} [nd] 两次运行 max|diff|={d:.6e}")
 
     for gname, a, b in zip(("dq", "dk", "dv"), grads["det"], grads["nd"]):
-        torch.testing.assert_close(
-            a.cpu(),
-            b.cpu(),
-            rtol=RTOL_GOLDEN,
-            atol=ATOL_GOLDEN,
-            msg=f"{name}: det vs nondet {gname}",
-        )
+        _gold_close(a, b, msg=f"{name}: det vs nondet {gname}")
 
     print(f"[PASS] {name}: golden 一致 + {REPEAT} 次 det 逐位一致 + det/nondet 互相一致")
 
@@ -319,23 +355,34 @@ def _check_case(name, run_bwd, golden_fn):
     ids=[c[0] for c in BSND_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large):
+def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large, request):
     scale = hd ** (-0.5)
     q = rand_inputs((bsz, sq, hq, hd), 42)
     k = rand_inputs((bsz, sk, hkv, hd), 43)
     v = rand_inputs((bsz, sk, hkv, hd), 44)
     dout = rand_inputs((bsz, sq, hq, hd), 45)
-    out, lse = torch_ref_fwd_bsnd(q, k, v, scale, causal)
+
+    def compute():
+        out, lse = torch_ref_fwd_bsnd(q, k, v, scale, causal)
+        dq, dk, dv = golden_bsnd_bwd_from_fwd(
+            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P, causal, -1, -1, gtype=GTYPE
+        )
+        return out, lse, dq, dk, dv
+
+    values = _cached_case_golden(
+        request.node.nodeid,
+        {"layout": "bsnd", "bsz": bsz, "sq": sq, "sk": sk, "hq": hq, "hkv": hkv,
+         "hd": hd, "causal": causal, "seeds": [42, 43, 44, 45]},
+        q, k, v, dout, compute,
+    )
+    out = values["out"].to(DEVICE)
+    lse = values["lse"].to(DEVICE)
+    golden = (values["dq"], values["dk"], values["dv"])
 
     def run_bwd(det):
         return run_bwd_bsnd(q, k, v, dout, out, lse, scale, causal, det)
 
-    def golden_fn():
-        return golden_bsnd_bwd_from_fwd(
-            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P, causal, -1, -1, gtype=GTYPE
-        )
-
-    _check_case(name, run_bwd, golden_fn)
+    _check_case(name, run_bwd, lambda: golden)
 
 
 @pytest.mark.parametrize(
@@ -344,7 +391,7 @@ def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large):
     ids=[c[0] for c in VARLEN_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large):
+def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large, request):
     scale = hd ** (-0.5)
     total_q, total_k = cu_q[-1], cu_k[-1]
     q = rand_inputs((total_q, hq, hd), 42)
@@ -355,17 +402,12 @@ def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large):
     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=DEVICE)
     max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1))
     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1))
-    out, lse = torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal)
 
-    def run_bwd(det):
-        return run_bwd_varlen(
-            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det
-        )
-
-    def golden_fn():
+    def compute():
+        out, lse = torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal)
         seqlens_q = [cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)]
         seqlens_k = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
-        return golden_tnd_bwd_from_fwd(
+        dq, dk, dv = golden_tnd_bwd_from_fwd(
             q,
             k,
             v,
@@ -384,5 +426,21 @@ def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large):
             -1,
             gtype=GTYPE,
         )
+        return out, lse, dq, dk, dv
 
-    _check_case(name, run_bwd, golden_fn)
+    values = _cached_case_golden(
+        request.node.nodeid,
+        {"layout": "tnd", "cu_q": list(cu_q), "cu_k": list(cu_k), "hq": hq,
+         "hkv": hkv, "hd": hd, "causal": causal, "seeds": [42, 43, 44, 45]},
+        q, k, v, dout, compute,
+    )
+    out = values["out"].to(DEVICE)
+    lse = values["lse"].to(DEVICE)
+    golden = (values["dq"], values["dk"], values["dv"])
+
+    def run_bwd(det):
+        return run_bwd_varlen(
+            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det
+        )
+
+    _check_case(name, run_bwd, lambda: golden)

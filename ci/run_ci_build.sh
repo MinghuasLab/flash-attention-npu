@@ -33,7 +33,19 @@ export FLASH_ATTN_SKIP_SUBMODULE_INIT=1
 export FLASH_ATTN_FORCE_BUILD=TRUE
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 log "python setup.py build_ext --inplace (FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:-all})"
-python3 setup.py build_ext --inplace
+# 折叠编译输出, 成功时只留一行状态, 失败时把尾部展开打印
+build_log="/tmp/ci_build.log"
+echo "::group::build_ext output (live, expand to watch)"
+set +e
+python3 setup.py build_ext --inplace 2>&1 | tee "$build_log"
+build_rc="${PIPESTATUS[0]}"
+echo "::endgroup::"
+set -e
+if [ "$build_rc" -ne 0 ]; then
+  tail -n 40 "$build_log" || true
+  die "build_ext failed rc=$build_rc"
+fi
+log "build_ext ok"
 
 log "build phase done (artifacts in build/)"
 log "build phase end: $(date '+%Y-%m-%d %H:%M:%S')"
