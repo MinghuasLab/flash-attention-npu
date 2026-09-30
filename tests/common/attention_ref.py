@@ -342,12 +342,12 @@ def cached_ref_flash_attention_pair(
     return tuple(values[name] for name in ("out_ref", "lse_ref", "out_pt", "lse_pt"))
 
 
-def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=None):
+def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=None,
+                          rebuild=None):
     """Cache an existing pair of reference autograd results.
 
-    ``outputs`` and ``refs`` are the exact tensors already built by the test,
-    so this helper also works for packed/varlen views whose gradient shape is
-    different from the padded reference input.
+    ``rebuild(query, key, value, differentiable=True)`` is called only when a
+    graph is needed but ``outputs`` came detached from the value cache.
     """
     query, key, value = refs
     case_metadata = {
@@ -368,11 +368,22 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
     }
 
     def compute():
+        if outputs[0].grad_fn is not None:
+            graph_outputs, graph_refs = outputs, refs
+        elif rebuild is None:
+            raise RuntimeError(
+                "cached_autograd_grads: the reference outputs carry no autograd "
+                "graph (they came from the value cache) -- pass rebuild=... to "
+                "recompute them for this case"
+            )
+        else:
+            graph_refs = tuple(tensor.detach().requires_grad_(True) for tensor in refs)
+            graph_outputs = rebuild(*graph_refs, differentiable=True)
         dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-            outputs[0], refs, dout.detach().cpu(), retain_graph=True
+            graph_outputs[0], graph_refs, dout.detach().cpu(), retain_graph=True
         )
         dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-            outputs[1], refs, dout.detach().cpu()
+            graph_outputs[1], graph_refs, dout.detach().cpu()
         )
         return {
             "dq_ref": dq_ref, "dk_ref": dk_ref, "dv_ref": dv_ref,
@@ -423,14 +434,15 @@ def ref_flash_attention_pair(
     alibi_slopes=None,
     q_seqlens=None,
     kv_seqlens=None,
+    differentiable=False,
 ):
-    # Backward tests need the live CPU graph to remain available when their
-    # separate gradient artifact is missing or being refreshed.  Forward-only
-    # cases use the persistent cache below.
-    if any(
-        isinstance(tensor, torch.Tensor) and tensor.requires_grad
-        for tensor in (query, key, value)
-    ):
+    """Return the two BSND golden references used by the comparator.
+
+    ``requires_grad`` inputs are not special-cased, so the cache serves them
+    too: a miss returns live tensors that a cold run also feeds to the gradient
+    artifact.  ``differentiable=True`` always recomputes and keeps the graph.
+    """
+    if differentiable:
         return _ref_flash_attention_pair(
             query, key, value, scale, mask, data_type, softcap,
             rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,

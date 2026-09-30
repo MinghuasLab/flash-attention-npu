@@ -472,27 +472,6 @@ public:
                 }
             }
 
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-
-            // ***move O to GM: FD SplitKV writes partial fp32 O into gCombineo;
-            // otherwise writes fp16 O directly to gOutput.
-            if (splitParams.isSplitkv) {
-                CopyOToGmFp32(
-                    splitParams.gCombineo,
-                    proTokenIdx,
-                    proTokenNum,
-                    epiTokenNum,
-                    integralHeadNum,
-                    qSThisSubBlock,
-                    embed,
-                    embedRound,
-                    oHiddenSize, oHiddenSize_gmlo);
-            } else {
-                CopyOToGm(
-                    gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum,
-                    qSThisSubBlock, embed, embedRound, oHiddenSize);
-            }
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
@@ -629,6 +608,28 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }
+            }
+
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+            // ***move O to GM: FD SplitKV writes partial fp32 O into gCombineo;
+            // otherwise writes fp16 O directly to gOutput.
+            if (splitParams.isSplitkv) {
+                CopyOToGmFp32(
+                    splitParams.gCombineo,
+                    proTokenIdx,
+                    proTokenNum,
+                    epiTokenNum,
+                    integralHeadNum,
+                    qSThisSubBlock,
+                    embed,
+                    embedRound,
+                    oHiddenSize, oHiddenSize_gmlo);
+            } else {
+                CopyOToGm(
+                    gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum,
+                    qSThisSubBlock, embed, embedRound, oHiddenSize);
             }
         } else if (needRowLoop) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);

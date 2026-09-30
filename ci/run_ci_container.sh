@@ -144,7 +144,7 @@ run_build_phase() {
 # NPU 候选 id 列表
 get_candidates() {
   bash "$SCRIPT_DIR/detect_npu.sh" --candidates 2>/dev/null \
-    | sed -n 's/^  - id=\([0-9]\+\) .*/\1/p'
+    | sed -n 's/^  - id=\([0-9]\+\) .*/\1/p' || true
 }
 
 run_docker_test() {
@@ -218,11 +218,10 @@ acquire_lock_and_run_test() {
   # 动态选卡模式 (不持 flock 长期锁, 允许多 runner 共享卡, 靠 task_count 阈值软限流)。
   # 返回码: 0=测试成功; 1=无可用卡 (全部超阈值, 不计重试, 等待后重探); 2=测试失败 (直接报错)
   local selected line
-  # 用 --env 模式取卡号 (输出 "export NPU_SELECTED_DEVICE=<id>"), 避免解析给人看的 --candidates 文本
   line="$(bash "$SCRIPT_DIR/detect_npu.sh" --env 2>/dev/null || true)"
   selected="${line#export NPU_SELECTED_DEVICE=}"
   if [ -z "$selected" ]; then
-    return 1   # 无可用卡 (所有卡 task_count >= MAX_TASKS 或 free 不足)
+    return 1
   fi
   log "selected NPU device=$selected (re-probed, no lock held)"
   if run_docker_test "$selected"; then
@@ -233,25 +232,32 @@ acquire_lock_and_run_test() {
 
 # ---------- 主流程 ----------
 main() {
-  local total_start
+  local total_start build_start build_seconds=0 build_skipped=false
+  local test_start test_seconds=0 wait_start wait_seconds=0
   total_start="$(date +%s)"
   log "CI start: $(date '+%Y-%m-%d %H:%M:%S') runner=${RUNNER_NAME:-<unset>} runner_host=$(hostname)"
 
   # 阶段1: 编译
   if [ "$CI_SKIP_BUILD" = "true" ]; then
+    build_skipped=true
     log "CI_SKIP_BUILD=true, skip phase 1 (assume build/ exists)"
   else
+    build_start="$(date +%s)"
     run_build_phase
-    log "=== Phase 1 done ==="
+    build_seconds=$(( $(date +%s) - build_start ))
+    log "=== Phase 1 done (build=${build_seconds}s) ==="
   fi
 
   # 阶段2: 动态选卡 + 测试 (无卡时等待重试, 测试失败直接报错)
   log "=== Phase 2: test (dynamic device selection) ==="
+  test_start="$(date +%s)"
 
   # 首次探测, 确认机器上有 NPU
   cands="$(get_candidates)"
   if [ -z "$cands" ]; then
-    die "no candidate NPU detected; run 'bash ci/detect_npu.sh --summary' to check"
+    log "no NPU passed the selection filter, diagnostic output:"
+    bash "$SCRIPT_DIR/detect_npu.sh" --summary 2>&1 || true
+    die "no candidate NPU with health=OK free>${CI_NPU_MIN_FREE_MB:-1024}MB tasks<${CI_NPU_MAX_TASKS:-4}"
   fi
 
   local wait_max="${CI_NPU_WAIT_MAX_SEC:-600}"
@@ -273,7 +279,9 @@ main() {
           die "no available NPU (all cards have >= ${CI_NPU_MAX_TASKS:-4} tasks or insufficient free) after waiting; aborting CI"
         fi
         log "all NPU busy (tasks >= ${CI_NPU_MAX_TASKS:-4} or free <= ${CI_NPU_MIN_FREE_MB:-1024}MB), waiting ${wait_interval}s (remaining wait budget: ${wait_max}s)..."
+        wait_start="$(date +%s)"
         sleep "$wait_interval"
+        wait_seconds=$(( wait_seconds + $(date +%s) - wait_start ))
         wait_max=$((wait_max - wait_interval))
         ;;
       2)
@@ -284,7 +292,13 @@ main() {
   done
 
   total_end="$(date +%s)"
-  log "CI end: $(date '+%Y-%m-%d %H:%M:%S') (total=$((total_end - total_start))s)"
+  test_seconds=$(( total_end - test_start - wait_seconds ))
+  log "CI end: $(date '+%Y-%m-%d %H:%M:%S')"
+  if [ "$build_skipped" = "true" ]; then
+    log "CI timing: build=skipped test=${test_seconds}s npu_wait=${wait_seconds}s total=$((total_end - total_start))s"
+  else
+    log "CI timing: build=${build_seconds}s test=${test_seconds}s npu_wait=${wait_seconds}s total=$((total_end - total_start))s"
+  fi
 }
 
 main "$@"

@@ -16,16 +16,33 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import torch
+from tests.common.timing import add
 
 
 _FORMAT_VERSION = 1
 _DEFAULT_CACHE_DIR = "/var/cache/flash-attention-npu/golden_cache"
 _RETRY_HANDLERS: dict[int, Callable[[], bool]] = {}
+
+# While a golden compute is in flight the interval is already reported as
+# "golden", so the reference wrapper stays quiet and "ref" means work done
+# outside the cache -- the two parts stay disjoint for the CI reporter.
+_GOLDEN_COMPUTE_DEPTH = 0
+
+
+@contextlib.contextmanager
+def _golden_compute():
+    global _GOLDEN_COMPUTE_DEPTH
+    _GOLDEN_COMPUTE_DEPTH += 1
+    try:
+        yield
+    finally:
+        _GOLDEN_COMPUTE_DEPTH -= 1
 
 
 def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]) -> None:
@@ -39,7 +56,9 @@ def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], 
         used = True
         refreshed = refresh_fn()
         for name, value in values.items():
-            value.copy_(refreshed[name].to(device=value.device, dtype=value.dtype))
+            # detach(): a grad-carrying refresh would graft the reference graph
+            # onto the cached tensor and keep it alive.
+            value.copy_(refreshed[name].detach().to(device=value.device, dtype=value.dtype))
         for value in values.values():
             _RETRY_HANDLERS.pop(id(value), None)
         return True
@@ -283,9 +302,14 @@ def get_or_compute_golden(
     ``GOLDEN_CACHE_REFRESH=1`` is set.  Returned tensors are detached CPU
     tensors on a cache hit and retain the caller's tensors on a miss.
     """
+    timing_state = getattr(get_or_compute_golden, "_ci_timing_state", None)
+    started = time.perf_counter()
     if not _cache_enabled():
         _record_cache_event("disabled", nodeid)
-        result = dict(compute_fn())
+        with _golden_compute():
+            result = dict(compute_fn())
+        if timing_state is not None:
+            add(timing_state, "golden", time.perf_counter() - started, "golden=disabled")
         return (result, "disabled") if return_status else result
 
     value_names = sorted(set(expected_keys))
@@ -328,16 +352,21 @@ def get_or_compute_golden(
             result = _load_artifact(artifact, case_metadata)
             _record_cache_event("hit", nodeid)
             print(f"[golden-cache] hit {nodeid}")
+            if timing_state is not None:
+                add(timing_state, "golden", time.perf_counter() - started, "golden=hit")
             return (result, "hit") if return_status else result
         except Exception as exc:  # cache is an optimization, never a test failure
             _record_cache_event("read_error", nodeid)
+            if timing_state is not None:
+                timing_state["events"].append("golden=read_error")
             warnings.warn(
                 f"golden cache read failed for {nodeid}: {exc}; recomputing",
                 RuntimeWarning,
             )
 
     _record_cache_event("refresh" if refresh else "miss", nodeid)
-    values = dict(compute_fn())
+    with _golden_compute():
+        values = dict(compute_fn())
     if set(values) != set(value_names):
         raise ValueError(
             f"computed golden tensors {sorted(values)} do not match "
@@ -356,7 +385,19 @@ def get_or_compute_golden(
             RuntimeWarning,
         )
     status = "refresh" if refresh else "miss"
+    if timing_state is not None:
+        recovered = "read_error->" if "golden=read_error" in timing_state["events"] else ""
+        add(timing_state, "golden", time.perf_counter() - started,
+            "golden=" + recovered + status)
     return (values, status) if return_status else values
 
 
-__all__ = ["get_or_compute_golden", "input_digest", "register_retry", "retry_cached_value"]
+def golden_compute_in_progress() -> bool:
+    """True while ``get_or_compute_golden`` is running its ``compute_fn``."""
+    return _GOLDEN_COMPUTE_DEPTH > 0
+
+
+__all__ = [
+    "get_or_compute_golden", "golden_compute_in_progress", "input_digest",
+    "register_retry", "retry_cached_value",
+]

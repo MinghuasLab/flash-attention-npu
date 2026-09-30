@@ -301,6 +301,11 @@ public:
                     AscendC::DataCopyExtParams(
                         1, static_cast<uint32_t>(rowNumCurSubCore * sizeof(float)),
                         0, 0, 0));
+                // LM is also the next base task's online-softmax max buffer.
+                // Protect this DMA read before returning to that softmax;
+                // waiting only at the next SubCoreCompute is too late.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             } else if (!skipOutput) {
                 copyUbToGmO(gOTensorTlaTile, ubOTensorTla);
             }

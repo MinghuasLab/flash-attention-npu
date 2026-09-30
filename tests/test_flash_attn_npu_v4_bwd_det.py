@@ -37,6 +37,11 @@ import pytest
 import torch
 import torch_npu
 
+# 950 后端扩展在分机编译 (FLASH_ATTN_BUILD_NPU=910) 的 910 机器上不存在,
+# 模块级 import 会在 collection 阶段报错, 故 import 前整文件跳过 (同 v2 模式)。
+if "Ascend950" not in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
+    pytest.skip("flash_attn_npu_4 950 backward tests require Ascend950", allow_module_level=True)
+
 from flash_attn_npu_4.flash_attn_npu_interface_950 import _flash_attn_backward
 from tests.fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
 

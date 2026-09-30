@@ -46,10 +46,11 @@ from tests.common.test_utils import (
 
 # Additional coverage: tiny head sizes 1/2/4, large-GQA decode, and special SWA windows
 
+# kv 131072 is kept only in a few rows per mode, other rows demoted to 16383 for CI time
 test_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 2, 6, 6, 16, 131072, 64, 0, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 16, 16383, 64, 0, 128, False, 512, 0, 2.0, False, False),
     (torch.float16, 2, 6, 3, 1, 128, 128, 0, 128, False, -1, -1, 0.0, False, False),
     (torch.float16, 2, 6, 6, 3, 799, 64, 0, 128, False, -1, -1, 0.0, False, False),
     (torch.float16, 2, 6, 3, 64, 256, 128, 0, 128, False, 512, 0, 2.0, False, False),
@@ -62,7 +63,7 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 3, 799, 64, 0, 128, False, 542, 647, 2.0, False, False),
     (torch.bfloat16, 2, 6, 6, 16, 20000, 64, 0, 128, False, 0, 256, 0.0, False, False),
     (torch.bfloat16, 2, 6, 1, 3, 1024, 32, 0, 128, False, 542, 647, 0.0, False, False),
-    (torch.bfloat16, 2, 6, 1, 16, 131072, 32, 0, 128, False, 0, 256, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 16, 16383, 32, 0, 128, False, 0, 256, 2.0, False, False),
     # data_type=torch.float16, is_causal=True, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
     (torch.float16, 2, 6, 3, 64, 800, 64, 0, 128, True, 512, 0, 2.0, False, False),
@@ -77,12 +78,12 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 64, 800, 32, 0, 128, True, 0, 256, 2.0, False, False),
     (torch.bfloat16, 2, 6, 1, 1, 339, 64, 0, 128, True, 542, 647, 2.0, False, False),
     (torch.bfloat16, 2, 6, 6, 64, 2048, 32, 0, 128, True, 542, 647, 0.0, False, False),
-    (torch.bfloat16, 2, 6, 3, 1, 131072, 128, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 1, 16383, 128, 0, 128, True, 542, 647, 0.0, False, False),
     (torch.bfloat16, 2, 6, 3, 64, 2048, 128, 0, 128, True, 0, 256, 2.0, False, False),
     # data_type=torch.float16, is_causal=False, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
     (torch.float16, 2, 6, 1, 3, 799, 59, 1, 128, False, 512, 0, 0.0, False, False),
-    (torch.float16, 2, 6, 6, 16, 131072, 80, 1, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 16, 16383, 80, 1, 128, False, 512, 0, 2.0, False, False),
     (torch.float16, 2, 6, 1, 16, 20000, 59, 1, 128, False, -1, -1, 2.0, False, False),
     (torch.float16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 512, 0, 2.0, False, False),
     (torch.float16, 2, 6, 6, 1, 128, 80, 1, 128, False, -1, -1, 0.0, False, False),
@@ -94,11 +95,11 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 3, 799, 59, 1, 128, False, 0, 256, 0.0, False, False),
     (torch.bfloat16, 2, 6, 1, 16, 20000, 80, 1, 128, False, 542, 647, 0.0, False, False),
     (torch.bfloat16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 542, 647, 2.0, False, False),
-    (torch.bfloat16, 2, 6, 6, 16, 131072, 59, 1, 128, False, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 16, 16383, 59, 1, 128, False, 542, 647, 2.0, False, False),
     # data_type=torch.float16, is_causal=True, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
     (torch.float16, 2, 6, 1, 128, 128, 80, 1, 128, True, 512, 0, 2.0, False, False),
-    (torch.float16, 2, 6, 6, 1, 131072, 59, 1, 128, True, 512, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 1, 16383, 59, 1, 128, True, 512, 0, 0.0, False, False),
     (torch.float16, 2, 6, 3, 1, 131072, 256, 1, 128, True, -1, -1, 2.0, False, False),
     (torch.float16, 2, 6, 6, 64, 2048, 59, 1, 128, True, -1, -1, 2.0, False, False),
     (torch.float16, 2, 6, 3, 64, 800, 256, 1, 128, True, 512, 0, 0.0, False, False),
@@ -684,8 +685,6 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
     query_ref = query.detach().cpu().requires_grad_(True)
     key_ref = key_cache.detach().cpu().requires_grad_(True)
     value_ref = value_cache.detach().cpu().requires_grad_(True)
-    golden_lseL_ref = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
-    golden_lseL_pt = torch.empty_like(golden_lseL_ref)
     atten_mask, _, _ = make_golden_attention_mask(
         q_seqlen,
         kv_seqlen,
@@ -693,16 +692,28 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
         window_size_left,
         window_size_right,
     )
-    golden_out_ref, golden_lseL_ref, golden_out_pt, golden_lseL_pt = ref_flash_attention_pair(
-        query_ref, key_ref, value_ref, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
-    )
-    if atten_mask is not None:
-        fully_masked = atten_mask.all(dim=-1)
-        golden_out_ref[:, fully_masked] = 0
-        golden_out_pt[:, fully_masked] = 0
-        golden_lseL_ref[:, :, fully_masked] = torch.inf
-        golden_lseL_pt[:, :, fully_masked] = torch.inf
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Reference values for this case, ``out_ref``/``out_pt`` first.
+
+        Shared by the forward check and the ``rebuild=`` fallback of
+        ``cached_autograd_grads``, so the post-processing stays in the graph.
+        """
+        golden_out_ref, golden_lseL_ref, golden_out_pt, golden_lseL_pt = ref_flash_attention_pair(
+            query_ref, key_ref, value_ref, scale, atten_mask, data_type, softcap,
+            drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
+            differentiable=differentiable,
+        )
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            golden_out_ref[:, fully_masked] = 0
+            golden_out_pt[:, fully_masked] = 0
+            golden_lseL_ref[:, :, fully_masked] = torch.inf
+            golden_lseL_pt[:, :, fully_masked] = torch.inf
+        return golden_out_ref, golden_out_pt, golden_lseL_ref, golden_lseL_pt
+
+    golden_out_ref, golden_out_pt, golden_lseL_ref, golden_lseL_pt = reference_pair(
+        query_ref, key_ref, value_ref)
 
     assert_fa_close(out_out, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
     if return_attn_probs:
@@ -723,6 +734,7 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
             "dout": dout,
             "drop_mask": drop_mask,
         },
+        rebuild=reference_pair,
     )
     assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
     assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
@@ -919,18 +931,16 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         block_table=block_table,
     )
     drop_mask = (S_dmask > 0).to(torch.float32).cpu() if dropout_p > 0.0 else None
-    query_ref = query.detach().cpu().requires_grad_(True)
-    key_ref = key.detach().cpu().requires_grad_(True)
-    value_ref = value.detach().cpu().requires_grad_(True)
+    query_ref = query.detach().cpu()
+    key_ref = key.detach().cpu()
+    value_ref = value.detach().cpu()
+    if cache_mode == 0:
+        # Only the backward block below differentiates these leaves; grad-free
+        # inputs let the reference come from the persistent cache instead.
+        query_ref.requires_grad_(True)
+        key_ref.requires_grad_(True)
+        value_ref.requires_grad_(True)
     block_tables_cpu = block_table.cpu() if cache_mode == 1 else None
-    query_padded = pad_packed_tensor(query_ref, seqlens_q, max_seqlen_q)
-    if cache_mode == 1:
-        key_padded, value_padded = gather_paged_kv_batch(
-            key_ref, value_ref, block_tables_cpu, kv_seqlen, block_size
-        )
-    else:
-        key_padded = pad_packed_tensor(key_ref, seqlens_k, max_seqlen_k)
-        value_padded = pad_packed_tensor(value_ref, seqlens_k, max_seqlen_k)
     # For paged KV (cache_mode=1), align the mask's KV dimension with
     # key_padded (the full kv_seqlen) to avoid a shape mismatch. Per-sequence
     # valid lengths still come from varlen seqlens_k because the kernel uses
@@ -940,26 +950,44 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         seqlens_q, seqlens_k, max_seqlen_q, mask_max_kv,
         is_causal, window_size_left, window_size_right,
     )
-    if drop_mask is not None and drop_mask.shape[-1] != key_padded.shape[1]:
+    if drop_mask is not None and drop_mask.shape[-1] != mask_max_kv:
         padded_drop_mask = torch.zeros(
-            (*drop_mask.shape[:-1], key_padded.shape[1]), dtype=drop_mask.dtype
+            (*drop_mask.shape[:-1], mask_max_kv), dtype=drop_mask.dtype
         )
         padded_drop_mask[..., :drop_mask.shape[-1]] = drop_mask
         drop_mask = padded_drop_mask
-    golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
-        query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
-        q_seqlens=seqlens_q, kv_seqlens=seqlens_k,
-    )
-    fully_masked = atten_mask.all(dim=-1)
-    golden_out_ref[fully_masked] = 0
-    golden_out_pt[fully_masked] = 0
-    golden_lse_ref = golden_lse_ref.masked_fill(fully_masked[:, None, :], torch.inf)
-    golden_lse_pt = golden_lse_pt.masked_fill(fully_masked[:, None, :], torch.inf)
-    golden_out_ref = golden_out_ref[q_valid]
-    golden_out_pt = golden_out_pt[q_valid]
-    golden_lseL_ref = golden_lse_ref.permute(0, 2, 1)[q_valid].transpose(0, 1)
-    golden_lseL_pt = golden_lse_pt.permute(0, 2, 1)[q_valid].transpose(0, 1)
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Reference values for this case, ``out_ref``/``out_pt`` first.
+
+        Shared by the forward check and the ``rebuild=`` fallback of
+        ``cached_autograd_grads``, so the post-processing stays in the graph.
+        """
+        query_padded = pad_packed_tensor(query_ref, seqlens_q, max_seqlen_q)
+        if cache_mode == 1:
+            key_padded, value_padded = gather_paged_kv_batch(
+                key_ref, value_ref, block_tables_cpu, kv_seqlen, block_size
+            )
+        else:
+            key_padded = pad_packed_tensor(key_ref, seqlens_k, max_seqlen_k)
+            value_padded = pad_packed_tensor(value_ref, seqlens_k, max_seqlen_k)
+        golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
+            query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap,
+            drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
+            q_seqlens=seqlens_q, kv_seqlens=seqlens_k,
+            differentiable=differentiable,
+        )
+        fully_masked = atten_mask.all(dim=-1)
+        golden_out_ref[fully_masked] = 0
+        golden_out_pt[fully_masked] = 0
+        golden_lse_ref = golden_lse_ref.masked_fill(fully_masked[:, None, :], torch.inf)
+        golden_lse_pt = golden_lse_pt.masked_fill(fully_masked[:, None, :], torch.inf)
+        return (golden_out_ref[q_valid], golden_out_pt[q_valid],
+                golden_lse_ref.permute(0, 2, 1)[q_valid].transpose(0, 1),
+                golden_lse_pt.permute(0, 2, 1)[q_valid].transpose(0, 1))
+
+    golden_out_ref, golden_out_pt, golden_lseL_ref, golden_lseL_pt = reference_pair(
+        query_ref, key_ref, value_ref)
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
     assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
     # The current varlen backward kernel does not support paged KV cases.
@@ -981,6 +1009,7 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
                 "dout": dout,
                 "drop_mask": drop_mask,
             },
+            rebuild=reference_pair,
         )
         assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
