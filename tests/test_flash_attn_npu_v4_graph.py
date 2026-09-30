@@ -61,20 +61,38 @@ def test_flash_attn_varlen_graph(is_causal):
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()
 
-    scheduler_metadata = get_scheduler_metadata(
-        batch_size=BATCH_SIZE,
-        max_seqlen_q=Q_SEQLEN,
-        max_seqlen_k=KV_SEQLEN,
-        num_heads_q=NUM_HEADS,
-        num_heads_kv=NUM_KV_HEADS,
-        headdim=HEAD_SIZE,
-        cache_seqlens=cache_seqlens,
-        qkv_dtype=DATA_TYPE,
-        cu_seqlens_q=cu_seqlens_q,
-        page_size=BLOCK_SIZE,
-        causal=is_causal,
-        window_size=WINDOW_SIZE,
-    )
+    if "Ascend950" in _device_name:
+        metadata_kwargs = dict(
+            max_seqlen_q=Q_SEQLEN,
+            max_seqlen_k=KV_SEQLEN,
+            nheads=NUM_HEADS,
+            nheads_kv=NUM_KV_HEADS,
+            headdim=HEAD_SIZE,
+            num_splits=1,
+            headdim_v=HEAD_SIZE,
+            seqused_k=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            causal=is_causal,
+            window_size_left=WINDOW_SIZE[0],
+            window_size_right=WINDOW_SIZE[1],
+            page_size=BLOCK_SIZE,
+        )
+    else:
+        metadata_kwargs = dict(
+            batch_size=BATCH_SIZE,
+            max_seqlen_q=Q_SEQLEN,
+            max_seqlen_k=KV_SEQLEN,
+            num_heads_q=NUM_HEADS,
+            num_heads_kv=NUM_KV_HEADS,
+            headdim=HEAD_SIZE,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=DATA_TYPE,
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=BLOCK_SIZE,
+            causal=is_causal,
+            window_size=WINDOW_SIZE,
+        )
+    scheduler_metadata = get_scheduler_metadata(**metadata_kwargs)
 
     causal_mask = None
     if is_causal:

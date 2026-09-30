@@ -290,7 +290,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     tilingData->blockSize = metadataArgs->pagedKV ? metadataArgs->blockSize : 128;
     tilingData->maxNumBlocksPerBatch = metadataArgs->maxNumBlocksPerBatch;
     tilingData->maskType = metadataArgs->maskType;
-    tilingData->scaleValue = metadataArgs->softmaxScale;
+    tilingData->scaleValue = metadataArgs->softcapValue > 0.0f
+                                 ? metadataArgs->softmaxScale / metadataArgs->softcapValue
+                                 : metadataArgs->softmaxScale;
+    tilingData->softcapValue = metadataArgs->softcapValue;
     tilingData->windowSizeLeft = metadataArgs->windowSizeLeft;
     tilingData->windowSizeRight = metadataArgs->windowSizeRight;
     tilingData->sparseMode = 0;

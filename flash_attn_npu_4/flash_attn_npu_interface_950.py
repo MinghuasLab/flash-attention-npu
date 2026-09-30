@@ -69,7 +69,6 @@ def _get_scheduler_metadata_op(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
@@ -93,7 +92,7 @@ def _get_scheduler_metadata_op(
         num_heads_kv,
         headdim,
         headdim_v,
-        qkv_dtype,
+        None,
         cache_seqlens,
         cu_seqlens_q,
         page_size,
@@ -117,7 +116,6 @@ def _get_scheduler_metadata_fake(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     page_size: Optional[int],
@@ -141,54 +139,86 @@ def _get_scheduler_metadata_fake(
 
 
 def get_scheduler_metadata(
-    batch_size,
     max_seqlen_q,
     max_seqlen_k,
-    num_heads_q,
-    num_heads_kv,
+    nheads,
+    nheads_kv,
     headdim,
-    cache_seqlens: torch.Tensor,
-    qkv_dtype=torch.bfloat16,
+    num_splits,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    page_size: Optional[int] = None,
+    pack_gqa=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0,   # 0.0 means deactivated
-    num_splits=0,  # Can be tuned for speed
-    pack_gqa=None,  # Can be tuned for speed
-    sm_margin=0,
+    window_size_left=None,
+    window_size_right=None,
+    seqlen_k_new=0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    _arch: Optional[int] = None,
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    page_size: Optional[int] = None,
+    softcap: float = 0.0,
 ):
-    """Precompute scheduler metadata (tiling + mask) on the AICPU.
+    """Precompute Ascend 950 FA4 metadata using the Tri Dao FA4 signature.
 
-    This avoids the device->host->device round trip in the eager tiling path by
-    running the tiling/mask derivation on the NPU. The returned byte tensor is
-    passed back to ``flash_attn_func`` / ``flash_attn_varlen_func`` through the
-    ``scheduler_metadata`` argument.
+    Ascend FA4 does not support KV updates, padded-Q lengths, left padding, or
+    fixed split lengths. Those Tri Dao parameters remain as compatibility
+    placeholders and must retain their default unsupported values.
     """
-    cache_seqlens = _maybe_contiguous(cache_seqlens)
+    if seqlen_k_new != 0:
+        raise ValueError("Ascend 950 FA4 does not support seqlen_k_new")
+    if cu_seqlens_k_new is not None:
+        raise ValueError("Ascend 950 FA4 does not support cu_seqlens_k_new")
+    if seqused_q is not None:
+        raise ValueError("Ascend 950 FA4 does not support seqused_q")
+    if leftpad_k is not None:
+        raise ValueError("Ascend 950 FA4 does not support leftpad_k")
+    if seqlen_k_per_split is not None:
+        raise ValueError("Ascend 950 FA4 does not support seqlen_k_per_split")
+    if _arch is not None:
+        raise ValueError("Ascend 950 FA4 does not accept _arch")
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
+    if cu_seqlens_k is not None:
+        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
+    if seqused_k is None:
+        if cu_seqlens_k is None:
+            raise ValueError("seqused_k or cu_seqlens_k is required")
+        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    seqused_k = _maybe_contiguous(seqused_k)
+    batch_size = seqused_k.numel()
+    if cu_seqlens_q is not None and cu_seqlens_q.numel() != batch_size + 1:
+        raise ValueError("cu_seqlens_q batch size does not match seqused_k")
     if headdim_v is None:
         headdim_v = headdim
+    if window_size_left is None:
+        window_size_left = -1
+    if window_size_right is None:
+        window_size_right = -1
+    if pack_gqa is not None and pack_gqa:
+        raise ValueError("Ascend 950 FA4 does not support pack_gqa=True")
     return _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
         max_seqlen_k,
-        num_heads_q,
-        num_heads_kv,
+        nheads,
+        nheads_kv,
         headdim,
         headdim_v,
-        qkv_dtype,
-        cache_seqlens,
+        seqused_k,
         cu_seqlens_q,
         page_size,
         causal,
-        window_size[0],
-        window_size[1],
+        window_size_left,
+        window_size_right,
         softcap,
         num_splits,
         pack_gqa,
-        sm_margin,
+        0,
         softmax_scale,
     )
 
@@ -486,21 +516,20 @@ class FlashAttnFunc(torch.autograd.Function):
         # device->host->device round trip.
         if scheduler_metadata is None and not disable_scheduler_metadata:
             scheduler_metadata = get_scheduler_metadata(
-                batch_size,
-                q.shape[1],
-                k.shape[1],
-                q.shape[2],
-                k.shape[2],
-                q.shape[3],
-                seqused_k,
-                qkv_dtype=q.dtype,
-                headdim_v=v.shape[-1],
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=k.shape[1],
+                nheads=q.shape[2],
+                nheads_kv=k.shape[2],
+                headdim=q.shape[3],
                 num_splits=num_splits,
+                headdim_v=v.shape[-1],
                 pack_gqa=pack_gqa,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                seqused_k=seqused_k,
                 softmax_scale=softmax_scale,
+                softcap=softcap,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
@@ -702,23 +731,22 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             else:
                 metadata_max_seqlen_k = max_seqlen_k
             scheduler_metadata = get_scheduler_metadata(
-                batch_size,
-                metadata_max_seqlen_q,
-                metadata_max_seqlen_k,
-                q.shape[1] if q.dim() == 3 else q.shape[2],
-                k.shape[1] if k.dim() == 3 else k.shape[2],
-                q.shape[-1],
-                kv_seqlens,
-                qkv_dtype=q.dtype,
-                headdim_v=v.shape[-1],
-                cu_seqlens_q=cu_seqlens_q,
-                page_size=k.shape[1] if page_table is not None and k.dim() == 4 else None,
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
+                max_seqlen_q=metadata_max_seqlen_q,
+                max_seqlen_k=metadata_max_seqlen_k,
+                nheads=q.shape[1] if q.dim() == 3 else q.shape[2],
+                nheads_kv=k.shape[1] if k.dim() == 3 else k.shape[2],
+                headdim=q.shape[-1],
                 num_splits=num_splits,
+                headdim_v=v.shape[-1],
                 pack_gqa=pack_gqa,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                seqused_k=kv_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
                 softmax_scale=softmax_scale,
+                page_size=(k.shape[1] if page_table is not None and k.dim() == 4 else None),
+                softcap=softcap,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(

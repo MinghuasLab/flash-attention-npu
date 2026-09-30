@@ -83,7 +83,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && cu_seqlens_q.has_value()),
                 "num_splits>1 requires paged KV cache and varlen query");
     TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative");
-    TORCH_CHECK(softcap == 0.0, "950 backend (v4) does not support softcap");
     const bool is_varlen_q = cu_seqlens_q.has_value();
     if (is_varlen_q) {
         auto cq = cu_seqlens_q.value();
@@ -121,6 +120,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.windowSizeLeft = local && window_left < 0 ? max_seqlen_k : window_left;
     args.windowSizeRight = local && window_right < 0 ? max_seqlen_k : window_right;
     args.softmaxScale = scale.value_or(1.0 / std::sqrt(double(headdim)));
+    args.softcapValue = static_cast<float>(softcap);
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
 }
 

@@ -12,7 +12,7 @@
  *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch)
  *   ✅ num_splits (FlashDecode for paged KV + TND)
  *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
- *   ❌ softcap
+ *   ✅ softcap (tanh, folded into the online-softmax epilogue)
  */
 
 #include <algorithm>
@@ -80,7 +80,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     TORCH_CHECK(!min_seqlen_k_.has_value(), "950 backend (v4) does not support min_seqlen_k");
     TORCH_CHECK(!gather_kv_indices_.has_value(), "950 backend (v4) does not support gather_kv_indices");
     TORCH_CHECK(!learnable_sink_.has_value(), "950 backend (v4) does not support learnable_sink");
-    TORCH_CHECK(softcap == 0.0f, "950 backend (v4) does not support softcap");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v4) requires num_splits in [0, ", blockDim, "]");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "950 backend (v4) does not support pack_gqa");
@@ -91,6 +90,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const bool paged_KV = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+    const bool is_softcap = softcap > 0.0f;
 
     if (num_splits > 1) {
         TORCH_CHECK(paged_KV && is_varlen_q, "950 backend (v4) num_splits>1 requires paged KV cache and "
@@ -263,8 +263,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
                                is_local ? window_size_left : 0, is_local ? window_size_right : 0, is_varlen_q, is_bf16,
                                batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
-                               softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), return_lse,
-                               is_varlen_q);
+                               softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
+                               return_lse, is_varlen_q);
         ctx.flashDecodeFlag = num_splits != 1 && fd_shape_supported;
         ctx.numSplits = static_cast<uint32_t>(num_splits);
         optiling::FAInferTiling tiler(ctx);
@@ -396,6 +396,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 paged_KV,
                                 enableDN,
                                 return_lse,
+                                is_softcap,
                                 flashDecodeEnabled,
                                 scheduler_metadata_.has_value() ? metadataFdCoreCapacity : tilingData.fdCombineBlockDim,
                                 launchBlockDim,

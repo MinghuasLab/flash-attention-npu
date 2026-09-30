@@ -50,6 +50,7 @@ struct FAMetadataArgs {
     uint32_t numBlocks, blockSize, maxNumBlocksPerBatch, maxQSeqlen;
     uint32_t maskType, blockDim, isVarlen, isVarlenKv, pagedKV, numSplits;
     float softmaxScale;
+    float softcapValue;
     int64_t windowSizeLeft, windowSizeRight;
 };
 #endif

@@ -3,6 +3,7 @@
 import pytest
 import torch
 import torch_npu
+import inspect
 
 _device_name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
 if "Ascend910" not in _device_name and "Ascend950" not in _device_name:
@@ -20,6 +21,50 @@ from flash_attn_npu_4 import (
     flash_attn_varlen_func,
     get_scheduler_metadata,
 )
+
+
+def test_950_scheduler_metadata_matches_signature():
+    if "Ascend950" not in _device_name:
+        pytest.skip("Ascend950-only API signature")
+    from flash_attn_npu_4.flash_attn_npu_interface_950 import get_scheduler_metadata
+
+    names = list(inspect.signature(get_scheduler_metadata).parameters)
+    assert names == [
+        "max_seqlen_q", "max_seqlen_k", "nheads", "nheads_kv", "headdim",
+        "num_splits", "headdim_v", "pack_gqa", "causal", "window_size_left",
+        "window_size_right", "seqlen_k_new", "cu_seqlens_q", "cu_seqlens_k",
+        "cu_seqlens_k_new", "seqused_q", "seqused_k", "leftpad_k",
+        "seqlen_k_per_split", "_arch", "softmax_scale", "page_size", "softcap"
+    ]
+
+
+@pytest.mark.parametrize(
+    "unsupported, value",
+    [
+        ("seqlen_k_new", 1),
+        ("cu_seqlens_k_new", torch.tensor([0, 1], dtype=torch.int32)),
+        ("seqused_q", torch.tensor([1], dtype=torch.int32)),
+        ("leftpad_k", torch.tensor([1], dtype=torch.int32)),
+        ("seqlen_k_per_split", 128),
+        ("_arch", 950),
+    ],
+)
+def test_950_scheduler_metadata_rejects_unsupported_parameters(unsupported, value):
+    if "Ascend950" not in _device_name:
+        pytest.skip("Ascend950-only API behavior")
+    from flash_attn_npu_4.flash_attn_npu_interface_950 import get_scheduler_metadata
+
+    with pytest.raises(ValueError, match="does not support|does not accept"):
+        get_scheduler_metadata(
+            max_seqlen_q=16,
+            max_seqlen_k=16,
+            nheads=4,
+            nheads_kv=4,
+            headdim=32,
+            num_splits=1,
+            seqused_k=torch.tensor([16], dtype=torch.int32, device="npu"),
+            **{unsupported: value},
+        )
 
 WINDOW_SIZE = (-1, -1)
 
@@ -88,6 +133,24 @@ def _metadata(
     softmax_scale=None,
     num_splits=0,
 ):
+    if "Ascend950" in _device_name:
+        return get_scheduler_metadata(
+            max_seqlen_q=q_seqlen,
+            max_seqlen_k=kv_seqlen,
+            nheads=num_heads,
+            nheads_kv=kv_heads,
+            headdim=head_size,
+            num_splits=num_splits,
+            headdim_v=head_size,
+            causal=is_causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            seqused_k=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+        )
+
     return get_scheduler_metadata(
         batch_size=batch_size,
         max_seqlen_q=q_seqlen,
@@ -97,6 +160,7 @@ def _metadata(
         headdim=head_size,
         cache_seqlens=cache_seqlens,
         qkv_dtype=data_type,
+        headdim_v=head_size,
         cu_seqlens_q=cu_seqlens_q,
         page_size=page_size,
         causal=is_causal,

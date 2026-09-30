@@ -68,21 +68,33 @@ def metadata_kwargs(api, causal, window_size):
     sig = inspect.signature(api.get_scheduler_metadata)
 
     candidates = {
+        # Legacy 910 FA4 / FA3 metadata names.
         "batch_size": 2,
         "max_seqlen_q": 16,
         "max_seqlen_k": 16,
         "num_heads_q": 6,
         "num_heads_kv": 6,
+        "qkv_dtype": torch.float16,
+        "cache_seqlens": torch.tensor([16, 16], dtype=torch.int32, device=DEVICE),
+        "page_size": None,
+        "window_size": window_size,
+        "softcap": 0.0,
+        "sm_margin": 0,
+        # Tri Dao-aligned 950 FA4 names.
+        "nheads": 6,
+        "nheads_kv": 6,
         "headdim": 32,
         "headdim_v": 32,
-        "qkv_dtype": torch.float16,
+        "num_splits": 1,
         "cu_seqlens_q": None,
         "cu_seqlens_k": None,
         "cu_seqlens_k_new": None,
         "seqused_q": None,
-        "cache_leftpad": None,
-        "page_size": None,
-        "max_seqlen_k_new": 0,
+        "seqused_k": torch.tensor([16, 16], dtype=torch.int32, device=DEVICE),
+        "leftpad_k": None,
+        "seqlen_k_new": 0,
+        "seqlen_k_per_split": None,
+        "_arch": None,
         "causal": causal,
         "window_size": window_size,
         "window_size_left": window_size[0],
@@ -94,6 +106,7 @@ def metadata_kwargs(api, causal, window_size):
         "sm_margin": 0,
         "deterministic": False,
         "softmax_scale": 32**-0.5,
+        "page_size": None,
         "alibi_slopes_batch_stride": 0,
         "learnable_sink": None,
     }
@@ -138,9 +151,13 @@ def run_metadata_compile_test(
         )
 
         def fn(cache):
+            call_kwargs = dict(static_kwargs)
+            if "cache_seqlens" in inspect.signature(api.get_scheduler_metadata).parameters:
+                call_kwargs["cache_seqlens"] = cache
+            else:
+                call_kwargs["seqused_k"] = cache
             return api.get_scheduler_metadata(
-                cache_seqlens=cache,
-                **static_kwargs,
+                **call_kwargs,
             )
 
         eager = fn(cache_seqlens)
