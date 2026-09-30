@@ -473,6 +473,36 @@ namespace SplitFuse {
                         pipelineDrain = PRE_LAUNCH;
                     }
 
+#ifdef __DAV_C220_CUBE__
+                    // Warm the next round-robin task's first K and V row into L2.
+                    // One dc_preload covers 256B, which is one bf16 head row.
+                    if constexpr (!PAGED_CACHE_FLAG && INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                        uint32_t nextTask = taskIdx + static_cast<uint32_t>(coreNum);
+                        if (nextTask < totalTaskNum) {
+                            uint32_t nextBatch = curBatchTmp;
+                            uint32_t nextPre = preTotalTaskNumTmp;
+                            uint32_t nextTot = curTotalTaskNumTmp;
+                            uint32_t qnPerGroup = curQNBlockNumCur / kvHeads;
+                            while (nextTask >= nextTot) {
+                                ++nextBatch;
+                                nextPre = nextTot;
+                                uint32_t prevQ = static_cast<uint32_t>(gActualQseqlen.GetValue(nextBatch));
+                                uint32_t qLen = static_cast<uint32_t>(gActualQseqlen.GetValue(nextBatch + 1)) - prevQ;
+                                qnPerGroup = CeilDiv(groupSize, GetQNBlockTile(qLen, groupSize));
+                                nextTot += qnPerGroup * kvHeads * CeilDiv(qLen, Q_TILE_CEIL);
+                            }
+                            uint32_t kvN = ((nextTask - nextPre) % (qnPerGroup * kvHeads)) / qnPerGroup;
+                            uint32_t prevKv = static_cast<uint32_t>(gActualKvseqlen.GetValue(nextBatch));
+                            dc_preload(reinterpret_cast<__gm__ uint64_t *>(gK.GetPhyAddr(
+                                static_cast<uint64_t>(prevKv) * strideK + static_cast<uint64_t>(kvN) * embed)),
+                                static_cast<int64_t>(0));
+                            dc_preload(reinterpret_cast<__gm__ uint64_t *>(gV.GetPhyAddr(
+                                static_cast<uint64_t>(prevKv) * strideV + static_cast<uint64_t>(kvN) * embedV)),
+                                static_cast<int64_t>(0));
+                        }
+                    }
+#endif
+
                     const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
                     const bool hasTaskWork = runMainLoop(
                         coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur,
@@ -833,7 +863,12 @@ namespace SplitFuse {
             LayoutQ layoutQTemp(rowNum, embed);
             LayoutK layoutKTemp(strideK, stackSeqTile);
             LayoutV layoutVTemp(stackSeqTile, strideV);
-            if (!isEmptyTask) {
+            if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                if (!isEmptyTask) {
+                    blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
+                    blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
+                }
+            } else {
                 blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
                 blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
             }

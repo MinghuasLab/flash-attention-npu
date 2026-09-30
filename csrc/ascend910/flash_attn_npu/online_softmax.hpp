@@ -963,11 +963,9 @@ public:
 
         uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
             (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-        if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
-            if (isFirstStackTile && isFirstRowLoop) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
-            }
-        } else {
+        if constexpr (LSE_MODE_ != LseModeT::OUT_ONLY) {
+            // SplitKV waits here for the shared partial-LSE buffer. The OUT_ONLY path does
+            // not: its LSE store finishes within the softmax of the following task.
             if (isFirstStackTile && isFirstRowLoop && isSplitKV) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
             }

@@ -68,10 +68,18 @@ public:
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
-    // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
+    // Scalar + broadcast LSE, one buffer per task slot so a slot's MTE3 store can drain
+    // without blocking the next task. Slots 0 and 1 sit past the live GM/GL softmax state;
+    // slot 2 keeps the original hole between the DM rows and the mask scratch.
     static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
+    static constexpr uint32_t LSE_SLOT_BYTES = LSE_STAGING_ELEMENTS * sizeof(float);
     static constexpr uint32_t LSE_STAGING_UB_OFFSET =
-        11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
+        11 * UB_UINT8_BLOCK_SIZE - LSE_SLOT_BYTES;
+    static constexpr uint32_t LSE_SLOT_TAIL_OFFSET =
+        11 * UB_UINT8_BLOCK_SIZE + 4 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE
+        + 2 * 3 * MAX_ROW_NUM_SUB_CORE * sizeof(float);
+    static_assert(LSE_SLOT_TAIL_OFFSET + 2 * LSE_SLOT_BYTES <= 192 * 1024,
+        "per-slot LSE staging exceeds the unified buffer");
 
     struct SplitKVParams {
         bool isSplitkv = false;
@@ -116,6 +124,7 @@ public:
         static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float)
             <= LSE_STAGING_UB_OFFSET, "LSE staging overlaps live DM rows");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
+        lseSlotTailTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_SLOT_TAIL_OFFSET);
     }
 
     __aicore__ inline
@@ -319,8 +328,15 @@ public:
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
-        auto lseUbTensor = lseStagingUbTensor;
-        auto lseBroadcastUbTensor = lseUbTensor[FLOAT_VECTOR_SIZE];
+        // Slots 0 and 1 live past the softmax state, slot 2 in the original staging hole.
+        AscendC::LocalTensor<float> lseSlotTensor;
+        if (taskStateSlot < 2) {
+            lseSlotTensor = lseSlotTailTensor[taskStateSlot * LSE_STAGING_ELEMENTS];
+        } else {
+            lseSlotTensor = lseStagingUbTensor;
+        }
+        auto lseUbTensor = lseSlotTensor;
+        auto lseBroadcastUbTensor = lseSlotTensor[FLOAT_VECTOR_SIZE];
 
         // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
         uint32_t oHiddenSize_gmlo = 0;
@@ -486,6 +502,10 @@ public:
 
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
+                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                    // Rewrite this slot's staging only after the store that reads it has landed.
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
                         lseUbTensor,
@@ -567,8 +587,6 @@ public:
                             }
                         }
                     }
-                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                 }
             } else {
@@ -828,6 +846,7 @@ private:
     AscendC::LocalTensor<float> goUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor;
     AscendC::LocalTensor<float> lseStagingUbTensor;
+    AscendC::LocalTensor<float> lseSlotTailTensor;
 };
 
 }
