@@ -1530,6 +1530,10 @@ def get_scheduler_metadata(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    # Compatibility aliases accepted by some ATK/adaptor callers. The V3
+    # scheduler derives these from page_size and max_seqlen_k.
+    num_blocks=None,
+    max_num_blocks_per_seq=None,
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
