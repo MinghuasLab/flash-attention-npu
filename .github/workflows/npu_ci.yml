@@ -214,11 +214,13 @@ jobs:
       matrix:
         include:
           - arch_label: x86_64-950
+            build_npu: "950"
             runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
             docker_image: fa-npu-ci:950-cann9.1-torch2.9
             require_healthy: "true"
             max_tasks: "6"
           - arch_label: aarch64-910B
+            build_npu: "910"
             runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
             docker_image: fa-npu-ci:910b-cann9.1-torch2.9
             require_healthy: "false"
@@ -230,6 +232,7 @@ jobs:
       CI_RUN_EXAMPLE_ST: "true"
       CI_TEST_WORKERS: ${{ needs.prepare.outputs.workers }}
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      FLASH_ATTN_BUILD_NPU: ${{ matrix.build_npu }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}

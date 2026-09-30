@@ -9,6 +9,10 @@
 #   torch_ver         torch 版本, 如 2.9.0 (README: torch_npu 与 torch 同版本)
 #   torch_npu_ver     torch_npu wheel 版本字符串, 如 2.9.0.post2
 #   torch_npu_release gitcode release tag, 如 v26.0.0-pytorch2.9.0
+#   cann_ver          CANN 兼容版本, 如 9.1
+#   npu               目标 NPU, 910 / 950
+#   build_version     API 内容, v2 / v3 / v4 / all
+#   abi               TRUE / FALSE / detected
 #   arch              目标架构, x86_64 / aarch64 (与 base_image 架构一致; 控制 torch_npu
 #                     wheel 后缀, 以及 torch 的安装方式)
 #   image             (可选) 预构建镜像名。非空时 build_matrix_images.sh 跳过构建,
@@ -19,11 +23,10 @@
 # 注意: torch_npu_ver / torch_npu_release / base_image 需在 AscendHub + gitcode 上核对,
 #       不匹配的组合会在 build_matrix_images.sh 阶段失败。
 #
-# name|base_image|py_tag|torch_ver|torch_npu_ver|torch_npu_release|arch|image
+# name|base_image|py_tag|torch_ver|torch_npu_ver|torch_npu_release|cann_ver|npu|build_version|abi|arch|image
 # 910b (aarch64): 与 950 统一用 ci/Dockerfile 构建, 镜像名 fa-npu-ci:910b-cann9.1-torch2.9。
-910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|aarch64
-# 950 (Ascend 950PR/DT, arch35/dav-3510): 实测机器上有 CANN 9.1.0-beta.1 的 950 镜像 (与 910b 同 CANN 版本)。
-# torch_npu 2.9.0.post2 在 9.1.0-beta.1 上可用 (910b 即如此), 故 torch/torch_npu 与 910b 相同, 只换 950 基础镜像。
-# 备选: cann:9.1.0-beta.3-950-ubuntu22.04-py3.12 (更新; 若 beta.1 对 950 有问题再换)。
+910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|9.1|910|all|detected|aarch64|
+# 950 (Ascend 950PR/DT, arch35/dav-3510): 与 910b 统一使用 CANN 9.1.0 正式版。
+# torch/torch_npu 版本与 910b 相同, 只换 950 基础镜像。
 # 注意: 该 950 镜像无 -devel 后缀, 需确认内含 bisheng 编译器 (见构建说明)。
-950-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|x86_64
+950-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-950-ubuntu22.04-py3.12|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|9.1|950|all|detected|x86_64|

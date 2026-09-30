@@ -37,11 +37,12 @@ CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 LOG_DIR="${REPO_ROOT}/build/matrix-logs"
 # 每个 combo 一个 docker CLI PID 文件; 取消时先终止这些客户端, 再按 scope 清理容器。
 PID_DIR="$LOG_DIR/pids"
-# 架构过滤: 非空时只跑 tsv 第 7 列 (arch) 匹配的 combo。用于多机器分架构跑:
+# 架构过滤: 非空时只跑 tsv 第 11 列 (arch) 匹配的 combo。用于多机器分架构跑:
 # 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
 ARCH_FILTER="${ARCH_FILTER:-}"
 
 # shellcheck source=ci/docker_proxy.sh
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/docker_proxy.sh"
 git_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
 
@@ -75,8 +76,8 @@ read_combos() {
   if [ -n "$ARCH_FILTER" ]; then
     awk -F'|' -v arch="$ARCH_FILTER" '
       /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-      NF >= 7 && $7 == arch {print}
-      NF < 7 {print}
+      NF >= 11 && $11 == arch {print}
+      NF < 11 {print}
     ' "$MATRIX_FILE"
   else
     awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
@@ -90,11 +91,11 @@ while IFS= read -r line; do
 done < <(read_combos)
 [ "${#COMBOS[@]}" -gt 0 ] || die "no combo in $MATRIX_FILE"
 
-# 从 combo 行解析镜像名: 若第 8 列 (image) 非空则直接用该镜像 (预构建), 否则用 $IMAGE_PREFIX:$name
+# 从 combo 行解析镜像名: 若第 12 列 (image) 非空则直接用该镜像 (预构建), 否则用 $IMAGE_PREFIX:$name
 combo_image() {
   local line="$1" name img
   name="${line%%|*}"
-  img="$(printf '%s' "$line" | awk -F'|' '{print $8}')"
+  img="$(printf '%s' "$line" | awk -F'|' '{print $12}')"
   if [ -n "$img" ]; then
     printf '%s\n' "$img"
   else
@@ -131,7 +132,8 @@ bash "$SCRIPT_DIR/init_submodules.sh" "$REPO_ROOT"
 
 # ---------- 2. 每个 combo 一个容器, 并发编译 ----------
 build_one() {
-  local line="$1" name logf rc img docker_pid pidfile
+  local line="$1" name logf rc img docker_pid pidfile _base py_tag torch_ver torch_npu_ver _torch_npu_rel cann npu api abi arch _image
+  IFS='|' read -r name _base py_tag torch_ver torch_npu_ver _torch_npu_rel cann npu api abi arch _image <<< "$line"
   name="${line%%|*}"
   img="$(combo_image "$line")"
   logf="$LOG_DIR/${name}.log"
@@ -148,10 +150,19 @@ build_one() {
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
     -e FLASH_ATTN_FORCE_BUILD=TRUE \
     -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
-    -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
+    -e MATRIX_NAME="$name" \
+    -e MATRIX_PY_TAG="$py_tag" \
+    -e MATRIX_TORCH_VERSION="$torch_ver" \
+    -e MATRIX_TORCH_NPU_VERSION="$torch_npu_ver" \
+    -e MATRIX_CANN_VERSION="$cann" \
+    -e MATRIX_NPU="$npu" \
+    -e MATRIX_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-$api}" \
+    -e MATRIX_ABI="$abi" \
+    -e MATRIX_ARCH="$arch" \
+    -e RELEASE_BUILD_MODE=build-only \
     -w /workspace/flash-attention-npu \
     "$img" \
-    bash -lc 'git config --global --add safe.directory "*" && python3 setup.py build --build-base=/tmp/build' \
+    bash -lc 'git config --global --add safe.directory "*" && bash ci/build_release_wheel.sh' \
     > "$logf" 2>&1 &
   docker_pid=$!
   printf '%s\n' "$docker_pid" > "$pidfile"
