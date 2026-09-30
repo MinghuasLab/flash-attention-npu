@@ -216,28 +216,56 @@ public:
                 }
                 uint32_t gmLseBase = batchBase + headBase * headStride + qPos;
                 uint32_t lseDstStride = (headStride - 1) * sizeof(float);
-
-                AscendC::Brcb(loFloatUbTensor.ReinterpretCast<uint32_t>(),
-                              tsUbTensor.ReinterpretCast<uint32_t>(),
-                              (lseBlockAlign + FLOAT_PER_BLOCK - 1) / FLOAT_PER_BLOCK,
-                              AscendC::BrcbRepeatParams(1, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-                if (q_len == 1) {
+                // UB rows are [token][head]. GM is contiguous only for one head,
+                // or for decode when consecutive heads are adjacent (stride 1).
+                uint32_t lseHeadCount = (q_len == 1U) ? lseBlock : n_len;
+                uint32_t lseSeqLen = (q_len == 1U) ? 1U : (lseBlock / n_len);
+                bool isLseContiguous = (lseHeadCount == 1U) ||
+                    (q_len == 1U && headStride == lseSeqLen);
+                if (isLseContiguous) {
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-
                     AscendC::DataCopyPad(
-                        oLseGmTensor[gmLseBase], loFloatUbTensor,
-                        AscendC::DataCopyExtParams(lseBlock, sizeof(float), 0, lseDstStride, 0));
-                } else {
+                        oLseGmTensor[gmLseBase], tsUbTensor,
+                        AscendC::DataCopyExtParams(
+                            1, lseBlock * sizeof(float), 0, 0, 0));
+                } else if (q_len > 1U && (lseSeqLen % FLOAT_PER_BLOCK) == 0U &&
+                           lseHeadCount <= lseSeqLen) {
+                    // MTE3 rounds UB blocks to 32 B. Broadcast rows keep each head's
+                    // tokens addressable; one copy writes that head's contiguous sequence.
+                    AscendC::Brcb(loFloatUbTensor.ReinterpretCast<uint32_t>(),
+                                  tsUbTensor.ReinterpretCast<uint32_t>(),
+                                  (lseBlockAlign + FLOAT_PER_BLOCK - 1) / FLOAT_PER_BLOCK,
+                                  AscendC::BrcbRepeatParams(1, 8));
+                    AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-                    uint32_t qTile = lseBlock / n_len;
-                    for (uint32_t qi = 0; qi < qTile; ++qi) {
+                    for (uint32_t hIdx = 0; hIdx < lseHeadCount; ++hIdx) {
                         AscendC::DataCopyPad(
-                            oLseGmTensor[gmLseBase + qi],
-                            loFloatUbTensor[qi * n_len * FLOAT_PER_BLOCK],
-                            AscendC::DataCopyExtParams(n_len, sizeof(float), 0, lseDstStride, 0));
+                            oLseGmTensor[gmLseBase + hIdx * headStride],
+                            loFloatUbTensor[hIdx * FLOAT_PER_BLOCK],
+                            AscendC::DataCopyExtParams(
+                                lseSeqLen, sizeof(float), lseHeadCount - 1U, 0, 0));
+                    }
+                } else {
+                    AscendC::Brcb(loFloatUbTensor.ReinterpretCast<uint32_t>(),
+                                  tsUbTensor.ReinterpretCast<uint32_t>(),
+                                  (lseBlockAlign + FLOAT_PER_BLOCK - 1) / FLOAT_PER_BLOCK,
+                                  AscendC::BrcbRepeatParams(1, 8));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                    if (q_len == 1) {
+                        AscendC::DataCopyPad(
+                            oLseGmTensor[gmLseBase], loFloatUbTensor,
+                            AscendC::DataCopyExtParams(lseBlock, sizeof(float), 0, lseDstStride, 0));
+                    } else {
+                        for (uint32_t qi = 0; qi < lseSeqLen; ++qi) {
+                            AscendC::DataCopyPad(
+                                oLseGmTensor[gmLseBase + qi],
+                                loFloatUbTensor[qi * n_len * FLOAT_PER_BLOCK],
+                                AscendC::DataCopyExtParams(n_len, sizeof(float), 0, lseDstStride, 0));
+                        }
                     }
                 }
 
