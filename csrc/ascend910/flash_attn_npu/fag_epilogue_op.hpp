@@ -82,6 +82,10 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
 
     __gm__ uint8_t* actual_seq_qlen_addr;
     __gm__ uint8_t* actual_seq_kvlen_addr;
+    __gm__ uint8_t* seqUsedQAddr;
+    __gm__ uint8_t* seqUsedKvAddr;
+    bool hasSeqUsedQ;
+    bool hasSeqUsedKv;
 
     GlobalTensor<float> dvGm;
 
@@ -211,7 +215,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     BlockEpilogue(Arch::Resource<ArchTag>& resource, AscendC::TPipe* pipe_in, __gm__ uint8_t* query,
                   __gm__ uint8_t* key, __gm__ uint8_t* value, __gm__ uint8_t* dx, __gm__ uint8_t* drop_mask,
                   __gm__ uint8_t* atten_mask, __gm__ uint8_t* forward_res, __gm__ uint8_t* softmax_lse,
-                  __gm__ uint8_t* actual_seq_qlen, __gm__ uint8_t* actual_seq_kvlen, __gm__ uint8_t* dq,
+                  __gm__ uint8_t* actual_seq_qlen, __gm__ uint8_t* actual_seq_kvlen,
+                  __gm__ uint8_t* seq_used_q, __gm__ uint8_t* seq_used_kv, __gm__ uint8_t* dq,
                   __gm__ uint8_t* dk, __gm__ uint8_t* dv, __gm__ uint8_t* alibi_slopes, __gm__ uint8_t* workspace,
                   __gm__ uint8_t* tiling_in, TBuf<>& buf)
     {
@@ -282,6 +287,10 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
 
         actual_seq_qlen_addr = actual_seq_qlen;
         actual_seq_kvlen_addr = actual_seq_kvlen;
+        seqUsedQAddr = seq_used_q;
+        seqUsedKvAddr = seq_used_kv;
+        hasSeqUsedQ = seq_used_q != nullptr;
+        hasSeqUsedKv = seq_used_kv != nullptr;
         if constexpr (IS_DROP == ENABLE) {
             dropMaskGm.SetGlobalBuffer((__gm__ uint8_t*)drop_mask);
         }
@@ -291,10 +300,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         compressMode = tilingData->attenMaskCompressMode;
 
-        int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
-        if constexpr (INPUT_LAYOUT == TND) {
-            sfmgOutputSize = ((__gm__ int32_t*)actual_seq_qlen)[b - 1] * n2 * g * 8;
-        }
+        // From tiling: cu[b - 1] would undercount after used-length tail trimming.
+        int64_t sfmgOutputSize = static_cast<int64_t>(tilingData->sfmgNormalAxisSize) * 8;
 
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
         int64_t dkWorkSpaceOffset = tilingData->dkWorkSpaceOffset;
@@ -334,6 +341,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     CATLASS_DEVICE
     void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
     {
+        // Region (cu) lengths; sfmgOffset strides must match Sfmg's region-dense D.
         if (unlikely(bIdx == 0)) {
             actualSeqQlen = ((__gm__ int32_t*)actual_seq_qlen_addr)[0];
             actualSeqKvlen = ((__gm__ int32_t*)actual_seq_kvlen_addr)[0];
@@ -347,6 +355,28 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     }
 
     CATLASS_DEVICE
+    void GetUsedSeqQlenKvlenByBidx(int64_t bIdx, int32_t& actualSeqQlen, int32_t& actualSeqKvlen)
+    {
+        // *Used* lengths (seqused-aware) for mask/causal/alibi extent math.
+        if (unlikely(bIdx == 0)) {
+            actualSeqQlen = hasSeqUsedQ ? ((__gm__ int32_t*)seqUsedQAddr)[0]
+                                        : ((__gm__ int32_t*)actual_seq_qlen_addr)[0];
+            actualSeqKvlen = hasSeqUsedKv ? ((__gm__ int32_t*)seqUsedKvAddr)[0]
+                                          : ((__gm__ int32_t*)actual_seq_kvlen_addr)[0];
+        } else {
+            actualSeqQlen =
+                hasSeqUsedQ ? ((__gm__ int32_t*)seqUsedQAddr)[bIdx]
+                            : ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx]
+                                  - ((__gm__ int32_t*)actual_seq_qlen_addr)[bIdx - 1];
+            actualSeqKvlen =
+                hasSeqUsedKv ? ((__gm__ int32_t*)seqUsedKvAddr)[bIdx]
+                             : ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx]
+                                   - ((__gm__ int32_t*)actual_seq_kvlen_addr)[bIdx - 1];
+        }
+        return;
+    }
+
+    CATLASS_DEVICE
     void UpdateToken(int64_t bIdx)
     {
         if constexpr (IS_ATTEN_MASK != ENABLE) {
@@ -354,7 +384,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         }
         int32_t actualS1Len = 0;
         int32_t actualS2Len = 0;
-        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
+        GetUsedSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
         actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
         actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
     }
@@ -427,7 +457,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         if constexpr (INPUT_LAYOUT == TND) {
             int32_t actualS1Len = 0;
             int32_t actualS2Len = 0;
-            GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
+            GetUsedSeqQlenKvlenByBidx(dbParam.bIdx, actualS1Len, actualS2Len);
             return causal_delta - actualS1Len + actualS2Len;
         } else {
             return causal_delta - s1 + s2;
@@ -688,7 +718,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             if constexpr (INPUT_LAYOUT == TND) {
                 int32_t actualS1LenBwd = 0;
                 int32_t actualS2LenBwd = 0;
-                GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1LenBwd, actualS2LenBwd);
+                GetUsedSeqQlenKvlenByBidx(dbParam.bIdx, actualS1LenBwd, actualS2LenBwd);
                 qKSeqDiff = static_cast<int64_t>(actualS2LenBwd) - static_cast<int64_t>(actualS1LenBwd);
             } else {
                 qKSeqDiff = s2 - s1;

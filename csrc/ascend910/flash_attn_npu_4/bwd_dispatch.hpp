@@ -43,6 +43,8 @@ struct BwdLaunchArgs {
     uint8_t *softMaxLseDevice;
     uint8_t *cuSeqQlenDevice;    // may be nullptr in BSND mode
     uint8_t *cuSeqKvlenDevice;   // may be nullptr in BSND mode
+    uint8_t *seqUsedQDevice;     // per-batch used Q lengths (seqused_q); nullptr when absent
+    uint8_t *seqUsedKvDevice;    // per-batch used KV lengths (seqused_k); nullptr when absent
     uint8_t *dqDevice;
     uint8_t *dkDevice;
     uint8_t *dvDevice;

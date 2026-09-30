@@ -120,8 +120,8 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
 }
 
 struct FAMetadataArgs {
-    uint64_t cuSeqlensQAddr;
-    uint64_t seqlensKAddr;
+    uint64_t seqlensQAddr;
+    uint64_t cacheSeqlensAddr;
     uint64_t metaOutAddr;
     uint32_t batch;
     uint32_t numHeads;

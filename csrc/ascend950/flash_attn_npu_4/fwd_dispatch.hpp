@@ -31,6 +31,8 @@ struct FwdLaunchArgs {
     uint8_t *lse_device;
     uint8_t *q_seq_device;
     uint8_t *kv_seq_device;
+    uint8_t *seq_used_q_device;    // per-batch used Q lengths (seqused_q); nullptr when absent
+    uint8_t *seq_used_kv_device;   // per-batch used KV lengths (seqused_k); nullptr when absent
     uint8_t *workspace_device;
     uint8_t *tiling_device;
 };

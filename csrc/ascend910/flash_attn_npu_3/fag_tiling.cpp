@@ -341,7 +341,12 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
 
         uint64_t tailZeroCount = 0;
         for (auto i = seqQShapeSize - 1; i >= 1; --i) {
-            if (fagTilingData.actualSeqQlen[i] <= 0 && fagTilingData.actualSeqKvlen[i] <= 0) {
+            // Prefer used lengths so inactive tails get trimmed despite non-empty regions.
+            const bool qEmpty = (fagInfo.qUsedLenList != nullptr)
+                ? (fagInfo.qUsedLenList[i] <= 0) : (fagTilingData.actualSeqQlen[i] <= 0);
+            const bool kvEmpty = (fagInfo.kvUsedLenList != nullptr)
+                ? (fagInfo.kvUsedLenList[i] <= 0) : (fagTilingData.actualSeqKvlen[i] <= 0);
+            if (qEmpty && kvEmpty) {
                 ++tailZeroCount;
             } else {
                 break;
@@ -388,7 +393,28 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.s1CvInner = SAMEAB_S1_BASE;
     fagTilingData.s2CvInner = SAMEAB_S2_BASE;
 
-    AdjustCvInner(fagTilingData);
+    {
+        // Block selection sees the used max; the tiling blob keeps the region max.
+        const int64_t blobMaxQ = fagTilingData.qSeqlen;
+        const int64_t blobMaxKv = fagTilingData.kvSeqlen;
+        if (fagInfo.qUsedLenList != nullptr) {
+            int32_t usedMaxQ = 0;
+            for (int64_t i = 0; i < fagInfo.batch; ++i) {
+                usedMaxQ = std::max(usedMaxQ, fagInfo.qUsedLenList[i]);
+            }
+            fagTilingData.qSeqlen = usedMaxQ;
+        }
+        if (fagInfo.kvUsedLenList != nullptr) {
+            int32_t usedMaxKv = 0;
+            for (int64_t i = 0; i < fagInfo.batch; ++i) {
+                usedMaxKv = std::max(usedMaxKv, fagInfo.kvUsedLenList[i]);
+            }
+            fagTilingData.kvSeqlen = usedMaxKv;
+        }
+        AdjustCvInner(fagTilingData);
+        fagTilingData.qSeqlen = blobMaxQ;
+        fagTilingData.kvSeqlen = blobMaxKv;
+    }
 
     fagTilingData.s1Outer = (fagTilingData.qSeqlen + fagTilingData.s1CvInner - 1) / fagTilingData.s1CvInner;
     fagTilingData.s2Outer = (fagTilingData.kvSeqlen + fagTilingData.s2CvInner - 1) / fagTilingData.s2CvInner;

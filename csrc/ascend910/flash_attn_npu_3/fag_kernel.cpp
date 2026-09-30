@@ -103,6 +103,10 @@ public:
 
     __gm__ uint8_t *actual_seq_qlen_addr;
     __gm__ uint8_t *actual_seq_kvlen_addr;
+    __gm__ uint8_t *seqUsedQAddr;
+    __gm__ uint8_t *seqUsedKvAddr;
+    bool hasSeqUsedQ;
+    bool hasSeqUsedKv;
 
     constexpr static uint32_t ENABLE = 1;
     constexpr static int8_t OUTIDX= -1;
@@ -148,11 +152,13 @@ public:
 
         actual_seq_qlen_addr = params.cu_seq_qlen;
         actual_seq_kvlen_addr = params.cu_seq_kvlen;
+        seqUsedQAddr = params.seqUsedQ;
+        seqUsedKvAddr = params.seqUsedKv;
+        hasSeqUsedQ = params.seqUsedQ != nullptr;
+        hasSeqUsedKv = params.seqUsedKv != nullptr;
 
-        int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
-        if constexpr (INPUT_LAYOUT == TND) {
-            sfmgOutputSize = ((__gm__ int32_t*)params.cu_seq_qlen)[b - 1] * n2 * g * 8;
-        }
+        // From tiling: cu[b - 1] would undercount after used-length tail trimming.
+        int64_t sfmgOutputSize = static_cast<int64_t>(fagTilingData->sfmgNormalAxisSize) * 8;
 
         dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)params.workspace +
                                     fagTilingData->dqWorkSpaceOffset / sizeof(float));
@@ -202,28 +208,23 @@ public:
 
     __aicore__ inline void GetSeqQlenKvlenByBidx(int64_t bIdx, int32_t &actualSeqQlen, int32_t &actualSeqKvlen)
     {
+        // *Used* lengths (seqused-aware); task partitioning and window math follow.
         if (unlikely(bIdx == 0)) {
-            actualSeqQlen = ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
-            actualSeqKvlen = ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
+            actualSeqQlen = hasSeqUsedQ ? ((__gm__ int32_t *)seqUsedQAddr)[0]
+                                        : ((__gm__ int32_t *)actual_seq_qlen_addr)[0];
+            actualSeqKvlen = hasSeqUsedKv ? ((__gm__ int32_t *)seqUsedKvAddr)[0]
+                                          : ((__gm__ int32_t *)actual_seq_kvlen_addr)[0];
         } else {
             actualSeqQlen =
-                ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
+                hasSeqUsedQ ? ((__gm__ int32_t *)seqUsedQAddr)[bIdx]
+                            : ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx]
+                                  - ((__gm__ int32_t *)actual_seq_qlen_addr)[bIdx - 1];
             actualSeqKvlen =
-                ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx] - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
+                hasSeqUsedKv ? ((__gm__ int32_t *)seqUsedKvAddr)[bIdx]
+                             : ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx]
+                                   - ((__gm__ int32_t *)actual_seq_kvlen_addr)[bIdx - 1];
         }
         return;
-    }
-
-    __aicore__ inline void UpdateToken(int64_t bIdx)
-    {
-        if constexpr (IS_ATTEN_MASK != ENABLE) {
-            return;
-        }
-        int32_t actualS1Len = 0;
-        int32_t actualS2Len = 0;
-        GetSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
-        actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
-        actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
     }
 
     __aicore__ inline void UpdateIndex()
@@ -281,12 +282,20 @@ public:
         int32_t actualSeqQlen = s1;
         int32_t actualSeqKvlen = s2;
         if constexpr(INPUT_LAYOUT == TND) {
-            UpdateToken(bDimIdx);
-            GetSeqQlenKvlenByBidx(bDimIdx, actualSeqQlen, actualSeqKvlen);
-            s1Outer = (actualSeqQlen + s1CvInner - 1) / s1CvInner;
-            s2Outer = (actualSeqKvlen + s2CvInner - 1) / s2CvInner;
-            s1CvTail = actualSeqQlen - (s1Outer - 1) * s1CvInner;
-            s2CvTail = actualSeqKvlen - (s2Outer - 1) * s2CvInner;
+            if (static_cast<uint32_t>(bDimIdx) != cachedBatch) {
+                cachedBatch = static_cast<uint32_t>(bDimIdx);
+                GetSeqQlenKvlenByBidx(bDimIdx, cachedActualSeqQlen, cachedActualSeqKvlen);
+                if constexpr (IS_ATTEN_MASK == ENABLE) {
+                    actualCalcS1Token = s1Token + cachedActualSeqQlen - cachedActualSeqKvlen;
+                    actualCalcS2Token = s2Token - cachedActualSeqQlen + cachedActualSeqKvlen;
+                }
+                s1Outer = (cachedActualSeqQlen + s1CvInner - 1) / s1CvInner;
+                s2Outer = (cachedActualSeqKvlen + s2CvInner - 1) / s2CvInner;
+                s1CvTail = cachedActualSeqQlen - (s1Outer - 1) * s1CvInner;
+                s2CvTail = cachedActualSeqKvlen - (s2Outer - 1) * s2CvInner;
+            }
+            actualSeqQlen = cachedActualSeqQlen;
+            actualSeqKvlen = cachedActualSeqKvlen;
         }
         dqOutIdx = dqOutBase + (n2DimIdx * g + gDimIdx) * s1Outer + s1oDimIdx;
         kvOutIdx = kvOutBase + n2DimIdx * s2Outer + s2oCvDimIdx;
@@ -406,8 +415,9 @@ public:
         dbParam.s2Stride = 0;
 
         if constexpr (INPUT_LAYOUT == TND) {
-            UpdateToken(dbParam.bIdx);
-            GetSeqQlenKvlenByBidx(dbParam.bIdx, dbParam.actualS1Len, dbParam.actualS2Len);
+            // Lengths from the batch-once cache; offsets read per task like the forward.
+            dbParam.actualS1Len = cachedActualSeqQlen;
+            dbParam.actualS2Len = cachedActualSeqKvlen;
             dbParam.aTensorOffsetCv = 0;
             dbParam.bTensorOffsetCv = 0;
             if (dbParam.bIdx > 0) {
@@ -791,7 +801,8 @@ public:
         AscendC::TPipe pipeVec;
         TBuf<> unifiedBuffer;
         EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
-            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, params.alibi_slopes,
+            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen,
+            params.seqUsedQ, params.seqUsedKv, params.dq, params.dk, params.dv, params.alibi_slopes,
             params.workspace, params.tiling, unifiedBuffer);
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
@@ -866,6 +877,11 @@ private:
     int64_t gDimIdx{0};
     int64_t s1oDimIdx{0};
     int64_t s2oCvDimIdx{0};
+
+    // Batch-once per-batch cache; safe in MM1 because it runs before the next walk.
+    uint32_t cachedBatch = 0xFFFFFFFFU;
+    int32_t cachedActualSeqQlen = 0;
+    int32_t cachedActualSeqKvlen = 0;
 
     // split info
     int64_t s1Outer;
@@ -993,7 +1009,8 @@ template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k,
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
                         GM_ADDR atten_mask, GM_ADDR softmax_lse,
-                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
+                        GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
+                        GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_,
                         GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_,
                         GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
 ) {
@@ -1103,7 +1120,8 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
 
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
-    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
+    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen,
+                           seqUsedQ, seqUsedKv, dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
 
     // call kernel
     FAGKernel flashAttn;

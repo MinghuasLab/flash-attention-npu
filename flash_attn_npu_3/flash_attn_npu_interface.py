@@ -799,6 +799,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cache_seqlens = seqused_k
         else:
             cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        if seqused_q is not None:
+            seqlens_q = seqused_q
+        else:
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         scheduler_metadata = get_scheduler_metadata(
             batch_size,
             max_seqlen_q,
@@ -808,7 +812,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             head_size,
             cache_seqlens,
             qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
+            seqlens_q=seqlens_q,
             causal=causal,
             window_size=window_size,
             softcap=softcap,
@@ -1410,10 +1414,9 @@ def _get_scheduler_metadata_op(
     headdim_v: int,
     qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
     cache_leftpad: Optional[torch.Tensor],
     page_size: Optional[int],
     max_seqlen_k_new: int,
@@ -1437,10 +1440,9 @@ def _get_scheduler_metadata_op(
         headdim_v,
         qkv_dtype,
         cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
         cu_seqlens_k,
         cu_seqlens_k_new,
-        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
@@ -1466,7 +1468,7 @@ def _get_scheduler_metadata_op(
         "page_size": None if page_size is None else int(page_size),
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
-        "varlen_q": cu_seqlens_q is not None,
+        "varlen_q": seqlens_q is not None,
         "num_splits": int(num_splits),
     }
     return scheduler_metadata
@@ -1483,10 +1485,9 @@ def _get_scheduler_metadata_fake(
     headdim_v: int,
     qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
+    seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
     cache_leftpad: Optional[torch.Tensor],
     page_size: Optional[int],
     max_seqlen_k_new: int,
@@ -1517,7 +1518,7 @@ def get_scheduler_metadata(
     cache_seqlens: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
+    seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
@@ -1536,7 +1537,6 @@ def get_scheduler_metadata(
         headdim_v = headdim
     # Route through the custom op so torch.compile / FakeTensor can use the
     # registered fake instead of tracing into the raw pybind extension.
-    # Public API still hard-codes cu_seqlens_k / seqused_q as None (unchanged).
     scheduler_metadata = _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
@@ -1547,10 +1547,9 @@ def get_scheduler_metadata(
         headdim_v,
         qkv_dtype,
         cache_seqlens,
-        cu_seqlens_q,
+        seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        None,  # seqused_q
         cache_leftpad,
         page_size,
         max_seqlen_k_new,

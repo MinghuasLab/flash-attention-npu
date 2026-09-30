@@ -155,6 +155,9 @@ struct FAGKernelParams {
     GM_ADDR softmax_lse;
     GM_ADDR cu_seq_qlen;
     GM_ADDR cu_seq_kvlen;
+    // Per-batch *used* lengths (seqused); nullptr when absent, cu arrays stay region.
+    GM_ADDR seqUsedQ;
+    GM_ADDR seqUsedKv;
     GM_ADDR dq;
     GM_ADDR dk;
     GM_ADDR dv;
@@ -176,6 +179,8 @@ struct FAGKernelParams {
                     GM_ADDR softmax_lse_,
                     GM_ADDR cu_seq_qlen_,
                     GM_ADDR cu_seq_kvlen_,
+                    GM_ADDR seqUsedQ_,
+                    GM_ADDR seqUsedKv_,
                     GM_ADDR dq_,
                     GM_ADDR dk_,
                     GM_ADDR dv_,
@@ -192,6 +197,8 @@ struct FAGKernelParams {
         , softmax_lse(softmax_lse_)
         , cu_seq_qlen(cu_seq_qlen_)
         , cu_seq_kvlen(cu_seq_kvlen_)
+        , seqUsedQ(seqUsedQ_)
+        , seqUsedKv(seqUsedKv_)
         , dq(dq_)
         , dk(dk_)
         , dv(dv_)

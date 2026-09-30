@@ -19,9 +19,8 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
-                                           const std::optional<at::Tensor>& cuSeqlensQ,
-                                           const std::optional<at::Tensor>& cuSeqlensK)
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cacheSeqlens,
+                                           const std::optional<at::Tensor>& seqlensQ)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -56,12 +55,9 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
 
     c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
-    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
-    if (cuSeqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
-    }
-    if (cuSeqlensK.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensK->storage().data_ptr(), aicpuStream);
+    c10_npu::NPUCachingAllocator::recordStream(cacheSeqlens.storage().data_ptr(), aicpuStream);
+    if (seqlensQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
 }
@@ -74,7 +70,7 @@ at::Tensor get_scheduler_metadata(
         int64_t headdim,
         int64_t headdim_v,
         at::Tensor cache_seqlens,
-        std::optional<at::Tensor> cu_seqlens_q,
+        std::optional<at::Tensor> seqlens_q,
         std::optional<at::Tensor> cu_seqlens_k,
         std::optional<int64_t> page_size,
         std::optional<int64_t> num_blocks,
@@ -95,13 +91,13 @@ at::Tensor get_scheduler_metadata(
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
 
-    const bool is_varlen_q = cu_seqlens_q.has_value();
+    const bool is_varlen_q = seqlens_q.has_value();
     const bool is_varlen_kv = cu_seqlens_k.has_value();
     if (is_varlen_q) {
-        auto cu_q = cu_seqlens_q.value();
-        TORCH_CHECK(cu_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-        TORCH_CHECK(cu_q.is_contiguous(), "cu_seqlens_q must be contiguous");
-        TORCH_CHECK(cu_q.numel() == batch_size + 1, "cu_seqlens_q must have batch_size+1 elements");
+        auto seqlens_q_t = seqlens_q.value();
+        TORCH_CHECK(seqlens_q_t.dtype() == torch::kInt32, "seqlens_q must have dtype int32");
+        TORCH_CHECK(seqlens_q_t.is_contiguous(), "seqlens_q must be contiguous");
+        TORCH_CHECK(seqlens_q_t.numel() == batch_size, "seqlens_q must have batch_size elements");
     }
     if (is_varlen_kv) {
         auto cu_k = cu_seqlens_k.value();
@@ -116,9 +112,8 @@ at::Tensor get_scheduler_metadata(
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
 
     FAMetadataArgs args{};
-    args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q.value().data_ptr()) : 0;
-    args.seqlensKAddr = is_varlen_kv ? reinterpret_cast<uint64_t>(cu_seqlens_k.value().data_ptr())
-                                     : reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
+    args.seqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(seqlens_q.value().data_ptr()) : 0;
+    args.cacheSeqlensAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
     args.batch = static_cast<uint32_t>(batch_size);
     args.numHeads = static_cast<uint32_t>(num_heads_q);
     args.numHeadsK = static_cast<uint32_t>(num_heads_kv);
@@ -146,7 +141,7 @@ at::Tensor get_scheduler_metadata(
         args.softmaxScale = static_cast<float>(softmax_scale) / static_cast<float>(softcapValue);
     }
     args.softcapValue = static_cast<float>(softcapValue);
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, cu_seqlens_k);
+    return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);
 }
 
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
