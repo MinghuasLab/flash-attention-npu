@@ -275,6 +275,26 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferTilingData* tilingDa
 
 } // namespace
 
+__global__ __aicpu__ uint32_t MergeFATiling(void* args)
+{
+    const auto* overrides = reinterpret_cast<const FATilingOverrides*>(args);
+    auto* tiling = reinterpret_cast<FAInferTilingData*>(overrides->tilingAddr);
+    std::memcpy(tiling, reinterpret_cast<const void*>(overrides->metadataAddr), sizeof(*tiling));
+    tiling->numBlocks = overrides->numBlocks;
+    tiling->blockSize = overrides->blockSize;
+    tiling->maxNumBlocksPerBatch = overrides->maxNumBlocksPerBatch;
+    tiling->maskType = overrides->maskType;
+    tiling->scaleValue = overrides->scaleValue;
+    tiling->softcapValue = overrides->softcapValue;
+    tiling->windowSizeLeft = overrides->windowSizeLeft;
+    tiling->windowSizeRight = overrides->windowSizeRight;
+    if (overrides->allowFlashDecode == 0) {
+        tiling->flashDecodeFlag = 0;
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 {
     auto* metadataArgs = reinterpret_cast<FAMetadataArgs*>(args);
@@ -290,14 +310,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     tilingData->kvHeads = metadataArgs->numHeadsK;
     tilingData->embeddingSize = metadataArgs->embeddingSize;
     tilingData->embeddingSizeV = metadataArgs->embeddingSizeV;
-    tilingData->numBlocks = metadataArgs->numBlocks;
-    tilingData->blockSize = metadataArgs->pagedKV ? metadataArgs->blockSize : 128;
-    tilingData->maxNumBlocksPerBatch = metadataArgs->maxNumBlocksPerBatch;
+    // Physical KV layout and score parameters are filled by forward.
+    tilingData->blockSize = 128;
     tilingData->maskType = metadataArgs->maskType;
-    tilingData->scaleValue = metadataArgs->softcapValue > 0.0f
-                                 ? metadataArgs->softmaxScale / metadataArgs->softcapValue
-                                 : metadataArgs->softmaxScale;
-    tilingData->softcapValue = metadataArgs->softcapValue;
     tilingData->windowSizeLeft = metadataArgs->windowSizeLeft;
     tilingData->windowSizeRight = metadataArgs->windowSizeRight;
     tilingData->sparseMode = 0;
@@ -357,7 +372,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 
     const uint32_t groupSizeForFlashDecode =
         metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
-    const bool isFlashDecodeCandidate = metadataArgs->pagedKV != 0 && metadataArgs->isVarlen != 0 &&
+    const bool isFlashDecodeCandidate = metadataArgs->isVarlen != 0 &&
                                         metadataArgs->numSplits != 1 && metadataArgs->maskType != 2 &&
                                         maxQSeqlen <= 16 && maxQSeqlen * groupSizeForFlashDecode <= 128 &&
                                         maxKvSeqlen >= 1024;

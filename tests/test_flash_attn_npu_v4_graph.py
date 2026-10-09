@@ -75,7 +75,6 @@ def test_flash_attn_varlen_graph(is_causal):
             causal=is_causal,
             window_size_left=WINDOW_SIZE[0],
             window_size_right=WINDOW_SIZE[1],
-            page_size=BLOCK_SIZE,
         )
     else:
         metadata_kwargs = dict(

@@ -49,11 +49,19 @@ struct FAMetadataArgs {
     // seqlensQAddr:   per-batch *used* Q lengths [batch] (used when hasSequsedQ != 0)
     uint64_t cuSeqlensQAddr, seqlensQAddr, seqlensKAddr, metaOutAddr;
     uint32_t batch, numHeads, numHeadsK, embeddingSize, embeddingSizeV;
-    uint32_t numBlocks, blockSize, maxNumBlocksPerBatch, maxQSeqlen;
-    uint32_t maskType, blockDim, isVarlen, isVarlenKv, pagedKV, numSplits;
+    uint32_t maxQSeqlen;
+    uint32_t maskType, blockDim, isVarlen, isVarlenKv, numSplits;
     uint32_t hasSequsedQ;
-    float softmaxScale;
-    float softcapValue;
     int64_t windowSizeLeft, windowSizeRight;
+};
+
+// Forward computes these values on CPU. The AICPU merge only copies them into
+// a private tiling buffer, avoiding a synchronous H2D copy during graph capture.
+struct FATilingOverrides {
+    uint64_t metadataAddr, tilingAddr;
+    uint32_t numBlocks, blockSize, maxNumBlocksPerBatch, maskType;
+    float scaleValue, softcapValue;
+    int64_t windowSizeLeft, windowSizeRight;
+    uint32_t allowFlashDecode;
 };
 #endif

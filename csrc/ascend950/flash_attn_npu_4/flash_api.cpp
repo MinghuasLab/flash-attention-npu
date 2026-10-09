@@ -67,12 +67,11 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
 }
 
 at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k, int64_t num_heads_q,
-                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v, pybind11::object,
+                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v,
                                   at::Tensor cache_seqlens, std::optional<at::Tensor> cu_seqlens_q = std::nullopt,
-                                  std::optional<int64_t> page_size = std::nullopt, bool causal = false,
-                                  int64_t window_left = -1, int64_t window_right = -1, double softcap = 0.0,
+                                  bool causal = false,
+                                  int64_t window_left = -1, int64_t window_right = -1,
                                   int64_t num_splits = 0, std::optional<bool> pack_gqa = std::nullopt, int64_t = 0,
-                                  std::optional<double> scale = std::nullopt,
                                   std::optional<at::Tensor> seqused_q = std::nullopt)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
@@ -85,9 +84,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     const uint32_t block_dim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(block_dim), "num_splits must be in [0, ",
                 block_dim, "]");
-    TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && cu_seqlens_q.has_value()),
-                "num_splits>1 requires paged KV cache and varlen query");
-    TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative");
     const bool is_varlen_q = cu_seqlens_q.has_value();
     if (is_varlen_q) {
         auto cq = cu_seqlens_q.value();
@@ -101,8 +97,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                         sq.dim() == 1 && sq.numel() == batch_size,
                     "seqused_q must be a contiguous int32 tensor of shape [batch] on NPU");
     }
-    const uint32_t page = page_size.value_or(128);
-    TORCH_CHECK(page == 128 || page == 256 || page == 512 || page == 1024, "unsupported page_size");
     FAMetadataArgs args{};
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q->data_ptr()) : 0;
     args.seqlensQAddr = seqused_q.has_value() ? reinterpret_cast<uint64_t>(seqused_q->data_ptr()) : 0;
@@ -113,13 +107,9 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.numHeadsK = num_heads_kv;
     args.embeddingSize = headdim;
     args.embeddingSizeV = headdim_v;
-    args.blockSize = page;
-    args.maxNumBlocksPerBatch = page_size ? (max_seqlen_k + page - 1) / page : 0;
-    args.numBlocks = page_size ? batch_size * args.maxNumBlocksPerBatch : 0;
     args.maxQSeqlen = max_seqlen_q;
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q;
-    args.pagedKV = page_size.has_value();
     args.numSplits = num_splits;
     if (max_seqlen_k > 0 && window_left >= max_seqlen_k)
         window_left = -1;
@@ -132,8 +122,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.maskType = normalized_causal ? 1 : (local ? 2 : 0);
     args.windowSizeLeft = local && window_left < 0 ? max_seqlen_k : window_left;
     args.windowSizeRight = local && window_right < 0 ? max_seqlen_k : window_right;
-    args.softmaxScale = scale.value_or(1.0 / std::sqrt(double(headdim)));
-    args.softcapValue = static_cast<float>(softcap);
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, seqused_q);
 }
 

@@ -71,15 +71,12 @@ def _get_scheduler_metadata_op(
     headdim_v: int,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
-    page_size: Optional[int],
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    softcap: float,
     num_splits: int,
     pack_gqa: Optional[bool],
     sm_margin: int,
-    softmax_scale: Optional[float],
     seqused_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Keep the raw pybind call behind a torch.library op.  Calling a pybind
@@ -93,18 +90,14 @@ def _get_scheduler_metadata_op(
         num_heads_kv,
         headdim,
         headdim_v,
-        None,
         cache_seqlens,
         cu_seqlens_q,
-        page_size,
         causal,
         window_size_left,
         window_size_right,
-        softcap,
         num_splits,
         pack_gqa,
         sm_margin,
-        softmax_scale,
         seqused_q,
     )
 
@@ -120,15 +113,12 @@ def _get_scheduler_metadata_fake(
     headdim_v: int,
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
-    page_size: Optional[int],
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    softcap: float,
     num_splits: int,
     pack_gqa: Optional[bool],
     sm_margin: int,
-    softmax_scale: Optional[float],
     seqused_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # The metadata is an opaque byte buffer during tracing.  Ascend950 FA4
@@ -162,13 +152,10 @@ def get_scheduler_metadata(
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
     _arch: Optional[int] = None,
-    softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
-    page_size: Optional[int] = None,
-    softcap: float = 0.0,
 ):
     """Precompute Ascend 950 FA4 metadata using the Tri Dao FA4 signature.
 
-    Ascend FA4 does not support KV updates, padded-Q lengths, left padding, or
+    Ascend FA4 does not support KV updates, padded BSND Q lengths, left padding, or
     fixed split lengths. Those Tri Dao parameters remain as compatibility
     placeholders and must retain their default unsupported values.
     """
@@ -216,15 +203,12 @@ def get_scheduler_metadata(
         headdim_v,
         seqused_k,
         cu_seqlens_q,
-        page_size,
         causal,
         window_size_left,
         window_size_right,
-        softcap,
         num_splits,
         pack_gqa,
         0,
-        softmax_scale,
         seqused_q,
     )
 
@@ -538,8 +522,6 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size_left=window_size[0],
                 window_size_right=window_size[1],
                 seqused_k=seqused_k,
-                softmax_scale=softmax_scale,
-                softcap=softcap,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
@@ -755,9 +737,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 seqused_k=kv_seqlens,
                 seqused_q=seqused_q,
                 cu_seqlens_q=cu_seqlens_q,
-                softmax_scale=softmax_scale,
-                page_size=(k.shape[1] if page_table is not None and k.dim() == 4 else None),
-                softcap=softcap,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(

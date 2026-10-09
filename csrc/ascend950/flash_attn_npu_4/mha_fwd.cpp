@@ -35,6 +35,8 @@
 #include "tiling_from_tensors.hpp"
 #include "fa_metadata_args.h"
 
+extern __global__ __aicpu__ uint32_t MergeFATiling(void* args);
+
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 using flash_attn_npu_950_v4::fill_inference_context;
@@ -348,11 +350,34 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // ============================================================
     at::Tensor tiling_dev;
     if (scheduler_metadata_.has_value()) {
-        tiling_dev = scheduler_metadata_.value();
-        TORCH_CHECK(tiling_dev.device() == q.device() && tiling_dev.dtype() == at::kByte && tiling_dev.is_contiguous(),
+        const auto& metadata = scheduler_metadata_.value();
+        TORCH_CHECK(metadata.device() == q.device() && metadata.dtype() == at::kByte && metadata.is_contiguous(),
                     "scheduler_metadata must be a contiguous NPU byte tensor");
-        TORCH_CHECK(tiling_dev.nbytes() == fa_metadata::MetadataBytes(false),
+        TORCH_CHECK(metadata.nbytes() == fa_metadata::MetadataBytes(false),
                     "scheduler_metadata has incompatible mask/layout size");
+        // Metadata owns scheduling; forward owns physical KV layout and score
+        // parameters. Patch a private copy so cached metadata remains reusable.
+        tiling_dev = at::empty_like(metadata);
+        FATilingOverrides overrides{};
+        overrides.metadataAddr = reinterpret_cast<uint64_t>(metadata.data_ptr());
+        overrides.tilingAddr = reinterpret_cast<uint64_t>(tiling_dev.data_ptr());
+        overrides.numBlocks = num_blocks;
+        overrides.blockSize = page_block_size;
+        overrides.maxNumBlocksPerBatch = max_num_blocks_per_seq;
+        overrides.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
+        const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
+        overrides.scaleValue = softcap > 0.0f ? scale / softcap : scale;
+        overrides.softcapValue = softcap;
+        overrides.windowSizeLeft = is_local && window_size_left < 0 ? metadataKvBound : window_size_left;
+        overrides.windowSizeRight = is_local && window_size_right < 0 ? metadataKvBound : window_size_right;
+        // AICPU may prepare a split schedule without knowing the KV layout.
+        // Preserve its runtime flag only when forward can launch FlashDecode.
+        overrides.allowFlashDecode = flashDecodeEnabled;
+        auto merge_tiling = [overrides, aclStream]() mutable -> int {
+            MergeFATiling<<<1, nullptr, aclStream>>>(&overrides, sizeof(overrides));
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_merge_tiling", merge_tiling);
     } else {
         at::Tensor tiling_cpu =
             at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));

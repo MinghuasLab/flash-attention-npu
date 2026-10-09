@@ -35,8 +35,57 @@ def test_950_scheduler_metadata_matches_signature():
         "num_splits", "headdim_v", "pack_gqa", "causal", "window_size_left",
         "window_size_right", "seqlen_k_new", "cu_seqlens_q", "cu_seqlens_k",
         "cu_seqlens_k_new", "seqused_q", "seqused_k", "leftpad_k",
-        "seqlen_k_per_split", "_arch", "softmax_scale", "page_size", "softcap"
+        "seqlen_k_per_split", "_arch"
     ]
+
+
+@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("paged", [False, True])
+def test_950_metadata_reuse_with_forward_parameters(page_size, paged):
+    if "Ascend950" not in _device_name:
+        pytest.skip("Ascend950-only metadata merging")
+    batch, q_len, kv_len, heads, dim = 2, 8, 2048, 2, 64
+    q = make_random_tensor((batch * q_len, heads, dim), torch.bfloat16, device="npu")
+    if paged:
+        k, v, table = _make_paged_cache(batch, kv_len, heads, dim, page_size, torch.bfloat16)
+        # A wider table must use its actual row stride, not ceil(maxK/page).
+        table = torch.cat([table, table[:, :1]], dim=1)
+        cu_k = None
+    else:
+        k = make_random_tensor((batch * kv_len, heads, dim), torch.bfloat16, device="npu")
+        v = make_random_tensor((batch * kv_len, heads, dim), torch.bfloat16, device="npu")
+        table = None
+        cu_k = _int32_npu([0, kv_len, 2 * kv_len])
+    cu_q = _int32_npu([0, q_len, 2 * q_len])
+    used_k = _int32_npu([kv_len] * batch)
+    metadata = get_scheduler_metadata(
+        q_len, kv_len, heads, heads, dim, 0,
+        cu_seqlens_q=cu_q, seqused_k=used_k,
+    )
+    before = metadata.clone()
+    for scale in (0.05, 0.2):
+        kwargs = dict(
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, seqused_k=used_k,
+            page_table=table, max_seqlen_q=q_len, max_seqlen_k=kv_len,
+            num_splits=0, softmax_scale=scale, return_lse=True,
+        )
+        out, lse, *_ = flash_attn_varlen_func(q, k, v, scheduler_metadata=metadata, **kwargs)
+        ref, ref_lse, *_ = flash_attn_varlen_func(q, k, v, disable_scheduler_metadata=True, **kwargs)
+        assert_fa_close(out, ref, ref, name="merged metadata out")
+        assert_fa_close(lse, ref_lse, ref_lse, name="merged metadata lse")
+        if page_size == 256:
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                graph_out, graph_lse, *_ = flash_attn_varlen_func(
+                    q, k, v, scheduler_metadata=metadata, **kwargs
+                )
+            for _ in range(2):
+                graph.replay()
+                torch.npu.synchronize()
+                assert_fa_close(graph_out, ref, ref, name="merged graph out")
+                assert_fa_close(graph_lse, ref_lse, ref_lse, name="merged graph lse")
+        assert torch.equal(metadata, before)
 
 
 @pytest.mark.parametrize(
@@ -147,8 +196,6 @@ def _metadata(
             window_size_right=window_size[1],
             seqused_q=seqlens_q,
             seqused_k=seqlens_k,
-            softmax_scale=softmax_scale,
-            page_size=page_size,
         )
 
     return get_scheduler_metadata(
