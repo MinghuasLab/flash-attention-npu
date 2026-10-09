@@ -237,6 +237,13 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
     assert host.current == "previous"
 
 
+def test_deterministic_inference_reuses_the_same_compiled_call(host):
+    for deterministic in (False, True, False):
+        interface.flash_attn_func(*host.inputs, deterministic=deterministic)
+    assert len(host.compiled) == 1
+    assert len(host.launched) == 3
+
+
 def test_public_call_restores_device_guard_on_compile_error(host, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("compile failed")

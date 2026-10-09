@@ -99,6 +99,9 @@ Q 为 `(B, Sq, Hq, D)`，K/V 为 `(B, Sk, Hkv, D)`；所有维度为正，
 - `score_mod` / `mask_mod`：自定义分数与掩码回调。自定义 `mask_mod` 覆盖上述内置掩码。
 - `aux_tensors` / `aux_scalars`：传给回调的辅助张量与运行时标量。
 - `block_sparse_tensors`：显式块元数据，见下文。
+- `deterministic`：接受 True/False，不改变推理前向的计算或编译对象；该选项对应
+  反向算法选择，本包仍不支持 backward。同一运行环境、编译产物、输入及块表顺序下，
+  确定性回调的重复调用应得到逐位一致的结果；不同块表顺序或计算路径之间不要求逐位一致。
 
 ## 回调与 SIMD / SIMT
 

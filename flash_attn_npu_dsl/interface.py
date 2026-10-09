@@ -251,6 +251,8 @@ def flash_attn_func(
 
     A mask alone applies to all KV blocks; sparse execution requires explicit
     block metadata. Modifiers consume scaled scores and Q-head indices.
+    deterministic selects backward behavior and does not change this inference
+    forward implementation.
     Unsupported options must retain their defaults in this forward subset.
     """
     import torch
@@ -261,7 +263,6 @@ def flash_attn_func(
         ("learnable_sink", learnable_sink is None),
         ("num_splits", num_splits == 1),
         ("pack_gqa", pack_gqa is None),
-        ("deterministic", deterministic is False),
         ("score_mod_bwd", score_mod_bwd is None),
         ("block_sparse_tensors_bwd", block_sparse_tensors_bwd is None),
     ):

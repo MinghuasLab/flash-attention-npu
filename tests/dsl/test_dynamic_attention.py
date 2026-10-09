@@ -450,6 +450,46 @@ def test_packed_lse_preserves_head_and_query_order(dtype, q_len, group):
     not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
     reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_deterministic_inference_is_bitwise_repeatable(dtype):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(17)
+    host = tuple(
+        torch.randn(shape, generator=generator).to(dtype)
+        for shape in ((2, 129, 4, 64), (2, 65, 2, 64), (2, 65, 2, 64))
+    )
+    inputs = tuple(value.to(device) for value in host)
+    q, k, v = (value.float().permute(0, 2, 1, 3) for value in host)
+    k, v = k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1)
+    keep = torch.arange(65)[None, :] <= torch.arange(129)[:, None] + 65 - 129
+    scores = (q @ k.transpose(-1, -2) / 8).masked_fill(~keep, -torch.inf)
+    expected = (scores.softmax(-1).nan_to_num() @ v).permute(0, 2, 1, 3)
+    expected_lse = scores.logsumexp(-1)
+    first = None
+    for index in range(8):
+        if index == 4:
+            inputs = tuple(value.clone() for value in inputs)
+        out, lse = interface.flash_attn_func(
+            *inputs, causal=True, return_lse=True, deterministic=bool(index % 2)
+        )
+        torch.npu.synchronize()
+        out, lse = out.cpu(), lse.cpu()
+        bits = tuple(value.contiguous().view(torch.uint8) for value in (out, lse))
+        if first is None:
+            first = tuple(value.clone() for value in bits)
+            torch.testing.assert_close(out.float(), expected, rtol=0, atol=0.05)
+            torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0.05)
+            assert torch.count_nonzero(out[:, :64]) == 0
+        assert all(torch.equal(actual, initial) for actual, initial in zip(bits, first))
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
 def test_dynamic_binding_matches_dlpack_and_uses_current_buffers(monkeypatch):
     import torch_npu  # noqa: F401
     from catlass.base_dsl.jit_executor import JitCompiledFunction
