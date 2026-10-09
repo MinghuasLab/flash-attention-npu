@@ -216,7 +216,7 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 23
+    assert len(host.compiled[0]) == 24
     args, kwargs = host.launched[0]
     assert len(args) == 8 and kwargs == {"block_num": 2}
     assert (args[4] is None) == (not lse)
@@ -230,8 +230,8 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         )
     dynamic = tensors is None and not scalars
     assert all(tensor.dynamic_mode == (0 if dynamic else None) for tensor in host.compiled[0][:4])
-    assert host.compiled[0][11:13] == ((None, None) if dynamic else (17, 65))
-    assert host.compiled[0][-2:] == (96, None)
+    assert host.compiled[0][11:13] == ((None, None) if dynamic else (34, 65))
+    assert host.compiled[0][-3:] == (96, None, 2)
     assert out.shape == host.inputs[0].shape
     assert (result_lse is None) == (not lse)
     assert host.current == "previous"
@@ -256,6 +256,64 @@ def test_public_call_checks_external_storage_not_new_outputs(host, monkeypatch):
     assert len(checked) == len(expected)
     assert all(actual is original for actual, original in zip(checked, expected))
     assert all(tensor is not out and tensor is not lse for tensor in checked)
+
+
+@pytest.mark.parametrize(
+    "batch,q_len,heads,kv_heads,cores,sparse,window,expected",
+    [
+        (650, 2, 49, 1, 32, None, (None, None), 49),
+        (2, 64, 6, 1, 32, None, (None, None), 1),
+        (32, 129, 33, 1, 32, None, (None, None), 1),
+        (32, 256, 33, 1, 32, None, (None, None), 1),
+        (32, 2, 48, 3, 32, None, (None, None), 16),
+        (32, 2, 49, 1, 32, SimpleNamespace(strides=((0, 1, 1),)), (None, None), 1),
+        (32, 2, 49, 1, 32, None, (None, 0), 1),
+    ],
+)
+def test_packed_head_policy_preserves_parallelism(
+    batch, q_len, heads, kv_heads, cores, sparse, window, expected
+):
+    assert (
+        interface._select_packed_heads(batch, q_len, heads, kv_heads, cores, sparse, *window)
+        == expected
+    )
+
+
+def test_packed_public_call_preserves_layout_and_reuses_lengths(host):
+    k = torch.empty(32, 129, 1, 64, dtype=torch.float16)
+    for q_len in (5, 7):
+        q = torch.empty(32, q_len, 33, 64, dtype=torch.float16)
+        out, lse = interface.flash_attn_func(q, k, k, return_lse=True)
+        assert out.shape == q.shape and out.is_contiguous()
+        assert lse.shape == (32, 33, q_len) and lse.is_contiguous()
+        launch = host.launched[-1][0]
+        assert launch[0].tensor.shape == (32, q_len * 33, 1, 64)
+        assert launch[0].tensor.data_ptr() == q.data_ptr()
+        assert q.shape == (32, q_len, 33, 64)
+    assert len(host.compiled) == 1
+    assert host.compiled[0][-1] == 33
+
+
+@pytest.mark.parametrize(
+    "mask,score,q_len,packed_heads",
+    [
+        (causal_mask, None, 5, 33),
+        (None, scale_score, 5, 33),
+        (causal_mask, vector_score, 5, 33),
+        (vector_mask, scale_score, 5, 33),
+        (vector_mask, vector_score, 5, 33),
+        (causal_mask, scale_score, 32, 33),
+        (causal_mask, None, 33, 1),
+        (None, scale_score, 63, 1),
+        (vector_mask, scale_score, 64, 1),
+        (vector_mask, vector_score, 64, 33),
+    ],
+)
+def test_callback_packing_limits_simt_to_short_queries(host, mask, score, q_len, packed_heads):
+    q = torch.empty(32, q_len, 33, 64, dtype=torch.float16)
+    k = torch.empty(32, 17, 1, 64, dtype=torch.float16)
+    interface.flash_attn_func(q, k, k, mask_mod=mask, score_mod=score)
+    assert host.compiled[0][-1] == packed_heads
 
 
 def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host, monkeypatch):
@@ -327,11 +385,15 @@ def test_public_call_reuses_dynamic_lengths_with_current_buffers(host, monkeypat
     assert args[4].tensor is lse
     assert args[4].build_memref_launch_fields()[0] == lse.data_ptr()
     assert args[4].build_memref_launch_fields()[3:5] == (4 * q_len, 1)
+    # A short dense GQA now selects the packed specialization; window paths do not.
+    interface.flash_attn_func(*host.inputs, return_lse=True, **options)
+    expected_variants = 3 if not options else 2
+    assert len(host.compiled) == expected_variants
+    assert len(host.converted) == (14 if not options else 9)
     with monkeypatch.context() as context:
         context.setattr(interface, "from_dlpack", unexpected_conversion)
         interface.flash_attn_func(*host.inputs, return_lse=True, **options)
-    assert len(host.compiled) == 2
-    assert len(host.converted) == 9
+    assert len(host.compiled) == expected_variants
 
 
 def test_dynamic_length_cache_keeps_batch_heads_dimension_and_dtype(host):
@@ -390,8 +452,10 @@ def test_public_callbacks_select_independent_modes_and_mask_overrides_window(
     args = host.compiled[0]
     assert args[15] is mask and args[16] is score
     assert args[17:19] == expected and args[19:21] == modes
-    assert args[21:] == (96, None)
-    assert args[11:13] == ((None, None) if mask is None and score is None else (17, 65))
+    assert args[21:] == (96, None, 2 if mask is not None else 1)
+    assert args[11:13] == (
+        (None, None) if mask is None and score is None else (34 if mask is not None else 17, 65)
+    )
     assert host.launched[0][0][5] is None
 
 

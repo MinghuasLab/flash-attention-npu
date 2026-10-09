@@ -254,7 +254,9 @@ def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, o
             _broadcast(running_max, row) + tla.log(safe_total, mask=full_mask),
             tla.full(float("-inf"), tla.Float32),
         )
-        _store_scalar(lse, row, logsumexp, one_mask)
+        tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
+            logsumexp, params=tla.params.UnalignStoreParams(), mask=one_mask
+        )
     for chunk in tla.range_constexpr(2):
         dst = _chunk(output, row, chunk)
         dst.store(tla.where(valid, dst.load() / safe_total, zero), mask=full_mask)
@@ -286,7 +288,11 @@ def output_empty_row(output, lse, row, full_mask, one_mask):
     for chunk in tla.range_constexpr(2):
         _chunk(output, row, chunk).store(zero, mask=full_mask)
     if tla.const_expr(lse is not None):
-        _store_scalar(lse, row, tla.full(float("-inf"), tla.Float32), one_mask)
+        tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
+            tla.full(float("-inf"), tla.Float32),
+            params=tla.params.UnalignStoreParams(),
+            mask=one_mask,
+        )
 
 
 @tla.jit

@@ -2,7 +2,8 @@
 
 """Ascend 950 BSND attention with score/mask callbacks and optional block sparsity.
 
-Each task processes one 128-row Q tile for one batch and Q head. Cube computes
+Each task processes one 128-row Q tile for one batch and Q head; packed
+tasks fold query heads sharing one KV head into those rows. Cube computes
 QK and PV; vector stages apply callbacks, online softmax and output rescaling.
 QK is issued two pipeline iterations before its PV. L1 P and UB alpha each use
 three slots, rotated by active-block ordinal. Physical KV indices select data
@@ -60,6 +61,106 @@ def _sparse_block(sparse_tensors, ordinal, partial_count, partial_base, full_bas
     return physical_index, block_kind
 
 
+@tla.jit
+def _load_grouped_query(
+    source,
+    destination,
+    start,
+    rows,
+    batch_offset,
+    group,
+    heads: tla.Constexpr[int],
+    groups: tla.Constexpr[int],
+    dim: tla.Constexpr[int],
+):
+    """Gather consecutive heads within each Q position into a single L1 tile."""
+    copied = tla.Int32(0)
+    while copied < rows:
+        index = start + copied
+        q = index // heads
+        head = index - q * heads
+        count = min(rows - copied, heads - head)
+        src = tla.make_tensor(
+            source.ptr + batch_offset + (q * heads * groups + group * heads + head) * dim,
+            tla.make_layout(tla.make_shape(count, dim), tla.make_stride(dim, 1)),
+        )
+        dst = tla.make_tensor(
+            destination,
+            tla.make_layout(
+                # Keep the full tile's column pitch across all row segments.
+                tla.make_shape((16, (rows + 15) // 16), (16, (dim + 15) // 16)),
+                tla.make_stride((16, 256), (1, ((rows + 15) // 16) * 256)),
+                origin_shape=tla.make_shape(rows, dim),
+                layoutTag=tla.arch.zN,
+            ),
+            coord=tla.make_coord(copied, 0),
+        )
+        dst_tile = tla.tile_view(dst, tla.make_shape(count, dim), tla.make_coord(0, 0))
+        tla.copy(dst_tile, src)
+        copied += count
+
+
+@tla.jit
+def _store_grouped_output(
+    source,
+    destination,
+    start,
+    rows,
+    batch_offset,
+    group,
+    heads: tla.Constexpr[int],
+    groups: tla.Constexpr[int],
+    dim: tla.Constexpr[int],
+):
+    """Scatter packed UB rows back to their original BSND head groups."""
+    copied = tla.Int32(0)
+    while copied < rows:
+        index = start + copied
+        q = index // heads
+        head = index - q * heads
+        count = min(rows - copied, heads - head)
+        src = tla.make_tensor(
+            source + copied * 128,
+            tla.make_layout(tla.make_shape(count, dim), tla.make_stride(128, 1)),
+        )
+        dst = tla.make_tensor(
+            destination.ptr + batch_offset + (q * heads * groups + group * heads + head) * dim,
+            tla.make_layout(tla.make_shape(count, dim), tla.make_stride(dim, 1)),
+        )
+        tla.copy(dst, src)
+        copied += count
+
+
+@tla.jit
+def _store_packed_lse(
+    source,
+    destination,
+    start,
+    rows,
+    q_len,
+    heads: tla.Constexpr[int],
+    batch,
+    groups: tla.Constexpr[int] = 1,
+    group=0,
+):
+    """Write packed rows to [B,H,Q], reading one FP32 from each 32-byte UB slot."""
+    copied = tla.Int32(0)
+    while copied < rows:
+        index = start + copied
+        head = index % heads
+        count = rows - copied if rows - copied < heads - head else heads - head
+        src = tla.make_tensor(
+            source.ptr + copied * 8,
+            tla.make_layout(tla.make_shape(count, 1), tla.make_stride(8, 1)),
+        )
+        dst = tla.make_tensor(
+            destination.ptr + ((batch * groups + group) * heads + head) * q_len + index // heads,
+            tla.make_layout(tla.make_shape(count, 1), tla.make_stride(q_len, 1)),
+        )
+        tla.copy(dst, src)
+        copied += count
+
+
 @tla.kernel
 def flex_attention_kernel(
     query: tla.Tensor,
@@ -85,11 +186,14 @@ def flex_attention_kernel(
     score_uses_simd: tla.Constexpr[bool] = False,
     head_dim: tla.Constexpr[int] = 128,
     sparse_strides: tla.Constexpr = None,
+    packed_heads: tla.Constexpr[int] = 1,
 ) -> None:
     if tla.const_expr(q_len is None):
         # Contiguous BSND roots use (B*S, H*D); B/H/D stay compile-time facts.
         q_len = query.shape[0] // batch
         kv_len = key.shape[0] // batch
+        if tla.const_expr(packed_heads > 1 and kv_heads > 1):
+            q_len *= packed_heads
     mixed_modifiers = (
         mask_mod is not None and score_mod is not None and mask_uses_simd != score_uses_simd
     )
@@ -123,7 +227,7 @@ def flex_attention_kernel(
     q_tiles = (q_len + 127) // 128
     kv_tiles = (kv_len + 127) // 128
     total_tasks = batch * q_heads * q_tiles
-    seqlen_info = create_seqlen_info(q_len, kv_len)
+    seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
     # --- L1->L0 完成 -> GM->L1 可开始 ---
     q_l0a_ready_l1 = tla.flag("l0a_ready_l1", tla.arch.MTE1, tla.arch.MTE2)
     k_l0b_ready_l1_0 = tla.flag("k_l0b_ready_l1_0", tla.arch.MTE1, tla.arch.MTE2)
@@ -266,7 +370,9 @@ def flex_attention_kernel(
     lastSum_ptr = tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256)
 
     if tla.const_expr(lse is not None):
-        lse_ub_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
+        lse_ub_ptr = tla.allocate(
+            512 if packed_heads > 1 else 64, tla.Float32, tla.AddressSpace.ub, 256
+        )
     else:
         lse_ub_ptr = None
     row_max_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
@@ -339,7 +445,20 @@ def flex_attention_kernel(
                 )
                 l1_q = tla.make_tensor_like(l1Q_ptrs[0], gm_q_tile, tla.arch.zN)
                 tla.wait_flag(q_l0a_ready_l1)
-                tla.copy(l1_q, gm_q_tile)
+                if tla.const_expr(packed_heads > 1 and kv_heads > 1):
+                    _load_grouped_query(
+                        query,
+                        l1Q_ptrs[0],
+                        qSTileIdx * 128,
+                        rowNum,
+                        qBOffset,
+                        qHeadIdx,
+                        packed_heads,
+                        kv_heads,
+                        head_dim,
+                    )
+                else:
+                    tla.copy(l1_q, gm_q_tile)
                 tla.set_flag(q_l1_ready_l0)
                 tla.wait_flag(q_l1_ready_l0)
 
@@ -625,6 +744,7 @@ def flex_attention_kernel(
                                         score_mod=score_mod,
                                         apply_scale=True,
                                         apply_mask=False,
+                                        packed_heads=packed_heads,
                                     )
                                 else:
                                     process_score_tile_simt(
@@ -632,6 +752,7 @@ def flex_attention_kernel(
                                         mask_mod=None,
                                         score_mod=score_mod,
                                         apply_scale=True,
+                                        packed_heads=packed_heads,
                                     )
                                 tla.pipe_barrier(tla.pipes.ALL)
                                 if block_kind == 0:
@@ -642,6 +763,7 @@ def flex_attention_kernel(
                                             score_mod=None,
                                             apply_scale=False,
                                             apply_mask=True,
+                                            packed_heads=packed_heads,
                                         )
                                     else:
                                         process_score_tile_simt(
@@ -649,6 +771,7 @@ def flex_attention_kernel(
                                             mask_mod=mask_mod,
                                             score_mod=None,
                                             apply_scale=False,
+                                            packed_heads=packed_heads,
                                         )
                                     tla.pipe_barrier(tla.pipes.ALL)
                                 scores_are_scaled = True
@@ -678,6 +801,7 @@ def flex_attention_kernel(
                                         seqlen_info,
                                         mask_mod,
                                         score_mod,
+                                        packed_heads=packed_heads,
                                     )
                                     tla.pipe_barrier(tla.pipes.ALL)
                                 if tla.const_expr(use_simd_modifiers):
@@ -700,6 +824,7 @@ def flex_attention_kernel(
                                             score_mod,
                                             True,
                                             True,
+                                            packed_heads=packed_heads,
                                         )
                                     elif tla.const_expr(score_mod is not None):
                                         process_score_tile_simd(
@@ -720,6 +845,7 @@ def flex_attention_kernel(
                                             score_mod,
                                             True,
                                             False,
+                                            packed_heads=packed_heads,
                                         )
                                     tla.pipe_barrier(tla.pipes.ALL)
                                 elif tla.const_expr(
@@ -744,6 +870,7 @@ def flex_attention_kernel(
                                         None,
                                         score_mod is None,
                                         False,
+                                        packed_heads=packed_heads,
                                     )
                                     tla.pipe_barrier(tla.pipes.ALL)
                                 scores_are_scaled = use_simt
@@ -1043,7 +1170,13 @@ def flex_attention_kernel(
                             re_running_sum = tla.make_tensor(lastSum_ptr, re_state_layout)
                             re_lse_ub = None
                             if tla.const_expr(lse is not None):
-                                re_lse_ub = tla.make_tensor(lse_ub_ptr, re_state_layout)
+                                re_lse_ub = tla.make_tensor(
+                                    lse_ub_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(64, 1),
+                                        tla.make_stride(8 if packed_heads > 1 else 1, 1),
+                                    ),
+                                )
                             output_update_tile(
                                 re_pv_ub,
                                 re_output_ub,
@@ -1076,7 +1209,10 @@ def flex_attention_kernel(
                     if tla.const_expr(lse is not None):
                         empty_lse_ub = tla.make_tensor(
                             lse_ub_ptr,
-                            tla.make_layout(tla.make_shape(64), tla.make_stride(1)),
+                            tla.make_layout(
+                                tla.make_shape(64, 1),
+                                tla.make_stride(8 if packed_heads > 1 else 1, 1),
+                            ),
                         )
                     with tla.vec.func(mode="simd"):
                         empty_full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
@@ -1134,17 +1270,53 @@ def flex_attention_kernel(
                     tla.make_shape(final_m, head_dim),
                     tla.make_coord(0, 0),
                 )
-                tla.copy(final_gm_out, final_packed_valid)
+                if tla.const_expr(packed_heads > 1 and kv_heads > 1):
+                    _store_grouped_output(
+                        ubO16_ptr,
+                        attention_out,
+                        qSTileIdx * 128 + final_subIdxEff * final_mHalf,
+                        final_m,
+                        qBOffset,
+                        qHeadIdx,
+                        packed_heads,
+                        kv_heads,
+                        head_dim,
+                    )
+                else:
+                    tla.copy(final_gm_out, final_packed_valid)
                 if tla.const_expr(lse is not None):
                     final_lse_layout = tla.make_layout(tla.make_shape(final_m), tla.make_stride(1))
-                    final_gm_lse = tla.make_tensor(
-                        lse.ptr
-                        + (curBatch * q_heads + qHeadIdx) * q_len
-                        + qSTileIdx * 128
-                        + final_subIdxEff * final_mHalf,
-                        final_lse_layout,
-                    )
-                    tla.copy(final_gm_lse, tla.make_tensor(lse_ub_ptr, final_lse_layout))
+                    if tla.const_expr(packed_heads > 1):
+                        final_gm_lse = tla.make_tensor(
+                            lse.ptr,
+                            tla.make_layout(
+                                tla.make_shape(batch * q_heads * q_len), tla.make_stride(1)
+                            ),
+                        )
+                        _store_packed_lse(
+                            tla.make_tensor(
+                                lse_ub_ptr,
+                                tla.make_layout(tla.make_shape(64, 1), tla.make_stride(8, 1)),
+                            ),
+                            final_gm_lse,
+                            qSTileIdx * 128 + final_subIdxEff * final_mHalf,
+                            final_m,
+                            q_len // packed_heads,
+                            packed_heads,
+                            curBatch,
+                            q_heads,
+                            qHeadIdx,
+                        )
+                        tla.pipe_barrier(tla.pipes.ALL)
+                    else:
+                        final_gm_lse = tla.make_tensor(
+                            lse.ptr
+                            + (curBatch * q_heads + qHeadIdx) * q_len
+                            + qSTileIdx * 128
+                            + final_subIdxEff * final_mHalf,
+                            final_lse_layout,
+                        )
+                        tla.copy(final_gm_lse, tla.make_tensor(lse_ub_ptr, final_lse_layout))
             tla.set_flag(mte3_ready_rescale)
     # Drain outstanding transfers and buffer-release flags before kernel exit.
     with tla.cube():

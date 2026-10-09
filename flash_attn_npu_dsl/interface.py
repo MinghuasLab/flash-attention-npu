@@ -16,6 +16,24 @@ _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
 
 
+def _select_packed_heads(batch, q_len, q_heads, kv_heads, cores, sparse, window_left, window_right):
+    """Fold heads sharing one KV head only when occupied cores are preserved."""
+    group = q_heads // kv_heads
+    if q_len >= 128 or group == 1:
+        return 1
+    if sparse is not None and any(
+        stride is not None and stride[1] != 0 for stride in sparse.strides
+    ):
+        return 1
+    if window_left is not None or window_right is not None:
+        return 1
+    original_tasks = batch * q_heads * ((q_len + 127) // 128)
+    packed_tasks = batch * kv_heads * ((q_len * group + 127) // 128)
+    if packed_tasks >= original_tasks or packed_tasks < min(original_tasks, cores):
+        return 1
+    return group
+
+
 def _check_launch_tensors(tensors):
     """Require the dense storage addressed by the compiled RowMajor views."""
     import torch_npu
@@ -232,8 +250,17 @@ def flash_attn_func(
         raise ValueError("softmax_scale must be finite")
     mask_uses_simd, score_uses_simd = validate_modifiers(mask_mod, score_mod)
     aux_tensors, aux_scalars = _validate_aux(aux_tensors, aux_scalars, q.device)
+    dynamic_lengths = (
+        mask_mod is None
+        and score_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and aux_scalars is None
+    )
     with torch.npu.device(q.device.index):
-        # Dense/window execution computes its block interval on device.
+        cores = max(1, int(torch.npu.get_device_properties(q.device.index).cube_core_num))
+        original_shape = tuple(q.shape)
+        # Validate the caller's logical shape before folding heads into Q rows.
         sparse = (
             validate_block_sparse(
                 block_sparse_tensors,
@@ -246,21 +273,41 @@ def flash_attn_func(
             if block_sparse_tensors is not None
             else None
         )
+        packed_heads = _select_packed_heads(
+            batch, q_len, q_heads, kv_heads, cores, sparse, window_left, window_right
+        )
+        # SIMT coordinate work can outweigh packing savings for longer Q tiles.
+        has_simt_mod = (mask_mod is not None and not mask_uses_simd) or (
+            score_mod is not None and not score_uses_simd
+        )
+        if has_simt_mod and q_len > 32:
+            packed_heads = 1
+        if packed_heads > 1:
+            # Only MQA has a contiguous folded view. GQA groups are gathered and
+            # scattered on device, retaining the original BSND descriptors.
+            if dynamic_lengths and kv_heads == 1:
+                q = q.view(batch, q_len * packed_heads, 1, head_dim)
+            q_len *= packed_heads
+            q_heads = kv_heads
+            if sparse is not None:
+                # Every packed tile uses the original single Q-block list.
+                # Only its addressing changes; the caller's tensors stay intact.
+                sparse = sparse._replace(
+                    strides=tuple(
+                        (stride[0], stride[1], 0) if stride is not None else None
+                        for stride in sparse.strides
+                    )
+                )
         out = torch.empty_like(q)
         lse = (
-            torch.empty((batch, q_heads, q_len), device=q.device, dtype=torch.float32)
+            torch.empty(
+                (batch, original_shape[2], original_shape[1]), device=q.device, dtype=torch.float32
+            )
             if return_lse
             else None
         )
         tensors = (q, k, v, out, lse)
         sparse_tensors = sparse.tensors if sparse is not None else ()
-        dynamic_lengths = (
-            mask_mod is None
-            and score_mod is None
-            and sparse is None
-            and aux_tensors is None
-            and aux_scalars is None
-        )
         if not dynamic_lengths:
             # O/LSE are freshly allocated here; validate caller-owned storage.
             _check_launch_tensors((q, k, v, *sparse_tensors, *(aux_tensors or ())))
@@ -294,6 +341,7 @@ def flash_attn_func(
             score_uses_simd,
             head_dim,
             sparse.strides if sparse is not None else None,
+            packed_heads,
         )
         key = _compilation_key(
             (*tensors, *sparse_tensors),
@@ -333,6 +381,7 @@ def flash_attn_func(
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
         tasks = batch * q_heads * ((q_len + 127) // 128)
-        cores = torch.npu.get_device_properties(q.device.index).cube_core_num
         compiled(*runtime_args, block_num=min(tasks, max(1, int(cores))))
+        if packed_heads > 1 and dynamic_lengths and kv_heads == 1:
+            out = out.view(original_shape)
         return out, lse

@@ -12,7 +12,237 @@ if find_spec("torch") is None:
 
 import torch
 
-from flash_attn_npu_dsl import interface
+import catlass.tla as tla
+from flash_attn_npu_dsl import BlockSparseTensorsTorch, interface, simd
+
+
+def _head_mask(b, h, q, kv, info, aux):
+    return (h != 0) & (kv <= q + info.seqlen_k - info.seqlen_q)
+
+
+@tla.jit
+def _scale_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return score * 0.75
+
+
+@tla.jit
+def _coordinate_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars=None):
+    return (
+        score * 0.75
+        + h.to(tla.Float32) * 0.01
+        + q_idx.to(tla.Float32) * 0.02
+        - kv_idx.to(tla.Float32) * 0.03
+    )
+
+
+@simd
+def _vector_head_mask(b, h, q, kv, info, aux):
+    return tla.bitwise_and(
+        tla.cmp(h, 0, "ne"), tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "le")
+    )
+
+
+@simd
+def _vector_scale_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars=None):
+    return score * 0.75
+
+
+def _causal_mask(b, h, q, kv, info, aux, aux_scalars):
+    return (
+        (b > 0)
+        & (kv <= q + info.seqlen_k - info.seqlen_q)
+        & ((kv < 256) | (kv >= 384))
+        & ((b != 1) | (aux_scalars[0] == 0) | (kv >= 128))
+    )
+
+
+@simd
+def _vector_causal_mask(b, h, q, kv, info, aux, aux_scalars):
+    return tla.bitwise_and(
+        tla.bitwise_and(tla.cmp(b, 0, "gt"), tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "le")),
+        tla.bitwise_and(
+            tla.bitwise_or(tla.cmp(kv, 256, "lt"), tla.cmp(kv, 384, "ge")),
+            tla.bitwise_or(
+                tla.bitwise_or(tla.cmp(b, 1, "ne"), tla.cmp(kv * 0 + aux_scalars[0], 0, "eq")),
+                tla.cmp(kv, 128, "ge"),
+            ),
+        ),
+    )
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
+@pytest.mark.parametrize(
+    "dtype,dim,mask,score",
+    [
+        (torch.float16, 64, _causal_mask, _coordinate_score),
+        (torch.bfloat16, 96, _vector_causal_mask, _vector_scale_score),
+        (torch.float16, 128, _causal_mask, _vector_scale_score),
+        (torch.bfloat16, 64, _vector_causal_mask, _coordinate_score),
+    ],
+)
+@pytest.mark.parametrize("kv_heads", [1, 3])
+def test_packed_shared_blocks_preserve_coordinates_tail_and_rebinding(
+    dtype, dim, mask, score, kv_heads
+):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(17)
+    batch, sq, heads, sk = 32, 5, 33 * kv_heads, 389
+    host = tuple(
+        torch.randn(shape, generator=generator).to(dtype)
+        for shape in (
+            (batch, sq, heads, dim),
+            (batch, sk, kv_heads, dim),
+            (batch, sk, kv_heads, dim),
+        )
+    )
+    inputs = tuple(t.to(device) for t in host)
+    q, k, v = (t.float().permute(0, 2, 1, 3) for t in host)
+    k = k.repeat_interleave(heads // kv_heads, dim=1)
+    v = v.repeat_interleave(heads // kv_heads, dim=1)
+    scores = q @ k.transpose(-1, -2) * dim**-0.5 * 0.75
+    if score is _coordinate_score:
+        scores += (
+            torch.arange(heads)[:, None, None] * 0.01
+            + torch.arange(sq)[None, :, None] * 0.02
+            - torch.arange(sk)[None, None, :] * 0.03
+        )
+    # Partial tail first, then two full blocks in reverse order. Counts vary
+    # by batch; indices broadcast. 165 packed rows must share the one Q list.
+    pc = torch.ones(batch, 1, 1, dtype=torch.int32)
+    fc = torch.full_like(pc, 2)
+    pc[0] = 0
+    fc[0] = 0
+    blocks = BlockSparseTensorsTorch(
+        pc.to(device),
+        torch.tensor([[[[3]]]], dtype=torch.int32, device=device),
+        fc.to(device),
+        torch.tensor([[[[1, 0]]]], dtype=torch.int32, device=device),
+        block_size=(128, 128),
+    )
+    interface._compiled_kernels.clear()
+    try:
+        for iteration in range(3):
+            if iteration == 1:
+                fc[1] = 1
+                blocks.full_block_cnt.copy_(fc)
+            elif iteration == 2:
+                blocks = blocks._replace(
+                    **{name: tensor.clone() for name, tensor in zip(blocks._fields[:4], blocks[:4])}
+                )
+                inputs = tuple(t.clone() for t in inputs)
+            visible = torch.zeros(batch, 1, sq, sk, dtype=torch.bool)
+            for b in range(batch):
+                if pc[b, 0, 0]:
+                    visible[b, 0, :, 384:] = torch.arange(5)[None, :] <= torch.arange(sq)[:, None]
+                if fc[b, 0, 0] >= 1:
+                    visible[b, 0, :, 128:256] = True
+                if fc[b, 0, 0] == 2:
+                    visible[b, 0, :, :128] = True
+            masked = scores.masked_fill(~visible, -torch.inf)
+            expected_lse = masked.logsumexp(-1)
+            expected = (masked.softmax(-1).nan_to_num() @ v).permute(0, 2, 1, 3)
+            for return_lse in (False, True):
+                out, lse = interface.flash_attn_func(
+                    *inputs,
+                    mask_mod=mask,
+                    score_mod=score,
+                    aux_scalars=(int(iteration > 0),),
+                    block_sparse_tensors=blocks,
+                    return_lse=return_lse,
+                )
+                torch.npu.synchronize()
+                torch.testing.assert_close(out.cpu().float(), expected, rtol=0, atol=0.05)
+                assert torch.count_nonzero(out.cpu()[0]) == 0
+                if return_lse:
+                    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.05)
+                else:
+                    assert lse is None
+            assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
+@pytest.mark.parametrize(
+    "dtype,mask,score,heads,kv_heads",
+    [
+        (torch.float16, None, None, 33, 1),
+        (torch.bfloat16, _vector_head_mask, _coordinate_score, 33, 1),
+        (torch.float16, _head_mask, _vector_scale_score, 33, 1),
+        (torch.bfloat16, _vector_head_mask, _vector_scale_score, 33, 1),
+        (torch.float16, _head_mask, _coordinate_score, 3, 1),
+        (torch.float16, _head_mask, None, 2, 1),
+        (torch.float16, None, _coordinate_score, 5, 1),
+        (torch.float16, _head_mask, _scale_score, 4, 1),
+        (torch.bfloat16, _vector_head_mask, _coordinate_score, 66, 2),
+        (torch.float16, _head_mask, _vector_scale_score, 66, 2),
+        (torch.float16, _head_mask, _coordinate_score, 6, 2),
+    ],
+)
+def test_short_queries_preserve_callback_coordinates_and_lse(dtype, mask, score, heads, kv_heads):
+    import torch_npu  # noqa: F401
+
+    device = int(os.environ["FLASH_ATTN_DSL_TEST_DEVICE"])
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(29)
+    interface._compiled_kernels.clear()
+    try:
+        lengths = [(5, 17), (7, 129)]
+        if mask is _head_mask and score is _vector_scale_score:
+            # Cross the packing boundary, then reuse the earlier packed variant.
+            lengths.extend(((33, 65), (5, 17)))
+        for sq, sk in lengths:
+            q = torch.randn(32, sq, heads, 64, generator=generator).to(dtype)
+            k = torch.randn(32, sk, kv_heads, 64, generator=generator).to(dtype)
+            v = torch.randn(32, sk, kv_heads, 64, generator=generator).to(dtype)
+            ref_k = k.float().repeat_interleave(heads // kv_heads, dim=2)
+            ref_v = v.float().repeat_interleave(heads // kv_heads, dim=2)
+            scores = q.float().permute(0, 2, 1, 3) @ ref_k.permute(0, 2, 3, 1) / 8
+            if score is not None:
+                scores *= 0.75
+            if score is _coordinate_score:
+                scores += (
+                    torch.arange(heads)[:, None, None] * 0.01
+                    + torch.arange(sq)[None, :, None] * 0.02
+                    - torch.arange(sk)[None, None, :] * 0.03
+                )
+            if mask is not None:
+                keep = (torch.arange(heads)[:, None, None] != 0) & (
+                    torch.arange(sk)[None, None, :] <= torch.arange(sq)[None, :, None] + sk - sq
+                )
+                scores = scores.masked_fill(~keep, float("-inf"))
+            expected_lse = scores.logsumexp(-1)
+            expected = (scores.softmax(-1).nan_to_num() @ ref_v.permute(0, 2, 1, 3)).permute(
+                0, 2, 1, 3
+            )
+            inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
+            for return_lse in (False, True):
+                out, lse = interface.flash_attn_func(
+                    *inputs, mask_mod=mask, score_mod=score, return_lse=return_lse
+                )
+                torch.npu.synchronize()
+                assert out.is_contiguous()
+                torch.testing.assert_close(out.cpu().float(), expected, rtol=0, atol=0.05)
+                if return_lse:
+                    assert lse.is_contiguous()
+                    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.05)
+                else:
+                    assert lse is None
+                if mask is not None:
+                    assert torch.count_nonzero(out.cpu()[:, :, 0]) == 0
+            if mask is None and score is None:
+                assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()
 
 
 @pytest.mark.skipif(
@@ -28,6 +258,8 @@ from flash_attn_npu_dsl import interface
         ("left_window", torch.bfloat16, 96),
         ("right_window", torch.float16, 64),
         ("zero_window", torch.float16, 128),
+        ("packed_dense", torch.float16, 8),
+        ("packed_dense", torch.bfloat16, 96),
     ],
 )
 def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
@@ -56,23 +288,31 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
     }
     options = (
         {}
-        if mode == "dense"
+        if mode in ("dense", "packed_dense")
         else {"causal": True}
         if mode == "causal"
         else {"window_size": windows[mode]}
     )
     try:
-        for sq, sk in [(512, 512), (768, 1024), (1024, 768), (512, 512), (1, 257), (257, 1)]:
-            q = torch.randn(2, sq, 2, dim, generator=generator).to(dtype)
-            k = torch.randn(2, sk, 1, dim, generator=generator).to(dtype)
-            v = torch.randn(2, sk, 1, dim, generator=generator).to(dtype)
+        batch, heads, kv_heads = (32, 34, 2) if mode == "packed_dense" else (2, 2, 1)
+        lengths = (
+            [(5, 65), (7, 129), (5, 65)]
+            if mode == "packed_dense"
+            else [(512, 512), (768, 1024), (1024, 768), (512, 512), (1, 257), (257, 1)]
+        )
+        for sq, sk in lengths:
+            q = torch.randn(batch, sq, heads, dim, generator=generator).to(dtype)
+            k = torch.randn(batch, sk, kv_heads, dim, generator=generator).to(dtype)
+            v = torch.randn(batch, sk, kv_heads, dim, generator=generator).to(dtype)
             runtime_inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
             out, lse = interface.flash_attn_func(*runtime_inputs, return_lse=True, **options)
             torch.npu.synchronize()
             assert len(compiled) == 1
 
             # The oracle does not call a modifier or use the device block schedule.
-            scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+            ref_k = k.float().repeat_interleave(heads // kv_heads, dim=2)
+            ref_v = v.float().repeat_interleave(heads // kv_heads, dim=2)
+            scores = q.float().permute(0, 2, 1, 3) @ ref_k.permute(0, 2, 3, 1)
             scores *= dim**-0.5
             qi, ki = torch.arange(sq)[:, None], torch.arange(sk)[None, :]
             keep = torch.ones(sq, sk, dtype=torch.bool)
@@ -86,7 +326,7 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
                     keep &= ki <= qi + sk - sq + right
             scores.masked_fill_(~keep, float("-inf"))
             expected_lse = torch.logsumexp(scores, dim=-1)
-            expected = (scores.softmax(-1).nan_to_num(0) @ v.float().permute(0, 2, 1, 3)).permute(
+            expected = (scores.softmax(-1).nan_to_num(0) @ ref_v.permute(0, 2, 1, 3)).permute(
                 0, 2, 1, 3
             )
             torch.testing.assert_close(out.cpu().float(), expected, rtol=0, atol=0.05)

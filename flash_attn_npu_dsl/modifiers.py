@@ -169,6 +169,7 @@ def process_score_tile_simd(
     score_mod,
     apply_scale: tla.Constexpr[bool],
     apply_mask: tla.Constexpr[bool],
+    packed_heads: tla.Constexpr[int] = 1,
 ):
     """Apply built-in bounds and explicit x64 callbacks to a rows-by-128 tile.
 
@@ -176,7 +177,15 @@ def process_score_tile_simd(
     the final valid key, so auxiliary gathers stay in bounds; the original KV
     coordinates still determine built-in and tail masking after the callbacks.
     """
+    # Loop-carried names must also exist in the unpacked specialization.
+    first_q = tla.Int32(0)
+    first_head = tla.Int32(0)
+    if tla.const_expr(packed_heads > 1):
+        first_q = (q_start // packed_heads).to(tla.Int32)
+        first_head = (q_start - first_q * packed_heads).to(tla.Int32)
     with tla.vec.func(mode="simd"):
+        logical_q = first_q
+        logical_head = first_head
         full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
         padding = tla.full(float("-inf"), tla.Float32)
         if tla.const_expr(apply_scale):
@@ -188,8 +197,14 @@ def process_score_tile_simd(
             last_kv = tla.full(kv_len - 1, tla.Int32)
         for row in tla.range(rows):
             q = (q_start + row).to(tla.Int32)
+            if tla.const_expr(packed_heads > 1):
+                q = logical_q
             if tla.const_expr(mask_mod is not None or score_mod is not None):
                 q_idx = zero_idx + q
+                if tla.const_expr(packed_heads > 1):
+                    row_head = zero_idx + h * packed_heads + logical_head
+                else:
+                    row_head = h
             for chunk in tla.range_constexpr(2):
                 kv_idx = tla.arange(kv_start + chunk * 64, dtype=tla.Int32)
                 score_chunk = tla.tile_view(
@@ -223,7 +238,7 @@ def process_score_tile_simd(
                     score = apply_score_mod_and_mask_mod(
                         score,
                         b,
-                        h,
+                        row_head,
                         q_idx,
                         callback_kv,
                         info,
@@ -235,6 +250,12 @@ def process_score_tile_simd(
                         True,
                     )
                 score_chunk.store(tla.where(keep, score, padding), mask=full_mask)
+            if tla.const_expr(packed_heads > 1):
+                # Each physical row advances one head; wrapping advances Q.
+                # Keep the VF row loop free of division and dynamic branches.
+                carry = (logical_head == packed_heads - 1).to(tla.Int32)
+                logical_q = logical_q + carry
+                logical_head = logical_head + 1 - carry * packed_heads
 
 
 @tla.jit
@@ -255,6 +276,7 @@ def process_score_tile_simt(
     mask_mod,
     score_mod,
     apply_scale: tla.Constexpr[bool] = True,
+    packed_heads: tla.Constexpr[int] = 1,
 ):
     """Dispatch full/partial once before entering the SIMT callback VF."""
     apply_mask = False
@@ -278,6 +300,7 @@ def process_score_tile_simt(
             mask_mod,
             score_mod,
             apply_scale,
+            packed_heads,
         )
     else:
         _process_score_tile_simt(
@@ -297,6 +320,7 @@ def process_score_tile_simt(
             mask_mod,
             score_mod,
             apply_scale,
+            packed_heads,
         )
 
 
@@ -318,24 +342,43 @@ def _process_score_tile_simt(
     mask_mod,
     score_mod,
     apply_scale: tla.Constexpr[bool],
+    packed_heads: tla.Constexpr[int],
 ):
     """SIMT iteration over the shared QK FP32 UB tile, one scalar per thread."""
+    threads = 512
+    columns = 128
+    row_step = threads // columns
+    if tla.const_expr(packed_heads > 1):
+        # Decode the tile origin outside SIMT; lanes advance logical coordinates
+        # without forming a remainder-dependent callback predicate.
+        base_q = (q_start // packed_heads).to(tla.Int32)
+        base_h = (q_start - base_q * packed_heads).to(tla.Int32)
     with tla.vec.func(mode="simt", thread_block_dim=512):
         tid, _, _ = tla.arch.thread_idx()
+        q = q_start + tid // columns
+        logical_h = head_idx
+        if tla.const_expr(packed_heads > 1):
+            q = base_q
+            logical_h = base_h + tid // columns
+            for _ in tla.range_constexpr((row_step - 1 + packed_heads - 1) // packed_heads):
+                if logical_h >= packed_heads:
+                    logical_h = logical_h - packed_heads
+                    q = q + 1
         # Match the thread count with a constant stride to specialize the loop.
         for index in tla.range(tid, rows * 128, 512):
-            q = q_start + index // 128
+            if tla.const_expr(packed_heads == 1):
+                q = q_start + index // columns
             kv = kv_start + index % 128
             result = tla.Float32(float("-inf"))
             # Callbacks may gather auxiliary memory: never invoke at padded indices.
-            if q < q_len and kv < kv_len:
+            if q < q_len // packed_heads and kv < kv_len:
                 result = scores[index]
                 if tla.const_expr(apply_scale):
                     result = result * scale
                 result = apply_score_mod_and_mask_mod(
                     result,
                     batch_idx,
-                    head_idx,
+                    logical_h + head_idx * packed_heads if packed_heads > 1 else logical_h,
                     q,
                     kv,
                     info,
@@ -347,3 +390,10 @@ def _process_score_tile_simt(
                     False,
                 )
             scores[index] = result
+            if tla.const_expr(packed_heads > 1):
+                # 512 threads / 128 columns advance each lane by four packed rows.
+                q = q + row_step // packed_heads
+                logical_h = logical_h + row_step % packed_heads
+                if logical_h >= packed_heads:
+                    logical_h = logical_h - packed_heads
+                    q = q + 1

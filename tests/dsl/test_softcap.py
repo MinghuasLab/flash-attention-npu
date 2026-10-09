@@ -30,36 +30,46 @@ def vector_mask(b, h, q, kv, info, tensors):
     reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
 )
 @pytest.mark.parametrize(
-    "dtype,dim,cap,mask",
+    "dtype,dim,cap,mask,batch,kv_heads",
     [
-        (torch.float16, 8, 50.0, None),
-        (torch.bfloat16, 32, 2.0, scalar_mask),
-        (torch.float16, 80, 2.0, vector_mask),
+        (torch.float16, 8, 50.0, None, 1, 1),
+        (torch.bfloat16, 32, 2.0, scalar_mask, 1, 1),
+        (torch.float16, 80, 2.0, vector_mask, 1, 1),
+        (torch.float16, 8, 50.0, None, 32, 2),
+        (torch.bfloat16, 32, 2.0, scalar_mask, 32, 2),
     ],
 )
-def test_softcap_near_zero_saturated_scores_and_full_tail_blocks(dtype, dim, cap, mask):
+def test_softcap_near_zero_saturated_scores_and_full_tail_blocks(
+    dtype, dim, cap, mask, batch, kv_heads
+):
     import torch_npu  # noqa: F401
 
     device = int(os.environ["FLASH_ATTN_DSL_TEST_DEVICE"])
     torch.npu.set_device(device)
-    q = torch.zeros(1, 7, 3, dim, dtype=dtype)
-    k = torch.zeros(1, 257, 1, dim, dtype=dtype)
+    q = torch.zeros(batch, 7, 3 * kv_heads, dim, dtype=dtype)
+    k = torch.zeros(batch, 257, kv_heads, dim, dtype=dtype)
     q[..., 0] = torch.tensor([-80, -2, -0.001, 0, 0.001, 2, 80]).reshape(1, 7, 1)
     k[..., 0] = ((torch.arange(257) % 3) - 1).reshape(1, 257, 1)
     v = torch.randn(k.shape, generator=torch.Generator().manual_seed(17)).to(dtype)
-    scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
+    scores = q.float().permute(0, 2, 1, 3) @ k.float().repeat_interleave(3, dim=2).permute(
+        0, 2, 3, 1
+    )
     scores = cap * torch.tanh(scores / cap)
     if mask is not None:
         keep = (torch.arange(257) < 128) | (torch.arange(257) == 256)
         scores.masked_fill_(~keep, -torch.inf)
     expected_lse = scores.logsumexp(-1)
-    expected = (scores.softmax(-1) @ v.float().permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
+    expected = (
+        scores.softmax(-1) @ v.float().repeat_interleave(3, dim=2).permute(0, 2, 1, 3)
+    ).permute(0, 2, 1, 3)
     inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
     schedules = [None]
     if mask is not None:
         # The first block and one-element tail are full. Both must still cap scores.
         schedules.append(
-            compute_block_sparsity(128, 128, 1, 3, 7, 257, mask, None, inputs[0].device)
+            compute_block_sparsity(
+                128, 128, 1, 1 if kv_heads > 1 else 3, 7, 257, mask, None, inputs[0].device
+            )
         )
     for blocks in schedules:
         for return_lse in (False, True):

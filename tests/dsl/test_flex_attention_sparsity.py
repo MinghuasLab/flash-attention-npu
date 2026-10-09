@@ -328,6 +328,60 @@ def sparse_host(monkeypatch, shape):
     interface._compiled_kernels.clear()
 
 
+@pytest.mark.parametrize("independent_head", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize("kv_heads", [1, 3])
+def test_short_query_packing_requires_every_sparse_tensor_to_share_heads(
+    sparse_host, independent_head, kv_heads
+):
+    q = torch.empty(32, 5, 33 * kv_heads, 64, dtype=torch.float16)
+    k = torch.empty(32, 257, kv_heads, 64, dtype=torch.float16)
+    tensors = [
+        torch.zeros(32, 1, 1, dtype=torch.int32),
+        torch.zeros(1, 1, 1, 1, dtype=torch.int32),
+        torch.zeros(1, 1, 1, dtype=torch.int32),
+        torch.zeros(32, 1, 1, 2, dtype=torch.int32),
+    ]
+    if independent_head is not None:
+        tensor = tensors[independent_head]
+        tensors[independent_head] = tensor.expand(
+            tensor.shape[0], 33 * kv_heads, *tensor.shape[2:]
+        ).contiguous()
+    blocks = block_sparsity.BlockSparseTensorsTorch(*tensors, block_size=(128, 128))
+    out, lse = interface.flash_attn_func(q, k, k, block_sparse_tensors=blocks, return_lse=True)
+    assert out.shape == q.shape and lse.shape == (32, 33 * kv_heads, 5)
+    assert sparse_host.compiled[0][-1] == (33 if independent_head is None else 1)
+    assert sparse_host.launched[0][0] is q
+    strides = sparse_host.compiled[0][-2]
+    assert tuple(stride[2] for stride in strides) == (
+        (0, 0, 0, 0) if independent_head is None else (1, 1, 1, 2)
+    )
+    assert all(bound is original for bound, original in zip(sparse_host.launched[0][5], tensors))
+
+
+@pytest.mark.parametrize("full_present,capacity", [(False, 0), (False, 1), (True, 0)])
+def test_packed_sparse_optional_and_empty_lists_keep_unit_bindings(
+    sparse_host, full_present, capacity
+):
+    q = torch.empty(32, 5, 33, 64, dtype=torch.float16)
+    k = torch.empty(32, 257, 1, 64, dtype=torch.float16)
+    count = torch.zeros(1, 1, 1, dtype=torch.int32)
+    index = torch.zeros(1, 1, 1, capacity, dtype=torch.int32)
+    blocks = block_sparsity.BlockSparseTensorsTorch(
+        count,
+        index,
+        count if full_present else None,
+        index if full_present else None,
+        block_size=(128, 128),
+    )
+    interface.flash_attn_func(q, k, k, block_sparse_tensors=blocks)
+    assert sparse_host.compiled[0][-1] == 33
+    bound = sparse_host.launched[0][5]
+    assert (bound[1] is None) == (capacity == 0)
+    assert (bound[2] is None) == (not full_present)
+    assert bound[3] is None
+    assert all(stride is None or stride == (0, 0, 0) for stride in sparse_host.compiled[0][-2])
+
+
 @pytest.mark.parametrize(
     "empty,full_present", [(False, True), (False, False), (True, True), (True, False)]
 )

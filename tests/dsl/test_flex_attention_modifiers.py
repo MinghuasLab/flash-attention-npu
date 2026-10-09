@@ -134,6 +134,7 @@ def _lower(
             *validate_modifiers(mask, score),
             dim,
             sparse_strides,
+            1,
         ),
     )
 
