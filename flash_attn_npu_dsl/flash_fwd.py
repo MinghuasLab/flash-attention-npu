@@ -153,7 +153,8 @@ def _store_packed_lse(
     head_start = start % heads
     query_segments = (head_start + rows + heads - 1) // heads
     # Across multiple Q segments, contiguous GM writes can outweigh extra copies.
-    # A single Q segment is already contiguous across heads.
+    # For a single Q segment, keep one strided copy across heads; the GM values
+    # are contiguous only when q_len == 1.
     if min(rows, heads) < query_segments or (q_len > 1 and query_segments > 1):
         # Walk each head down Q: strided UB scalars become contiguous GM values.
         for offset in tla.range(min(rows, heads)):

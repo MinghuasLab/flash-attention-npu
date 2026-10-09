@@ -21,6 +21,8 @@ _MODULES = {
     "__init__.py",
     "block_sparsity.py",
     "compute_block_sparsity.py",
+    "dn_full.py",
+    "dn_softmax.py",
     "example.py",
     "flash_fwd.py",
     "interface.py",
