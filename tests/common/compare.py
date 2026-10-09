@@ -2,62 +2,119 @@
 
 """Numerical comparison rules shared by the attention tests."""
 
+import functools
+import os
 import torch
 import time
 from tests.common.golden_cache import retry_cached_value
 from tests.common.timing import add
 
 
-def _assert_fa_close_npu(actual, ref, pt, *, softcap=0.0, name="out"):
-    """NPU fast path, all metrics computed in parallel, 3 scalars back to CPU.
+@functools.lru_cache(maxsize=1)
+def _is_ascend950() -> bool:
+    try:
+        import torch_npu
+        return "Ascend950" in torch_npu.npu.get_device_name()
+    except Exception:
+        return False
 
-    Returns True on pass, False to fall back to the CPU path for diagnostics.
-    """
+
+def _npu_compare_allowed(actual) -> bool:
+    """NPU fast path gate, default all CPU while diagnosing, env FA_TEST_COMPARE is auto, npu or cpu."""
+    if not (hasattr(actual, "is_npu") and actual.is_npu):
+        return False
+    mode = os.environ.get("FA_TEST_COMPARE", "cpu").strip().lower()
+    if mode == "cpu":
+        return False
+    if mode == "auto" and _is_ascend950():
+        return False
+    return True
+
+
+def _assert_fa_close_npu(actual, ref, pt, *, softcap=0.0, name="out"):
+    """NPU fast path, verdict and diagnostics computed on device, one scalar back on pass."""
     device = actual.device
     if not ref.is_npu:
         ref = ref.detach().to(device)
     if not pt.is_npu:
         pt = pt.detach().to(device)
 
-    diff_ar = (actual.float() - ref.float()).abs()
-    max_diff = diff_ar.max().item()
-    nan_flag = (actual.isnan().any() | ref.isnan().any() | pt.isnan().any()).item()
-    if nan_flag:
-        return False
-    ref_inf = ref.isinf()
-    if ref_inf.any().item():
-        return False
-    actual_inf = actual.isinf().any().item()
-    pt_inf = pt.isinf().any().item()
-    if actual_inf or pt_inf:
-        return False
-
     rtol = 3.0 if softcap != 0.0 else 2.0
-    if max_diff <= 1e-5:
-        return True
-    pt_diff = (pt.float() - ref.float()).abs().max().item()
-    if max_diff <= rtol * pt_diff:
-        return True
-    ulp = (ref + 0.3 - 0.3 - ref).abs().max().item()
-    tolerance = max(rtol * pt_diff + 2.0 * ulp, 1e-5)
-    if max_diff <= tolerance:
-        return True
-    return False
+    # Same predicate as the CPU path, all tensors until the single verdict sync.
+    nan_bad = actual.isnan().any() | ref.isnan().any() | pt.isnan().any()
+    ref_inf = ref.isinf()
+    inf_ok = (
+        ((actual.isinf() == ref_inf).all() & (pt.isinf() == ref_inf).all())
+        & (~ref_inf | (actual == ref)).all()
+        & (~ref_inf | (pt == ref)).all()
+    )
+    # Inf positions cannot enter the metric, zero them like the CPU path masks.
+    diff = (actual.float() - ref.float()).abs_()
+    pt_diff_all = (pt.float() - ref.float()).abs_()
+    ulp_all = (ref + 0.3 - 0.3 - ref).abs()
+    diff.masked_fill_(ref_inf, 0)
+    pt_diff_all.masked_fill_(ref_inf, 0)
+    ulp_all.masked_fill_(ref_inf, 0)
+    max_diff = diff.max()
+    pt_diff = pt_diff_all.max()
+    ulp = ulp_all.max()
+    tolerance = torch.clamp(rtol * pt_diff + 2.0 * ulp, min=1e-5)
+    passed = (
+        ~nan_bad & inf_ok
+        & ((max_diff <= 1e-5) | (max_diff <= rtol * pt_diff) | (max_diff <= tolerance))
+    )
+    if bool(passed):
+        return
+
+    # Failure only: worst spots with samples plus metric scalars, pulled once.
+    flat_actual, flat_ref, flat_pt = actual.flatten(), ref.flatten(), pt.flatten()
+    k = min(4, diff.numel())
+    top_vals, top_idx = diff.flatten().topk(k)
+    samples = torch.stack([
+        top_vals,
+        flat_actual[top_idx].float(),
+        flat_ref[top_idx].float(),
+        flat_pt[top_idx].float(),
+    ]).t().reshape(-1)
+    metrics = torch.stack([
+        nan_bad.float(), (~inf_ok).float(),
+        max_diff.float(), pt_diff.float(), ulp.float(),
+        (diff > tolerance).sum().float(),
+        (diff > torch.clamp(tolerance, min=0.5)).sum().float(),
+    ])
+    idx_cpu = top_idx.cpu()
+    samples = samples.cpu()
+    metrics = metrics.cpu()
+    nan_bad_v, inf_bad_v, max_diff_v, pt_diff_v, ulp_v, num_bad, num_loose = metrics.tolist()
+    if nan_bad_v:
+        raise AssertionError(f"{name}: actual/ref/pt contains NaN")
+    if inf_bad_v:
+        raise AssertionError(f"{name}: actual/pt inf mask or inf value mismatch vs ref")
+    spots = [samples[i * 4:(i + 1) * 4].tolist() for i in range(k)]
+    total = actual.numel()
+    print(f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
+          f"num_bad(>{float(tolerance):.3g})={int(num_bad)} "
+          f"num_loose(>0.5)={int(num_loose)}")
+    for fi, (d, av, rv, pv) in zip(idx_cpu.tolist(), spots):
+        print(f"    diff={d} flat={fi}/{total} ({100.0 * fi / total:.1f}%) "
+              f"actual={av} ref={rv} pt={pv}")
+    raise AssertionError(
+        f"{name}: max|actual-ref|={max_diff_v} exceeds "
+        f"{rtol} * max|pt-ref|={pt_diff_v} + 2*ULP(ref)={2.0 * ulp_v} "
+        f"(softcap={softcap})")
 
 
 def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
     """Compare implementation results using Tri Dao's dual-reference rule.
 
-    When actual is on NPU and the tensor is in the medium size band,
-    a fast path computes all metrics on NPU, only scalars return to CPU.
-    The CPU path handles small and large tensors plus any fast-path failure.
+    NPU fast path for the medium size band, CPU path otherwise.
     """
-    if hasattr(actual, 'is_npu') and actual.is_npu and ref.numel() > 0:
+    if _npu_compare_allowed(actual) and ref.numel() > 0:
         n = actual.numel()
         if 1_000_000 <= n <= 50_000_000:
             try:
-                if _assert_fa_close_npu(actual, ref, pt, softcap=softcap, name=name):
-                    return
+                _assert_fa_close_npu(actual, ref, pt, softcap=softcap, name=name)
+                return
             except RuntimeError:
                 pass
 

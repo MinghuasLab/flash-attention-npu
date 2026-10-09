@@ -68,18 +68,35 @@ log "test phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 # ---------- 1. NPU 自检 (需要卡) ----------
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 python3 - <<'PY' || die "torch_npu not functional inside container (check --privileged / driver mount)"
+import time
 import torch
 import torch_npu
 print("torch:", torch.__version__)
 print("torch_npu:", torch_npu.__version__)
 print("torch_npu device_count:", torch_npu.npu.device_count())
 assert torch_npu.npu.device_count() >= 1, "device_count==0; --privileged or driver mount missing?"
+# machine health probe, healthy hosts show tens of ms on both
+t0 = time.perf_counter(); torch.rand(2_000_000); t_rand = time.perf_counter() - t0
+probe = torch.rand(65536).npu(); torch.npu.synchronize()
+t0 = time.perf_counter(); probe.cpu(); t_sync = time.perf_counter() - t0
+print(f"machine probe: cpu_rand_2M={t_rand * 1000:.0f}ms d2h_sync={t_sync * 1000:.0f}ms")
 PY
 
 # ---------- 2. 安装 (复用 build/ 产物, 不重新编译) ----------
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 log "python setup.py install --skip-build (reuse build/ artifacts)"
-python3 setup.py install --skip-build
+# 折叠安装的 copying 输出, 失败时把尾部展开打印
+install_log="$RUN_LOG_DIR/install.log"
+echo "::group::setup.py install output (live, reuse build/ artifacts)"
+set +e
+python3 setup.py install --skip-build 2>&1 | tee "$install_log"
+install_rc="${PIPESTATUS[0]}"
+echo "::endgroup::"
+set -e
+if [ "$install_rc" -ne 0 ]; then
+  tail -n 30 "$install_log" || true
+  die "setup.py install failed rc=$install_rc"
+fi
 
 log "import check"
 python3 - <<'PY'
@@ -109,8 +126,8 @@ if [ "$MODE" = "quick" ]; then
   SAMPLE_ARG="--random-sample=${CI_QUICK_SAMPLE}"
 fi
 
-# Set to true for detailed slow-case timing output during CI debugging
-VERBOSE="${CI_VERBOSE:-false}"
+# Default on while diagnosing machine slowness, CI_VERBOSE=false turns it off
+VERBOSE="${CI_VERBOSE:-true}"
 
 FAILED_FILE="$LOG_DIR/failed_cases.txt"
 : > "$FAILED_FILE"
@@ -176,12 +193,26 @@ top5_slow_lines() {
     | awk -F'\t' '{line = sprintf("[CI-test]   %10ss  %s [%s]", $1, $3, $2); if ($4 != "") line = line " (" $4 ")"; print line}'
 }
 
-# extract first failure traceback from pytest FAILURES section, 60 lines max
+# extract first failure traceback, head 50 plus tail 100 so the trailing assert message survives
+# VERBOSE=true prints the whole first failure block instead of the excerpt
 print_first_failure() {
-  local logfile="$1"
-  awk '/^=+ FAILURES =+/{flag=1; next}
+  local logfile="$1" block n elided
+  block="$(awk '/^=+ FAILURES =+/{flag=1; next}
        flag && /^_+ .* _+$/{c++; if (c == 2) exit}
-       flag' "$logfile" 2>/dev/null | head -n 60 | sed 's/^/    /'
+       flag' "$logfile" 2>/dev/null)"
+  if [ "$VERBOSE" = "true" ]; then
+    printf '%s\n' "$block" | sed 's/^/    /'
+    return
+  fi
+  n="$(printf '%s\n' "$block" | wc -l)"
+  if [ "$n" -le 150 ]; then
+    printf '%s\n' "$block" | sed 's/^/    /'
+    return
+  fi
+  elided=$((n - 150))
+  printf '%s\n' "$block" | head -n 50 | sed 's/^/    /'
+  printf '    ... %s lines omitted ...\n' "$elided"
+  printf '%s\n' "$block" | tail -n 100 | sed 's/^/    /'
 }
 
 # tally finished run results, structured events first, xdist log grep fallback
@@ -547,7 +578,7 @@ summarize_golden_cache 2>&1 | tee -a "$SUMMARY_FILE"
 
 FAILED_CASES="$(tr '\n' ' ' < "$FAILED_FILE" 2>/dev/null || true)"
 if [ -n "$FAILED_CASES" ]; then
-  die "pytest FAILED targets:$FAILED_CASES"
+  die "pytest FAILED: $(grep -c . "$FAILED_FILE" || true) entries, details in [FAIL] lines above and failed_cases.txt"
 fi
 
 log "all tests passed"
