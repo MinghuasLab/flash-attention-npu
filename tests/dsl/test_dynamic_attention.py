@@ -425,6 +425,31 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
     not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
     reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("q_len,group", [(32, 2), (33, 3), (5, 8), (1, 13), (7, 8), (5, 33)])
+def test_packed_lse_preserves_head_and_query_order(dtype, q_len, group):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    batch, kv_heads, kv_len, dim = 64, 2, 65, 16
+    generator = torch.Generator().manual_seed(29)
+    host_q = torch.randn(batch, q_len, kv_heads * group, dim, generator=generator).to(dtype)
+    q = host_q.to(device)
+    k = torch.ones(batch, kv_len, kv_heads, dim, dtype=dtype, device=device)
+    v = torch.ones_like(k)
+    out, lse = interface.flash_attn_func(q, k, v, return_lse=True)
+    torch.npu.synchronize()
+    # Identical K rows make LSE analytic, but every batch/head/query is distinct.
+    expected_lse = host_q.float().sum(-1).permute(0, 2, 1) / 4 + torch.log(torch.tensor(65.0))
+    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.05)
+    torch.testing.assert_close(out.cpu(), torch.ones_like(out.cpu()), rtol=0, atol=0.05)
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
 def test_dynamic_binding_matches_dlpack_and_uses_current_buffers(monkeypatch):
     import torch_npu  # noqa: F401
     from catlass.base_dsl.jit_executor import JitCompiledFunction

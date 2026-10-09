@@ -150,21 +150,45 @@ def _store_packed_lse(
     group=0,
 ):
     """Write packed rows to [B,H,Q], reading one FP32 from each 32-byte UB slot."""
-    copied = tla.Int32(0)
-    while copied < rows:
-        index = start + copied
-        head = index % heads
-        count = rows - copied if rows - copied < heads - head else heads - head
-        src = tla.make_tensor(
-            source.ptr + copied * 8,
-            tla.make_layout(tla.make_shape(count, 1), tla.make_stride(8, 1)),
-        )
-        dst = tla.make_tensor(
-            destination.ptr + ((batch * groups + group) * heads + head) * q_len + index // heads,
-            tla.make_layout(tla.make_shape(count, 1), tla.make_stride(q_len, 1)),
-        )
-        tla.copy(dst, src)
-        copied += count
+    head_start = start % heads
+    query_segments = (head_start + rows + heads - 1) // heads
+    # Across multiple Q segments, contiguous GM writes can outweigh extra copies.
+    # A single Q segment is already contiguous across heads.
+    if min(rows, heads) < query_segments or (q_len > 1 and query_segments > 1):
+        # Walk each head down Q: strided UB scalars become contiguous GM values.
+        for offset in tla.range(min(rows, heads)):
+            index = start + offset
+            head = index % heads
+            count = (rows - offset + heads - 1) // heads
+            src = tla.make_tensor(
+                source.ptr + offset * 8,
+                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(heads * 8, 1)),
+            )
+            dst = tla.make_tensor(
+                destination.ptr
+                + ((batch * groups + group) * heads + head) * q_len
+                + index // heads,
+                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(1, 1)),
+            )
+            tla.copy(dst, src)
+    else:
+        copied = tla.Int32(0)
+        while copied < rows:
+            index = start + copied
+            head = index % heads
+            count = rows - copied if rows - copied < heads - head else heads - head
+            src = tla.make_tensor(
+                source.ptr + copied * 8,
+                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(8, 1)),
+            )
+            dst = tla.make_tensor(
+                destination.ptr
+                + ((batch * groups + group) * heads + head) * q_len
+                + index // heads,
+                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(q_len, 1)),
+            )
+            tla.copy(dst, src)
+            copied += count
 
 
 @tla.kernel
