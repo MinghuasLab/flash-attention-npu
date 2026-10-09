@@ -60,8 +60,9 @@ def main():
     aux_scalars = (0.75,)
     blocks = None
     if args.sparse:
+        # 本例的 causal mask 与 batch/head 无关，使用共享块表。
         blocks = compute_block_sparsity(
-            128, 128, 1, 2, sq, sk, mask_mod, None, q.device, aux_scalars=aux_scalars
+            128, 128, 1, 1, sq, sk, mask_mod, None, q.device, aux_scalars=aux_scalars
         )
     out, lse = flash_attn_func(
         q,

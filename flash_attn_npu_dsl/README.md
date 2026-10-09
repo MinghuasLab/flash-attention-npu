@@ -174,8 +174,8 @@ from flash_attn_npu_dsl import compute_block_sparsity
 blocks = compute_block_sparsity(
     128,
     128,
-    B,
-    Hq,
+    1,  # causal_mask 与 batch 无关，共享一份分类
+    1,  # causal_mask 与 head 无关
     Sq,
     Sk,
     causal_mask,
@@ -198,6 +198,27 @@ out, lse = flash_attn_func(
 分类在 NPU 上只按 mask 的 SIMT/SIMD 模式精确执行，与 score 模式无关，仅支持 `(128, 128)` 块：
 空块跳过，partial 块执行 mask，full 块跳过自定义 mask，但仍执行 score 修改和尾块边界检查。
 分类与前向必须使用相同的 mask 及其输入；mask、序列长度或所依赖的辅助数据变化后需重新分类。
+
+### 按 mask 的实际依赖选择建块维度
+
+上面的右对齐 causal mask 只依赖 Q/KV 坐标和共同的序列长度，因此可以用
+`batch_size=1, num_heads=1` 建表，再传给实际为 `B × Hq` 的 attention。
+前向通过广播步长直接读取共享表，不需要 `expand().contiguous()` 或复制元数据。
+这会减少重复分类及块表存储，不改变 attention 的实际 batch/head 数量。
+
+| mask 的依赖 | 建块的 `batch_size` | 建块的 `num_heads` |
+| --- | ---: | ---: |
+| 所有 batch/head 共享 | `1` | `1` |
+| 随 batch 变化、head 共享 | `B` | `1` |
+| 随 head 变化、batch 共享 | `1` | `Hq` |
+| batch/head 均可能变化 | `B` | `Hq` |
+
+共享由调用方显式选择，库不会推断 callback 是否依赖 `b`、`h` 或辅助数据。
+例如按 head 读取不同阈值的 mask 应按 `Hq` 建表，不能复用 head 0 的分类。
+`score_mod` 可以随 batch/head 变化；只要 mask 的可见性相同，仍可共享块表。
+若 mask 及其输入不变，块表还可跨多次前向复用；需要重新建块时，也可以继续使用上述广播维度。
+
+### 自行提供块表
 
 也可自行构造 `BlockSparseTensorsTorch`，建议显式设置 `block_size=(128, 128)`：
 

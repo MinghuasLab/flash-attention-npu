@@ -146,7 +146,11 @@ def flex_attention_classify_blocks_simd_kernel(
         q_tile = work % q_tiles
         head = (work // q_tiles) % num_heads_q
         batch = work // (q_tiles * num_heads_q)
-        valid_q = min(128, seqlen_q - q_tile * 128)
+        if tla.const_expr(q_tiles == 1):
+            # Keep the known row count constant across the SIMD VF boundary.
+            valid_q = seqlen_q
+        else:
+            valid_q = min(128, seqlen_q - q_tile * 128)
         with tla.vector():
             with tla.vec.func(mode="simd"):
                 zero = tla.full(0, tla.Int32)

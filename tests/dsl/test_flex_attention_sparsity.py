@@ -74,6 +74,60 @@ def shape(monkeypatch):
     return dict(batch_size=2, num_heads_q=3, seqlen_q=129, seqlen_k=513, device="cpu")
 
 
+@simd
+def simd_head_window(b, h, q, kv, info, tensors, scalars):
+    center = q + info.seqlen_k - info.seqlen_q + b - h
+    return tla.bitwise_and(tla.cmp(kv, center, "le"), tla.cmp(kv, center - scalars[0], "ge"))
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
+@pytest.mark.parametrize("q_len", (1, 127, 128, 129))
+def test_classifier_query_tile_boundary_and_runtime_window(q_len):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    kv_len = 257
+    for width in (2, 129):
+        blocks = classifier.compute_block_sparsity(
+            128,
+            128,
+            2,
+            3,
+            q_len,
+            kv_len,
+            simd_head_window,
+            None,
+            device,
+            aux_scalars=(width,),
+        )
+        torch.npu.synchronize()
+        pc, pi, fc, fi = (tensor.cpu() for tensor in blocks[:4])
+        for batch in range(2):
+            for head in range(3):
+                q, kv = torch.arange(q_len)[:, None], torch.arange(kv_len)[None, :]
+                center = q + kv_len - q_len + batch - head
+                keep = (kv <= center) & (kv >= center - width)
+                for tile in range((q_len + 127) // 128):
+                    partial, full = [], []
+                    for kv_tile in range((kv_len + 127) // 128):
+                        region = keep[
+                            tile * 128 : (tile + 1) * 128,
+                            kv_tile * 128 : (kv_tile + 1) * 128,
+                        ]
+                        if region.all():
+                            full.append(kv_tile)
+                        elif region.any():
+                            partial.append(kv_tile)
+                    assert pc[batch, head, tile].item() == len(partial)
+                    assert fc[batch, head, tile].item() == len(full)
+                    assert pi[batch, head, tile, : len(partial)].tolist() == partial
+                    assert fi[batch, head, tile, : len(full)].tolist() == full
+
+
 def _blocks(partial=((3, 0), ()), full=((4, 1), (2,))):
     def pair(rows):
         counts = torch.tensor([[list(map(len, rows))]], dtype=torch.int32)
