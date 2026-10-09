@@ -76,12 +76,6 @@ def _require_npu(device):
     return device
 
 
-def _same_device(actual, requested):
-    return actual.type == requested.type and (
-        requested.index is None or actual.index == requested.index
-    )
-
-
 def _check_pair(counts, indices, name, dimensions, device):
     import torch
 
@@ -91,31 +85,30 @@ def _check_pair(counts, indices, name, dimensions, device):
             raise TypeError(f"{name}_block_{suffix} must be a torch.Tensor")
         if tensor.dtype != torch.int32:
             raise TypeError(f"{name}_block_{suffix} must have dtype torch.int32")
-        if not _same_device(tensor.device, device):
+        if tensor.device != device:
             raise ValueError(f"{name}_block_{suffix} must be on {device}")
         if not tensor.is_contiguous():
             raise ValueError(f"{name}_block_{suffix} must be contiguous")
-    if counts.ndim != 3:
+    counts_shape, indices_shape = counts.shape, indices.shape
+    if len(counts_shape) != 3:
         raise ValueError(f"{name}_block_cnt must have shape [B,Hq,Tq]")
     if (
-        counts.shape[0] not in (1, batch_size)
-        or counts.shape[1] not in (1, num_heads_q)
-        or counts.shape[2] != q_tiles
+        counts_shape[0] not in (1, batch_size)
+        or counts_shape[1] not in (1, num_heads_q)
+        or counts_shape[2] != q_tiles
     ):
         raise ValueError(f"{name}_block_cnt has incompatible batch/head/Q extents")
-    if indices.ndim != 4:
+    if len(indices_shape) != 4:
         raise ValueError(f"{name}_block_idx must have shape [B,Hq,Tq,capacity]")
     if (
-        indices.shape[0] not in (1, batch_size)
-        or indices.shape[1] not in (1, num_heads_q)
-        or indices.shape[2] != q_tiles
+        indices_shape[0] not in (1, batch_size)
+        or indices_shape[1] not in (1, num_heads_q)
+        or indices_shape[2] != q_tiles
     ):
         raise ValueError(f"{name}_block_idx has incompatible batch/head/Q extents")
-    capacity = indices.shape[-1]
+    capacity = indices_shape[-1]
     if capacity > kv_tiles:
         raise ValueError(f"{name}_block_idx capacity must be <= {kv_tiles}")
-    if counts.device != indices.device:
-        raise ValueError(f"{name} counts and indices must be on the same NPU device")
 
 
 def _metadata_strides(tensor):

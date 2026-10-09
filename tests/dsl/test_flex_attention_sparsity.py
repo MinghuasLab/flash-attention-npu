@@ -250,6 +250,7 @@ def sparse_host(monkeypatch, shape):
         return lambda *args, **kwargs: state.launched.append(args)
 
     monkeypatch.setattr(interface, "_validate_inputs", lambda *args: None)
+    monkeypatch.setattr(interface, "_check_launch_tensors", lambda tensors: None)
     monkeypatch.setattr(interface, "from_dlpack", lambda tensor, *, layout_tag: tensor)
     monkeypatch.setattr(interface.tla, "compile", compile)
     monkeypatch.setattr(
@@ -426,6 +427,7 @@ def test_public_builder_selects_mode_and_direct_compile(monkeypatch, shape, call
 
     monkeypatch.setattr(torch, "npu", SimpleNamespace(device=guard), raising=False)
     monkeypatch.setattr(classifier, "from_dlpack", lambda tensor, *, layout_tag: tensor)
+    monkeypatch.setattr(classifier, "_check_launch_tensors", lambda tensors: None)
     monkeypatch.setattr(classifier, "_compile_kernel", compile)
     blocks = classifier.compute_block_sparsity(
         128, 128, 2, 3, 129, 513, callback, [], "cpu", aux_scalars=()

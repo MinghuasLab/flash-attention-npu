@@ -16,6 +16,21 @@ _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
 
 
+def _check_launch_tensors(tensors):
+    """Require the dense storage addressed by the compiled RowMajor views."""
+    import torch_npu
+
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        if torch_npu.get_npu_format(tensor) not in (0, 2):  # NCHW / ND storage
+            raise ValueError(
+                "attention requires dense ND/NCHW storage; convert the Tensor explicitly"
+            )
+        if not tensor.data_ptr():
+            raise RuntimeError("Tensor buffer is not bound")
+
+
 class _DynamicTensorArgument:
     """Bind a contiguous Torch tensor as a dynamic (rows, columns) GM root.
 
@@ -217,7 +232,7 @@ def flash_attn_func(
         raise ValueError("softmax_scale must be finite")
     mask_uses_simd, score_uses_simd = validate_modifiers(mask_mod, score_mod)
     aux_tensors, aux_scalars = _validate_aux(aux_tensors, aux_scalars, q.device)
-    with torch.npu.device(q.device):
+    with torch.npu.device(q.device.index):
         # Dense/window execution computes its block interval on device.
         sparse = (
             validate_block_sparse(
@@ -246,6 +261,9 @@ def flash_attn_func(
             and aux_tensors is None
             and aux_scalars is None
         )
+        if not dynamic_lengths:
+            # O/LSE are freshly allocated here; validate caller-owned storage.
+            _check_launch_tensors((q, k, v, *sparse_tensors, *(aux_tensors or ())))
 
         def bind_tensor(tensor):
             if tensor is None:
@@ -253,20 +271,11 @@ def flash_attn_func(
             if dynamic_lengths:
                 columns = tensor.shape[-2] * head_dim if tensor.ndim == 4 else 1
                 return _DynamicTensorArgument(tensor, columns)
-            return from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
+            return tensor
 
         runtime_args = tuple(bind_tensor(tensor) for tensor in tensors) + (
-            tuple(
-                from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
-                if tensor is not None
-                else None
-                for tensor in sparse_tensors
-            )
-            if sparse is not None
-            else None,
-            None
-            if aux_tensors is None
-            else [from_dlpack(tensor, layout_tag=tla.arch.RowMajor) for tensor in aux_tensors],
+            sparse_tensors if sparse is not None else None,
+            aux_tensors,
             aux_scalars,
         )
         constants = (
@@ -296,11 +305,29 @@ def flash_attn_func(
         )
 
         def compile_args():
-            bindings = (
+            roots = (
                 tuple(arg.compile_sample() if arg is not None else None for arg in runtime_args[:5])
-                + runtime_args[5:]
                 if dynamic_lengths
-                else runtime_args
+                else tuple(
+                    from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
+                    if tensor is not None
+                    else None
+                    for tensor in tensors
+                )
+            )
+            bindings = roots + (
+                tuple(
+                    from_dlpack(tensor.reshape(-1), layout_tag=tla.arch.RowMajor)
+                    if tensor is not None
+                    else None
+                    for tensor in sparse_tensors
+                )
+                if sparse is not None
+                else None,
+                None
+                if aux_tensors is None
+                else [from_dlpack(tensor, layout_tag=tla.arch.RowMajor) for tensor in aux_tensors],
+                aux_scalars,
             )
             return (*bindings, *constants)
 

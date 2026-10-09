@@ -2,6 +2,7 @@
 """CPU-only public contracts and compiled-kernel reuse."""
 
 from contextlib import contextmanager
+import sys
 from types import SimpleNamespace
 
 from importlib.util import find_spec
@@ -64,6 +65,22 @@ def test_public_exports():
         "flash_attn_func",
         "simd",
     }
+
+
+@pytest.mark.parametrize(
+    "storage_format,address,error",
+    [(0, 16, None), (2, 16, None), (29, 16, ValueError), (2, 0, RuntimeError)],
+)
+def test_static_launch_requires_dense_bound_storage(monkeypatch, storage_format, address, error):
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(get_npu_format=lambda tensor: storage_format)
+    )
+    tensor = SimpleNamespace(data_ptr=lambda: address)
+    if error is None:
+        interface._check_launch_tensors((None, tensor))
+    else:
+        with pytest.raises(error, match="storage|not bound"):
+            interface._check_launch_tensors((tensor,))
 
 
 @pytest.mark.parametrize(
@@ -166,6 +183,7 @@ def host(monkeypatch):
         return lambda *args, **kwargs: state.launched.append((args, kwargs))
 
     monkeypatch.setattr(interface, "_validate_inputs", lambda *args: None)
+    monkeypatch.setattr(interface, "_check_launch_tensors", lambda tensors: None)
     monkeypatch.setattr(interface, "from_dlpack", HostTensor)
     monkeypatch.setattr(interface.tla, "compile", compile)
     monkeypatch.setenv("CATLASS_DSL_CACHE", "1")
@@ -205,7 +223,11 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
     assert args[5] is None
     assert (args[6] is None) == (tensors is None)
     assert args[7] == (tuple(scalars) if scalars else None)
-    assert args[6] is host.compiled[0][6]
+    if tensors is not None:
+        assert all(actual is original for actual, original in zip(args[6], tensors))
+        assert all(
+            sample.owner is original for sample, original in zip(host.compiled[0][6], tensors)
+        )
     dynamic = tensors is None and not scalars
     assert all(tensor.dynamic_mode == (0 if dynamic else None) for tensor in host.compiled[0][:4])
     assert host.compiled[0][11:13] == ((None, None) if dynamic else (17, 65))
@@ -225,17 +247,34 @@ def test_public_call_restores_device_guard_on_compile_error(host, monkeypatch):
     assert not host.launched and host.current == "previous"
 
 
-def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host):
+def test_public_call_checks_external_storage_not_new_outputs(host, monkeypatch):
+    checked = []
+    monkeypatch.setattr(interface, "_check_launch_tensors", lambda tensors: checked.extend(tensors))
+    aux = torch.ones(4)
+    out, lse = interface.flash_attn_func(*host.inputs, aux_tensors=[aux], return_lse=True)
+    expected = (*host.inputs, aux)
+    assert len(checked) == len(expected)
+    assert all(actual is original for actual, original in zip(checked, expected))
+    assert all(tensor is not out and tensor is not lse for tensor in checked)
+
+
+def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host, monkeypatch):
     aux = torch.ones(2)
     first, _ = interface.flash_attn_func(*host.inputs, aux_tensors=[aux], aux_scalars=(0.25,))
     inputs, updated_aux = tuple(t.clone() for t in host.inputs), aux.clone()
-    second, _ = interface.flash_attn_func(*inputs, aux_tensors=[updated_aux], aux_scalars=(0.75,))
+    with monkeypatch.context() as warm:
+        warm.setattr(
+            interface, "from_dlpack", lambda *a, **kw: pytest.fail("hot DLPack conversion")
+        )
+        second, _ = interface.flash_attn_func(
+            *inputs, aux_tensors=[updated_aux], aux_scalars=(0.75,)
+        )
     assert len(host.compiled) == 1 and len(host.launched) == 2
     args = host.launched[-1][0]
     assert args[0].data_ptr() == inputs[0].data_ptr()
     assert args[0].data_ptr() != host.launched[0][0][0].data_ptr()
     assert args[3].data_ptr() == second.data_ptr() != first.data_ptr()
-    assert args[6][0].owner is updated_aux and args[7] == (0.75,)
+    assert args[6][0] is updated_aux and args[7] == (0.75,)
 
     variants = (
         (inputs, {"softmax_scale": 0.5}),

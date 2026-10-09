@@ -19,7 +19,7 @@ from .modifiers import (
     uses_simd,
     validate_callback,
 )
-from .interface import _compilation_key, _compile_kernel, _validate_aux
+from .interface import _check_launch_tensors, _compilation_key, _compile_kernel, _validate_aux
 from .seqlen_info import create_seqlen_info
 
 
@@ -266,17 +266,22 @@ def compute_block_sparsity(
             full_counts.reshape(num_works),
             full_indices.reshape(num_works, kv_tiles),
         )
-        outputs = tuple(from_dlpack(t, layout_tag=tla.arch.RowMajor) for t in tensors)
-        runtime_aux = (
-            None
-            if aux_tensors is None
-            else [from_dlpack(t, layout_tag=tla.arch.RowMajor) for t in aux_tensors]
-        )
+        _check_launch_tensors((*tensors, *(aux_tensors or ())))
+        outputs = tensors
+        runtime_aux = aux_tensors
         constants = (mask_mod, num_heads, q_tiles, kv_tiles, seqlen_q, seqlen_k)
         key = _compilation_key(tensors, aux_tensors, aux_scalars, constants, device)
-        compiled = _compile_kernel(
-            classifier, key, lambda: (*outputs, *constants, runtime_aux, aux_scalars)
-        )
+
+        def compile_args():
+            samples = tuple(from_dlpack(t, layout_tag=tla.arch.RowMajor) for t in tensors)
+            sample_aux = (
+                None
+                if aux_tensors is None
+                else [from_dlpack(t, layout_tag=tla.arch.RowMajor) for t in aux_tensors]
+            )
+            return (*samples, *constants, sample_aux, aux_scalars)
+
+        compiled = _compile_kernel(classifier, key, compile_args)
         # Logical rows beyond the launch grid are covered by the kernel's grid stride.
         compiled(*outputs, runtime_aux, aux_scalars, block_num=min(num_works, 65535))
         return BlockSparseTensorsTorch(
