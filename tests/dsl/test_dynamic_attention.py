@@ -250,6 +250,81 @@ def test_short_queries_preserve_callback_coordinates_and_lse(dtype, mask, score,
     reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
 )
 @pytest.mark.parametrize(
+    "dtype,dim,heads,kv_heads,lengths,window,score",
+    [
+        (torch.float16, 8, 48, 2, ((16, 257), (32, 389)), (None, 0), None),
+        (torch.float16, 16, 13, 1, ((1, 129), (5, 257)), (None, 0), None),
+        (torch.bfloat16, 96, 34, 2, ((9, 1), (7, 129)), (0, 0), None),
+        (torch.float16, 80, 33, 1, ((5, 389), (7, 129)), (128, 32), None),
+        (torch.bfloat16, 64, 33, 1, ((5, 257), (7, 129)), (0, None), _coordinate_score),
+        (torch.float16, 128, 32, 1, ((4, 257), (8, 389)), (None, 0), _vector_scale_score),
+        (torch.float16, 128, 16, 4, ((33, 257), (45, 389)), (None, 0), _vector_scale_score),
+        (torch.bfloat16, 96, 30, 2, ((35, 1), (45, 129)), (0, 0), None),
+    ],
+)
+def test_packed_builtin_windows_preserve_query_coordinates(
+    dtype, dim, heads, kv_heads, lengths, window, score
+):
+    import torch_npu  # noqa: F401
+
+    device = int(os.environ["FLASH_ATTN_DSL_TEST_DEVICE"])
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(29)
+    interface._compiled_kernels.clear()
+    try:
+        # A packed tile can begin/end within one Q's head group. Changing lengths
+        # also checks current dynamic metadata, including empty tasks before live ones.
+        for sq, sk in (*lengths, lengths[0]):
+            q = torch.randn(32, sq, heads, dim, generator=generator).to(dtype)
+            k = torch.randn(32, sk, kv_heads, dim, generator=generator).to(dtype)
+            v = torch.randn(32, sk, kv_heads, dim, generator=generator).to(dtype)
+            ref_k = k.float().repeat_interleave(heads // kv_heads, dim=2)
+            ref_v = v.float().repeat_interleave(heads // kv_heads, dim=2)
+            scores = q.float().permute(0, 2, 1, 3) @ ref_k.permute(0, 2, 3, 1) * dim**-0.5
+            if score is not None:
+                scores *= 0.75
+            if score is _coordinate_score:
+                scores = (
+                    scores
+                    + torch.arange(heads)[:, None, None] * 0.01
+                    + torch.arange(sq)[None, :, None] * 0.02
+                    - torch.arange(sk)[None, None, :] * 0.03
+                )
+            qi, ki = torch.arange(sq)[:, None], torch.arange(sk)[None, :]
+            keep = torch.ones(sq, sk, dtype=torch.bool)
+            left, right = window
+            if left is not None:
+                keep &= ki >= qi + sk - sq - left
+            if right is not None:
+                keep &= ki <= qi + sk - sq + right
+            scores.masked_fill_(~keep, float("-inf"))
+            expected_lse = scores.logsumexp(-1)
+            expected = (scores.softmax(-1).nan_to_num() @ ref_v.permute(0, 2, 1, 3)).permute(
+                0, 2, 1, 3
+            )
+            inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
+            options = {"causal": True} if window == (None, 0) else {"window_size": window}
+            for return_lse in (False, True):
+                out, lse = interface.flash_attn_func(
+                    *inputs, score_mod=score, return_lse=return_lse, **options
+                )
+                torch.npu.synchronize()
+                assert out.shape == q.shape and out.is_contiguous()
+                torch.testing.assert_close(out.cpu().float(), expected, rtol=0, atol=0.05)
+                assert torch.count_nonzero(out.cpu()[:, ~keep.any(-1)]) == 0
+                if return_lse:
+                    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.05)
+                else:
+                    assert lse is None
+    finally:
+        interface._compiled_kernels.clear()
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"),
+    reason="set FLASH_ATTN_DSL_TEST_DEVICE to opt into NPU execution",
+)
+@pytest.mark.parametrize(
     "mode,dtype,dim",
     [
         ("dense", torch.float16, 128),
@@ -300,14 +375,16 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
             if mode == "packed_dense"
             else [(512, 512), (768, 1024), (1024, 768), (512, 512), (1, 257), (257, 1)]
         )
-        for sq, sk in lengths:
+        for index, (sq, sk) in enumerate(lengths):
             q = torch.randn(batch, sq, heads, dim, generator=generator).to(dtype)
             k = torch.randn(batch, sk, kv_heads, dim, generator=generator).to(dtype)
             v = torch.randn(batch, sk, kv_heads, dim, generator=generator).to(dtype)
             runtime_inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
             out, lse = interface.flash_attn_func(*runtime_inputs, return_lse=True, **options)
             torch.npu.synchronize()
-            assert len(compiled) == 1
+            # Long aligned queries use DN; short/tail queries reuse an ND variant.
+            expected_compilations = 1 if mode == "packed_dense" or index < 4 else 2
+            assert len(compiled) == expected_compilations
 
             # The oracle does not call a modifier or use the device block schedule.
             ref_k = k.float().repeat_interleave(heads // kv_heads, dim=2)

@@ -164,6 +164,10 @@ mask 和 score 的模式独立选择，四种组合均受支持：
 SIMD 组合条件使用 `tla.bitwise_and/or`、`tla.where`，不用 Python `and/or`；
 辅助张量访问仍受 DSL 索引能力限制，不保证任意 SIMD gather 可用。
 
+每个 SIMD lane 对应一个 `(b, h, q, kv)` 分数位置，回调按位置逐元素计算。
+内部可以沿 KV 或 Q/head 组织 lane；不要假定 `q`、`h` 在所有 lane 中相同，
+也不要依赖相邻 lane 必须对应连续 KV。回调的数学定义、参数及输出布局不变。
+
 ## 显式两步块稀疏
 
 仅传 `mask_mod` 仍遍历所有 KV 块；跳过空块需要先分类，再将元数据交给前向：
@@ -249,6 +253,8 @@ out, lse = flash_attn_func(
 | [flash_fwd.py](flash_fwd.py) | 前向主内核：调度 Q/KV 块，组织 QK、回调、softmax、PV 的流水、搬运与同步。 |
 | [modifiers.py](modifiers.py) | 定义 SIMD/SIMT 回调契约，绑定参数，执行分数修改与掩码。 |
 | [softmax.py](softmax.py) | 在线 softmax、跨块输出重缩放与累加、最终归一化和 LSE，处理空行。 |
+| [dn_softmax.py](dn_softmax.py) | 沿 Q/head 组织 SIMD lane 的回调和在线 softmax，处理 KV 尾块与空行。 |
+| [dn_full.py](dn_full.py) | 无回调、无边界裁剪的满 tile softmax，直接读取原始 score，省去修改后的 score 写回。 |
 | [block_sparsity.py](block_sparsity.py) | 定义公开块元数据，只校验元数据规格并记录四个张量各自的广播步长和容量。 |
 | [compute_block_sparsity.py](compute_block_sparsity.py) | 根据 mask 在设备上分类空块、partial 块和 full 块，返回公开块元数据。 |
 | [seqlen_info.py](seqlen_info.py) | 构造回调共享的定长序列信息，包含长度、零偏移和 KV 块数。 |
@@ -271,15 +277,26 @@ dense 和内置 causal/window 使用动态 Q/K 长度：固定 batch、head、D�
 不同正序列长度可复用同一编译对象。输出及 LSE 每次按当前长度分配，空行和尾块按当前长度处理。
 O-only 与 O+LSE 使用不同变体；其他参数组合继续按完整张量规格特化。
 
-对 Q 长度小于 128、未启用内置窗口的调用，内核可将共用同一 KV head 的 Q heads 合并，
+对 Q 长度小于 128 的调用，内核可将共用同一 KV head 的 Q heads 合并，
 以减少重复读取 KV。MQA 直接使用连续数据；一般 GQA 在设备上分段读取 Q、写回 O，
 不在 host 上转置或复制。传入块表时，要求所有已提供元数据张量的 head 维均为 1；
 合并后的计算块直接读取原来的单行 Q 块表，不复制元数据，仍允许按 batch 使用不同的列表。
 仅当任务数减少且不降低可占用核心数时选择此策略；其他情况
 保持逐 head 调度。用户 callback 仍接收原始的 head、Q 坐标和序列长度，O 与 LSE 的布局不变。
-涉及 SIMT 回调时，合并进一步限定为 Q 长度不超过 32，避免坐标处理抵消调度收益。
+涉及 SIMT 回调时，合并进一步限定为 Q 长度不超过 32，避免逐行坐标处理抵消调度收益。
+内置 causal/window 沿用上述合并条件，其 KV 块范围和逐元素判断均使用合并前的 Q 坐标。
 合并后的 SIMT 线程按逻辑 Q/head 坐标递增，不要求一个任务内的 head 保持一致。
 两种调度策略使用独立编译变体，长度变化导致策略切换时会匹配对应变体。
+
+score 布局由入口在编译前选择。没有 SIMT 回调或显式 auxiliary，且满足以下任一条件时，
+采用 DN：合并后的 Q 行数为 128 的整数倍、KV 长度至少 256；或没有合并 head，
+Q/KV 长度均至少 512。后者允许长序列带 Q 尾块，避免因尾块而让整段计算退回 ND。
+DN 直接计算 `K @ Qᵀ`，让 SIMD lane 沿 Q/head 排列。合并内置窗口保留 ND，以避免该组合的开销；
+其他不满足 DN 条件的调用也保持 ND 的 `Q @ Kᵀ` 与 KV-lane 路径。
+DN 中，Q/KV 均对齐 128、没有 mask/score/内置窗口且缩放为正的调用使用满 tile 计算体；
+其余使用带回调和边界处理的计算体。softcap 属于 score 修改，不会被满 tile 路径跳过。
+这些选择不增加设备 kernel，也不改变块表顺序与 QK/PV 流水；不同选择使用独立编译变体，
+同一变体内仍可复用动态长度。用户不需要指定执行后端。
 
 动态长度路径仅在编译时构造 DSL Tensor；缓存命中时直接从当前 Torch Tensor 绑定地址和
 动态描述符，不重复执行 DLPack 转换。它不缓存数据或省略输入规格检查；跨 stream 的生产者

@@ -8,6 +8,10 @@ QK and PV; vector stages apply callbacks, online softmax and output rescaling.
 QK is issued two pipeline iterations before its PV. L1 P and UB alpha each use
 three slots, rotated by active-block ordinal. Physical KV indices select data
 and callback coordinates.
+
+ND computes Q @ K^T and places KV along SIMD lanes. DN computes K @ Q^T and
+places queries along lanes; P is packed for the same logical PV computation.
+The compile-time layout choice preserves task and buffer ownership.
 """
 
 import catlass.tla as tla
@@ -17,6 +21,8 @@ from .modifiers import (
     process_score_tile_simt,
 )
 from .seqlen_info import create_seqlen_info
+from .dn_softmax import native_dn_softmax
+from .dn_full import full_dn_softmax
 
 from .softmax import (
     output_empty_row,
@@ -187,6 +193,8 @@ def flex_attention_kernel(
     head_dim: tla.Constexpr[int] = 128,
     sparse_strides: tla.Constexpr = None,
     packed_heads: tla.Constexpr[int] = 1,
+    use_dn: tla.Constexpr[bool] = False,
+    full_dn: tla.Constexpr[bool] = False,
 ) -> None:
     if tla.const_expr(q_len is None):
         # Contiguous BSND roots use (B*S, H*D); B/H/D stay compile-time facts.
@@ -389,6 +397,8 @@ def flex_attention_kernel(
         kBOffset = curBatch * kv_len * kSOffset
         gmOffsetV = curBatch * kv_len * vSOffset + kvHeadIdx * head_dim
         rowNum = min(128, q_len - qSTileIdx * 128)
+        if tla.const_expr(use_dn):
+            paddedRows = (rowNum + 31) // 32 * 32
         first_kv = 0
         partial_count = 0
         partial_base = 0
@@ -396,16 +406,20 @@ def flex_attention_kernel(
         if tla.const_expr(sparse_tensors is None):
             end_kv = kv_tiles
             if tla.const_expr(window_left is not None):
+                # Packed rows interleave heads; window bounds use original Q positions.
+                first_q = qSTileIdx * 128 // packed_heads
                 first_kv = min(
                     kv_tiles,
-                    max(0, (qSTileIdx * 128 + kv_len - q_len - window_left) // 128),
+                    max(0, (first_q + kv_len - seqlen_info.seqlen_q - window_left) // 128),
                 )
             if tla.const_expr(window_right is not None):
+                # A tile can end partway through a group of heads at the same Q.
+                end_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads + 1
                 end_kv = min(
                     kv_tiles,
                     max(
                         0,
-                        (qSTileIdx * 128 + rowNum + kv_len - q_len + window_right + 127) // 128,
+                        (end_q + kv_len - seqlen_info.seqlen_q + window_right + 127) // 128,
                     ),
                 )
             kvSLoopNum = max(0, end_kv - first_kv)
@@ -480,13 +494,22 @@ def flex_attention_kernel(
                     kvSTileSizeAct = min(128, kv_len - gatheredKvSTileIdx * 128)
                     ubSBufId = validIdx % 2
                     ubS_ptr = ubS_ptrs[0] if ubSBufId == 0 else ubS_ptrs[1]
-                    ubSTensorTla = tla.make_tensor(
-                        ubS_ptr,
-                        tla.make_layout(
-                            tla.make_shape(rowNum, kvSTileSizeAct),
-                            tla.make_stride(128, 1),
-                        ),
-                    )
+                    if tla.const_expr(use_dn):
+                        ubSTensorTla = tla.make_tensor(
+                            ubS_ptr,
+                            tla.make_layout(
+                                tla.make_shape(kvSTileSizeAct, paddedRows),
+                                tla.make_stride(64, 1),
+                            ),
+                        )
+                    else:
+                        ubSTensorTla = tla.make_tensor(
+                            ubS_ptr,
+                            tla.make_layout(
+                                tla.make_shape(rowNum, kvSTileSizeAct),
+                                tla.make_stride(128, 1),
+                            ),
+                        )
                     # QK Mmad
                     with tla.cube():
                         gm_q = tla.make_tensor(
@@ -568,30 +591,66 @@ def flex_attention_kernel(
                         l0ABufId = l0ALoopCounter % L0_STAGES
                         l0BBufId = l0BLoopCounter % L0_STAGES
 
+                        # The A/B operands are Q/K in ND and K/Q in DN.
                         l0a_ptr = l0a_ptrs[0] if l0ABufId == c0 else l0a_ptrs[1]
-                        l0a_q_tensor = tla.make_tensor_like(l0a_ptr, l1_q, tla.arch.zN)
+                        if tla.const_expr(use_dn):
+                            q_transposed = tla.make_tensor(
+                                l1Q_ptrs[0],
+                                tla.make_layout(
+                                    tla.make_shape(embed_, rowNum),
+                                    tla.make_stride(1, embed_),
+                                    layoutTag=tla.arch.ColumnMajor,
+                                ),
+                            )
+                            q_transposed = tla.make_tensor_like(
+                                l1Q_ptrs[0], q_transposed, tla.arch.nZ
+                            )
+                            k_transposed = tla.make_tensor(
+                                l1K_ptr,
+                                tla.make_layout(
+                                    tla.make_shape(kvSTileSizeAct, embed_),
+                                    tla.make_stride(embed_, 1),
+                                ),
+                            )
+                            k_transposed = tla.make_tensor_like(l1K_ptr, k_transposed, tla.arch.zN)
+                            l0a_q_tensor = tla.make_tensor_like(l0a_ptr, k_transposed, tla.arch.zN)
+                        else:
+                            l0a_q_tensor = tla.make_tensor_like(l0a_ptr, l1_q, tla.arch.zN)
 
                         if l0ABufId == 0:
                             tla.wait_flag(mmad_ready_l0a_0)  # CUBE_MTE1
                         else:
                             tla.wait_flag(mmad_ready_l0a_1)
-                        tla.copy(l0a_q_tensor, l1_q)
+                        if tla.const_expr(use_dn):
+                            if l1BBufId == c0:
+                                tla.wait_flag(k_l1_ready_l0_0)
+                            else:
+                                tla.wait_flag(k_l1_ready_l0_1)
+                            tla.copy(l0a_q_tensor, k_transposed)
+                        else:
+                            tla.copy(l0a_q_tensor, l1_q)
                         if l0ABufId == 0:
                             tla.set_flag(l0a_ready_mmad_0)  # MTE1_CUBE
                         else:
                             tla.set_flag(l0a_ready_mmad_1)
 
                         l0b_ptr = l0b_ptrs[0] if l0BBufId == c0 else l0b_ptrs[1]
-                        l0b_k_tensor = tla.make_tensor_like(l0b_ptr, l1_k_tile)
+                        if tla.const_expr(use_dn):
+                            l0b_k_tensor = tla.make_tensor_like(l0b_ptr, q_transposed, tla.arch.nZ)
+                        else:
+                            l0b_k_tensor = tla.make_tensor_like(l0b_ptr, l1_k_tile)
                         if l0BBufId == 0:
                             tla.wait_flag(mmad_ready_l0b_0)  # CUBE_MTE1
                         else:
                             tla.wait_flag(mmad_ready_l0b_1)
-                        if l1BBufId == c0:
-                            tla.wait_flag(k_l1_ready_l0_0)  # MTE2_MTE1
+                        if tla.const_expr(use_dn):
+                            tla.copy(l0b_k_tensor, q_transposed)
                         else:
-                            tla.wait_flag(k_l1_ready_l0_1)
-                        tla.copy(l0b_k_tensor, l1_k_tile)
+                            if l1BBufId == c0:
+                                tla.wait_flag(k_l1_ready_l0_0)  # MTE2_MTE1
+                            else:
+                                tla.wait_flag(k_l1_ready_l0_1)
+                            tla.copy(l0b_k_tensor, l1_k_tile)
 
                         if l0BBufId == 0:
                             tla.set_flag(l0b_ready_mmad_0)  # MTE1_CUBE
@@ -638,11 +697,22 @@ def flex_attention_kernel(
                             tla.set_flag(mmad_ready_fix_1)
                             tla.wait_flag(mmad_ready_fix_1)
 
-                        tla.copy(
-                            ubSTensorTla,
-                            l0c_s,
-                            tla.params.CopyL0C2DstParams(l0c2ub_mode=tla.params.L0C2UBMode.SPLIT_M),
-                        )
+                        if tla.const_expr(use_dn):
+                            tla.copy(
+                                ubSTensorTla,
+                                l0c_s,
+                                tla.params.CopyL0C2DstParams(
+                                    l0c2ub_mode=tla.params.L0C2UBMode.SPLIT_N
+                                ),
+                            )
+                        else:
+                            tla.copy(
+                                ubSTensorTla,
+                                l0c_s,
+                                tla.params.CopyL0C2DstParams(
+                                    l0c2ub_mode=tla.params.L0C2UBMode.SPLIT_M
+                                ),
+                            )
 
                         if l0CBufId == 0:
                             tla.set_flag(fix_ready_mmad_0)  # FIX_CUBE
@@ -662,15 +732,24 @@ def flex_attention_kernel(
                         if l1PBufId == 0
                         else (l1P_ptrs[1] if l1PBufId == 1 else l1P_ptrs[2])
                     )
-                    l1PTensorTla = tla.make_tensor_like(
-                        l1p_ptr,
-                        tla.tile_view(ubSTensorTla, tla.make_shape(128, 128), tla.make_coord(0, 0)),
-                        tla.arch.zN,
-                    )
+                    if tla.const_expr(use_dn):
+                        l1PTensorTla = tla.make_tensor_like(l1p_ptr, ubSTensorTla, tla.arch.zN)
+                    else:
+                        l1PTensorTla = tla.make_tensor_like(
+                            l1p_ptr,
+                            tla.tile_view(
+                                ubSTensorTla, tla.make_shape(128, 128), tla.make_coord(0, 0)
+                            ),
+                            tla.arch.zN,
+                        )
                     with tla.vector():
                         subIdxEff = tla.arch.sub_block_idx()
-                        mHalf = (rowNum + 1) // 2
-                        m = mHalf if subIdxEff == 0 else rowNum - mHalf
+                        if tla.const_expr(use_dn):
+                            mHalf = paddedRows // 2
+                            m = min(mHalf, rowNum) if subIdxEff == 0 else max(0, rowNum - mHalf)
+                        else:
+                            mHalf = (rowNum + 1) // 2
+                            m = mHalf if subIdxEff == 0 else rowNum - mHalf
                         if ubSBufId == 0:
                             tla.cross_core_wait_flag(mm1_ready_sm_0, tla.arch.VECTOR)
                             tla.wait_flag(mte3_ready_softmax_0)
@@ -684,239 +763,317 @@ def flex_attention_kernel(
                                 if l1PBufId == 0
                                 else (expMax_ptrs[1] if l1PBufId == 1 else expMax_ptrs[2])
                             )
-                            ub_s = tla.make_tensor(
-                                ubS_ptr,
-                                tla.make_layout(tla.make_shape(m, 128), tla.make_stride(128, 1)),
-                            )
-                            score_flat = tla.make_tensor(
-                                ubS_ptr,
-                                tla.make_layout(tla.make_shape(64 * 128), tla.make_stride(1)),
-                            )
-                            ub_p = tla.make_tensor(
-                                ubP_ptr,
-                                tla.make_layout(tla.make_shape(65, 128), tla.make_stride(128, 1)),
-                            )
-                            ub_p_zN_full = tla.make_tensor_like(ubP_ptr, ub_p, tla.arch.zNUnAlign)
+                            if tla.const_expr(use_dn):
+                                ub_s = tla.make_tensor(
+                                    ubS_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(128, 64), tla.make_stride(64, 1)
+                                    ),
+                                )
+                                ub_p = tla.make_tensor(
+                                    ubP_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(129, 64), tla.make_stride(64, 1)
+                                    ),
+                                )
+                                ub_p_zn = tla.make_tensor_like(ubP_ptr, ub_p, tla.arch.zNUnAlign)
+                            else:
+                                ub_s = tla.make_tensor(
+                                    ubS_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(m, 128), tla.make_stride(128, 1)
+                                    ),
+                                )
+                                score_flat = tla.make_tensor(
+                                    ubS_ptr,
+                                    tla.make_layout(tla.make_shape(64 * 128), tla.make_stride(1)),
+                                )
+                                ub_p = tla.make_tensor(
+                                    ubP_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(65, 128), tla.make_stride(128, 1)
+                                    ),
+                                )
+                                ub_p_zN_full = tla.make_tensor_like(
+                                    ubP_ptr, ub_p, tla.arch.zNUnAlign
+                                )
                             state_layout = tla.make_layout(tla.make_shape(64), tla.make_stride(1))
                             running_max = tla.make_tensor(lastMax_ptr, state_layout)
                             running_sum = tla.make_tensor(lastSum_ptr, state_layout)
                             alpha = tla.make_tensor(expMax_ptr, state_layout)
-                            row_max = tla.make_tensor(row_max_ptr, state_layout)
-                            tile_sum = tla.make_tensor(tile_sum_ptr, state_layout)
-                            # FIX -> modifier -> softmax share this UB allocation.
-                            tla.pipe_barrier(tla.pipes.ALL)
-                            if tla.const_expr(mixed_modifiers):
-                                # Each writer completes before the next mode reads
-                                # the same UB tile. Custom masks override windows.
-                                coordinates = (
-                                    m,
-                                    qSTileIdx * 128 + subIdxEff * mHalf,
-                                    gatheredKvSTileIdx * 128,
-                                    curBatch,
-                                    qHeadIdx,
-                                )
-                                scalar_inputs = (
-                                    score_flat,
-                                    *coordinates,
-                                    0,
-                                    aux_tensors,
-                                    aux_scalars,
-                                    q_len,
-                                    kv_len,
-                                    scale,
-                                    seqlen_info,
-                                )
-                                vector_inputs = (
-                                    ub_s,
-                                    *coordinates,
-                                    kv_len,
-                                    scale,
-                                    seqlen_info,
-                                    aux_tensors,
-                                    aux_scalars,
-                                    None,
-                                    None,
-                                )
-                                if tla.const_expr(score_uses_simd):
-                                    process_score_tile_simd(
-                                        *vector_inputs,
-                                        mask_mod=None,
-                                        score_mod=score_mod,
-                                        apply_scale=True,
-                                        apply_mask=False,
-                                        packed_heads=packed_heads,
-                                    )
-                                else:
-                                    process_score_tile_simt(
-                                        *scalar_inputs,
-                                        mask_mod=None,
-                                        score_mod=score_mod,
-                                        apply_scale=True,
-                                        packed_heads=packed_heads,
-                                    )
-                                tla.pipe_barrier(tla.pipes.ALL)
-                                if block_kind == 0:
-                                    if tla.const_expr(mask_uses_simd):
-                                        process_score_tile_simd(
-                                            *vector_inputs,
-                                            mask_mod=mask_mod,
-                                            score_mod=None,
-                                            apply_scale=False,
-                                            apply_mask=True,
-                                            packed_heads=packed_heads,
-                                        )
-                                    else:
-                                        process_score_tile_simt(
-                                            *scalar_inputs,
-                                            mask_mod=mask_mod,
-                                            score_mod=None,
-                                            apply_scale=False,
-                                            packed_heads=packed_heads,
-                                        )
-                                    tla.pipe_barrier(tla.pipes.ALL)
-                                scores_are_scaled = True
+                            if tla.const_expr(use_dn):
+                                for current_slot in tla.range_constexpr(2):
+                                    if ubSBufId == current_slot:
+                                        if tla.const_expr(full_dn):
+                                            full_dn_softmax(
+                                                ub_s,
+                                                ub_p_zn,
+                                                running_max,
+                                                running_sum,
+                                                alpha,
+                                                validIdx == 0,
+                                                scale,
+                                                DTYPE_P,
+                                            )
+                                        else:
+                                            native_dn_softmax(
+                                                ub_s,
+                                                ub_p_zn,
+                                                running_max,
+                                                running_sum,
+                                                alpha,
+                                                validIdx == 0,
+                                                scale,
+                                                kvSTileSizeAct,
+                                                m,
+                                                DTYPE_P,
+                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                gatheredKvSTileIdx * 128,
+                                                curBatch,
+                                                qHeadIdx,
+                                                packed_heads,
+                                                seqlen_info,
+                                                mask_mod,
+                                                score_mod,
+                                                aux_tensors,
+                                                aux_scalars,
+                                                block_kind == 0,
+                                                window_left,
+                                                window_right,
+                                            )
                             else:
-                                use_simt = True
-                                if tla.const_expr(use_simd_modifiers):
-                                    use_simt = False
-                                elif tla.const_expr(score_mod is None):
-                                    if tla.const_expr(mask_mod is None):
-                                        use_simt = False
-                                    else:
-                                        use_simt = block_kind == 0
-                                if use_simt:
-                                    process_score_tile_simt(
-                                        score_flat,
+                                row_max = tla.make_tensor(row_max_ptr, state_layout)
+                                tile_sum = tla.make_tensor(tile_sum_ptr, state_layout)
+                                # FIX -> modifier -> softmax share this UB allocation.
+                                tla.pipe_barrier(tla.pipes.ALL)
+                                if tla.const_expr(mixed_modifiers):
+                                    # Each writer completes before the next mode reads
+                                    # the same UB tile. Custom masks override windows.
+                                    coordinates = (
                                         m,
                                         qSTileIdx * 128 + subIdxEff * mHalf,
                                         gatheredKvSTileIdx * 128,
                                         curBatch,
                                         qHeadIdx,
-                                        block_kind,
+                                    )
+                                    scalar_inputs = (
+                                        score_flat,
+                                        *coordinates,
+                                        0,
                                         aux_tensors,
                                         aux_scalars,
                                         q_len,
                                         kv_len,
                                         scale,
                                         seqlen_info,
-                                        mask_mod,
-                                        score_mod,
-                                        packed_heads=packed_heads,
                                     )
-                                    tla.pipe_barrier(tla.pipes.ALL)
-                                if tla.const_expr(use_simd_modifiers):
-                                    if block_kind == 0:
-                                        process_score_tile_simd(
-                                            ub_s,
-                                            m,
-                                            qSTileIdx * 128 + subIdxEff * mHalf,
-                                            gatheredKvSTileIdx * 128,
-                                            curBatch,
-                                            qHeadIdx,
-                                            kv_len,
-                                            scale,
-                                            seqlen_info,
-                                            aux_tensors,
-                                            aux_scalars,
-                                            window_left,
-                                            window_right,
-                                            mask_mod,
-                                            score_mod,
-                                            True,
-                                            True,
-                                            packed_heads=packed_heads,
-                                        )
-                                    elif tla.const_expr(score_mod is not None):
-                                        process_score_tile_simd(
-                                            ub_s,
-                                            m,
-                                            qSTileIdx * 128 + subIdxEff * mHalf,
-                                            gatheredKvSTileIdx * 128,
-                                            curBatch,
-                                            qHeadIdx,
-                                            kv_len,
-                                            scale,
-                                            seqlen_info,
-                                            aux_tensors,
-                                            aux_scalars,
-                                            window_left,
-                                            window_right,
-                                            mask_mod,
-                                            score_mod,
-                                            True,
-                                            False,
-                                            packed_heads=packed_heads,
-                                        )
-                                    tla.pipe_barrier(tla.pipes.ALL)
-                                elif tla.const_expr(
-                                    window_left is not None or window_right is not None
-                                ):
-                                    # A scalar score is already scaled by the SIMT stage.
-                                    process_score_tile_simd(
+                                    vector_inputs = (
                                         ub_s,
-                                        m,
-                                        qSTileIdx * 128 + subIdxEff * mHalf,
-                                        gatheredKvSTileIdx * 128,
-                                        curBatch,
-                                        qHeadIdx,
+                                        *coordinates,
                                         kv_len,
                                         scale,
                                         seqlen_info,
                                         aux_tensors,
                                         aux_scalars,
-                                        window_left,
-                                        window_right,
                                         None,
                                         None,
-                                        score_mod is None,
-                                        False,
-                                        packed_heads=packed_heads,
                                     )
-                                    tla.pipe_barrier(tla.pipes.ALL)
-                                scores_are_scaled = use_simt
-                                if tla.const_expr(use_simd_modifiers):
-                                    # Full blocks without a score callback leave scaling
-                                    # and KV-tail masking to the softmax load pass.
-                                    if tla.const_expr(score_mod is None):
-                                        scores_are_scaled = block_kind == 0
+                                    if tla.const_expr(score_uses_simd):
+                                        process_score_tile_simd(
+                                            *vector_inputs,
+                                            mask_mod=None,
+                                            score_mod=score_mod,
+                                            apply_scale=True,
+                                            apply_mask=False,
+                                            packed_heads=packed_heads,
+                                        )
                                     else:
-                                        scores_are_scaled = True
-                                elif tla.const_expr(
-                                    window_left is not None or window_right is not None
-                                ):
+                                        process_score_tile_simt(
+                                            *scalar_inputs,
+                                            mask_mod=None,
+                                            score_mod=score_mod,
+                                            apply_scale=True,
+                                            packed_heads=packed_heads,
+                                        )
+                                    tla.pipe_barrier(tla.pipes.ALL)
+                                    if block_kind == 0:
+                                        if tla.const_expr(mask_uses_simd):
+                                            process_score_tile_simd(
+                                                *vector_inputs,
+                                                mask_mod=mask_mod,
+                                                score_mod=None,
+                                                apply_scale=False,
+                                                apply_mask=True,
+                                                packed_heads=packed_heads,
+                                            )
+                                        else:
+                                            process_score_tile_simt(
+                                                *scalar_inputs,
+                                                mask_mod=mask_mod,
+                                                score_mod=None,
+                                                apply_scale=False,
+                                                packed_heads=packed_heads,
+                                            )
+                                        tla.pipe_barrier(tla.pipes.ALL)
                                     scores_are_scaled = True
-                            if scores_are_scaled:
-                                online_softmax_tile(
-                                    ub_s,
-                                    ub_p_zN_full,
-                                    running_max,
-                                    running_sum,
-                                    alpha,
-                                    validIdx == 0,
-                                    scale,
-                                    kvSTileSizeAct,
-                                    False,
-                                    m,
-                                    DTYPE_P,
-                                    row_max,
-                                    tile_sum,
-                                )
-                            else:
-                                online_softmax_tile(
-                                    ub_s,
-                                    ub_p_zN_full,
-                                    running_max,
-                                    running_sum,
-                                    alpha,
-                                    validIdx == 0,
-                                    scale,
-                                    kvSTileSizeAct,
-                                    True,
-                                    m,
-                                    DTYPE_P,
-                                    row_max,
-                                    tile_sum,
-                                )
+                                else:
+                                    use_simt = True
+                                    if tla.const_expr(use_simd_modifiers):
+                                        use_simt = False
+                                    elif tla.const_expr(score_mod is None):
+                                        if tla.const_expr(mask_mod is None):
+                                            use_simt = False
+                                        else:
+                                            use_simt = block_kind == 0
+                                    if use_simt:
+                                        process_score_tile_simt(
+                                            score_flat,
+                                            m,
+                                            qSTileIdx * 128 + subIdxEff * mHalf,
+                                            gatheredKvSTileIdx * 128,
+                                            curBatch,
+                                            qHeadIdx,
+                                            block_kind,
+                                            aux_tensors,
+                                            aux_scalars,
+                                            q_len,
+                                            kv_len,
+                                            scale,
+                                            seqlen_info,
+                                            mask_mod,
+                                            score_mod,
+                                            packed_heads=packed_heads,
+                                        )
+                                        tla.pipe_barrier(tla.pipes.ALL)
+                                    if tla.const_expr(use_simd_modifiers):
+                                        if block_kind == 0:
+                                            process_score_tile_simd(
+                                                ub_s,
+                                                m,
+                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                gatheredKvSTileIdx * 128,
+                                                curBatch,
+                                                qHeadIdx,
+                                                kv_len,
+                                                scale,
+                                                seqlen_info,
+                                                aux_tensors,
+                                                aux_scalars,
+                                                window_left,
+                                                window_right,
+                                                mask_mod,
+                                                score_mod,
+                                                True,
+                                                True,
+                                                packed_heads=packed_heads,
+                                            )
+                                        elif tla.const_expr(score_mod is not None):
+                                            process_score_tile_simd(
+                                                ub_s,
+                                                m,
+                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                gatheredKvSTileIdx * 128,
+                                                curBatch,
+                                                qHeadIdx,
+                                                kv_len,
+                                                scale,
+                                                seqlen_info,
+                                                aux_tensors,
+                                                aux_scalars,
+                                                window_left,
+                                                window_right,
+                                                mask_mod,
+                                                score_mod,
+                                                True,
+                                                False,
+                                                packed_heads=packed_heads,
+                                            )
+                                        tla.pipe_barrier(tla.pipes.ALL)
+                                    elif tla.const_expr(
+                                        window_left is not None or window_right is not None
+                                    ):
+                                        # A scalar score is already scaled by the SIMT stage.
+                                        process_score_tile_simd(
+                                            ub_s,
+                                            m,
+                                            qSTileIdx * 128 + subIdxEff * mHalf,
+                                            gatheredKvSTileIdx * 128,
+                                            curBatch,
+                                            qHeadIdx,
+                                            kv_len,
+                                            scale,
+                                            seqlen_info,
+                                            aux_tensors,
+                                            aux_scalars,
+                                            window_left,
+                                            window_right,
+                                            None,
+                                            None,
+                                            score_mod is None,
+                                            False,
+                                            packed_heads=packed_heads,
+                                        )
+                                        tla.pipe_barrier(tla.pipes.ALL)
+                                    scores_are_scaled = use_simt
+                                    if tla.const_expr(use_simd_modifiers):
+                                        # Full blocks without a score callback leave scaling
+                                        # and KV-tail masking to the softmax load pass.
+                                        if tla.const_expr(score_mod is None):
+                                            scores_are_scaled = block_kind == 0
+                                        else:
+                                            scores_are_scaled = True
+                                    elif tla.const_expr(
+                                        window_left is not None or window_right is not None
+                                    ):
+                                        scores_are_scaled = True
+                                if scores_are_scaled:
+                                    online_softmax_tile(
+                                        ub_s,
+                                        ub_p_zN_full,
+                                        running_max,
+                                        running_sum,
+                                        alpha,
+                                        validIdx == 0,
+                                        scale,
+                                        kvSTileSizeAct,
+                                        False,
+                                        m,
+                                        DTYPE_P,
+                                        row_max,
+                                        tile_sum,
+                                    )
+                                elif kvSTileSizeAct == 128:
+                                    online_softmax_tile(
+                                        ub_s,
+                                        ub_p_zN_full,
+                                        running_max,
+                                        running_sum,
+                                        alpha,
+                                        validIdx == 0,
+                                        scale,
+                                        None,
+                                        True,
+                                        m,
+                                        DTYPE_P,
+                                        row_max,
+                                        tile_sum,
+                                    )
+                                else:
+                                    online_softmax_tile(
+                                        ub_s,
+                                        ub_p_zN_full,
+                                        running_max,
+                                        running_sum,
+                                        alpha,
+                                        validIdx == 0,
+                                        scale,
+                                        kvSTileSizeAct,
+                                        True,
+                                        m,
+                                        DTYPE_P,
+                                        row_max,
+                                        tile_sum,
+                                    )
                             if ubSBufId == 0:
                                 tla.set_flag(p_ub_ready_l1_0)
                                 tla.wait_flag(p_ub_ready_l1_0)
@@ -935,24 +1092,57 @@ def flex_attention_kernel(
                             tla.cross_core_wait_flag(sm_ready_mm2_2, tla.arch.MTE3)
                         if m > 0:
                             ubP_copy_ptr = ubP_ptrs[0] if ubSBufId == 0 else ubP_ptrs[1]
-                            p_copy_source = tla.make_tensor(
-                                ubP_copy_ptr,
-                                tla.make_layout(tla.make_shape(65, 128), tla.make_stride(128, 1)),
-                            )
-                            p_copy_source_zn = tla.make_tensor_like(
-                                ubP_copy_ptr, p_copy_source, tla.arch.zNUnAlign
-                            )
-                            p_copy_tile = tla.tile_view(
-                                p_copy_source_zn,
-                                tla.make_shape(m, kvSTileSizeAct),
-                                tla.make_coord(0, 0),
-                            )
-                            l1P_tile = tla.tile_view(
-                                l1PTensorTla,
-                                tla.make_shape(mHalf, kvSTileSizeAct),
-                                tla.make_coord(subIdxEff, 0),
-                            )
-                            tla.copy(l1P_tile, p_copy_tile)
+                            if tla.const_expr(use_dn):
+                                for p_half in tla.range_constexpr(2):
+                                    half_columns = min(64, max(0, kvSTileSizeAct - p_half * 64))
+                                    half_ptr = ubP_copy_ptr + p_half * 4160
+                                    p_copy_source = tla.make_tensor(
+                                        half_ptr,
+                                        tla.make_layout(
+                                            tla.make_shape(65, 64), tla.make_stride(64, 1)
+                                        ),
+                                    )
+                                    p_copy_source_zn = tla.make_tensor_like(
+                                        half_ptr, p_copy_source, tla.arch.zNUnAlign
+                                    )
+                                    p_copy_tile = tla.tile_view(
+                                        p_copy_source_zn,
+                                        tla.make_shape(half_columns, mHalf),
+                                        tla.make_coord(0, 0),
+                                    )
+                                    l1_half = tla.make_tensor_like(
+                                        l1p_ptr + p_half * 64 * 16,
+                                        ubSTensorTla,
+                                        tla.arch.zN,
+                                    )
+                                    l1P_tile = tla.tile_view(
+                                        l1_half,
+                                        tla.make_shape(half_columns, mHalf),
+                                        tla.make_coord(0, subIdxEff),
+                                    )
+                                    if kvSTileSizeAct > p_half * 64:
+                                        tla.copy(l1P_tile, p_copy_tile)
+                            else:
+                                p_copy_source = tla.make_tensor(
+                                    ubP_copy_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(65, 128), tla.make_stride(128, 1)
+                                    ),
+                                )
+                                p_copy_source_zn = tla.make_tensor_like(
+                                    ubP_copy_ptr, p_copy_source, tla.arch.zNUnAlign
+                                )
+                                p_copy_tile = tla.tile_view(
+                                    p_copy_source_zn,
+                                    tla.make_shape(m, kvSTileSizeAct),
+                                    tla.make_coord(0, 0),
+                                )
+                                l1P_tile = tla.tile_view(
+                                    l1PTensorTla,
+                                    tla.make_shape(mHalf, kvSTileSizeAct),
+                                    tla.make_coord(subIdxEff, 0),
+                                )
+                                tla.copy(l1P_tile, p_copy_tile)
                         if ubSBufId == 0:
                             tla.set_flag(mte3_ready_softmax_0)
                         else:
@@ -978,24 +1168,45 @@ def flex_attention_kernel(
                     kvSTileSizeActDe = min(128, kv_len - gatheredKvSTileIdxDe * 128)
                     ubOTmpBufId = validIdxDe % 2
                     ubOTmp_ptr = ubOTmp_ptrs[0] if ubOTmpBufId == 0 else ubOTmp_ptrs[1]
-                    ubOTmpTensorTla = tla.make_tensor(
-                        ubOTmp_ptr,
-                        tla.make_layout(tla.make_shape(rowNum, head_dim), tla.make_stride(128, 1)),
-                    )
+                    if tla.const_expr(use_dn):
+                        ubOTmpTensorTla = tla.make_tensor(
+                            ubOTmp_ptr,
+                            tla.make_layout(
+                                tla.make_shape(paddedRows, head_dim),
+                                tla.make_stride(128, 1),
+                            ),
+                        )
+                    else:
+                        ubOTmpTensorTla = tla.make_tensor(
+                            ubOTmp_ptr,
+                            tla.make_layout(
+                                tla.make_shape(rowNum, head_dim), tla.make_stride(128, 1)
+                            ),
+                        )
                     l1PBufIdDe = validIdxDe % 3
                     l1P_ptrDe = (
                         l1P_ptrs[0]
                         if l1PBufIdDe == 0
                         else (l1P_ptrs[1] if l1PBufIdDe == 1 else l1P_ptrs[2])
                     )
-                    p_shape = tla.make_tensor(
-                        ubOTmp_ptr,
-                        tla.make_layout(
-                            tla.make_shape(rowNum, kvSTileSizeActDe),
-                            tla.make_stride(128, 1),
-                        ),
-                    )
-                    l1PTensorTlaDe = tla.make_tensor_like(l1P_ptrDe, p_shape, tla.arch.zN)
+                    if tla.const_expr(use_dn):
+                        p_shape = tla.make_tensor(
+                            ubOTmp_ptr,
+                            tla.make_layout(
+                                tla.make_shape(paddedRows, kvSTileSizeActDe),
+                                tla.make_stride(128, 1),
+                            ),
+                        )
+                        l1PTensorTlaDe = tla.make_tensor_like(l1P_ptrDe, p_shape, tla.arch.nZ)
+                    else:
+                        p_shape = tla.make_tensor(
+                            ubOTmp_ptr,
+                            tla.make_layout(
+                                tla.make_shape(rowNum, kvSTileSizeActDe),
+                                tla.make_stride(128, 1),
+                            ),
+                        )
+                        l1PTensorTlaDe = tla.make_tensor_like(l1P_ptrDe, p_shape, tla.arch.zN)
 
                     # PV Mmad
                     with tla.cube():
@@ -1144,8 +1355,16 @@ def flex_attention_kernel(
 
                     with tla.vector():
                         re_subIdxEff = tla.arch.sub_block_idx()
-                        re_mHalf = (rowNum + 1) // 2
-                        re_m = re_mHalf if re_subIdxEff == 0 else rowNum - re_mHalf
+                        if tla.const_expr(use_dn):
+                            re_mHalf = paddedRows // 2
+                            re_m = (
+                                min(re_mHalf, rowNum)
+                                if re_subIdxEff == 0
+                                else max(0, rowNum - re_mHalf)
+                            )
+                        else:
+                            re_mHalf = (rowNum + 1) // 2
+                            re_m = re_mHalf if re_subIdxEff == 0 else rowNum - re_mHalf
                         if ubOTmpBufId == 0:
                             tla.cross_core_wait_flag(mm2_ready_re_0, tla.arch.VECTOR)
                         else:
@@ -1197,8 +1416,16 @@ def flex_attention_kernel(
         else:
             with tla.vector():
                 empty_subIdxEff = tla.arch.sub_block_idx()
-                empty_mHalf = (rowNum + 1) // 2
-                empty_m = empty_mHalf if empty_subIdxEff == 0 else rowNum - empty_mHalf
+                if tla.const_expr(use_dn):
+                    empty_mHalf = paddedRows // 2
+                    empty_m = (
+                        min(empty_mHalf, rowNum)
+                        if empty_subIdxEff == 0
+                        else max(0, rowNum - empty_mHalf)
+                    )
+                else:
+                    empty_mHalf = (rowNum + 1) // 2
+                    empty_m = empty_mHalf if empty_subIdxEff == 0 else rowNum - empty_mHalf
                 tla.wait_flag(mte3_ready_rescale)
                 if empty_m > 0:
                     empty_output_ub = tla.make_tensor(
@@ -1230,8 +1457,16 @@ def flex_attention_kernel(
         # Every task, including an empty sparse row, writes its complete O/LSE.
         with tla.vector():
             final_subIdxEff = tla.arch.sub_block_idx()
-            final_mHalf = (rowNum + 1) // 2
-            final_m = final_mHalf if final_subIdxEff == 0 else rowNum - final_mHalf
+            if tla.const_expr(use_dn):
+                final_mHalf = paddedRows // 2
+                final_m = (
+                    min(final_mHalf, rowNum)
+                    if final_subIdxEff == 0
+                    else max(0, rowNum - final_mHalf)
+                )
+            else:
+                final_mHalf = (rowNum + 1) // 2
+                final_m = final_mHalf if final_subIdxEff == 0 else rowNum - final_mHalf
             tla.wait_flag(mte3_ready_rescale)
             if final_m > 0:
                 final_out_layout = tla.make_layout(

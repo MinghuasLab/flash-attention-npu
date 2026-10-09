@@ -16,22 +16,55 @@ _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
 
 
-def _select_packed_heads(batch, q_len, q_heads, kv_heads, cores, sparse, window_left, window_right):
-    """Fold heads sharing one KV head only when occupied cores are preserved."""
+def _select_kernel_options(
+    batch,
+    q_len,
+    kv_len,
+    q_heads,
+    kv_heads,
+    cores,
+    sparse,
+    *,
+    has_simt_mod,
+    has_aux,
+    has_mod,
+    has_window,
+    scale,
+):
+    """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
-    if q_len >= 128 or group == 1:
-        return 1
-    if sparse is not None and any(
-        stride is not None and stride[1] != 0 for stride in sparse.strides
-    ):
-        return 1
-    if window_left is not None or window_right is not None:
-        return 1
-    original_tasks = batch * q_heads * ((q_len + 127) // 128)
-    packed_tasks = batch * kv_heads * ((q_len * group + 127) // 128)
-    if packed_tasks >= original_tasks or packed_tasks < min(original_tasks, cores):
-        return 1
-    return group
+    shared_heads = sparse is None or all(
+        stride is None or stride[1] == 0 for stride in sparse.strides
+    )
+    packed_heads = 1
+    if q_len < 128 and group > 1 and shared_heads:
+        original_tasks = batch * q_heads * ((q_len + 127) // 128)
+        packed_tasks = batch * kv_heads * ((q_len * group + 127) // 128)
+        # Folding heads must reduce tasks without losing occupied cores.
+        if min(original_tasks, cores) <= packed_tasks < original_tasks:
+            packed_heads = group
+    # Per-row SIMT coordinate work can outweigh packing beyond short Q.
+    if has_simt_mod and q_len > 32:
+        packed_heads = 1
+    q_rows = q_len * packed_heads
+    # Packed windows, SIMT and auxiliary calls retain KV-lane SIMD.
+    # Unpacked DN tails need enough Q/KV tiles to amortize their padding.
+    use_dn = (
+        not (packed_heads > 1 and has_window)
+        and not has_simt_mod
+        and not has_aux
+        and (q_rows % 128 == 0 or (packed_heads == 1 and q_rows >= 512 and kv_len >= 512))
+        and kv_len >= 256
+    )
+    full_dn = (
+        use_dn
+        and q_rows % 128 == 0
+        and kv_len % 128 == 0
+        and not has_mod
+        and not has_window
+        and scale > 0
+    )
+    return packed_heads, use_dn, full_dn
 
 
 def _check_launch_tensors(tensors):
@@ -273,15 +306,21 @@ def flash_attn_func(
             if block_sparse_tensors is not None
             else None
         )
-        packed_heads = _select_packed_heads(
-            batch, q_len, q_heads, kv_heads, cores, sparse, window_left, window_right
+        packed_heads, use_dn, full_dn = _select_kernel_options(
+            batch,
+            q_len,
+            kv_len,
+            q_heads,
+            kv_heads,
+            cores,
+            sparse,
+            has_simt_mod=(mask_mod is not None and not mask_uses_simd)
+            or (score_mod is not None and not score_uses_simd),
+            has_aux=aux_tensors is not None or aux_scalars is not None,
+            has_mod=mask_mod is not None or score_mod is not None,
+            has_window=window_left is not None or window_right is not None,
+            scale=scale,
         )
-        # SIMT coordinate work can outweigh packing savings for longer Q tiles.
-        has_simt_mod = (mask_mod is not None and not mask_uses_simd) or (
-            score_mod is not None and not score_uses_simd
-        )
-        if has_simt_mod and q_len > 32:
-            packed_heads = 1
         if packed_heads > 1:
             # Only MQA has a contiguous folded view. GQA groups are gathered and
             # scattered on device, retaining the original BSND descriptors.
@@ -342,6 +381,8 @@ def flash_attn_func(
             head_dim,
             sparse.strides if sparse is not None else None,
             packed_heads,
+            use_dn,
+            full_dn,
         )
         key = _compilation_key(
             (*tensors, *sparse_tensors),

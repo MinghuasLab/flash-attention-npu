@@ -77,6 +77,8 @@ def _lower(
     dynamic=False,
     lengths=(17, 129),
     window=(None, None),
+    dn=False,
+    full_dn=False,
 ):
     from flash_attn_npu_dsl.flash_fwd import flex_attention_kernel
 
@@ -135,6 +137,8 @@ def _lower(
             dim,
             sparse_strides,
             1,
+            dn,
+            full_dn,
         ),
     )
 
@@ -304,6 +308,7 @@ def short_score(value, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
         (None, short_score, "Float32 VectorSSA"),
     ],
 )
-def test_simd_rejects_scalar_or_short_results(mask, score, error):
+@pytest.mark.parametrize("dn", [False, True])
+def test_simd_rejects_scalar_or_short_results(mask, score, error, dn):
     with pytest.raises(UnsupportedExecutionLowering, match=error):
-        _lower(mask, score)
+        _lower(mask, score, dn=dn)

@@ -31,12 +31,16 @@ def _load_score_row(scores, row, scale, columns, apply_scale):
         params=tla.params.NormalLoadParams(load_dist=tla.params.LoadDist.DIST_DINTLV_B32)
     )
     if tla.const_expr(apply_scale):
-        first_mask, _ = tla.update_mask((columns + 1) // 2, dtype=tla.Float32)
-        second_mask, _ = tla.update_mask(columns // 2, dtype=tla.Float32)
         multiplier = tla.full(scale, tla.Float32)
-        padding = tla.full(float("-inf"), tla.Float32)
-        odd = tla.where(first_mask, odd * multiplier, padding)
-        even = tla.where(second_mask, even * multiplier, padding)
+        if tla.const_expr(columns is None):
+            odd = odd * multiplier
+            even = even * multiplier
+        else:
+            first_mask, _ = tla.update_mask((columns + 1) // 2, dtype=tla.Float32)
+            second_mask, _ = tla.update_mask(columns // 2, dtype=tla.Float32)
+            padding = tla.full(float("-inf"), tla.Float32)
+            odd = tla.where(first_mask, odd * multiplier, padding)
+            even = tla.where(second_mask, even * multiplier, padding)
     return odd, even
 
 

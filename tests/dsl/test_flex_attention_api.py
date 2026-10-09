@@ -216,7 +216,7 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 24
+    assert len(host.compiled[0]) == 26
     args, kwargs = host.launched[0]
     assert len(args) == 8 and kwargs == {"block_num": 2}
     assert (args[4] is None) == (not lse)
@@ -231,7 +231,7 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
     dynamic = tensors is None and not scalars
     assert all(tensor.dynamic_mode == (0 if dynamic else None) for tensor in host.compiled[0][:4])
     assert host.compiled[0][11:13] == ((None, None) if dynamic else (34, 65))
-    assert host.compiled[0][-3:] == (96, None, 2)
+    assert host.compiled[0][21:24] == (96, None, 2)
     assert out.shape == host.inputs[0].shape
     assert (result_lse is None) == (not lse)
     assert host.current == "previous"
@@ -259,31 +259,46 @@ def test_public_call_checks_external_storage_not_new_outputs(host, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch,q_len,heads,kv_heads,cores,sparse,window,expected",
+    "batch,q_len,heads,kv_heads,cores,sparse,expected",
     [
-        (650, 2, 49, 1, 32, None, (None, None), 49),
-        (2, 64, 6, 1, 32, None, (None, None), 1),
-        (32, 129, 33, 1, 32, None, (None, None), 1),
-        (32, 256, 33, 1, 32, None, (None, None), 1),
-        (32, 2, 48, 3, 32, None, (None, None), 16),
-        (32, 2, 49, 1, 32, SimpleNamespace(strides=((0, 1, 1),)), (None, None), 1),
-        (32, 2, 49, 1, 32, None, (None, 0), 1),
+        (650, 2, 49, 1, 32, None, 49),
+        (2, 64, 6, 1, 32, None, 1),
+        (32, 129, 33, 1, 32, None, 1),
+        (32, 256, 33, 1, 32, None, 1),
+        (32, 2, 48, 3, 32, None, 16),
+        (13, 35, 4, 1, 28, None, 1),
+        (14, 35, 4, 1, 28, None, 4),
+        (32, 2, 49, 1, 32, SimpleNamespace(strides=((0, 1, 1),)), 1),
     ],
 )
 def test_packed_head_policy_preserves_parallelism(
-    batch, q_len, heads, kv_heads, cores, sparse, window, expected
+    batch, q_len, heads, kv_heads, cores, sparse, expected
 ):
-    assert (
-        interface._select_packed_heads(batch, q_len, heads, kv_heads, cores, sparse, *window)
-        == expected
+    packed_heads, _, _ = interface._select_kernel_options(
+        batch,
+        q_len,
+        257,
+        heads,
+        kv_heads,
+        cores,
+        sparse,
+        has_simt_mod=False,
+        has_aux=False,
+        has_mod=False,
+        has_window=False,
+        scale=0.125,
     )
+    assert packed_heads == expected
 
 
-def test_packed_public_call_preserves_layout_and_reuses_lengths(host):
+@pytest.mark.parametrize(
+    "options", [{}, {"causal": True}, {"window_size": (7, 3)}, {"window_size": (0, None)}]
+)
+def test_packed_public_call_preserves_layout_and_reuses_lengths(host, options):
     k = torch.empty(32, 129, 1, 64, dtype=torch.float16)
-    for q_len in (5, 7):
+    for q_len in (5, 7, 32, 33):
         q = torch.empty(32, q_len, 33, 64, dtype=torch.float16)
-        out, lse = interface.flash_attn_func(q, k, k, return_lse=True)
+        out, lse = interface.flash_attn_func(q, k, k, return_lse=True, **options)
         assert out.shape == q.shape and out.is_contiguous()
         assert lse.shape == (32, 33, q_len) and lse.is_contiguous()
         launch = host.launched[-1][0]
@@ -291,7 +306,7 @@ def test_packed_public_call_preserves_layout_and_reuses_lengths(host):
         assert launch[0].tensor.data_ptr() == q.data_ptr()
         assert q.shape == (32, q_len, 33, 64)
     assert len(host.compiled) == 1
-    assert host.compiled[0][-1] == 33
+    assert host.compiled[0][23] == 33
 
 
 @pytest.mark.parametrize(
@@ -313,7 +328,83 @@ def test_callback_packing_limits_simt_to_short_queries(host, mask, score, q_len,
     q = torch.empty(32, q_len, 33, 64, dtype=torch.float16)
     k = torch.empty(32, 17, 1, 64, dtype=torch.float16)
     interface.flash_attn_func(q, k, k, mask_mod=mask, score_mod=score)
-    assert host.compiled[0][-1] == packed_heads
+    assert host.compiled[0][23] == packed_heads
+
+
+@pytest.mark.parametrize(
+    "q_len,kv_len,options,expected",
+    [
+        (127, 512, {}, (False, False)),
+        (128, 255, {}, (False, False)),
+        (128, 256, {}, (True, True)),
+        (128, 257, {}, (True, False)),
+        (129, 512, {}, (False, False)),
+        (511, 512, {}, (False, False)),
+        (513, 511, {}, (False, False)),
+        (512, 512, {}, (True, True)),
+        (513, 512, {}, (True, False)),
+        (513, 513, {"mask_mod": vector_mask}, (True, False)),
+        (513, 513, {"mask_mod": causal_mask}, (False, False)),
+        (513, 513, {"aux_scalars": (1,)}, (False, False)),
+        (128, 256, {"mask_mod": vector_mask}, (True, False)),
+        (128, 256, {"score_mod": vector_score}, (True, False)),
+        (128, 256, {"mask_mod": causal_mask}, (False, False)),
+        (128, 256, {"mask_mod": vector_mask, "score_mod": scale_score}, (False, False)),
+        (128, 256, {"aux_scalars": (1,)}, (False, False)),
+        (128, 256, {"aux_tensors": []}, (False, False)),
+        (128, 256, {"softcap": 5.0}, (True, False)),
+        (128, 256, {"softmax_scale": 0.0}, (True, False)),
+        (128, 256, {"softmax_scale": -0.125}, (True, False)),
+    ],
+)
+def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
+    q = torch.empty(1, q_len, 4, 64, dtype=torch.float16)
+    k = torch.empty(1, kv_len, 2, 64, dtype=torch.float16)
+    interface.flash_attn_func(q, k, k, **options)
+    assert host.compiled[0][-2:] == expected
+    assert len(host.launched[0][0]) == 8
+
+
+@pytest.mark.parametrize(
+    "q_len,options,packed_heads,expected",
+    [
+        (4, {}, 32, (True, True)),
+        (17, {}, 32, (False, False)),
+        (4, {"causal": True}, 32, (False, False)),
+        (4, {"window_size": (128, 32)}, 32, (False, False)),
+        (4, {"window_size": (0, None)}, 32, (False, False)),
+        (4, {"causal": True, "score_mod": vector_score}, 32, (False, False)),
+        (32, {"causal": True}, 32, (False, False)),
+        (33, {"causal": True}, 32, (False, False)),
+        (64, {"window_size": (128, 32)}, 32, (False, False)),
+        (33, {"causal": True, "score_mod": vector_score}, 32, (False, False)),
+        (33, {"causal": True, "score_mod": scale_score}, 1, (False, False)),
+    ],
+)
+def test_packed_window_layout_and_query_limit(host, q_len, options, packed_heads, expected):
+    q = torch.empty(32, q_len, 32, 64, dtype=torch.float16)
+    k = torch.empty(32, 256, 1, 64, dtype=torch.float16)
+    interface.flash_attn_func(q, k, k, **options)
+    assert host.compiled[0][23] == packed_heads
+    assert host.compiled[0][-2:] == expected
+
+
+def test_dynamic_cache_separates_score_layouts_and_reuses_within_each(host):
+    for q_len, kv_len, count in (
+        (128, 256, 1),
+        (256, 384, 1),
+        (128, 257, 2),
+        (256, 513, 2),
+        (513, 512, 2),
+        (577, 1025, 2),
+        (129, 257, 3),
+        (127, 513, 3),
+        (128, 256, 3),
+    ):
+        q = torch.empty(1, q_len, 4, 64, dtype=torch.float16)
+        k = torch.empty(1, kv_len, 2, 64, dtype=torch.float16)
+        interface.flash_attn_func(q, k, k)
+        assert len(host.compiled) == count
 
 
 def test_public_call_reuses_compilation_with_current_buffers_and_scalars(host, monkeypatch):
@@ -356,17 +447,20 @@ def test_public_call_reuses_dynamic_lengths_with_current_buffers(host, monkeypat
     def unexpected_conversion(*args, **kwargs):
         pytest.fail("cache hits must not construct DLPack compilation samples")
 
+    seen_modes = set()
     for q_len, kv_len in ((512, 257), (768, 513), (1024, 1024), (512, 257)):
+        mode = (True, not options and kv_len % 128 == 0)
         inputs = (
             torch.empty(1, q_len, 4, 96, dtype=torch.bfloat16),
             torch.empty(1, kv_len, 2, 96, dtype=torch.bfloat16),
             torch.empty(1, kv_len, 2, 96, dtype=torch.bfloat16),
         )
         with monkeypatch.context() as context:
-            if host.compiled:
+            if mode in seen_modes:
                 context.setattr(interface, "from_dlpack", unexpected_conversion)
             out, lse = interface.flash_attn_func(*inputs, **options)
-        assert len(host.compiled) == 1
+        seen_modes.add(mode)
+        assert len(host.compiled) == len(seen_modes)
         assert host.compiled[0][11:13] == (None, None)
         assert all(tensor.dynamic_mode == 0 for tensor in host.compiled[0][:4])
         args = host.launched[-1][0]
@@ -376,20 +470,20 @@ def test_public_call_reuses_dynamic_lengths_with_current_buffers(host, monkeypat
         assert args[0].build_memref_launch_fields()[3:5] == (q_len, 4 * 96)
         assert args[1].build_memref_launch_fields()[3:5] == (kv_len, 2 * 96)
         assert out.shape == inputs[0].shape and lse is None
-        assert len(host.converted) == 4
+        assert len(host.converted) == 4 * len(seen_modes)
 
     out, lse = interface.flash_attn_func(*inputs, return_lse=True, **options)
-    assert len(host.compiled) == 2
+    assert len(host.compiled) == len(seen_modes) + 1
     assert lse.shape == (1, 4, q_len)
     args = host.launched[-1][0]
     assert args[4].tensor is lse
     assert args[4].build_memref_launch_fields()[0] == lse.data_ptr()
     assert args[4].build_memref_launch_fields()[3:5] == (4 * q_len, 1)
-    # A short dense GQA now selects the packed specialization; window paths do not.
+    # Short queries select ND, independent of the DN executables above.
     interface.flash_attn_func(*host.inputs, return_lse=True, **options)
-    expected_variants = 3 if not options else 2
+    expected_variants = len(seen_modes) + 2
     assert len(host.compiled) == expected_variants
-    assert len(host.converted) == (14 if not options else 9)
+    assert len(host.converted) == 4 * len(seen_modes) + 10
     with monkeypatch.context() as context:
         context.setattr(interface, "from_dlpack", unexpected_conversion)
         interface.flash_attn_func(*host.inputs, return_lse=True, **options)
@@ -452,10 +546,8 @@ def test_public_callbacks_select_independent_modes_and_mask_overrides_window(
     args = host.compiled[0]
     assert args[15] is mask and args[16] is score
     assert args[17:19] == expected and args[19:21] == modes
-    assert args[21:] == (96, None, 2 if mask is not None else 1)
-    assert args[11:13] == (
-        (None, None) if mask is None and score is None else (34 if mask is not None else 17, 65)
-    )
+    assert args[21:24] == (96, None, 2)
+    assert args[11:13] == ((None, None) if mask is None and score is None else (34, 65))
     assert host.launched[0][0][5] is None
 
 

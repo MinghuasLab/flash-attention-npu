@@ -349,9 +349,9 @@ def test_short_query_packing_requires_every_sparse_tensor_to_share_heads(
     blocks = block_sparsity.BlockSparseTensorsTorch(*tensors, block_size=(128, 128))
     out, lse = interface.flash_attn_func(q, k, k, block_sparse_tensors=blocks, return_lse=True)
     assert out.shape == q.shape and lse.shape == (32, 33 * kv_heads, 5)
-    assert sparse_host.compiled[0][-1] == (33 if independent_head is None else 1)
+    assert sparse_host.compiled[0][23] == (33 if independent_head is None else 1)
     assert sparse_host.launched[0][0] is q
-    strides = sparse_host.compiled[0][-2]
+    strides = sparse_host.compiled[0][22]
     assert tuple(stride[2] for stride in strides) == (
         (0, 0, 0, 0) if independent_head is None else (1, 1, 1, 2)
     )
@@ -374,12 +374,12 @@ def test_packed_sparse_optional_and_empty_lists_keep_unit_bindings(
         block_size=(128, 128),
     )
     interface.flash_attn_func(q, k, k, block_sparse_tensors=blocks)
-    assert sparse_host.compiled[0][-1] == 33
+    assert sparse_host.compiled[0][23] == 33
     bound = sparse_host.launched[0][5]
     assert (bound[1] is None) == (capacity == 0)
     assert (bound[2] is None) == (not full_present)
     assert bound[3] is None
-    assert all(stride is None or stride == (0, 0, 0) for stride in sparse_host.compiled[0][-2])
+    assert all(stride is None or stride == (0, 0, 0) for stride in sparse_host.compiled[0][22])
 
 
 @pytest.mark.parametrize(
@@ -608,8 +608,8 @@ def _direct_sparse_regression_blocks():
     return block_sparsity.BlockSparseTensorsTorch(pc, pi, fc, fi, block_size=(128, 128))
 
 
-def _regression_visibility(blocks):
-    visible = torch.zeros(2, 2, 1041, 513, dtype=torch.bool)
+def _regression_visibility(blocks, q_len=1041):
+    visible = torch.zeros(2, 2, q_len, 513, dtype=torch.bool)
 
     def row(tensor, batch, head, query):
         return tensor[batch % tensor.shape[0], head % tensor.shape[1], query]
@@ -677,8 +677,9 @@ def test_device_regression_metadata_contains_only_safe_active_prefixes(shape):
         (torch.bfloat16, 96, True, _regression_vector_mask, None),
     ],
 )
+@pytest.mark.parametrize("q_len", [1041, 1152])
 def test_direct_sparse_device_ordinals_tail_broadcast_and_rebinding(
-    monkeypatch, dtype, dim, return_lse, mask, score
+    monkeypatch, dtype, dim, return_lse, mask, score, q_len
 ):
     import torch_npu  # noqa: F401
 
@@ -696,7 +697,7 @@ def test_direct_sparse_device_ordinals_tail_broadcast_and_rebinding(
     monkeypatch.setenv("CATLASS_DSL_CACHE", "1")
     monkeypatch.setenv("CATLASS_DSL_FORCE_RECOMPILE", "0")
     generator = torch.Generator().manual_seed(17 + dim)
-    q = torch.randn(2, 1041, 2, dim, generator=generator, dtype=dtype).to(device)
+    q = torch.randn(2, q_len, 2, dim, generator=generator, dtype=dtype).to(device)
     k = torch.randn(2, 513, 1, dim, generator=generator, dtype=dtype).to(device)
     v = torch.randn(2, 513, 1, dim, generator=generator, dtype=dtype).to(device)
     cpu_blocks = _direct_sparse_regression_blocks()
@@ -724,7 +725,7 @@ def test_direct_sparse_device_ordinals_tail_broadcast_and_rebinding(
                 blocks = block_sparsity.BlockSparseTensorsTorch(
                     *(tensor.clone() for tensor in blocks[:4]), block_size=(128, 128)
                 )
-            masked = scores.masked_fill(~_regression_visibility(cpu_blocks), -torch.inf)
+            masked = scores.masked_fill(~_regression_visibility(cpu_blocks, q_len), -torch.inf)
             expected_lse = torch.logsumexp(masked, dim=-1)
             empty = torch.isneginf(expected_lse)
             probability = torch.exp(masked - torch.where(empty, 0, expected_lse)[..., None])
