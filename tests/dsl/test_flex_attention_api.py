@@ -573,6 +573,36 @@ def test_window_sides_normalize_independently(host, window, expected):
     assert host.compiled[0][17:19] == expected
 
 
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ({"causal": True}, (None, None)),
+        ({"window_size": (None, 3)}, (None, None)),
+        ({"window_size": (7, 0)}, (7, None)),
+        ({"causal": True, "window_size": (0, None)}, (0, None)),
+        ({"causal": True, "score_mod": vector_score}, (None, None)),
+        ({"causal": True, "window_size": (7, 3), "mask_mod": vector_mask}, (None, None)),
+    ],
+)
+def test_single_query_removes_only_redundant_right_bound(host, options, expected):
+    q = torch.empty(32, 1, 33, 64, dtype=torch.float16)
+    k = torch.empty(32, 129, 1, 64, dtype=torch.float16)
+    interface.flash_attn_func(q, k, k, **options)
+    assert host.compiled[0][17:19] == expected
+    assert host.compiled[0][15] is options.get("mask_mod")
+    assert host.compiled[0][16] is options.get("score_mod")
+
+
+def test_single_query_causal_shares_dense_cache_not_longer_causal(host):
+    k = torch.empty(32, 129, 1, 64, dtype=torch.float16)
+    for q_len, causal, variants in ((1, True, 1), (1, False, 1), (2, True, 2), (2, False, 2)):
+        q = torch.empty(32, q_len, 33, 64, dtype=torch.float16)
+        interface.flash_attn_func(q, k, k, causal=causal)
+        assert len(host.compiled) == variants
+    assert host.compiled[0][17:19] == (None, None)
+    assert host.compiled[1][17:19] == (None, 0)
+
+
 @pytest.mark.parametrize("option,value", [("qv", object()), ("num_splits", 2)])
 def test_unsupported_options_rejected_before_compile(host, option, value):
     with pytest.raises(NotImplementedError, match=option):

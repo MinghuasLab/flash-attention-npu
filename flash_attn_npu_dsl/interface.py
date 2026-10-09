@@ -277,6 +277,9 @@ def flash_attn_func(
         score_mod = softcap_score_mod(softcap)
     window_left, window_right = _resolve_window(causal, window_size, mask_mod)
     batch, q_len, q_heads, head_dim = q.shape
+    # One right-aligned Q row is centered on the last KV position.
+    if q_len == 1:
+        window_right = None
     kv_len, kv_heads = k.shape[1:3]
     scale = float(softmax_scale) if softmax_scale is not None else 1 / math.sqrt(head_dim)
     if not math.isfinite(scale):

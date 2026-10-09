@@ -254,8 +254,12 @@ def test_short_queries_preserve_callback_coordinates_and_lse(dtype, mask, score,
     [
         (torch.float16, 8, 48, 2, ((16, 257), (32, 389)), (None, 0), None),
         (torch.float16, 16, 13, 1, ((1, 129), (5, 257)), (None, 0), None),
+        (torch.bfloat16, 64, 33, 1, ((1, 2), (2, 2)), (None, 0), None),
+        (torch.float16, 64, 128, 1, ((1, 256), (2, 257)), (None, 0), None),
+        (torch.float16, 32, 66, 2, ((1, 2), (2, 2)), (0, 0), _vector_scale_score),
         (torch.bfloat16, 96, 34, 2, ((9, 1), (7, 129)), (0, 0), None),
         (torch.float16, 80, 33, 1, ((5, 389), (7, 129)), (128, 32), None),
+        (torch.float16, 64, 33, 1, ((5, 1024), (7, 1025)), (128, 32), None),
         (torch.bfloat16, 64, 33, 1, ((5, 257), (7, 129)), (0, None), _coordinate_score),
         (torch.float16, 128, 32, 1, ((4, 257), (8, 389)), (None, 0), _vector_scale_score),
         (torch.float16, 128, 16, 4, ((33, 257), (45, 389)), (None, 0), _vector_scale_score),
@@ -382,8 +386,12 @@ def test_public_attention_reuses_dynamic_lengths(monkeypatch, mode, dtype, dim):
             runtime_inputs = tuple(t.to(f"npu:{device}") for t in (q, k, v))
             out, lse = interface.flash_attn_func(*runtime_inputs, return_lse=True, **options)
             torch.npu.synchronize()
-            # Long aligned queries use DN; short/tail queries reuse an ND variant.
+            # Long aligned queries use DN. Short Q / KV calls use ND, but a
+            # single Q removes the right bound and cannot supply the later
+            # multi-row window variant.
             expected_compilations = 1 if mode == "packed_dense" or index < 4 else 2
+            if index == 5 and mode in ("causal", "window", "right_window", "zero_window"):
+                expected_compilations = 3
             assert len(compiled) == expected_compilations
 
             # The oracle does not call a modifier or use the device block schedule.

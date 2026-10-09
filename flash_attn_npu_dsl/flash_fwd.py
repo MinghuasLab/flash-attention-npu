@@ -397,6 +397,14 @@ def flex_attention_kernel(
         kBOffset = curBatch * kv_len * kSOffset
         gmOffsetV = curBatch * kv_len * vSOffset + kvHeadIdx * head_dim
         rowNum = min(128, q_len - qSTileIdx * 128)
+        if tla.const_expr(
+            not use_dn
+            and mask_mod is None
+            and score_mod is None
+            and (window_left is not None or window_right is not None)
+        ):
+            window_first_q = qSTileIdx * 128 // packed_heads
+            window_last_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads
         if tla.const_expr(use_dn):
             paddedRows = (rowNum + 31) // 32 * 32
         first_kv = 0
@@ -492,6 +500,27 @@ def flex_attention_kernel(
                             full_base,
                         )
                     kvSTileSizeAct = min(128, kv_len - gatheredKvSTileIdx * 128)
+                    window_needs_mask = True
+                    if tla.const_expr(
+                        not use_dn
+                        and mask_mod is None
+                        and score_mod is None
+                        and (window_left is not None or window_right is not None)
+                    ):
+                        # Extremal logical Q positions bound visibility for the
+                        # whole tile. Full tiles leave scaling/tail protection
+                        # to the softmax load pass; no score rewrite is needed.
+                        window_needs_mask = tla.as_numeric(False)
+                        if tla.const_expr(window_left is not None):
+                            window_needs_mask = window_needs_mask | (
+                                gatheredKvSTileIdx * 128
+                                < window_last_q + kv_len - seqlen_info.seqlen_q - window_left
+                            )
+                        if tla.const_expr(window_right is not None):
+                            window_needs_mask = window_needs_mask | (
+                                gatheredKvSTileIdx * 128 + kvSTileSizeAct - 1
+                                > window_first_q + kv_len - seqlen_info.seqlen_q + window_right
+                            )
                     ubSBufId = validIdx % 2
                     ubS_ptr = ubS_ptrs[0] if ubSBufId == 0 else ubS_ptrs[1]
                     if tla.const_expr(use_dn):
@@ -993,27 +1022,28 @@ def flex_attention_kernel(
                                         window_left is not None or window_right is not None
                                     ):
                                         # A scalar score is already scaled by the SIMT stage.
-                                        process_score_tile_simd(
-                                            ub_s,
-                                            m,
-                                            qSTileIdx * 128 + subIdxEff * mHalf,
-                                            gatheredKvSTileIdx * 128,
-                                            curBatch,
-                                            qHeadIdx,
-                                            kv_len,
-                                            scale,
-                                            seqlen_info,
-                                            aux_tensors,
-                                            aux_scalars,
-                                            window_left,
-                                            window_right,
-                                            None,
-                                            None,
-                                            score_mod is None,
-                                            False,
-                                            packed_heads=packed_heads,
-                                        )
-                                        tla.pipe_barrier(tla.pipes.ALL)
+                                        if window_needs_mask:
+                                            process_score_tile_simd(
+                                                ub_s,
+                                                m,
+                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                gatheredKvSTileIdx * 128,
+                                                curBatch,
+                                                qHeadIdx,
+                                                kv_len,
+                                                scale,
+                                                seqlen_info,
+                                                aux_tensors,
+                                                aux_scalars,
+                                                window_left,
+                                                window_right,
+                                                None,
+                                                None,
+                                                score_mod is None,
+                                                False,
+                                                packed_heads=packed_heads,
+                                            )
+                                            tla.pipe_barrier(tla.pipes.ALL)
                                     scores_are_scaled = use_simt
                                     if tla.const_expr(use_simd_modifiers):
                                         # Full blocks without a score callback leave scaling
@@ -1025,7 +1055,7 @@ def flex_attention_kernel(
                                     elif tla.const_expr(
                                         window_left is not None or window_right is not None
                                     ):
-                                        scores_are_scaled = True
+                                        scores_are_scaled = window_needs_mask
                                 if scores_are_scaled:
                                     online_softmax_tile(
                                         ub_s,
