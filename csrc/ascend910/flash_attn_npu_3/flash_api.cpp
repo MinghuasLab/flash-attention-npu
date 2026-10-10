@@ -189,6 +189,7 @@ std::vector<at::Tensor> mha_fwd(
     const bool paged_KV = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+    const bool appendKV = k_new_.has_value();
 
     if (paged_KV) {
         auto page_table = page_table_.value();
@@ -278,7 +279,22 @@ std::vector<at::Tensor> mha_fwd(
     const int page_block_size = !paged_KV ? 128 : k.size(1);
     const int num_heads_k = k.dim() == 3 ? k.size(1) : k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256, "FlashAttention only supports head dimension in [1, 256]");
+    // V3 keeps the original <=256 path untouched. D=512 is enabled only for
+    // the SplitFuse production shape: TND varlen-Q + paged KV, no append-KV.
+    if (head_size_og > 256) {
+        TORCH_CHECK(head_size_og == 512,
+                    "FlashAttention only supports head dimension at most 256, or exactly 512 "
+                    "for the TND + paged-KV varlen path");
+        TORCH_CHECK(is_varlen_q, "head dimension 512 requires varlen-Q (TND) layout");
+        TORCH_CHECK(paged_KV, "head dimension 512 requires paged KV cache");
+        TORCH_CHECK(!appendKV, "head dimension 512 does not support append-KV");
+        TORCH_CHECK(!is_varlen_kv, "head dimension 512 requires paged KV cache, not varlen-KV");
+    } else {
+        TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256,
+                    "FlashAttention only supports head dimension in [1, 256]");
+    }
+    TORCH_CHECK(k.size(-1) == head_size_og, "query and key must have the same head dimension");
+    TORCH_CHECK(v.size(-1) == head_size_og, "query and value must have the same head dimension");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // If seqused_k_ was not provided, derive seqlens_k from tensor shapes or cu_seqlens_k
@@ -293,7 +309,6 @@ std::vector<at::Tensor> mha_fwd(
         }
     }
 
-    const bool appendKV = k_new_.has_value();
     int64_t kvCacheSeqlen = 0; // per-batch cache capacity in append mode
     int64_t kvNewSeqlen = 0;   // per-batch new length in append mode
     if (appendKV) {

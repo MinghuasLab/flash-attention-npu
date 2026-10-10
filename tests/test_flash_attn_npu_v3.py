@@ -236,6 +236,23 @@ test_cases = [
     # new_kv=True dtype symmetry at 127/129 and 511/513 cache-update boundaries.
     (torch.float16, 3, 10, 2, 127, 513, 64, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 5, 24, 4, 129, 511, 256, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
+    # head_dim 512 (SplitFuse production shape: paged KV + TND varlen-q, no append-KV).
+    # dtype symmetry + Flash Decode (num_splits>1) on a single decode step.
+    (torch.float16, 1, 32, 8, 1, 2048, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 4, False),
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 4, False),
+    # head_dim 512 prefill (Sq>1) with FD, GQA group 8.
+    (torch.bfloat16, 1, 16, 2, 64, 2048, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
+    # head_dim 512 multi-KV-stack (4096 KV / 2 splits) and MHA (group 1).
+    (torch.float16, 1, 16, 2, 32, 4096, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
+    (torch.bfloat16, 2, 8, 8, 8, 1024, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 1, False),
+    # head_dim 512 bidirectional (no causal mask) with a wider GQA group.
+    (torch.bfloat16, 1, 32, 4, 32, 1024, 512, 1, 128, False, "TND", False, -1, -1, 0.0, 1, False),
+    # head_dim 512 must be skipped off the supported shape (BSND / append-KV).
+    (torch.bfloat16, 2, 8, 8, 64, 256, 512, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, False),
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 0, True),
+    # head_dim <=256 controls for the same shapes (regression guard).
+    (torch.float16, 1, 32, 8, 1, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 4, False),
+    (torch.bfloat16, 1, 16, 2, 64, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv", test_cases)
@@ -243,8 +260,20 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
-    if not (1 <= head_size <= 256):
-        pytest.skip("head_size must be in [1, 256]")
+    if head_size > 256:
+        # head_dim 512 is enabled only for the SplitFuse production shape:
+        # TND (varlen-q) + paged KV cache + FP16/BF16 + no append-KV, and only
+        # on the Ascend910 path (the Ascend950 v3 kernel caps head dim at 256).
+        if head_size != 512:
+            pytest.skip("head_size > 256 is only supported for exactly 512")
+        if "Ascend950" in name:
+            pytest.skip("Ascend950 v3 does not support head_size 512")
+        if not (cache_mode == 1 and layout == "TND"):
+            pytest.skip("head_size 512 requires paged KV cache and TND (varlen-q) layout")
+        if new_kv:
+            pytest.skip("head_size 512 does not support append-KV")
+    elif head_size < 1:
+        pytest.skip("head_size must be >= 1")
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     if new_kv:
