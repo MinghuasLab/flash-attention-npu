@@ -123,8 +123,10 @@ public:
     __aicore__ inline
     void operator()(FAIKernelParams const &params)
     {
-        __gm__ FAInferTilingData *faiTilingData =
-            reinterpret_cast<__gm__ FAInferTilingData *>(params.tiling);
+        __gm__ const FAInferStaticTilingData *faiTilingData =
+            reinterpret_cast<__gm__ const FAInferStaticTilingData *>(params.tiling);
+        __gm__ const FAInferRuntimeData *runtimeTilingData =
+            reinterpret_cast<__gm__ const FAInferRuntimeData *>(params.runtimeTiling);
         AscendC::GlobalTensor<ElementQ> gQ;
         gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
         AscendC::GlobalTensor<ElementK> gK;
@@ -164,8 +166,8 @@ public:
         embedV_ = faiTilingData->embeddingSizeV;
         firstBatchTaskNum_ = faiTilingData->firstBatchTaskNum;
         totalTaskNum_ = faiTilingData->totalTaskNum;
-        scaleValue_ = faiTilingData->scaleValue;
-        softcapValue_ = faiTilingData->softcapValue;
+        scaleValue_ = runtimeTilingData->scaleValue;
+        softcapValue_ = runtimeTilingData->softcapValue;
         // base tile info
         qBaseTile_ = faiTilingData->qBaseTile;
         kvBaseTile_ = faiTilingData->kvBaseTile;
@@ -174,9 +176,9 @@ public:
         // aligned seqlen q & kv
         qSeqlenAligned_ = faiTilingData->qSeqlenAligned;
         kvSeqlenAligned_ = faiTilingData->kvSeqlenAligned;
-        maxNumBlocksPerBatch_ = faiTilingData->maxNumBlocksPerBatch;
-        blockSize_ = faiTilingData->blockSize;
-        numBlocks_ = faiTilingData->numBlocks;
+        maxNumBlocksPerBatch_ = runtimeTilingData->maxNumBlocksPerBatch;
+        blockSize_ = runtimeTilingData->blockSize;
+        numBlocks_ = runtimeTilingData->numBlocks;
         qkL1TileM_ = faiTilingData->qkL1TileM;
         qkL1TileN_ = faiTilingData->qkL1TileN;
         qkL1TileKLeft_ = faiTilingData->qkL1TileKLeft;
@@ -189,9 +191,10 @@ public:
         kL1BufNum_ = faiTilingData->kL1BufNum;
         vL1BufNum_ = faiTilingData->vL1BufNum;
         pL1BufNum_ = faiTilingData->pL1BufNum;
-        windowSizeLeft_ = faiTilingData->windowSizeLeft;
-        windowSizeRight_ = faiTilingData->windowSizeRight;
-        flashDecodeFlag_ = faiTilingData->flashDecodeFlag;
+        windowSizeLeft_ = runtimeTilingData->windowSizeLeft;
+        windowSizeRight_ = runtimeTilingData->windowSizeRight;
+        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U &&
+            runtimeTilingData->allowFlashDecode != 0U;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
@@ -1039,7 +1042,7 @@ CATLASS_GLOBAL void FAInfer(
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
     GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
     GM_ADDR workspace,
-    GM_ADDR tiling
+    GM_ADDR tiling, GM_ADDR runtimeTiling
 ) {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1101,7 +1104,7 @@ CATLASS_GLOBAL void FAInfer(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling, runtimeTiling};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1115,7 +1118,7 @@ CATLASS_GLOBAL void FAInferDn(
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
     GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
     GM_ADDR workspace,
-    GM_ADDR tiling
+    GM_ADDR tiling, GM_ADDR runtimeTiling
 ) {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1170,7 +1173,7 @@ CATLASS_GLOBAL void FAInferDn(
     using Kernel = FAIKernel950<
         BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling, runtimeTiling};
     Kernel faInfer;
     faInfer(params);
 }

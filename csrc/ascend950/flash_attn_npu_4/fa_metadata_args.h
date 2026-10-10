@@ -6,7 +6,12 @@
 #include <type_traits>
 #include "tilingdata.h"
 
-static_assert(std::is_trivially_copyable<FAInferTilingData>::value, "FAInferTilingData must be trivially copyable");
+static_assert(std::is_trivially_copyable<FAInferStaticTilingData>::value, "static tiling must be trivially copyable");
+static_assert(std::is_standard_layout<FAInferStaticTilingData>::value, "static tiling must have a stable layout");
+static_assert(sizeof(FAInferStaticTilingData) == 3544, "static metadata ABI changed; update Python fake size");
+static_assert(std::is_trivially_copyable<FAInferRuntimeData>::value, "runtime tiling must be trivially copyable");
+static_assert(std::is_standard_layout<FAInferRuntimeData>::value, "runtime tiling must have a stable layout");
+static_assert(sizeof(FAInferRuntimeData) == 48, "runtime tiling ABI changed");
 namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = uint64_t(MASK_DIM) * MASK_DIM;
@@ -19,7 +24,7 @@ inline uint64_t TilingOffset(bool /*has_mask*/)
 }
 inline uint64_t MetadataBytes(bool /*has_mask*/)
 {
-    return sizeof(FAInferTilingData);
+    return sizeof(FAInferStaticTilingData);
 }
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = uint64_t(128) * 512;
 constexpr uint32_t PRELAUNCH_NUM = 3;
@@ -55,13 +60,10 @@ struct FAMetadataArgs {
     int64_t windowSizeLeft, windowSizeRight;
 };
 
-// Forward computes these values on CPU. The AICPU merge only copies them into
-// a private tiling buffer, avoiding a synchronous H2D copy during graph capture.
-struct FATilingOverrides {
-    uint64_t metadataAddr, tilingAddr;
-    uint32_t numBlocks, blockSize, maxNumBlocksPerBatch, maskType;
-    float scaleValue, softcapValue;
-    int64_t windowSizeLeft, windowSizeRight;
-    uint32_t allowFlashDecode;
+// CPU-computed launch payload. AICPU writes only this small, private runtime
+// buffer; reusable static metadata is neither read nor modified.
+struct FARuntimeArgs {
+    uint64_t runtimeAddr;
+    FAInferRuntimeData runtime;
 };
 #endif

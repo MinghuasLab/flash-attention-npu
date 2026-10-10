@@ -49,11 +49,11 @@ def _window_to_npu(window_size: Optional[int]) -> int:
     return -1 if window_size is None else int(window_size)
 
 
-# Ascend950 FA4 metadata contains only the serialized FAInferTilingData.  Keep
+# Ascend950 FA4 metadata contains only serialized FAInferStaticTilingData. Keep
 # this in sync with fa_metadata::MetadataBytes(false) in
 # csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
 # metadata, its size does not depend on the input sequence lengths or mask.
-_SCHEDULER_METADATA_TILING_BYTES = 3584
+_SCHEDULER_METADATA_TILING_BYTES = 3544
 
 
 @_torch_custom_op_wrapper(
@@ -122,7 +122,7 @@ def _get_scheduler_metadata_fake(
     seqused_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # The metadata is an opaque byte buffer during tracing.  Ascend950 FA4
-    # always serializes one fixed-size FAInferTilingData object, so returning
+    # serializes one fixed-size FAInferStaticTilingData object, so returning
     # a static shape lets Dynamo keep the custom op in the graph.
     return torch.empty(
         (_SCHEDULER_METADATA_TILING_BYTES,),

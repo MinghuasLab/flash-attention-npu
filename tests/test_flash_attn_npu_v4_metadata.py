@@ -63,6 +63,7 @@ def test_950_metadata_reuse_with_forward_parameters(page_size, paged):
         cu_seqlens_q=cu_q, seqused_k=used_k,
     )
     before = metadata.clone()
+    assert metadata.numel() == 3544
     for scale in (0.05, 0.2):
         kwargs = dict(
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, seqused_k=used_k,
@@ -86,6 +87,69 @@ def test_950_metadata_reuse_with_forward_parameters(page_size, paged):
                 assert_fa_close(graph_out, ref, ref, name="merged graph out")
                 assert_fa_close(graph_lse, ref_lse, ref_lse, name="merged graph lse")
         assert torch.equal(metadata, before)
+
+    if page_size == 256:
+        current = torch.npu.current_stream()
+        results = []
+        for scale in (0.05, 0.2):
+            kwargs["softmax_scale"] = scale
+            ref, ref_lse, *_ = flash_attn_varlen_func(
+                q, k, v, disable_scheduler_metadata=True, **kwargs
+            )
+            stream = torch.npu.Stream()
+            stream.wait_stream(current)
+            with torch.npu.stream(stream):
+                out, lse, *_ = flash_attn_varlen_func(
+                    q, k, v, scheduler_metadata=metadata, **kwargs
+                )
+            results.append((stream, out, lse, ref, ref_lse))
+        for stream, out, lse, ref, ref_lse in results:
+            current.wait_stream(stream)
+            assert_fa_close(out, ref, ref, name="multi-stream metadata out")
+            assert_fa_close(lse, ref_lse, ref_lse, name="multi-stream metadata lse")
+        assert torch.equal(metadata, before)
+
+
+def test_950_static_metadata_reuse_across_kv_layouts():
+    if "Ascend950" not in _device_name:
+        pytest.skip("Ascend950-only split tiling ABI")
+    q_len, kv_len, heads, dim, page_size = 8, 2048, 2, 64, 256
+    q = make_random_tensor((q_len, heads, dim), torch.bfloat16, device="npu")
+    k = make_random_tensor((kv_len, heads, dim), torch.bfloat16, device="npu")
+    v = make_random_tensor((kv_len, heads, dim), torch.bfloat16, device="npu")
+    paged_k = k.view(-1, page_size, heads, dim)
+    paged_v = v.view(-1, page_size, heads, dim)
+    table = torch.arange(kv_len // page_size, dtype=torch.int32, device="npu").view(1, -1)
+    cu_q = _int32_npu([0, q_len])
+    cu_k = _int32_npu([0, kv_len])
+    used_k = _int32_npu([kv_len])
+    metadata = get_scheduler_metadata(
+        q_len, kv_len, heads, heads, dim, 0,
+        cu_seqlens_q=cu_q, seqused_k=used_k,
+    )
+    before = metadata.clone()
+    for paged, scale in ((True, 0.05), (False, 0.2), (True, 0.2), (False, 0.05)):
+        key, value = (paged_k, paged_v) if paged else (k, v)
+        kwargs = dict(
+            cu_seqlens_q=cu_q, cu_seqlens_k=None if paged else cu_k,
+            seqused_k=used_k, page_table=table if paged else None,
+            max_seqlen_q=q_len, max_seqlen_k=kv_len, num_splits=0,
+            softmax_scale=scale, return_lse=True,
+        )
+        out, lse, *_ = flash_attn_varlen_func(
+            q, key, value, scheduler_metadata=metadata, **kwargs
+        )
+        ref, ref_lse, *_ = flash_attn_varlen_func(
+            q, key, value, disable_scheduler_metadata=True, **kwargs
+        )
+        assert_fa_close(out, ref, ref, name="shared static metadata out")
+        assert_fa_close(lse, ref_lse, ref_lse, name="shared static metadata lse")
+        assert torch.equal(metadata, before)
+
+    # Cached metadata produced by the old single-buffer ABI must be regenerated.
+    old_metadata = torch.zeros(3584, dtype=torch.uint8, device="npu")
+    with pytest.raises(RuntimeError, match="incompatible.*size"):
+        flash_attn_varlen_func(q, key, value, scheduler_metadata=old_metadata, **kwargs)
 
 
 @pytest.mark.parametrize(

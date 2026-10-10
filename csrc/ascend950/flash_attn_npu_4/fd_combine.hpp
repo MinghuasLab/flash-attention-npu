@@ -78,11 +78,16 @@ public:
         AscendC::SetVectorMask<int8_t>(
             static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
 
-        __gm__ FAInferTilingData *tiling =
-            reinterpret_cast<__gm__ FAInferTilingData *>(params.tiling);
+        __gm__ const FAInferStaticTilingData *tiling =
+            reinterpret_cast<__gm__ const FAInferStaticTilingData *>(params.tiling);
+        __gm__ const FAInferRuntimeData *runtimeTiling =
+            reinterpret_cast<__gm__ const FAInferRuntimeData *>(params.runtimeTiling);
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t combineIdx = AscendC::GetBlockIdx() / subBlockNum;
         if (combineIdx >= tiling->fdCombineTaskNum) {
+            return;
+        }
+        if (tiling->flashDecodeFlag == 0U || runtimeTiling->allowFlashDecode == 0U) {
             return;
         }
 
@@ -323,7 +328,7 @@ private:
     }
 
     __aicore__ inline void WriteAllLse(
-        __gm__ FAInferTilingData *tiling,
+        __gm__ const FAInferStaticTilingData *tiling,
         AscendC::GlobalTensor<float> &partialLse,
         AscendC::GlobalTensor<int32_t> &actualQ,
         AscendC::GlobalTensor<int32_t> &seqUsedQ,
@@ -447,10 +452,10 @@ CATLASS_GLOBAL void FAFlashDecodeCombine(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
     GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
-    GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling)
 {
     FAIKernelParams params{q, k, v, mask, blockTables,
-        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling};
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, o, lse, workspace, tiling, runtimeTiling};
     FlashDecodeCombine950<InDtype> combine;
     combine(params);
 }

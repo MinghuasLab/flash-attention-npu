@@ -54,7 +54,7 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize, uint32_t em
     return qnBlockTile == 0 ? 1 : qnBlockTile;
 }
 
-inline void DisableFlashDecode(FAInferTilingData* tilingData)
+inline void DisableFlashDecode(FAInferStaticTilingData* tilingData)
 {
     tilingData->flashDecodeFlag = 0;
     tilingData->fdActiveCoreNum = 0;
@@ -69,7 +69,7 @@ inline void DisableFlashDecode(FAInferTilingData* tilingData)
     tilingData->fdWorkspaceEnd = tilingData->workSpaceSize;
 }
 
-__attribute__((noinline)) void FillFlashDecodeTiling(FAInferTilingData* tilingData, const FAMetadataArgs* metadataArgs,
+__attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* tilingData, const FAMetadataArgs* metadataArgs,
                                                      const int32_t* cuSeqlensQ, const int32_t* seqlensQ,
                                                      const int32_t* seqlensK)
 {
@@ -275,22 +275,11 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferTilingData* tilingDa
 
 } // namespace
 
-__global__ __aicpu__ uint32_t MergeFATiling(void* args)
+__global__ __aicpu__ uint32_t WriteFARuntime(void* args)
 {
-    const auto* overrides = reinterpret_cast<const FATilingOverrides*>(args);
-    auto* tiling = reinterpret_cast<FAInferTilingData*>(overrides->tilingAddr);
-    std::memcpy(tiling, reinterpret_cast<const void*>(overrides->metadataAddr), sizeof(*tiling));
-    tiling->numBlocks = overrides->numBlocks;
-    tiling->blockSize = overrides->blockSize;
-    tiling->maxNumBlocksPerBatch = overrides->maxNumBlocksPerBatch;
-    tiling->maskType = overrides->maskType;
-    tiling->scaleValue = overrides->scaleValue;
-    tiling->softcapValue = overrides->softcapValue;
-    tiling->windowSizeLeft = overrides->windowSizeLeft;
-    tiling->windowSizeRight = overrides->windowSizeRight;
-    if (overrides->allowFlashDecode == 0) {
-        tiling->flashDecodeFlag = 0;
-    }
+    const auto* runtimeArgs = reinterpret_cast<const FARuntimeArgs*>(args);
+    auto* runtime = reinterpret_cast<FAInferRuntimeData*>(runtimeArgs->runtimeAddr);
+    *runtime = runtimeArgs->runtime;
     AscendC::DataStoreBarrier();
     return 0;
 }
@@ -299,7 +288,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 {
     auto* metadataArgs = reinterpret_cast<FAMetadataArgs*>(args);
     auto* tilingData =
-        reinterpret_cast<FAInferTilingData*>(metadataArgs->metaOutAddr + fa_metadata::TilingOffset(false));
+        reinterpret_cast<FAInferStaticTilingData*>(metadataArgs->metaOutAddr + fa_metadata::TilingOffset(false));
     auto* cuSeqlensQ = reinterpret_cast<const int32_t*>(metadataArgs->cuSeqlensQAddr);
     auto* seqlensQ = reinterpret_cast<const int32_t*>(metadataArgs->seqlensQAddr);
     auto* seqlensK = reinterpret_cast<const int32_t*>(metadataArgs->seqlensKAddr);
@@ -310,11 +299,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     tilingData->kvHeads = metadataArgs->numHeadsK;
     tilingData->embeddingSize = metadataArgs->embeddingSize;
     tilingData->embeddingSizeV = metadataArgs->embeddingSizeV;
-    // Physical KV layout and score parameters are filled by forward.
-    tilingData->blockSize = 128;
-    tilingData->maskType = metadataArgs->maskType;
-    tilingData->windowSizeLeft = metadataArgs->windowSizeLeft;
-    tilingData->windowSizeRight = metadataArgs->windowSizeRight;
     tilingData->sparseMode = 0;
     tilingData->cacheLayout = 0;
     tilingData->globalWindowSize = 4;

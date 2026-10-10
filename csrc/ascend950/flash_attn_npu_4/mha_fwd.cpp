@@ -21,6 +21,7 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 #include <c10/core/Device.h>
 #include <torch/extension.h>
@@ -29,13 +30,14 @@
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
 #include "fa_metadata_args.h"
 
-extern __global__ __aicpu__ uint32_t MergeFATiling(void* args);
+extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
@@ -218,7 +220,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     bool is_local = false;
     FAInferTilingData tilingData{};
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
-                  "FAInferTilingData must remain a trivially-copyable Device ABI");
+                  "CPU tiling aggregate must remain trivially copyable");
     if (scheduler_metadata_.has_value()) {
         const int64_t kv_seqlen_bound =
             max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
@@ -345,44 +347,78 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     }
 
     // ============================================================
-    // 9. Tiling host→device (CPU byte tensor + .to(kPrivateUse1) —
-    //    same idiom
+    // 9. Static scheduling and per-call execution data have separate device ABIs.
     // ============================================================
     at::Tensor tiling_dev;
+    at::Tensor runtime_dev;
     if (scheduler_metadata_.has_value()) {
         const auto& metadata = scheduler_metadata_.value();
         TORCH_CHECK(metadata.device() == q.device() && metadata.dtype() == at::kByte && metadata.is_contiguous(),
                     "scheduler_metadata must be a contiguous NPU byte tensor");
         TORCH_CHECK(metadata.nbytes() == fa_metadata::MetadataBytes(false),
                     "scheduler_metadata has incompatible mask/layout size");
-        // Metadata owns scheduling; forward owns physical KV layout and score
-        // parameters. Patch a private copy so cached metadata remains reusable.
-        tiling_dev = at::empty_like(metadata);
-        FATilingOverrides overrides{};
-        overrides.metadataAddr = reinterpret_cast<uint64_t>(metadata.data_ptr());
-        overrides.tilingAddr = reinterpret_cast<uint64_t>(tiling_dev.data_ptr());
-        overrides.numBlocks = num_blocks;
-        overrides.blockSize = page_block_size;
-        overrides.maxNumBlocksPerBatch = max_num_blocks_per_seq;
-        overrides.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
+        // Alias only the read-only scheduling buffer. Each forward owns a small
+        // runtime buffer, so different streams never overwrite shared metadata.
+        tiling_dev = metadata;
+        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))},
+                               q.options().dtype(at::kByte));
+        FARuntimeArgs runtimeArgs{};
+        runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
+        auto& runtime = runtimeArgs.runtime;
+        runtime.numBlocks = num_blocks;
+        runtime.blockSize = page_block_size;
+        runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
+        runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
         const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
-        overrides.scaleValue = softcap > 0.0f ? scale / softcap : scale;
-        overrides.softcapValue = softcap;
-        overrides.windowSizeLeft = is_local && window_size_left < 0 ? metadataKvBound : window_size_left;
-        overrides.windowSizeRight = is_local && window_size_right < 0 ? metadataKvBound : window_size_right;
-        // AICPU may prepare a split schedule without knowing the KV layout.
-        // Preserve its runtime flag only when forward can launch FlashDecode.
-        overrides.allowFlashDecode = flashDecodeEnabled;
-        auto merge_tiling = [overrides, aclStream]() mutable -> int {
-            MergeFATiling<<<1, nullptr, aclStream>>>(&overrides, sizeof(overrides));
+        runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
+        runtime.softcapValue = softcap;
+        runtime.windowSizeLeft = is_local && window_size_left < 0 ? metadataKvBound : window_size_left;
+        runtime.windowSizeRight = is_local && window_size_right < 0 ? metadataKvBound : window_size_right;
+        runtime.allowFlashDecode = flashDecodeEnabled;
+        auto aicpu = c10_npu::getNPUStreamFromPool();
+        if (aicpu.stream(false) == aclStream) {
+            aicpu = c10_npu::getNPUStreamFromPool();
+        }
+        const auto aicpuStream = aicpu.stream(false);
+        TORCH_CHECK(aicpuStream != aclStream, "AICPU tiling merge requires a separate stream");
+        struct MergeEvents {
+            aclrtEvent input_ready = nullptr;
+            aclrtEvent done = nullptr;
+        };
+        // Separate event pairs prevent different caller streams from reusing
+        // one another's capture dependencies.
+        static thread_local std::unordered_map<aclrtStream, MergeEvents> events_by_stream;
+        auto& events = events_by_stream[aclStream];
+        if (events.input_ready == nullptr) {
+            constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
+            TORCH_CHECK(aclrtCreateEventExWithFlag(&events.input_ready, event_flags) == ACL_SUCCESS,
+                        "create merge input event failed");
+            TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
+                        "create merge completion event failed");
+        }
+        auto write_runtime = [runtimeArgs, aclStream, aicpuStream,
+                             input_ready = events.input_ready, done = events.done]() mutable -> int {
+            TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
+            TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS, "wait for merge input failed");
+            WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
+            TORCH_CHECK(aclrtRecordEvent(done, aicpuStream) == ACL_SUCCESS, "record merge completion event failed");
+            TORCH_CHECK(aclrtStreamWaitEvent(aclStream, done) == ACL_SUCCESS, "wait for tiling merge failed");
             return 0;
         };
-        at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_merge_tiling", merge_tiling);
+        at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
+        c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(), aicpu);
+        c10_npu::NPUCachingAllocator::recordStream(tiling_dev.storage().data_ptr(), c10_npu::getCurrentNPUStream());
     } else {
+        tilingData.allowFlashDecode = flashDecodeEnabled;
+        const auto& schedule = static_cast<const FAInferStaticTilingData&>(tilingData);
+        const auto& runtime = static_cast<const FAInferRuntimeData&>(tilingData);
         at::Tensor tiling_cpu =
-            at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
-        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData, sizeof(FAInferTilingData));
-        tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
+            at::empty({static_cast<int64_t>(sizeof(schedule))}, at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &schedule, sizeof(schedule));
+        tiling_dev = tiling_cpu.to(q.device());
+        auto runtime_cpu = at::empty({static_cast<int64_t>(sizeof(runtime))}, at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(runtime_cpu.data_ptr<uint8_t>(), &runtime, sizeof(runtime));
+        runtime_dev = runtime_cpu.to(q.device());
     }
 
     // ============================================================
@@ -401,6 +437,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                              : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
+    auto runtimeDev = static_cast<uint8_t*>(runtime_dev.data_ptr());
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
     at::Tensor q_seq_i64 = is_varlen_q ? cu_seqlens_q : at::empty({batch_size}, i64_npu);
@@ -468,7 +505,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 seqUsedQDev,
                                 seqUsedKvDev,
                                 wsDev,
-                                tilDev};
+                                tilDev,
+                                runtimeDev};
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;
