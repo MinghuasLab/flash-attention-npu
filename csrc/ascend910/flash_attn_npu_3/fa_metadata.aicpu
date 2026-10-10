@@ -54,8 +54,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->numBlocks = metaArgs->numBlocks;
     tilingData->blockSize = metaArgs->blockSize;
     tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
-    tilingData->scaleValue = metaArgs->scaleValue;
-    tilingData->softcapValue = metaArgs->softcapValue;
     tilingData->maxQSeqlen = metaArgs->maxQSeqlen;
     tilingData->numSplits = metaArgs->numSplits > 0u ? metaArgs->numSplits : 1u;
     // Append-KV fields (0 = append disabled, from the memset above).

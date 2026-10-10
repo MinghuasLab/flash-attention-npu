@@ -18,7 +18,7 @@ Q_SEQLEN = 16
 KV_SEQLEN = 128
 HEAD_SIZE = 128
 BLOCK_SIZE = 128
-SCALE = 1.0 / (HEAD_SIZE ** 0.5)
+SCALE = 1.0 / (HEAD_SIZE**0.5)
 WINDOW_SIZE = (-1, -1)
 
 
@@ -51,12 +51,21 @@ def _run_flash_attn(
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_kvcache_graph(is_causal):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    key_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
-    value_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    key_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
+    value_cache = make_random_tensor(
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+    )
     seqlens_q = torch.tensor([Q_SEQLEN], dtype=torch.int32).npu()
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
+    metadata_q_lengths = (
+        {"cu_seqlens_q": cu_seqlens_q}
+        if "Ascend910" in torch_npu.npu.get_device_name()
+        else {"seqlens_q": seqlens_q}
+    )
 
     scheduler_metadata = get_scheduler_metadata(
         batch_size=BATCH_SIZE,
@@ -65,12 +74,12 @@ def test_flash_attn_kvcache_graph(is_causal):
         num_heads_q=NUM_HEADS,
         num_heads_kv=NUM_KV_HEADS,
         headdim=HEAD_SIZE,
-        seqlens_q=seqlens_q,
         cache_seqlens=cache_seqlens,
         qkv_dtype=DATA_TYPE,
         page_size=BLOCK_SIZE,
         causal=is_causal,
         window_size=WINDOW_SIZE,
+        **metadata_q_lengths,
     )
 
     causal_mask = None
