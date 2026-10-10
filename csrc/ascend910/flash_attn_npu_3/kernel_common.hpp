@@ -26,6 +26,12 @@ constexpr uint32_t NUM_32 = 32;
 constexpr uint32_t NUM_128 = 128;
 constexpr uint32_t NUM_256 = 256;
 constexpr int64_t WINDOW_SIZE_INT_MAX = 2147483647;
+constexpr uint32_t L1_HEAD_DIM_SLICE = NUM_128;
+// D=512 keeps the KV token tile equal to the L0 N tile (128) so that one
+// KV chunk maps to exactly one L0C S tile. That lets the D=512 path reuse
+// the same shared ping-pong cadence as the <=256 path instead of running
+// a second, independent stage manager.
+constexpr uint32_t L1_D512_KV_TILE = NUM_128;
 
 template <typename T>
 __aicore__ inline T AlignUp(T a, T b)

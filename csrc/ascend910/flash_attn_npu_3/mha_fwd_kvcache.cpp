@@ -272,27 +272,43 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID6);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID7);
 
-        uint32_t kDynNum = RoundUp(embed, NUM_128);
-        kDynNum = kDynNum < NUM_256 ? NUM_256 : kDynNum;
-        uint32_t maxQKPL1Size = L1_MAX_SIZE - embedV * MAX_KV_STACK_LEN * sizeof(ElementV);
-        uint32_t maxQL1Size = Q_TILE_CEIL * kDynNum * sizeof(ElementQ);
-        uint32_t maxNDynNum =
-            ((maxQKPL1Size - maxQL1Size) / kDynNum / sizeof(ElementV) / DOUBLE_BUFFER) / NUM_32 * NUM_32;
+        const bool headDimSplit = embed > NUM_256;
+        uint32_t kDynNum = L1_HEAD_DIM_SLICE;
+        uint32_t nDynNum = L1_D512_KV_TILE;
+        uint32_t qL1DynNum = embed;
+        uint32_t kPVDynNum = L1_D512_KV_TILE;
+        uint32_t vL1Stages = DOUBLE_BUFFER;
+        uint32_t vSegLen = L1_D512_KV_TILE;
+        uint32_t vSliceWidth = L1_HEAD_DIM_SLICE;
+        if (!headDimSplit) {
+            // Preserve the production <=256 layout.
+            kDynNum = RoundUp(embed, NUM_128);
+            kDynNum = kDynNum < NUM_256 ? NUM_256 : kDynNum;
+            uint32_t maxQKPL1Size = L1_MAX_SIZE - embedV * MAX_KV_STACK_LEN * sizeof(ElementV);
+            uint32_t maxQL1Size = Q_TILE_CEIL * kDynNum * sizeof(ElementQ);
+            uint32_t maxNDynNum =
+                ((maxQKPL1Size - maxQL1Size) / kDynNum / sizeof(ElementV) / DOUBLE_BUFFER) / NUM_32 * NUM_32;
+            nDynNum = maxNDynNum < L1_MAX_N_NUM ? maxNDynNum : L1_MAX_N_NUM;
+            nDynNum = L1_MAX_N_NUM % nDynNum != 0 ? RoundDown((nDynNum - 1), NUM_32) : nDynNum;
+            qL1DynNum = kDynNum;
+            kPVDynNum = nDynNum * kDynNum / BlockMmadPV::L1TileShape::M;
+            vL1Stages = 1U;
+            vSegLen = MAX_KV_STACK_LEN;
+            vSliceWidth = embedV;
+        }
 
-        uint32_t nDynNum = maxNDynNum < L1_MAX_N_NUM ? maxNDynNum : L1_MAX_N_NUM;
-        nDynNum = L1_MAX_N_NUM % nDynNum != 0 ? RoundDown((nDynNum - 1), NUM_32) : nDynNum;
-
-        uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * kDynNum * sizeof(ElementQ);
         blockMmadQK.SetPingPongState(&pingPongState);
         blockMmadPV.SetPingPongState(&pingPongState);
-        uint32_t kPVDynNum = nDynNum * kDynNum / BlockMmadPV::L1TileShape::M;
+
+        uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * qL1DynNum * sizeof(ElementQ);
+        uint32_t kPVPoolSize = BlockMmadPV::L1TileShape::M * kPVDynNum * sizeof(ElementP) * DOUBLE_BUFFER;
+        uint32_t vPoolSize = vL1Stages * vSegLen * vSliceWidth * sizeof(ElementV);
         // Append-KV QK writeback staging (ND copy of the new-K sub-tile), placed after
         // the QK/PV shared K/P region and the PV V region (the K and P tiles share one
         // L1 region across the QK/PV phases, so it must not be counted twice).
-        uint32_t ndCopyL1Offset = L1_QK_SIZE + nDynNum * kDynNum * sizeof(ElementK) * DOUBLE_BUFFER +
-                                  embedV * MAX_KV_STACK_LEN * sizeof(ElementV);
-        blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN, 0, ndCopyL1Offset);
-        blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE);
+        uint32_t ndCopyL1Offset = L1_QK_SIZE + kPVPoolSize + vPoolSize;
+        blockMmadQK.init(resource, nDynNum, kDynNum, qL1DynNum, MAX_KV_STACK_LEN, 0, ndCopyL1Offset);
+        blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE, vL1Stages, vSegLen, vSliceWidth);
 #endif
 #ifdef __DAV_C220_VEC__
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
