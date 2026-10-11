@@ -17,8 +17,8 @@ enum class Mxfp4Layout : uint32_t
 };
 enum class Mxfp4QuantMode : uint32_t
 {
-    OCP = 2,
-    CX = 3
+    OCP = 0,
+    CX = 1
 };
 
 struct Mxfp4LaunchArgs {

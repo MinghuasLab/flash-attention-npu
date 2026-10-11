@@ -7,12 +7,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <type_traits>
 
 #include "mxfp4_kernel_dispatch.hpp"
 #include "mxfp4_tiling.hpp"
 #include "tiling/platform/platform_ascendc.h"
+#include "torch_npu/csrc/core/npu/CachingHostAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
@@ -38,11 +41,9 @@ void check_shape(const at::Tensor& tensor, const std::vector<int64_t>& expected,
     TORCH_CHECK(tensor.sizes().vec() == expected, name, " has shape ", tensor.sizes(), ", expected ", expected);
 }
 
-at::Tensor lengths_to_npu(const std::vector<int64_t>& lengths, const at::Device& device)
+size_t align_up(size_t value, size_t alignment)
 {
-    at::Tensor cpu = at::empty({static_cast<int64_t>(lengths.size())}, at::device(at::kCPU).dtype(at::kLong));
-    std::memcpy(cpu.data_ptr<int64_t>(), lengths.data(), lengths.size() * sizeof(int64_t));
-    return cpu.to(device);
+    return (value + alignment - 1) & ~(alignment - 1);
 }
 
 struct ParsedShape {
@@ -200,7 +201,7 @@ at::Tensor mxfp4_quant_attention(
     TORCH_CHECK(
         quant_mode == static_cast<int64_t>(Mxfp4QuantMode::OCP) ||
             quant_mode == static_cast<int64_t>(Mxfp4QuantMode::CX),
-        "quant_mode must be 2 (OCP) or 3 (CX)");
+        "quant_mode must be 0 (MXFP4_OCP) or 1 (MXFP4_CX)");
     TORCH_CHECK(output_dtype.has_value(), "output_dtype must be torch.float16 or torch.bfloat16");
     TORCH_CHECK(
         *output_dtype == at::kHalf || *output_dtype == at::kBFloat16,
@@ -261,46 +262,70 @@ at::Tensor mxfp4_quant_attention(
     ctx.dstTypeMax = dst_type_max;
 
     static_assert(std::is_trivially_copyable<Mxfp4TilingData>::value, "Mxfp4TilingData must remain trivially copyable");
-    Mxfp4TilingData tiling{};
+    static_assert(std::is_trivially_destructible<Mxfp4TilingData>::value, "Mxfp4TilingData destructor must stay trivial");
+
+    const std::vector<int64_t> q_lengths = actual_seq_lengths.value_or(std::vector<int64_t>(p.batch, p.max_q));
+    const std::vector<int64_t> kv_lengths = actual_seq_lengths_kv.value_or(std::vector<int64_t>(p.batch, p.max_kv));
+    const size_t tiling_bytes = sizeof(Mxfp4TilingData);
+    const size_t q_bytes = q_lengths.size() * sizeof(int64_t);
+    const size_t kv_bytes = kv_lengths.size() * sizeof(int64_t);
+    const size_t q_offset = align_up(tiling_bytes, alignof(int64_t));
+    const size_t kv_offset = q_offset + align_up(q_bytes, alignof(int64_t));
+    const size_t total = kv_offset + kv_bytes;
+    at::Tensor host = at::empty(
+        {static_cast<int64_t>(total)},
+        at::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true));
+    auto* host_base = static_cast<uint8_t*>(host.data_ptr());
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(host_base) % alignof(Mxfp4TilingData) == 0,
+        "pinned MXFP4 launch buffer is not aligned for Mxfp4TilingData");
+    auto* tiling = reinterpret_cast<Mxfp4TilingData*>(host_base);
+    *tiling = Mxfp4TilingData{};
     optiling::Mxfp4Tiling tiler(ctx);
     tiler.SetCoreNum(block_dim);
-    tiler.DoTiling(tiling);
-    TORCH_CHECK(tiling.totalTaskNum > 0, "attention has no work");
+    tiler.DoTiling(*tiling);
+    TORCH_CHECK(tiling->totalTaskNum > 0, "attention has no work");
     if (ctx.cx) {
-        TORCH_CHECK(std::isfinite(tiling.log2Cx), "dst_type_max must be positive and finite");
+        TORCH_CHECK(std::isfinite(tiling->log2Cx), "dst_type_max must be positive and finite");
+    }
+    if (q_bytes != 0) {
+        std::memcpy(host_base + q_offset, q_lengths.data(), q_bytes);
+    }
+    if (kv_bytes != 0) {
+        std::memcpy(host_base + kv_offset, kv_lengths.data(), kv_bytes);
     }
 
-    at::Tensor tiling_cpu = at::empty({static_cast<int64_t>(sizeof(tiling))}, at::device(at::kCPU).dtype(at::kByte));
-    std::memcpy(tiling_cpu.data_ptr(), &tiling, sizeof(tiling));
-    at::Tensor tiling_npu = tiling_cpu.to(query.device());
+    at::Tensor device_args = at::empty({static_cast<int64_t>(total)}, query.options().dtype(at::kByte));
+    auto* device_base = static_cast<uint8_t*>(device_args.data_ptr());
+    c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
+    aclrtStream rt_stream = stream.stream(false);
+    TORCH_CHECK(
+        aclrtMemcpyAsync(device_base, total, host_base, total, ACL_MEMCPY_HOST_TO_DEVICE, rt_stream) == ACL_SUCCESS,
+        "async copy of MXFP4 launch args failed");
 
-    const std::vector<int64_t> uniform_q(p.batch, p.max_q);
-    const std::vector<int64_t> uniform_kv(p.batch, p.max_kv);
-    at::Tensor q_lengths_npu = lengths_to_npu(actual_seq_lengths.value_or(uniform_q), query.device());
-    at::Tensor kv_lengths_npu = lengths_to_npu(actual_seq_lengths_kv.value_or(uniform_kv), query.device());
     at::Tensor output = at::empty(p.output_shape, query.options().dtype(*output_dtype));
     at::Tensor workspace;
     if (sparse) {
-        workspace = at::empty({static_cast<int64_t>(tiling.workSpaceSize)}, query.options().dtype(at::kByte));
+        workspace = at::empty({static_cast<int64_t>(tiling->workSpaceSize)}, query.options().dtype(at::kByte));
     }
 
     auto ptr = [](const at::Tensor &tensor) { return static_cast<uint8_t *>(tensor.data_ptr()); };
     Mxfp4LaunchArgs args{
         block_dim,
-        c10_npu::getCurrentNPUStream().stream(false),
+        rt_stream,
         ptr(query),
         ptr(key),
         ptr(value),
         sparse ? ptr(*block_sparse_mask) : nullptr,
-        ptr(q_lengths_npu),
-        ptr(kv_lengths_npu),
+        device_base + q_offset,
+        device_base + kv_offset,
         ptr(q_dequant_scale),
         ptr(k_dequant_scale),
         ptr(v_dequant_scale),
         ptr(output),
         sparse ? ptr(workspace) : nullptr,
         nullptr,
-        ptr(tiling_npu)};
+        device_base};
 
     const auto layout = p.layout;
     const auto mode = static_cast<Mxfp4QuantMode>(quant_mode);
@@ -310,5 +335,13 @@ at::Tensor mxfp4_quant_attention(
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("mxfp4_quant_attention", launch);
+    const c10::DataPtr& host_data = host.storage().data_ptr();
+    TORCH_CHECK(
+        at_npu::native::CachingHostAllocator_recordEvent(host_data.get(), host_data.get_context(), stream),
+        "failed to record MXFP4 host copy completion");
+    c10_npu::NPUCachingAllocator::recordStream(device_args.storage().data_ptr(), stream);
+    if (sparse) {
+        c10_npu::NPUCachingAllocator::recordStream(workspace.storage().data_ptr(), stream);
+    }
     return output;
 }

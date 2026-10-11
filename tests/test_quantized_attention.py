@@ -7,29 +7,13 @@ import pytest
 import torch
 
 from flash_attn_npu_3.flash_attn_quant_npu import (
-    BlockSparseConfig,
-    NpuQuantDType,
-    QuantizationConfig,
-    QuantizationScheme,
+    QuantMode,
     flash_attn_quant,
 )
 from tests.common.mxfp4_attention_ref import _mx_quantize, ref_mxfp4_attention
 
 _E8M0_BIAS = 127
 _MX_GROUP = 32
-
-
-def _quant_config(q_scale, k_scale, v_scale, scheme=QuantizationScheme.OCP, out_dtype=torch.bfloat16, target_max=0.0):
-    return QuantizationConfig(
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        input_dtype=NpuQuantDType.FLOAT4_E2M1,
-        scale_dtype=NpuQuantDType.FLOAT8_E8M0,
-        scheme=scheme,
-        out_dtype=out_dtype,
-        target_max=target_max,
-    )
 
 
 def _npu_available():
@@ -275,22 +259,16 @@ def _run_quant(
     q_lengths,
     kv_lengths,
     sparse=None,
-    scheme=QuantizationScheme.OCP,
+    quant_mode=QuantMode.MXFP4_OCP,
     target_max=0.0,
     pass_lengths=True,
 ):
     device = "npu"
-    features = _quant_config(
-        query_scale.to(device),
-        key_scale.to(device),
-        value_scale.to(device),
-        scheme=scheme,
-        out_dtype=out_dtype,
-        target_max=target_max,
-    )
+    block_sparse_mask = None
+    block_shape = None
     if sparse is not None:
         mask, block_shape = sparse
-        features = (features, BlockSparseConfig(mask=mask.to(device), block_shape=block_shape))
+        block_sparse_mask = mask.to(device)
     kwargs = {}
     if pass_lengths and (layout == "TND" or q_lengths is not None):
         kwargs["actual_seq_lengths"] = q_lengths
@@ -299,10 +277,17 @@ def _run_quant(
         query.to(device),
         key.to(device),
         value.to(device),
-        features=features,
+        query_scale.to(device),
+        key_scale.to(device),
+        value_scale.to(device),
+        quant_mode,
+        block_sparse_mask,
+        block_shape,
         layout=layout,
         num_heads_kv=kv_heads,
         softmax_scale=softmax_scale,
+        output_dtype=out_dtype,
+        dst_type_max=target_max,
         **kwargs,
     )
 
@@ -500,7 +485,7 @@ def test_cx_dense_attention_is_finite(out_dtype, target_max):
         softmax_scale=head_dim ** -0.5,
         q_lengths=lengths,
         kv_lengths=lengths,
-        scheme=QuantizationScheme.CX,
+        quant_mode=QuantMode.MXFP4_CX,
         target_max=target_max,
     )
     assert actual.shape == (batch, heads, seq, head_dim)

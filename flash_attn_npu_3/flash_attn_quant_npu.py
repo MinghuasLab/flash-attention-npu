@@ -1,17 +1,12 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by Minghua Shen, 2026.
 
-"""Quantized attention entry for dtypes PyTorch cannot express natively.
-
-`flash_attn_quant` is the public entry. `QuantizationConfig.input_dtype`
-selects the kernel. MXFP4 is the current implementation.
-"""
+"""Quantized attention entry. MXFP4 is the current implementation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, IntEnum
-from typing import List, Optional, Sequence, Tuple, Union
+from enum import IntEnum
+from typing import List, Optional, Sequence, Union
 
 import torch
 
@@ -40,74 +35,20 @@ else:
     _torch_register_fake_wrapper = _noop_register_fake_wrapper
 
 
-class NpuQuantDType(Enum):
-    """Storage dtypes that PyTorch cannot express natively."""
-
-    FLOAT4_E2M1 = "float4_e2m1"
-    FLOAT8_E8M0 = "float8_e8m0"
-
-
-class QuantizationScheme(IntEnum):
-    OCP = 2
-    CX = 3
-
-
-@dataclass(frozen=True)
-class QuantizationConfig:
-    q_scale: torch.Tensor
-    k_scale: torch.Tensor
-    v_scale: torch.Tensor
-    input_dtype: NpuQuantDType
-    scale_dtype: NpuQuantDType
-    scheme: QuantizationScheme
-    out_dtype: torch.dtype
-    target_max: float = 0.0
-
-
-@dataclass(frozen=True)
-class BlockSparseConfig:
-    mask: torch.Tensor
-    block_shape: Sequence[int]
-
-
-Feature = Union[QuantizationConfig, BlockSparseConfig]
-FeatureSet = Union[Feature, Sequence[Feature]]
+class QuantMode(IntEnum):
+    MXFP4_OCP = 0
+    MXFP4_CX = 1
 
 
 def _maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
-
-def parse_features(features: FeatureSet) -> Tuple[QuantizationConfig, Optional[BlockSparseConfig]]:
-    """Validate and split the feature set. Config order does not matter."""
-    if isinstance(features, (QuantizationConfig, BlockSparseConfig)):
-        items: List[Feature] = [features]
-    else:
-        items = list(features)
-
-    quant: Optional[QuantizationConfig] = None
-    sparse: Optional[BlockSparseConfig] = None
-    seen_types = []
-    for item in items:
-        item_type = type(item)
-        if item_type in seen_types:
-            raise ValueError(f"duplicate feature config: {item_type.__name__}")
-        seen_types.append(item_type)
-        if isinstance(item, QuantizationConfig):
-            quant = item
-        elif isinstance(item, BlockSparseConfig):
-            sparse = item
-        else:
-            raise TypeError(
-                f"unsupported feature {item_type.__name__}; "
-                "flash_attn_quant currently accepts QuantizationConfig and "
-                "optional BlockSparseConfig"
-            )
-
-    if quant is None:
-        raise ValueError("flash_attn_quant requires a QuantizationConfig")
-    return quant, sparse
-
+def _resolve_quant_mode(quant_mode: Union[QuantMode, int]) -> int:
+    try:
+        return int(QuantMode(quant_mode))
+    except (TypeError, ValueError) as exc:
+        valid = ", ".join(f"{mode.name} ({int(mode)})" for mode in QuantMode)
+        raise ValueError(f"quant_mode must be one of {valid}, got {quant_mode!r}") from exc
 
 def _infer_kv_heads(k: torch.Tensor, layout: str) -> int:
     if layout == "TND":
@@ -202,37 +143,38 @@ def flash_attn_quant(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    quant_mode: Union[QuantMode, int],
+    block_sparse_mask: Optional[torch.Tensor] = None,
+    block_shape: Optional[Sequence[int]] = None,
     *,
-    features: FeatureSet,
     layout: str = "TND",
     num_heads_kv: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     actual_seq_lengths: Optional[Sequence[int]] = None,
     actual_seq_lengths_kv: Optional[Sequence[int]] = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+    dst_type_max: float = 0.0,
 ) -> torch.Tensor:
-    """Quantized attention. `QuantizationConfig.input_dtype` selects the kernel.
+    """Run MXFP4 attention.
 
-    Current kernels:
-      * FLOAT4_E2M1 input with FLOAT8_E8M0 scales (MXFP4), dense or block-sparse
+    ``quant_mode`` accepts either ``QuantMode`` or its integer value.
+    Packed MXFP4 q/k/v use uint8 storage and E8M0 dequant scales.
 
-    Packed quantized q/k/v use uint8 storage; the last dimension is logical
-    head dim / 2. The returned tensor restores the logical head dim.
+    The optional ``block_sparse_mask`` and two-element ``block_shape`` enable
+    block-sparse attention; omit both for dense attention.
     """
-    quant, sparse = parse_features(features)
-    if quant.input_dtype != NpuQuantDType.FLOAT4_E2M1 or quant.scale_dtype != NpuQuantDType.FLOAT8_E8M0:
-        raise ValueError(
-            "current kernel only supports input_dtype=FLOAT4_E2M1 with scale_dtype=FLOAT8_E8M0"
-        )
-    if quant.scheme not in (QuantizationScheme.OCP, QuantizationScheme.CX):
-        raise ValueError("quantization scheme must be QuantizationScheme.OCP or QuantizationScheme.CX")
-    if quant.out_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("QuantizationConfig.out_dtype must be torch.float16 or torch.bfloat16")
-    if quant.scheme == QuantizationScheme.CX and not (
-        quant.target_max == 0.0 or 6.0 <= quant.target_max <= 12.0
+    resolved_quant_mode = _resolve_quant_mode(quant_mode)
+    if output_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("output_dtype must be torch.float16 or torch.bfloat16")
+    if resolved_quant_mode == int(QuantMode.MXFP4_CX) and not (
+        dst_type_max == 0.0 or 6.0 <= dst_type_max <= 12.0
     ):
         raise ValueError(
-            "CX scheme requires target_max == 0 or target_max in [6, 12], "
-            f"got {quant.target_max}"
+            "MXFP4_CX quant_mode requires dst_type_max == 0 or dst_type_max in [6, 12], "
+            f"got {dst_type_max}"
         )
 
     layout = layout.upper()
@@ -243,30 +185,31 @@ def flash_attn_quant(
 
     q_lengths = list(actual_seq_lengths) if actual_seq_lengths is not None else None
     kv_lengths = list(actual_seq_lengths_kv) if actual_seq_lengths_kv is not None else None
-    mask = None
-    block_shape = None
-    if sparse is not None:
-        mask = sparse.mask
-        block_shape = [int(x) for x in sparse.block_shape]
-        if len(block_shape) != 2:
-            raise ValueError("BlockSparseConfig.block_shape must be [q_block, kv_block]")
+    if (block_sparse_mask is None) != (block_shape is None):
+        raise ValueError("block_sparse_mask and block_shape must be provided together")
+    resolved_block_shape = None if block_shape is None else [int(x) for x in block_shape]
+    if resolved_block_shape is not None and len(resolved_block_shape) != 2:
+        raise ValueError("block_shape must be [q_block, kv_block]")
 
     return _flash_attn_quant(
         q,
         k,
         v,
-        quant.q_scale,
-        quant.k_scale,
-        quant.v_scale,
+        q_descale,
+        k_descale,
+        v_descale,
         layout,
         int(kv_heads),
         float(scale),
-        int(quant.scheme),
+        resolved_quant_mode,
         q_lengths,
         kv_lengths,
-        mask,
-        block_shape,
-        quant.out_dtype,
-        float(quant.target_max),
-        0 if quant.input_dtype == NpuQuantDType.FLOAT4_E2M1 else -1,
+        block_sparse_mask,
+        resolved_block_shape,
+        output_dtype,
+        float(dst_type_max),
+        0,
     )
+
+
+flash_attn_quant.QuantMode = QuantMode

@@ -169,7 +169,20 @@ public:
         CopyGmToL1K copyGmToL1K;
 
         uint32_t scaleK = CeilDivision(embed, MXFP4::FP4_C0_ELEMS) * 2;
-        uint32_t scaleRowHalf = scaleK / 2;
+        uint32_t scaleRowHalf = scaleK >> 1;
+        // headMul * scaleRowHalf 在整段 gather 里不变，提到循环外，避免每段重算并重载 this。
+        const uint32_t srcScaleStride = kvHeadMul * scaleRowHalf;
+        AscendC::GlobalTensor<half> gKScaleB16;
+        gKScaleB16.SetGlobalBuffer((__gm__ half *)(gKScale.GetPhyAddr()), MXFP4::GM_MAX_BUFFER_LEN);
+        auto l1KScaleB16 = l1AScaleTensor[kBufId].template ReinterpretCast<half>();
+        AscendC::Dn2NzParams scaleDn2Nz;
+        scaleDn2Nz.dnNum = 1;
+        scaleDn2Nz.nValue = scaleRowHalf;
+        scaleDn2Nz.srcDnMatrixStride = 0;
+        scaleDn2Nz.srcDValue = srcScaleStride;
+        scaleDn2Nz.dstNzC0Stride = scaleRowHalf;
+        scaleDn2Nz.dstNzNStride = 1;
+        scaleDn2Nz.dstNzMatrixStride = 0;
 
         const uint32_t kvSeqlenU = static_cast<uint32_t>(kvSeqlen);
         uint32_t gatheredYBlockIdx = firstYBlockIdx;
@@ -183,8 +196,11 @@ public:
                 break;
             }
 
-            uint32_t curYBlockSize =
-                (oriYBlockIdx == yBlockNumAval - 1) ? (kvSeqlenU - oriYBlockIdx * blockShapeY) : blockShapeY;
+            // 满块直接用 blockShapeY。尾块才改长度，避免每段都做一次 SEL。
+            uint32_t curYBlockSize = blockShapeY;
+            if (oriYBlockIdx + 1 == yBlockNumAval) {
+                curYBlockSize = kvSeqlenU - oriYBlockIdx * blockShapeY;
+            }
             if (curYBlockSize <= yBlockInnerStart) {
                 break;
             }
@@ -198,8 +214,10 @@ public:
             while (!runEndsShort && dealtLenAccum + availLen < kvsActBaseTile && peekYBlockIdx < yBlockNumRsvd &&
                    peekOriIdx < yBlockNumAval &&
                    static_cast<uint32_t>(gSparseBlockIdx.GetValue(peekYBlockIdx)) == peekOriIdx) {
-                uint32_t peekBlockSize =
-                    (peekOriIdx == yBlockNumAval - 1) ? (kvSeqlenU - peekOriIdx * blockShapeY) : blockShapeY;
+                uint32_t peekBlockSize = blockShapeY;
+                if (peekOriIdx + 1 == yBlockNumAval) {
+                    peekBlockSize = kvSeqlenU - peekOriIdx * blockShapeY;
+                }
                 availLen += peekBlockSize;
                 runEndsShort = (peekBlockSize < blockShapeY);
                 ++peekYBlockIdx;
@@ -212,10 +230,14 @@ public:
             auto l1KTile = GetTile(l1KTensorTla, tla::MakeCoord(dealtLenAccum, 0), tla::MakeShape(curDealtLen, embed));
             copyGmToL1K(l1KTile, gKTile);
 
-            uint32_t srcB16Off = oriStartOffset * kvHeadMul * scaleRowHalf;
-            uint32_t dstB16Off = dealtLenAccum * scaleRowHalf;
-            copyGmToL1MxScaleDn2Nz(
-                l1AScaleTensor[kBufId], gKScale, curDealtLen, scaleK, srcB16Off, dstB16Off, kvHeadMul);
+            // 原实现每段调用 copyGmToL1MxScaleDn2Nz，在循环内重算
+            // srcB16Off/dstB16Off 并重建 Dn2Nz 参数。这里参数、half 视图和
+            // srcScaleStride 已在循环外备好，每段只更新 dValue=curDealtLen。
+            // 源地址仍是 oriStartOffset * kvHeadMul * scaleRowHalf，目的地址仍是
+            // dealtLenAccum * scaleRowHalf。
+            scaleDn2Nz.dValue = curDealtLen;
+            AscendC::DataCopy(
+                l1KScaleB16[dealtLenAccum * scaleRowHalf], gKScaleB16[oriStartOffset * srcScaleStride], scaleDn2Nz);
 
             dealtLenAccum += curDealtLen;
             if (runEndsShort) {
@@ -398,6 +420,45 @@ public:
         uint32_t pendNSubRowStart = 0;
         uint32_t pendNCur = 0;
 
+        // 基址和与 nSub 无关的 LoadData / Mmad 字段在进循环前落到局部变量。
+        // 混合 TU 下 this 的成员会溢到栈上，每轮 LD_IO 再重算地址。
+        constexpr uint32_t kNzC0 = MXFP4::NZ_C0_ELEMS;
+        constexpr uint32_t kFp4C0 = MXFP4::FP4_C0_ELEMS;
+        const uint32_t scaleRowHalfL0 = scaleK >> 1;
+        const uint32_t kStep = (embed + kFp4C0 - 1) / kFp4C0;
+        const uint32_t srcStrideRows = kvsActBaseTileAlign16 / kNzC0;
+        auto l1KFp4 = l1ATensor[kBufId].template ReinterpretCast<fp4x2_e2m1_t>();
+        auto l1KScaleE8 = l1AScaleTensor[kBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>();
+        auto l0AFp4_0 = l0ATensor[0].template ReinterpretCast<fp4x2_e2m1_t>();
+        auto l0AFp4_1 = l0ATensor[1].template ReinterpretCast<fp4x2_e2m1_t>();
+        auto l0A0 = l0ATensor[0];
+        auto l0A1 = l0ATensor[1];
+        auto l0B0 = l0BTensor[0];
+        auto l0B1 = l0BTensor[1];
+        auto l0C0 = l0CTensor[0];
+        auto l0C1 = l0CTensor[1];
+
+        AscendC::LoadData2DParamsV2 loadDataParams;
+        loadDataParams.sid = 0;
+        loadDataParams.kStartPosition = 0;
+        loadDataParams.kStep = kStep;
+        loadDataParams.srcStride = srcStrideRows;
+        loadDataParams.ifTranspose = false;
+        AscendC::LoadData2DMxParams loadMxDataParams;
+        loadMxDataParams.yStartPosition = 0;
+        loadMxDataParams.yStep = scaleRowHalfL0;
+        loadMxDataParams.srcStride = scaleRowHalfL0;
+        loadMxDataParams.dstStride = scaleRowHalfL0;
+
+        AscendC::MmadParams mmadParams;
+        mmadParams.n = qsActBaseTileAlign16;
+        mmadParams.k = embed;
+        mmadParams.unitFlag = 0;
+        mmadParams.cmatrixInitVal = true;
+#if (__CCE_AICORE__ == 310)
+        mmadParams.disableGemv = true;
+#endif
+
         for (uint32_t nSub = 0; nSub < nLoopNum; ++nSub) {
             uint32_t l0ABEventId = QK_L0AB_EVENT0 + qkL0abBufId;
             uint32_t l0CEventId = QK_L0C_EVENT0 + qkL0cBufId;
@@ -408,7 +469,20 @@ public:
 
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABEventId);
             // Q 已在 task 首 tile 常驻两个 L0B 槽，此处只需装 K
-            LoadKToL0A(nSubRowStart, nCur, embed, kvsActBaseTileAlign16, scaleK, kBufId, qkL0abBufId);
+            // Q 已常驻 L0B。这里只更新随 nSub 变化的 m 起点和步长，不再重建 layout。
+            uint32_t nCurAlign16 = (nCur + kNzC0 - 1) / kNzC0 * kNzC0;
+            uint32_t mStep = nCurAlign16 / kNzC0;
+            uint32_t mStart = nSubRowStart / kNzC0;
+            loadDataParams.mStartPosition = mStart;
+            loadDataParams.mStep = mStep;
+            loadDataParams.dstStride = mStep;
+            loadMxDataParams.xStartPosition = mStart;
+            loadMxDataParams.xStep = mStep;
+            if (qkL0abBufId == 0) {
+                AscendC::LoadData(l0AFp4_0, l1KFp4, l1KScaleE8, loadDataParams, loadMxDataParams);
+            } else {
+                AscendC::LoadData(l0AFp4_1, l1KFp4, l1KScaleE8, loadDataParams, loadMxDataParams);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0ABEventId);
 
             // 上一轮的 fixpipe 插在这里，掩盖刚发出的 MTE1_M 往返
@@ -419,7 +493,21 @@ public:
             }
 
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0ABEventId);
-            MatmulQK(nCur, qsActBaseTileAlign16, embed, qkL0cBufId, qkL0abBufId);
+            mmadParams.m = nCur;
+            if (qkL0abBufId == 0) {
+                if (qkL0cBufId == 0) {
+                    AscendC::Mmad(l0C0, l0A0, l0B0, mmadParams);
+                } else {
+                    AscendC::Mmad(l0C1, l0A0, l0B0, mmadParams);
+                }
+            } else if (qkL0cBufId == 0) {
+                AscendC::Mmad(l0C0, l0A1, l0B1, mmadParams);
+            } else {
+                AscendC::Mmad(l0C1, l0A1, l0B1, mmadParams);
+            }
+            if ((nCur / kNzC0) * (qsActBaseTileAlign16 / kNzC0) < 10) {
+                AscendC::PipeBarrier<PIPE_M>();
+            }
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABEventId);
             qkL0abBufId = (qkL0abBufId + 1) % MXFP4::L0A_QK_BUF_CNT;
 

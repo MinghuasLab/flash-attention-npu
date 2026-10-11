@@ -171,8 +171,10 @@ public:
                 break;
             }
 
-            uint32_t curYBlockSize =
-                (oriYBlockIdx == yBlockNumAval - 1) ? (kvSeqlenU - oriYBlockIdx * blockShapeY) : blockShapeY;
+            uint32_t curYBlockSize = blockShapeY;
+            if (oriYBlockIdx + 1 == yBlockNumAval) {
+                curYBlockSize = kvSeqlenU - oriYBlockIdx * blockShapeY;
+            }
             if (curYBlockSize <= yBlockInnerStart) {
                 break;
             }
@@ -186,8 +188,10 @@ public:
             while (!runEndsShort && dealtLenAccum + availLen < curBaseTileSize && peekYBlockIdx < yBlockNumRsvd &&
                    peekOriIdx < yBlockNumAval &&
                    static_cast<uint32_t>(gSparseBlockIdx.GetValue(peekYBlockIdx)) == peekOriIdx) {
-                uint32_t peekBlockSize =
-                    (peekOriIdx == yBlockNumAval - 1) ? (kvSeqlenU - peekOriIdx * blockShapeY) : blockShapeY;
+                uint32_t peekBlockSize = blockShapeY;
+                if (peekOriIdx + 1 == yBlockNumAval) {
+                    peekBlockSize = kvSeqlenU - peekOriIdx * blockShapeY;
+                }
                 availLen += peekBlockSize;
                 runEndsShort = (peekBlockSize < blockShapeY);
                 ++peekYBlockIdx;

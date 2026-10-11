@@ -36,10 +36,7 @@ elif is_ascend950():
         get_scheduler_metadata,
     )
     from .flash_attn_quant_npu import (
-        BlockSparseConfig,
-        NpuQuantDType,
-        QuantizationConfig,
-        QuantizationScheme,
+        QuantMode,
         flash_attn_quant,
     )
 elif _device:
