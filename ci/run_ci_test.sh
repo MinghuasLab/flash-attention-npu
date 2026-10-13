@@ -42,6 +42,7 @@ printf 'nodeid,duration_s,verdict,rand,h2d,pack,cache,index,postprocess,forward,
 TEST_PHASE_START="$(date +%s)"
 export GOLDEN_CACHE_STATS_FILE="${GOLDEN_CACHE_STATS_FILE:-$LOG_DIR/golden_cache_events.tsv}"
 CACHE_STATS_FILE="$GOLDEN_CACHE_STATS_FILE"
+export FA_TEST_COMPARE="${FA_TEST_COMPARE:-auto}"
 
 cache_artifact_count() {
   if [ -n "${GOLDEN_CACHE_DIR:-}" ] && [ -d "$GOLDEN_CACHE_DIR" ]; then
@@ -63,23 +64,41 @@ fi
 
 log "repo=$REPO_ROOT device=$DEVICE mode=${CI_MODE:-quick}"
 log "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
+log "FA_TEST_COMPARE=$FA_TEST_COMPARE"
 log "test phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 
 # ---------- 1. NPU 自检 (需要卡) ----------
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 python3 - <<'PY' || die "torch_npu not functional inside container (check --privileged / driver mount)"
+import time
 import torch
 import torch_npu
 print("torch:", torch.__version__)
 print("torch_npu:", torch_npu.__version__)
 print("torch_npu device_count:", torch_npu.npu.device_count())
 assert torch_npu.npu.device_count() >= 1, "device_count==0; --privileged or driver mount missing?"
+# machine health probe, healthy hosts show tens of ms on both
+t0 = time.perf_counter(); torch.rand(2_000_000); t_rand = time.perf_counter() - t0
+probe = torch.rand(65536).npu(); torch.npu.synchronize()
+t0 = time.perf_counter(); probe.cpu(); t_sync = time.perf_counter() - t0
+print(f"machine probe: cpu_rand_2M={t_rand * 1000:.0f}ms d2h_sync={t_sync * 1000:.0f}ms")
 PY
 
 # ---------- 2. 安装 (复用 build/ 产物, 不重新编译) ----------
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 log "python setup.py install --skip-build (reuse build/ artifacts)"
-python3 setup.py install --skip-build
+# 折叠安装的 copying 输出, 失败时把尾部展开打印
+install_log="$RUN_LOG_DIR/install.log"
+echo "::group::setup.py install output (live, reuse build/ artifacts)"
+set +e
+python3 setup.py install --skip-build 2>&1 | tee "$install_log"
+install_rc="${PIPESTATUS[0]}"
+echo "::endgroup::"
+set -e
+if [ "$install_rc" -ne 0 ]; then
+  tail -n 30 "$install_log" || true
+  die "setup.py install failed rc=$install_rc"
+fi
 
 log "import check"
 python3 - <<'PY'
@@ -109,11 +128,13 @@ if [ "$MODE" = "quick" ]; then
   SAMPLE_ARG="--random-sample=${CI_QUICK_SAMPLE}"
 fi
 
-# Set to true for detailed slow-case timing output during CI debugging
-VERBOSE="${CI_VERBOSE:-false}"
+# Default on while diagnosing machine slowness, CI_VERBOSE=false turns it off
+VERBOSE="${CI_VERBOSE:-true}"
 
 FAILED_FILE="$LOG_DIR/failed_cases.txt"
 : > "$FAILED_FILE"
+FAIL_META_FILE="$LOG_DIR/failure_case_metadata.tsv"
+: > "$FAIL_META_FILE"
 SUMMARY_FILE="$LOG_DIR/summary.txt"
 : > "$SUMMARY_FILE"
 # per-file table and totals for the final summary
@@ -137,14 +158,14 @@ timing_total() {
 
 # top 3 nonzero phases from timing string
 timing_top_phases() {
-  printf '%s\n' $1 | sed 's/s$//' \
+  printf '%s\n' "$1" | sed 's/s$//' \
     | awk -F= '$1 != "total" && $2+0 > 0 {printf "%s=%.1fs\n", $1, $2}' \
     | sort -t= -k2 -rn | head -3 | awk '{printf "%s%s", sep, $0; sep = " "}'
 }
 
 # csv tail for one timing summary, 12 phase seconds then quoted event tags
 timing_csv_fields() {
-  printf '%s\n' $1 \
+  printf '%s\n' "$1" \
     | awk -F= 'BEGIN{split("rand h2d pack cache index postprocess forward backward ref golden compare other", o, " ")}
         NF < 2 {next}
         $2 ~ /^[0-9]+(\.[0-9]+)?s?$/ {v[$1] = $2 + 0; next}
@@ -176,12 +197,26 @@ top5_slow_lines() {
     | awk -F'\t' '{line = sprintf("[CI-test]   %10ss  %s [%s]", $1, $3, $2); if ($4 != "") line = line " (" $4 ")"; print line}'
 }
 
-# extract first failure traceback from pytest FAILURES section, 60 lines max
+# extract first failure traceback, head 50 plus tail 100 so the trailing assert message survives
+# VERBOSE=true prints the whole first failure block instead of the excerpt
 print_first_failure() {
-  local logfile="$1"
-  awk '/^=+ FAILURES =+/{flag=1; next}
+  local logfile="$1" block n elided
+  block="$(awk '/^=+ FAILURES =+/{flag=1; next}
        flag && /^_+ .* _+$/{c++; if (c == 2) exit}
-       flag' "$logfile" 2>/dev/null | head -n 60 | sed 's/^/    /'
+       flag' "$logfile" 2>/dev/null)"
+  if [ "$VERBOSE" = "true" ]; then
+    printf '%s\n' "$block" | sed 's/^/    /'
+    return
+  fi
+  n="$(printf '%s\n' "$block" | wc -l)"
+  if [ "$n" -le 150 ]; then
+    printf '%s\n' "$block" | sed 's/^/    /'
+    return
+  fi
+  elided=$((n - 150))
+  printf '%s\n' "$block" | head -n 50 | sed 's/^/    /'
+  printf '    ... %s lines omitted ...\n' "$elided"
+  printf '%s\n' "$block" | tail -n 100 | sed 's/^/    /'
 }
 
 # tally finished run results, structured events first, xdist log grep fallback
@@ -212,7 +247,9 @@ run_pytest() {
   export CI_PROGRESS_FILE="$progress_file"
   (
     local total=0 done=0 passed=0 failed=0 skipped=0 events_seen=0 last_line=0
-    local started_at="$(date +%s)" running="" running_since=0
+    local started_at running running_since=0
+    started_at="$(date +%s)"
+    running=""
     local last_progress=$(( $(date +%s) - 20 ))
     local kind value duration encoded details nodeid timing dur_s
     local log_total log_pass log_fail log_skip now
@@ -248,6 +285,7 @@ run_pytest() {
               elif [ "$value" = "failed" ] || [ "$value" = "error" ]; then
                 failed=$((failed + 1))
                 printf '[FAIL] %s | %ss\n' "${nodeid#tests/}" "$dur_s"
+                printf '%s\t%s\t%s\n' "$nodeid" "$dur_s" "$timing" >> "$FAIL_META_FILE"
                 printf '"%s",%s,fail,%s\n' "$nodeid" "$dur_s" "$(timing_csv_fields "")" >> "$SLOW_CASES_FILE"
               else
                 skipped=$((skipped + 1))
@@ -274,7 +312,7 @@ run_pytest() {
         running_since=0
       fi
       now="$(date +%s)"
-      if [ $((now - last_progress)) -ge "${CI_PROGRESS_INTERVAL:-30}" ]; then
+      if [ $((now - last_progress)) -ge "${CI_PROGRESS_INTERVAL:-60}" ]; then
         local log_size=0
         [ -f "$logfile" ] && log_size="$(stat -c%s "$logfile" 2>/dev/null || echo 0)"
         if [ "$total" -gt 0 ] 2>/dev/null; then
@@ -282,11 +320,11 @@ run_pytest() {
           if [ "${OVERALL_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
             local overall_done=$(( ${OVERALL_BASE:-0} + done ))
             local pct=$(( overall_done * 100 / OVERALL_TOTAL ))
-            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) | "
+            local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
+            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | "
           fi
-          local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
           printf '[progress] %sgroup %s/%s %s: %s/%s | %ss\n' \
-            "overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | " \
+            "$overall_seg" \
             "${FILE_IDX:-?}" "${FILE_TOT:-1}" "${short##*/}" \
             "$done" "$total" "$((now - started_at))"
           if [ -n "$running" ]; then
@@ -368,9 +406,6 @@ run_pytest_scanned() {
   # Group files by imported flash_attn version to avoid aicpu fold
   local common_files=() v2_files=() v3_files=() v4_files=()
   local skipped_files=() collect_failed_files=()
-  local runnable_common=() runnable_v2=() runnable_v3=() runnable_v4=()
-  local common_count=0 v2_count=0 v3_count=0 v4_count=0
-
   for file in "${files[@]}"; do
     local has_v2=0 has_v3=0 has_v4=0
     grep -q "flash_attn_npu_4" "$file" 2>/dev/null && has_v4=1
@@ -426,7 +461,7 @@ run_pytest_scanned() {
         *) skipped_files+=("$file") ;;
       esac
     done
-    group_counts[$gi]=$gtotal
+    group_counts[gi]=$gtotal
     if [ "$gtotal" -gt 0 ]; then
       group_runnable+=("$gi")
     fi
@@ -449,7 +484,7 @@ run_pytest_scanned() {
 
   local overall_total=0
   for gi in "${group_runnable[@]}"; do
-    overall_total=$((overall_total + group_counts[$gi]))
+    overall_total=$((overall_total + group_counts[gi]))
   done
 
   local group_idx=0 group_tot=${#group_runnable[@]}
@@ -463,7 +498,7 @@ run_pytest_scanned() {
     logfile="$RUN_LOG_DIR/${gname}_group.log"
     local short="${gname}_group"
     FILE_IDX="$group_idx"; FILE_TOT="$group_tot"; FILE_NAME="$short"
-    FILE_CASES="${group_counts[$gi]}"
+    FILE_CASES="${group_counts[gi]}"
     OVERALL_TOTAL="$overall_total"; OVERALL_BASE="$overall_base"; CUM_F_FAIL="$cum_f"
     local file_start file_dur dur_h
     file_start="$(date +%s)"
@@ -547,7 +582,10 @@ summarize_golden_cache 2>&1 | tee -a "$SUMMARY_FILE"
 
 FAILED_CASES="$(tr '\n' ' ' < "$FAILED_FILE" 2>/dev/null || true)"
 if [ -n "$FAILED_CASES" ]; then
-  die "pytest FAILED targets:$FAILED_CASES"
+  printf '[FAILURE SUMMARY] case metadata\n'
+  awk -F '\t' '{printf "  nodeid=%s | duration=%ss | timing=%s\n", $1, $2, $3}' \
+    "$FAIL_META_FILE" 2>/dev/null || true
+  die "pytest FAILED: $(grep -c . "$FAILED_FILE" || true) entries, details in [FAIL] lines above and failed_cases.txt"
 fi
 
 log "all tests passed"
