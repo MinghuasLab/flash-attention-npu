@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_common_def.h
- * \brief
- */
-
 #ifndef VF_COMMON_DEF_H_
 #define VF_COMMON_DEF_H_
 #include "kernel_tensor.h"
@@ -24,9 +19,6 @@
 namespace Catlass::Epilogue::Block::Mxfp4VF {
 using namespace AscendC;
 using namespace Reg;
-
-#define VMULSCVT false
-#define DROPOUT false
 
 constexpr static AscendC::Reg::CastTrait h2iZero = {
     AscendC::Reg::RegLayout::ZERO,

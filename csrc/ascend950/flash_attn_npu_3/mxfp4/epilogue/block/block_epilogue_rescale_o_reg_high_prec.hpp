@@ -25,13 +25,11 @@
 
 namespace Catlass::Epilogue::Block {
 using namespace MXFP4Kernel;
-template <
-    class ElementO_, class ElementOTmp_, class ElementDm_, class TileCopy_, class OTmpSrcPos_, LseMode LSE_MODE_,
-    LseFormat LSE_FORMAT_>
-class BlockEpilogue<
-    EpilogueAtlasA5RescaleOMx<LSE_MODE_, LSE_FORMAT_, true>, ElementO_, ElementOTmp_, ElementDm_, TileCopy_,
-    OTmpSrcPos_> {
-public:
+template <class ElementO_, class ElementOTmp_, class ElementDm_, class TileCopy_, class OTmpSrcPos_, LseMode LSE_MODE_,
+          LseFormat LSE_FORMAT_>
+class BlockEpilogue<EpilogueAtlasA5RescaleOMx<LSE_MODE_, LSE_FORMAT_, true>, ElementO_, ElementOTmp_, ElementDm_,
+                    TileCopy_, OTmpSrcPos_> {
+  public:
     using DispatchPolicy = EpilogueAtlasA5RescaleOMx<LSE_MODE_, LSE_FORMAT_, true>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementO = ElementO_;
@@ -49,25 +47,24 @@ public:
         oTransUBTensor = resource.ubBuf.template GetBufferByByte<ElementO>(MXFP4::UB_O_TRANS_BUF_OFFSET);
         oUBTensor = resource.ubBuf.template GetBufferByByte<ElementOTmp>(MXFP4::UB_O_BUF_OFFSET);
         for (uint32_t i = 0; i < MXFP4::UB_UPDATE_SCALE_CNT; i++) {
-            dmUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDm>(
-                MXFP4::UB_UPDATE_SCALE_BUF_OFFSET + MXFP4::UB_UPDATE_SCALE_BUF_SIZE * i);
+            dmUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDm>(MXFP4::UB_UPDATE_SCALE_BUF_OFFSET +
+                                                                               MXFP4::UB_UPDATE_SCALE_BUF_SIZE * i);
         }
     }
 
-    __aicore__ inline ~BlockEpilogue()
-    {}
+    __aicore__ inline ~BlockEpilogue() {}
 
     template <class TensorO>
-    __aicore__ inline void operator()(
-        TensorO& gOTensor, Catlass::GemmCoord& actualOriShape, TaskInfo& taskInfo, TileInfo& tileInfo)
+    __aicore__ inline void operator()(TensorO& gOTensor, Catlass::GemmCoord& actualOriShape, TaskInfo& taskInfo,
+                                      TileInfo& tileInfo)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         AscendC::LocalTensor<ElementDm> dm = dmUBTensor[tileInfo.updateScaleIdx];
 
         if (tileInfo.curKvsTileLoopIdx / TILE_GROUP_N == 0) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(MXFP4::SYNC_ATTNOUT_BUF_FLAG);
-            Mxfp4VF::ProcessUpdateOCallVF<false>(
-                oUBTensor, oTmpUBTensor, dm, globalRowSumUBTensor, localRowSumUBTensor);
+            Mxfp4VF::ProcessUpdateOCallVF<false>(oUBTensor, oTmpUBTensor, dm, globalRowSumUBTensor,
+                                                 localRowSumUBTensor);
         } else {
             Mxfp4VF::ProcessUpdateOCallVF<true>(oUBTensor, oTmpUBTensor, dm, globalRowSumUBTensor, localRowSumUBTensor);
         }
@@ -85,8 +82,8 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(MXFP4::SYNC_P_BUF1_FLAG);
                 AscendC::LocalTensor<ElementOTmp> outTensorFp32Ub =
                     oTransUBTensor.template ReinterpretCast<ElementOTmp>(); // 空间复用P, bf16 vf写出是强解释fp32
-                Mxfp4VF::TransposeAttnOutCallVF<MXFP4::QS_BASE_SIZE, ElementO>(
-                    outTensorFp32Ub, oUBTensor, globalRowSumUBTensor);
+                Mxfp4VF::TransposeAttnOutCallVF<MXFP4::QS_BASE_SIZE, ElementO>(outTensorFp32Ub, oUBTensor,
+                                                                               globalRowSumUBTensor);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::LocalTensor<ElementO> oTransUBTensorB16 = oTransUBTensor.template ReinterpretCast<ElementO>();
                 AscendC::LocalTensor<ElementO> oUBTensorB16 = oUBTensor.template ReinterpretCast<ElementO>();
@@ -104,11 +101,10 @@ public:
                 uint32_t embdingSize = actualOriShape.m();
                 uint32_t rowOffsetCurSubCore = subBlockIdx * splitMSizePerCore;
                 uint32_t colNumCurSubCore = tla::get<1>(gOTensor.shape());
-                auto gOTensorTlaTile = GetTile(
-                    gOTensor, tla::MakeCoord(rowOffsetCurSubCore, 0),
-                    tla::MakeShape(actMSizeThisCore, colNumCurSubCore));
-                auto ubOLayoutTla = tla::MakeLayout(
-                    tla::MakeShape(actMSizeThisCore, embdingSize), tla::MakeStride(embedColumnCnt, tla::Int<1>{}));
+                auto gOTensorTlaTile = GetTile(gOTensor, tla::MakeCoord(rowOffsetCurSubCore, 0),
+                                               tla::MakeShape(actMSizeThisCore, colNumCurSubCore));
+                auto ubOLayoutTla = tla::MakeLayout(tla::MakeShape(actMSizeThisCore, embdingSize),
+                                                    tla::MakeStride(embedColumnCnt, tla::Int<1>{}));
                 auto ubOTensorTla = tla::MakeTensor(oUBTensorB16, ubOLayoutTla, Catlass::Arch::PositionUB{});
                 copyUbToGmO(gOTensorTlaTile, ubOTensorTla);
             }
@@ -116,7 +112,7 @@ public:
         }
     }
 
-private:
+  private:
     // UB tensors（FIXPIPE<->V 及常驻 buffer）
     AscendC::LocalTensor<ElementOTmp> oTmpUBTensor;                         // mm2Res(PV)
     AscendC::LocalTensor<ElementSum> localRowSumUBTensor;                   // LocalRowSum

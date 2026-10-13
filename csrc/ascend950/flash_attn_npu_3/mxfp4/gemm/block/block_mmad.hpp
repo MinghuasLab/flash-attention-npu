@@ -19,14 +19,13 @@
 namespace Catlass::Gemm::Block {
 
 #if (__CCE_AICORE__ == 310)
-template <
-    class DispatchPolicy, class L1TileShape, class L0TileShape, class ElementA, class ElementB, class ElementC,
-    class ElementBias = void,
-    class TileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
-        typename DispatchPolicy::ArchTag, ElementA, Catlass::layout::RowMajor, ElementB, Catlass::layout::RowMajor,
-        ElementC, Catlass::layout::RowMajor, ElementBias>,
-    class TileMmad =
-        Catlass::Gemm::Tile::TileMmadTla<typename DispatchPolicy::ArchTag, ElementA, typename TileCopy::LayoutTagL1A> >
+template <class DispatchPolicy, class L1TileShape, class L0TileShape, class ElementA, class ElementB, class ElementC,
+          class ElementBias = void,
+          class TileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
+              typename DispatchPolicy::ArchTag, ElementA, Catlass::layout::RowMajor, ElementB,
+              Catlass::layout::RowMajor, ElementC, Catlass::layout::RowMajor, ElementBias>,
+          class TileMmad = Catlass::Gemm::Tile::TileMmadTla<typename DispatchPolicy::ArchTag, ElementA,
+                                                            typename TileCopy::LayoutTagL1A>>
 struct BlockMmadTla {
     static_assert(DEPENDENT_FALSE<DispatchPolicy>, "BlockMmadTla is not implemented for this DispatchPolicy");
 };
@@ -38,4 +37,4 @@ struct BlockMmadTla {
 #include "../../gemm/block/block_mmad_pv.hpp"
 #include "../../gemm/block/block_mmad_copy_global_max_l1_to_ub.hpp"
 #endif
-#endif // GEMM_BLOCK_BLOCK_MMAD_HPP
+#endif // MXFP4_BLOCK_MMAD_HPP

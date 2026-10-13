@@ -28,7 +28,7 @@ using namespace MXFP4Kernel;
 
 template <MXQuantMode MX_QUANT_MODE_, class ElementGroupMax_, class ElementDm_, class PScaleType_>
 class BlockEpilogue<EpilogueComputePScaleMx<true, MX_QUANT_MODE_>, ElementGroupMax_, ElementDm_, PScaleType_> {
-public:
+  public:
     using DispatchPolicy = EpilogueComputePScaleMx<true, MX_QUANT_MODE_>;
     static constexpr MXQuantMode MX_QUANT_MODE = DispatchPolicy::MX_QUANT_MODE;
     using ArchTag = typename DispatchPolicy::ArchTag;
@@ -41,8 +41,8 @@ public:
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, ElementGroupMax LOG2_CX_CEIL)
     {
         for (uint32_t i = 0; i < MXFP4::UB_P_SCALE_CNT; i++) {
-            pscaleUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementPScale>(
-                MXFP4::UB_P_SCALE_BUF_OFFSET + MXFP4::UB_P_SCALE_BUF_SIZE * i);
+            pscaleUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementPScale>(MXFP4::UB_P_SCALE_BUF_OFFSET +
+                                                                                       MXFP4::UB_P_SCALE_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::UB_PEER_GLOBAL_MAX_CNT; i++) {
             peerGlobalMaxUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementGroupMax>(
@@ -58,13 +58,12 @@ public:
                 MXFP4::UB_LOCAL_GLOBAL_MAX_BUF_OFFSET + MXFP4::UB_LOCAL_GLOBAL_MAX_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::UB_UPDATE_SCALE_CNT; i++) {
-            dmUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDm>(
-                MXFP4::UB_UPDATE_SCALE_BUF_OFFSET + MXFP4::UB_UPDATE_SCALE_BUF_SIZE * i);
+            dmUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDm>(MXFP4::UB_UPDATE_SCALE_BUF_OFFSET +
+                                                                               MXFP4::UB_UPDATE_SCALE_BUF_SIZE * i);
         }
         LOG2_CX_CEIL_ = LOG2_CX_CEIL;
     }
-    __aicore__ inline ~BlockEpilogue()
-    {}
+    __aicore__ inline ~BlockEpilogue() {}
 
     template <class TensorL1Pscale>
     __aicore__ inline void operator()(TensorL1Pscale& l1PScaleTensor, TileInfo const& tileInfo, TaskInfo& taskInfo)
@@ -132,25 +131,23 @@ public:
 
         // copy pscale1 ub to l1
         bool isQsAlign128 = taskInfo.qsActBaseTileAlign64 == MXFP4::QS_BASE_SIZE;
-        CopyPScaleUbToL1(
-            l1PScaleTensor, pscale1, pscale2, subBlockIdx, firstLoopStart, firstLoop, secondLoopStart, secondLoop,
-            isQsAlign128);
+        CopyPScaleUbToL1(l1PScaleTensor, pscale1, pscale2, subBlockIdx, firstLoopStart, firstLoop, secondLoopStart,
+                         secondLoop, isQsAlign128);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(MXFP4::SYNC_P_BUF0_FLAG);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(MXFP4::SYNC_P_BUF1_FLAG);
     }
 
     template <class TensorDst>
-    __aicore__ inline void CopyPScaleUbToL1(
-        TensorDst& l1PScaleTensor, AscendC::LocalTensor<ElementPScale>& pscale1Src,
-        AscendC::LocalTensor<ElementPScale>& pscale2Src, uint32_t subBlockIdx, uint16_t firstLoopStart,
-        uint16_t firstLoop, uint16_t secondLoopStart, uint16_t secondLoop, bool isQsAlign128)
+    __aicore__ inline void CopyPScaleUbToL1(TensorDst& l1PScaleTensor, AscendC::LocalTensor<ElementPScale>& pscale1Src,
+                                            AscendC::LocalTensor<ElementPScale>& pscale2Src, uint32_t subBlockIdx,
+                                            uint16_t firstLoopStart, uint16_t firstLoop, uint16_t secondLoopStart,
+                                            uint16_t secondLoop, bool isQsAlign128)
     {
         // 第一部分: firstLoop 组, 从 firstLoopStart 开始
         uint32_t l1PScaleTensorNSize = tla::get<1>(l1PScaleTensor.shape());
-        auto l1TlaTile1 = tla::GetTile(
-            l1PScaleTensor, tla::MakeCoord(subBlockIdx + firstLoopStart, 0),
-            tla::MakeShape(firstLoop, l1PScaleTensorNSize));
+        auto l1TlaTile1 = tla::GetTile(l1PScaleTensor, tla::MakeCoord(subBlockIdx + firstLoopStart, 0),
+                                       tla::MakeShape(firstLoop, l1PScaleTensorNSize));
         uint32_t dstOffset = l1TlaTile1.layout()(l1TlaTile1.coord());
         uint16_t pscaleGroupLen = static_cast<uint16_t>(l1PScaleTensorNSize / MXFP4::DATA_BLOCK_BYTE);
         uint16_t pscaleGroupHalfLen = static_cast<uint16_t>(l1PScaleTensorNSize / 2 / MXFP4::DATA_BLOCK_BYTE);
@@ -164,9 +161,8 @@ public:
 
         if (secondLoop != 0) {
             // 第二部分: secondLoop 组, 从 secondLoopStart 开始
-            auto l1TlaTile2 = tla::GetTile(
-                l1PScaleTensor, tla::MakeCoord(subBlockIdx + secondLoopStart, 0),
-                tla::MakeShape(secondLoop, l1PScaleTensorNSize));
+            auto l1TlaTile2 = tla::GetTile(l1PScaleTensor, tla::MakeCoord(subBlockIdx + secondLoopStart, 0),
+                                           tla::MakeShape(secondLoop, l1PScaleTensorNSize));
             uint32_t dstOffset2 = l1TlaTile2.layout()(l1TlaTile2.coord());
             AscendC::DataCopyParams repeatParams2;
             repeatParams2.blockCount = secondLoop;
@@ -178,10 +174,9 @@ public:
         }
     }
 
-private:
-    __aicore__ inline void GetPScaleParams(
-        const TileInfo& tileInfo, uint32_t subBlockIdx, uint16_t& firstLoopStart, uint16_t& firstLoop,
-        uint16_t& secondLoopStart, uint16_t& secondLoop)
+  private:
+    __aicore__ inline void GetPScaleParams(const TileInfo& tileInfo, uint32_t subBlockIdx, uint16_t& firstLoopStart,
+                                           uint16_t& firstLoop, uint16_t& secondLoopStart, uint16_t& secondLoop)
     {
         uint16_t isLoopFirstTaskVecCore = (subBlockIdx == tileInfo.kvsFirstTileStartVecCore);
         uint32_t loop = tileInfo.loop;
@@ -216,7 +211,7 @@ private:
         secondLoop /= 2;
     }
 
-private:
+  private:
     static constexpr uint32_t GROUP_MAX_SPACE_LEN = 20;
     static constexpr uint32_t WHOLE_PROCESS_LOOP = 16;
 

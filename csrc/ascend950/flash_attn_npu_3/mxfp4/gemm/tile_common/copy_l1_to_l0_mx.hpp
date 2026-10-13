@@ -25,15 +25,13 @@ namespace Catlass::Gemm::Tile {
 // mx L1 → L0A 转置搬运：L1 V(nZ, [S2,D]) + V-scale → L0A(zN, Vᵀ=[D,S2])
 struct CopyL1ToL0AMxA5 {
     CATLASS_DEVICE
-    CopyL1ToL0AMxA5()
-    {}
+    CopyL1ToL0AMxA5() {}
 
     // dAct  : embed 维（源 k → 转置后 L0A m）
     // s2Act : seq 维对齐 64（源 m → 转置后 L0A k）
     template <class TensorDst, class TensorSrc, class TensorScale>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dst, TensorSrc const& src, TensorScale const& scale, uint32_t dAct, uint32_t s2Act)
+    CATLASS_DEVICE void operator()(TensorDst const& dst, TensorSrc const& src, TensorScale const& scale, uint32_t dAct,
+                                   uint32_t s2Act)
     {
         constexpr uint32_t NZ_C0 = Catlass::Gemm::Block::MXFP4::NZ_C0_ELEMS;
         constexpr uint32_t FP4_C0 = Catlass::Gemm::Block::MXFP4::FP4_C0_ELEMS;
@@ -65,8 +63,7 @@ struct CopyL1ToL0AMxA5 {
 // mx L1 → L0B 转置搬运：L1 P(zN, [M,S2]) + P-scale → L0B(nZ, Pᵀ=[S2,M])
 struct CopyL1ToL0BMxA5 {
     CATLASS_DEVICE
-    CopyL1ToL0BMxA5()
-    {}
+    CopyL1ToL0BMxA5() {}
 
     // s2Align64         : seq 维对齐 64（源 m → 转置后 L0B k）
     // dAct              : embed 维
@@ -74,10 +71,9 @@ struct CopyL1ToL0BMxA5 {
     // actScaleSrcStride : 实际 scale srcStride（0 表示由 s2Base 推导）
     // s1Align64         : M 维对齐 64（源 k → 转置后 L0B n）
     template <class TensorDst, class TensorSrc, class TensorScale>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dst, TensorSrc const& src, TensorScale const& scale, uint32_t s2Align64, uint32_t dAct,
-        uint32_t s2Base, uint32_t actScaleSrcStride, uint32_t s1Align64)
+    CATLASS_DEVICE void operator()(TensorDst const& dst, TensorSrc const& src, TensorScale const& scale,
+                                   uint32_t s2Align64, uint32_t dAct, uint32_t s2Base, uint32_t actScaleSrcStride,
+                                   uint32_t s1Align64)
     {
         constexpr uint32_t NZ_C0 = Catlass::Gemm::Block::MXFP4::NZ_C0_ELEMS;
         constexpr uint32_t FP4_C0 = Catlass::Gemm::Block::MXFP4::FP4_C0_ELEMS;
@@ -106,8 +102,7 @@ struct CopyL1ToL0BMxA5 {
 // mx L1 → L0A 非转置搬运（QK）：L1 K(nZ, [S,D]) + K-scale(沿 D) → L0A
 struct CopyL1ToL0AMxQKA5 {
     CATLASS_DEVICE
-    CopyL1ToL0AMxQKA5()
-    {}
+    CopyL1ToL0AMxQKA5() {}
 
     // nSubRowStart  : 本子块在整 tile L1 中的行起点
     // nCur          : 本子块实际 K 行数
@@ -115,10 +110,9 @@ struct CopyL1ToL0AMxQKA5 {
     // s2Align16Full : 整 tile 行 16 对齐
     // scaleK        : Ceil(D/64)*2，沿 D
     template <class TensorDst, class TensorSrc, class TensorScale>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dst, TensorSrc const& src, TensorScale const& scale, uint32_t nSubRowStart, uint32_t nCur,
-        uint32_t alignK, uint32_t s2Align16Full, uint32_t scaleK)
+    CATLASS_DEVICE void operator()(TensorDst const& dst, TensorSrc const& src, TensorScale const& scale,
+                                   uint32_t nSubRowStart, uint32_t nCur, uint32_t alignK, uint32_t s2Align16Full,
+                                   uint32_t scaleK)
     {
         constexpr uint32_t NZ_C0 = Catlass::Gemm::Block::MXFP4::NZ_C0_ELEMS;
         constexpr uint32_t FP4_C0 = Catlass::Gemm::Block::MXFP4::FP4_C0_ELEMS;
@@ -150,8 +144,7 @@ struct CopyL1ToL0AMxQKA5 {
 // mx L1 → L0B 非转置搬运（QK）：L1 Q(nZ, [M,D]) + Q-scale(沿 D) → L0B
 struct CopyL1ToL0BMxQKA5 {
     CATLASS_DEVICE
-    CopyL1ToL0BMxQKA5()
-    {}
+    CopyL1ToL0BMxQKA5() {}
 
     // mAlignL1      : M 维 L1 对齐（恒 128）
     // alignK        : CeilAlign(D, 64)
@@ -159,10 +152,9 @@ struct CopyL1ToL0BMxQKA5 {
     // scaleMAlignL1 : scale 的 M 维 L1 对齐
     // scaleK        : Ceil(D/64)*2，沿 D
     template <class TensorDst, class TensorSrc, class TensorScale>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dst, TensorSrc const& src, TensorScale const& scale, uint32_t mAlignL1, uint32_t alignK,
-        uint32_t mAlignL0, uint32_t scaleMAlignL1, uint32_t scaleK)
+    CATLASS_DEVICE void operator()(TensorDst const& dst, TensorSrc const& src, TensorScale const& scale,
+                                   uint32_t mAlignL1, uint32_t alignK, uint32_t mAlignL0, uint32_t scaleMAlignL1,
+                                   uint32_t scaleK)
     {
         constexpr uint32_t NZ_C0 = Catlass::Gemm::Block::MXFP4::NZ_C0_ELEMS;
         constexpr uint32_t FP4_C0 = Catlass::Gemm::Block::MXFP4::FP4_C0_ELEMS;

@@ -35,10 +35,9 @@ namespace Catlass::Epilogue::Block {
 using namespace MXFP4Kernel;
 
 template <MXQuantMode MX_QUANT_MODE_, class OutputType_, class LayoutS_, class ScaleType_>
-class BlockEpilogue<
-    EpilogueOnlineSoftmaxMx<true, MX_QUANT_MODE_>, OutputType_, Catlass::Gemm::GemmType<half, LayoutS_>,
-    ScaleType_> {
-public:
+class BlockEpilogue<EpilogueOnlineSoftmaxMx<true, MX_QUANT_MODE_>, OutputType_, Catlass::Gemm::GemmType<half, LayoutS_>,
+                    ScaleType_> {
+  public:
     using DispatchPolicy = EpilogueOnlineSoftmaxMx<true, MX_QUANT_MODE_>;
     static constexpr MXQuantMode MX_QUANT_MODE = DispatchPolicy::MX_QUANT_MODE;
     using ArchTag = typename DispatchPolicy::ArchTag;
@@ -53,14 +52,14 @@ public:
     {
         // FIXPIPE<->V 区
         for (uint32_t i = 0; i < MXFP4::UB_S_BUF_CNT; i++) {
-            sUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(
-                MXFP4::UB_S_BUF_OFFSET + MXFP4::UB_S_INNER_BUF_OFFSET * i);
+            sUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(MXFP4::UB_S_BUF_OFFSET +
+                                                                                 MXFP4::UB_S_INNER_BUF_OFFSET * i);
         }
 
         // 输出缓冲区
         for (uint32_t i = 0; i < MXFP4::UB_P_BUF_CNT; i++) {
-            pUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDisguiseP>(
-                MXFP4::UB_P_BUF_OFFSET + MXFP4::UB_P_INNER_BUF_OFFSET * i);
+            pUBTensor[i] = resource.ubBuf.template GetBufferByByte<ElementDisguiseP>(MXFP4::UB_P_BUF_OFFSET +
+                                                                                     MXFP4::UB_P_INNER_BUF_OFFSET * i);
         }
 
         // 常驻 buffer
@@ -78,13 +77,11 @@ public:
         //  Init Tensor
         Mxfp4VF::InitIndexesAndDuplicateCallVF<ElementMax>(indexUBTensor, localGlobalMaxUBTensor[0]);
     }
-    __aicore__ inline ~BlockEpilogue()
-    {}
+    __aicore__ inline ~BlockEpilogue() {}
 
     template <class TensorL1P>
-    __aicore__ inline void operator()(
-        TensorL1P& l1PTensorTla, Catlass::GemmCoord& actualBlockShape, TileInfo const& tileInfo,
-        TaskInfo const& taskInfo)
+    __aicore__ inline void operator()(TensorL1P& l1PTensorTla, Catlass::GemmCoord& actualBlockShape,
+                                      TileInfo const& tileInfo, TaskInfo const& taskInfo)
     {
         uint32_t spBuffIdx = GetSPBufferIdx(tileInfo.loop);
         // 跨 tile 同步: 每个 vec core 都需要一个跨 tile 的同步
@@ -99,14 +96,14 @@ public:
         if (actKvsTile == MXFP4::KVS_BASE_SIZE) {
             if (taskInfo.qsActBaseTileAlign64 == MXFP4::QS_BASE_SIZE) {
                 // qs=128, kvs=256 softmax
-                Mxfp4VF::SoftmaxWithGroupMaxQs128Kvs256CallVF<
-                    MX_QUANT_MODE, true, ElementInput, ElementDisguiseP, MXFP4::KVS_BASE_SIZE, MXFP4::QS_BASE_SIZE>(
+                Mxfp4VF::SoftmaxWithGroupMaxQs128Kvs256CallVF<MX_QUANT_MODE, true, ElementInput, ElementDisguiseP,
+                                                              MXFP4::KVS_BASE_SIZE, MXFP4::QS_BASE_SIZE>(
                     pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                     localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_);
             } else {
                 // qs=64, kvs=256 softmax
-                Mxfp4VF::SoftmaxWithGroupMaxQs64Kvs256CallVF<
-                    MX_QUANT_MODE, true, ElementInput, ElementDisguiseP, MXFP4::KVS_BASE_SIZE, MXFP4::QS_BASE_SIZE>(
+                Mxfp4VF::SoftmaxWithGroupMaxQs64Kvs256CallVF<MX_QUANT_MODE, true, ElementInput, ElementDisguiseP,
+                                                             MXFP4::KVS_BASE_SIZE, MXFP4::QS_BASE_SIZE>(
                     pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                     localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_);
             }
@@ -131,30 +128,30 @@ public:
             if (tileInfo.kvsActBaseTileAlign32 == MXFP4::DATA_BLOCK_BYTE) {
                 if (taskInfo.qsActBaseTileAlign64 == MXFP4::QS_BASE_SIZE) {
                     // softmax padding 32, qs=128
-                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs128Kvs32CallVF<
-                        MX_QUANT_MODE, true, ElementInput, ElementDisguiseP>(
+                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs128Kvs32CallVF<MX_QUANT_MODE, true, ElementInput,
+                                                                      ElementDisguiseP>(
                         pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                         localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_);
                 } else {
                     // softmax padding 32, qs=64
-                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs64Kvs32CallVF<
-                        MX_QUANT_MODE, true, ElementInput, ElementDisguiseP>(
+                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs64Kvs32CallVF<MX_QUANT_MODE, true, ElementInput,
+                                                                     ElementDisguiseP>(
                         pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                         localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_);
                 }
             } else {
                 if (taskInfo.qsActBaseTileAlign64 == MXFP4::QS_BASE_SIZE) {
                     // softmax padding 32 multi >= 64, qs=128
-                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs128Kvs32MultiCallVF<
-                        MX_QUANT_MODE, true, ElementInput, ElementDisguiseP, MXFP4::QS_BASE_SIZE>(
+                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs128Kvs32MultiCallVF<MX_QUANT_MODE, true, ElementInput,
+                                                                           ElementDisguiseP, MXFP4::QS_BASE_SIZE>(
                         pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                         localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_,
                         static_cast<uint16_t>(tileInfo.kvsActBaseTileAlign32),
                         static_cast<uint16_t>(tileInfo.kvsActBaseTileAlign64));
                 } else {
                     // softmax padding 32 multi >= 64, qs=64
-                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs64Kvs32MultiCallVF<
-                        MX_QUANT_MODE, true, ElementInput, ElementDisguiseP, MXFP4::QS_BASE_SIZE>(
+                    Mxfp4VF::SoftmaxWithGroupMaxAlignQs64Kvs32MultiCallVF<MX_QUANT_MODE, true, ElementInput,
+                                                                          ElementDisguiseP, MXFP4::QS_BASE_SIZE>(
                         pUBTensor[spBuffIdx], sUBTensor[spBuffIdx], localGroupMaxUBTensor[groupMaxIdx],
                         localGlobalMaxUBTensor[tileInfo.tileMaxIdx], indexUBTensor, NEG_LOG2_CX_,
                         static_cast<uint16_t>(tileInfo.kvsActBaseTileAlign32),
@@ -176,9 +173,8 @@ public:
     }
 
     template <class TensorDst, class TensorSrc>
-    __aicore__ inline void CopyPUBToPL1(
-        TensorDst const& l1PTensorTla, TensorSrc const& ubPTensorTla, TileInfo const& tileInfo,
-        TaskInfo const& taskInfo, uint32_t spBuffIdx)
+    __aicore__ inline void CopyPUBToPL1(TensorDst const& l1PTensorTla, TensorSrc const& ubPTensorTla,
+                                        TileInfo const& tileInfo, TaskInfo const& taskInfo, uint32_t spBuffIdx)
     {
         uint32_t pUBTlaMSize = tla::get<0>(ubPTensorTla.shape());
         uint32_t pUBTlaNSize = tla::get<1>(ubPTensorTla.shape());
@@ -196,9 +192,9 @@ public:
             repeatParams.srcStride = static_cast<uint16_t>(pUBTlaNSize / 2 / MXFP4::DATA_BLOCK_BYTE);
             repeatParams.dstStride = 0;
 
-            auto pUBTensorTlaTile = GetTile(
-                ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
-                tla::MakeShape(pUBTlaMSize, pUBTlaNSize / 2));
+            auto pUBTensorTlaTile =
+                GetTile(ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
+                        tla::MakeShape(pUBTlaMSize, pUBTlaNSize / 2));
             auto srcOffset = pUBTensorTlaTile.layout()(pUBTensorTlaTile.coord());
 
             AscendC::DataCopy(l1PTensorTla.data(), pUBTensorTlaTile.data()[srcOffset], repeatParams);
@@ -206,9 +202,9 @@ public:
         } else {
             // 消去高位 低位中间的间隙搬运
             // 低位搬运
-            auto pUBTensorTlaTile = GetTile(
-                ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
-                tla::MakeShape(pUBTlaMSize, pUBTlaNSize / 2));
+            auto pUBTensorTlaTile =
+                GetTile(ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
+                        tla::MakeShape(pUBTlaMSize, pUBTlaNSize / 2));
             auto srcOffset = pUBTensorTlaTile.layout()(pUBTensorTlaTile.coord());
 
             AscendC::DataCopyParams repeatParams1;
@@ -219,9 +215,9 @@ public:
             repeatParams1.srcStride = static_cast<uint16_t>(pUBTlaNSize / 2 / MXFP4::DATA_BLOCK_BYTE);
             repeatParams1.dstStride = 0;
 
-            auto pUBTensorTlaTile1 = tla::GetTile(
-                ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
-                tla::MakeShape(pUBTlaMSize / 2, pUBTlaNSize / 2));
+            auto pUBTensorTlaTile1 =
+                tla::GetTile(ubPTensorTla, tla::MakeCoord(0u, spBuffIdx * MXFP4::UB_P_INNER_BUF_ELEMENT_OFFSET),
+                             tla::MakeShape(pUBTlaMSize / 2, pUBTlaNSize / 2));
             auto srcOffset1 = pUBTensorTlaTile1.layout()(pUBTensorTlaTile1.coord());
             AscendC::DataCopy(l1PTensorTla.data(), ubPTensorTla.data()[srcOffset1], repeatParams1);
 
@@ -243,17 +239,16 @@ public:
                     xL1P = 0;
                     yL1P = pL1NHalfSize;
                 }
-                auto pUBTensorTlaTile2 = tla::GetTile(
-                    pUBTensorTlaTile1, tla::MakeCoord(pUBTlaMSize / 2, 0u),
-                    tla::MakeShape(pUBTlaMSize / 2, pUBTlaNSize / 2)); // 遗留
-                auto pl1TensorTlaTile = tla::GetTile(
-                    l1PTensorTla, tla::MakeCoord(xL1P, yL1P), tla::MakeShape(MXFP4::KVS_BASE_SIZE, pL1NHalfSize));
+                auto pUBTensorTlaTile2 = tla::GetTile(pUBTensorTlaTile1, tla::MakeCoord(pUBTlaMSize / 2, 0u),
+                                                      tla::MakeShape(pUBTlaMSize / 2, pUBTlaNSize / 2)); // 遗留
+                auto pl1TensorTlaTile = tla::GetTile(l1PTensorTla, tla::MakeCoord(xL1P, yL1P),
+                                                     tla::MakeShape(MXFP4::KVS_BASE_SIZE, pL1NHalfSize));
 
                 auto srcOffset2 = pUBTensorTlaTile2.layout()(pUBTensorTlaTile2.coord());
                 auto dstOffset2 = pl1TensorTlaTile.layout()(pl1TensorTlaTile.coord());
 
-                AscendC::DataCopy(
-                    pl1TensorTlaTile.data()[dstOffset2], pUBTensorTlaTile2.data()[srcOffset2], repeatParams2);
+                AscendC::DataCopy(pl1TensorTlaTile.data()[dstOffset2], pUBTensorTlaTile2.data()[srcOffset2],
+                                  repeatParams2);
             }
         }
     }
@@ -269,7 +264,7 @@ public:
         return loop / 2 * 2 % MXFP4::UB_LOCAL_GROUP_MAX_CNT;
     }
 
-private:
+  private:
     // UB tensors（FIXPIPE<->V 及常驻 buffer）
     AscendC::LocalTensor<ElementInput> sUBTensor[MXFP4::UB_S_BUF_CNT];                       // mm1Res(S)
     AscendC::LocalTensor<ElementDisguiseP> pUBTensor[MXFP4::UB_P_BUF_CNT];                   // vec1Res(P)

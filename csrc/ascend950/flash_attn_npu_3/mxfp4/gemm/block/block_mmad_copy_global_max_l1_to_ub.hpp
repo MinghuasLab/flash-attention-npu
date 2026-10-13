@@ -22,7 +22,7 @@ namespace Catlass::Gemm::Block {
 
 template <class ElementLocalGlobalMax_>
 struct BlockMmadTla<CopyGlobalMaxL1ToUb, void, void, ElementLocalGlobalMax_, void, void, void, void, void> {
-public:
+  public:
     using DispatchPolicy = CopyGlobalMaxL1ToUb;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementLocalGlobalMax = ElementLocalGlobalMax_;
@@ -43,8 +43,7 @@ public:
                 MXFP4::L1_LOCAL_GLOBAL_MAX_BUF_OFFSET + MXFP4::L1_LOCAL_GLOBAL_MAX_BUF_SIZE * i);
         }
     }
-    __aicore__ inline ~BlockMmadTla()
-    {}
+    __aicore__ inline ~BlockMmadTla() {}
 
     template <class TensorGMaxUb, class TileInfoT>
     __aicore__ inline void operator()(TensorGMaxUb& gMaxUbTensor, TileInfoT& delay3TileInfo)
@@ -67,16 +66,14 @@ public:
         intriParams.dstGap = 0;                       // 目的操作数连续排布
         // CANN 9.1 does not expose the newer DataCopyL1ToUB wrapper used by
         // ops-transformer. Invoke its underlying Atlas-A5 builtin directly.
-        copy_cbuf_to_ubuf(
-            (__ubuf__ void*)peerGlobalMax.GetPhyAddr(), (__cbuf__ void*)localGlobalMax0.GetPhyAddr(), VEC0,
-            intriParams.blockCount, intriParams.blockLen, intriParams.srcGap, intriParams.dstGap);
-        copy_cbuf_to_ubuf(
-            (__ubuf__ void*)peerGlobalMax.GetPhyAddr(), (__cbuf__ void*)localGlobalMax1.GetPhyAddr(), VEC1,
-            intriParams.blockCount, intriParams.blockLen, intriParams.srcGap, intriParams.dstGap);
+        copy_cbuf_to_ubuf((__ubuf__ void*)peerGlobalMax.GetPhyAddr(), (__cbuf__ void*)localGlobalMax0.GetPhyAddr(),
+                          VEC0, intriParams.blockCount, intriParams.blockLen, intriParams.srcGap, intriParams.dstGap);
+        copy_cbuf_to_ubuf((__ubuf__ void*)peerGlobalMax.GetPhyAddr(), (__cbuf__ void*)localGlobalMax1.GetPhyAddr(),
+                          VEC1, intriParams.blockCount, intriParams.blockLen, intriParams.srcGap, intriParams.dstGap);
         AscendC::PipeBarrier<PIPE_MTE1>();
     }
 
-protected:
+  protected:
     // MXFP4 专用：E8M0 scale 的 L1 buffer（V-scale 4 份，P-scale 20 份）+ MX 版 L1->L0 拷贝器
     AscendC::LocalTensor<half> localGlobalMaxL1[MXFP4::L1_LOCAL_GLOBAL_MAX_BUF_CNT];
 };

@@ -214,9 +214,7 @@ class BishengBuildExt(build_ext):
                     break
             extra_includes.append(f"-I{this_dir}/csrc/ascend950/{version_dir}")
             if version_dir == "flash_attn_npu_3":
-                extra_includes.append(
-                    f"-I{this_dir}/csrc/ascend950/{version_dir}/mxfp4"
-                )
+                extra_includes.append(f"-I{this_dir}/csrc/ascend950/{version_dir}/mxfp4")
             extra_defines.append("-DCATLASS_ARCH=3510")
         else:
             extra_defines.append("-DCATLASS_ARCH=2201")
@@ -358,15 +356,11 @@ class BishengBuildExt(build_ext):
             "flash_attn_npu_3.flash_attn_npu_3": os.path.join(
                 this_dir, "csrc/ascend910", "flash_attn_npu_3"
             ),
-            "flash_attn_npu_3_950": os.path.join(
-                this_dir, "csrc/ascend950", "flash_attn_npu_3"
-            ),
+            "flash_attn_npu_3_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_3"),
             "flash_attn_npu_4.flash_attn_npu_4": os.path.join(
                 this_dir, "csrc/ascend910", "flash_attn_npu_4"
             ),
-            "flash_attn_npu_4_950": os.path.join(
-                this_dir, "csrc/ascend950", "flash_attn_npu_4"
-            ),
+            "flash_attn_npu_4_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_4"),
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:

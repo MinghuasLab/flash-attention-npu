@@ -30,4 +30,4 @@ struct CopyGlobalMaxL1ToUb : public MmadAtlasA5 {};
 
 } // namespace Catlass::Gemm
 
-#endif // GEMM_DISPATCH_POLICY_HPP
+#endif // MXFP4_DISPATCH_POLICY_HPP

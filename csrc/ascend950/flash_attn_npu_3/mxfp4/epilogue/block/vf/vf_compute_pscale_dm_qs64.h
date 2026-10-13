@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_compute_pscale_dm_qs64.h
- * \brief
- */
-
 #ifndef VF_COMPUTE_PSCALE_DM_QS64_H_
 #define VF_COMPUTE_PSCALE_DM_QS64_H_
 #include "kernel_tensor.h"
@@ -27,15 +22,12 @@ using AscendC::LocalTensor;
 using namespace AscendC;
 using namespace Reg;
 
-#define VMULSCVT false
-#define DROPOUT false
-
 // T: half
 template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, uint16_t m = 128>
-__simd_vf__ inline void compute_pscale_qs64_vf(
-    __ubuf__ uint8_t* mxscale1, __ubuf__ uint8_t* mxscale2, __ubuf__ T* ulmax1, __ubuf__ T* ulmax2, __ubuf__ T* umax1,
-    __ubuf__ T* umax2, __ubuf__ T* ugmax_old, __ubuf__ float* urs, uint16_t firstLoop, uint16_t secondLoop,
-    uint16_t coreIndex, const T LOG2_CX_CEIL)
+__simd_vf__ inline void
+compute_pscale_qs64_vf(__ubuf__ uint8_t* mxscale1, __ubuf__ uint8_t* mxscale2, __ubuf__ T* ulmax1, __ubuf__ T* ulmax2,
+                       __ubuf__ T* umax1, __ubuf__ T* umax2, __ubuf__ T* ugmax_old, __ubuf__ float* urs,
+                       uint16_t firstLoop, uint16_t secondLoop, uint16_t coreIndex, const T LOG2_CX_CEIL)
 {
     MaskReg preg_all_32 = CreateMask<uint32_t, MaskPattern::ALL>();
     MaskReg preg_VL32_32 = CreateMask<uint32_t, MaskPattern::VL32>();
@@ -71,9 +63,8 @@ __simd_vf__ inline void compute_pscale_qs64_vf(
         ShiftLefts((RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs1, SHIFT_VALUE, preg_VL32_32);
         ShiftLefts((RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs2, SHIFT_VALUE, preg_VL32_32);
 
-        Interleave(
-            (RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs1,
-            (RegTensor<int32_t>&)vreg_rs2);
+        Interleave((RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs1,
+                   (RegTensor<int32_t>&)vreg_rs2);
         for (uint16_t i = 0; i < 1 - coreIndex; ++i) {
             StoreAlign(urs, vreg_rs1, preg_all_32);
         }
@@ -130,17 +121,17 @@ __simd_vf__ inline void compute_pscale_qs64_vf(
         Or(vreg_mxscale5, vreg_mxscale5, vreg_mxscale6, preg_VL128_8);
         Or(vreg_mxscale7, vreg_mxscale7, vreg_mxscale8, preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale1 + i * 32 * 5 * 8 + 32 * 0, vreg_mxscale1, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale1 + i * 32 * 5 * 8 + 32 * 0, vreg_mxscale1, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale1 + i * 32 * 5 * 8 + 32 * 1, vreg_mxscale3, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale1 + i * 32 * 5 * 8 + 32 * 1, vreg_mxscale3, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale1 + i * 32 * 5 * 8 + 32 * 2, vreg_mxscale5, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale1 + i * 32 * 5 * 8 + 32 * 2, vreg_mxscale5, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale1 + i * 32 * 5 * 8 + 32 * 3, vreg_mxscale7, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale1 + i * 32 * 5 * 8 + 32 * 3, vreg_mxscale7, 5,
+                                                           preg_VL128_8);
     }
 
     for (uint16_t i = 0; i < secondLoop; i++) {
@@ -181,26 +172,26 @@ __simd_vf__ inline void compute_pscale_qs64_vf(
         Or(vreg_mxscale5, vreg_mxscale5, vreg_mxscale6, preg_VL128_8);
         Or(vreg_mxscale7, vreg_mxscale7, vreg_mxscale8, preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale2 + i * 32 * 5 * 8 + 32 * 0, vreg_mxscale1, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale2 + i * 32 * 5 * 8 + 32 * 0, vreg_mxscale1, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale2 + i * 32 * 5 * 8 + 32 * 1, vreg_mxscale3, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale2 + i * 32 * 5 * 8 + 32 * 1, vreg_mxscale3, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale2 + i * 32 * 5 * 8 + 32 * 2, vreg_mxscale5, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale2 + i * 32 * 5 * 8 + 32 * 2, vreg_mxscale5, 5,
+                                                           preg_VL128_8);
 
-        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(
-            mxscale2 + i * 32 * 5 * 8 + 32 * 3, vreg_mxscale7, 5, preg_VL128_8);
+        StoreAlign<uint8_t, DataCopyMode::DATA_BLOCK_COPY>(mxscale2 + i * 32 * 5 * 8 + 32 * 3, vreg_mxscale7, 5,
+                                                           preg_VL128_8);
     }
 }
 
 template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, uint16_t QsBase = 128>
-__aicore__ inline void ComputePscaleAndDmQS64CallVF(
-    const LocalTensor<uint8_t>& mxscale1, const LocalTensor<uint8_t>& mxscale2, const LocalTensor<T>& ulmax1,
-    const LocalTensor<T>& ulmax2, const LocalTensor<T>& umax1, const LocalTensor<T>& umax2,
-    const LocalTensor<T>& ugmaxOld, const LocalTensor<float>& urs, uint16_t firstLoop, uint16_t secondLoop,
-    uint16_t coreIndex, const T LOG2_CX_CEIL)
+__aicore__ inline void
+ComputePscaleAndDmQS64CallVF(const LocalTensor<uint8_t>& mxscale1, const LocalTensor<uint8_t>& mxscale2,
+                             const LocalTensor<T>& ulmax1, const LocalTensor<T>& ulmax2, const LocalTensor<T>& umax1,
+                             const LocalTensor<T>& umax2, const LocalTensor<T>& ugmaxOld, const LocalTensor<float>& urs,
+                             uint16_t firstLoop, uint16_t secondLoop, uint16_t coreIndex, const T LOG2_CX_CEIL)
 {
     __ubuf__ uint8_t* mxscale1_buf = (__ubuf__ uint8_t*)mxscale1.GetPhyAddr();
     __ubuf__ uint8_t* mxscale2_buf = (__ubuf__ uint8_t*)mxscale2.GetPhyAddr();
@@ -211,9 +202,9 @@ __aicore__ inline void ComputePscaleAndDmQS64CallVF(
     __ubuf__ T* ugmax_old_buf = (__ubuf__ T*)ugmaxOld.GetPhyAddr();
     __ubuf__ float* urs_buf = (__ubuf__ float*)urs.GetPhyAddr();
 
-    compute_pscale_qs64_vf<MX_QUANT_MODE, clear_gmax, T, QsBase>(
-        mxscale1_buf, mxscale2_buf, ulmax1_buf, ulmax2_buf, umax1_buf, umax2_buf, ugmax_old_buf, urs_buf, firstLoop,
-        secondLoop, coreIndex, LOG2_CX_CEIL);
+    compute_pscale_qs64_vf<MX_QUANT_MODE, clear_gmax, T, QsBase>(mxscale1_buf, mxscale2_buf, ulmax1_buf, ulmax2_buf,
+                                                                 umax1_buf, umax2_buf, ugmax_old_buf, urs_buf,
+                                                                 firstLoop, secondLoop, coreIndex, LOG2_CX_CEIL);
 }
 } // namespace Catlass::Epilogue::Block::Mxfp4VF
 #endif // VF_COMPUTE_PSCALE_DM_QS64_H_

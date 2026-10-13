@@ -13,12 +13,13 @@
 // mxfp4_kernel_dispatch_impl.hpp and explicitly instantiated in
 // autogen/mxfp4_dispatch_<policy>_<layout>_<quant>_<dtype>.cpp.
 template <typename OType, Mxfp4Layout Layout, Mxfp4QuantMode QuantMode, bool Sparse>
-void launch_mxfp4_impl(const Mxfp4LaunchArgs &a);
+void launch_mxfp4_impl(const Mxfp4LaunchArgs& a);
 
 // Runtime entry. Each launch_mxfp4_impl specialization lives in its own
 // autogen translation unit.
-inline void launch_mxfp4(const Mxfp4LaunchArgs &a, Mxfp4Layout layout, Mxfp4QuantMode quant_mode,
-                         bool output_bf16, bool sparse) {
+inline void launch_mxfp4(const Mxfp4LaunchArgs& a, Mxfp4Layout layout, Mxfp4QuantMode quant_mode, bool output_bf16,
+                         bool sparse)
+{
     if (!sparse) {
         if (layout == Mxfp4Layout::TND) {
             if (quant_mode == Mxfp4QuantMode::OCP) {
@@ -110,4 +111,4 @@ inline void launch_mxfp4(const Mxfp4LaunchArgs &a, Mxfp4Layout layout, Mxfp4Quan
     }
 }
 
-#endif  // MXFP4_KERNEL_DISPATCH_HPP
+#endif // MXFP4_KERNEL_DISPATCH_HPP

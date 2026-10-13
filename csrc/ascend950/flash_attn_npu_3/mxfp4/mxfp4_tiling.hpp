@@ -34,9 +34,9 @@ struct Mxfp4Context {
 };
 
 class Mxfp4Tiling {
-public:
+  public:
     Mxfp4Tiling() = default;
-    explicit Mxfp4Tiling(const Mxfp4Context &ctx) : ctx_(ctx) {}
+    explicit Mxfp4Tiling(const Mxfp4Context& ctx) : ctx_(ctx) {}
 
     void SetCoreNum(uint32_t blockNum)
     {
@@ -48,19 +48,19 @@ public:
         return blockNum_;
     }
 
-    void DoTiling(Mxfp4TilingData &tilingdata)
+    void DoTiling(Mxfp4TilingData& tilingdata)
     {
         FillBasicTilingData(tilingdata);
         FillWorkSpaceTilingData(tilingdata);
     }
 
-private:
+  private:
     static int64_t CeilDiv(int64_t a, int64_t b)
     {
         return (a + b - 1) / b;
     }
 
-    void FillBasicTilingData(Mxfp4TilingData &tilingdata)
+    void FillBasicTilingData(Mxfp4TilingData& tilingdata)
     {
         const uint32_t qBaseTile = static_cast<uint32_t>(std::min<int64_t>(ctx_.blockX, 128));
         const uint32_t kvBaseTile = 256;
@@ -101,22 +101,23 @@ private:
         tilingdata.maxKvSeqlen = static_cast<uint32_t>(ctx_.maxKv);
         tilingdata.useUniformQSeqlen = ctx_.hasQLengths ? 0 : 1;
         tilingdata.useUniformKvSeqlen = ctx_.hasKvLengths ? 0 : 1;
-        tilingdata.mask2IdxTileInfo = {
-            xBlocks, yBlocks, avgRows, ctx_.sparse ? static_cast<uint32_t>(CeilDiv(totalMaskRows, avgRows)) : 0};
+        tilingdata.mask2IdxTileInfo = {xBlocks, yBlocks, avgRows,
+                                       ctx_.sparse ? static_cast<uint32_t>(CeilDiv(totalMaskRows, avgRows)) : 0};
         tilingdata.baseTileInfo = {qBaseTile, kvBaseTile};
         if (ctx_.cx) {
             constexpr float kCxDefaultLog2 = 2.584962500721156f;
-            tilingdata.log2Cx = ctx_.dstTypeMax == 0.0 ? kCxDefaultLog2 : static_cast<float>(std::log2(ctx_.dstTypeMax));
+            tilingdata.log2Cx =
+                ctx_.dstTypeMax == 0.0 ? kCxDefaultLog2 : static_cast<float>(std::log2(ctx_.dstTypeMax));
             tilingdata.log2CxCeil = std::ceil(tilingdata.log2Cx);
         }
     }
 
-    void FillWorkSpaceTilingData(Mxfp4TilingData &tilingdata)
+    void FillWorkSpaceTilingData(Mxfp4TilingData& tilingdata)
     {
-        const uint64_t selectIdxSize =
-            ctx_.sparse ? static_cast<uint64_t>(ctx_.batch * ctx_.qHeads) * tilingdata.maxQBlockNum *
-                              tilingdata.maxKvBlockNum * sizeof(int32_t)
-                        : 0;
+        const uint64_t selectIdxSize = ctx_.sparse
+                                           ? static_cast<uint64_t>(ctx_.batch * ctx_.qHeads) * tilingdata.maxQBlockNum *
+                                                 tilingdata.maxKvBlockNum * sizeof(int32_t)
+                                           : 0;
         const uint64_t selectCountSize =
             ctx_.sparse ? static_cast<uint64_t>(ctx_.batch * ctx_.qHeads) * tilingdata.maxQBlockNum * sizeof(int32_t)
                         : 0;

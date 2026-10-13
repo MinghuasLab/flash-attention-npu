@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_only_compute_pscale.h
- * \brief
- */
-
 #ifndef VF_ONLY_COMPUTE_PSCALE_H_
 #define VF_ONLY_COMPUTE_PSCALE_H_
 #include "kernel_tensor.h"
@@ -26,13 +21,10 @@ using AscendC::LocalTensor;
 using namespace AscendC;
 using namespace Reg;
 
-#define VMULSCVT false
-#define DROPOUT false
-
 // T: half
 template <bool clear_gmax, typename T, uint16_t m = 128>
-__simd_vf__ inline void compute_only_pscale_vf(
-    __ubuf__ T* umax1, __ubuf__ T* umax2, __ubuf__ T* ugmax_old, __ubuf__ float* urs, uint16_t coreIndex)
+__simd_vf__ inline void compute_only_pscale_vf(__ubuf__ T* umax1, __ubuf__ T* umax2, __ubuf__ T* ugmax_old,
+                                               __ubuf__ float* urs, uint16_t coreIndex)
 {
     MaskReg preg_all16 = CreateMask<uint16_t, MaskPattern::ALL>();
 
@@ -62,9 +54,8 @@ __simd_vf__ inline void compute_only_pscale_vf(
         ShiftLefts((RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs1, SHIFT_VALUE, preg_all16);
         ShiftLefts((RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs2, SHIFT_VALUE, preg_all16);
 
-        Interleave(
-            (RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs1,
-            (RegTensor<int32_t>&)vreg_rs2);
+        Interleave((RegTensor<int32_t>&)vreg_rs1, (RegTensor<int32_t>&)vreg_rs2, (RegTensor<int32_t>&)vreg_rs1,
+                   (RegTensor<int32_t>&)vreg_rs2);
         for (uint16_t i = 0; i < 1 - coreIndex; ++i) {
             StoreAlign(urs, vreg_rs1, preg_all16);
         }
@@ -76,9 +67,9 @@ __simd_vf__ inline void compute_only_pscale_vf(
 }
 
 template <bool clear_gmax, typename T, uint16_t QsBase = 128>
-__aicore__ inline void ComputeOnlyPscaleCallVF(
-    const LocalTensor<T>& umax1, const LocalTensor<T>& umax2, const LocalTensor<T>& ugmaxOld,
-    const LocalTensor<float>& urs, uint16_t coreIndex)
+__aicore__ inline void ComputeOnlyPscaleCallVF(const LocalTensor<T>& umax1, const LocalTensor<T>& umax2,
+                                               const LocalTensor<T>& ugmaxOld, const LocalTensor<float>& urs,
+                                               uint16_t coreIndex)
 {
     __ubuf__ T* umax1_buf = (__ubuf__ T*)umax1.GetPhyAddr();
     __ubuf__ T* umax2_buf = (__ubuf__ T*)umax2.GetPhyAddr();

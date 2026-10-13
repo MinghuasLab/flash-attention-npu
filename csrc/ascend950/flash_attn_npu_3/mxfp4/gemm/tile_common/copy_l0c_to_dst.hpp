@@ -16,23 +16,20 @@
 
 namespace Catlass::Gemm::Tile {
 
-enum class ScaleGranularity
-{
+enum class ScaleGranularity {
     NO_QUANT = 0,
     PER_TENSOR,
     PER_GROUP
 };
 
-enum class CopyL0CToUBMode
-{
+enum class CopyL0CToUBMode {
     NO_SPLIT = 0,
     SPLIT_M,
     SPLIT_N
 };
 
-template <
-    class ArchTag, class ElementSrc, class ElementDst,
-    ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT>
+template <class ArchTag, class ElementSrc, class ElementDst,
+          ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT>
 struct CopyL0CToDstQuantMode {
     static_assert(DEPENDENT_FALSE<ArchTag>, "Unsupported copy l0c to gm, can not find the specialization.");
 };
@@ -47,9 +44,9 @@ struct CopyL0CToDstQuantMode<ArchTag, float, half, ScaleGranularity::PER_TENSOR>
     static constexpr auto VALUE = QuantMode_t::QF322F16_PRE;
 };
 
-template <
-    class ArchTag, class TensorSrc, class TensorDst, CopyL0CToUBMode CopyMode = CopyL0CToUBMode::NO_SPLIT,
-    ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT, bool ReluEnable = false, class Enable = void>
+template <class ArchTag, class TensorSrc, class TensorDst, CopyL0CToUBMode CopyMode = CopyL0CToUBMode::NO_SPLIT,
+          ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT, bool ReluEnable = false,
+          class Enable = void>
 struct CopyL0CToUBTla {
     static_assert(DEPENDENT_FALSE<ArchTag>, "Unsupported copy l0c to ub, can not find the specialization.");
 };

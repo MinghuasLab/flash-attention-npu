@@ -29,4 +29,4 @@ class BlockEpilogue {
 #include "../../epilogue/block/block_epilogue_compute_pscale.hpp"
 #include "../../epilogue/block/block_epilogue_copy_global_max_ub_to_l1.hpp"
 #endif
-#endif // EPILOGUE_BLOCK_BLOCK_EPILOGUE_HPP
+#endif // MXFP4_BLOCK_EPILOGUE_HPP

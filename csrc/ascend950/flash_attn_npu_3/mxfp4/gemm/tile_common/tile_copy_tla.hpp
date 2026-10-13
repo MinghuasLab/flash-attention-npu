@@ -22,4 +22,4 @@ struct TileCopyTla {
 };
 } // namespace Catlass::Gemm::Tile
 
-#endif // GEMM_TILE_TILE_COPY_TLA_HPP
+#endif // MXFP4_TILE_COPY_TLA_HPP

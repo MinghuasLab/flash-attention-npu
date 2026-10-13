@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_rescale_o_dn.h
- * \brief
- */
-
 #ifndef VF_RESCALE_O_DN_H_
 #define VF_RESCALE_O_DN_H_
 #include "kernel_tensor.h"
@@ -26,13 +21,9 @@ using AscendC::LocalTensor;
 using namespace AscendC;
 using namespace Reg;
 
-#define VMULSCVT false
-#define DROPOUT false
-
 template <bool isUpdate, uint16_t KvsBase = 256>
-__simd_vf__ void process_update_o_vf(
-    __ubuf__ float* update_res_ub, __ubuf__ float* mm2_res_ub, __ubuf__ float* urs, __ubuf__ float* rsum,
-    __ubuf__ float* ursum)
+__simd_vf__ void process_update_o_vf(__ubuf__ float* update_res_ub, __ubuf__ float* mm2_res_ub, __ubuf__ float* urs,
+                                     __ubuf__ float* rsum, __ubuf__ float* ursum)
 {
     // 更新 mm2
     MaskReg preg_all32 = CreateMask<uint32_t, MaskPattern::ALL>();
@@ -94,9 +85,9 @@ __simd_vf__ void process_update_o_vf(
 }
 
 template <bool isUpdate, uint16_t KvsBase = 256>
-__aicore__ inline void ProcessUpdateOCallVF(
-    const LocalTensor<float>& updateResUb, const LocalTensor<float>& mm2ResUb, const LocalTensor<float>& urs,
-    const LocalTensor<float>& rsum, const LocalTensor<float>& ursum)
+__aicore__ inline void ProcessUpdateOCallVF(const LocalTensor<float>& updateResUb, const LocalTensor<float>& mm2ResUb,
+                                            const LocalTensor<float>& urs, const LocalTensor<float>& rsum,
+                                            const LocalTensor<float>& ursum)
 {
     __ubuf__ float* update_res_ub_buf = (__ubuf__ float*)updateResUb.GetPhyAddr();
     __ubuf__ float* mm2_res_ub_buf = (__ubuf__ float*)mm2ResUb.GetPhyAddr();

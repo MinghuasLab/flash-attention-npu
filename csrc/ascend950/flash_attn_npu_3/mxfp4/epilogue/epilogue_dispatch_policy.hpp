@@ -17,18 +17,15 @@
 
 namespace Catlass::Epilogue {
 
-enum class LseMode
-{
+enum class LseMode {
     NONE = 0
 };
-enum class LseFormat
-{
+enum class LseFormat {
     TN1 = 0,
     BNS1 = 1,
     BSN1 = 2
 };
-enum class MXQuantMode
-{
+enum class MXQuantMode {
     NONE = 0,
     OCP = 1,
     CX = 2
@@ -62,4 +59,4 @@ struct EpilogueAtlasA5RescaleOMx {
 
 } // namespace Catlass::Epilogue
 
-#endif // EPILOGUE_DISPATCH_POLICY_HPP
+#endif // MXFP4_EPILOGUE_DISPATCH_POLICY_HPP

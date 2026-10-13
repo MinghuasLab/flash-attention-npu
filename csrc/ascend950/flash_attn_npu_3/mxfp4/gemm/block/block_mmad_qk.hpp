@@ -25,13 +25,11 @@
 
 namespace Catlass::Gemm::Block {
 
-template <
-    class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_, class ElementC_, class ElementBias_,
-    class TileCopy_, class TileMmad_>
-struct BlockMmadTla<
-    MmadAtlasA5QkMx<true>, L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_,
-    TileMmad_> {
-public:
+template <class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_, class ElementC_, class ElementBias_,
+          class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAtlasA5QkMx<true>, L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_, ElementBias_,
+                    TileCopy_, TileMmad_> {
+  public:
     using DispatchPolicy = MmadAtlasA5QkMx<true>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
@@ -62,24 +60,24 @@ public:
                 resource.l1Buf.template GetBufferByByte<ElementA>(MXFP4::L1_Q_BUF_OFFSET + MXFP4::L1_Q_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L1_Q_BUF_CNT; i++) {
-            l1BScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(
-                MXFP4::L1_Q_DESCALE_BUF_OFFSET + MXFP4::L1_Q_DESCALE_BUF_SIZE * i);
+            l1BScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(MXFP4::L1_Q_DESCALE_BUF_OFFSET +
+                                                                                 MXFP4::L1_Q_DESCALE_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L1_KV_BUF_CNT; i++) {
             l1ATensor[i] =
                 resource.l1Buf.template GetBufferByByte<ElementB>(MXFP4::L1_KV_BUF_OFFSET + MXFP4::L1_KV_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L1_KV_DESCALE_BUF_CNT; i++) {
-            l1AScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(
-                MXFP4::L1_KV_DESCALE_BUF_OFFSET + MXFP4::L1_KV_DESCALE_BUF_SIZE * i);
+            l1AScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(MXFP4::L1_KV_DESCALE_BUF_OFFSET +
+                                                                                 MXFP4::L1_KV_DESCALE_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L0A_QK_BUF_CNT; i++) {
-            l0ATensor[i] = resource.l0ABuf.template GetBufferByByte<ElementB>(
-                MXFP4::L0A_QK_BUF_OFFSET + MXFP4::L0A_QK_BUF_SIZE * i);
+            l0ATensor[i] = resource.l0ABuf.template GetBufferByByte<ElementB>(MXFP4::L0A_QK_BUF_OFFSET +
+                                                                              MXFP4::L0A_QK_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L0B_QK_BUF_CNT; i++) {
-            l0BTensor[i] = resource.l0BBuf.template GetBufferByByte<ElementA>(
-                MXFP4::L0B_QK_BUF_OFFSET + MXFP4::L0B_QK_BUF_SIZE * i);
+            l0BTensor[i] = resource.l0BBuf.template GetBufferByByte<ElementA>(MXFP4::L0B_QK_BUF_OFFSET +
+                                                                              MXFP4::L0B_QK_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < MXFP4::L0C_QK_BUF_CNT; i++) {
             l0CTensor[i] =
@@ -117,8 +115,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(QK_L0C_EVENT1);
     }
 
-    __aicore__ inline ~BlockMmadTla()
-    {}
+    __aicore__ inline ~BlockMmadTla() {}
 
     __aicore__ inline uint32_t CeilDivision(uint32_t numerator, uint32_t denominator)
     {
@@ -132,8 +129,8 @@ public:
 
     // Q 稠密 GM → L1（RowMajor → zN）
     template <class TensorQ, class TensorL1Q>
-    __aicore__ inline void CopyQGmToL1(
-        uint32_t qsActBaseTile, uint32_t embed, TensorQ gQTensorTla, TensorL1Q l1QTensorTla)
+    __aicore__ inline void CopyQGmToL1(uint32_t qsActBaseTile, uint32_t embed, TensorQ gQTensorTla,
+                                       TensorL1Q l1QTensorTla)
     {
         auto l1QTileTla = GetTile(l1QTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qsActBaseTile, embed));
         // BSND: GetTile 确保 dValue = embed 而非 qHeadMul * embed
@@ -145,9 +142,9 @@ public:
     }
 
     // Q-scale 稠密 GM → L1（Host 沿 D Dn2Nz）
-    __aicore__ inline void CopyQScaleGmToL1(
-        uint32_t qsActBaseTile, uint32_t scaleK, AscendC::GlobalTensor<uint8_t>& gQDequantScale, uint32_t qBufId,
-        uint32_t qHeadMul)
+    __aicore__ inline void CopyQScaleGmToL1(uint32_t qsActBaseTile, uint32_t scaleK,
+                                            AscendC::GlobalTensor<uint8_t>& gQDequantScale, uint32_t qBufId,
+                                            uint32_t qHeadMul)
     {
         copyGmToL1MxScaleDn2Nz(l1BScaleTensor[qBufId], gQDequantScale, qsActBaseTile, scaleK, 0, 0, qHeadMul);
     }
@@ -158,12 +155,12 @@ public:
     // 段推进天然落在 y-block 边界上（仅首段 innerStart 可能非 0），故循环内无除法/取模。
     // firstYBlockIdx / firstOriYBlockIdx 由调用方提前预取，避免首个 index 的阻塞访存落在此处。
     template <class TensorK, class TensorL1K>
-    __aicore__ inline void SparseKFusedBaseTileL1FullLoad(
-        TensorK gKTensorTla, TensorL1K l1KTensorTla, AscendC::GlobalTensor<uint8_t> gKScale,
-        AscendC::GlobalTensor<int32_t> gSparseBlockIdx, uint32_t gatheredKvSTileIdx, int64_t kvSeqlen,
-        uint32_t kvSBaseTile, uint32_t blockShapeY, uint32_t yBlockNumAval, uint32_t yBlockNumRsvd,
-        uint32_t kvsActBaseTile, uint32_t embed, uint32_t kBufId, uint32_t kvHeadMul, uint32_t firstYBlockIdx,
-        uint32_t firstOriYBlockIdx)
+    __aicore__ inline void
+    SparseKFusedBaseTileL1FullLoad(TensorK gKTensorTla, TensorL1K l1KTensorTla, AscendC::GlobalTensor<uint8_t> gKScale,
+                                   AscendC::GlobalTensor<int32_t> gSparseBlockIdx, uint32_t gatheredKvSTileIdx,
+                                   int64_t kvSeqlen, uint32_t kvSBaseTile, uint32_t blockShapeY, uint32_t yBlockNumAval,
+                                   uint32_t yBlockNumRsvd, uint32_t kvsActBaseTile, uint32_t embed, uint32_t kBufId,
+                                   uint32_t kvHeadMul, uint32_t firstYBlockIdx, uint32_t firstOriYBlockIdx)
     {
         using CopyGmToL1K = Catlass::Gemm::Tile::TileCopyTla<ArchTag, decltype(gKTensorTla), decltype(l1KTensorTla)>;
         CopyGmToL1K copyGmToL1K;
@@ -173,7 +170,7 @@ public:
         // headMul * scaleRowHalf 在整段 gather 里不变，提到循环外，避免每段重算并重载 this。
         const uint32_t srcScaleStride = kvHeadMul * scaleRowHalf;
         AscendC::GlobalTensor<half> gKScaleB16;
-        gKScaleB16.SetGlobalBuffer((__gm__ half *)(gKScale.GetPhyAddr()), MXFP4::GM_MAX_BUFFER_LEN);
+        gKScaleB16.SetGlobalBuffer((__gm__ half*)(gKScale.GetPhyAddr()), MXFP4::GM_MAX_BUFFER_LEN);
         auto l1KScaleB16 = l1AScaleTensor[kBufId].template ReinterpretCast<half>();
         AscendC::Dn2NzParams scaleDn2Nz;
         scaleDn2Nz.dnNum = 1;
@@ -236,8 +233,8 @@ public:
             // 源地址仍是 oriStartOffset * kvHeadMul * scaleRowHalf，目的地址仍是
             // dealtLenAccum * scaleRowHalf。
             scaleDn2Nz.dValue = curDealtLen;
-            AscendC::DataCopy(
-                l1KScaleB16[dealtLenAccum * scaleRowHalf], gKScaleB16[oriStartOffset * srcScaleStride], scaleDn2Nz);
+            AscendC::DataCopy(l1KScaleB16[dealtLenAccum * scaleRowHalf], gKScaleB16[oriStartOffset * srcScaleStride],
+                              scaleDn2Nz);
 
             dealtLenAccum += curDealtLen;
             if (runEndsShort) {
@@ -253,32 +250,29 @@ public:
     }
 
     // Q → L0B（非转置，带 mx scale）
-    __aicore__ inline void LoadQToL0B(
-        uint32_t qsActBaseTileAlign16, uint32_t embed, uint32_t qsActBaseTileAlign16L0, uint32_t scaleMAlign16,
-        uint32_t scaleK, uint32_t qBufId, uint32_t qkL0abBufId)
+    __aicore__ inline void LoadQToL0B(uint32_t qsActBaseTileAlign16, uint32_t embed, uint32_t qsActBaseTileAlign16L0,
+                                      uint32_t scaleMAlign16, uint32_t scaleK, uint32_t qBufId, uint32_t qkL0abBufId)
     {
-        copyL1ToL0BMxQk(
-            l0BTensor[qkL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-            l1BTensor[qBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-            l1BScaleTensor[qBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), qsActBaseTileAlign16, embed,
-            qsActBaseTileAlign16L0, scaleMAlign16, scaleK);
+        copyL1ToL0BMxQk(l0BTensor[qkL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                        l1BTensor[qBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                        l1BScaleTensor[qBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), qsActBaseTileAlign16,
+                        embed, qsActBaseTileAlign16L0, scaleMAlign16, scaleK);
     }
 
     // K → L0A（非转置，带 mx scale，n 方向子切分）
-    __aicore__ inline void LoadKToL0A(
-        uint32_t nSubRowStart, uint32_t nCur, uint32_t embed, uint32_t kvsActBaseTileAlign16, uint32_t scaleK,
-        uint32_t kBufId, uint32_t qkL0abBufId)
+    __aicore__ inline void LoadKToL0A(uint32_t nSubRowStart, uint32_t nCur, uint32_t embed,
+                                      uint32_t kvsActBaseTileAlign16, uint32_t scaleK, uint32_t kBufId,
+                                      uint32_t qkL0abBufId)
     {
-        copyL1ToL0AMxQk(
-            l0ATensor[qkL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-            l1ATensor[kBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-            l1AScaleTensor[kBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), nSubRowStart, nCur, embed,
-            kvsActBaseTileAlign16, scaleK);
+        copyL1ToL0AMxQk(l0ATensor[qkL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                        l1ATensor[kBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                        l1AScaleTensor[kBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), nSubRowStart, nCur,
+                        embed, kvsActBaseTileAlign16, scaleK);
     }
 
     // C = K · Qᵀ，每 nSub 独立计算，initC 恒 true
-    __aicore__ inline void MatmulQK(
-        uint32_t n, uint32_t qsActBaseTileAlign16, uint32_t embed, uint32_t qkL0abBufId, uint32_t qkL0cBufId)
+    __aicore__ inline void MatmulQK(uint32_t n, uint32_t qsActBaseTileAlign16, uint32_t embed, uint32_t qkL0abBufId,
+                                    uint32_t qkL0cBufId)
     {
         auto l0ALayout = tla::MakeLayout<ElementB, LayoutTagL0A>(n, embed);
         auto l0ATensorTla = tla::MakeTensor(l0ATensor[qkL0abBufId], l0ALayout, Catlass::Arch::PositionL0A{});
@@ -291,15 +285,16 @@ public:
 
     // L0C → UB fixpipe（NO_SPLIT 模式，subBlockId 选目标 AIV）
     template <class TensorUB>
-    __aicore__ inline void FixpipeMm1(
-        uint32_t qsActBaseTileAlign16, uint32_t n, TensorUB& ubSTensorTla, bool subBlockId, uint32_t qkL0cBufId)
+    __aicore__ inline void FixpipeMm1(uint32_t qsActBaseTileAlign16, uint32_t n, TensorUB& ubSTensorTla,
+                                      bool subBlockId, uint32_t qkL0cBufId)
     {
-        auto l0CTensorTla = tla::MakeTensor(
-            l0CTensor[qkL0cBufId], tla::MakeLayoutL0C(n, qsActBaseTileAlign16), Catlass::Arch::PositionL0C{});
+        auto l0CTensorTla = tla::MakeTensor(l0CTensor[qkL0cBufId], tla::MakeLayoutL0C(n, qsActBaseTileAlign16),
+                                            Catlass::Arch::PositionL0C{});
 
-        using CopyL0CToUB = Catlass::Gemm::Tile::CopyL0CToUBTla<
-            ArchTag, decltype(l0CTensorTla), TensorUB, Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT,
-            Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR, false>;
+        using CopyL0CToUB =
+            Catlass::Gemm::Tile::CopyL0CToUBTla<ArchTag, decltype(l0CTensorTla), TensorUB,
+                                                Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT,
+                                                Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR, false>;
         CopyL0CToUB copyL0CToUB;
         copyL0CToUB(ubSTensorTla, l0CTensorTla, softmaxScale_, subBlockId);
     }
@@ -308,9 +303,8 @@ public:
     //   拆出来是为了能延后一拍发射：调用点把它插在 mmad 之后、下一轮的 WaitFlag<MTE1_M> 之前，
     //   用它的发射时间掩盖跨流水 flag 的往返延迟。
     template <class TensorUB>
-    __aicore__ inline void EmitFixpipeMm1(
-        uint32_t l0cBufId, uint32_t nSubRowStart, uint32_t nCur, uint32_t qsActBaseTileAlign16, TensorUB& ubSTensorTla,
-        uint32_t subBlockIdx)
+    __aicore__ inline void EmitFixpipeMm1(uint32_t l0cBufId, uint32_t nSubRowStart, uint32_t nCur,
+                                          uint32_t qsActBaseTileAlign16, TensorUB& ubSTensorTla, uint32_t subBlockIdx)
     {
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(QK_L0C_EVENT0 + l0cBufId);
         // nCur 偶数对齐用于 Fixpipe mSize
@@ -322,11 +316,12 @@ public:
     }
 
     template <class TensorQ, class TensorK, class TensorUB, class TaskInfoT, class TileInfoT, class SparsityPolicy>
-    __aicore__ inline void operator()(
-        TensorQ& gQTensorTla, TensorK& gKTensorTla, AscendC::GlobalTensor<uint8_t> gQDequantScale,
-        AscendC::GlobalTensor<uint8_t> gKDequantScale, AscendC::GlobalTensor<int32_t> gSparseBlockIdx,
-        TensorUB& ubSTensorTla, TaskInfoT& curTaskInfo, TileInfoT& curTileInfo, uint32_t embed, uint32_t kvSBaseTile,
-        uint32_t blockShapeY, uint32_t subBlockIdx, uint32_t kvHeadMul, uint32_t qHeadMul, SparsityPolicy)
+    __aicore__ inline void
+    operator()(TensorQ& gQTensorTla, TensorK& gKTensorTla, AscendC::GlobalTensor<uint8_t> gQDequantScale,
+               AscendC::GlobalTensor<uint8_t> gKDequantScale, AscendC::GlobalTensor<int32_t> gSparseBlockIdx,
+               TensorUB& ubSTensorTla, TaskInfoT& curTaskInfo, TileInfoT& curTileInfo, uint32_t embed,
+               uint32_t kvSBaseTile, uint32_t blockShapeY, uint32_t subBlockIdx, uint32_t kvHeadMul, uint32_t qHeadMul,
+               SparsityPolicy)
     {
         uint32_t qsActBaseTile = curTaskInfo.qsActBaseTile;
         int64_t kvSeqlen = curTaskInfo.kvSeqlen;
@@ -371,9 +366,8 @@ public:
             //   原实现每个 nSub 都重装同一份 Q，一个 task 的 518 次装载里 516 次是冗余。
             for (uint32_t i = 0; i < MXFP4::L0A_QK_BUF_CNT; ++i) {
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(QK_L0AB_EVENT0 + qkL0abBufId);
-                LoadQToL0B(
-                    qsActBaseTileAlign16, embed, qsActBaseTileAlign16, qsActBaseTileAlign16, scaleK, qBufId,
-                    qkL0abBufId);
+                LoadQToL0B(qsActBaseTileAlign16, embed, qsActBaseTileAlign16, qsActBaseTileAlign16, scaleK, qBufId,
+                           qkL0abBufId);
                 AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(QK_L0AB_EVENT0 + qkL0abBufId);
                 qkL0abBufId = (qkL0abBufId + 1) % MXFP4::L0A_QK_BUF_CNT;
             }
@@ -384,10 +378,10 @@ public:
         auto l1KLayout = tla::MakeLayout<ElementA, Catlass::layout::zN>(kvsActBaseTile, embed);
         auto l1KTensorTla = tla::MakeTensor(l1ATensor[kBufId], l1KLayout, Catlass::Arch::PositionL1{});
         if constexpr (SparsityPolicy::IS_SPARSE) {
-            SparseKFusedBaseTileL1FullLoad(
-                gKTensorTla, l1KTensorTla, gKDequantScale, gSparseBlockIdx, gatheredKvSTileIdx, kvSeqlen, kvSBaseTile,
-                blockShapeY, yBlockNumAval, yBlockNumRsvd, kvsActBaseTile, embed, kBufId, kvHeadMul, firstYBlockIdx,
-                firstOriYBlockIdx);
+            SparseKFusedBaseTileL1FullLoad(gKTensorTla, l1KTensorTla, gKDequantScale, gSparseBlockIdx,
+                                           gatheredKvSTileIdx, kvSeqlen, kvSBaseTile, blockShapeY, yBlockNumAval,
+                                           yBlockNumRsvd, kvsActBaseTile, embed, kBufId, kvHeadMul, firstYBlockIdx,
+                                           firstOriYBlockIdx);
         } else {
             // Dense policy: K and K-scale are contiguous in sequence order.
             // No sparse index tensor is read or materialized.
@@ -399,9 +393,8 @@ public:
             copyGmToL1K(l1KTile, gKTile);
             const uint32_t scaleK = CeilDivision(embed, MXFP4::FP4_C0_ELEMS) * 2;
             const uint32_t scaleRowHalf = scaleK / 2;
-            copyGmToL1MxScaleDn2Nz(
-                l1AScaleTensor[kBufId], gKDequantScale, kvsActBaseTile, scaleK, denseStart * kvHeadMul * scaleRowHalf,
-                0, kvHeadMul);
+            copyGmToL1MxScaleDn2Nz(l1AScaleTensor[kBufId], gKDequantScale, kvsActBaseTile, scaleK,
+                                   denseStart * kvHeadMul * scaleRowHalf, 0, kvHeadMul);
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KEventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1KEventId);
@@ -487,8 +480,8 @@ public:
 
             // 上一轮的 fixpipe 插在这里，掩盖刚发出的 MTE1_M 往返
             if (fixPending) {
-                EmitFixpipeMm1(
-                    pendL0cBufId, pendNSubRowStart, pendNCur, qsActBaseTileAlign16, ubSTensorTla, subBlockIdx);
+                EmitFixpipeMm1(pendL0cBufId, pendNSubRowStart, pendNCur, qsActBaseTileAlign16, ubSTensorTla,
+                               subBlockIdx);
                 fixPending = false;
             }
 
@@ -531,7 +524,7 @@ public:
         }
     }
 
-protected:
+  protected:
     AscendC::LocalTensor<ElementB> l1ATensor[MXFP4::L1_KV_BUF_CNT];
     AscendC::LocalTensor<ElementA> l1BTensor[MXFP4::L1_Q_BUF_CNT];
     AscendC::LocalTensor<ElementB> l0ATensor[MXFP4::L0A_QK_BUF_CNT];

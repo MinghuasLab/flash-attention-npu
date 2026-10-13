@@ -104,9 +104,10 @@ if __name__ == "__main__":
         "(per sparsity x layout x quant mode x output dtype).",
     )
     parser.add_argument(
-        "-o", "--output_dir", required=False,
-        help="Where to generate the dispatch .cpp stubs; "
-             "defaults to this script's directory.",
+        "-o",
+        "--output_dir",
+        required=False,
+        help="Where to generate the dispatch .cpp stubs; defaults to this script's directory.",
     )
     args = parser.parse_args()
     main(args.output_dir)

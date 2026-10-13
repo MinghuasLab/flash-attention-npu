@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_softmax_dn_cast_nz.h
- * \brief
- */
-
 #ifndef VF_SOFTMAX_DN_CAST_NZ_ALIGN_QS128_KVS32_H_
 #define VF_SOFTMAX_DN_CAST_NZ_ALIGN_QS128_KVS32_H_
 #include "vf_common_def.h"
@@ -27,12 +22,11 @@ using AscendC::LocalTensor;
 using namespace AscendC;
 using namespace Reg;
 
-template <
-    MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2, uint16_t KvsBaseAlign = 32,
-    uint16_t QsBase = 128>
-__simd_vf__ inline void softmax_with_group_max_align_qs128_kvs32_vf(
-    __ubuf__ T2* p_dest, __ubuf__ T* s, __ubuf__ T* local_group_max, __ubuf__ T* global_max,
-    __ubuf__ uint8_t* indexes_ub, const T NEG_LOG2_CX)
+template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2,
+          uint16_t KvsBaseAlign = 32, uint16_t QsBase = 128>
+__simd_vf__ inline void softmax_with_group_max_align_qs128_kvs32_vf(__ubuf__ T2* p_dest, __ubuf__ T* s,
+                                                                    __ubuf__ T* local_group_max, __ubuf__ T* global_max,
+                                                                    __ubuf__ uint8_t* indexes_ub, const T NEG_LOG2_CX)
 {
     // ====================== 寄存器定义 ======================
     RegTensor<half> src_c0, src_c1, src_c2, src_c3;
@@ -134,14 +128,12 @@ __simd_vf__ inline void softmax_with_group_max_align_qs128_kvs32_vf(
             Gather((RegTensor<uint8_t>&)quant_0, (RegTensor<uint8_t>&)quant_0, idx_nd2nz);
 
             // 写入内存（偶数块：无+128偏移）
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256, (RegTensor<uint8_t>&)quant_0,
-                preg_vl128 // 低128字节掩码
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128 // 低128字节掩码
             );
 
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 16256, (RegTensor<uint8_t>&)quant_0,
-                preg_vl128_not // 高128字节掩码
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 16256, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128_not // 高128字节掩码
             );
         }
 
@@ -182,13 +174,12 @@ __simd_vf__ inline void softmax_with_group_max_align_qs128_kvs32_vf(
             Gather((RegTensor<uint8_t>&)quant_0, (RegTensor<uint8_t>&)quant_0, idx_nd2nz);
 
             // 奇数块：低128字节写入（基础地址 +128 偏移）
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 128, (RegTensor<uint8_t>&)quant_0, preg_vl128);
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 128, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128);
 
             // 奇数块：高128字节写入（远端地址）
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 16384, (RegTensor<uint8_t>&)quant_0,
-                preg_vl128_not);
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 16384, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128_not);
         }
 
         // ====================== 全局/局部最大值更新 ======================
@@ -200,12 +191,12 @@ __simd_vf__ inline void softmax_with_group_max_align_qs128_kvs32_vf(
     StoreAlign<T, Reg::StoreDist::DIST_NORM_B16>(local_group_max + GROUP_COUNT * QsBase, min_val_reg, preg_all_16bit);
 }
 
-template <
-    MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2, uint16_t KvsBaseAlign = 32,
-    uint16_t QsBase = 128>
-__aicore__ inline void SoftmaxWithGroupMaxAlignQs128Kvs32CallVF(
-    const LocalTensor<T2>& dstTensor, const LocalTensor<T>& srcTensor, const LocalTensor<T>& localGroupMax,
-    const LocalTensor<T>& globalMax, const LocalTensor<uint8_t>& indexesBuf, const T NEG_LOG2_CX)
+template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2,
+          uint16_t KvsBaseAlign = 32, uint16_t QsBase = 128>
+__aicore__ inline void
+SoftmaxWithGroupMaxAlignQs128Kvs32CallVF(const LocalTensor<T2>& dstTensor, const LocalTensor<T>& srcTensor,
+                                         const LocalTensor<T>& localGroupMax, const LocalTensor<T>& globalMax,
+                                         const LocalTensor<uint8_t>& indexesBuf, const T NEG_LOG2_CX)
 {
     __ubuf__ T2* p_dest = (__ubuf__ T2*)dstTensor.GetPhyAddr();
     __ubuf__ T* s_ub = (__ubuf__ T*)srcTensor.GetPhyAddr();

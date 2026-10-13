@@ -23,10 +23,9 @@
 namespace Catlass::Gemm::Tile {
 
 // Extra template parameters are kept so kernel_interface instantiations stay stable.
-template <
-    class ArchTag, class ElementA_, class LayoutTagA_, class ElementB_, class LayoutTagB_, class ElementC_,
-    class LayoutTagC_, class ElementBias = void, bool ReluEnable_ = false,
-    ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT, class L0CCopyMode = void>
+template <class ArchTag, class ElementA_, class LayoutTagA_, class ElementB_, class LayoutTagB_, class ElementC_,
+          class LayoutTagC_, class ElementBias = void, bool ReluEnable_ = false,
+          ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT, class L0CCopyMode = void>
 struct PackedTileCopyTla {
     using LayoutTagL1A = typename Catlass::Gemm::helper::L1ATypeSelector<
         Catlass::Gemm::GemmType<ElementA_, LayoutTagA_>>::L1AType::Layout;
@@ -37,15 +36,13 @@ struct PackedTileCopyTla {
 };
 
 #if (__CCE_AICORE__ == 310)
-template <
-    class ArchTag, class ElementA_, class LayoutTagA, class ElementB_, class LayoutTagB, class ElementC_,
-    class LayoutTagC, class ElementBias = void, CopyL0CToUBMode CopyMode_ = CopyL0CToUBMode::NO_SPLIT,
-    bool ReluEnable = false, ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT>
-struct PackedTileCopyTlaToUB
-    : public PackedTileCopyTla<
-          ArchTag, ElementA_, LayoutTagA, ElementB_, LayoutTagB, ElementC_, LayoutTagC, ElementBias> {};
+template <class ArchTag, class ElementA_, class LayoutTagA, class ElementB_, class LayoutTagB, class ElementC_,
+          class LayoutTagC, class ElementBias = void, CopyL0CToUBMode CopyMode_ = CopyL0CToUBMode::NO_SPLIT,
+          bool ReluEnable = false, ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT>
+struct PackedTileCopyTlaToUB : public PackedTileCopyTla<ArchTag, ElementA_, LayoutTagA, ElementB_, LayoutTagB,
+                                                        ElementC_, LayoutTagC, ElementBias> {};
 #endif
 
 } // namespace Catlass::Gemm::Tile
 
-#endif // GEMM_TILE_TILE_COPY_HPP
+#endif // MXFP4_TILE_COPY_HPP

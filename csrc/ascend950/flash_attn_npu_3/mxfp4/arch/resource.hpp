@@ -22,7 +22,7 @@ struct Resource {};
 
 template <>
 struct Resource<Catlass::Arch::Ascend950> {
-public:
+  public:
     LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::A1> l1Buf;
     LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::A2> l0ABuf;
     LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::B2> l0BBuf;
@@ -42,4 +42,4 @@ public:
 
 } // namespace Catlass::Arch
 
-#endif // INCLUDE_ARCH_RESOURCE_HPP
+#endif // MXFP4_RESOURCE_HPP

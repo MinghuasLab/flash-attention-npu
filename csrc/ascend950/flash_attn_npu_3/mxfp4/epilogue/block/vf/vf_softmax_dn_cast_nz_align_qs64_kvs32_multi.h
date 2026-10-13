@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_softmax_dn_cast_nz_align_qs64_kvs32_multi.h
- * \brief softmax + mxfp4 quant for qs=64, kvs padding 32 multi (kvsActBaseTileAlign32 >= 64, runtime variable)
- */
-
 #ifndef VF_SOFTMAX_DN_CAST_NZ_ALIGN_QS64_KVS32_MULTI_H_
 #define VF_SOFTMAX_DN_CAST_NZ_ALIGN_QS64_KVS32_MULTI_H_
 #include "vf_common_def.h"
@@ -28,9 +23,10 @@ using namespace AscendC;
 using namespace Reg;
 
 template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2, uint16_t QsBase = 128>
-__simd_vf__ inline void softmax_with_group_max_align_qs64_kvs32_multi_vf(
-    __ubuf__ T2* p_dest, __ubuf__ T* s, __ubuf__ T* local_group_max, __ubuf__ T* global_max,
-    __ubuf__ uint8_t* indexes_ub, const T NEG_LOG2_CX, uint16_t KvsBaseAlign32, uint16_t KvsBaseAlign64)
+__simd_vf__ inline void
+softmax_with_group_max_align_qs64_kvs32_multi_vf(__ubuf__ T2* p_dest, __ubuf__ T* s, __ubuf__ T* local_group_max,
+                                                 __ubuf__ T* global_max, __ubuf__ uint8_t* indexes_ub,
+                                                 const T NEG_LOG2_CX, uint16_t KvsBaseAlign32, uint16_t KvsBaseAlign64)
 {
     // ====================== 寄存器定义 ======================
     RegTensor<half> src_c0, src_c1, src_c2, src_c3;
@@ -152,9 +148,8 @@ __simd_vf__ inline void softmax_with_group_max_align_qs64_kvs32_multi_vf(
             Gather((RegTensor<uint8_t>&)quant_0, (RegTensor<uint8_t>&)quant_0, idx_nd2nz);
 
             // 写入内存（偶数块：无+128偏移）
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256, (RegTensor<uint8_t>&)quant_0,
-                preg_vl128 // 低128字节掩码
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128 // 低128字节掩码
             );
         }
 
@@ -207,8 +202,8 @@ __simd_vf__ inline void softmax_with_group_max_align_qs64_kvs32_multi_vf(
             Gather((RegTensor<uint8_t>&)quant_0, (RegTensor<uint8_t>&)quant_0, idx_nd2nz);
 
             // 奇数块：低128字节写入（基础地址 +128 偏移）
-            StoreAlign(
-                ((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 128, (RegTensor<uint8_t>&)quant_0, preg_vl128);
+            StoreAlign(((__ubuf__ uint8_t*&)p_dest) + i * 2048 + j * 256 + 128, (RegTensor<uint8_t>&)quant_0,
+                       preg_vl128);
         }
 
         // ====================== 全局/局部最大值更新 ======================
@@ -226,8 +221,8 @@ __simd_vf__ inline void softmax_with_group_max_align_qs64_kvs32_multi_vf(
         Max(group_gmax, group_gmax, next_group_max, preg_valid_max);
 
         // 存储下一块最大值到 ulmax (i+1)*128 偏移
-        StoreAlign<T, Reg::StoreDist::DIST_NORM_B16>(
-            local_group_max + ((i + 1) * QsBase), next_group_max, preg_valid_max);
+        StoreAlign<T, Reg::StoreDist::DIST_NORM_B16>(local_group_max + ((i + 1) * QsBase), next_group_max,
+                                                     preg_valid_max);
 
         // 更新当前块最大值，用于下一次循环
         if constexpr (MX_QUANT_MODE == MXQuantMode::OCP) {
@@ -244,10 +239,11 @@ __simd_vf__ inline void softmax_with_group_max_align_qs64_kvs32_multi_vf(
 }
 
 template <MXQuantMode MX_QUANT_MODE = MXQuantMode::OCP, bool clear_gmax, typename T, typename T2, uint16_t QsBase = 128>
-__aicore__ inline void SoftmaxWithGroupMaxAlignQs64Kvs32MultiCallVF(
-    const LocalTensor<T2>& dstTensor, const LocalTensor<T>& srcTensor, const LocalTensor<T>& localGroupMax,
-    const LocalTensor<T>& globalMax, const LocalTensor<uint8_t>& indexesBuf, const T NEG_LOG2_CX,
-    uint16_t KvsBaseAlign32, uint16_t KvsBaseAlign64)
+__aicore__ inline void
+SoftmaxWithGroupMaxAlignQs64Kvs32MultiCallVF(const LocalTensor<T2>& dstTensor, const LocalTensor<T>& srcTensor,
+                                             const LocalTensor<T>& localGroupMax, const LocalTensor<T>& globalMax,
+                                             const LocalTensor<uint8_t>& indexesBuf, const T NEG_LOG2_CX,
+                                             uint16_t KvsBaseAlign32, uint16_t KvsBaseAlign64)
 {
     __ubuf__ T2* p_dest = (__ubuf__ T2*)dstTensor.GetPhyAddr();
     __ubuf__ T* s_ub = (__ubuf__ T*)srcTensor.GetPhyAddr();

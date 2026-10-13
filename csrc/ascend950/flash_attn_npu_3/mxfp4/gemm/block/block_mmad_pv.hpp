@@ -23,13 +23,11 @@
 #include "block_mmad_utils.hpp"
 
 namespace Catlass::Gemm::Block {
-template <
-    bool transposedMm1_, class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_, class ElementC_,
-    class ElementBias_, class TileCopy_, class TileMmad_>
-struct BlockMmadTla<
-    MmadAtlasA5PvMx<transposedMm1_>, L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_, ElementBias_,
-    TileCopy_, TileMmad_> {
-public:
+template <bool transposedMm1_, class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_,
+          class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAtlasA5PvMx<transposedMm1_>, L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_,
+                    ElementBias_, TileCopy_, TileMmad_> {
+  public:
     using DispatchPolicy = MmadAtlasA5PvMx<transposedMm1_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
@@ -63,8 +61,8 @@ public:
         }
 
         for (uint32_t i = 0; i < MXFP4::L1_P_SCALE_BUF_CNT; i++) {
-            l1BScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(
-                MXFP4::L1_P_SCALE_BUF_OFFSET + MXFP4::L1_P_SCALE_BUF_SIZE * i);
+            l1BScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(MXFP4::L1_P_SCALE_BUF_OFFSET +
+                                                                                 MXFP4::L1_P_SCALE_BUF_SIZE * i);
         }
 
         for (uint32_t i = 0; i < MXFP4::L1_KV_BUF_CNT; i++) {
@@ -73,18 +71,18 @@ public:
         }
 
         for (uint32_t i = 0; i < MXFP4::L1_KV_DESCALE_BUF_CNT; i++) {
-            l1AScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(
-                MXFP4::L1_KV_DESCALE_BUF_OFFSET + MXFP4::L1_KV_DESCALE_BUF_SIZE * i);
+            l1AScaleTensor[i] = resource.l1Buf.template GetBufferByByte<uint8_t>(MXFP4::L1_KV_DESCALE_BUF_OFFSET +
+                                                                                 MXFP4::L1_KV_DESCALE_BUF_SIZE * i);
         }
 
         for (uint32_t i = 0; i < MXFP4::L0A_PV_BUF_CNT; i++) {
-            l0ATensor[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(
-                MXFP4::L0A_PV_BUF_OFFSET + MXFP4::L0A_PV_BUF_SIZE * i);
+            l0ATensor[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(MXFP4::L0A_PV_BUF_OFFSET +
+                                                                              MXFP4::L0A_PV_BUF_SIZE * i);
         }
 
         for (uint32_t i = 0; i < MXFP4::L0B_PV_BUF_CNT; i++) {
-            l0BTensor[i] = resource.l0BBuf.template GetBufferByByte<ElementB>(
-                MXFP4::L0B_PV_BUF_OFFSET + MXFP4::L0B_PV_BUF_SIZE * i);
+            l0BTensor[i] = resource.l0BBuf.template GetBufferByByte<ElementB>(MXFP4::L0B_PV_BUF_OFFSET +
+                                                                              MXFP4::L0B_PV_BUF_SIZE * i);
         }
 
         l0CTensor[0] = resource.l0CBuf.template GetBufferByByte<float>(MXFP4::L0C_PV_BUF_OFFSET);
@@ -92,8 +90,7 @@ public:
         AllocEventID();
         InitL0BufferForReduceSum();
     }
-    __aicore__ inline ~BlockMmadTla()
-    {}
+    __aicore__ inline ~BlockMmadTla() {}
 
     __aicore__ inline void AllocEventID()
     {
@@ -112,26 +109,24 @@ public:
     // V: nZ L1 + V-scale → zN L0A（转置）
     __aicore__ inline void LoadVToL0(uint32_t l1ABufId, uint32_t l0ABufId, uint32_t embedReal, uint32_t s2Align64)
     {
-        copyL1ToL0AMx(
-            l0ATensor[l0ABufId], l1ATensor[l1ABufId],
-            l1AScaleTensor[l1ABufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), embedReal, s2Align64);
+        copyL1ToL0AMx(l0ATensor[l0ABufId], l1ATensor[l1ABufId],
+                      l1AScaleTensor[l1ABufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), embedReal, s2Align64);
     }
 
     // P: zN L1 + P-scale → nZ L0B（转置）
-    __aicore__ inline void LoadPToL0(
-        uint32_t l1BBufId, uint32_t l0BBufId, uint32_t s2Align64, uint32_t embedReal, uint32_t s1Align64)
+    __aicore__ inline void LoadPToL0(uint32_t l1BBufId, uint32_t l0BBufId, uint32_t s2Align64, uint32_t embedReal,
+                                     uint32_t s1Align64)
     {
         constexpr uint32_t s2Base = MXFP4::S2_BASE_TILE_SIZE;
         constexpr uint32_t scaleSrcStride = s2Base / MXFP4::FP4_C0_ELEMS + 1;
-        copyL1ToL0BMx(
-            l0BTensor[l0BBufId], l1BTensor[l1BBufId],
-            l1BScaleTensor[l1BBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), s2Align64, embedReal, s2Base,
-            scaleSrcStride, s1Align64);
+        copyL1ToL0BMx(l0BTensor[l0BBufId], l1BTensor[l1BBufId],
+                      l1BScaleTensor[l1BBufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), s2Align64, embedReal,
+                      s2Base, scaleSrcStride, s1Align64);
     }
 
     // C = Vᵀ @ P = Oᵀ，initC 由 isTileGroupFirstTile 控制
-    __aicore__ inline void MatmulPV(
-        uint32_t l0ABufId, uint32_t l0BBufId, uint32_t m, uint32_t n, uint32_t k, bool initC)
+    __aicore__ inline void MatmulPV(uint32_t l0ABufId, uint32_t l0BBufId, uint32_t m, uint32_t n, uint32_t k,
+                                    bool initC)
     {
         auto l0ALayout = tla::MakeLayout<ElementA, LayoutTagL0A>(m, k);
         auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayout, Catlass::Arch::PositionL0A{});
@@ -207,12 +202,11 @@ public:
                 GetTile(l1ATensorTla, tla::MakeCoord(0, dealtLenAccum), tla::MakeShape(embed, curDealtLen));
             copyGmToL1A(l1ATensorTile, gVTensorTile);
 
-            auto gVScaleTile = GetTile(
-                gVScaleTensor, tla::MakeCoord(0, oriStartOffset / Catlass::MX_SCALE_GROUP_NUM),
-                tla::MakeShape(embed, curScaleLen));
-            auto l1AScaleTile = GetTile(
-                l1AScaleTensorTla, tla::MakeCoord(0, dealtLenAccum / Catlass::MX_SCALE_GROUP_NUM),
-                tla::MakeShape(embed, curScaleLen));
+            auto gVScaleTile = GetTile(gVScaleTensor, tla::MakeCoord(0, oriStartOffset / Catlass::MX_SCALE_GROUP_NUM),
+                                       tla::MakeShape(embed, curScaleLen));
+            auto l1AScaleTile =
+                GetTile(l1AScaleTensorTla, tla::MakeCoord(0, dealtLenAccum / Catlass::MX_SCALE_GROUP_NUM),
+                        tla::MakeShape(embed, curScaleLen));
             copyGmToL1AScale(l1AScaleTile, gVScaleTile);
 
             dealtLenAccum += curDealtLen;
@@ -232,11 +226,12 @@ public:
     template <class TensorUB>
     __aicore__ inline void FixpipeMm2(uint32_t s1Align64, TensorUB& ubOTmpTensor)
     {
-        auto l0CTensorTla = tla::MakeTensor(
-            l0CTensor[0], tla::MakeLayoutL0C(MXFP4::PV_MMAD_M_DIM, s1Align64), Catlass::Arch::PositionL0C{});
-        using CopyL0CToDst = Catlass::Gemm::Tile::CopyL0CToUBTla<
-            ArchTag, decltype(l0CTensorTla), TensorUB, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N, Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT,
-            false>;
+        auto l0CTensorTla = tla::MakeTensor(l0CTensor[0], tla::MakeLayoutL0C(MXFP4::PV_MMAD_M_DIM, s1Align64),
+                                            Catlass::Arch::PositionL0C{});
+        using CopyL0CToDst =
+            Catlass::Gemm::Tile::CopyL0CToUBTla<ArchTag, decltype(l0CTensorTla), TensorUB,
+                                                Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N,
+                                                Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
         CopyL0CToDst copyL0CToDst;
         copyL0CToDst(ubOTmpTensor, l0CTensorTla);
     }
@@ -245,11 +240,12 @@ public:
     template <class TensorUB>
     __aicore__ inline void FixpipeMm2SingleVect(uint32_t s1Align64, TensorUB& ubOTmpTensor)
     {
-        auto l0CTensorTla = tla::MakeTensor(
-            l0CTensor[0], tla::MakeLayoutL0C(MXFP4::PV_MMAD_M_DIM, s1Align64), Catlass::Arch::PositionL0C{});
-        using CopyL0CToDst = Catlass::Gemm::Tile::CopyL0CToUBTla<
-            ArchTag, decltype(l0CTensorTla), TensorUB, Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT,
-            Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
+        auto l0CTensorTla = tla::MakeTensor(l0CTensor[0], tla::MakeLayoutL0C(MXFP4::PV_MMAD_M_DIM, s1Align64),
+                                            Catlass::Arch::PositionL0C{});
+        using CopyL0CToDst =
+            Catlass::Gemm::Tile::CopyL0CToUBTla<ArchTag, decltype(l0CTensorTla), TensorUB,
+                                                Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT,
+                                                Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
         CopyL0CToDst copyL0CToDst;
         copyL0CToDst(ubOTmpTensor, l0CTensorTla);
     }
@@ -295,11 +291,10 @@ public:
 
         for (uint32_t i = 0; i < MXFP4::L0A_PV_BUF_CNT; i++) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(PV_L0AB_EVENT0 + pvL0abBufId);
-            LoadData(
-                l0ATensor[pvL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-                l1ATensor[l1ABufId].template ReinterpretCast<fp4x2_e2m1_t>(),
-                l1AScaleTensor[l1ABufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), loadData2DParamsA,
-                loadData2DMXParamsA);
+            LoadData(l0ATensor[pvL0abBufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                     l1ATensor[l1ABufId].template ReinterpretCast<fp4x2_e2m1_t>(),
+                     l1AScaleTensor[l1ABufId].template ReinterpretCast<AscendC::fp8_e8m0_t>(), loadData2DParamsA,
+                     loadData2DMXParamsA);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(PV_L0AB_EVENT0 + pvL0abBufId);
             pvL0abBufId = (pvL0abBufId + 1) % MXFP4::L0A_PV_BUF_CNT;
         }
@@ -310,8 +305,8 @@ public:
 
     __aicore__ inline void PadPS2NotAlign64(uint32_t s2Align64, uint32_t s2Align32, uint32_t embedReal, uint32_t pSlot)
     {
-        AscendC::InitConstValueParams<uint16_t> PL1InitParams(
-            1, static_cast<uint16_t>(s2Align64 - s2Align32), 0, MXFP4::ZERO_FILL_PATTERN);
+        AscendC::InitConstValueParams<uint16_t> PL1InitParams(1, static_cast<uint16_t>(s2Align64 - s2Align32), 0,
+                                                              MXFP4::ZERO_FILL_PATTERN);
         uint32_t planeOffset = s2Align32 * MXFP4::FP4_C0_ELEMS;
         AscendC::Fill(l1BTensor[pSlot][planeOffset].template ReinterpretCast<uint16_t>(), PL1InitParams);
         uint32_t plane2Offset = 2 * planeOffset + (s2Align64 - s2Align32) * MXFP4::FP4_C0_ELEMS;
@@ -320,22 +315,22 @@ public:
 
     __aicore__ inline void PadVS2NotAlign64(uint32_t s2Align64, uint32_t curBaseTileSize, uint32_t embedReal)
     {
-        AscendC::InitConstValueParams<uint16_t> kvL1InitParams(
-            1, static_cast<uint16_t>(s2Align64 - curBaseTileSize), 0, MXFP4::ZERO_FILL_PATTERN);
+        AscendC::InitConstValueParams<uint16_t> kvL1InitParams(1, static_cast<uint16_t>(s2Align64 - curBaseTileSize), 0,
+                                                               MXFP4::ZERO_FILL_PATTERN);
         uint32_t halfEmbed = MXFP4::ROW_SUM_NUM / 2;
-        AscendC::Fill(
-            l1ATensor[l1ABufId][halfEmbed * curBaseTileSize].template ReinterpretCast<uint16_t>(), kvL1InitParams);
-        AscendC::Fill(
-            l1ATensor[l1ABufId][halfEmbed * curBaseTileSize * 2 + (s2Align64 - curBaseTileSize) * halfEmbed]
-                .template ReinterpretCast<uint16_t>(),
-            kvL1InitParams);
+        AscendC::Fill(l1ATensor[l1ABufId][halfEmbed * curBaseTileSize].template ReinterpretCast<uint16_t>(),
+                      kvL1InitParams);
+        AscendC::Fill(l1ATensor[l1ABufId][halfEmbed * curBaseTileSize * 2 + (s2Align64 - curBaseTileSize) * halfEmbed]
+                          .template ReinterpretCast<uint16_t>(),
+                      kvL1InitParams);
     }
 
     template <class TensorV, class TensorC, class TaskInfoT, class TileInfoT, class SparsityPolicy>
-    __aicore__ inline void operator()(
-        TensorV& gV, AscendC::GlobalTensor<uint8_t> gVDequantScale, AscendC::GlobalTensor<int32_t> gSparseIdx,
-        TensorC& ubOTmpTensor, Catlass::GemmCoord actualBlockShapePV, TileInfoT& delay20TileInfo,
-        TaskInfoT& delay20TaskInfo, uint32_t kvSBaseTile, uint32_t blockShapeY, uint32_t kvHeadMul, SparsityPolicy)
+    __aicore__ inline void operator()(TensorV& gV, AscendC::GlobalTensor<uint8_t> gVDequantScale,
+                                      AscendC::GlobalTensor<int32_t> gSparseIdx, TensorC& ubOTmpTensor,
+                                      Catlass::GemmCoord actualBlockShapePV, TileInfoT& delay20TileInfo,
+                                      TaskInfoT& delay20TaskInfo, uint32_t kvSBaseTile, uint32_t blockShapeY,
+                                      uint32_t kvHeadMul, SparsityPolicy)
     {
         uint32_t rowNum = actualBlockShapePV[0];
         uint32_t embed = actualBlockShapePV[1];
@@ -366,8 +361,8 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(KV_EVENT0 + l1ABufId);
 
         if (delay20TileInfo.kvsActBaseTileAlign32 != delay20TileInfo.kvsActBaseTileAlign64) {
-            PadPS2NotAlign64(
-                delay20TileInfo.kvsActBaseTileAlign64, delay20TileInfo.kvsActBaseTileAlign32, embedReal, pSlot);
+            PadPS2NotAlign64(delay20TileInfo.kvsActBaseTileAlign64, delay20TileInfo.kvsActBaseTileAlign32, embedReal,
+                             pSlot);
         }
 
         if (curBaseTileSize != delay20TileInfo.kvsActBaseTileAlign64) {
@@ -379,23 +374,23 @@ public:
             tla::MakeLayout<ElementA, Catlass::layout::nZ>(embedReal, delay20TileInfo.kvsActBaseTileAlign64),
             Catlass::Arch::PositionL1{});
 
-        auto gVScaleTensorTla = tla::MakeTensor(
-            gVScale.ReinterpretCast<AscendC::fp8_e8m0_t>(),
-            tla::MakeMxScaleLayout<AscendC::fp8_e8m0_t, Catlass::layout::ColumnMajor, false>(
-                kvHeadMul * embedReal,
-                CeilDiv(delay20TaskInfo.kvSeqlen, static_cast<int64_t>(Catlass::MX_SCALE_GROUP_NUM))),
-            Catlass::Arch::PositionGM{});
-        auto l1AScaleTensorTla = tla::MakeTensor(
-            l1AScaleTensor[l1ABufId].ReinterpretCast<AscendC::fp8_e8m0_t>(),
-            tla::MakeMxScaleLayout<AscendC::fp8_e8m0_t, Catlass::layout::zZ, false>(
-                embedReal, delay20TileInfo.kvsActBaseTileAlign64 / Catlass::MX_SCALE_GROUP_NUM),
-            Catlass::Arch::PositionL1{});
+        auto gVScaleTensorTla =
+            tla::MakeTensor(gVScale.ReinterpretCast<AscendC::fp8_e8m0_t>(),
+                            tla::MakeMxScaleLayout<AscendC::fp8_e8m0_t, Catlass::layout::ColumnMajor, false>(
+                                kvHeadMul * embedReal,
+                                CeilDiv(delay20TaskInfo.kvSeqlen, static_cast<int64_t>(Catlass::MX_SCALE_GROUP_NUM))),
+                            Catlass::Arch::PositionGM{});
+        auto l1AScaleTensorTla =
+            tla::MakeTensor(l1AScaleTensor[l1ABufId].ReinterpretCast<AscendC::fp8_e8m0_t>(),
+                            tla::MakeMxScaleLayout<AscendC::fp8_e8m0_t, Catlass::layout::zZ, false>(
+                                embedReal, delay20TileInfo.kvsActBaseTileAlign64 / Catlass::MX_SCALE_GROUP_NUM),
+                            Catlass::Arch::PositionL1{});
 
         if constexpr (SparsityPolicy::IS_SPARSE) {
-            SparseVFusedBaseTileL1FullLoad(
-                gV, l1ATensorTla, gVScaleTensorTla, l1AScaleTensorTla, gSparseBlockIdx, gatheredKvSTileIdx, kvSeqlen,
-                kvSBaseTile, blockShapeY, yBlockNumAval, yBlockNumRsvd, curBaseTileSize, embedReal, firstYBlockIdx,
-                firstOriYBlockIdx);
+            SparseVFusedBaseTileL1FullLoad(gV, l1ATensorTla, gVScaleTensorTla, l1AScaleTensorTla, gSparseBlockIdx,
+                                           gatheredKvSTileIdx, kvSeqlen, kvSBaseTile, blockShapeY, yBlockNumAval,
+                                           yBlockNumRsvd, curBaseTileSize, embedReal, firstYBlockIdx,
+                                           firstOriYBlockIdx);
         } else {
             // Dense policy: load one contiguous V tile and its matching
             // sequence-group scale tile. No selectIdx/gather path is compiled.
@@ -431,15 +426,14 @@ public:
 
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABEventId);
 
-        LoadPToL0(
-            pSlot, l0BBufId, delay20TileInfo.kvsActBaseTileAlign64, embedReal, delay20TaskInfo.qsActBaseTileAlign64);
+        LoadPToL0(pSlot, l0BBufId, delay20TileInfo.kvsActBaseTileAlign64, embedReal,
+                  delay20TaskInfo.qsActBaseTileAlign64);
         LoadVToL0(l1ABufId, l0ABufId, embedReal, delay20TileInfo.kvsActBaseTileAlign64);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0ABEventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0ABEventId);
 
-        MatmulPV(
-            l0ABufId, l0BBufId, mMmad, delay20TaskInfo.qsActBaseTileAlign64, delay20TileInfo.kvsActBaseTileAlign64,
-            delay20TileInfo.isTileGoupFirstTile);
+        MatmulPV(l0ABufId, l0BBufId, mMmad, delay20TaskInfo.qsActBaseTileAlign64, delay20TileInfo.kvsActBaseTileAlign64,
+                 delay20TileInfo.isTileGoupFirstTile);
 
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABEventId);
         pvL0abBufId = (pvL0abBufId + 1) % MXFP4::L0A_PV_BUF_CNT;
@@ -463,7 +457,7 @@ public:
         }
     }
 
-protected:
+  protected:
     AscendC::LocalTensor<ElementA> l1ATensor[MXFP4::L1_KV_BUF_CNT];
     AscendC::LocalTensor<ElementB> l1BTensor[MXFP4::L1_P_BUF_CNT];
     AscendC::LocalTensor<ElementA> l0ATensor[MXFP4::L0A_PV_BUF_CNT];

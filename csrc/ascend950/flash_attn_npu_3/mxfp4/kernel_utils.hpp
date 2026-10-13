@@ -114,8 +114,7 @@ struct TileInfo {
 
 namespace Mxfp4Kernel {
 
-enum class Format
-{
+enum class Format {
     TND = 0,
     BNSD = 1,
     BSND = 2
@@ -136,24 +135,15 @@ struct Mxfp4KernelParams {
     GM_ADDR tiling;
 
     // Methods
-    __aicore__ inline Mxfp4KernelParams()
-    {}
-    __aicore__ inline Mxfp4KernelParams(
-        GM_ADDR query_, GM_ADDR key_, GM_ADDR value_, GM_ADDR blockSparseMask_, GM_ADDR actualSeqLengths_,
-        GM_ADDR actualSeqLengthsKv_, GM_ADDR qDequantScale_, GM_ADDR kDequantScale_, GM_ADDR vDequantScale_,
-        GM_ADDR attentionOut_, GM_ADDR workSpace_, GM_ADDR tiling_)
-        : query(query_),
-          key(key_),
-          value(value_),
-          blockSparseMask(blockSparseMask_),
-          actualSeqLengths(actualSeqLengths_),
-          actualSeqLengthsKv(actualSeqLengthsKv_),
-          qDequantScale(qDequantScale_),
-          kDequantScale(kDequantScale_),
-          vDequantScale(vDequantScale_),
-          attentionOut(attentionOut_),
-          workSpace(workSpace_),
-          tiling(tiling_)
+    __aicore__ inline Mxfp4KernelParams() {}
+    __aicore__ inline Mxfp4KernelParams(GM_ADDR query_, GM_ADDR key_, GM_ADDR value_, GM_ADDR blockSparseMask_,
+                                        GM_ADDR actualSeqLengths_, GM_ADDR actualSeqLengthsKv_, GM_ADDR qDequantScale_,
+                                        GM_ADDR kDequantScale_, GM_ADDR vDequantScale_, GM_ADDR attentionOut_,
+                                        GM_ADDR workSpace_, GM_ADDR tiling_)
+        : query(query_), key(key_), value(value_), blockSparseMask(blockSparseMask_),
+          actualSeqLengths(actualSeqLengths_), actualSeqLengthsKv(actualSeqLengthsKv_), qDequantScale(qDequantScale_),
+          kDequantScale(kDequantScale_), vDequantScale(vDequantScale_), attentionOut(attentionOut_),
+          workSpace(workSpace_), tiling(tiling_)
     {}
 };
 

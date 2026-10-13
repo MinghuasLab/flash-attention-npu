@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_init_nd2nz_indexes_duplicate.h
- * \brief
- */
-
 #ifndef VF_INIT_ND2NZ_INDEXES_DUPLICATE_H_
 #define VF_INIT_ND2NZ_INDEXES_DUPLICATE_H_
 #include "kernel_tensor.h"
@@ -53,8 +48,8 @@ __simd_vf__ void inline init_indexs_and_duplicate_vf(__ubuf__ uint8_t* index_nd2
 }
 
 template <typename T>
-__aicore__ inline void InitIndexesAndDuplicateCallVF(
-    LocalTensor<uint8_t>& nd2nzIndexes, const LocalTensor<T>& localGlobalMaxUB)
+__aicore__ inline void InitIndexesAndDuplicateCallVF(LocalTensor<uint8_t>& nd2nzIndexes,
+                                                     const LocalTensor<T>& localGlobalMaxUB)
 {
     __ubuf__ uint8_t* index_nd2xz = (__ubuf__ uint8_t*)nd2nzIndexes.GetPhyAddr();
 

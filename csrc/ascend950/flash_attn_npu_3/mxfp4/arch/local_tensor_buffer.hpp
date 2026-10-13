@@ -18,14 +18,14 @@
 namespace Catlass::Arch {
 
 struct LocalTensorBufferBase {
-public:
+  public:
     template <class Element = half>
     __aicore__ inline AscendC::LocalTensor<Element> GetBufferByByte(const uint32_t offset) const
     {
         return tensor[offset].template ReinterpretCast<Element>();
     }
 
-protected:
+  protected:
     __aicore__ inline LocalTensorBufferBase() = default;
 
     AscendC::LocalTensor<uint8_t> tensor;
@@ -38,7 +38,7 @@ struct LocalTensorBuffer {
 
 template <>
 struct LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::A1> : LocalTensorBufferBase {
-public:
+  public:
     static constexpr AscendC::TPosition Position = AscendC::TPosition::A1;
 
     __aicore__ inline LocalTensorBuffer()
@@ -49,7 +49,7 @@ public:
 
 template <>
 struct LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::A2> : LocalTensorBufferBase {
-public:
+  public:
     static constexpr AscendC::TPosition Position = AscendC::TPosition::A2;
 
     __aicore__ inline LocalTensorBuffer()
@@ -60,7 +60,7 @@ public:
 
 template <>
 struct LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::B2> : LocalTensorBufferBase {
-public:
+  public:
     static constexpr AscendC::TPosition Position = AscendC::TPosition::B2;
 
     __aicore__ inline LocalTensorBuffer()
@@ -71,7 +71,7 @@ public:
 
 template <>
 struct LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::CO1> : LocalTensorBufferBase {
-public:
+  public:
     static constexpr AscendC::TPosition Position = AscendC::TPosition::CO1;
 
     __aicore__ inline LocalTensorBuffer()
@@ -82,7 +82,7 @@ public:
 
 template <>
 struct LocalTensorBuffer<Catlass::Arch::Ascend950, AscendC::TPosition::VECCALC> : LocalTensorBufferBase {
-public:
+  public:
     static constexpr AscendC::TPosition Position = AscendC::TPosition::VECCALC;
 
     __aicore__ inline LocalTensorBuffer()
@@ -92,4 +92,4 @@ public:
 };
 } // namespace Catlass::Arch
 
-#endif // INCLUDE_ARCH_MEMORY_H
+#endif // MXFP4_LOCAL_TENSOR_BUFFER_HPP

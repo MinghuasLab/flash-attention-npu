@@ -37,8 +37,7 @@ struct CopyL0CToUBTla<
     static constexpr auto reluEn = ReluEnable_;
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint8_t unitFlag = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint8_t unitFlag = 0)
     {
         static_assert(
             tla::detail::isRowMajor<typename TensorDst::Layout>::value &&
@@ -62,8 +61,8 @@ struct CopyL0CToUBTla<
         auto srcOffset = srcTensor.layout()(srcTensor.coord());
 
         // Call AscendC Fixpipe
-        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(
-            dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], intriParams);
+        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(dstTensor.data()[dstOffset],
+                                                                   srcTensor.data()[srcOffset], intriParams);
     }
 };
 
@@ -81,8 +80,7 @@ struct CopyL0CToUBTla<
     static constexpr auto reluEn = ReluEnable_;
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint8_t unitFlag = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint8_t unitFlag = 0)
     {
         static_assert(
             tla::detail::isRowMajor<typename TensorDst::Layout>::value &&
@@ -107,8 +105,8 @@ struct CopyL0CToUBTla<
         auto srcOffset = srcTensor.layout()(srcTensor.coord());
 
         // Call AscendC Fixpipe
-        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(
-            dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], intriParams);
+        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(dstTensor.data()[dstOffset],
+                                                                   srcTensor.data()[srcOffset], intriParams);
     }
 };
 
@@ -126,10 +124,8 @@ struct CopyL0CToUBTla<
     static constexpr auto reluEn = ReluEnable_;
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dstTensor, TensorSrc const& srcTensor, uint64_t deqScalar, bool subBlockId,
-        uint8_t unitFlag = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint64_t deqScalar,
+                                   bool subBlockId, uint8_t unitFlag = 0)
     {
         static_assert(
             tla::detail::isRowMajor<typename TensorDst::Layout>::value &&
@@ -156,8 +152,8 @@ struct CopyL0CToUBTla<
         auto srcOffset = srcTensor.layout()(srcTensor.coord());
 
         // Call AscendC Fixpipe
-        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(
-            dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], intriParams);
+        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(dstTensor.data()[dstOffset],
+                                                                   srcTensor.data()[srcOffset], intriParams);
     }
 };
 

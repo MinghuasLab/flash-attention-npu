@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by Minghua Shen, 2026.
 
-import math
 
 import pytest
 import torch
@@ -18,7 +17,6 @@ _MX_GROUP = 32
 
 def _npu_available():
     try:
-        import torch_npu
         from flash_attn_npu_3 import is_ascend950
 
         return torch.npu.is_available() and is_ascend950()
@@ -86,18 +84,22 @@ def _pack_v(bnsd: torch.Tensor, kv_lengths):
         length = int(length)
         if length == 0:
             continue
-        prefix = bnsd[index:index + 1, :, :length, :]
+        prefix = bnsd[index : index + 1, :, :length, :]
         moved = prefix.movedim(2, -1).contiguous()
         quantized, scales = _quantize_last(moved)
         restored = quantized.movedim(-1, 2).contiguous()
         scales = _e8m0(scales.movedim(-1, 2).contiguous())
         packed[index, :, :length] = _pack_e2m1(restored)[0]
-        scale_groups[index, :, :scales.shape[2]] = scales[0]
+        scale_groups[index, :, : scales.shape[2]] = scales[0]
     if groups % 2:
         pad = torch.full((batch, heads, 1, head_dim), _E8M0_BIAS, dtype=torch.uint8)
         scale_groups = torch.cat((scale_groups, pad), dim=2)
     pair_count = scale_groups.shape[2] // 2
-    paired = scale_groups.reshape(batch, heads, pair_count, 2, head_dim).permute(0, 1, 2, 4, 3).contiguous()
+    paired = (
+        scale_groups.reshape(batch, heads, pair_count, 2, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
     return packed, paired
 
 
@@ -115,7 +117,9 @@ def _draw_bnsd(batch, heads, seq, head_dim, generator, low, high, scale_trap):
         for head in range(heads):
             lo, hi = (0.60, 0.90) if head % 2 == 0 else (1.20, 1.80)
             magnitude = lo + (hi - lo) * torch.rand(batch, seq, head_dim, generator=generator)
-            sign = torch.where(torch.rand(batch, seq, head_dim, generator=generator) > 0.5, 1.0, -1.0)
+            sign = torch.where(
+                torch.rand(batch, seq, head_dim, generator=generator) > 0.5, 1.0, -1.0
+            )
             values[:, head] = magnitude * sign
         return values
     if low is None:
@@ -124,7 +128,18 @@ def _draw_bnsd(batch, heads, seq, head_dim, generator, low, high, scale_trap):
 
 
 def _logical_bnsd(
-    batch, heads, kv_heads, seq_q, seq_k, head_dim, q_lengths, kv_lengths, generator, low=None, high=None, scale_trap=False
+    batch,
+    heads,
+    kv_heads,
+    seq_q,
+    seq_k,
+    head_dim,
+    q_lengths,
+    kv_lengths,
+    generator,
+    low=None,
+    high=None,
+    scale_trap=False,
 ):
     query = _draw_bnsd(batch, heads, seq_q, head_dim, generator, low, high, scale_trap)
     key = _draw_bnsd(batch, kv_heads, seq_k, head_dim, generator, low, high, scale_trap)
@@ -222,7 +237,9 @@ def _assert_mxfp4_close(actual, expect):
         rtol, atol = 0.005, 2.5e-5
     actual = actual.detach().to(torch.float32).flatten().cpu()
     expect = expect.detach().to(torch.float32).flatten().cpu()
-    assert actual.shape == expect.shape, f"shape mismatch actual={tuple(actual.shape)} expect={tuple(expect.shape)}"
+    assert actual.shape == expect.shape, (
+        f"shape mismatch actual={tuple(actual.shape)} expect={tuple(expect.shape)}"
+    )
     assert torch.isfinite(actual).all(), "actual contains non-finite values"
     assert torch.isfinite(expect).all(), "golden contains non-finite values"
     if actual.numel() == 0:
@@ -330,7 +347,7 @@ def _dense_case(
     packed = _pack_bnsd(query, key, value, kv_lengths)
     tensors = _to_layout(layout, packed[:3], packed[3:], q_lengths, kv_lengths)
     if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
+        softmax_scale = head_dim**-0.5
     actual = _run_quant(
         *tensors,
         layout=layout,
@@ -359,7 +376,18 @@ def _dense_case(
 
 
 @pytest.mark.parametrize(
-    ("layout", "batch", "heads", "kv_heads", "seq_q", "seq_k", "head_dim", "out_dtype", "q_lengths", "kv_lengths"),
+    (
+        "layout",
+        "batch",
+        "heads",
+        "kv_heads",
+        "seq_q",
+        "seq_k",
+        "head_dim",
+        "out_dtype",
+        "q_lengths",
+        "kv_lengths",
+    ),
     [
         ("BNSD", 1, 4, 2, 128, 128, 64, torch.bfloat16, None, None),
         ("BSND", 1, 4, 2, 128, 128, 64, torch.float16, None, None),
@@ -374,7 +402,9 @@ def _dense_case(
 def test_dense_quantized_attention_matches_golden(
     layout, batch, heads, kv_heads, seq_q, seq_k, head_dim, out_dtype, q_lengths, kv_lengths
 ):
-    _dense_case(layout, batch, heads, kv_heads, seq_q, seq_k, head_dim, out_dtype, q_lengths, kv_lengths)
+    _dense_case(
+        layout, batch, heads, kv_heads, seq_q, seq_k, head_dim, out_dtype, q_lengths, kv_lengths
+    )
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires Ascend 950")
@@ -417,7 +447,9 @@ def test_block_sparse_all_ones_matches_dense_golden(block):
     q_lengths = [seq]
     kv_lengths = [seq]
     generator = torch.Generator().manual_seed(3)
-    query, key, value = _logical_bnsd(batch, heads, heads, seq, seq, head_dim, q_lengths, kv_lengths, generator)
+    query, key, value = _logical_bnsd(
+        batch, heads, heads, seq, seq, head_dim, q_lengths, kv_lengths, generator
+    )
     packed = _pack_bnsd(query, key, value, kv_lengths)
     blocks = seq // block
     mask = torch.ones(batch, heads, blocks, blocks, dtype=torch.uint8)
@@ -426,7 +458,7 @@ def test_block_sparse_all_ones_matches_dense_golden(block):
         layout="BNSD",
         kv_heads=heads,
         out_dtype=torch.bfloat16,
-        softmax_scale=head_dim ** -0.5,
+        softmax_scale=head_dim**-0.5,
         q_lengths=q_lengths,
         kv_lengths=kv_lengths,
         sparse=(mask, (block, block)),
@@ -446,13 +478,15 @@ def test_block_sparse_partial_mask_changes_output():
     q_lengths = [seq]
     kv_lengths = [seq]
     generator = torch.Generator().manual_seed(4)
-    query, key, value = _logical_bnsd(batch, heads, heads, seq, seq, head_dim, q_lengths, kv_lengths, generator)
+    query, key, value = _logical_bnsd(
+        batch, heads, heads, seq, seq, head_dim, q_lengths, kv_lengths, generator
+    )
     packed = _pack_bnsd(query, key, value, kv_lengths)
     common = dict(
         layout="BNSD",
         kv_heads=heads,
         out_dtype=torch.bfloat16,
-        softmax_scale=head_dim ** -0.5,
+        softmax_scale=head_dim**-0.5,
         q_lengths=q_lengths,
         kv_lengths=kv_lengths,
     )
@@ -475,14 +509,16 @@ def test_cx_dense_attention_is_finite(out_dtype, target_max):
     batch, heads, seq, head_dim = 1, 2, 64, 64
     lengths = [seq]
     generator = torch.Generator().manual_seed(5)
-    query, key, value = _logical_bnsd(batch, heads, heads, seq, seq, head_dim, lengths, lengths, generator)
+    query, key, value = _logical_bnsd(
+        batch, heads, heads, seq, seq, head_dim, lengths, lengths, generator
+    )
     packed = _pack_bnsd(query, key, value, lengths)
     actual = _run_quant(
         *packed,
         layout="BNSD",
         kv_heads=heads,
         out_dtype=out_dtype,
-        softmax_scale=head_dim ** -0.5,
+        softmax_scale=head_dim**-0.5,
         q_lengths=lengths,
         kv_lengths=lengths,
         quant_mode=QuantMode.MXFP4_CX,
@@ -523,9 +559,57 @@ def test_cx_dense_attention_is_finite(out_dtype, target_max):
         ("BNSD", 1, 2, 2, 128, 512, 128, torch.bfloat16, None, None, True, False, None, None, 11),
         ("TND", 1, 4, 2, 64, 1024, 64, torch.bfloat16, None, None, True, False, None, None, 11),
         ("BNSD", 2, 2, 2, 128, 256, 128, torch.float16, None, None, True, False, None, None, 11),
-        ("TND", 2, 2, 2, 256, 256, 128, torch.bfloat16, [128, 256], [256, 128], True, False, None, None, 12),
-        ("TND", 2, 2, 2, 129, 255, 128, torch.bfloat16, [127, 129], [255, 193], True, False, None, None, 12),
-        ("TND", 2, 2, 2, 128, 512, 128, torch.bfloat16, [1, 128], [64, 512], True, False, None, None, 12),
+        (
+            "TND",
+            2,
+            2,
+            2,
+            256,
+            256,
+            128,
+            torch.bfloat16,
+            [128, 256],
+            [256, 128],
+            True,
+            False,
+            None,
+            None,
+            12,
+        ),
+        (
+            "TND",
+            2,
+            2,
+            2,
+            129,
+            255,
+            128,
+            torch.bfloat16,
+            [127, 129],
+            [255, 193],
+            True,
+            False,
+            None,
+            None,
+            12,
+        ),
+        (
+            "TND",
+            2,
+            2,
+            2,
+            128,
+            512,
+            128,
+            torch.bfloat16,
+            [1, 128],
+            [64, 512],
+            True,
+            False,
+            None,
+            None,
+            12,
+        ),
         ("BNSD", 1, 2, 2, 128, 256, 128, torch.bfloat16, None, None, False, False, None, None, 13),
         ("BSND", 1, 2, 2, 128, 256, 128, torch.bfloat16, None, None, False, False, None, None, 13),
         ("BSND", 1, 2, 2, 128, 256, 128, torch.bfloat16, None, None, True, True, None, None, 14),
@@ -585,7 +669,9 @@ def test_bsa_block_sparse_mask(layout, block_q, block_kv, seq_q, seq_k, mask_kin
     q_lengths = [seq_q]
     kv_lengths = [seq_k]
     generator = torch.Generator().manual_seed(seed)
-    query, key, value = _logical_bnsd(batch, heads, heads, seq_q, seq_k, head_dim, q_lengths, kv_lengths, generator)
+    query, key, value = _logical_bnsd(
+        batch, heads, heads, seq_q, seq_k, head_dim, q_lengths, kv_lengths, generator
+    )
     packed = _pack_bnsd(query, key, value, kv_lengths)
     tensors = _to_layout(layout, packed[:3], packed[3:], q_lengths, kv_lengths)
     q_blocks, kv_blocks = seq_q // block_q, seq_k // block_kv
@@ -599,7 +685,7 @@ def test_bsa_block_sparse_mask(layout, block_q, block_kv, seq_q, seq_k, mask_kin
         layout=layout,
         kv_heads=heads,
         out_dtype=torch.bfloat16,
-        softmax_scale=head_dim ** -0.5,
+        softmax_scale=head_dim**-0.5,
         q_lengths=q_lengths,
         kv_lengths=kv_lengths,
     )

@@ -23,8 +23,7 @@ namespace Catlass::Gemm::Tile {
 
 struct CopyGmToL1MxScaleDn2NzA5 {
     CATLASS_DEVICE
-    CopyGmToL1MxScaleDn2NzA5()
-    {}
+    CopyGmToL1MxScaleDn2NzA5() {}
 
     // rows      : 本次搬的 token 行数
     // scaleK    : Ceil(D/64)*2
@@ -32,9 +31,9 @@ struct CopyGmToL1MxScaleDn2NzA5 {
     // dstB16Off : 目的 half 偏移
     // headMul   : 头内 token 步长因子（BNSD=1, BSND/TND=N）
     CATLASS_DEVICE
-    void operator()(
-        AscendC::LocalTensor<uint8_t> const& l1Scale, AscendC::GlobalTensor<uint8_t> const& gScale, uint32_t rows,
-        uint32_t scaleK, uint32_t srcB16Off = 0, uint32_t dstB16Off = 0, uint32_t headMul = 1)
+    void operator()(AscendC::LocalTensor<uint8_t> const& l1Scale, AscendC::GlobalTensor<uint8_t> const& gScale,
+                    uint32_t rows, uint32_t scaleK, uint32_t srcB16Off = 0, uint32_t dstB16Off = 0,
+                    uint32_t headMul = 1)
     {
         uint32_t scaleRowHalf = scaleK / 2;
 

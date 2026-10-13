@@ -26,12 +26,12 @@ namespace GmMXFP4 = Gemm::Block::MXFP4;     // L1 常量别名
 
 namespace Mxfp4Kernel {
 
-template <
-    class EpilogueMask2Idx, class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO,
-    class EpilogueComputePScale, class EpilogueCopyGlobalMaxUbToL1, class BlockMmadCopyGlobalMaxL1ToUB, Format qFormat,
-    Format kvFormat, bool transposedMm1 = false, bool sparsePolicy = true>
+template <class EpilogueMask2Idx, class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV,
+          class EpilogueRescaleO, class EpilogueComputePScale, class EpilogueCopyGlobalMaxUbToL1,
+          class BlockMmadCopyGlobalMaxL1ToUB, Format qFormat, Format kvFormat, bool transposedMm1 = false,
+          bool sparsePolicy = true>
 class Mxfp4FullQuantKernel {
-public:
+  public:
     using ArchTag = typename BlockMmadPV::ArchTag;
 
     using ElementQ = typename BlockMmadQK::ElementA;
@@ -83,13 +83,11 @@ public:
     static constexpr uint32_t PRELOAD_TASK_CACHE_SIZE = PV_RE_DELAY_N + 1;
 
     // Methods
-    __aicore__ inline Mxfp4FullQuantKernel()
-    {}
+    __aicore__ inline Mxfp4FullQuantKernel() {}
 
     __aicore__ inline void operator()(Mxfp4KernelParams const& params)
     {
-        __gm__ Mxfp4TilingData* tilingData =
-            reinterpret_cast<__gm__ Mxfp4TilingData*>(params.tiling);
+        __gm__ Mxfp4TilingData* tilingData = reinterpret_cast<__gm__ Mxfp4TilingData*>(params.tiling);
         FetchBaseShapeInfo(tilingData);
         InitLayoutStride();
         // global buffers
@@ -135,8 +133,8 @@ public:
         AscendC::LocalTensor<ElementS> ubPeerGlobalMaxTensor[EpMXFP4::UB_PEER_GLOBAL_MAX_CNT];
         AscendC::LocalTensor<ElementOTmp> ubOTmpTensor;
 
-        InitCrossCoreDstBuf(
-            l1PTensor, l1PScaleTensor, l1LocalGlobalMaxTensor, ubSTensor, ubPeerGlobalMaxTensor, ubOTmpTensor);
+        InitCrossCoreDstBuf(l1PTensor, l1PScaleTensor, l1LocalGlobalMaxTensor, ubSTensor, ubPeerGlobalMaxTensor,
+                            ubOTmpTensor);
         // core idx
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = AscendC::GetBlockNum();
@@ -147,9 +145,8 @@ public:
             if ASCEND_IS_AIV {
                 EpilogueMask2Idx epilogueMask2Idx(resource);
                 uint32_t totalRowNumBlockMask = batch_ * qHeads_ * xBlockNumAligned_;
-                epilogueMask2Idx(
-                    gBlockSparseMask, gSparseIdx, gSparseCount, totalRowNumBlockMask, yBlockNumAligned_,
-                    avgRowPerSubCore_, preActiveSubCoreNum_);
+                epilogueMask2Idx(gBlockSparseMask, gSparseIdx, gSparseCount, totalRowNumBlockMask, yBlockNumAligned_,
+                                 avgRowPerSubCore_, preActiveSubCoreNum_);
             }
             AscendC::SyncAll<false>();
         }
@@ -227,19 +224,18 @@ public:
 
             // 创建qs任务
             if (curTaskTileIdx == 0 && coreTaskId < coreTaskNum) {
-                CreateTaskInfo(
-                    curTaskInfo, coreTaskId, coreIdx, coreNum, gActualQseqlen, gActualKvseqlen, gSparseCount,
-                    gSparseIdx, batchOffsetInfo);
+                CreateTaskInfo(curTaskInfo, coreTaskId, coreIdx, coreNum, gActualQseqlen, gActualKvseqlen, gSparseCount,
+                               gSparseIdx, batchOffsetInfo);
             }
 
             // main process
             if (coreTileLoop >= PV_RE_DELAY_N && delay20CoreTaskId < coreTaskNum) {
                 if ASCEND_IS_AIC {
                     if (delay20TileInfo.isTileGoupFirstTile) {
-                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_PSCALE_C2_BUF0 + delay20TileInfo.pscaleNum);
-                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_PSCALE_C2_BUF0 + delay20TileInfo.pscaleNum + 16);
+                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_PSCALE_C2_BUF0 +
+                                                                           delay20TileInfo.pscaleNum);
+                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_PSCALE_C2_BUF0 +
+                                                                           delay20TileInfo.pscaleNum + 16);
                     }
                     if (delay20TileInfo.isUpdatePScale) {
                         AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_FIX>(CROSS_CORE_SYNC_V2_C2);
@@ -251,17 +247,17 @@ public:
                         tla::MakeTensor(gV[delay20TaskInfo.gmOffsetV], gmVLayoutTla, Catlass::Arch::PositionGM{});
 
                     // [catlass化] UB Oᵀ 实际存储布局：rows=embed_+1（D 行 Oᵀ + 1 行 rowsum）
-                    auto ubOTmpLayoutTla = tla::MakeLayout(
-                        tla::MakeShape(GmMXFP4::ROW_SUM_NUM + 1, delay20TaskInfo.qsActBaseTileAlign64),
-                        tla::MakeStride(static_cast<int64_t>(64), tla::Int<1>{}));
+                    auto ubOTmpLayoutTla =
+                        tla::MakeLayout(tla::MakeShape(GmMXFP4::ROW_SUM_NUM + 1, delay20TaskInfo.qsActBaseTileAlign64),
+                                        tla::MakeStride(static_cast<int64_t>(64), tla::Int<1>{}));
                     auto ubOTmpTensorTla = tla::MakeTensor(ubOTmpTensor, ubOTmpLayoutTla, Catlass::Arch::PositionUB{});
 
-                    Catlass::GemmCoord actualBlockShapePV{
-                        delay20TaskInfo.qsActBaseTile, embed_, delay20TileInfo.kvsActBaseTile};
+                    Catlass::GemmCoord actualBlockShapePV{delay20TaskInfo.qsActBaseTile, embed_,
+                                                          delay20TileInfo.kvsActBaseTile};
 
-                    blockMmadPV(
-                        gmVTensorTla, gVDequantScale, gSparseIdx, ubOTmpTensorTla, actualBlockShapePV, delay20TileInfo,
-                        delay20TaskInfo, kvBaseTile_, blockShapeY_, kvHeadMul, SparsityPolicy<sparsePolicy>{});
+                    blockMmadPV(gmVTensorTla, gVDequantScale, gSparseIdx, ubOTmpTensorTla, actualBlockShapePV,
+                                delay20TileInfo, delay20TaskInfo, kvBaseTile_, blockShapeY_, kvHeadMul,
+                                SparsityPolicy<sparsePolicy>{});
 
                     if (delay20TileInfo.isUpdatePScale) {
                         AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_FIX>(CROSS_CORE_SYNC_C2_V2);
@@ -271,13 +267,12 @@ public:
                     if (delay20TileInfo.isUpdatePScale) {
                         AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_V>(CROSS_CORE_SYNC_C2_V2);
 
-                        auto gmOLayoutTla = tla::MakeLayout(
-                            tla::MakeShape(qBaseTile_, embed_),
-                            tla::MakeStride(delay20TaskInfo.oShapeCol, tla::Int<1>{}));
+                        auto gmOLayoutTla = tla::MakeLayout(tla::MakeShape(qBaseTile_, embed_),
+                                                            tla::MakeStride(delay20TaskInfo.oShapeCol, tla::Int<1>{}));
                         auto gmOTensorTla =
                             tla::MakeTensor(gO[delay20TaskInfo.gmOffsetO], gmOLayoutTla, Catlass::Arch::PositionGM{});
-                        Catlass::GemmCoord actualBlockShapeVPT{
-                            embed_, delay20TaskInfo.qsActBaseTile, delay20TileInfo.kvsActBaseTile};
+                        Catlass::GemmCoord actualBlockShapeVPT{embed_, delay20TaskInfo.qsActBaseTile,
+                                                               delay20TileInfo.kvsActBaseTile};
                         epilogueRescaleO(gmOTensorTla, actualBlockShapeVPT, delay20TaskInfo, delay20TileInfo);
                         AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_V>(CROSS_CORE_SYNC_V2_C2);
                     }
@@ -286,20 +281,19 @@ public:
             if (coreTileLoop >= DELAY_PSCALE_N && delay3CoreTaskId < coreTaskNum) {
                 if (delay3TileInfo.isUpdatePScale) {
                     if ASCEND_IS_AIC {
-                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 + delay3TileInfo.tileMaxIdx / 2);
-                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 + delay3TileInfo.tileMaxIdx / 2 + 16);
+                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 +
+                                                                           delay3TileInfo.tileMaxIdx / 2);
+                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 +
+                                                                           delay3TileInfo.tileMaxIdx / 2 + 16);
                         auto l1GMaxLayoutTla =
                             tla::MakeLayout<ElementLocalGlobalMax, LayoutLocalGlobalMax>(1, EpMXFP4::KVS_BASE_SIZE);
-                        auto l1GMaxTensorTla = tla::MakeTensor(
-                            ubPeerGlobalMaxTensor[delay3TileInfo.tileMaxIdx], l1GMaxLayoutTla,
-                            Catlass::Arch::PositionUB{});
+                        auto l1GMaxTensorTla = tla::MakeTensor(ubPeerGlobalMaxTensor[delay3TileInfo.tileMaxIdx],
+                                                               l1GMaxLayoutTla, Catlass::Arch::PositionUB{});
                         blockGMaxL1ToUb(l1GMaxTensorTla, delay3TileInfo);
-                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 + delay3TileInfo.tileMaxIdx / 2);
-                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE1>(
-                            CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 + delay3TileInfo.tileMaxIdx / 2 + 16);
+                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 +
+                                                                          delay3TileInfo.tileMaxIdx / 2);
+                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 +
+                                                                          delay3TileInfo.tileMaxIdx / 2 + 16);
                         if (delay3TileInfo.tileMaxIdx == 3 ||
                             (delay3CoreTaskId == coreTaskNum - 1 &&
                              delay3TileInfo.isLastKvsTile)) { // tilemax最后一块 或者 单核上的最后一块
@@ -307,25 +301,24 @@ public:
                             AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE1>(CROSS_CORE_SYNC_GMAX_L1_UB_BACK + 16);
                         }
                     } else {
-                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_V>(
-                            CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 + delay3TileInfo.tileMaxIdx / 2);
+                        AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_V>(CROSS_CORE_SYNC_GMAX_L1_TO_UB_BUF0 +
+                                                                        delay3TileInfo.tileMaxIdx / 2);
                         epilogueComputePScale(l1PScaleTensorTla, delay3TileInfo, delay3TaskInfo);
-                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE3>(
-                            CROSS_CORE_SYNC_PSCALE_C2_BUF0 + delay3TileInfo.pscaleNum);
+                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE3>(CROSS_CORE_SYNC_PSCALE_C2_BUF0 +
+                                                                          delay3TileInfo.pscaleNum);
                     }
                 }
             }
             if (coreTaskId < coreTaskNum) {
-                CreateTileInfo(
-                    curTileInfo, coreTileLoop, static_cast<uint32_t>(curTaskTileIdx),
-                    curTaskInfo); // 创建任务
+                CreateTileInfo(curTileInfo, coreTileLoop, static_cast<uint32_t>(curTaskTileIdx),
+                               curTaskInfo); // 创建任务
 
                 uint32_t mm1ResBufId = (curTileInfo.loop / 2) % 2;
                 uint32_t subBlockIdx = curTileInfo.loop % 2;
 
                 if ASCEND_IS_AIC {
-                    AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_FIX>(
-                        CROSS_CORE_SYNC_V1_C1[mm1ResBufId] + subBlockIdx * 16);
+                    AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_FIX>(CROSS_CORE_SYNC_V1_C1[mm1ResBufId] +
+                                                                      subBlockIdx * 16);
                     auto gQLayoutTla = tla::MakeLayout<ElementQ, LayoutQ>(
                         curTaskInfo.qsActBaseTile, // rows = S1 实际 tile
                         qHeadMul * embed_);        // cols → row-stride（BNSD 时 qHeadMul=1，即 embed_）
@@ -336,29 +329,27 @@ public:
                         kvHeadMul * embed_); // [BSND stride 修复] row-stride=kvHeadMul*embed(BNSD=embed)
                     auto gKTensorTla =
                         tla::MakeTensor(gK[curTaskInfo.gmOffsetK], gKLayout, Catlass::Arch::PositionGM{});
-                    auto curUBSTensorTla = GetTile(
-                        ubSTensorTla, tla::MakeCoord(0, EpMXFP4::QS_BASE_SIZE * mm1ResBufId),
-                        MakeShape(EpMXFP4::KVS_BASE_SIZE, EpMXFP4::QS_BASE_SIZE));
+                    auto curUBSTensorTla = GetTile(ubSTensorTla, tla::MakeCoord(0, EpMXFP4::QS_BASE_SIZE * mm1ResBufId),
+                                                   MakeShape(EpMXFP4::KVS_BASE_SIZE, EpMXFP4::QS_BASE_SIZE));
 
                     // QK：UB S 传当前 ping-pong 槽 TLA；Fixpipe 按 subBlockIdx 写到对应 AIV。
-                    blockMmadQK(
-                        gQTensorTla, gKTensorTla, gQDequantScale[curTaskInfo.gmOffsetQScale],
-                        gKDequantScale[curTaskInfo.gmOffsetKScale], gSparseIdx[curTaskInfo.gmOffsetSparseIdx],
-                        curUBSTensorTla, curTaskInfo, curTileInfo, embed_, kvBaseTile_, blockShapeY_, subBlockIdx,
-                        kvHeadMul, qHeadMul, SparsityPolicy<sparsePolicy>{});
-                    AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_FIX>(
-                        CROSS_CORE_SYNC_V1_C1[mm1ResBufId] + subBlockIdx * 16);
+                    blockMmadQK(gQTensorTla, gKTensorTla, gQDequantScale[curTaskInfo.gmOffsetQScale],
+                                gKDequantScale[curTaskInfo.gmOffsetKScale], gSparseIdx[curTaskInfo.gmOffsetSparseIdx],
+                                curUBSTensorTla, curTaskInfo, curTileInfo, embed_, kvBaseTile_, blockShapeY_,
+                                subBlockIdx, kvHeadMul, qHeadMul, SparsityPolicy<sparsePolicy>{});
+                    AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_FIX>(CROSS_CORE_SYNC_V1_C1[mm1ResBufId] +
+                                                                     subBlockIdx * 16);
                 } else {
 #ifdef __DAV_VEC__
                     if (subBlockIdx == AscendC::GetSubBlockIdx()) {
                         AscendC::CrossCoreWaitFlag<SYNC_MODE_4, PIPE_V>(CROSS_CORE_SYNC_V1_C1[mm1ResBufId]);
                         uint32_t l1PBufId = curTileInfo.loop % GmMXFP4::L1_P_BUF_CNT;
-                        auto l1PLayoutTla = tla::MakeLayout<ElementDisguiseP, LayoutPL1>(
-                            EpMXFP4::KVS_BASE_SIZE, EpMXFP4::QS_BASE_SIZE / 2);
+                        auto l1PLayoutTla = tla::MakeLayout<ElementDisguiseP, LayoutPL1>(EpMXFP4::KVS_BASE_SIZE,
+                                                                                         EpMXFP4::QS_BASE_SIZE / 2);
                         auto l1PTensorTla =
                             tla::MakeTensor(l1PTensor[l1PBufId], l1PLayoutTla, Catlass::Arch::PositionL1{});
-                        Catlass::GemmCoord actualBlockShapeQK{
-                            curTileInfo.kvsActBaseTile, curTaskInfo.qsActBaseTile, embed_};
+                        Catlass::GemmCoord actualBlockShapeQK{curTileInfo.kvsActBaseTile, curTaskInfo.qsActBaseTile,
+                                                              embed_};
                         epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, curTileInfo, curTaskInfo);
                         AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_V>(CROSS_CORE_SYNC_V1_C1[mm1ResBufId]);
                     }
@@ -368,12 +359,11 @@ public:
                         }
                         auto l1GMaxLayoutTla =
                             tla::MakeLayout<ElementLocalGlobalMax, LayoutLocalGlobalMax>(2, EpMXFP4::QS_BASE_SIZE);
-                        auto l1GMaxTensorTla = tla::MakeTensor(
-                            l1LocalGlobalMaxTensor[curTileInfo.tileMaxIdx], l1GMaxLayoutTla,
-                            Catlass::Arch::PositionL1{});
+                        auto l1GMaxTensorTla = tla::MakeTensor(l1LocalGlobalMaxTensor[curTileInfo.tileMaxIdx],
+                                                               l1GMaxLayoutTla, Catlass::Arch::PositionL1{});
                         epilogueCopyGlobalMaxUbToL1(l1GMaxTensorTla, curTileInfo);
-                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE3>(
-                            CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 + curTileInfo.tileMaxIdx / 2);
+                        AscendC::CrossCoreSetFlag<SYNC_MODE_4, PIPE_MTE3>(CROSS_CORE_SYNC_GMAX_UB_TO_L1_BUF0 +
+                                                                          curTileInfo.tileMaxIdx / 2);
                     }
 #endif
                 }
@@ -485,19 +475,19 @@ public:
         }
     }
 
-    __aicore__ inline void InitCrossCoreDstBuf(
-        AscendC::LocalTensor<ElementDisguiseP> (&l1PTensor)[GmMXFP4::L1_P_BUF_CNT],
-        AscendC::LocalTensor<ElementPScale> (&l1PScaleTensor)[GmMXFP4::L1_P_SCALE_BUF_CNT],
-        AscendC::LocalTensor<ElementS> (&l1LocalGlobalMax)[GmMXFP4::L1_LOCAL_GLOBAL_MAX_BUF_CNT],
-        AscendC::LocalTensor<ElementS> (&ubSTensor)[EpMXFP4::UB_S_BUF_CNT],
-        AscendC::LocalTensor<ElementS> (&ubPeerGlobalMax)[EpMXFP4::UB_PEER_GLOBAL_MAX_CNT],
-        AscendC::LocalTensor<ElementOTmp>& ubOTmpTensor)
+    __aicore__ inline void
+    InitCrossCoreDstBuf(AscendC::LocalTensor<ElementDisguiseP> (&l1PTensor)[GmMXFP4::L1_P_BUF_CNT],
+                        AscendC::LocalTensor<ElementPScale> (&l1PScaleTensor)[GmMXFP4::L1_P_SCALE_BUF_CNT],
+                        AscendC::LocalTensor<ElementS> (&l1LocalGlobalMax)[GmMXFP4::L1_LOCAL_GLOBAL_MAX_BUF_CNT],
+                        AscendC::LocalTensor<ElementS> (&ubSTensor)[EpMXFP4::UB_S_BUF_CNT],
+                        AscendC::LocalTensor<ElementS> (&ubPeerGlobalMax)[EpMXFP4::UB_PEER_GLOBAL_MAX_CNT],
+                        AscendC::LocalTensor<ElementOTmp>& ubOTmpTensor)
 
     {
         // L1 侧 buffer 初始化：OFFSET + i * SIZE 递增
         for (uint32_t i = 0; i < GmMXFP4::L1_P_BUF_CNT; i++) {
-            l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementDisguiseP>(
-                GmMXFP4::L1_P_BUF_OFFSET + GmMXFP4::L1_P_BUF_SIZE * i);
+            l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementDisguiseP>(GmMXFP4::L1_P_BUF_OFFSET +
+                                                                                     GmMXFP4::L1_P_BUF_SIZE * i);
         }
         for (uint32_t i = 0; i < GmMXFP4::L1_P_SCALE_BUF_CNT; i++) {
             l1PScaleTensor[i] = resource.l1Buf.template GetBufferByByte<ElementPScale>(
@@ -509,8 +499,8 @@ public:
         }
         // UB 侧 buffer 初始化
         for (uint32_t i = 0; i < EpMXFP4::UB_S_BUF_CNT; i++) {
-            ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(
-                EpMXFP4::UB_S_BUF_OFFSET + EpMXFP4::UB_S_INNER_BUF_OFFSET * i);
+            ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(EpMXFP4::UB_S_BUF_OFFSET +
+                                                                             EpMXFP4::UB_S_INNER_BUF_OFFSET * i);
         }
         for (uint32_t i = 0; i < EpMXFP4::UB_PEER_GLOBAL_MAX_CNT; i++) {
             ubPeerGlobalMax[i] = resource.ubBuf.template GetBufferByByte<ElementS>(
@@ -521,11 +511,12 @@ public:
     }
 
     // Qs维度任务
-    __aicore__ inline void CreateTaskInfo(
-        TaskInfo& info, uint32_t coreTaskId, uint32_t coreIdx, uint32_t coreNum,
-        AscendC::GlobalTensor<int64_t>& gActualQseqlen, AscendC::GlobalTensor<int64_t>& gActualKvseqlen,
-        AscendC::GlobalTensor<ElementSparseCount>& gSparseCount, AscendC::GlobalTensor<ElementSparseIdx>& gSparseIdx,
-        BatchOffsetInfo& batchInfo)
+    __aicore__ inline void CreateTaskInfo(TaskInfo& info, uint32_t coreTaskId, uint32_t coreIdx, uint32_t coreNum,
+                                          AscendC::GlobalTensor<int64_t>& gActualQseqlen,
+                                          AscendC::GlobalTensor<int64_t>& gActualKvseqlen,
+                                          AscendC::GlobalTensor<ElementSparseCount>& gSparseCount,
+                                          AscendC::GlobalTensor<ElementSparseIdx>& gSparseIdx,
+                                          BatchOffsetInfo& batchInfo)
     {
         uint32_t taskIdx = coreTaskId * coreNum + coreIdx; // 反推全局 task 序号
 
@@ -572,9 +563,9 @@ public:
         uint32_t xBlockSize =
             (xBlockIdx == xBlockNumAval - 1) ? static_cast<uint32_t>(qSeqlen - xBlockIdx * blockShapeX_) : blockShapeX_;
         uint32_t qSTileNumCurXBlock = CeilDiv(xBlockSize, qBaseTile_);
-        uint32_t qsActBaseTile = (qSTileIdxCurXBlock == qSTileNumCurXBlock - 1) ?
-                                     (xBlockSize - qSTileIdxCurXBlock * qBaseTile_) :
-                                     qBaseTile_;
+        uint32_t qsActBaseTile = (qSTileIdxCurXBlock == qSTileNumCurXBlock - 1)
+                                     ? (xBlockSize - qSTileIdxCurXBlock * qBaseTile_)
+                                     : qBaseTile_;
 
         // Sparse tasks consume mask2idx output. Dense tasks cover the complete
         // KV sequence directly and never read sparse workspace.
@@ -589,9 +580,9 @@ public:
             gmOffsetSparseIdx = gmOffsetSparseCount * yBlockNumAligned_;
             uint32_t lastIdxOffset = gmOffsetSparseIdx + yBlockNumRsvd - 1;
             uint32_t lastSparseIdx = gSparseIdx.GetValue(lastIdxOffset);
-            uint32_t lastYBlockSize = (lastSparseIdx == yBlockNumAval - 1) ?
-                                          static_cast<uint32_t>(kvSeqlen - lastSparseIdx * blockShapeY_) :
-                                          blockShapeY_;
+            uint32_t lastYBlockSize = (lastSparseIdx == yBlockNumAval - 1)
+                                          ? static_cast<uint32_t>(kvSeqlen - lastSparseIdx * blockShapeY_)
+                                          : blockShapeY_;
             gatheredKvSeqlen = (yBlockNumRsvd - 1) * blockShapeY_ + lastYBlockSize;
         } else {
             yBlockNumRsvd = yBlockNumAval;
@@ -683,8 +674,8 @@ public:
     }
 
     // 256*128基本块维度
-    __aicore__ inline void CreateTileInfo(
-        TileInfo& info, uint64_t coreTileLoop, uint32_t curTaskTileIdx, const TaskInfo& taskInfo)
+    __aicore__ inline void CreateTileInfo(TileInfo& info, uint64_t coreTileLoop, uint32_t curTaskTileIdx,
+                                          const TaskInfo& taskInfo)
     {
         info.loop = static_cast<uint32_t>(coreTileLoop);
         info.curKvsTileLoopIdx = curTaskTileIdx;
@@ -786,7 +777,7 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-private:
+  private:
     Arch::Resource<ArchTag> resource;
     /*
     tiling info, which are const in each kernel launch
@@ -853,10 +844,9 @@ private:
 namespace Mxfp4 {
 
 template <class OType, Mxfp4Kernel::Format Layout, Catlass::Epilogue::MXQuantMode QuantMode, bool Sparse>
-__aicore__ inline void Run(
-    GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR blockSparseMask, GM_ADDR actualSeqLengths,
-    GM_ADDR actualSeqLengthsKv, GM_ADDR qDequantScale, GM_ADDR kDequantScale, GM_ADDR vDequantScale,
-    GM_ADDR attentionOut, GM_ADDR workspace, GM_ADDR lse, GM_ADDR tiling)
+__aicore__ inline void Run(GM_ADDR query, GM_ADDR key, GM_ADDR value, GM_ADDR blockSparseMask, GM_ADDR actualSeqLengths,
+                           GM_ADDR actualSeqLengthsKv, GM_ADDR qDequantScale, GM_ADDR kDequantScale,
+                           GM_ADDR vDequantScale, GM_ADDR attentionOut, GM_ADDR workspace, GM_ADDR lse, GM_ADDR tiling)
 {
     using namespace Catlass;
     using ArchTag = Catlass::Arch::Ascend950;
@@ -888,8 +878,8 @@ __aicore__ inline void Run(
     using TileCopyQK = Catlass::Gemm::Tile::PackedTileCopyTlaToUB<
         ArchTag, ElementQ, Catlass::layout::RowMajor, ElementK, Catlass::layout::ColumnMajor, ElementS, LayoutS, void,
         Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N, false, Catlass::Gemm::Tile::ScaleGranularity::PER_GROUP>;
-    using BlockMmadQK = Gemm::Block::BlockMmadTla<
-        DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK, ElementS, void, TileCopyQK>;
+    using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK,
+                                                  ElementS, void, TileCopyQK>;
 
     using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueOnlineSoftmaxMx<true, QuantMode>;
     using PType = Catlass::Gemm::GemmType<ElementP, LayoutPDummy>;
@@ -907,27 +897,30 @@ __aicore__ inline void Run(
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using DispatchPolicyPV = Gemm::MmadAtlasA5PvMx<true>;
-    using TileCopyPV = Catlass::Gemm::Tile::PackedTileCopyTlaToUB<
-        ArchTag, ElementP, LayoutPDummy, ElementV, LayoutV, ElementOTmp, LayoutOTmp, void,
-        Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M, false, Catlass::Gemm::Tile::ScaleGranularity::PER_GROUP>;
-    using BlockMmadPV = Gemm::Block::BlockMmadTla<
-        DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
+    using TileCopyPV =
+        Catlass::Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementP, LayoutPDummy, ElementV, LayoutV, ElementOTmp,
+                                                   LayoutOTmp, void, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M,
+                                                   false, Catlass::Gemm::Tile::ScaleGranularity::PER_GROUP>;
+    using BlockMmadPV = Gemm::Block::BlockMmadTla<DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV,
+                                                  ElementOTmp, void, TileCopyPV>;
 
-    using BlockMmadCopyGlobalMaxL1ToUB = Gemm::Block::BlockMmadTla<
-        Gemm::CopyGlobalMaxL1ToUb, void, void, ElementLocalGlobalMax, void, void, void, void, void>;
-    using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA5RescaleOMx<
-        Epilogue::LseMode::NONE,
-        Layout == Mxfp4Kernel::Format::TND ?
-            Epilogue::LseFormat::TN1 :
-            (Layout == Mxfp4Kernel::Format::BNSD ? Epilogue::LseFormat::BNS1 : Epilogue::LseFormat::BSN1),
-        true>;
+    using BlockMmadCopyGlobalMaxL1ToUB = Gemm::Block::BlockMmadTla<Gemm::CopyGlobalMaxL1ToUb, void, void,
+                                                                   ElementLocalGlobalMax, void, void, void, void, void>;
+    using DispatchPolicyRescaleO =
+        Epilogue::EpilogueAtlasA5RescaleOMx<Epilogue::LseMode::NONE,
+                                            Layout == Mxfp4Kernel::Format::TND
+                                                ? Epilogue::LseFormat::TN1
+                                                : (Layout == Mxfp4Kernel::Format::BNSD ? Epilogue::LseFormat::BNS1
+                                                                                       : Epilogue::LseFormat::BSN1),
+                                            true>;
     using TileCopyRescaleO = Catlass::Epilogue::Tile::TileCopyRescaleO<ArchTag, OType, LayoutO, LayoutOTmp>;
-    using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<
-        DispatchPolicyRescaleO, OType, ElementOTmp, ElementDm, TileCopyRescaleO, Catlass::Arch::PositionL0C>;
+    using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, OType, ElementOTmp, ElementDm,
+                                                            TileCopyRescaleO, Catlass::Arch::PositionL0C>;
 
-    using Kernel = Mxfp4Kernel::Mxfp4FullQuantKernel<
-        EpilogueMask2Idx, BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, EpilogueComputePScale,
-        EpilogueCopyGlobalMaxUbToL1, BlockMmadCopyGlobalMaxL1ToUB, Layout, Layout, true, Sparse>;
+    using Kernel =
+        Mxfp4Kernel::Mxfp4FullQuantKernel<EpilogueMask2Idx, BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV,
+                                          EpilogueRescaleO, EpilogueComputePScale, EpilogueCopyGlobalMaxUbToL1,
+                                          BlockMmadCopyGlobalMaxL1ToUB, Layout, Layout, true, Sparse>;
 
     (void)lse;
     Mxfp4Kernel::Mxfp4KernelParams params{

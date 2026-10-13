@@ -43,12 +43,14 @@ class QuantMode(IntEnum):
 def _maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
+
 def _resolve_quant_mode(quant_mode: Union[QuantMode, int]) -> int:
     try:
         return int(QuantMode(quant_mode))
     except (TypeError, ValueError) as exc:
         valid = ", ".join(f"{mode.name} ({int(mode)})" for mode in QuantMode)
         raise ValueError(f"quant_mode must be one of {valid}, got {quant_mode!r}") from exc
+
 
 def _infer_kv_heads(k: torch.Tensor, layout: str) -> int:
     if layout == "TND":

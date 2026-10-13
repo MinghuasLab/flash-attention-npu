@@ -122,7 +122,9 @@ def _snap_local_probabilities(scores, running_max, softmax_scale):
     grouped = grouped.reshape(*other_shape, block_count, _MX_BLOCK)
 
     block_max = grouped.max(dim=-1).values
-    block_max = torch.where(torch.isinf(block_max) & (block_max < 0), torch.zeros_like(block_max), block_max)
+    block_max = torch.where(
+        torch.isinf(block_max) & (block_max < 0), torch.zeros_like(block_max), block_max
+    )
     block_max = block_max * scale_fp16
     grid = torch.floor(block_max * inv_ln2)
     snapped = (grid - 2) * ln2
@@ -166,12 +168,20 @@ def _attention_tile(query, key, value, softmax_scale):
             probability, merged_max = _snap_local_probabilities(scores, running_max, softmax_scale)
             probability = probability.float()
             previous = running_max
-            safe_previous = torch.where(torch.isinf(previous) & (previous < 0), torch.zeros_like(previous), previous)
-            safe_merged = torch.where(torch.isinf(merged_max) & (merged_max < 0), torch.zeros_like(merged_max), merged_max)
+            safe_previous = torch.where(
+                torch.isinf(previous) & (previous < 0), torch.zeros_like(previous), previous
+            )
+            safe_merged = torch.where(
+                torch.isinf(merged_max) & (merged_max < 0), torch.zeros_like(merged_max), merged_max
+            )
             first_tile = torch.isinf(previous) & (previous < 0)
-            rescale = torch.where(first_tile, torch.zeros_like(safe_previous), torch.exp2(safe_previous - safe_merged))
+            rescale = torch.where(
+                first_tile, torch.zeros_like(safe_previous), torch.exp2(safe_previous - safe_merged)
+            )
             running_sum = rescale * running_sum + probability.sum(dim=0)
-            accumulator = rescale.unsqueeze(-1) * accumulator + probability.t() @ value[key_start:key_end]
+            accumulator = (
+                rescale.unsqueeze(-1) * accumulator + probability.t() @ value[key_start:key_end]
+            )
             running_max = merged_max
         safe_sum = torch.where(running_sum > 0, running_sum, torch.ones_like(running_sum))
         output[query_start:query_end] = accumulator / safe_sum.unsqueeze(-1)
@@ -189,23 +199,29 @@ def _packed_mxfp4_attention(query, key, value, cu_q, used_q, cu_kv, used_kv, sof
     for offset, length in zip(cu_kv, used_kv):
         if length == 0:
             continue
-        value_quant[offset:offset + length] = _mxfp4_qdq(value.float()[offset:offset + length], axis=0)
+        value_quant[offset : offset + length] = _mxfp4_qdq(
+            value.float()[offset : offset + length], axis=0
+        )
     group = num_heads // key.shape[1]
     if group > 1:
         key = key.repeat_interleave(group, dim=1)
         value_quant = value_quant.repeat_interleave(group, dim=1)
 
-    output = torch.zeros(query.shape[0], num_heads, value.shape[-1], dtype=torch.float32, device=query.device)
+    output = torch.zeros(
+        query.shape[0], num_heads, value.shape[-1], dtype=torch.float32, device=query.device
+    )
     for batch, (query_offset, query_len) in enumerate(zip(cu_q, used_q)):
         key_offset, key_len = cu_kv[batch], used_kv[batch]
         if query_len == 0 or key_len == 0:
             continue
-        query_batch = query[query_offset:query_offset + query_len].transpose(0, 1).contiguous()
-        key_batch = key[key_offset:key_offset + key_len].transpose(0, 1).contiguous()
-        value_batch = value_quant[key_offset:key_offset + key_len].transpose(0, 1).contiguous()
+        query_batch = query[query_offset : query_offset + query_len].transpose(0, 1).contiguous()
+        key_batch = key[key_offset : key_offset + key_len].transpose(0, 1).contiguous()
+        value_batch = value_quant[key_offset : key_offset + key_len].transpose(0, 1).contiguous()
         for head in range(num_heads):
-            attended = _attention_tile(query_batch[head], key_batch[head], value_batch[head], softmax_scale)
-            output[query_offset:query_offset + query_len, head] = attended
+            attended = _attention_tile(
+                query_batch[head], key_batch[head], value_batch[head], softmax_scale
+            )
+            output[query_offset : query_offset + query_len, head] = attended
     return output
 
 

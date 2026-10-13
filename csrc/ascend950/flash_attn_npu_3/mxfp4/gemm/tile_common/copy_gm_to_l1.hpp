@@ -32,13 +32,11 @@ struct TileCopyTla<
     // Methods
 
     CATLASS_DEVICE
-    TileCopyTla(){};
+    TileCopyTla() {};
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1, uint32_t srcNdMatrixStride = 0,
-        uint32_t dstNzMatrixStride = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1,
+                                   uint32_t srcNdMatrixStride = 0, uint32_t dstNzMatrixStride = 0)
     {
         static_assert(
             tla::detail::isRowMajor<typename TensorSrc::Layout>::value &&
@@ -93,20 +91,18 @@ struct TileCopyTla<
     // Methods
 
     CATLASS_DEVICE
-    TileCopyTla(){};
+    TileCopyTla() {};
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1, uint32_t srcNdMatrixStride = 0,
-        uint32_t dstNzMatrixStride = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1,
+                                   uint32_t srcNdMatrixStride = 0, uint32_t dstNzMatrixStride = 0)
     {
-        static_assert(
-            tla::detail::isColumnMajor<typename TensorSrc::Layout>::value &&
-                tla::detail::isnZ<typename TensorDst::Element, typename TensorDst::Layout>::value &&
-                TensorSrc::position == AscendC::TPosition::GM && TensorDst::position == AscendC::TPosition::A1,
-            "The input parameters do not match. TensorSrc must be GM and ColumnMajor, "
-            "while TensorDst must be L1 and nZ");
+        static_assert(tla::detail::isColumnMajor<typename TensorSrc::Layout>::value &&
+                          tla::detail::isnZ<typename TensorDst::Element, typename TensorDst::Layout>::value &&
+                          TensorSrc::position == AscendC::TPosition::GM &&
+                          TensorDst::position == AscendC::TPosition::A1,
+                      "The input parameters do not match. TensorSrc must be GM and ColumnMajor, "
+                      "while TensorDst must be L1 and nZ");
 
         const uint32_t nValue = tla::get<1>(srcTensor.shape());
         const uint32_t dValue = tla::get<0>(srcTensor.shape());
@@ -153,21 +149,17 @@ struct TileCopyTla<
 ///     dstNzC0Stride = get<0,1>(dstStride)/BYTE_PER_C0, dstNzNStride = 1
 /// 全部与原 raw SparseVScaleBaseTileL1FullLoad 的 Nd2Nz 对齐（待上机验证）。
 template <class ElementMx, class LayoutSrc, class LayoutDst, class CoordSrc, class CoordDst>
-struct TileCopyTla<
-    Catlass::Arch::Ascend950,
-    tla::Tensor<AscendC::GlobalTensor<ElementMx>, LayoutSrc, CoordSrc, AscendC::TPosition::GM>,
-    tla::Tensor<AscendC::LocalTensor<ElementMx>, LayoutDst, CoordDst, AscendC::TPosition::A1>,
-    std::enable_if_t<
-        tla::detail::isMxScaleForColumnMajorA<ElementMx, LayoutSrc>::value &&
-        tla::detail::isMxScaleForzZ<ElementMx, LayoutDst>::value>> {
+struct TileCopyTla<Catlass::Arch::Ascend950,
+                   tla::Tensor<AscendC::GlobalTensor<ElementMx>, LayoutSrc, CoordSrc, AscendC::TPosition::GM>,
+                   tla::Tensor<AscendC::LocalTensor<ElementMx>, LayoutDst, CoordDst, AscendC::TPosition::A1>,
+                   std::enable_if_t<tla::detail::isMxScaleForColumnMajorA<ElementMx, LayoutSrc>::value &&
+                                    tla::detail::isMxScaleForzZ<ElementMx, LayoutDst>::value>> {
     CATLASS_DEVICE
-    TileCopyTla(){};
+    TileCopyTla() {};
 
     template <class TensorDst, class TensorSrc>
-    CATLASS_DEVICE
-    void operator()(
-        TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1, uint32_t srcNdMatrixStride = 0,
-        uint32_t dstNzMatrixStride = 0)
+    CATLASS_DEVICE void operator()(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t ndNum = 1,
+                                   uint32_t srcNdMatrixStride = 0, uint32_t dstNzMatrixStride = 0)
     {
         static_assert(
             tla::detail::isMxScaleForColumnMajorA<typename TensorSrc::Element, typename TensorSrc::Layout>::value &&
@@ -178,9 +170,8 @@ struct TileCopyTla<
         // MxScaleA shape=(rows,(2,CeilDiv(cols,2))) -> 直接取 fractal 字段
         const uint32_t nValue = tla::get<1, 1>(srcTensor.shape()); // = CeilDiv(cols,2)
         const uint32_t dValue = tla::get<0>(srcTensor.shape());    // = rows
-        const uint32_t srcDValue = CeilDiv(
-            tla::get<1, 1>(srcTensor.stride()),
-            Catlass::MX_SCALE_COPY_GROUP_NUM); // = rows*2/2
+        const uint32_t srcDValue = CeilDiv(tla::get<1, 1>(srcTensor.stride()),
+                                           Catlass::MX_SCALE_COPY_GROUP_NUM); // = rows*2/2
         const uint32_t dstOuterStrideRow = tla::get<0, 1>(dstTensor.stride());
         const uint32_t dstNzC0Stride = dstOuterStrideRow / Catlass::BYTE_PER_C0;
 

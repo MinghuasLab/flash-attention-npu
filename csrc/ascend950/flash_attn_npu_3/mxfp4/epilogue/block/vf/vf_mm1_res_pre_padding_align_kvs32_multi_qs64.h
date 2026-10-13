@@ -12,11 +12,6 @@
  */
 /* Modified by Minghua Shen, 2026. */
 
-/*!
- * \file vf_softmax_dn_cast_nz.h
- * \brief
- */
-
 #ifndef VF_MM1_RES_PRE_PADDING_ALIGN_KVS32_MULTI_QS64_H
 #define VF_MM1_RES_PRE_PADDING_ALIGN_KVS32_MULTI_QS64_H
 #include "vf_common_def.h"
@@ -27,8 +22,8 @@ using namespace AscendC;
 using namespace Reg;
 
 template <typename T, uint16_t QsBase = 128>
-__simd_vf__ inline void mm1_res_pre_padding_align_kvs32_multi_qs64_vf(
-    __ubuf__ T* s, uint16_t actKvsTile, uint16_t kvsActBaseTileAlign32)
+__simd_vf__ inline void mm1_res_pre_padding_align_kvs32_multi_qs64_vf(__ubuf__ T* s, uint16_t actKvsTile,
+                                                                      uint16_t kvsActBaseTileAlign32)
 {
     // ====================== 寄存器定义 ======================
     MaskReg mask_VL64_16b = CreateMask<uint16_t, MaskPattern::VL64>();
@@ -47,8 +42,8 @@ __simd_vf__ inline void mm1_res_pre_padding_align_kvs32_multi_qs64_vf(
 }
 
 template <typename T>
-__aicore__ inline void Mm1ResPrePaddingAlignKvs32MultiQs64CallVF(
-    const LocalTensor<T>& srcTensor, uint16_t actKvsTile, uint16_t kvsActBaseTileAlign32)
+__aicore__ inline void Mm1ResPrePaddingAlignKvs32MultiQs64CallVF(const LocalTensor<T>& srcTensor, uint16_t actKvsTile,
+                                                                 uint16_t kvsActBaseTileAlign32)
 {
     __ubuf__ T* s_ub = (__ubuf__ T*)srcTensor.GetPhyAddr();
 
