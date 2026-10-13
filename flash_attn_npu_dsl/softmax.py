@@ -247,7 +247,7 @@ def output_update_row(pv, output, alpha, row, full_mask, head_mask):
     second.store(second.load() * rescale + even, mask=full_mask)
 
 
-def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, one_mask):
+def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, one_mask, chunks):
     total = _broadcast(running_sum, row)
     zero = tla.full(0.0, tla.Float32)
     valid = tla.cmp(total, zero, "gt", mask=full_mask)
@@ -261,12 +261,12 @@ def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, o
         tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
             logsumexp, params=tla.params.UnalignStoreParams(), mask=one_mask
         )
-    for chunk in tla.range_constexpr(2):
+    for chunk in tla.range_constexpr(chunks):
         dst = _chunk(output, row, chunk)
         dst.store(tla.where(valid, dst.load() / safe_total, zero), mask=full_mask)
 
 
-def output_pack_row(output, packed_output, row, output_dtype, full_mask, packed_mask):
+def output_pack_row(output, packed_output, row, output_dtype, full_mask, packed_mask, head_dim):
     zero_slot = tla.params.CastParams(
         reg_slot=tla.params.RegSlot.ZERO,
         sat_mode=tla.params.SatMode.SAT,
@@ -277,11 +277,15 @@ def output_pack_row(output, packed_output, row, output_dtype, full_mask, packed_
         sat_mode=tla.params.SatMode.SAT,
         round_mode=tla.params.RoundMode.CAST_ROUND,
     )
-    packed = tla.bitwise_or(
-        _chunk(output, row, 0).load().to(output_dtype, zero_slot, mask=full_mask),
-        _chunk(output, row, 1).load().to(output_dtype, one_slot, mask=full_mask),
-        mask=packed_mask,
-    )
+    if tla.const_expr(head_dim <= 64):
+        lower = _chunk(output, row, 0).load().to(output_dtype, zero_slot, mask=full_mask)
+        packed, unused = tla.deinterleave(lower, tla.full(0, output_dtype))
+    else:
+        packed = tla.bitwise_or(
+            _chunk(output, row, 0).load().to(output_dtype, zero_slot, mask=full_mask),
+            _chunk(output, row, 1).load().to(output_dtype, one_slot, mask=full_mask),
+            mask=packed_mask,
+        )
     tla.tile_view(packed_output, tla.make_shape(1, 128), tla.make_coord(row, 0)).store(
         packed, mask=packed_mask
     )
@@ -319,9 +323,19 @@ def _output_update_tile_impl(
         one_mask, _ = tla.update_mask(1, dtype=tla.Float32)
         head_mask = None
         if tla.const_expr(head_dim < 128):
-            head_mask, _ = tla.update_mask(head_dim // 2, dtype=tla.Float32)
+            head_mask, _ = tla.update_mask(
+                head_dim if head_dim <= 64 else head_dim // 2, dtype=tla.Float32
+            )
         for row in tla.range(rows):
-            if tla.const_expr(first):
+            if tla.const_expr(head_dim <= 64):
+                # Small D occupies one contiguous register; only larger D uses
+                # the two deinterleaved registers expected by the pack stage.
+                value = tla.where(head_mask, _chunk(pv, row, 0).load(), tla.full(0.0, tla.Float32))
+                dst = _chunk(output, row, 0)
+                if tla.const_expr(not first):
+                    value = dst.load() * _broadcast(alpha, row) + value
+                dst.store(value, mask=full_mask)
+            elif tla.const_expr(first):
                 output_first_row(pv, output, row, full_mask, head_mask)
             else:
                 output_update_row(pv, output, alpha, row, full_mask, head_mask)
@@ -339,6 +353,7 @@ def _output_update_tile_impl(
                     normalize_row,
                     full_mask,
                     one_mask,
+                    (head_dim + 63) // 64,
                 )
 
 

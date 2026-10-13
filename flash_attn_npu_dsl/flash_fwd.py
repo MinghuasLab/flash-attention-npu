@@ -1547,6 +1547,7 @@ def flex_attention_kernel(
                             DTYPE_Q,
                             final_full_mask,
                             final_packed_mask,
+                            head_dim,
                         )
                 tla.set_flag(p_ub_ready_l1_0)
                 tla.wait_flag(p_ub_ready_l1_0)
