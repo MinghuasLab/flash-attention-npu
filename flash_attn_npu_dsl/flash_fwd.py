@@ -818,19 +818,12 @@ def flex_attention_kernel(
                                 else (expMax_ptrs[1] if l1PBufId == 1 else expMax_ptrs[2])
                             )
                             if tla.const_expr(use_dn):
-                                ub_s = tla.make_tensor(
-                                    ubS_ptr,
-                                    tla.make_layout(
-                                        tla.make_shape(128, 64), tla.make_stride(64, 1)
-                                    ),
-                                )
                                 ub_p = tla.make_tensor(
                                     ubP_ptr,
                                     tla.make_layout(
                                         tla.make_shape(129, 64), tla.make_stride(64, 1)
                                     ),
                                 )
-                                ub_p_zn = tla.make_tensor_like(ubP_ptr, ub_p, tla.arch.zNUnAlign)
                             else:
                                 ub_s = tla.make_tensor(
                                     ubS_ptr,
@@ -858,10 +851,21 @@ def flex_attention_kernel(
                             if tla.const_expr(use_dn):
                                 for current_slot in tla.range_constexpr(2):
                                     if ubSBufId == current_slot:
+                                        # Pass the selected score/P bank explicitly so the
+                                        # backend sees bank-specific addresses at each VF call.
+                                        slot_scores = tla.make_tensor(
+                                            ubS_ptrs[current_slot],
+                                            tla.make_layout(
+                                                tla.make_shape(128, 64), tla.make_stride(64, 1)
+                                            ),
+                                        )
+                                        slot_probs = tla.make_tensor_like(
+                                            ubP_ptrs[current_slot], ub_p, tla.arch.zNUnAlign
+                                        )
                                         if tla.const_expr(full_dn):
                                             full_dn_softmax(
-                                                ub_s,
-                                                ub_p_zn,
+                                                slot_scores,
+                                                slot_probs,
                                                 running_max,
                                                 running_sum,
                                                 alpha,
@@ -871,8 +875,8 @@ def flex_attention_kernel(
                                             )
                                         else:
                                             native_dn_softmax(
-                                                ub_s,
-                                                ub_p_zn,
+                                                slot_scores,
+                                                slot_probs,
                                                 running_max,
                                                 running_sum,
                                                 alpha,

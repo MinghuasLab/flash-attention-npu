@@ -38,6 +38,11 @@ def coordinate_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
     )
 
 
+@simd
+def _strict_causal(b, h, q, kv, info, tensors):
+    return tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "lt")
+
+
 @pytest.mark.parametrize("dtype,dim,kv_heads", [(torch.float16, 64, 1), (torch.bfloat16, 96, 3)])
 def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
     import torch_npu  # noqa: F401
@@ -173,5 +178,69 @@ def test_dn_query_tails_preserve_empty_rows_and_dynamic_reuse(dtype, dim):
                 constants = next(reversed(interface._compiled_kernels))[1][-1]
                 assert constants[-2][1] is True and constants[-1][1] is False
             assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(29)
+    host = tuple(
+        torch.randn(shape, generator=generator).to(dtype)
+        for shape in ((2, 128, 2, 64), (2, 256, 1, 64), (2, 256, 1, 64))
+    )
+    q, k, v = (value.float().permute(0, 2, 1, 3) for value in host)
+    k, v = (value.repeat_interleave(2, dim=1) for value in (k, v))
+    scores = (q @ k.transpose(-1, -2)) / 8
+    inputs = tuple(value.to(device) for value in host)
+    blocks = BlockSparseTensorsTorch(
+        torch.ones((1, 1, 1), dtype=torch.int32, device=device),
+        torch.ones((1, 1, 1, 1), dtype=torch.int32, device=device),
+        torch.ones((1, 1, 1), dtype=torch.int32, device=device),
+        torch.zeros((1, 1, 1, 1), dtype=torch.int32, device=device),
+        block_size=(128, 128),
+    )
+    interface._compiled_kernels.clear()
+    executable = None
+    try:
+        # Partial block 1 is visited before full block 0. The first query has
+        # no visible value in the partial block, so the full update starts
+        # from max=-inf and sum=0, not from an ordinary finite softmax state.
+        for iteration, (partial, full) in enumerate(((1, 1), (1, 0), (0, 1), (0, 0), (1, 1))):
+            blocks.mask_block_cnt.fill_(partial)
+            blocks.full_block_cnt.fill_(full)
+            if iteration == 4:
+                inputs = tuple(value.clone() for value in inputs)
+            visible = torch.arange(256)[None, :] < torch.arange(128)[:, None] + 128
+            if not partial:
+                visible[:, 128:] = False
+            if not full:
+                visible[:, :128] = False
+            masked = scores.masked_fill(~visible, -torch.inf)
+            expected = (masked.softmax(-1).nan_to_num(0) @ v).permute(0, 2, 1, 3)
+            out, lse = flash_attn_func(
+                *inputs,
+                mask_mod=_strict_causal,
+                block_sparse_tensors=blocks,
+                return_lse=return_lse,
+            )
+            torch.npu.synchronize()
+            actual = out.cpu().float()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0.05)
+            assert torch.count_nonzero(actual[:, ~visible.any(-1)]) == 0
+            if return_lse:
+                torch.testing.assert_close(lse.cpu(), masked.logsumexp(-1), rtol=0, atol=0.05)
+            else:
+                assert lse is None
+            assert len(interface._compiled_kernels) == 1
+            current = next(iter(interface._compiled_kernels.values()))
+            if executable is None:
+                executable = current
+            assert current is executable
     finally:
         interface._compiled_kernels.clear()

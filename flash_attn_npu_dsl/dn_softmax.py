@@ -1,6 +1,7 @@
 """KV-by-Q softmax: each SIMD lane carries one query/head coordinate."""
 
 import catlass.tla as tla
+from .dn_full import full_dn_softmax
 from .modifiers import (
     call_mask_mod,
     call_score_mod,
@@ -126,6 +127,73 @@ def _dn_impl(
 
 @tla.jit
 def native_dn_softmax(
+    scores,
+    probs,
+    running_max,
+    running_sum,
+    alpha,
+    first,
+    scale,
+    columns,
+    rows,
+    probability_dtype,
+    q_start,
+    kv_start,
+    batch,
+    head,
+    packed_heads,
+    info,
+    mask_mod,
+    score_mod,
+    aux_tensors,
+    aux_scalars,
+    apply_mask,
+    window_left,
+    window_right,
+):
+    # A full metadata block must also be physically full. Never bypass score
+    # modification or an intrinsic window.
+    eligible = False
+    if tla.const_expr(
+        score_mod is None and window_left is None and window_right is None and scale > 0
+    ):
+        eligible = (rows == 64) & (columns == 128)
+        if tla.const_expr(mask_mod is not None):
+            eligible = eligible & (not apply_mask)
+    if eligible:
+        full_dn_softmax(
+            scores, probs, running_max, running_sum, alpha, first, scale, probability_dtype
+        )
+    else:
+        _general_native_dn_softmax(
+            scores,
+            probs,
+            running_max,
+            running_sum,
+            alpha,
+            first,
+            scale,
+            columns,
+            rows,
+            probability_dtype,
+            q_start,
+            kv_start,
+            batch,
+            head,
+            packed_heads,
+            info,
+            mask_mod,
+            score_mod,
+            aux_tensors,
+            aux_scalars,
+            apply_mask,
+            window_left,
+            window_right,
+        )
+
+
+@tla.jit
+def _general_native_dn_softmax(
     scores,
     probs,
     running_max,
