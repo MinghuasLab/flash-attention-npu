@@ -277,6 +277,7 @@ def process_score_tile_simt(
     score_mod,
     apply_scale: tla.Constexpr[bool] = True,
     packed_heads: tla.Constexpr[int] = 1,
+    dn_layout: tla.Constexpr[bool] = False,
 ):
     """Dispatch full/partial once before entering the SIMT callback VF."""
     apply_mask = False
@@ -301,6 +302,7 @@ def process_score_tile_simt(
             score_mod,
             apply_scale,
             packed_heads,
+            dn_layout,
         )
     else:
         _process_score_tile_simt(
@@ -321,6 +323,7 @@ def process_score_tile_simt(
             score_mod,
             apply_scale,
             packed_heads,
+            dn_layout,
         )
 
 
@@ -343,6 +346,7 @@ def _process_score_tile_simt(
     score_mod,
     apply_scale: tla.Constexpr[bool],
     packed_heads: tla.Constexpr[int],
+    dn_layout: tla.Constexpr[bool],
 ):
     """SIMT iteration over the shared QK FP32 UB tile, one scalar per thread."""
     threads = 512
@@ -359,6 +363,11 @@ def _process_score_tile_simt(
         kv = kv_start + tid % columns
         valid_kv = kv < kv_len
         logical_h = head_idx
+        if tla.const_expr(dn_layout):
+            # A thread keeps its Q lane while advancing through KV by eight.
+            # Expose this invariant before the callback's KV loop.
+            q = q_start + tid % 64
+            valid_q = (tid % 64 < rows) & (q < q_len)
         if tla.const_expr(packed_heads > 1):
             q = base_q
             logical_h = base_h + tid // columns
@@ -366,12 +375,17 @@ def _process_score_tile_simt(
                 if logical_h >= packed_heads:
                     logical_h = logical_h - packed_heads
                     q = q + 1
-        # A 512-element stride preserves each lane's KV column and advances
-        # four Q rows. Keep those coordinates explicit across iterations.
-        for index in tla.range(tid, rows * 128, 512):
+        # Match the thread count with a constant stride to specialize the loop.
+        for index in tla.range(tid, 8192 if dn_layout else rows * 128, 512):
+            if tla.const_expr(dn_layout):
+                kv = kv_start + index // 64
             result = tla.Float32(float("-inf"))
             # Callbacks may gather auxiliary memory: never invoke at padded indices.
-            if (q < q_len // packed_heads) & valid_kv:
+            if tla.const_expr(dn_layout):
+                valid = valid_q & (kv < kv_len)
+            else:
+                valid = (q < q_len // packed_heads) & valid_kv
+            if valid:
                 result = scores[index]
                 if tla.const_expr(apply_scale):
                     result = result * scale
@@ -397,5 +411,5 @@ def _process_score_tile_simt(
                 if logical_h >= packed_heads:
                     logical_h = logical_h - packed_heads
                     q = q + 1
-            else:
+            elif tla.const_expr(not dn_layout):
                 q = q + row_step

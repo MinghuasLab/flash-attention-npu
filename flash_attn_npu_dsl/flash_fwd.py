@@ -898,6 +898,14 @@ def flex_attention_kernel(
                                                 block_kind == 0,
                                                 window_left,
                                                 window_right,
+                                                scalar_callbacks=(
+                                                    not use_simd_modifiers
+                                                    and not mixed_modifiers
+                                                    and (
+                                                        mask_mod is not None
+                                                        or score_mod is not None
+                                                    )
+                                                ),
                                             )
                             else:
                                 row_max = tla.make_tensor(row_max_ptr, state_layout)

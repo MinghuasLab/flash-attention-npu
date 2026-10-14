@@ -1,27 +1,48 @@
-"""Online softmax for full KV-by-Q tiles without modifiers or boundaries.
+"""Online softmax for fully initialized 128-by-64 KV-by-Q tiles.
 
-The caller guarantees 128 valid KV positions, 64 query lanes and positive
-scale. Scores remain unmodified; scaling is applied on each exponential read.
+Unmodified tiles require valid coordinates and positive scale. Modified tiles
+already contain scaled scores with masked/padded entries set to -inf; they use
+unit scale and explicitly preserve the empty-row state.
 """
 
 import catlass.tla as tla
 
 
 @tla.jit
-def full_dn_softmax(scores, probs, running_max, running_sum, alpha, first, scale, dtype):
+def full_dn_softmax(
+    scores,
+    probs,
+    running_max,
+    running_sum,
+    alpha,
+    first,
+    scale,
+    dtype,
+    masked: tla.Constexpr[bool] = False,
+):
     source = tla.make_tensor(scores.ptr, tla.make_layout(tla.make_shape(8192), tla.make_stride(1)))
     packed = tla.make_tensor(probs.ptr, tla.make_layout(tla.make_shape(8320), tla.make_stride(1)))
     if first:
         with tla.vec.func(mode="simd"):
             full = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
             alpha.store(tla.full(0.0, tla.Float32), mask=full)
-        _full_dn_impl(source, running_max, running_sum, packed, scale, dtype, alpha, True)
+        _full_dn_impl(source, running_max, running_sum, packed, scale, dtype, alpha, True, masked)
     else:
-        _full_dn_impl(source, running_max, running_sum, packed, scale, dtype, alpha, False)
+        _full_dn_impl(source, running_max, running_sum, packed, scale, dtype, alpha, False, masked)
 
 
 @tla.jit
-def _full_dn_impl(src, mx, sm, packed, scale, ptype, alpha, first: tla.Constexpr):
+def _full_dn_impl(
+    src,
+    mx,
+    sm,
+    packed,
+    scale,
+    ptype,
+    alpha,
+    first: tla.Constexpr,
+    masked: tla.Constexpr[bool],
+):
     with tla.vec.func(mode="simd"):
         full = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
         full16 = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float16)
@@ -46,10 +67,22 @@ def _full_dn_impl(src, mx, sm, packed, scale, ptype, alpha, first: tla.Constexpr
             previous_max = mx.load()
             previous_sum = sm.load()
             m0 = tla.max(m0, previous_max, mask=full)
+        if tla.const_expr(masked):
+            mx.store(m0, mask=full)
+            # SIMT has initialized every padded/masked position to -inf.
+            # Keep -inf as the true running maximum, but avoid -inf - -inf
+            # in empty rows when forming exponentials and rescale factors.
+            m0 = tla.where(
+                tla.cmp(m0, tla.full(float("-inf"), tla.Float32), "gt"),
+                m0,
+                tla.full(0.0, tla.Float32),
+            )
+        if tla.const_expr(not first):
             rescale = tla.exp(tla.sub(previous_max, m0, mask=full), mask=full)
             previous_sum = tla.mul(rescale, previous_sum, mask=full)
             alpha.store(rescale, mask=full)
-        mx.store(m0, mask=full)
+        if tla.const_expr(not masked):
+            mx.store(m0, mask=full)
         s0 = tla.full(0.0, tla.Float32)
         s1 = tla.full(0.0, tla.Float32)
         s2 = tla.full(0.0, tla.Float32)

@@ -290,6 +290,7 @@ def test_packed_head_policy_preserves_parallelism(
         cores,
         sparse,
         has_simt_mod=False,
+        has_score_mod=False,
         has_aux=False,
         has_mod=False,
         has_window=False,

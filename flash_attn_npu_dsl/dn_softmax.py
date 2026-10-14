@@ -6,6 +6,7 @@ from .modifiers import (
     call_mask_mod,
     call_score_mod,
     _validate_mask_vector,
+    process_score_tile_simt,
     _validate_score_vector,
 )
 
@@ -127,6 +128,113 @@ def _dn_impl(
 
 @tla.jit
 def native_dn_softmax(
+    scores,
+    probs,
+    running_max,
+    running_sum,
+    alpha,
+    first,
+    scale,
+    columns,
+    rows,
+    probability_dtype,
+    q_start,
+    kv_start,
+    batch,
+    head,
+    packed_heads,
+    info,
+    mask_mod,
+    score_mod,
+    aux_tensors,
+    aux_scalars,
+    apply_mask,
+    window_left,
+    window_right,
+    scalar_callbacks: tla.Constexpr[bool] = False,
+):
+    common = (scores, probs, running_max, running_sum, alpha, first)
+    coordinates = (q_start, kv_start, batch, head, packed_heads, info)
+    needs_simt = False
+    if tla.const_expr(scalar_callbacks):
+        if tla.const_expr(score_mod is not None):
+            needs_simt = True
+        else:
+            needs_simt = apply_mask
+    if needs_simt:
+        flat = tla.make_tensor(
+            scores.ptr, tla.make_layout(tla.make_shape(8192), tla.make_stride(1))
+        )
+        block_kind = 0 if apply_mask else 1
+        # FIX -> SIMT -> SIMD transfers ownership of the same score bank.
+        tla.pipe_barrier(tla.pipes.ALL)
+        process_score_tile_simt(
+            flat,
+            rows,
+            q_start,
+            kv_start,
+            batch,
+            head,
+            block_kind,
+            aux_tensors,
+            aux_scalars,
+            info.seqlen_q,
+            info.seqlen_k,
+            scale,
+            info,
+            mask_mod,
+            score_mod,
+            dn_layout=True,
+        )
+        tla.pipe_barrier(tla.pipes.ALL)
+        if tla.const_expr(window_left is None and window_right is None):
+            # SIMT wrote all 128x64 physical positions, including padding.
+            # Reuse the same optimized reduction/exp/P packing as raw full
+            # blocks, with safe empty-row normalization for modified scores.
+            full_dn_softmax(
+                *common,
+                1.0,
+                probability_dtype,
+                masked=True,
+            )
+        else:
+            _general_native_dn_softmax(
+                *common,
+                1.0,
+                columns,
+                rows,
+                probability_dtype,
+                *coordinates,
+                None,
+                None,
+                aux_tensors,
+                aux_scalars,
+                False,
+                window_left,
+                window_right,
+            )
+    else:
+        # Full blocks without a score callback remain unmodified and retain
+        # the existing full-tile path. Never invoke a scalar callback as SIMD.
+        _vector_native_dn_softmax(
+            *common,
+            scale,
+            columns,
+            rows,
+            probability_dtype,
+            *coordinates,
+            None if scalar_callbacks else mask_mod,
+            None if scalar_callbacks else score_mod,
+            aux_tensors,
+            aux_scalars,
+            False if scalar_callbacks else apply_mask,
+            window_left,
+            window_right,
+        )
+
+
+@tla.jit
+def _vector_native_dn_softmax(
     scores,
     probs,
     running_max,

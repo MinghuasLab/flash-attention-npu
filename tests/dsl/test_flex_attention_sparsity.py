@@ -651,6 +651,39 @@ def _regression_vector_score(value, b, h, *, q_idx, kv_idx, seqlen_info, aux_ten
     return value * 0.75
 
 
+@pytest.mark.parametrize(
+    "q_len,kv_len,score,expected_dn",
+    [
+        (128, 255, None, False),
+        (128, 256, None, True),
+        (129, 512, None, False),
+        (256, 513, None, True),
+        (513, 512, None, False),
+        (128, 256, _regression_score, False),
+        (128, 256, _regression_vector_score, False),
+    ],
+)
+def test_sparse_simt_layout_selection(sparse_host, q_len, kv_len, score, expected_dn):
+    q = torch.empty(2, q_len, 4, 64, dtype=torch.float16)
+    k = torch.empty(2, kv_len, 2, 64, dtype=torch.float16)
+    rows = (q_len + 127) // 128
+    blocks = block_sparsity.BlockSparseTensorsTorch(
+        torch.zeros(1, 1, rows, dtype=torch.int32),
+        torch.zeros(1, 1, rows, 1, dtype=torch.int32),
+        block_size=(128, 128),
+    )
+    interface.flash_attn_func(
+        q,
+        k,
+        k,
+        mask_mod=right_causal_mask,
+        score_mod=score,
+        aux_tensors=(torch.zeros(2, dtype=torch.int32),),
+        block_sparse_tensors=blocks,
+    )
+    assert sparse_host.compiled[0][-2:] == (expected_dn, False)
+
+
 def test_device_regression_metadata_contains_only_safe_active_prefixes(shape):
     blocks = _direct_sparse_regression_blocks()
     sparse = block_sparsity.validate_block_sparse(
@@ -675,6 +708,8 @@ def test_device_regression_metadata_contains_only_safe_active_prefixes(shape):
         (torch.bfloat16, 128, True, _regression_vector_mask, _regression_vector_score),
         (torch.float16, 64, False, _regression_vector_mask, None),
         (torch.bfloat16, 96, True, _regression_vector_mask, None),
+        (torch.float16, 64, False, _regression_mask, None),
+        (torch.bfloat16, 96, True, _regression_mask, None),
     ],
 )
 @pytest.mark.parametrize("q_len", [1041, 1152])

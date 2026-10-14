@@ -43,6 +43,10 @@ def _strict_causal(b, h, q, kv, info, tensors):
     return tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "lt")
 
 
+def _scalar_strict_causal(b, h, q, kv, info, tensors):
+    return kv < q + info.seqlen_k - info.seqlen_q + tensors[0][b]
+
+
 @pytest.mark.parametrize("dtype,dim,kv_heads", [(torch.float16, 64, 1), (torch.bfloat16, 96, 3)])
 def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
     import torch_npu  # noqa: F401
@@ -184,7 +188,8 @@ def test_dn_query_tails_preserve_empty_rows_and_dynamic_reuse(dtype, dim):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse):
+@pytest.mark.parametrize("mask", [_strict_causal, _scalar_strict_causal])
+def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse, mask):
     import torch_npu  # noqa: F401
 
     device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
@@ -198,6 +203,8 @@ def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse):
     k, v = (value.repeat_interleave(2, dim=1) for value in (k, v))
     scores = (q @ k.transpose(-1, -2)) / 8
     inputs = tuple(value.to(device) for value in host)
+    offsets = torch.tensor([0, 1] if mask is _scalar_strict_causal else [0, 0], dtype=torch.int32)
+    aux = (offsets.to(device),) if mask is _scalar_strict_causal else None
     blocks = BlockSparseTensorsTorch(
         torch.ones((1, 1, 1), dtype=torch.int32, device=device),
         torch.ones((1, 1, 1, 1), dtype=torch.int32, device=device),
@@ -214,25 +221,33 @@ def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse):
         for iteration, (partial, full) in enumerate(((1, 1), (1, 0), (0, 1), (0, 0), (1, 1))):
             blocks.mask_block_cnt.fill_(partial)
             blocks.full_block_cnt.fill_(full)
+            if iteration == 1 and aux is not None:
+                offsets = offsets.flip(0)
+                aux[0].copy_(offsets)
             if iteration == 4:
                 inputs = tuple(value.clone() for value in inputs)
-            visible = torch.arange(256)[None, :] < torch.arange(128)[:, None] + 128
+                if aux is not None:
+                    aux = (aux[0].clone(),)
+            visible = torch.arange(256)[None, None, :] < (
+                torch.arange(128)[None, :, None] + 128 + offsets[:, None, None]
+            )
             if not partial:
-                visible[:, 128:] = False
+                visible[:, :, 128:] = False
             if not full:
-                visible[:, :128] = False
-            masked = scores.masked_fill(~visible, -torch.inf)
+                visible[:, :, :128] = False
+            masked = scores.masked_fill(~visible[:, None], -torch.inf)
             expected = (masked.softmax(-1).nan_to_num(0) @ v).permute(0, 2, 1, 3)
             out, lse = flash_attn_func(
                 *inputs,
-                mask_mod=_strict_causal,
+                mask_mod=mask,
+                aux_tensors=aux,
                 block_sparse_tensors=blocks,
                 return_lse=return_lse,
             )
             torch.npu.synchronize()
             actual = out.cpu().float()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0.05)
-            assert torch.count_nonzero(actual[:, ~visible.any(-1)]) == 0
+            assert torch.count_nonzero(actual[~visible.any(-1)]) == 0
             if return_lse:
                 torch.testing.assert_close(lse.cpu(), masked.logsumexp(-1), rtol=0, atol=0.05)
             else:

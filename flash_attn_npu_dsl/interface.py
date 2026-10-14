@@ -30,6 +30,7 @@ def _select_kernel_options(
     has_mod,
     has_window,
     scale,
+    has_score_mod,
 ):
     """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
@@ -47,12 +48,22 @@ def _select_kernel_options(
     if has_simt_mod and q_len > 32:
         packed_heads = 1
     q_rows = q_len * packed_heads
-    # Packed windows, SIMT and auxiliary calls retain KV-lane SIMD.
-    # Unpacked DN tails need enough Q/KV tiles to amortize their padding.
+    # Scalar masks use DN only for complete query tiles with explicit blocks.
+    # Full blocks can bypass the modifier; a score callback would prevent that.
+    # Vector callbacks may also use large unpacked Q tails to amortize padding.
     use_dn = (
         not (packed_heads > 1 and has_window)
-        and not has_simt_mod
-        and not has_aux
+        and (
+            (not has_simt_mod and not has_aux)
+            or (
+                has_simt_mod
+                and not has_score_mod
+                and packed_heads == 1
+                and q_rows % 128 == 0
+                and sparse is not None
+                and not has_window
+            )
+        )
         and (q_rows % 128 == 0 or (packed_heads == 1 and q_rows >= 512 and kv_len >= 512))
         and kv_len >= 256
     )
@@ -324,6 +335,7 @@ def flash_attn_func(
             has_mod=mask_mod is not None or score_mod is not None,
             has_window=window_left is not None or window_right is not None,
             scale=scale,
+            has_score_mod=score_mod is not None,
         )
         if packed_heads > 1:
             # Only MQA has a contiguous folded view. GQA groups are gathered and
