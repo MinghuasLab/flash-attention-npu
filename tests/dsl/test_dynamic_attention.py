@@ -200,6 +200,10 @@ def test_short_queries_preserve_callback_coordinates_and_lse(dtype, mask, score,
         if mask is _head_mask and score is _vector_scale_score:
             # Cross the packing boundary, then reuse the earlier packed variant.
             lengths.extend(((33, 65), (5, 17)))
+        if mask is _head_mask and score is _coordinate_score and heads == 3:
+            # Unpacked SIMT lanes revisit Q rows at a fixed KV column. Cover
+            # multiple iterations, query tails and the final partial KV tile.
+            lengths.extend(((129, 257), (128, 255)))
         for sq, sk in lengths:
             q = torch.randn(32, sq, heads, 64, generator=generator).to(dtype)
             k = torch.randn(32, sk, kv_heads, 64, generator=generator).to(dtype)
