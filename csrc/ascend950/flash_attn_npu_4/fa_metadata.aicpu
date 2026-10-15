@@ -2,6 +2,7 @@
 #include "fa_metadata_args.h"
 #include "tilingdata.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -20,6 +21,10 @@ constexpr uint32_t SIZE_OF_32BIT = 4;
 struct FdBaseTask {
     uint32_t kvTiles;
     uint32_t rowNum;
+    uint32_t batchIdx;
+    uint32_t qStart;
+    uint32_t qRows;
+    uint32_t qHeadStart;
 };
 
 struct FdCandidate {
@@ -63,16 +68,117 @@ inline void DisableFlashDecode(FAInferStaticTilingData* tilingData)
     tilingData->fdPartialCapacity = 0;
     tilingData->fdRowCapacity = 0;
     tilingData->fdLseSubStride = 0;
-    tilingData->fdCombineBlockDim = 0;
+    tilingData->fdCombineRowNum = 0;
+    tilingData->fdCombineAivNum = 0;
+    tilingData->fdCombineUseUniform = 0;
     tilingData->fdPartialLseOffset = 0;
     tilingData->fdPartialOOffset = 0;
     tilingData->fdWorkspaceEnd = tilingData->workSpaceSize;
 }
 
-__attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* tilingData, const FAMetadataArgs* metadataArgs,
-                                                     const int32_t* cuSeqlensQ, const int32_t* seqlensQ,
-                                                     const int32_t* seqlensK)
+bool FillFdCombineCoreSchedules(FAInferStaticTilingData& tiling)
 {
+    struct SourcePartition {
+        uint32_t task;
+        uint32_t subBlock;
+        uint32_t rows;
+    };
+    SourcePartition partitions[MAX_FD_COMBINE_AIV_NUM]{};
+    uint32_t partitionCount = 0;
+    uint64_t totalLoad = 0U;
+    for (uint32_t task = 0U; task < tiling.fdCombineTaskNum; ++task) {
+        const uint32_t rows = tiling.fdCombineTaskInfo[task].rowNum;
+        const uint32_t sourceSplit = std::min(rows, static_cast<uint32_t>(AlignUp(rows, 8U)) / FD_SOURCE_SUB_BLOCK_NUM);
+        const uint32_t sourceRows[FD_SOURCE_SUB_BLOCK_NUM] = {sourceSplit, rows - sourceSplit};
+        for (uint32_t sub = 0U; sub < FD_SOURCE_SUB_BLOCK_NUM; ++sub) {
+            if (sourceRows[sub] != 0U) {
+                partitions[partitionCount++] = {task, sub, sourceRows[sub]};
+            }
+        }
+        totalLoad += static_cast<uint64_t>(rows) * tiling.fdCombineSchedules[task].partialCount;
+    }
+
+    const uint32_t aivNum = tiling.fdActiveCoreNum * FD_SOURCE_SUB_BLOCK_NUM;
+    // FD has fewer base tasks than active AICs, hence every nonempty
+    // source partition can reserve at least one AIV.
+    if (aivNum == 0U || partitionCount > aivNum) {
+        return false;
+    }
+    const uint64_t averageLoad = std::max<uint64_t>(1U, (totalLoad + aivNum - 1U) / aivNum);
+    uint32_t extraAivs = aivNum - static_cast<uint32_t>(partitionCount);
+    uint32_t nextAiv = 0U;
+    for (uint32_t p = 0; p < partitionCount; ++p) {
+        const auto& partition = partitions[p];
+        const uint64_t load =
+            static_cast<uint64_t>(partition.rows) * tiling.fdCombineSchedules[partition.task].partialCount;
+        // Reserve one AIV for every remaining partition before deriving
+        // the row extent. Recompute the actual count after ceil rounding.
+        const uint32_t initialAivs = static_cast<uint32_t>(
+            std::min<uint64_t>(std::max<uint64_t>(1U, load / averageLoad), std::min(partition.rows, extraAivs + 1U)));
+        const uint32_t rowsPerAiv = (partition.rows + initialAivs - 1U) / initialAivs;
+        const uint32_t usedAivs = (partition.rows + rowsPerAiv - 1U) / rowsPerAiv;
+        for (uint32_t i = 0U; i < usedAivs; ++i) {
+            const uint32_t row = i * rowsPerAiv;
+            tiling.fdCombineCoreSchedules[nextAiv++] = {partition.task, partition.subBlock, row,
+                                                        std::min(rowsPerAiv, partition.rows - row)};
+        }
+        extraAivs -= usedAivs - 1U;
+    }
+    tiling.fdCombineAivNum = nextAiv;
+
+    // One combine task has no inter-task imbalance to remove. For the
+    // no-LSE path, also retain uniform dispatch when its busiest AIV's
+    // aggregate partial O fits the existing input buffer: extra metadata
+    // and per-AIV rounds can cost more than the small reduction in work.
+    // Derive this from actual partials/rows, never the requested splits.
+    tiling.fdCombineUseUniform = 0U;
+    if (tiling.fdCombineTaskNum == 1U) {
+        tiling.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE | FD_COMBINE_UNIFORM_WITH_LSE;
+    } else {
+        const uint32_t rowTile =
+            std::min(FD_COMBINE_ROW_TILE, std::max(1U, (tiling.fdCombineRowNum + aivNum - 1U) / aivNum));
+        uint64_t uniformLoads[MAX_FD_COMBINE_AIV_NUM]{};
+        uint32_t uniformRounds[MAX_FD_COMBINE_AIV_NUM]{};
+        uint32_t tile = 0U;
+        for (uint32_t p = 0; p < partitionCount; ++p) {
+            const auto& partition = partitions[p];
+            for (uint32_t row = 0U; row < partition.rows; row += rowTile) {
+                const uint32_t core = tile++ % aivNum;
+                ++uniformRounds[core];
+                uniformLoads[core] += static_cast<uint64_t>(std::min(rowTile, partition.rows - row)) *
+                                      tiling.fdCombineSchedules[partition.task].partialCount;
+            }
+        }
+        const uint64_t maxInputElems =
+            *std::max_element(uniformLoads, uniformLoads + aivNum) * AlignUp(tiling.embeddingSizeV, 8U);
+        if (maxInputElems <= FD_COMBINE_O_INPUT_ELEMS) {
+            tiling.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE;
+            uint32_t balancedRounds = 0U;
+            for (uint32_t core = 0U; core < tiling.fdCombineAivNum; ++core) {
+                balancedRounds =
+                    std::max(balancedRounds, (tiling.fdCombineCoreSchedules[core].rowCount + FD_COMBINE_ROW_TILE - 1U) /
+                                                 FD_COMBINE_ROW_TILE);
+            }
+            // With no multi-buffer input to remove, adding a whole extra
+            // row round can also outweigh balancing the LSE stores.
+            if (balancedRounds > *std::max_element(uniformRounds, uniformRounds + aivNum)) {
+                tiling.fdCombineUseUniform |= FD_COMBINE_UNIFORM_WITH_LSE;
+            }
+        }
+    }
+    return true;
+}
+
+__attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* tilingData,
+                                                     const FAMetadataArgs* metadataArgs, const int32_t* cuSeqlensQ,
+                                                     const int32_t* seqlensQ, const int32_t* seqlensK)
+{
+    tilingData->fdCombineAivNum = 0;
+    tilingData->fdCombineUseUniform = 0;
+    tilingData->fdCombineRowNum = 0;
+    for (auto& schedule : tilingData->fdCombineCoreSchedules) {
+        schedule = {};
+    }
     for (uint32_t i = 0; i < MAX_FD_CORES; ++i) {
         // Metadata launches use the fixed device block count because the host
         // cannot synchronously read fdActiveCoreNum. Empty schedules keep
@@ -81,6 +187,7 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
     }
     for (uint32_t i = 0; i < MAX_FD_COMBINE_TASKS; ++i) {
         tilingData->fdCombineSchedules[i] = {-1, -1, -1, 0};
+        tilingData->fdCombineTaskInfo[i] = {};
     }
 
     const uint32_t coreCount = metadataArgs->blockDim;
@@ -123,7 +230,10 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
                     DisableFlashDecode(tilingData);
                     return;
                 }
-                bases[baseTaskCount++] = {kvTileCount, qRows * qnBlockSize};
+                bases[baseTaskCount++] = {
+                    kvTileCount, qRows * qnBlockSize,
+                    batchIndex,  qTileIndex * qBaseTile,
+                    qRows,       (qnTask / qnBlocksPerGroup) * groupSize + qnBlockIndex * qnBlockTile};
             }
         }
     }
@@ -240,9 +350,13 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
                 DisableFlashDecode(tilingData);
                 return;
             }
-            tilingData->fdCombineSchedules[combineCount++] = {static_cast<int32_t>(base), firstCore,
-                                                              static_cast<int32_t>(partialStart),
-                                                              static_cast<int32_t>(partialCount)};
+            tilingData->fdCombineSchedules[combineCount] = {static_cast<int32_t>(base), firstCore,
+                                                            static_cast<int32_t>(partialStart),
+                                                            static_cast<int32_t>(partialCount)};
+            const auto& info = bases[base];
+            tilingData->fdCombineTaskInfo[combineCount++] = {info.batchIdx, info.qStart, info.qRows, info.qHeadStart,
+                                                             info.rowNum};
+            tilingData->fdCombineRowNum += info.rowNum;
             partialStart += partialCount;
         }
     }
@@ -254,7 +368,10 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
     tilingData->fdActiveCoreNum = activeCores;
     tilingData->fdCombineTaskNum = combineCount;
     tilingData->fdPartialTaskNum = partialStart;
-    tilingData->fdCombineBlockDim = combineCount < coreCount ? combineCount : coreCount;
+    if (!FillFdCombineCoreSchedules(*tilingData)) {
+        DisableFlashDecode(tilingData);
+        return;
+    }
 
     uint32_t maxFdRows = 0;
     for (uint32_t base = 0; base < baseTaskCount; ++base) {
@@ -262,12 +379,17 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
     }
     tilingData->fdRowCapacity = static_cast<uint32_t>(AlignUp(maxFdRows, 8));
     tilingData->fdLseSubStride = static_cast<uint32_t>(AlignUp((tilingData->fdRowCapacity + 1) / 2, 8));
-    tilingData->fdPartialLseOffset = AlignUp(tilingData->workSpaceSize, FD_WORKSPACE_ALIGNMENT);
+    // The FD pipeline keeps QK/softmax/PV/rescale buffers on chip.
+    tilingData->qkOutSize = 0;
+    tilingData->smOnlineOutSize = 0;
+    tilingData->pvOutSize = 0;
+    tilingData->UpdateSize = 0;
+    tilingData->fdPartialLseOffset = 0;
     const uint64_t partialLseSize =
         static_cast<uint64_t>(tilingData->fdPartialCapacity) * 2 * tilingData->fdLseSubStride * SIZE_OF_32BIT;
     tilingData->fdPartialOOffset = AlignUp(tilingData->fdPartialLseOffset + partialLseSize, FD_WORKSPACE_ALIGNMENT);
     const uint64_t partialOSize = static_cast<uint64_t>(tilingData->fdPartialCapacity) * tilingData->fdRowCapacity *
-                                  metadataArgs->embeddingSizeV * SIZE_OF_16BIT;
+                                  metadataArgs->embeddingSizeV * SIZE_OF_32BIT;
     tilingData->fdWorkspaceEnd = tilingData->fdPartialOOffset + partialOSize;
     tilingData->workSpaceSize = tilingData->fdWorkspaceEnd;
     tilingData->flashDecodeFlag = 1;
@@ -331,11 +453,11 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
     for (uint32_t batchIndex = 0; batchIndex < metadataArgs->batch; ++batchIndex) {
-        const uint32_t qSeqlen = metadataArgs->isVarlen
-                                     ? (metadataArgs->hasSequsedQ != 0
-                                            ? static_cast<uint32_t>(seqlensQ[batchIndex])
-                                            : static_cast<uint32_t>(cuSeqlensQ[batchIndex + 1] - cuSeqlensQ[batchIndex]))
-                                     : metadataArgs->maxQSeqlen;
+        const uint32_t qSeqlen =
+            metadataArgs->isVarlen ? (metadataArgs->hasSequsedQ != 0
+                                          ? static_cast<uint32_t>(seqlensQ[batchIndex])
+                                          : static_cast<uint32_t>(cuSeqlensQ[batchIndex + 1] - cuSeqlensQ[batchIndex]))
+                                   : metadataArgs->maxQSeqlen;
         const uint32_t kvSeqlen = metadataArgs->isVarlenKv
                                       ? static_cast<uint32_t>(seqlensK[batchIndex + 1] - seqlensK[batchIndex])
                                       : static_cast<uint32_t>(seqlensK[batchIndex]);
@@ -356,10 +478,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 
     const uint32_t groupSizeForFlashDecode =
         metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
-    const bool isFlashDecodeCandidate = metadataArgs->isVarlen != 0 &&
-                                        metadataArgs->numSplits != 1 && metadataArgs->maskType != 2 &&
-                                        maxQSeqlen <= 16 && maxQSeqlen * groupSizeForFlashDecode <= 128 &&
-                                        maxKvSeqlen >= 1024;
+    const bool isFlashDecodeCandidate = metadataArgs->isVarlen != 0 && metadataArgs->numSplits != 1 &&
+                                        metadataArgs->maskType != 2 && maxQSeqlen <= 16 &&
+                                        maxQSeqlen * groupSizeForFlashDecode <= 128 && maxKvSeqlen >= 1024;
     if (isFlashDecodeCandidate) {
         FillFlashDecodeTiling(tilingData, metadataArgs, cuSeqlensQ, seqlensQ, seqlensK);
     }

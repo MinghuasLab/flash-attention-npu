@@ -159,6 +159,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
 
     faTilingData.set_embeddingSize(static_cast<uint32_t>(faInfo_.embeddingSize));
     faTilingData.set_embeddingSizeV(static_cast<uint32_t>(faInfo_.embeddingSizeV));
+
     if (faInfo_.pagedCacheFlag) {
         faTilingData.set_blockSize(static_cast<uint32_t>(faInfo_.blockSize));
     } else {
@@ -166,7 +167,9 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     }
     faTilingData.set_maxQSeqlen(faInfo_.maxQSeqlen);
     faTilingData.set_maxKvSeqlen(faInfo_.maxKvSeqlen);
+
     faTilingData.set_maskType(static_cast<uint32_t>(faInfo_.maskType));
+
     faTilingData.set_sparseMode(faInfo_.sparseMode);
     faTilingData.set_cacheLayout(0U);
     faTilingData.set_flashDecodeFlag(faInfo_.flashDecodeFlag ? 1U : 0U);
@@ -250,6 +253,10 @@ namespace {
 struct FdBaseTaskHost {
     uint32_t kvTiles;
     uint32_t rowNum;
+    uint32_t batchIdx;
+    uint32_t qStart;
+    uint32_t qRows;
+    uint32_t qHeadStart;
 };
 
 struct FdCandidateHost {
@@ -263,15 +270,111 @@ inline uint64_t AlignUpU64(uint64_t value, uint64_t alignment)
 {
     return (value + alignment - 1U) / alignment * alignment;
 }
+
+void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
+{
+    struct SourcePartition {
+        uint32_t task;
+        uint32_t subBlock;
+        uint32_t rows;
+    };
+    std::vector<SourcePartition> partitions;
+    uint64_t totalLoad = 0U;
+    for (uint32_t task = 0U; task < tiling.fdCombineTaskNum; ++task) {
+        const uint32_t rows = tiling.fdCombineTaskInfo[task].rowNum;
+        const uint32_t sourceSplit =
+            std::min(rows, static_cast<uint32_t>(AlignUpU64(rows, 8U)) / FD_SOURCE_SUB_BLOCK_NUM);
+        const uint32_t sourceRows[FD_SOURCE_SUB_BLOCK_NUM] = {sourceSplit, rows - sourceSplit};
+        for (uint32_t sub = 0U; sub < FD_SOURCE_SUB_BLOCK_NUM; ++sub) {
+            if (sourceRows[sub] != 0U) {
+                partitions.push_back({task, sub, sourceRows[sub]});
+            }
+        }
+        totalLoad += static_cast<uint64_t>(rows) * tiling.fdCombineSchedules[task].partialCount;
+    }
+
+    const uint32_t aivNum = tiling.fdActiveCoreNum * FD_SOURCE_SUB_BLOCK_NUM;
+    // FD has fewer base tasks than active AICs, hence every nonempty
+    // source partition can reserve at least one AIV.
+    if (aivNum == 0U || partitions.size() > aivNum) {
+        throw std::runtime_error("FD combine source partitions exceed available AIVs");
+    }
+    const uint64_t averageLoad = std::max<uint64_t>(1U, (totalLoad + aivNum - 1U) / aivNum);
+    uint32_t extraAivs = aivNum - static_cast<uint32_t>(partitions.size());
+    uint32_t nextAiv = 0U;
+    for (const auto& partition : partitions) {
+        const uint64_t load =
+            static_cast<uint64_t>(partition.rows) * tiling.fdCombineSchedules[partition.task].partialCount;
+        // Reserve one AIV for every remaining partition before deriving
+        // the row extent. Recompute the actual count after ceil rounding.
+        const uint32_t initialAivs = static_cast<uint32_t>(
+            std::min<uint64_t>(std::max<uint64_t>(1U, load / averageLoad), std::min(partition.rows, extraAivs + 1U)));
+        const uint32_t rowsPerAiv = (partition.rows + initialAivs - 1U) / initialAivs;
+        const uint32_t usedAivs = (partition.rows + rowsPerAiv - 1U) / rowsPerAiv;
+        for (uint32_t i = 0U; i < usedAivs; ++i) {
+            const uint32_t row = i * rowsPerAiv;
+            tiling.fdCombineCoreSchedules[nextAiv++] = {partition.task, partition.subBlock, row,
+                                                        std::min(rowsPerAiv, partition.rows - row)};
+        }
+        extraAivs -= usedAivs - 1U;
+    }
+    tiling.fdCombineAivNum = nextAiv;
+
+    // One combine task has no inter-task imbalance to remove. For the
+    // no-LSE path, also retain uniform dispatch when its busiest AIV's
+    // aggregate partial O fits the existing input buffer: extra metadata
+    // and per-AIV rounds can cost more than the small reduction in work.
+    // Derive this from actual partials/rows, never the requested splits.
+    tiling.fdCombineUseUniform = 0U;
+    if (tiling.fdCombineTaskNum == 1U) {
+        tiling.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE | FD_COMBINE_UNIFORM_WITH_LSE;
+    } else {
+        const uint32_t rowTile =
+            std::min(FD_COMBINE_ROW_TILE, std::max(1U, (tiling.fdCombineRowNum + aivNum - 1U) / aivNum));
+        std::vector<uint64_t> uniformLoads(aivNum, 0U);
+        std::vector<uint32_t> uniformRounds(aivNum, 0U);
+        uint32_t tile = 0U;
+        for (const auto& partition : partitions) {
+            for (uint32_t row = 0U; row < partition.rows; row += rowTile) {
+                const uint32_t core = tile++ % aivNum;
+                ++uniformRounds[core];
+                uniformLoads[core] += static_cast<uint64_t>(std::min(rowTile, partition.rows - row)) *
+                                      tiling.fdCombineSchedules[partition.task].partialCount;
+            }
+        }
+        const uint64_t maxInputElems =
+            *std::max_element(uniformLoads.begin(), uniformLoads.end()) * AlignUpU64(tiling.embeddingSizeV, 8U);
+        if (maxInputElems <= FD_COMBINE_O_INPUT_ELEMS) {
+            tiling.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE;
+            uint32_t balancedRounds = 0U;
+            for (uint32_t core = 0U; core < tiling.fdCombineAivNum; ++core) {
+                balancedRounds =
+                    std::max(balancedRounds, (tiling.fdCombineCoreSchedules[core].rowCount + FD_COMBINE_ROW_TILE - 1U) /
+                                                 FD_COMBINE_ROW_TILE);
+            }
+            // With no multi-buffer input to remove, adding a whole extra
+            // row round can also outweigh balancing the LSE stores.
+            if (balancedRounds > *std::max_element(uniformRounds.begin(), uniformRounds.end())) {
+                tiling.fdCombineUseUniform |= FD_COMBINE_UNIFORM_WITH_LSE;
+            }
+        }
+    }
+}
 } // namespace
 
 void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 {
+    tiling.fdCombineAivNum = 0U;
+    tiling.fdCombineUseUniform = 0U;
+    for (auto& schedule : tiling.fdCombineCoreSchedules) {
+        schedule = {};
+    }
     for (uint32_t i = 0; i < MAX_FD_ACTIVE_CORE_NUM; ++i) {
         tiling.fdDecodeSchedules[i] = {-1, -1, -1, -1};
     }
     for (uint32_t i = 0; i < MAX_FD_COMBINE_TASK_NUM; ++i) {
         tiling.fdCombineSchedules[i] = {-1, -1, -1, 0};
+        tiling.fdCombineTaskInfo[i] = {};
     }
 
     const uint32_t cfdMax = std::min(blockNum_, MAX_FD_ACTIVE_CORE_NUM);
@@ -300,7 +403,9 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
             for (uint32_t qNTask = 0; qNTask < qNTaskNum; ++qNTask) {
                 const uint32_t qNBlockIdxInGroup = qNTask % qNBlockNumPerGroup;
                 const uint32_t qNBlockSize = std::min(qNBlockTile, groupSize - qNBlockIdxInGroup * qNBlockTile);
-                bases.push_back({kvTileNum, qRows * qNBlockSize});
+                const uint32_t kvHeadIdx = qNTask / qNBlockNumPerGroup;
+                bases.push_back({kvTileNum, qRows * qNBlockSize, static_cast<uint32_t>(batchIdx), qTileIdx * qTile,
+                                 qRows, kvHeadIdx * groupSize + qNBlockIdxInGroup * qNBlockTile});
             }
         }
     }
@@ -388,6 +493,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 
     uint32_t partialStart = 0U;
     uint32_t combineCount = 0U;
+    uint32_t combineRows = 0U;
     for (uint32_t base = 0; base < bases.size(); ++base) {
         int32_t firstCore = -1;
         uint32_t partialCount = 0U;
@@ -402,10 +508,14 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
             }
         }
         if (partialCount > 1U) {
-            tiling.fdCombineSchedules[combineCount++] = {static_cast<int32_t>(base), firstCore,
-                                                         static_cast<int32_t>(partialStart),
-                                                         static_cast<int32_t>(partialCount)};
+            tiling.fdCombineSchedules[combineCount] = {static_cast<int32_t>(base), firstCore,
+                                                       static_cast<int32_t>(partialStart),
+                                                       static_cast<int32_t>(partialCount)};
+            const auto& info = bases[base];
+            tiling.fdCombineTaskInfo[combineCount++] = {info.batchIdx, info.qStart, info.qRows, info.qHeadStart,
+                                                        info.rowNum};
             partialStart += partialCount;
+            combineRows += bases[base].rowNum;
         }
     }
 
@@ -417,7 +527,8 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     tiling.fdActiveCoreNum = activeCores;
     tiling.fdCombineTaskNum = combineCount;
     tiling.fdPartialTaskNum = partialStart;
-    tiling.fdCombineBlockDim = std::min(blockNum_, combineCount);
+    tiling.fdCombineRowNum = combineRows;
+    FillFdCombineCoreSchedules(tiling);
     uint32_t maxFdRows = 0U;
     for (const auto& base : bases) {
         maxFdRows = std::max(maxFdRows, base.rowNum);
@@ -425,13 +536,18 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     tiling.fdRowCapacity = static_cast<uint32_t>(AlignUpU64(maxFdRows, 8U));
     tiling.fdLseSubStride = static_cast<uint32_t>(AlignUpU64((tiling.fdRowCapacity + 1U) / 2U, 8U));
 
-    const uint64_t pipelineEnd = tiling.workSpaceSize;
-    tiling.fdPartialLseOffset = AlignUpU64(pipelineEnd, FD_WORKSPACE_ALIGNMENT);
+    // The Ascend950 FD pipeline keeps QK, softmax, PV and rescale buffers
+    // on chip. Its GM workspace only needs the partial LSE and O regions.
+    tiling.set_qkOutSize(0U);
+    tiling.set_smOnlineOutSize(0U);
+    tiling.set_pvOutSize(0U);
+    tiling.set_UpdateSize(0U);
+    tiling.fdPartialLseOffset = 0U;
     const uint64_t partialLseSize =
         static_cast<uint64_t>(tiling.fdPartialCapacity) * 2U * tiling.fdLseSubStride * sizeof(float);
     tiling.fdPartialOOffset = AlignUpU64(tiling.fdPartialLseOffset + partialLseSize, FD_WORKSPACE_ALIGNMENT);
     const uint64_t partialOSize =
-        static_cast<uint64_t>(tiling.fdPartialCapacity) * tiling.fdRowCapacity * faInfo_.embeddingSizeV * SIZE_OF_16BIT;
+        static_cast<uint64_t>(tiling.fdPartialCapacity) * tiling.fdRowCapacity * faInfo_.embeddingSizeV * sizeof(float);
     tiling.fdWorkspaceEnd = tiling.fdPartialOOffset + partialOSize;
     tiling.workSpaceSize = tiling.fdWorkspaceEnd;
 }

@@ -10,7 +10,6 @@
 
 #include "fwd_dispatch.hpp"
 #include "fwd_kernel.cpp"
-#include "fd_combine.hpp"
 
 // ─── SWITCH / LAUNCH macros ───────────────────────────────────────
 // Three flat macros; none of them expands another. They are composed only at
@@ -83,12 +82,6 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
             });
         });
     });
-    if (a.flash_decode) {
-        FAFlashDecodeCombine<DType><<<a.combine_block_dim, nullptr, a.stream>>>(
-            a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device, a.lse_device,
-            a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,
-            a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks, a.max_num_blocks_per_batch);
-    }
 }
 
 #undef FWD_KERNEL_LAUNCH

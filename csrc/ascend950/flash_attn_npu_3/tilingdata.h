@@ -40,6 +40,12 @@ struct splitNode {
 
 constexpr uint32_t MAX_FD_ACTIVE_CORE_NUM = 32U;
 constexpr uint32_t MAX_FD_COMBINE_TASK_NUM = 32U;
+constexpr uint32_t FD_COMBINE_ROW_TILE = 8U;
+constexpr uint32_t FD_SOURCE_SUB_BLOCK_NUM = 2U;
+constexpr uint32_t MAX_FD_COMBINE_AIV_NUM = MAX_FD_ACTIVE_CORE_NUM * FD_SOURCE_SUB_BLOCK_NUM;
+constexpr uint32_t FD_COMBINE_O_INPUT_ELEMS = MAX_FD_ACTIVE_CORE_NUM * 256U;
+constexpr uint32_t FD_COMBINE_UNIFORM_NO_LSE = 1U;
+constexpr uint32_t FD_COMBINE_UNIFORM_WITH_LSE = 2U;
 
 struct FdDecodeSchedule {
     int32_t baseTaskStart;
@@ -55,15 +61,36 @@ struct FdCombineSchedule {
     int32_t partialCount;
 };
 
+// Output geometry follows used Q lengths. batchIdx selects the original cu-Q
+// storage offset at runtime, which may differ from the used-length prefix sum.
+struct FdCombineTaskInfo {
+    uint32_t batchIdx;
+    uint32_t qStart;
+    uint32_t qRows;
+    uint32_t qHeadStart;
+    uint32_t rowNum;
+};
+
+// One contiguous range in one source subblock per AIV. rowCount may exceed
+// FD_COMBINE_ROW_TILE; the kernel processes it in rounds of at most eight rows.
+struct FdCombineCoreSchedule {
+    uint32_t combineTaskIdx;
+    uint32_t sourceSubBlock;
+    uint32_t sourceLocalRow;
+    uint32_t rowCount;
+};
+
 struct FAInferTilingData {
     uint32_t numHeads;
     uint32_t embeddingSize;
     uint32_t embeddingSizeV;
+
     uint32_t blockSize;
     uint32_t maxQSeqlen;
     uint32_t maxKvSeqlen;
     uint32_t kvHeads;
     uint32_t batch;
+
     uint32_t firstBatchTaskNum;
     uint32_t totalTaskNum;
     uint32_t maskType;
@@ -72,6 +99,7 @@ struct FAInferTilingData {
     uint64_t pvOutSize;
     uint64_t UpdateSize;
     uint64_t workSpaceSize;
+
     uint64_t padding1;
     uint64_t padding2;
     uint32_t padding3;
@@ -100,8 +128,11 @@ struct FAInferTilingData {
     uint32_t fdPartialCapacity;
     uint32_t fdRowCapacity;
     uint32_t fdLseSubStride;
-    uint32_t fdCombineBlockDim;
-    uint32_t fdReserved;
+    uint32_t fdCombineRowNum;
+    // Share the original reserved word. At most 64 AIVs and two mode bits;
+    // keeping the policy beside main FD fields avoids another GM cache line.
+    uint16_t fdCombineAivNum;
+    uint16_t fdCombineUseUniform;
     uint64_t fdPartialLseOffset;
     uint64_t fdPartialOOffset;
     uint64_t fdWorkspaceEnd;
@@ -127,6 +158,10 @@ struct FAInferTilingData {
     uint32_t vL1BufNum;
     uint32_t pL1BufNum;
 
+    // Append combine-only metadata to preserve all main-attention field offsets.
+    FdCombineTaskInfo fdCombineTaskInfo[MAX_FD_COMBINE_TASK_NUM];
+    FdCombineCoreSchedule fdCombineCoreSchedules[MAX_FD_COMBINE_AIV_NUM];
+
     // Getter functions
     uint32_t get_numHeads() const
     {
@@ -140,6 +175,7 @@ struct FAInferTilingData {
     {
         return embeddingSizeV;
     }
+
     uint32_t get_blockSize() const
     {
         return blockSize;
@@ -160,6 +196,7 @@ struct FAInferTilingData {
     {
         return batch;
     }
+
     uint32_t get_firstBatchTaskNum() const
     {
         return firstBatchTaskNum;
@@ -192,6 +229,7 @@ struct FAInferTilingData {
     {
         return workSpaceSize;
     }
+
     uint64_t get_padding1() const
     {
         return padding1;
@@ -228,9 +266,9 @@ struct FAInferTilingData {
     {
         return fdActiveCoreNum;
     }
-    uint32_t get_fdCombineBlockDim() const
+    uint32_t get_fdCombineRowNum() const
     {
-        return fdCombineBlockDim;
+        return fdCombineRowNum;
     }
 
     // Setter functions
@@ -246,6 +284,7 @@ struct FAInferTilingData {
     {
         embeddingSizeV = value;
     }
+
     void set_blockSize(uint32_t value)
     {
         blockSize = value;
@@ -266,6 +305,7 @@ struct FAInferTilingData {
     {
         batch = value;
     }
+
     void set_firstBatchTaskNum(uint32_t value)
     {
         firstBatchTaskNum = value;
@@ -298,6 +338,7 @@ struct FAInferTilingData {
     {
         workSpaceSize = value;
     }
+
     void set_padding1(uint64_t value)
     {
         padding1 = value;

@@ -8,7 +8,7 @@
 
 static_assert(std::is_trivially_copyable<FAInferStaticTilingData>::value, "static tiling must be trivially copyable");
 static_assert(std::is_standard_layout<FAInferStaticTilingData>::value, "static tiling must have a stable layout");
-static_assert(sizeof(FAInferStaticTilingData) == 3544, "static metadata ABI changed; update Python fake size");
+static_assert(sizeof(FAInferStaticTilingData) == 5208, "static metadata ABI changed; update Python fake size");
 static_assert(std::is_trivially_copyable<FAInferRuntimeData>::value, "runtime tiling must be trivially copyable");
 static_assert(std::is_standard_layout<FAInferRuntimeData>::value, "runtime tiling must have a stable layout");
 static_assert(sizeof(FAInferRuntimeData) == 48, "runtime tiling ABI changed");

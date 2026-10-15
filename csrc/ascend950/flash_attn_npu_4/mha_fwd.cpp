@@ -287,8 +287,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         SeqlenScratch scratch;
         optiling::FAInferContext ctx;
         fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
-                               seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu,
-                               paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
+                               seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu, paged_KV,
+                               page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
                                is_local ? window_size_left : 0, is_local ? window_size_right : 0, is_varlen_q, is_bf16,
                                batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
@@ -300,21 +300,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         tiler.DoTiling(tilingData);
     }
 
-    // The 950 chunk-prefill driver overrides workSpaceSize to 128 MiB
-    constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
-    if (!scheduler_metadata_.has_value() && tilingData.workSpaceSize < WS_FLOOR) {
-        tilingData.workSpaceSize = WS_FLOOR;
-    }
-
-    // ============================================================
-    // 8. Allocate output-side buffers on NPU
-    // ============================================================
-    auto workspace =
-        at::empty({static_cast<int64_t>(scheduler_metadata_.has_value() ? WS_FLOOR : tilingData.workSpaceSize)},
-                  at::device(at::kPrivateUse1).dtype(at::kByte));
     // Metadata tiling also carries FlashDecode schedules. Avoid synchronizing
     // per-batch lengths on the host just to inspect the AICPU-written flag;
-    // use the same declared-shape eligibility here and let the combine kernel
+    // use the same declared-shape eligibility here and let the fused kernel
     // guard against a metadata schedule that was disabled by AICPU.
     const int64_t metadataKvBound =
         max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
@@ -332,6 +320,20 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const bool flashDecodeEnabled =
         scheduler_metadata_.has_value() ? metadataFlashDecodeCandidate : tilingData.flashDecodeFlag != 0U;
 
+    // Metadata and non-FD calls retain the conservative workspace allocation.
+    // Host-tiled FD calls use the exact partial O/LSE workspace size.
+    constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
+    if (!scheduler_metadata_.has_value() && !flashDecodeEnabled && tilingData.workSpaceSize < WS_FLOOR) {
+        tilingData.workSpaceSize = WS_FLOOR;
+    }
+
+    // ============================================================
+    // 8. Allocate output-side buffers on NPU
+    // ============================================================
+    auto workspace =
+        at::empty({static_cast<int64_t>(scheduler_metadata_.has_value() ? WS_FLOOR : tilingData.workSpaceSize)},
+                  at::device(at::kPrivateUse1).dtype(at::kByte));
+
     at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (return_lse && is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
@@ -340,10 +342,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     }
     if (return_lse) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    }
-    at::Tensor fd_lse;
-    if (flashDecodeEnabled && !return_lse) {
-        fd_lse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
 
     // ============================================================
@@ -360,8 +358,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         // Alias only the read-only scheduling buffer. Each forward owns a small
         // runtime buffer, so different streams never overwrite shared metadata.
         tiling_dev = metadata;
-        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))},
-                               q.options().dtype(at::kByte));
+        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
         FARuntimeArgs runtimeArgs{};
         runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
         auto& runtime = runtimeArgs.runtime;
@@ -396,8 +393,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
                         "create merge completion event failed");
         }
-        auto write_runtime = [runtimeArgs, aclStream, aicpuStream,
-                             input_ready = events.input_ready, done = events.done]() mutable -> int {
+        auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
+                              done = events.done]() mutable -> int {
             TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
             TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS, "wait for merge input failed");
             WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
@@ -433,8 +430,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto kDev = static_cast<uint8_t*>(k.data_ptr());
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
-    auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr())
-                             : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
+    auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
     auto runtimeDev = static_cast<uint8_t*>(runtime_dev.data_ptr());
@@ -462,13 +458,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     }
     auto qSeqDev = static_cast<uint8_t*>(q_seq_i64.data_ptr());
     auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
-    auto seqUsedQDev = seqused_q_.has_value() ?
-        static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
-    auto seqUsedKvDev = seqused_k_.has_value() ?
-        static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
-    auto blockTableDev = paged_KV
-        ? static_cast<uint8_t*>(page_table.data_ptr())
-        : nullptr;
+    auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
+    auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
+    auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     if (is_causal || is_local) {
@@ -482,31 +474,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                         ? (flashDecodeEnabled ? metadataFdCoreCapacity : blockDim)
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
-    const FwdLaunchArgs fwdArgs{is_bf16,
-                                fmt,
-                                mask_category,
-                                paged_KV,
-                                enableDN,
-                                return_lse,
-                                is_softcap,
-                                flashDecodeEnabled,
-                                scheduler_metadata_.has_value() ? metadataFdCoreCapacity : tilingData.fdCombineBlockDim,
-                                launchBlockDim,
-                                aclStream,
-                                qDev,
-                                kDev,
-                                vDev,
-                                maskDev,
-                                blockTableDev,
-                                oDev,
-                                lseDev,
-                                qSeqDev,
-                                kvSeqDev,
-                                seqUsedQDev,
-                                seqUsedKvDev,
-                                wsDev,
-                                tilDev,
-                                runtimeDev};
+    const FwdLaunchArgs fwdArgs{
+        is_bf16,   fmt,      mask_category, paged_KV,     enableDN, return_lse,    is_softcap, launchBlockDim,
+        aclStream, qDev,     kDev,          vDev,         maskDev,  blockTableDev, oDev,       lseDev,
+        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,    tilDev,        runtimeDev};
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

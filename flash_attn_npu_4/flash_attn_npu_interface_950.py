@@ -53,7 +53,7 @@ def _window_to_npu(window_size: Optional[int]) -> int:
 # this in sync with fa_metadata::MetadataBytes(false) in
 # csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
 # metadata, its size does not depend on the input sequence lengths or mask.
-_SCHEDULER_METADATA_TILING_BYTES = 3544
+_SCHEDULER_METADATA_TILING_BYTES = 5208
 
 
 @_torch_custom_op_wrapper(
