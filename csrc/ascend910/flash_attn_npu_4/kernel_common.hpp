@@ -74,16 +74,27 @@ struct FAIKernelParams {
     uint64_t blockTableStride;
     GM_ADDR seqUsedQ;
     GM_ADDR seqUsedKv;
+    // Element strides along batch/seq/head for Q/K/V. For contiguous BSND inputs
+    // these carry the values the kernel previously hard-coded (batch=S*N*D,
+    // seq=N*D, head=D); strided BSND views pass their real offsets.
+    uint64_t qBatchStride, qSeqStride, qHeadStride;
+    uint64_t kBatchStride, kSeqStride, kHeadStride;
+    uint64_t vBatchStride, vSeqStride, vHeadStride;
 
     __aicore__ inline FAIKernelParams() {}
 
     __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_,
                                       GM_ADDR workSpace_, GM_ADDR tiling_, GM_ADDR runtime_, uint64_t blockTableStride_,
-                                      GM_ADDR seqUsedQ_ = nullptr, GM_ADDR seqUsedKv_ = nullptr)
+                                      GM_ADDR seqUsedQ_ = nullptr, GM_ADDR seqUsedKv_ = nullptr,
+                                      uint64_t qBatchStride_ = 0, uint64_t qSeqStride_ = 0, uint64_t qHeadStride_ = 0,
+                                      uint64_t kBatchStride_ = 0, uint64_t kSeqStride_ = 0, uint64_t kHeadStride_ = 0,
+                                      uint64_t vBatchStride_ = 0, uint64_t vSeqStride_ = 0, uint64_t vHeadStride_ = 0)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), runtime(runtime_),
-          blockTableStride(blockTableStride_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_)
+          blockTableStride(blockTableStride_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), qBatchStride(qBatchStride_),
+          qSeqStride(qSeqStride_), qHeadStride(qHeadStride_), kBatchStride(kBatchStride_), kSeqStride(kSeqStride_),
+          kHeadStride(kHeadStride_), vBatchStride(vBatchStride_), vSeqStride(vSeqStride_), vHeadStride(vHeadStride_)
     {}
 };
 

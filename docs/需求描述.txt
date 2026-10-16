@@ -1,0 +1,15 @@
+1. 需求详情
+
+Flash Attention 4 前向接口（flash_attn_func / flash_attn_varlen_func / flash_attn_with_kvcache）新增对非连续内存 BSND 布局的支持，该布局由 BNSD transpose 得到。
+
+2.具体说明：
+
+BSND 布局定义：张量形状为 (Batch, Seqlen, Nheads, Headdim)，即 batch 维、序列维、头数维、头维度依次排列。
+
+BNSD transpose 的含义：调用方将形状 (Batch, Nheads, Seqlen, Headdim) 的 BNSD 张量执行 transpose(1, 2)，得到逻辑形状为 BSND 的张量。由于 transpose 只改变 stride 而不复制数据，结果张量的内存不连续——这是该特性的核心场景。
+
+接口直接消费非连续输入：FA4 前向 kernel 按张量的真实 stride 计算内存偏移，不再要求调用方先执行 .contiguous() 将数据复制为连续布局。
+
+性能收益：省去一次显式的 contiguous 拷贝，减少显存占用和带宽开销。对于 KV Cache 场景，该优化对推理延迟的影响尤为明显
+
+3. 硬件型号：910

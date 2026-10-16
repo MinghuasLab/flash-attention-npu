@@ -26,7 +26,8 @@
                        SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tilingDevice, runtimeDevice, a.blockTableStride, sequsedQDevice,                 \
-        sequsedKVDevice)
+        sequsedKVDevice, a.qBatchStride, a.qSeqStride, a.qHeadStride, a.kBatchStride, a.kSeqStride, a.kHeadStride,     \
+        a.vBatchStride, a.vSeqStride, a.vHeadStride)
 
 #define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)                                                                         \
     do {                                                                                                               \

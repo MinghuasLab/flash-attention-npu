@@ -37,7 +37,26 @@ else:
 
 
 def maybe_contiguous(x):
+    """Only materialize when the last dim is not contiguous; outer strides are
+    preserved so a BNSD.transpose(1, 2) BSND view is passed through zero-copy."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _is_bnsd_transpose_view(x):
+    """BSND view produced by BNSD.transpose(1, 2) — stride == (N*S*D, D, S*D, 1)."""
+    if x is None or x.dim() != 4 or x.stride(-1) != 1:
+        return False
+    _, seqlen, nheads, headdim = x.shape
+    return x.stride() == (nheads * seqlen * headdim, headdim, seqlen * headdim, 1)
+
+
+def maybe_contiguous_last_dim(x):
+    """Keep Q/K/V outer strides; only the D dimension must be contiguous."""
+    return (
+        x.contiguous()
+        if x is not None and x.stride(-1) != 1 and not _is_bnsd_transpose_view(x)
+        else x
+    )
 
 
 def round_multiple(x, m):
@@ -120,7 +139,7 @@ def _flash_attn_forward(
     scheduler_metadata: Optional[torch.Tensor] = None,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    q, k = [maybe_contiguous(x) for x in (q, k)]
+    q, k = [maybe_contiguous_last_dim(x) for x in (q, k)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
     seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]

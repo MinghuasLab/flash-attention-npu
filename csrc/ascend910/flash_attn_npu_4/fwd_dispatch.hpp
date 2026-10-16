@@ -48,6 +48,11 @@ struct FwdLaunchArgs {
     uint8_t* runtimeDevice;
     uint8_t* sequsedQDevice;
     uint8_t* sequsedKVDevice;
+    // Element strides of Q/K/V along batch/seq/head (contiguous BSND degenerates
+    // to batch=S*N*D, seq=N*D, head=D).
+    uint64_t qBatchStride, qSeqStride, qHeadStride;
+    uint64_t kBatchStride, kSeqStride, kHeadStride;
+    uint64_t vBatchStride, vSeqStride, vHeadStride;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp

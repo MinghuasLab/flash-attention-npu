@@ -96,6 +96,43 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     return meta;
 }
 
+// Element-level strides (in elements, not bytes) along the batch / seq / head
+// axes of a 3D (total, h, d) or 4D (b, s, h, d) Q/K/V tensor. FA4 kernels
+// consume these directly so that non-contiguous BSND views
+// (e.g. BNSD.transpose(1, 2)) are supported zero-copy; for contiguous inputs
+// the values degenerate to the previously hard-coded constants.
+struct QkvElementStrides {
+    uint64_t batch;
+    uint64_t seq;
+    uint64_t head;
+};
+
+static QkvElementStrides GetQkvElementStrides(const at::Tensor& x, const char* name)
+{
+    TORCH_CHECK(x.dim() == 3 || x.dim() == 4, name, " must be 3D (total, h, d) or 4D (b, s, h, d), got ", x.dim(), "D");
+    TORCH_CHECK(x.stride(-1) == 1, name, " must have contiguous last dimension");
+
+    const int64_t max_u32 = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+    TORCH_CHECK(x.stride(0) >= 0 && x.stride(1) >= 0 && x.stride(2) >= 0, name, " must have non-negative strides");
+
+    QkvElementStrides s{};
+    if (x.dim() == 4) {
+        s.batch = static_cast<uint64_t>(x.stride(0));
+        s.seq = static_cast<uint64_t>(x.stride(1));
+        s.head = static_cast<uint64_t>(x.stride(2));
+    } else {
+        // varlen / paged-KV single-batch-axis layout: the batch stride is unused
+        // (offset 0) and the leading axis is the token (seq) axis.
+        s.batch = 0;
+        s.seq = static_cast<uint64_t>(x.stride(0));
+        s.head = static_cast<uint64_t>(x.stride(1));
+    }
+    // The DMA descriptors encode the seq/head strides in 32 bits.
+    TORCH_CHECK(static_cast<int64_t>(s.seq) <= max_u32 && static_cast<int64_t>(s.head) <= max_u32, name,
+                " seq/head strides must fit in uint32_t");
+    return s;
+}
+
 std::vector<at::Tensor> mha_fwd(
     at::Tensor q, // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     at::Tensor
@@ -129,9 +166,9 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor k must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor v must have contiguous last dimension");
+    const auto qStrides = GetQkvElementStrides(q, "q");
+    const auto kStrides = GetQkvElementStrides(k, "k");
+    const auto vStrides = GetQkvElementStrides(v, "v");
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t launchBlockDim = blockDim;
     at::Tensor seqlens_k, block_table, out;
@@ -145,7 +182,7 @@ std::vector<at::Tensor> mha_fwd(
     if (paged_KV) {
         auto page_table = page_table_.value();
         TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype int32");
-        TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+        TORCH_CHECK(page_table.is_contiguous(), "page_table must be contiguous");
     }
 
     if (is_varlen_q) {
@@ -185,9 +222,11 @@ std::vector<at::Tensor> mha_fwd(
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
     } else {
-        out = torch::empty_like(q);
+        // Always allocate the output densely in BSND order: Q may be a
+        // non-contiguous strided view whose layout empty_like would preserve.
+        out = torch::empty(q.sizes(), q.options());
     }
     const auto sizes = q.sizes();
 
@@ -619,6 +658,19 @@ std::vector<at::Tensor> mha_fwd(
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.runtimeDevice = runtimeDevice;
+    // Element strides of Q/K/V along batch/seq/head (see QkvElementStrides).
+    // For contiguous inputs these equal the values the kernel used to hard-code,
+    // so the launch stays bit-identical; for strided BSND views they carry the
+    // real offsets.
+    fwd_args.qBatchStride = qStrides.batch;
+    fwd_args.qSeqStride = qStrides.seq;
+    fwd_args.qHeadStride = qStrides.head;
+    fwd_args.kBatchStride = kStrides.batch;
+    fwd_args.kSeqStride = kStrides.seq;
+    fwd_args.kHeadStride = kStrides.head;
+    fwd_args.vBatchStride = vStrides.batch;
+    fwd_args.vSeqStride = vStrides.seq;
+    fwd_args.vHeadStride = vStrides.head;
     // Launch the forward kernel through RunOpApiV2, matching the v3 path. The
     // scheduler-metadata task (GetSchedulerMetadataImpl) is also enqueued via
     // RunOpApiV2, so both run through the same ordered task queue: the metadata
