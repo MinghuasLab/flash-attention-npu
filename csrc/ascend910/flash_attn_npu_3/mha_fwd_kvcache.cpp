@@ -273,12 +273,12 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID7);
 
         const bool headDimSplit = embed > NUM_256;
-        uint32_t kDynNum = L1_HEAD_DIM_SLICE;
+        uint32_t kDynNum = NUM_256;
         uint32_t nDynNum = L1_D512_KV_TILE;
         uint32_t qL1DynNum = embed;
-        uint32_t kPVDynNum = L1_D512_KV_TILE;
+        uint32_t kPVDynNum = NUM_256;
         uint32_t vL1Stages = DOUBLE_BUFFER;
-        uint32_t vSegLen = L1_D512_KV_TILE;
+        uint32_t vSegLen = NUM_256;
         uint32_t vSliceWidth = L1_HEAD_DIM_SLICE;
         if (!headDimSplit) {
             // Preserve the production <=256 layout.
