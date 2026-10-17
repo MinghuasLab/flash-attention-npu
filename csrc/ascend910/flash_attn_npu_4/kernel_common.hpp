@@ -78,6 +78,7 @@ struct FAIKernelParams {
     // BNSD only: the allocated per-batch KV sequence length (k.size(2), i.e. the
     // per-head plane pitch in elements); 0 for BSND / TND.
     int64_t kvSeqlenAllocated;
+    GM_ADDR sink;
 
     __aicore__ inline FAIKernelParams() {}
 
@@ -85,11 +86,11 @@ struct FAIKernelParams {
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_,
                                       GM_ADDR workSpace_, GM_ADDR tiling_, GM_ADDR runtime_, uint64_t blockTableStride_,
                                       GM_ADDR seqUsedQ_ = nullptr, GM_ADDR seqUsedKv_ = nullptr,
-                                      int64_t kvSeqlenAllocated_ = 0)
+                                      int64_t kvSeqlenAllocated_ = 0, GM_ADDR sink_ = nullptr)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), runtime(runtime_),
           blockTableStride(blockTableStride_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_),
-          kvSeqlenAllocated(kvSeqlenAllocated_)
+          kvSeqlenAllocated(kvSeqlenAllocated_), sink(sink_)
     {}
 };
 

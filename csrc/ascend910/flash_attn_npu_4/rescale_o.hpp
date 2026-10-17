@@ -411,6 +411,9 @@ public:
         }
 
         if (isLastStackTile) {
+            if (applySink_) {
+                ApplyLearnableSink(curRowNum, stateRowOffset, rowOffsetLoop, embed, embedRound, qSThisSubBlock);
+            }
             // *** gl_block = expand_to_block(gl)
             AscendC::Brcb(
                 tvUbTensor.ReinterpretCast<uint32_t>(),
@@ -530,9 +533,11 @@ public:
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
 
-                    InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx,
-                            inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
-                            lseUbTensor);
+                    if (!hasSink_) {
+                        InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx,
+                                inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
+                                lseUbTensor);
+                    }
                     AscendC::Brcb(
                         lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
                         lseUbTensor.ReinterpretCast<uint32_t>(),
@@ -653,6 +658,158 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
     }
 
+    // Fold one bfloat16 sink logit per query head into the running max / sum
+    // before O is normalized. Rows that never saw a finite score (gm == -inf,
+    // or a fully masked -3e38) pick up LSE = sink and a zero output.
+    __aicore__ inline
+    void ApplyLearnableSink(uint32_t curRowNum, uint32_t stateRowOffset, uint32_t rowOffsetLoop, uint32_t embed,
+        uint32_t embedRound, uint32_t qSThisSubBlock)
+    {
+        if (curRowNum == 0U) {
+            return;
+        }
+        uint32_t aligned = RoundUp(curRowNum, FLOAT_BLOCK_SIZE);
+        AscendC::LocalTensor<float> sinkRows = loUbTensor;
+        AscendC::LocalTensor<float> oldMax = loUbTensor[MAX_ROW_NUM_SUB_CORE];
+        AscendC::LocalTensor<float> scale = loUbTensor[MAX_ROW_NUM_SUB_CORE * 2];
+
+        for (uint32_t row = 0; row < curRowNum; ++row) {
+            uint32_t head = qNStartIdx_;
+            if (qNBlockSize_ > 1U) {
+                uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+                uint32_t subBlockNum = AscendC::GetSubBlockNum();
+                uint32_t qNSplit = qNBlockSize_ / subBlockNum;
+                uint32_t headInSub = (rowOffsetLoop + row) / qSThisSubBlock;
+                head = qNStartIdx_ + subBlockIdx * qNSplit + headInSub;
+            }
+            sinkRows.SetValue(row, AscendC::ToFloat(gSink_.GetValue(head)));
+        }
+        for (uint32_t row = curRowNum; row < aligned; ++row) {
+            sinkRows.SetValue(row, 0.0f);
+            scale.SetValue(row, 1.0f);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        for (uint32_t off = 0; off < curRowNum; off += FLOAT_VECTOR_SIZE) {
+            uint32_t n = AscendC::Std::min(FLOAT_VECTOR_SIZE, curRowNum - off);
+            SetMask(static_cast<int32_t>(n));
+            AscendC::Adds<float, false>(
+                oldMax[off], gmUbTensor[stateRowOffset + off], 0.0f, (uint64_t)0, 1,
+                AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Max<float, false>(
+                gmUbTensor[stateRowOffset + off], oldMax[off], sinkRows[off], (uint64_t)0, 1,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub<float, false>(
+                scale[off], oldMax[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp<float, false>(
+                scale[off], scale[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul<float, false>(
+                glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], scale[off], (uint64_t)0, 1,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub<float, false>(
+                sinkRows[off], sinkRows[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp<float, false>(
+                sinkRows[off], sinkRows[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add<float, false>(
+                glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], sinkRows[off], (uint64_t)0, 1,
+                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+
+        AscendC::Brcb(
+            tvUbTensor.ReinterpretCast<uint32_t>(), scale.ReinterpretCast<uint32_t>(),
+            aligned / FLOAT_BLOCK_SIZE, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t vmul_idx = 0; vmul_idx < embed / FLOAT_VECTOR_SIZE; ++vmul_idx) {
+            AscendC::Mul<float, false>(
+                goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE], goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE], tvUbTensor,
+                (uint64_t)0, curRowNum,
+                AscendC::BinaryRepeatParams(
+                    1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+        }
+        if (embed % FLOAT_VECTOR_SIZE > 0) {
+            SetMask(static_cast<int32_t>(embed % FLOAT_VECTOR_SIZE));
+            AscendC::Mul<float, false>(
+                goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0, curRowNum,
+                AscendC::BinaryRepeatParams(
+                    1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline
+    void WriteRepeatedScalar(AscendC::GlobalTensor<float> dst, float value, uint32_t count, uint32_t stride)
+    {
+        if (count == 0U) {
+            return;
+        }
+        for (uint32_t off = 0; off < count; off += FLOAT_VECTOR_SIZE) {
+            uint32_t n = AscendC::Std::min(FLOAT_VECTOR_SIZE, count - off);
+            AscendC::Duplicate(lseStagingUbTensor, value, n);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyPad(
+                dst[off * stride], lseStagingUbTensor,
+                AscendC::DataCopyExtParams(n, sizeof(float), 0, (stride - 1U) * sizeof(float), 0));
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+    }
+
+    // Non-split empty tile: O is already 0. Replace the +inf LSE with the sink logit.
+    __aicore__ inline
+    void OverwriteEmptyTaskLse(AscendC::GlobalTensor<float> gLse, uint32_t lseHeadStride, uint32_t tokenStart,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    {
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        if (qNBlockSize <= 1U) {
+            uint32_t tokenSplit = qSBlockSize / subBlockNum;
+            uint32_t tokenCount = (subBlockIdx == subBlockNum - 1U) ? (qSBlockSize - subBlockIdx * tokenSplit)
+                                                                     : tokenSplit;
+            if (tokenCount == 0U) {
+                return;
+            }
+            float sink = AscendC::ToFloat(gSink.GetValue(qNStartIdx));
+            WriteRepeatedScalar(
+                gLse[qNStartIdx * lseHeadStride + tokenStart + subBlockIdx * tokenSplit], sink, tokenCount, 1U);
+            return;
+        }
+        uint32_t qNSplit = qNBlockSize / subBlockNum;
+        uint32_t headBegin = subBlockIdx * qNSplit;
+        uint32_t headCount = (subBlockIdx == subBlockNum - 1U) ? (qNBlockSize - headBegin) : qNSplit;
+        for (uint32_t localHead = 0; localHead < headCount; ++localHead) {
+            float sink = AscendC::ToFloat(gSink.GetValue(qNStartIdx + headBegin + localHead));
+            WriteRepeatedScalar(
+                gLse[(qNStartIdx + headBegin + localHead) * lseHeadStride + tokenStart], sink, qSBlockSize, 1U);
+        }
+    }
+
+    // First SplitKV chunk produced no tiles. Partial O stays 0; partial LSE becomes the sink.
+    // Layout is (qS, qN) row-major, matching rescale's gCombineLse stores.
+    __aicore__ inline
+    void OverwriteEmptySplitLse(AscendC::GlobalTensor<float> gPartial, uint32_t qSBlockSize, uint32_t qNBlockSize,
+        uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    {
+        if (AscendC::GetSubBlockIdx() != 0U) {
+            return;
+        }
+        for (uint32_t localHead = 0; localHead < qNBlockSize; ++localHead) {
+            float sink = AscendC::ToFloat(gSink.GetValue(qNStartIdx + localHead));
+            WriteRepeatedScalar(gPartial[localHead], sink, qSBlockSize, qNBlockSize);
+        }
+    }
+
     __aicore__ inline
     void operator()(
         AscendC::GlobalTensor<ElementOutput> gOutput,
@@ -671,8 +828,15 @@ public:
         uint32_t oHeadStride,
         const SplitKVParams& splitParams = SplitKVParams(),
         int32_t invalidSuffixStartRow = 0, int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0,
-        uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1)
+        uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1, bool hasSink = false, bool applySink = false,
+        uint32_t qNStartIdx = 0, AscendC::GlobalTensor<bfloat16_t> gSink = {})
     {
+        hasSink_ = hasSink;
+        applySink_ = applySink;
+        qNStartIdx_ = qNStartIdx;
+        qNBlockSize_ = qNBlockSize;
+        gSink_ = gSink;
+        (void)curQNBlockTile;
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
         uint32_t embedRoundV = (layoutInput.stride(0) == 0) ? BLOCK_SIZE : layoutInput.stride(0);
@@ -830,6 +994,11 @@ private:
     AscendC::LocalTensor<float> goUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor;
     AscendC::LocalTensor<float> lseStagingUbTensor;
+    bool hasSink_ = false;
+    bool applySink_ = false;
+    uint32_t qNStartIdx_ = 0;
+    uint32_t qNBlockSize_ = 1;
+    AscendC::GlobalTensor<bfloat16_t> gSink_;
 };
 
 }

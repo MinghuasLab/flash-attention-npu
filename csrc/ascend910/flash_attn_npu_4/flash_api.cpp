@@ -197,7 +197,6 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "NPU FlashAttention does not support pack_gqa");
     TORCH_CHECK(!min_seqlen_k_.has_value(), "NPU FlashAttention does not support min_seqlen_k");
     TORCH_CHECK(!gather_kv_indices_.has_value(), "NPU FlashAttention does not support gather_kv_indices");
-    TORCH_CHECK(!learnable_sink_.has_value(), "NPU FlashAttention does not support learnable_sink");
 
     // Input layout (Q/K/V share one layout): 0 = TND (varlen packed),
     // 1 = BSND, 2 = BNSD. TND is exactly the cu_seqlens_q (varlen-q) form, and
@@ -271,6 +270,18 @@ std::vector<at::Tensor> mha_fwd(
         TORCH_CHECK(head_size_og >= 1, "head dimension must be positive");
     }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    at::Tensor learnable_sink_hold;
+    uint8_t* sinkDevice = nullptr;
+    if (learnable_sink_.has_value()) {
+        learnable_sink_hold = learnable_sink_.value();
+        TORCH_CHECK(learnable_sink_hold.device() == q.device(), "learnable_sink must be on the same device as query");
+        TORCH_CHECK(learnable_sink_hold.dtype() == torch::kBFloat16, "learnable_sink must be bfloat16");
+        TORCH_CHECK(learnable_sink_hold.dim() == 1 && learnable_sink_hold.size(0) == num_heads,
+                    "learnable_sink must have shape (num_heads,), got ", learnable_sink_hold.sizes());
+        TORCH_CHECK(learnable_sink_hold.stride(0) == 1, "learnable_sink must be contiguous");
+        sinkDevice = static_cast<uint8_t*>(learnable_sink_hold.data_ptr());
+    }
 
     // If seqused_k_ was not provided, derive seqlens_k from tensor shapes or cu_seqlens_k
     if (!seqused_k_.has_value()) {
@@ -630,6 +641,7 @@ std::vector<at::Tensor> mha_fwd(
     fwd_args.kv_seqlen_allocated = kv_seqlen_allocated;
     fwd_args.sequsedQDevice = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     fwd_args.sequsedKVDevice = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
+    fwd_args.sinkDevice = sinkDevice;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -651,7 +663,8 @@ std::vector<at::Tensor> mha_fwd(
     // from reading uninitialized tiling on the first call in a fresh process.
     // seqlenk_gpu_tensor is captured by value to keep it alive for the deferred
     // task (the lambda outlives the local tensor scope).
-    auto launch_fa_infer = [fwd_args, seqlenk_gpu_tensor]() -> int {
+    auto launch_fa_infer = [fwd_args, seqlenk_gpu_tensor, learnable_sink_hold]() -> int {
+        (void)learnable_sink_hold;
         if (fwd_args.layout == FaiKenel::inputLayout::TND) {
             launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
         } else if (fwd_args.layout == FaiKenel::inputLayout::BNSD) {
