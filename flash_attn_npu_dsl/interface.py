@@ -46,8 +46,15 @@ def _select_kernel_options(
     if pack_gqa is not False and q_len < q_tile and group > 1 and shared_heads:
         original_tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
         packed_tasks = batch * kv_heads * ((q_len * group + q_tile - 1) // q_tile)
-        # Folding heads must reduce tasks without losing occupied cores.
-        if min(original_tasks, cores) <= packed_tasks < original_tasks:
+        # For several waves of padded head tasks, reduced KV work can outweigh
+        # lower core occupancy. Require four original waves and retain at least
+        # a quarter of the cores; the wide-D path keeps its original resource gate.
+        enough_folded_work = (
+            q_tile == 128 and original_tasks >= 4 * cores and 4 * packed_tasks >= cores
+        )
+        if packed_tasks < original_tasks and (
+            packed_tasks >= min(original_tasks, cores) or enough_folded_work
+        ):
             packed_heads = group
     # Per-row SIMT coordinate work can outweigh packing beyond short Q.
     if has_simt_mod and q_len > 32:
@@ -463,6 +470,7 @@ def _flash_attention(
                     seqlen_k=storage_lengths[1] if storage_lengths is not None else kv_len,
                     device=q.device,
                 )
+        sparse_strides = sparse.strides if sparse is not None else None
         packed_heads, use_dn, full_dn = _select_kernel_options(
             batch,
             q_len,
@@ -484,20 +492,14 @@ def _flash_attention(
             pack_gqa=pack_gqa,
         )
         if packed_heads > 1:
-            # Only MQA has a contiguous folded view. GQA groups are gathered and
-            # scattered on device, retaining the original BSND descriptors.
-            if dynamic_lengths and kv_heads == 1:
-                q = q.view(batch, q_len * packed_heads, 1, head_dim)
             q_len *= packed_heads
             q_heads = kv_heads
-            if sparse is not None:
+            if sparse_strides is not None:
                 # Every packed tile uses the original single Q-block list.
                 # Only its addressing changes; the caller's tensors stay intact.
-                sparse = sparse._replace(
-                    strides=tuple(
-                        (stride[0], stride[1], 0) if stride is not None else None
-                        for stride in sparse.strides
-                    )
+                sparse_strides = tuple(
+                    (stride[0], stride[1], 0) if stride is not None else None
+                    for stride in sparse_strides
                 )
         tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
         splits = 1
@@ -553,15 +555,25 @@ def _flash_attention(
                 (q, k, v, page_table, *sparse_tensors, *sequence_tensors, *(aux_tensors or ()))
             )
 
-        def bind_tensor(tensor):
-            if tensor is None:
-                return None
-            if dynamic_lengths:
-                columns = tensor.shape[-2] * tensor.shape[-1] if tensor.ndim == 4 else 1
-                return _DynamicTensorArgument(tensor, columns)
-            return tensor
-
-        runtime_args = tuple(bind_tensor(tensor) for tensor in tensors) + (
+        if dynamic_lengths:
+            # MQA heads are contiguous and fold into the DSL row dimension.
+            # GQA retains the original head stride for device gather/scatter.
+            # Keep the public Torch tensors unchanged; only the root view differs.
+            root_heads = q_heads if kv_heads == 1 else original_shape[-2]
+            columns = (
+                root_heads * head_dim,
+                kv_heads * head_dim,
+                kv_heads * value_dim,
+                root_heads * value_dim,
+                1,
+            )
+            runtime_tensors = tuple(
+                _DynamicTensorArgument(tensor, width) if tensor is not None else None
+                for tensor, width in zip(tensors, columns)
+            )
+        else:
+            runtime_tensors = tensors
+        runtime_args = runtime_tensors + (
             sparse_tensors if sparse is not None else None,
             aux_tensors,
             aux_scalars,
@@ -586,7 +598,7 @@ def _flash_attention(
             mask_uses_simd,
             score_uses_simd,
             head_dim,
-            sparse.strides if sparse is not None else None,
+            sparse_strides,
             packed_heads,
             use_dn,
             full_dn,
@@ -665,8 +677,6 @@ def _flash_attention(
             from .split_kv import combine_split_results
 
             combine_split_results(partial_out, partial_stats, out, lse, cores)
-        if packed_heads > 1 and dynamic_lengths and kv_heads == 1:
-            out = out.view(*original_shape[:-1], value_dim)
         return out, lse
 
 

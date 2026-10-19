@@ -402,10 +402,15 @@ def test_public_call_checks_external_storage_not_new_outputs(host, monkeypatch):
         (32, 2, 48, 3, 32, None, 16),
         (13, 35, 4, 1, 28, None, 1),
         (14, 35, 4, 1, 28, None, 4),
+        (7, 1, 8, 1, 28, None, 1),
+        (6, 1, 16, 1, 28, None, 1),
+        (7, 1, 16, 1, 28, None, 16),
+        (2, 1, 512, 1, 28, None, 512),
+        (2, 1, 512, 1, 28, SimpleNamespace(strides=((0, 1, 1),)), 1),
         (32, 2, 49, 1, 32, SimpleNamespace(strides=((0, 1, 1),)), 1),
     ],
 )
-def test_packed_head_policy_preserves_parallelism(
+def test_packed_head_policy_balances_parallelism_and_padded_work(
     batch, q_len, heads, kv_heads, cores, sparse, expected
 ):
     packed_heads, _, _ = interface._select_kernel_options(
@@ -427,6 +432,33 @@ def test_packed_head_policy_preserves_parallelism(
 
 
 @pytest.mark.parametrize(
+    "q_tile,pack_gqa,expected",
+    [(128, None, 512), (64, None, 1), (128, False, 1), (64, False, 1)],
+)
+def test_lower_occupancy_packing_keeps_resource_and_explicit_disable_gates(
+    q_tile, pack_gqa, expected
+):
+    packed_heads, _, _ = interface._select_kernel_options(
+        2,
+        1,
+        1024,
+        512,
+        1,
+        28,
+        None,
+        has_simt_mod=False,
+        has_score_mod=False,
+        has_aux=False,
+        has_mod=False,
+        has_window=False,
+        scale=0.125,
+        q_tile=q_tile,
+        pack_gqa=pack_gqa,
+    )
+    assert packed_heads == expected
+
+
+@pytest.mark.parametrize(
     "options", [{}, {"causal": True}, {"window_size": (7, 3)}, {"window_size": (0, None)}]
 )
 def test_packed_public_call_preserves_layout_and_reuses_lengths(host, options):
@@ -437,7 +469,15 @@ def test_packed_public_call_preserves_layout_and_reuses_lengths(host, options):
         assert out.shape == q.shape and out.is_contiguous()
         assert lse.shape == (32, 33, q_len) and lse.is_contiguous()
         launch = host.launched[-1][0]
-        assert launch[0].tensor.shape == (32, q_len * 33, 1, 64)
+        assert launch[0].tensor is q and launch[3].tensor is out
+        assert launch[0].build_memref_launch_fields()[3:5] == (32 * q_len * 33, 64)
+        assert launch[3].build_memref_launch_fields()[3:5] == (32 * q_len * 33, 64)
+        # Folding is a logical root view: the complete payload matches the
+        # contiguous Torch view without creating that view in each hot call.
+        for tensor, argument in ((q, launch[0]), (out, launch[3])):
+            folded = tensor.view(32, q_len * 33, 1, 64)
+            expected = interface._DynamicTensorArgument(folded, 64)
+            assert argument.build_memref_launch_fields() == expected.build_memref_launch_fields()
         assert launch[0].tensor.data_ptr() == q.data_ptr()
         assert q.shape == (32, q_len, 33, 64)
     assert len(host.compiled) == 1
@@ -451,7 +491,11 @@ def test_pack_gqa_false_disables_packing_without_creating_another_interface(host
         out, lse = interface.flash_attn_func(q, k, k, pack_gqa=choice)
         assert out.shape == q.shape and lse is None
         argument = host.launched[-1][0][0]
-        assert argument.tensor.shape[1:3] == (3 * expected, 33 // expected)
+        assert argument.tensor is q
+        assert argument.build_memref_launch_fields()[3:5] == (
+            32 * 3 * expected,
+            (33 // expected) * 64,
+        )
     assert [args[23] for args in host.compiled] == [33, 1]
     with pytest.raises(NotImplementedError, match="pack_gqa"):
         interface.flash_attn_func(q, k, k, pack_gqa=True)

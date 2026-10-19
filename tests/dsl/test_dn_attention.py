@@ -43,6 +43,20 @@ def coordinate_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
     )
 
 
+def _scalar_coordinate_score(score, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return (
+        score * 0.75
+        + b.to(tla.Float32) * 0.005
+        + h.to(tla.Float32) * 0.01
+        + q_idx.to(tla.Float32) * 0.02
+        - kv_idx.to(tla.Float32) * 0.03
+    )
+
+
+def _scalar_causal(b, h, q, kv, info, tensors):
+    return kv <= q + info.seqlen_k - info.seqlen_q
+
+
 @simd
 def _strict_causal(b, h, q, kv, info, tensors):
     return tla.cmp(kv, q + info.seqlen_k - info.seqlen_q, "lt")
@@ -52,13 +66,25 @@ def _scalar_strict_causal(b, h, q, kv, info, tensors):
     return kv < q + info.seqlen_k - info.seqlen_q + tensors[0][b]
 
 
-@pytest.mark.parametrize("dtype,dim,kv_heads", [(torch.float16, 64, 1), (torch.bfloat16, 96, 3)])
-def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
+@pytest.mark.parametrize(
+    "dtype,dim,kv_heads,batch,mode",
+    [
+        (torch.float16, 64, 1, 64, "simd"),
+        (torch.bfloat16, 96, 3, 64, "simd"),
+        (torch.float16, 64, 1, 8, "simt"),
+        (torch.bfloat16, 96, 1, 8, "simd_mask"),
+        (torch.float16, 64, 1, 8, "simd_score"),
+        (torch.bfloat16, 96, 1, 8, "simd"),
+    ],
+)
+def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode):
     import torch_npu  # noqa: F401
 
     device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
     torch.npu.set_device(device)
-    batch, sq, sk, heads = 64, 4, 388, 32 * kv_heads
+    sq, sk, heads = 4, 388, 32 * kv_heads
+    mask_mod = causal if mode in ("simd", "simd_mask") else _scalar_causal
+    score_mod = coordinate_score if mode in ("simd", "simd_score") else _scalar_coordinate_score
     generator = torch.Generator().manual_seed(17)
     host = tuple(
         torch.randn(shape, generator=generator).to(dtype)
@@ -113,8 +139,8 @@ def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
             for lse_requested in (False, True):
                 out, lse = flash_attn_func(
                     *inputs,
-                    mask_mod=causal,
-                    score_mod=coordinate_score,
+                    mask_mod=mask_mod,
+                    score_mod=score_mod,
                     block_sparse_tensors=blocks,
                     return_lse=lse_requested,
                 )
@@ -126,7 +152,8 @@ def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
                 else:
                     assert lse is None
                 constants = next(reversed(interface._compiled_kernels))[1][-1]
-                assert constants[16][1] is True and constants[17][1] is False
+                assert constants[15][1] == 32
+                assert constants[16][1] is (mode == "simd") and constants[17][1] is False
             assert len(interface._compiled_kernels) == 2
     finally:
         interface._compiled_kernels.clear()
