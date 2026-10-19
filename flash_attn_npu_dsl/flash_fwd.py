@@ -20,7 +20,7 @@ from .modifiers import (
     process_score_tile_simd,
     process_score_tile_simt,
 )
-from .seqlen_info import create_seqlen_info
+from .seqlen_info import create_packed_seqlen_info, create_seqlen_info
 from .dn_softmax import native_dn_softmax
 from .dn_full import full_dn_softmax
 
@@ -143,19 +143,18 @@ def _store_packed_lse(
     destination,
     start,
     rows,
-    q_len,
+    head_stride,
     heads: tla.Constexpr[int],
-    batch,
-    groups: tla.Constexpr[int] = 1,
-    group=0,
+    head_group,
+    sequence_offset=0,
 ):
-    """Write packed rows to [B,H,Q], reading one FP32 from each 32-byte UB slot."""
+    """Scatter packed rows to head-major LSE with a sequence-local offset."""
     head_start = start % heads
     query_segments = (head_start + rows + heads - 1) // heads
     # Across multiple Q segments, contiguous GM writes can outweigh extra copies.
     # For a single Q segment, keep one strided copy across heads; the GM values
-    # are contiguous only when q_len == 1.
-    if min(rows, heads) < query_segments or (q_len > 1 and query_segments > 1):
+    # are contiguous only when head_stride == 1.
+    if min(rows, heads) < query_segments or (head_stride > 1 and query_segments > 1):
         # Walk each head down Q: strided UB scalars become contiguous GM values.
         for offset in tla.range(min(rows, heads)):
             index = start + offset
@@ -167,7 +166,8 @@ def _store_packed_lse(
             )
             dst = tla.make_tensor(
                 destination.ptr
-                + ((batch * groups + group) * heads + head) * q_len
+                + (head_group * heads + head) * head_stride
+                + sequence_offset
                 + index // heads,
                 tla.make_layout(tla.make_shape(count, 1), tla.make_stride(1, 1)),
             )
@@ -184,9 +184,10 @@ def _store_packed_lse(
             )
             dst = tla.make_tensor(
                 destination.ptr
-                + ((batch * groups + group) * heads + head) * q_len
+                + (head_group * heads + head) * head_stride
+                + sequence_offset
                 + index // heads,
-                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(q_len, 1)),
+                tla.make_layout(tla.make_shape(count, 1), tla.make_stride(head_stride, 1)),
             )
             tla.copy(dst, src)
             copied += count
@@ -220,6 +221,8 @@ def flex_attention_kernel(
     packed_heads: tla.Constexpr[int] = 1,
     use_dn: tla.Constexpr[bool] = False,
     full_dn: tla.Constexpr[bool] = False,
+    sequence_metadata=None,
+    total_q: tla.Constexpr[int] = 0,
 ) -> None:
     if tla.const_expr(q_len is None):
         # Contiguous BSND roots use (B*S, H*D); B/H/D stay compile-time facts.
@@ -246,8 +249,6 @@ def flex_attention_kernel(
     qBaseTile_ = 128
     kvBaseTile_ = 128
     embed_ = head_dim
-    curQSeqlen = q_len
-    curKvSeqlen = kv_len
     qNOffset = head_dim
     qSOffset = q_heads * head_dim
     kNOffset = head_dim
@@ -260,7 +261,6 @@ def flex_attention_kernel(
     q_tiles = (q_len + 127) // 128
     kv_tiles = (kv_len + 127) // 128
     total_tasks = batch * q_heads * q_tiles
-    seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
     # --- L1->L0 完成 -> GM->L1 可开始 ---
     q_l0a_ready_l1 = tla.flag("l0a_ready_l1", tla.arch.MTE1, tla.arch.MTE2)
     k_l0b_ready_l1_0 = tla.flag("k_l0b_ready_l1_0", tla.arch.MTE1, tla.arch.MTE2)
@@ -418,10 +418,24 @@ def flex_attention_kernel(
         qHeadIdx = batch_head % q_heads
         curBatch = batch_head // q_heads
         kvHeadIdx = qHeadIdx // (q_heads // kv_heads)
-        qBOffset = curBatch * q_len * qSOffset
-        kBOffset = curBatch * kv_len * kSOffset
-        gmOffsetV = curBatch * kv_len * vSOffset + kvHeadIdx * head_dim
-        rowNum = min(128, q_len - qSTileIdx * 128)
+        if tla.const_expr(sequence_metadata is not None):
+            seqlen_info = create_packed_seqlen_info(curBatch, sequence_metadata)
+            curQSeqlen = seqlen_info.seqlen_q * packed_heads
+            curKvSeqlen = seqlen_info.seqlen_k
+            num_kv_tiles = seqlen_info.num_n_blocks
+            qBOffset = seqlen_info.offset_q * packed_heads * qSOffset
+            kBOffset = seqlen_info.offset_k * kSOffset
+        else:
+            seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
+            curQSeqlen = q_len
+            curKvSeqlen = kv_len
+            num_kv_tiles = kv_tiles
+            qBOffset = curBatch * q_len * qSOffset
+            kBOffset = curBatch * kv_len * kSOffset
+        gmOffsetV = kBOffset + kvHeadIdx * head_dim
+        rowNum = min(128, curQSeqlen - qSTileIdx * 128)
+        if tla.const_expr(sequence_metadata is not None):
+            rowNum = max(0, rowNum)
         if tla.const_expr(
             not use_dn
             and mask_mod is None
@@ -437,28 +451,42 @@ def flex_attention_kernel(
         partial_base = 0
         full_base = 0
         if tla.const_expr(sparse_tensors is None):
-            end_kv = kv_tiles
+            end_kv = num_kv_tiles
             if tla.const_expr(window_left is not None):
                 # Packed rows interleave heads; window bounds use original Q positions.
                 first_q = qSTileIdx * 128 // packed_heads
                 first_kv = min(
-                    kv_tiles,
-                    max(0, (first_q + kv_len - seqlen_info.seqlen_q - window_left) // 128),
+                    num_kv_tiles,
+                    max(0, (first_q + curKvSeqlen - seqlen_info.seqlen_q - window_left) // 128),
                 )
             if tla.const_expr(window_right is not None):
                 # A tile can end partway through a group of heads at the same Q.
                 end_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads + 1
                 end_kv = min(
-                    kv_tiles,
+                    num_kv_tiles,
                     max(
                         0,
-                        (end_q + kv_len - seqlen_info.seqlen_q + window_right + 127) // 128,
+                        (end_q + curKvSeqlen - seqlen_info.seqlen_q + window_right + 127) // 128,
                     ),
                 )
             kvSLoopNum = max(0, end_kv - first_kv)
         else:
             full_count = 0
-            if tla.const_expr(sparse_tensors[1] is not None):
+            if tla.const_expr(sequence_metadata is not None):
+                # Packed query rows still consume the caller's 128-row lists.
+                sparse_q_tile = qSTileIdx * 128 // packed_heads // 128
+                count_row = seqlen_info.m_block_offset + sparse_q_tile
+                index_row = seqlen_info.block_idx_offset + sparse_q_tile * num_kv_tiles
+                if rowNum > 0:
+                    if tla.const_expr(sparse_tensors[1] is not None):
+                        partial_count = sparse_tensors[0][
+                            qHeadIdx * sparse_strides[0][1] + count_row
+                        ]
+                        partial_base = qHeadIdx * sparse_strides[1][1] + index_row
+                    if tla.const_expr(sparse_tensors[3] is not None):
+                        full_count = sparse_tensors[2][qHeadIdx * sparse_strides[2][1] + count_row]
+                        full_base = qHeadIdx * sparse_strides[3][1] + index_row
+            elif tla.const_expr(sparse_tensors[1] is not None):
                 partial_count = sparse_tensors[0][
                     curBatch * sparse_strides[0][0]
                     + qHeadIdx * sparse_strides[0][1]
@@ -469,7 +497,7 @@ def flex_attention_kernel(
                     + qHeadIdx * sparse_strides[1][1]
                     + qSTileIdx * sparse_strides[1][2]
                 )
-            if tla.const_expr(sparse_tensors[3] is not None):
+            if tla.const_expr(sequence_metadata is None and sparse_tensors[3] is not None):
                 full_count = sparse_tensors[2][
                     curBatch * sparse_strides[2][0]
                     + qHeadIdx * sparse_strides[2][1]
@@ -481,11 +509,18 @@ def flex_attention_kernel(
                     + qSTileIdx * sparse_strides[3][2]
                 )
             kvSLoopNum = partial_count + full_count
+        if tla.const_expr(sequence_metadata is not None):
+            # Upper-bound scheduling may visit an absent query tile. It must
+            # neither load Q/K nor invoke callbacks, but still balance flags.
+            if rowNum == 0:
+                kvSLoopNum = 0
         if kvSLoopNum > 0:
             with tla.cube():
                 gm_q = tla.make_tensor(
                     query.ptr + qBOffset + qHeadIdx * head_dim,
-                    tla.make_layout(tla.make_shape(q_len, head_dim), tla.make_stride(qSOffset, 1)),
+                    tla.make_layout(
+                        tla.make_shape(curQSeqlen, head_dim), tla.make_stride(qSOffset, 1)
+                    ),
                 )
                 gm_q_tile = tla.tile_view(
                     gm_q, tla.make_shape(128, head_dim), tla.make_coord(qSTileIdx, 0)
@@ -524,7 +559,7 @@ def flex_attention_kernel(
                             partial_base,
                             full_base,
                         )
-                    kvSTileSizeAct = min(128, kv_len - gatheredKvSTileIdx * 128)
+                    kvSTileSizeAct = min(128, curKvSeqlen - gatheredKvSTileIdx * 128)
                     window_needs_mask = True
                     if tla.const_expr(
                         not use_dn
@@ -539,12 +574,12 @@ def flex_attention_kernel(
                         if tla.const_expr(window_left is not None):
                             window_needs_mask = window_needs_mask | (
                                 gatheredKvSTileIdx * 128
-                                < window_last_q + kv_len - seqlen_info.seqlen_q - window_left
+                                < window_last_q + curKvSeqlen - seqlen_info.seqlen_q - window_left
                             )
                         if tla.const_expr(window_right is not None):
                             window_needs_mask = window_needs_mask | (
                                 gatheredKvSTileIdx * 128 + kvSTileSizeAct - 1
-                                > window_first_q + kv_len - seqlen_info.seqlen_q + window_right
+                                > window_first_q + curKvSeqlen - seqlen_info.seqlen_q + window_right
                             )
                     ubSBufId = validIdx % 2
                     ubS_ptr = ubS_ptrs[0] if ubSBufId == 0 else ubS_ptrs[1]
@@ -928,15 +963,15 @@ def flex_attention_kernel(
                                         0,
                                         aux_tensors,
                                         aux_scalars,
-                                        q_len,
-                                        kv_len,
+                                        curQSeqlen,
+                                        curKvSeqlen,
                                         scale,
                                         seqlen_info,
                                     )
                                     vector_inputs = (
                                         ub_s,
                                         *coordinates,
-                                        kv_len,
+                                        curKvSeqlen,
                                         scale,
                                         seqlen_info,
                                         aux_tensors,
@@ -1002,8 +1037,8 @@ def flex_attention_kernel(
                                             block_kind,
                                             aux_tensors,
                                             aux_scalars,
-                                            q_len,
-                                            kv_len,
+                                            curQSeqlen,
+                                            curKvSeqlen,
                                             scale,
                                             seqlen_info,
                                             mask_mod,
@@ -1020,7 +1055,7 @@ def flex_attention_kernel(
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
-                                                kv_len,
+                                                curKvSeqlen,
                                                 scale,
                                                 seqlen_info,
                                                 aux_tensors,
@@ -1041,7 +1076,7 @@ def flex_attention_kernel(
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
-                                                kv_len,
+                                                curKvSeqlen,
                                                 scale,
                                                 seqlen_info,
                                                 aux_tensors,
@@ -1067,7 +1102,7 @@ def flex_attention_kernel(
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
-                                                kv_len,
+                                                curKvSeqlen,
                                                 scale,
                                                 seqlen_info,
                                                 aux_tensors,
@@ -1232,7 +1267,7 @@ def flex_attention_kernel(
                             partial_base,
                             full_base,
                         )
-                    kvSTileSizeActDe = min(128, kv_len - gatheredKvSTileIdxDe * 128)
+                    kvSTileSizeActDe = min(128, curKvSeqlen - gatheredKvSTileIdxDe * 128)
                     ubOTmpBufId = validIdxDe % 2
                     ubOTmp_ptr = ubOTmp_ptrs[0] if ubOTmpBufId == 0 else ubOTmp_ptrs[1]
                     if tla.const_expr(use_dn):
@@ -1588,12 +1623,25 @@ def flex_attention_kernel(
                 else:
                     tla.copy(final_gm_out, final_packed_valid)
                 if tla.const_expr(lse is not None):
+                    if tla.const_expr(sequence_metadata is not None):
+                        lse_head_group = qHeadIdx
+                        lse_sequence_offset = seqlen_info.offset_q
+                        lse_head_stride = total_q
+                    else:
+                        lse_head_group = curBatch * q_heads + qHeadIdx
+                        lse_sequence_offset = 0
+                        lse_head_stride = q_len // packed_heads
                     final_lse_layout = tla.make_layout(tla.make_shape(final_m), tla.make_stride(1))
                     if tla.const_expr(packed_heads > 1):
                         final_gm_lse = tla.make_tensor(
                             lse.ptr,
                             tla.make_layout(
-                                tla.make_shape(batch * q_heads * q_len), tla.make_stride(1)
+                                tla.make_shape(
+                                    total_q * q_heads * packed_heads
+                                    if sequence_metadata is not None
+                                    else batch * q_heads * q_len
+                                ),
+                                tla.make_stride(1),
                             ),
                         )
                         _store_packed_lse(
@@ -1604,17 +1652,17 @@ def flex_attention_kernel(
                             final_gm_lse,
                             qSTileIdx * 128 + final_subIdxEff * final_mHalf,
                             final_m,
-                            q_len // packed_heads,
+                            lse_head_stride,
                             packed_heads,
-                            curBatch,
-                            q_heads,
-                            qHeadIdx,
+                            lse_head_group,
+                            lse_sequence_offset,
                         )
                         tla.pipe_barrier(tla.pipes.ALL)
                     else:
                         final_gm_lse = tla.make_tensor(
                             lse.ptr
-                            + (curBatch * q_heads + qHeadIdx) * q_len
+                            + lse_head_group * lse_head_stride
+                            + lse_sequence_offset
                             + qSTileIdx * 128
                             + final_subIdxEff * final_mHalf,
                             final_lse_layout,

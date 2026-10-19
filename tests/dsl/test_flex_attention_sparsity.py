@@ -521,13 +521,13 @@ def test_public_builder_selects_mode_and_direct_compile(monkeypatch, shape, call
     def compile(actual_kernel, key, compile_args):
         assert actual_kernel is kernel
         args = compile_args()
-        assert len(args) == 12
-        assert args[4] is callback and args[-2] == [] and args[-1] is None
+        assert len(args) == 13
+        assert args[4] is callback and args[-3:] == ([], None, None)
         events.append("compile")
 
         def launch(*args, **kwargs):
-            assert len(args) == 6
-            assert args[-2] == [] and args[-1] is None
+            assert len(args) == 7
+            assert args[-3:] == ([], None, None)
             assert kwargs == {"block_num": 12}
             events.append("launch")
 
@@ -572,6 +572,7 @@ def test_classifier_native_lowering(callback, kernel, mode):
             3,
             129,
             257,
+            None,
             None,
             None,
         )
@@ -681,7 +682,7 @@ def test_sparse_simt_layout_selection(sparse_host, q_len, kv_len, score, expecte
         aux_tensors=(torch.zeros(2, dtype=torch.int32),),
         block_sparse_tensors=blocks,
     )
-    assert sparse_host.compiled[0][-2:] == (expected_dn, False)
+    assert sparse_host.compiled[0][24:26] == (expected_dn, False)
 
 
 def test_device_regression_metadata_contains_only_safe_active_prefixes(shape):

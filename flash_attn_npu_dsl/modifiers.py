@@ -194,7 +194,7 @@ def process_score_tile_simd(
             zero_idx = tla.full(0, tla.Int32)
             b = zero_idx + batch_idx
             h = zero_idx + head_idx
-            last_kv = tla.full(kv_len - 1, tla.Int32)
+            last_kv = zero_idx + (kv_len - 1)
         for row in tla.range(rows):
             q = (q_start + row).to(tla.Int32)
             if tla.const_expr(packed_heads > 1):

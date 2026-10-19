@@ -121,7 +121,7 @@ def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
                 else:
                     assert lse is None
                 constants = next(reversed(interface._compiled_kernels))[1][-1]
-                assert constants[-2][1] is True and constants[-1][1] is False
+                assert constants[16][1] is True and constants[17][1] is False
             assert len(interface._compiled_kernels) == 2
     finally:
         interface._compiled_kernels.clear()
@@ -180,7 +180,7 @@ def test_dn_query_tails_preserve_empty_rows_and_dynamic_reuse(dtype, dim):
                 else:
                     assert lse is None
                 constants = next(reversed(interface._compiled_kernels))[1][-1]
-                assert constants[-2][1] is True and constants[-1][1] is False
+                assert constants[16][1] is True and constants[17][1] is False
             assert len(interface._compiled_kernels) == 2
     finally:
         interface._compiled_kernels.clear()

@@ -11,18 +11,21 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+from .seqlen_info import validate_sequence_tensor
+
 
 BLOCK_SIZE = 128
 
 
 class BlockSparseTensorsTorch(NamedTuple):
-    """Per-query-block partial/full KV lists for fixed-length attention.
+    """Per-query-block partial/full KV lists for fixed-length or packed attention.
 
     Counts are NPU int32 ``[B,Hq,Tq]``; indices are ``[B,Hq,Tq,capacity]``
     with capacity at most the number of KV blocks, including zero. Each tensor
     may independently broadcast batch/head dimensions. The optional full pair
-    bypasses ``mask_mod``. Unused index entries are ignored. Varlen and backward
-    metadata fields are present for interface parity but must remain ``None``.
+    bypasses ``mask_mod``. Unused index entries are ignored. Packed TND uses
+    counts [H,total_m] and indices [H,total_indices], addressed by cumulative
+    block offsets. Backward metadata fields must remain ``None``.
     """
 
     mask_block_cnt: Any
@@ -195,3 +198,54 @@ def validate_block_sparse(
         for tensor in tensors
     )
     return _SparseMetadata(bindings, strides)
+
+
+def validate_packed_block_sparse(block_sparse, *, batch_size, num_heads_q, device):
+    """Validate packed [H,total] tables without reading any device contents.
+
+    Counts use cu_total_m_blocks; each index row starts at cu_block_idx_offsets
+    plus local_q_block * ceil(effective_k/128). Prefix capacities may leave gaps.
+    Bounds, nonoverlapping regions, valid counts/indices and mask consistency
+    are caller guarantees, just as for the fixed-length tables.
+    """
+    import torch
+
+    if not isinstance(block_sparse, BlockSparseTensorsTorch):
+        raise TypeError("block_sparse must be a BlockSparseTensorsTorch")
+    if block_sparse.block_size is None:
+        raise ValueError("packed tables require explicit block_size=(128, 128)")
+    if tuple(block_sparse.block_size) != (128, 128):
+        raise NotImplementedError("only block_size=(128, 128) is supported")
+    for name in ("dq_write_order", "dq_write_order_full", "spt"):
+        if getattr(block_sparse, name) is not None:
+            raise NotImplementedError(f"{name} is not supported by forward")
+    validate_sequence_tensor(
+        block_sparse.cu_total_m_blocks, "cu_total_m_blocks", batch_size + 1, device
+    )
+    if block_sparse.cu_block_idx_offsets is not None:
+        validate_sequence_tensor(
+            block_sparse.cu_block_idx_offsets, "cu_block_idx_offsets", batch_size + 1, device
+        )
+    if (block_sparse.full_block_cnt is None) != (block_sparse.full_block_idx is None):
+        raise ValueError("full_block_cnt and full_block_idx must both be present or None")
+    for name, tensor in zip(block_sparse._fields[:4], block_sparse[:4]):
+        if name.startswith("full") and tensor is None:
+            continue
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim != 2
+            or tensor.shape[0] not in (1, num_heads_q)
+        ):
+            raise ValueError(f"{name} must have shape [H,total] with H=1 or Hq")
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must have dtype torch.int32")
+        if tensor.device != device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous on the same device as Q")
+    tensors = block_sparse[:4]
+    strides = tuple(
+        (0, tensor.stride(0) if tensor.shape[0] > 1 else 0, 1) if tensor is not None else None
+        for tensor in tensors
+    )
+    return _SparseMetadata(
+        tuple(t if t is not None and t.numel() else None for t in tensors), strides
+    )

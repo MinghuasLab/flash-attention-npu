@@ -82,7 +82,7 @@ FLASH_ATTN_BUILD_NPU=950 python setup.py install
 `flash_attn_npu_dsl` focuses on customizing attention forward through `score_mod`
 and `mask_mod` on Ascend 950. Callbacks run inline in the attention kernel using
 SIMT or explicit SIMD; optional block classification enables sparse execution.
-It supports BSND, FP16/BF16, and GQA without replacing the V2/V3/V4 entry points.
+It supports BSND and nonpaged packed TND, FP16/BF16, and GQA without replacing the V2/V3/V4 entry points.
 Supported head dimensions and other constraints are listed in the package guide below.
 
 This optional package requires Python `>=3.10,<3.14`, CANN `>=9.1.0`, and a separately

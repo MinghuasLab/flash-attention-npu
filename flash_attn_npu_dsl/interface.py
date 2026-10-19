@@ -1,4 +1,4 @@
-"""Fixed-length BSND attention on Ascend 950."""
+"""BSND and packed TND attention on Ascend 950."""
 
 import math
 import os
@@ -8,9 +8,10 @@ from threading import Lock
 import catlass.tla as tla
 from catlass.tla.runtime import from_dlpack
 
-from .block_sparsity import validate_block_sparse
+from .block_sparsity import validate_block_sparse, validate_packed_block_sparse
 from .flash_fwd import flex_attention_kernel
 from .modifiers import softcap_score_mod, validate_modifiers
+from .seqlen_info import validate_sequence_tensor
 
 _compiled_kernels = OrderedDict()
 _compile_lock = Lock()
@@ -31,6 +32,8 @@ def _select_kernel_options(
     has_window,
     scale,
     has_score_mod,
+    variable_lengths=False,
+    average_q_len=None,
 ):
     """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
@@ -48,9 +51,10 @@ def _select_kernel_options(
     if has_simt_mod and q_len > 32:
         packed_heads = 1
     q_rows = q_len * packed_heads
-    # Scalar masks use DN only for complete query tiles with explicit blocks.
-    # Full blocks can bypass the modifier; a score callback would prevent that.
-    # Vector callbacks may also use large unpacked Q tails to amortize padding.
+    # Sparse scalar masks benefit from DN when enough Q rows amortize padding.
+    # For variable lengths, the maximum alone cannot establish utilization;
+    # use the known average only when seqused_q does not hide valid row counts.
+    # Full blocks bypass the mask, but a score callback would prevent that.
     use_dn = (
         not (packed_heads > 1 and has_window)
         and (
@@ -59,9 +63,10 @@ def _select_kernel_options(
                 has_simt_mod
                 and not has_score_mod
                 and packed_heads == 1
-                and q_rows % 128 == 0
+                and (q_rows % 128 == 0 or (variable_lengths and q_rows >= 512 and kv_len >= 512))
                 and sparse is not None
                 and not has_window
+                and (not variable_lengths or (average_q_len is not None and average_q_len >= 128))
             )
         )
         and (q_rows % 128 == 0 or (packed_heads == 1 and q_rows >= 512 and kv_len >= 512))
@@ -74,6 +79,7 @@ def _select_kernel_options(
         and not has_mod
         and not has_window
         and scale > 0
+        and not variable_lengths
     )
     return packed_heads, use_dn, full_dn
 
@@ -194,12 +200,13 @@ def _validate_aux(aux_tensors, aux_scalars, device):
     )
 
 
-def _validate_inputs(q, k, v):
+def _validate_inputs(q, k, v, *, packed=False):
     import torch
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
-        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
-            raise ValueError(f"{name} must be a rank-4 BSND Tensor")
+        rank = 3 if packed else 4
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != rank:
+            raise ValueError(f"{name} must be a rank-{rank} {'TND' if packed else 'BSND'} Tensor")
         if tensor.device.type != "npu" or tensor.device != q.device:
             raise ValueError("q, k and v must be on the same NPU")
         if not tensor.is_contiguous():
@@ -209,18 +216,18 @@ def _validate_inputs(q, k, v):
         if tensor.dtype != q.dtype:
             raise TypeError("q, k and v must have the same dtype")
         if tensor.shape[-1] not in (8, 16, 32, 64, 80, 96, 128) or any(
-            size <= 0 for size in tensor.shape
+            size <= 0 for size in (tensor.shape[1:] if packed else tensor.shape)
         ):
             raise ValueError(
                 "head dimension must be 8, 16, 32, 64, 80, 96 or 128 and dimensions nonempty"
             )
         if tensor.requires_grad:
             raise ValueError("this implementation supports inference forward only")
-    if k.shape != v.shape or q.shape[0] != k.shape[0]:
+    if k.shape != v.shape or (not packed and q.shape[0] != k.shape[0]):
         raise ValueError("k/v shapes and q/k batch sizes must match")
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Q, K and V head dimensions must match")
-    if q.shape[2] % k.shape[2]:
+    if q.shape[-2] % k.shape[-2]:
         raise ValueError("Q head count must be divisible by KV head count")
 
 
@@ -266,8 +273,6 @@ def flash_attn_func(
     forward implementation.
     Unsupported options must retain their defaults in this forward subset.
     """
-    import torch
-
     for name, supported in (
         ("qv", qv is None),
         ("gather_kv_indices", gather_kv_indices is None),
@@ -280,6 +285,45 @@ def flash_attn_func(
         if not supported:
             raise NotImplementedError(f"{name} is not supported by this forward implementation")
     _validate_inputs(q, k, v)
+    return _flash_attention(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        score_mod,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        block_sparse_tensors,
+        return_lse,
+    )
+
+
+def _flash_attention(
+    q,
+    k,
+    v,
+    softmax_scale,
+    causal,
+    window_size,
+    softcap,
+    score_mod,
+    mask_mod,
+    aux_tensors,
+    aux_scalars,
+    block_sparse_tensors,
+    return_lse,
+    sequence_metadata=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+    """Prepare one shared forward kernel; only sequence addressing differs."""
+    import torch
+
+    packed = sequence_metadata is not None
     softcap = float(softcap)
     if not math.isfinite(softcap) or softcap < 0:
         raise ValueError("softcap must be finite and nonnegative")
@@ -288,18 +332,31 @@ def flash_attn_func(
             raise ValueError("softcap and score_mod cannot be used together")
         score_mod = softcap_score_mod(softcap)
     window_left, window_right = _resolve_window(causal, window_size, mask_mod)
-    batch, q_len, q_heads, head_dim = q.shape
+    if packed:
+        batch = sequence_metadata[0].numel() - 1
+        q_len, kv_len = max_seqlen_q, max_seqlen_k
+        q_heads, head_dim = q.shape[-2:]
+        kv_heads = k.shape[-2]
+    else:
+        batch, q_len, q_heads, head_dim = q.shape
+        kv_len, kv_heads = k.shape[1:3]
     # One right-aligned Q row is centered on the last KV position.
-    if q_len == 1:
+    if q_len == 1 and not packed:
         window_right = None
-    kv_len, kv_heads = k.shape[1:3]
     scale = float(softmax_scale) if softmax_scale is not None else 1 / math.sqrt(head_dim)
     if not math.isfinite(scale):
         raise ValueError("softmax_scale must be finite")
     mask_uses_simd, score_uses_simd = validate_modifiers(mask_mod, score_mod)
     aux_tensors, aux_scalars = _validate_aux(aux_tensors, aux_scalars, q.device)
+    if packed and (q.shape[0] == 0 or k.shape[0] == 0):
+        return torch.zeros_like(q), (
+            torch.full((q_heads, q.shape[0]), -torch.inf, dtype=torch.float32, device=q.device)
+            if return_lse
+            else None
+        )
     dynamic_lengths = (
-        mask_mod is None
+        not packed
+        and mask_mod is None
         and score_mod is None
         and block_sparse_tensors is None
         and aux_tensors is None
@@ -309,18 +366,26 @@ def flash_attn_func(
         cores = max(1, int(torch.npu.get_device_properties(q.device.index).cube_core_num))
         original_shape = tuple(q.shape)
         # Validate the caller's logical shape before folding heads into Q rows.
-        sparse = (
-            validate_block_sparse(
-                block_sparse_tensors,
-                batch_size=batch,
-                num_heads_q=q_heads,
-                seqlen_q=q_len,
-                seqlen_k=kv_len,
-                device=q.device,
-            )
-            if block_sparse_tensors is not None
-            else None
-        )
+        sparse = None
+        if block_sparse_tensors is not None:
+            if packed:
+                sparse = validate_packed_block_sparse(
+                    block_sparse_tensors, batch_size=batch, num_heads_q=q_heads, device=q.device
+                )
+                sequence_metadata = (
+                    *sequence_metadata[:4],
+                    block_sparse_tensors.cu_total_m_blocks,
+                    block_sparse_tensors.cu_block_idx_offsets,
+                )
+            else:
+                sparse = validate_block_sparse(
+                    block_sparse_tensors,
+                    batch_size=batch,
+                    num_heads_q=q_heads,
+                    seqlen_q=q_len,
+                    seqlen_k=kv_len,
+                    device=q.device,
+                )
         packed_heads, use_dn, full_dn = _select_kernel_options(
             batch,
             q_len,
@@ -336,6 +401,8 @@ def flash_attn_func(
             has_window=window_left is not None or window_right is not None,
             scale=scale,
             has_score_mod=score_mod is not None,
+            variable_lengths=packed,
+            average_q_len=(q.shape[0] / batch) if packed and sequence_metadata[2] is None else None,
         )
         if packed_heads > 1:
             # Only MQA has a contiguous folded view. GQA groups are gathered and
@@ -356,16 +423,23 @@ def flash_attn_func(
         out = torch.empty_like(q)
         lse = (
             torch.empty(
-                (batch, original_shape[2], original_shape[1]), device=q.device, dtype=torch.float32
+                (original_shape[-2], original_shape[0])
+                if packed
+                else (batch, original_shape[2], original_shape[1]),
+                device=q.device,
+                dtype=torch.float32,
             )
             if return_lse
             else None
         )
         tensors = (q, k, v, out, lse)
         sparse_tensors = sparse.tensors if sparse is not None else ()
+        sequence_tensors = sequence_metadata if packed else ()
         if not dynamic_lengths:
             # O/LSE are freshly allocated here; validate caller-owned storage.
-            _check_launch_tensors((q, k, v, *sparse_tensors, *(aux_tensors or ())))
+            _check_launch_tensors(
+                (q, k, v, *sparse_tensors, *sequence_tensors, *(aux_tensors or ()))
+            )
 
         def bind_tensor(tensor):
             if tensor is None:
@@ -379,6 +453,7 @@ def flash_attn_func(
             sparse_tensors if sparse is not None else None,
             aux_tensors,
             aux_scalars,
+            sequence_metadata,
         )
         constants = (
             batch,
@@ -401,10 +476,10 @@ def flash_attn_func(
             full_dn,
         )
         key = _compilation_key(
-            (*tensors, *sparse_tensors),
+            (*tensors, *sparse_tensors, *sequence_tensors),
             aux_tensors,
             aux_scalars,
-            constants,
+            (*constants, packed),
             q.device,
             dynamic_lengths=dynamic_lengths,
         )
@@ -434,11 +509,124 @@ def flash_attn_func(
                 else [from_dlpack(tensor, layout_tag=tla.arch.RowMajor) for tensor in aux_tensors],
                 aux_scalars,
             )
-            return (*bindings, *constants)
+            sample_sequences = (
+                tuple(
+                    from_dlpack(tensor, layout_tag=tla.arch.RowMajor)
+                    if tensor is not None
+                    else None
+                    for tensor in sequence_metadata
+                )
+                if packed
+                else None
+            )
+            return (*bindings, *constants, sample_sequences, original_shape[0] if packed else 0)
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
         tasks = batch * q_heads * ((q_len + 127) // 128)
-        compiled(*runtime_args, block_num=min(tasks, max(1, int(cores))))
+        compiled(*runtime_args, block_num=max(1, min(tasks, int(cores))))
         if packed_heads > 1 and dynamic_lengths and kv_heads == 1:
             out = out.view(original_shape)
         return out, lse
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    qv=None,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    min_seqlen_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    gather_kv_indices=None,
+    page_table=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(None, None),
+    learnable_sink=None,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    score_mod=None,
+    score_mod_bwd=None,
+    mask_mod=None,
+    block_sparse_tensors=None,
+    aux_tensors=None,
+    aux_scalars=None,
+    return_lse=False,
+    scheduler_metadata=None,
+    seqlen_k_per_split=None,
+    disable_scheduler_metadata=False,
+):
+    """Return packed O [total_q,Hq,D] and optional natural-log LSE [Hq,total_q].
+
+    Both inputs must be nonpaged TND. Prefix sums describe storage; seqused
+    optionally restricts valid lengths. Prefix contents, length bounds and
+    max_seqlen upper bounds are caller guarantees, never scanned by this API.
+    Unused Q storage rows have unspecified values. Callback indices are local
+    to each sequence; seqlen_info exposes the packed offsets.
+    """
+    import torch
+
+    for name, supported in (
+        ("qv", qv is None),
+        ("min_seqlen_k", min_seqlen_k is None),
+        ("gather_kv_indices", gather_kv_indices is None),
+        ("page_table", page_table is None),
+        ("learnable_sink", learnable_sink is None),
+        ("num_splits", num_splits == 1),
+        ("pack_gqa", pack_gqa is None),
+        ("score_mod_bwd", score_mod_bwd is None),
+        ("scheduler_metadata", scheduler_metadata is None),
+        ("seqlen_k_per_split", seqlen_k_per_split is None),
+        ("disable_scheduler_metadata", disable_scheduler_metadata is False),
+    ):
+        if not supported:
+            raise NotImplementedError(f"{name} is not supported by this forward implementation")
+    _validate_inputs(q, k, v, packed=True)
+    if (
+        not isinstance(cu_seqlens_q, torch.Tensor)
+        or cu_seqlens_q.ndim != 1
+        or cu_seqlens_q.numel() < 2
+    ):
+        raise ValueError("cu_seqlens_q must have shape [B+1] for B >= 1")
+    batch = cu_seqlens_q.numel() - 1
+    for name, tensor, size in (
+        ("cu_seqlens_q", cu_seqlens_q, batch + 1),
+        ("cu_seqlens_k", cu_seqlens_k, batch + 1),
+        ("seqused_q", seqused_q, batch),
+        ("seqused_k", seqused_k, batch),
+    ):
+        if tensor is not None or name.startswith("cu_"):
+            validate_sequence_tensor(tensor, name, size, q.device)
+    bounds = []
+    for name, value, capacity in (
+        ("max_seqlen_q", max_seqlen_q, q.shape[0]),
+        ("max_seqlen_k", max_seqlen_k, k.shape[0]),
+    ):
+        if value is None:
+            value = capacity
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer or None")
+        bounds.append(value)
+    return _flash_attention(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        score_mod,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        block_sparse_tensors,
+        return_lse,
+        (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None),
+        *bounds,
+    )

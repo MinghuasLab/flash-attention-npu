@@ -8,7 +8,8 @@
 - 回调支持普通 Python 函数和 `@tla.jit` helper，按声明使用 SIMT 或显式 SIMD，
   内联到 attention 内核；需要跳过空块时，可显式建块并传入稀疏元数据。
 
-当前实现面向 Ascend 950 的定长推理前向，支持 BSND、FP16/BF16、D8/16/32/64/80/96/128 和 GQA。
+当前实现面向 Ascend 950 的推理前向，支持定长 BSND、非分页变长 TND、
+FP16/BF16、D8/16/32/64/80/96/128 和 GQA。
 通过独立的 `flash_attn_npu_dsl` 包使用，不替换现有 V2/V3/V4 的 C++ 后端。
 
 静态 modifier／块表路径的 Tensor 使用连续 ND/NCHW 物理存储；特殊分块存储格式
@@ -83,11 +84,51 @@ out, lse = flash_attn_func(q, k, v, mask_mod=causal_mask, return_lse=True)
 Q/K/V 为同设备、同 dtype、连续的 FP16 或 BF16 NPU 张量，采用 BSND 布局。
 Q 为 `(B, Sq, Hq, D)`，K/V 为 `(B, Sk, Hkv, D)`；所有维度为正，
 `D` 支持 8/16/32/64/80/96/128，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
-仅支持推理前向，不支持梯度、packed/变长序列或 paged KV；未实现的选项必须保持默认值。
+仅支持推理前向，不支持梯度或 paged KV；未实现的选项必须保持默认值。
 
 `flash_attn_func` 始终返回 `(out, lse)`。O 与 Q 的形状和 dtype 相同；
 `return_lse=True` 返回 FP32 自然对数 LSE，形状为 `(B, Hq, Sq)`，否则 LSE 为 `None`。
 完全被 mask 的行返回精确零 O 和 `-inf` LSE。
+
+### 变长 TND
+
+`flash_attn_varlen_func` 接受连续的 Q `[total_q,Hq,D]` 和 K/V `[total_k,Hkv,D]`。
+`cu_seqlens_q/k` 是同设备连续 int32 `[B+1]` 累计存储偏移；可选的
+`seqused_q/k` 是 int32 `[B]` 有效长度，可以小于存储段长度。O 与 Q 同形状，
+LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。仅支持 Q/K 同时使用 TND。
+
+```python
+from flash_attn_npu_dsl import flash_attn_varlen_func
+
+# 两条序列：Q 长度 65、129，KV 长度 128、257。
+cu_q = torch.tensor([0, 65, 194], dtype=torch.int32, device=q.device)
+cu_k = torch.tensor([0, 128, 385], dtype=torch.int32, device=q.device)
+q_packed = torch.randn(194, Hq, D, dtype=q.dtype, device=q.device)
+k_packed = torch.randn(385, Hkv, D, dtype=q.dtype, device=q.device)
+v_packed = torch.randn_like(k_packed)
+out, lse = flash_attn_varlen_func(
+    q_packed,
+    k_packed,
+    v_packed,
+    cu_seqlens_q=cu_q,
+    cu_seqlens_k=cu_k,
+    max_seqlen_q=129,
+    max_seqlen_k=257,
+    causal=True,
+    return_lse=True,
+)
+```
+
+`max_seqlen_q/k` 是调度上界；省略时使用总 token 容量，不在热调用中回读长度。
+callback 的 q/kv 坐标仍是序列内坐标，`seqlen_info` 同时提供当前有效长度与
+`offset_q/k` 累计存储偏移。右对齐 causal/window 按各序列的有效长度计算。
+空序列合法；有效 Q 行没有可见 KV 时 O=0、LSE=-inf；`seqused_q` 以外的
+存储行没有数值保证。
+
+调用方保证累计偏移单调、从零开始且终值匹配存储容量，有效长度不超过存储段，
+并且调度上界覆盖实际有效长度。接口只检查元数据的形状、dtype、设备和连续性。
+元数据原地更新或地址替换会在下次调用生效；地址和内容不进入编译 key，
+总容量或编译期策略变化则可能产生新编译对象。
 
 - `softmax_scale`：基础分数缩放，默认 `1 / sqrt(D)`。
 - `softcap`：默认 0（关闭）；正值 `c` 将缩放后分数变为 `c * tanh(score / c)`，
@@ -246,11 +287,59 @@ out, lse = flash_attn_func(
 编译期移除相应索引读取，不创建占位索引张量。重新调用时会绑定当前张量和内容；
 调用方必须保证张量及其内容在该次异步执行完成前有效且不被修改。
 
+### TND 块表
+
+TND 使用相同的两步接口；向建块函数传入与 attention 相同的累计长度和有效长度：
+
+```python
+blocks = compute_block_sparsity(
+    128,
+    128,
+    2,
+    1,
+    129,
+    257,
+    causal_mask,
+    None,
+    q_packed.device,
+    cu_seqlens_q=cu_q,
+    cu_seqlens_k=cu_k,
+)
+out, lse = flash_attn_varlen_func(
+    q_packed,
+    k_packed,
+    v_packed,
+    cu_seqlens_q=cu_q,
+    cu_seqlens_k=cu_k,
+    max_seqlen_q=129,
+    max_seqlen_k=257,
+    mask_mod=causal_mask,
+    block_sparse_tensors=blocks,
+    return_lse=True,
+)
+```
+
+counts 为 `[H,total_m_blocks]`，indices 为 `[H,total_indices]`，每个张量可独立使用
+`H=1` 广播。`cu_total_m_blocks[b]` 定位该序列的 count 段，
+`cu_block_idx_offsets[b] + local_q_block * ceil(effective_k/128)` 定位 index 行。
+与 BSND 一样，只读取 count 指定的有效前缀，按 partial→full、列表原顺序消费，
+不排序或物化另一套调度表。显式表须提供 `block_size=(128,128)`。
+
+建块入口可通过一个前缀计算 kernel 生成缺少的累计块偏移，以存储段预留容量；
+只合并回读一次终值用于分配。已提供两个偏移时不再计算前缀。
+有效长度小于存储长度时允许段间留空隙。自行提供累计块偏移时，调用方保证容量、
+互不重叠的段和有效索引合法。省略 index 累计偏移时使用
+`cu_total_m_blocks[b] * ceil(effective_k/128)`，仅适用于该公式能正确定位各段的表。
+不同 batch 长度可能不同，因此 TND 不支持跨 batch 广播。
+
+固定表 attention 不扫描、回读或转换块表。改变有效长度、mask 数据或辅助数据后，
+必须先重建或更新表，再调用 attention；同形状表的原地修改和地址替换不要求重新编译。
+
 ## 代码模块与执行流程
 
 | 文件 | 职责 |
 | --- | --- |
-| [__init__.py](__init__.py) | 导出 `flash_attn_func`、`compute_block_sparsity`、`BlockSparseTensorsTorch`、`simd`。 |
+| [__init__.py](__init__.py) | 导出 `flash_attn_func`、`flash_attn_varlen_func`、`compute_block_sparsity`、`BlockSparseTensorsTorch`、`simd`。 |
 | [example.py](example.py) | 可运行入口：创建输入和回调，按需建块，调用前向并检查 O/LSE。 |
 | [interface.py](interface.py) | 校验 Q/K/V、辅助输入和参数，分配输出、转换运行时参数，管理编译缓存并编译、复用及启动内核。 |
 | [flash_fwd.py](flash_fwd.py) | 前向主内核：调度 Q/KV 块，组织 QK、回调、softmax、PV 的流水、搬运与同步。 |
@@ -260,7 +349,7 @@ out, lse = flash_attn_func(
 | [dn_full.py](dn_full.py) | 无回调、无边界裁剪的满 tile softmax，直接读取原始 score，省去修改后的 score 写回。 |
 | [block_sparsity.py](block_sparsity.py) | 定义公开块元数据，只校验元数据规格并记录四个张量各自的广播步长和容量。 |
 | [compute_block_sparsity.py](compute_block_sparsity.py) | 根据 mask 在设备上分类空块、partial 块和 full 块，返回公开块元数据。 |
-| [seqlen_info.py](seqlen_info.py) | 构造回调共享的定长序列信息，包含长度、零偏移和 KV 块数。 |
+| [seqlen_info.py](seqlen_info.py) | 构造 attention 与 classifier 共用的序列信息：有效长度、累计存储偏移和块偏移；检查元数据结构。 |
 
 1. 可选建块：`compute_block_sparsity` 调用 mask，产生 partial/full 元数据。
 2. 调用前向：`interface.py` 校验输入规格，直接绑定公开块张量，按编译缓存编译或复用后启动内核。
@@ -276,7 +365,7 @@ Cube 负责 QK/PV 矩阵乘；AIV 上的回调按声明使用 SIMT 或 SIMD，so
 
 进程内缓存只保存编译结果，不保存启动参数、块内容或输出。无回调、`aux_tensors=None`、
 无辅助标量且未提供块表时，
-dense 和内置 causal/window 使用动态 Q/K 长度：固定 batch、head、D、dtype、窗口配置及调度策略，
+BSND 的 dense 和内置 causal/window 使用动态 Q/K 长度：固定 batch、head、D、dtype、窗口配置及调度策略，
 不同正序列长度可复用同一编译对象。输出及 LSE 每次按当前长度分配，空行和尾块按当前长度处理。
 O-only 与 O+LSE 使用不同变体；其他参数组合继续按完整张量规格特化。
 
@@ -301,10 +390,13 @@ score 布局由入口在编译前选择。没有 SIMT 回调或显式 auxiliary�
 Q/KV 长度均至少 512。后者允许长序列带 Q 尾块，避免因尾块而让整段计算退回 ND。
 DN 直接计算 `K @ Qᵀ`，让 SIMD lane 沿 Q/head 排列。合并内置窗口保留 ND，以避免该组合的开销；
 其他不满足 DN 条件的调用也保持 ND 的 `Q @ Kᵀ` 与 KV-lane 路径。
+无 score 修改的 SIMT 稀疏调用也可复用 DN。TND 额外根据可知的平均 Q 长度
+约束此选择；仅有最大长度上界不足以证明利用率，指定 `seqused_q` 时不作这一推断。
 DN 中，Q/KV 均对齐 128、没有 mask/score/内置窗口且缩放为正的调用使用满 tile 计算体。
 其他调用按当前块判断：物理行列完整、整块可见、没有 score 修改且缩放为正时，
 也可复用满 tile 计算体；可见性由 full 块标记或内置窗口边界确定。
 边界块和尾块保留原处理；softcap 属于 score 修改，不会被满 tile 路径跳过。
+TND 的编译期上界不用于证明满块；当前任务的实际行列数满足条件时，仍复用同一满块计算体。
 这些选择不增加设备 kernel，也不改变块表顺序与 QK/PV 流水；不同选择使用独立编译变体，
 同一变体内仍可复用动态长度。用户不需要指定执行后端。
 

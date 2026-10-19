@@ -63,8 +63,48 @@ def test_public_exports():
         "BlockSparseTensorsTorch",
         "compute_block_sparsity",
         "flash_attn_func",
+        "flash_attn_varlen_func",
         "simd",
     }
+
+
+@pytest.mark.parametrize(
+    "total_q,used,expected_dn",
+    [
+        (254, False, False),
+        (256, False, True),
+        (258, False, True),
+        (1024, True, False),
+    ],
+)
+def test_varlen_scalar_dn_uses_known_rows_not_only_upper_bound(host, total_q, used, expected_dn):
+    from flash_attn_npu_dsl import BlockSparseTensorsTorch
+
+    q = torch.empty(total_q, 4, 64, dtype=torch.float16)
+    k = torch.empty(1026, 2, 64, dtype=torch.float16)
+    cuq = torch.tensor([0, total_q // 2, total_q], dtype=torch.int32)
+    cuk = torch.tensor([0, 513, 1026], dtype=torch.int32)
+    blocks = BlockSparseTensorsTorch(
+        torch.zeros(1, 8, dtype=torch.int32),
+        torch.zeros(1, 40, dtype=torch.int32),
+        cu_total_m_blocks=torch.tensor([0, 4, 8], dtype=torch.int32),
+        cu_block_idx_offsets=torch.tensor([0, 20, 40], dtype=torch.int32),
+        block_size=(128, 128),
+    )
+    interface.flash_attn_varlen_func(
+        q,
+        k,
+        k,
+        cu_seqlens_q=cuq,
+        cu_seqlens_k=cuk,
+        max_seqlen_q=512,
+        max_seqlen_k=513,
+        seqused_q=torch.tensor([1, 1], dtype=torch.int32) if used else None,
+        mask_mod=causal_mask,
+        block_sparse_tensors=blocks,
+    )
+    assert host.compiled[0][24:26] == (expected_dn, False)
+    assert host.launched[0][0][8][:2] == (cuq, cuk)
 
 
 @pytest.mark.parametrize(
@@ -182,7 +222,7 @@ def host(monkeypatch):
         state.compiled.append(args)
         return lambda *args, **kwargs: state.launched.append((args, kwargs))
 
-    monkeypatch.setattr(interface, "_validate_inputs", lambda *args: None)
+    monkeypatch.setattr(interface, "_validate_inputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(interface, "_check_launch_tensors", lambda tensors: None)
     monkeypatch.setattr(interface, "from_dlpack", HostTensor)
     monkeypatch.setattr(interface.tla, "compile", compile)
@@ -216,9 +256,10 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 26
+    assert len(host.compiled[0]) == 28
     args, kwargs = host.launched[0]
-    assert len(args) == 8 and kwargs == {"block_num": 2}
+    assert len(args) == 9 and kwargs == {"block_num": 2}
+    assert args[8] is None  # BSND has no packed sequence metadata.
     assert (args[4] is None) == (not lse)
     assert args[5] is None
     assert (args[6] is None) == (tensors is None)
@@ -369,8 +410,8 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
     q = torch.empty(1, q_len, 4, 64, dtype=torch.float16)
     k = torch.empty(1, kv_len, 2, 64, dtype=torch.float16)
     interface.flash_attn_func(q, k, k, **options)
-    assert host.compiled[0][-2:] == expected
-    assert len(host.launched[0][0]) == 8
+    assert host.compiled[0][24:26] == expected
+    assert len(host.launched[0][0]) == 9
 
 
 @pytest.mark.parametrize(
@@ -394,7 +435,7 @@ def test_packed_window_layout_and_query_limit(host, q_len, options, packed_heads
     k = torch.empty(32, 256, 1, 64, dtype=torch.float16)
     interface.flash_attn_func(q, k, k, **options)
     assert host.compiled[0][23] == packed_heads
-    assert host.compiled[0][-2:] == expected
+    assert host.compiled[0][24:26] == expected
 
 
 def test_dynamic_cache_separates_score_layouts_and_reuses_within_each(host):
