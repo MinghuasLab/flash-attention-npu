@@ -61,13 +61,17 @@ def _select_kernel_options(
         packed_heads = 1
     q_rows = q_len * packed_heads
     # A mostly empty query tail can cost more in DN than the full tiles save.
-    # For shorter problems require at least 3/4 of the allocated query rows;
+    # Extend tail coverage only when at least 3/4 of the query rows are used.
+    # Both allocated and known-valid lengths must be expressed in folded rows;
     # a variable-length upper bound alone cannot establish that utilization.
     padded_q_rows = ((q_rows + 127) // 128) * 128
-    known_q_rows = average_q_len if variable_lengths else q_rows
+    known_q_rows = (
+        (average_q_len * packed_heads if average_q_len is not None else None)
+        if variable_lengths
+        else q_rows
+    )
     efficient_query_tail = (
-        packed_heads == 1
-        and q_rows >= 128
+        q_rows >= 128
         and kv_len >= 256
         and known_q_rows is not None
         and 4 * known_q_rows >= 3 * padded_q_rows

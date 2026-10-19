@@ -562,23 +562,26 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
 
 
 @pytest.mark.parametrize(
-    "average_q_len,has_simt_mod,has_aux,expected",
+    "q_len,group,average_q_len,has_simt_mod,has_aux,expected",
     [
-        (None, False, False, False),
-        (191, False, False, False),
-        (192, False, False, True),
-        (255, True, False, False),
-        (255, False, True, False),
+        (255, 1, None, False, False, False),
+        (255, 1, 191, False, False, False),
+        (255, 1, 192, False, False, True),
+        (255, 1, 255, True, False, False),
+        (255, 1, 255, False, True, False),
+        (65, 5, None, False, False, False),
+        (65, 5, 57, False, False, False),
+        (65, 5, 58, False, False, True),
     ],
 )
 def test_short_variable_query_dn_requires_known_utilization(
-    average_q_len, has_simt_mod, has_aux, expected
+    q_len, group, average_q_len, has_simt_mod, has_aux, expected
 ):
     _, use_dn, full_dn = interface._select_kernel_options(
         4,
-        255,
+        q_len,
         512,
-        4,
+        4 * group,
         4,
         28,
         None,
@@ -599,7 +602,11 @@ def test_short_variable_query_dn_requires_known_utilization(
     "q_len,options,packed_heads,expected",
     [
         (4, {}, 32, (True, True)),
-        (17, {}, 32, (False, False)),
+        (5, {}, 32, (False, False)),
+        (6, {}, 32, (True, False)),
+        (17, {}, 32, (True, False)),
+        (6, {"aux_scalars": (1,)}, 32, (False, False)),
+        (6, {"mask_mod": causal_mask}, 32, (False, False)),
         (4, {"causal": True}, 32, (False, False)),
         (4, {"window_size": (128, 32)}, 32, (False, False)),
         (4, {"window_size": (0, None)}, 32, (False, False)),

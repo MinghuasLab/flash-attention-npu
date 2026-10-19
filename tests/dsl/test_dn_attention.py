@@ -67,22 +67,24 @@ def _scalar_strict_causal(b, h, q, kv, info, tensors):
 
 
 @pytest.mark.parametrize(
-    "dtype,dim,kv_heads,batch,mode",
+    "dtype,dim,kv_heads,batch,mode,sq,group",
     [
-        (torch.float16, 64, 1, 64, "simd"),
-        (torch.bfloat16, 96, 3, 64, "simd"),
-        (torch.float16, 64, 1, 8, "simt"),
-        (torch.bfloat16, 96, 1, 8, "simd_mask"),
-        (torch.float16, 64, 1, 8, "simd_score"),
-        (torch.bfloat16, 96, 1, 8, "simd"),
+        (torch.float16, 64, 1, 64, "simd", 4, 32),
+        (torch.bfloat16, 96, 3, 64, "simd", 4, 32),
+        (torch.float16, 64, 1, 8, "simt", 4, 32),
+        (torch.bfloat16, 96, 1, 8, "simd_mask", 4, 32),
+        (torch.float16, 64, 1, 8, "simd_score", 4, 32),
+        (torch.bfloat16, 96, 1, 8, "simd", 4, 32),
+        (torch.float16, 64, 3, 8, "simd", 65, 3),
+        (torch.bfloat16, 96, 1, 32, "simd", 49, 5),
     ],
 )
-def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode):
+def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode, sq, group):
     import torch_npu  # noqa: F401
 
     device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
     torch.npu.set_device(device)
-    sq, sk, heads = 4, 388, 32 * kv_heads
+    sk, heads = 388, group * kv_heads
     mask_mod = causal if mode in ("simd", "simd_mask") else _scalar_causal
     score_mod = coordinate_score if mode in ("simd", "simd_score") else _scalar_coordinate_score
     generator = torch.Generator().manual_seed(17)
@@ -96,7 +98,7 @@ def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode):
     )
     inputs = tuple(value.to(device) for value in host)
     q, k, v = (value.float().permute(0, 2, 1, 3) for value in host)
-    k, v = k.repeat_interleave(32, dim=1), v.repeat_interleave(32, dim=1)
+    k, v = k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1)
     scores = q @ k.transpose(-1, -2) * dim**-0.5 * 0.75
     scores += (
         torch.arange(batch)[:, None, None, None] * 0.005
@@ -128,7 +130,9 @@ def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode):
             visible = torch.zeros(batch, 1, sq, sk, dtype=torch.bool)
             for b in range(batch):
                 if pc[b, 0, 0]:
-                    visible[b, 0, :, 384:] = torch.arange(4)[None, :] <= torch.arange(sq)[:, None]
+                    visible[b, 0, :, 384:] = (
+                        torch.arange(384, sk)[None, :] <= torch.arange(sq)[:, None] + sk - sq
+                    )
                 if fc[b, 0, 0] >= 1:
                     visible[b, 0, :, 128:256] = True
                 if fc[b, 0, 0] == 2:
@@ -152,7 +156,7 @@ def test_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads, batch, mode):
                 else:
                     assert lse is None
                 constants = next(reversed(interface._compiled_kernels))[1][-1]
-                assert constants[15][1] == 32
+                assert constants[15][1] == group
                 assert constants[16][1] is (mode == "simd") and constants[17][1] is False
             assert len(interface._compiled_kernels) == 2
     finally:
