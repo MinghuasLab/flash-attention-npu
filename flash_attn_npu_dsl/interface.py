@@ -36,6 +36,7 @@ def _select_kernel_options(
     average_q_len=None,
     q_tile=128,
     pack_gqa=None,
+    num_splits=1,
 ):
     """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
@@ -76,6 +77,24 @@ def _select_kernel_options(
         and known_q_rows is not None
         and 4 * known_q_rows >= 3 * padded_q_rows
     )
+    if (
+        efficient_query_tail
+        and packed_heads > 1
+        and has_score_mod
+        and q_rows % 128
+        and num_splits == 1
+        and (not variable_lengths or average_q_len == q_len)
+    ):
+        # Tile-major work is round-robin across cores. A last wave containing
+        # only short tails can extend DN score work even at high global row
+        # utilization. Estimate the busiest AIV's valid rows, not just the sum.
+        # The model requires uniform lengths and unsplit tasks; an average equal
+        # to the valid upper bound proves uniformity without reading metadata.
+        tasks_per_tile = batch * kv_heads
+        full_waves = (tasks_per_tile * (q_rows // 128) + cores - 1) // cores
+        waves = (tasks_per_tile * (padded_q_rows // 128) + cores - 1) // cores
+        busy_rows = full_waves * 64 + (waves - full_waves) * min(q_rows % 128, 64)
+        efficient_query_tail = 4 * busy_rows >= 3 * waves * 64
     # Sparse scalar masks benefit from DN when enough Q rows amortize padding.
     # For variable lengths, the maximum alone cannot establish utilization;
     # use the known average only when seqused_q does not hide valid row counts.
@@ -495,6 +514,7 @@ def _flash_attention(
             average_q_len=(q.shape[0] / batch) if packed and sequence_metadata[2] is None else None,
             q_tile=q_tile,
             pack_gqa=pack_gqa,
+            num_splits=num_splits,
         )
         if packed_heads > 1:
             q_len *= packed_heads

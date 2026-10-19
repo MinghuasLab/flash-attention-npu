@@ -561,6 +561,44 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
     assert len(host.launched[0][0]) == 9
 
 
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    "batch,q_len,group,softcap,use_dn",
+    [
+        (8, 13, 31, 2.0, False),
+        (8, 13, 31, 0.0, True),
+        (12, 13, 31, 2.0, True),
+        (8, 17, 31, 2.0, True),
+        (8, 31, 13, 2.0, False),
+    ],
+)
+def test_uniform_packed_score_tail_respects_core_waves(
+    host, monkeypatch, packed, batch, q_len, group, softcap, use_dn
+):
+    monkeypatch.setattr(
+        torch.npu, "get_device_properties", lambda index: SimpleNamespace(cube_core_num=28)
+    )
+    q = torch.empty(batch, q_len, group, 64, dtype=torch.float16)
+    k = torch.empty(batch, 768, 1, 64, dtype=torch.float16)
+    options = dict(mask_mod=vector_mask, softcap=softcap)
+    if packed:
+        cu_q = torch.arange(batch + 1, dtype=torch.int32) * q_len
+        cu_k = torch.arange(batch + 1, dtype=torch.int32) * 768
+        interface.flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            k.flatten(0, 1),
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=768,
+            **options,
+        )
+    else:
+        interface.flash_attn_func(q, k, k, **options)
+    assert host.compiled[0][23:26] == (group, use_dn, False)
+
+
 @pytest.mark.parametrize(
     "q_len,group,average_q_len,has_simt_mod,has_aux,expected",
     [
