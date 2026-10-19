@@ -259,15 +259,27 @@ def _vector_native_dn_softmax(
     window_left,
     window_right,
 ):
-    # A full metadata block must also be physically full. Never bypass score
-    # modification or an intrinsic window.
+    # Both metadata and intrinsic windows can prove that a tile is fully
+    # visible. The same fast path also requires complete physical rows/columns
+    # and unmodified scores.
     eligible = False
-    if tla.const_expr(
-        score_mod is None and window_left is None and window_right is None and scale > 0
-    ):
+    if tla.const_expr(score_mod is None and scale > 0):
         eligible = (rows == 64) & (columns == 128)
         if tla.const_expr(mask_mod is not None):
             eligible = eligible & (not apply_mask)
+        else:
+            # Every key must lie inside every query's window. The largest Q
+            # gives the tightest left bound; the smallest Q gives the right.
+            if tla.const_expr(window_left is not None):
+                last_q = (q_start + rows - 1) // packed_heads
+                eligible = eligible & (
+                    kv_start >= last_q + info.seqlen_k - info.seqlen_q - window_left
+                )
+            if tla.const_expr(window_right is not None):
+                first_q = q_start // packed_heads
+                eligible = eligible & (
+                    kv_start + columns - 1 <= first_q + info.seqlen_k - info.seqlen_q + window_right
+                )
     if eligible:
         full_dn_softmax(
             scores, probs, running_max, running_sum, alpha, first, scale, probability_dtype

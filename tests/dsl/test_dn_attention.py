@@ -259,3 +259,61 @@ def test_dn_partial_then_full_preserves_empty_rows(dtype, return_lse, mask):
             assert current is executable
     finally:
         interface._compiled_kernels.clear()
+
+
+@pytest.mark.parametrize(
+    "dtype,dim,window",
+    [
+        (torch.float16, 16, (None, 0)),
+        (torch.bfloat16, 128, (256, 0)),
+        (torch.float16, 64, (0, 256)),
+        (torch.bfloat16, 96, (129, 64)),
+    ],
+)
+def test_dn_intrinsic_full_and_boundary_tiles_reuse_dynamic_lengths(dtype, dim, window):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(29)
+    interface._compiled_kernels.clear()
+    executables = {}
+    try:
+        # Cross full/partial tiles, rectangular right alignment and empty rows,
+        # then revisit the first shape with new data and storage addresses.
+        for sq, sk in ((256, 512), (513, 769), (640, 384), (256, 512)):
+            host = tuple(
+                torch.randn(shape, generator=generator).to(dtype)
+                for shape in ((2, sq, 4, dim), (2, sk, 2, dim), (2, sk, 2, dim))
+            )
+            q, k, v = (tensor.float().permute(0, 2, 1, 3) for tensor in host)
+            k, v = k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1)
+            scores = q @ k.transpose(-1, -2) * dim**-0.5
+            center = torch.arange(sq)[:, None] + sk - sq
+            keys = torch.arange(sk)[None, :]
+            keep = torch.ones(sq, sk, dtype=torch.bool)
+            if window[0] is not None:
+                keep &= keys >= center - window[0]
+            if window[1] is not None:
+                keep &= keys <= center + window[1]
+            scores.masked_fill_(~keep, -torch.inf)
+            expected_lse = scores.logsumexp(-1)
+            expected = (scores.softmax(-1).nan_to_num() @ v).permute(0, 2, 1, 3)
+            inputs = tuple(tensor.to(device) for tensor in host)
+            for return_lse in (False, True):
+                out, lse = flash_attn_func(*inputs, window_size=window, return_lse=return_lse)
+                torch.npu.synchronize()
+                actual = out.cpu().float()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0.05)
+                assert torch.count_nonzero(actual[:, ~keep.any(-1)]) == 0
+                if return_lse:
+                    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.05)
+                else:
+                    assert lse is None
+                executable = next(reversed(interface._compiled_kernels.values()))
+                if return_lse not in executables:
+                    executables[return_lse] = executable
+                assert executable is executables[return_lse]
+            assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()
