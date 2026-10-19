@@ -67,6 +67,7 @@ def _check(out, lse, expected, expected_lse):
         (torch.bfloat16, 96, 16, 2, 257, 129, (4, 2), "sparse"),
         (torch.float16, 80, 8, 32, 3, 257, (8, 1), "builtin"),
         (torch.bfloat16, 8, 80, 32, 3, 257, (8, 2), "simd"),
+        (torch.float16, 32, 96, 2, 192, 257, (4, 2), "sparse"),
         (torch.float16, 192, 128, 2, 65, 257, (4, 2), "builtin"),
         (torch.bfloat16, 128, 256, 2, 129, 257, (4, 2), "simt"),
         (torch.float16, 256, 64, 2, 129, 257, (4, 2), "sparse"),

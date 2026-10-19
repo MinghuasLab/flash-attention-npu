@@ -239,7 +239,16 @@ def test_dn_query_tails_preserve_empty_rows_and_dynamic_reuse(dtype, dim):
     try:
         # Exercise one inactive AIV, both AIVs with partial rows, and an aligned
         # tile, then return to the first lengths using new buffers and data.
-        for sq, sk in ((513, 513), (543, 513), (577, 1025), (640, 768), (513, 513)):
+        for sq, sk in (
+            (513, 513),
+            (543, 513),
+            (577, 1025),
+            (640, 768),
+            (192, 256),
+            (255, 384),
+            (513, 511),
+            (513, 513),
+        ):
             host = tuple(
                 torch.randn(shape, generator=generator).to(dtype)
                 for shape in ((2, sq, 4, dim), (2, sk, 2, dim), (2, sk, 2, dim))

@@ -487,8 +487,12 @@ def test_callback_packing_limits_simt_to_short_queries(host, mask, score, q_len,
         (128, 256, {}, (True, True)),
         (128, 257, {}, (True, False)),
         (129, 512, {}, (False, False)),
-        (511, 512, {}, (False, False)),
-        (513, 511, {}, (False, False)),
+        (191, 512, {}, (False, False)),
+        (192, 255, {}, (False, False)),
+        (192, 256, {}, (True, False)),
+        (399, 512, {}, (True, False)),
+        (511, 512, {}, (True, False)),
+        (513, 511, {}, (True, False)),
         (512, 512, {}, (True, True)),
         (513, 512, {}, (True, False)),
         (513, 513, {"mask_mod": vector_mask}, (True, False)),
@@ -511,6 +515,40 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
     interface.flash_attn_func(q, k, k, **options)
     assert host.compiled[0][24:26] == expected
     assert len(host.launched[0][0]) == 9
+
+
+@pytest.mark.parametrize(
+    "average_q_len,has_simt_mod,has_aux,expected",
+    [
+        (None, False, False, False),
+        (191, False, False, False),
+        (192, False, False, True),
+        (255, True, False, False),
+        (255, False, True, False),
+    ],
+)
+def test_short_variable_query_dn_requires_known_utilization(
+    average_q_len, has_simt_mod, has_aux, expected
+):
+    _, use_dn, full_dn = interface._select_kernel_options(
+        4,
+        255,
+        512,
+        4,
+        4,
+        28,
+        None,
+        has_simt_mod=has_simt_mod,
+        has_aux=has_aux,
+        has_mod=True,
+        has_window=False,
+        scale=0.125,
+        has_score_mod=False,
+        variable_lengths=True,
+        average_q_len=average_q_len,
+    )
+    assert use_dn is expected
+    assert full_dn is False
 
 
 @pytest.mark.parametrize(
@@ -546,6 +584,8 @@ def test_dynamic_cache_separates_score_layouts_and_reuses_within_each(host):
         (513, 512, 2),
         (577, 1025, 2),
         (129, 257, 3),
+        (191, 512, 3),
+        (192, 512, 3),
         (127, 513, 3),
         (128, 256, 3),
     ):

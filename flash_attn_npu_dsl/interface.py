@@ -53,6 +53,18 @@ def _select_kernel_options(
     if has_simt_mod and q_len > 32:
         packed_heads = 1
     q_rows = q_len * packed_heads
+    # A mostly empty query tail can cost more in DN than the full tiles save.
+    # For shorter problems require at least 3/4 of the allocated query rows;
+    # a variable-length upper bound alone cannot establish that utilization.
+    padded_q_rows = ((q_rows + 127) // 128) * 128
+    known_q_rows = average_q_len if variable_lengths else q_rows
+    efficient_query_tail = (
+        packed_heads == 1
+        and q_rows >= 128
+        and kv_len >= 256
+        and known_q_rows is not None
+        and 4 * known_q_rows >= 3 * padded_q_rows
+    )
     # Sparse scalar masks benefit from DN when enough Q rows amortize padding.
     # For variable lengths, the maximum alone cannot establish utilization;
     # use the known average only when seqused_q does not hide valid row counts.
@@ -72,7 +84,11 @@ def _select_kernel_options(
                 and (not variable_lengths or (average_q_len is not None and average_q_len >= 128))
             )
         )
-        and (q_rows % 128 == 0 or (packed_heads == 1 and q_rows >= 512 and kv_len >= 512))
+        and (
+            q_rows % 128 == 0
+            or (packed_heads == 1 and q_rows >= 512 and kv_len >= 512)
+            or efficient_query_tail
+        )
         and kv_len >= 256
     )
     full_dn = (
