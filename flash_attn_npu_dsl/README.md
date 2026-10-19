@@ -167,6 +167,21 @@ auxiliary 和显式块表保持可用；建块时提供相同的 `cu_seqlens_q`�
 页索引、长度及上界内容由调用方保证合法。页表原地修改和地址替换会在下次调用生效，
 不影响编译 key；长度或 auxiliary 改变可见性时，须重新生成或更新块表。
 
+### Split-KV decode
+
+分页 TND 且 `max_seqlen_q <= 16` 时，可用 `num_splits>1` 显式拆分 KV 工作。
+分割数不超过设备 Cube 核数；`num_splits=1`（默认）沿用单 kernel。
+`num_splits=0` 自动判断：只有低占用、至少65536个有效候选 KV token 的非稀疏短 Q
+才拆分；窄窗口按可访问范围计算工作量，块表自动模式保持1。
+
+各分段使用相同的 modifier、辅助数据和块表遍历，另一个 kernel 归并 FP32 部分结果。
+计时须包含分段和归并，不能只看分段 attention。
+短 KV 或较高占用时，额外分配、提交及归并可能抵消并行收益。
+O-only 仍需内部 max/sum，但不分配最终 LSE；确定性仅要求相同分割方案的重复运行，
+不同分割数允许正常舍入差异。
+
+### 常用选项
+
 - `softmax_scale`：基础分数缩放，默认 `1 / sqrt(Dqk)`。
 - `softcap`：默认 0（关闭）；正值 `c` 将缩放后分数变为 `c * tanh(score / c)`，
   然后再应用 mask。内部使用 SIMD score helper，不可与显式 `score_mod` 同用；

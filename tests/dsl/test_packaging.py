@@ -29,6 +29,7 @@ _MODULES = {
     "modifiers.py",
     "seqlen_info.py",
     "softmax.py",
+    "split_kv.py",
 }
 _FORBIDDEN_ROOTS = {
     "examples",

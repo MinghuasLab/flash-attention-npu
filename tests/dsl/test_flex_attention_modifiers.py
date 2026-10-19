@@ -142,8 +142,8 @@ def _lower(
             None,
             0,
             dim,
-            None,  # Contiguous KV: no page table.
-            0,  # No physical page size.
+            0,  # Contiguous KV: no page size.
+            1,  # No Split-KV workspace or merge.
         ),
     )
 

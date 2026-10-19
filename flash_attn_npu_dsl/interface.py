@@ -242,6 +242,21 @@ def _resolve_window(causal, window_size, mask_mod):
     return left, right
 
 
+def _select_num_splits(request, tasks, cores, kv_len, eligible, sparse, rows, value_dim):
+    """Fill one core wave for short dense decode without inspecting device metadata."""
+    if type(request) is not int or request < 0 or request > cores:
+        raise ValueError(f"num_splits must be an integer in [0,{cores}]")
+    if request:
+        return request
+    # A second launch is worthwhile only for a long KV traversal. Short decode
+    # may save device work while losing more time to the extra host submission.
+    if not eligible or sparse is not None or tasks == 0 or tasks >= cores or kv_len < 65536:
+        return 1
+    # Bound speculative workspace from max-seqlen scheduling, not tensor contents.
+    capacity = (64 * 1024 * 1024) // max(1, rows * (value_dim + 2) * 4)
+    return max(1, min((cores + tasks - 1) // tasks, (kv_len + 127) // 128, capacity))
+
+
 def flash_attn_func(
     q,
     k,
@@ -277,7 +292,7 @@ def flash_attn_func(
         ("qv", qv is None),
         ("gather_kv_indices", gather_kv_indices is None),
         ("learnable_sink", learnable_sink is None),
-        ("num_splits", num_splits == 1),
+        ("num_splits", type(num_splits) is int and num_splits in (0, 1)),
         ("pack_gqa", pack_gqa is None),
         ("score_mod_bwd", score_mod_bwd is None),
         ("block_sparse_tensors_bwd", block_sparse_tensors_bwd is None),
@@ -320,6 +335,7 @@ def _flash_attention(
     max_seqlen_q=None,
     max_seqlen_k=None,
     page_table=None,
+    num_splits=1,
 ):
     """Prepare one shared forward kernel; only sequence addressing differs."""
     import torch
@@ -428,6 +444,22 @@ def _flash_attention(
                         for stride in sparse.strides
                     )
                 )
+        tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
+        splits = 1
+        if num_splits != 1:
+            split_kv_work = kv_len
+            if packed and window_left is not None:
+                split_kv_work = min(kv_len, max_seqlen_q + window_left)
+            splits = _select_num_splits(
+                num_splits,
+                tasks,
+                cores,
+                split_kv_work,
+                packed and paged and max_seqlen_q <= 16,
+                sparse,
+                original_shape[0] * original_shape[-2] if packed else q.numel() // head_dim,
+                value_dim,
+            )
         out = (
             torch.empty_like(q)
             if value_dim == head_dim
@@ -445,6 +477,19 @@ def _flash_attention(
             else None
         )
         tensors = (q, k, v, out, lse)
+        partial_stats = None
+        if splits > 1:
+            partial_out = torch.empty(
+                (splits, original_shape[0], original_shape[-2], value_dim),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            partial_stats = torch.empty(
+                (splits, original_shape[0] * original_shape[-2], 2),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            tensors = (q, k, v, partial_out, None)
         sparse_tensors = sparse.tensors if sparse is not None else ()
         sequence_tensors = sequence_metadata if sequence_metadata is not None else ()
         if not dynamic_lengths:
@@ -465,8 +510,11 @@ def _flash_attention(
             sparse_tensors if sparse is not None else None,
             aux_tensors,
             aux_scalars,
-            sequence_metadata,
-            page_table,
+            # Keep contiguous BSND's metadata as one Unit argument. Optional
+            # sequence addressing and split state travel together when present.
+            (sequence_metadata, page_table, partial_stats)
+            if sequence_metadata is not None
+            else None,
         )
         constants = (
             batch,
@@ -488,11 +536,16 @@ def _flash_attention(
             use_dn,
             full_dn,
         )
+        key_tensors = (*tensors, *sparse_tensors, *sequence_tensors)
+        if page_table is not None:
+            key_tensors += (page_table,)
+        if partial_stats is not None:
+            key_tensors += (partial_stats,)
         key = _compilation_key(
-            (*tensors, page_table, *sparse_tensors, *sequence_tensors),
+            key_tensors,
             aux_tensors,
             aux_scalars,
-            (*constants, packed, value_dim, k.shape[1] if paged else 0),
+            (*constants, packed, value_dim, k.shape[1] if paged else 0, splits),
             q.device,
             dynamic_lengths=dynamic_lengths,
         )
@@ -535,16 +588,27 @@ def _flash_attention(
             return (
                 *bindings,
                 *constants,
-                sample_sequences,
+                (
+                    sample_sequences,
+                    from_dlpack(page_table, layout_tag=tla.arch.RowMajor) if paged else None,
+                    from_dlpack(partial_stats.reshape(-1), layout_tag=tla.arch.RowMajor)
+                    if partial_stats is not None
+                    else None,
+                )
+                if sequence_metadata is not None
+                else None,
                 original_shape[0] if packed else 0,
                 value_dim,
-                from_dlpack(page_table, layout_tag=tla.arch.RowMajor) if paged else None,
                 k.shape[1] if paged else 0,
+                splits,
             )
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
-        tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
-        compiled(*runtime_args, block_num=max(1, min(tasks, int(cores))))
+        compiled(*runtime_args, block_num=max(1, min(tasks * splits, int(cores))))
+        if splits > 1:
+            from .split_kv import combine_split_results
+
+            combine_split_results(partial_out, partial_stats, out, lse, cores)
         if packed_heads > 1 and dynamic_lengths and kv_heads == 1:
             out = out.view(*original_shape[:-1], value_dim)
         return out, lse
@@ -600,7 +664,6 @@ def flash_attn_varlen_func(
         ("gather_kv_indices", gather_kv_indices is None),
         ("learnable_sink", learnable_sink is None),
         ("pack_gqa", pack_gqa is None),
-        ("num_splits", num_splits == 1),
         ("score_mod_bwd", score_mod_bwd is None),
         ("scheduler_metadata", scheduler_metadata is None),
         ("seqlen_k_per_split", seqlen_k_per_split is None),
@@ -659,6 +722,10 @@ def flash_attn_varlen_func(
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer or None")
         bounds.append(value)
+    if type(num_splits) is not int or num_splits < 0:
+        raise ValueError("num_splits must be a nonnegative integer")
+    if num_splits > 1 and not (paged and packed and bounds[0] <= 16):
+        raise NotImplementedError("num_splits>1 requires paged TND with max_seqlen_q<=16")
     return _flash_attention(
         q,
         k,
@@ -676,4 +743,5 @@ def flash_attn_varlen_func(
         (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None),
         *bounds,
         page_table,
+        num_splits,
     )

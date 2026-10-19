@@ -27,6 +27,8 @@ from .dn_full import full_dn_softmax
 from .softmax import (
     output_empty_row,
     output_pack_row,
+    output_partial_tile,
+    pack_split_statistics,
     output_update_tile,
     online_softmax_tile,
 )
@@ -117,9 +119,11 @@ def _store_grouped_output(
     heads: tla.Constexpr[int],
     groups: tla.Constexpr[int],
     dim: tla.Constexpr[int],
+    row_stride: tla.Constexpr[int] = 0,
 ):
     """Scatter packed UB rows back to their original BSND head groups."""
-    row_stride = 64 if dim <= 64 else ((dim + 127) // 128) * 128
+    if tla.const_expr(row_stride == 0):
+        row_stride = 64 if dim <= 64 else ((dim + 127) // 128) * 128
     copied = tla.Int32(0)
     while copied < rows:
         index = start + copied
@@ -222,12 +226,17 @@ def flex_attention_kernel(
     packed_heads: tla.Constexpr[int] = 1,
     use_dn: tla.Constexpr[bool] = False,
     full_dn: tla.Constexpr[bool] = False,
-    sequence_metadata=None,
+    launch_metadata=None,
     total_q: tla.Constexpr[int] = 0,
     value_dim: tla.Constexpr[int | None] = None,
-    page_table=None,
     page_size: tla.Constexpr[int] = 0,
+    num_splits: tla.Constexpr[int] = 1,
 ) -> None:
+    sequence_metadata = None
+    page_table = None
+    partial_stats = None
+    if tla.const_expr(launch_metadata is not None):
+        sequence_metadata, page_table, partial_stats = launch_metadata
     if tla.const_expr(value_dim is None):
         value_dim = head_dim
     if tla.const_expr(q_len is None):
@@ -270,7 +279,7 @@ def flex_attention_kernel(
     mm2L0BTotalStages_ = (value_dim + 127) // 128
     q_tiles = (q_len + qBaseTile_ - 1) // qBaseTile_
     kv_tiles = (kv_len + 127) // 128
-    total_tasks = batch * q_heads * q_tiles
+    total_tasks = batch * q_heads * q_tiles * num_splits
     # --- L1->L0 完成 -> GM->L1 可开始 ---
     q_l0a_ready_l1 = tla.flag("l0a_ready_l1", tla.arch.MTE1, tla.arch.MTE2)
     k_l0b_ready_l1_0 = tla.flag("k_l0b_ready_l1_0", tla.arch.MTE1, tla.arch.MTE2)
@@ -436,10 +445,15 @@ def flex_attention_kernel(
         lse_ub_ptr = None
     row_max_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
     tile_sum_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
+    if tla.const_expr(num_splits > 1):
+        stats_ub_ptr = tla.allocate(64 * 8, tla.Float32, tla.AddressSpace.ub, 256)
+        total_output_rows = total_q * q_heads * packed_heads
     # Interleave heads/batches for each Q tile; metadata keeps its logical order.
     for work in tla.range(tla.arch.block_idx(), total_tasks, tla.arch.block_num()):
-        q_tile = work // (batch * q_heads)
-        batch_head = work % (batch * q_heads)
+        base_work = work // num_splits
+        split = work % num_splits
+        q_tile = base_work // (batch * q_heads)
+        batch_head = base_work % (batch * q_heads)
         qSTileIdx = q_tile
         qHeadIdx = batch_head % q_heads
         curBatch = batch_head // q_heads
@@ -554,6 +568,13 @@ def flex_attention_kernel(
             # neither load Q/K nor invoke callbacks, but still balance flags.
             if rowNum == 0:
                 kvSLoopNum = 0
+        active_start = 0
+        if tla.const_expr(num_splits > 1):
+            active_start = kvSLoopNum * split // num_splits
+            active_end = kvSLoopNum * (split + 1) // num_splits
+            kvSLoopNum = active_end - active_start
+            if tla.const_expr(sparse_tensors is None):
+                first_kv += active_start
         if kvSLoopNum > 0:
             with tla.cube():
                 gm_q = tla.make_tensor(
@@ -594,7 +615,7 @@ def flex_attention_kernel(
                     if tla.const_expr(sparse_tensors is not None):
                         gatheredKvSTileIdx, block_kind = _sparse_block(
                             sparse_tensors,
-                            validIdx,
+                            validIdx + active_start,
                             partial_count,
                             partial_base,
                             full_base,
@@ -1354,7 +1375,7 @@ def flex_attention_kernel(
                     if tla.const_expr(sparse_tensors is not None):
                         gatheredKvSTileIdxDe, _ = _sparse_block(
                             sparse_tensors,
-                            validIdxDe,
+                            validIdxDe + active_start,
                             partial_count,
                             partial_base,
                             full_base,
@@ -1646,6 +1667,7 @@ def flex_attention_kernel(
                                 validIdxDe,
                                 kvSLoopNum,
                                 value_dim,
+                                normalize=num_splits == 1,
                             )
                         if ubOTmpBufId == 0:
                             tla.cross_core_set_flag(mm2_ready_re_0, tla.arch.VECTOR)
@@ -1716,30 +1738,58 @@ def flex_attention_kernel(
                     tla.make_shape(final_m, output_stride), tla.make_stride(output_stride, 1)
                 )
                 final_output_ub = tla.make_tensor(ubO_ptr, final_out_layout)
-                final_packed_output = tla.make_tensor(ubO16_ptr, final_out_layout)
-                # O16 aliases the FP32 accumulator: finish normalization before
-                # packing rows in increasing order into the same storage.
+                final_data_ptr = ubO16_ptr
+                if tla.const_expr(num_splits > 1):
+                    final_data_ptr = ubO_ptr
+                final_packed_output = tla.make_tensor(final_data_ptr, final_out_layout)
                 tla.pipe_barrier(tla.pipes.ALL)
-                with tla.vec.func(mode="simd"):
-                    final_full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
-                    final_packed_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float16)
-                    if tla.const_expr(value_dim <= 64):
-                        final_packed_mask, _ = tla.update_mask(64, dtype=tla.Float16)
-                    for final_row in tla.range(final_m):
-                        output_pack_row(
-                            final_output_ub,
-                            final_packed_output,
-                            final_row,
-                            DTYPE_Q,
-                            final_full_mask,
-                            final_packed_mask,
-                            value_dim,
+                if tla.const_expr(num_splits == 1):
+                    with tla.vec.func(mode="simd"):
+                        final_full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
+                        final_packed_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float16)
+                        if tla.const_expr(value_dim <= 64):
+                            final_packed_mask, _ = tla.update_mask(64, dtype=tla.Float16)
+                        for final_row in tla.range(final_m):
+                            output_pack_row(
+                                final_output_ub,
+                                final_packed_output,
+                                final_row,
+                                DTYPE_Q,
+                                final_full_mask,
+                                final_packed_mask,
+                                value_dim,
+                            )
+                else:
+                    output_partial_tile(final_output_ub, final_m, value_dim)
+                    final_stats_ub = tla.make_tensor(
+                        stats_ub_ptr,
+                        tla.make_layout(tla.make_shape(final_m, 8), tla.make_stride(8, 1)),
+                    )
+                    final_stat_layout = tla.make_layout(tla.make_shape(64), tla.make_stride(1))
+                    if kvSLoopNum == 0:
+                        pack_split_statistics(
+                            final_stats_ub,
+                            tla.make_tensor(lastMax_ptr, final_stat_layout),
+                            tla.make_tensor(lastSum_ptr, final_stat_layout),
+                            final_m,
+                            True,
+                        )
+                    else:
+                        pack_split_statistics(
+                            final_stats_ub,
+                            tla.make_tensor(lastMax_ptr, final_stat_layout),
+                            tla.make_tensor(lastSum_ptr, final_stat_layout),
+                            final_m,
+                            False,
                         )
                 tla.set_flag(p_ub_ready_l1_0)
                 tla.wait_flag(p_ub_ready_l1_0)
+                output_offset = oBOffset
+                if tla.const_expr(num_splits > 1):
+                    output_offset += split * total_output_rows * value_dim
                 final_gm_out = tla.make_tensor(
                     attention_out.ptr
-                    + oBOffset
+                    + output_offset
                     + qHeadIdx * value_dim
                     + (qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf) * oSOffset,
                     tla.make_layout(
@@ -1753,11 +1803,11 @@ def flex_attention_kernel(
                 )
                 if tla.const_expr(packed_heads > 1 and kv_heads > 1):
                     _store_grouped_output(
-                        ubO16_ptr,
+                        final_data_ptr,
                         attention_out,
                         qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf,
                         final_m,
-                        oBOffset,
+                        output_offset,
                         qHeadIdx,
                         packed_heads,
                         kv_heads,
@@ -1765,6 +1815,39 @@ def flex_attention_kernel(
                     )
                 else:
                     tla.copy(final_gm_out, final_packed_valid)
+                if tla.const_expr(num_splits > 1):
+                    stats_offset = output_offset // value_dim * 2
+                    if tla.const_expr(packed_heads > 1 and kv_heads > 1):
+                        _store_grouped_output(
+                            stats_ub_ptr,
+                            partial_stats,
+                            qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf,
+                            final_m,
+                            stats_offset,
+                            qHeadIdx,
+                            packed_heads,
+                            kv_heads,
+                            2,
+                            row_stride=8,
+                        )
+                    else:
+                        final_stats_gm = tla.make_tensor(
+                            partial_stats.ptr
+                            + stats_offset
+                            + qHeadIdx * 2
+                            + (qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf)
+                            * q_heads
+                            * 2,
+                            tla.make_layout(
+                                tla.make_shape(final_m, 2), tla.make_stride(q_heads * 2, 1)
+                            ),
+                        )
+                        tla.copy(
+                            final_stats_gm,
+                            tla.tile_view(
+                                final_stats_ub, tla.make_shape(final_m, 2), tla.make_coord(0, 0)
+                            ),
+                        )
                 if tla.const_expr(lse is not None):
                     if tla.const_expr(
                         sequence_metadata is not None and sequence_metadata[0] is not None

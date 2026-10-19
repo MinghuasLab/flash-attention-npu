@@ -390,6 +390,7 @@ def output_update_tile(
     valid_idx,
     active_tiles,
     head_dim=128,
+    normalize=True,
 ):
     """Initialize O from the first PV tile; rescale and accumulate later PV tiles.
 
@@ -399,11 +400,45 @@ def output_update_tile(
     common = (pv, output, alpha, running_max, running_sum, lse, rows)
     if valid_idx == 0:
         if active_tiles == 1:
-            _output_update_tile_impl(*common, True, True, head_dim)
+            _output_update_tile_impl(*common, True, normalize, head_dim)
         else:
             _output_update_tile_impl(*common, True, False, head_dim)
     else:
         if valid_idx == active_tiles - 1:
-            _output_update_tile_impl(*common, False, True, head_dim)
+            _output_update_tile_impl(*common, False, normalize, head_dim)
         else:
             _output_update_tile_impl(*common, False, False, head_dim)
+
+
+@tla.jit
+def output_partial_tile(output, rows, head_dim: tla.Constexpr[int]):
+    """Restore contiguous FP32 columns before writing a split's numerator."""
+    if tla.const_expr(head_dim > 64):
+        with tla.vec.func(mode="simd"):
+            full = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
+            for row in tla.range(rows):
+                for part in tla.range_constexpr((head_dim + 127) // 128):
+                    first = _chunk(output, row, part * 2)
+                    second = _chunk(output, row, part * 2 + 1)
+                    lower, upper = tla.interleave(first.load(), second.load())
+                    first.store(lower, mask=full)
+                    second.store(upper, mask=full)
+
+
+@tla.jit
+def pack_split_statistics(destination, running_max, running_sum, rows, empty: tla.Constexpr):
+    """Store max/sum in aligned UB rows for the same scatter as the partial O."""
+    with tla.vec.func(mode="simd"):
+        one, _ = tla.update_mask(1, dtype=tla.Float32)
+        for row in tla.range(rows):
+            maximum = tla.full(float("-inf"), tla.Float32)
+            total = tla.full(0.0, tla.Float32)
+            if tla.const_expr(not empty):
+                maximum = _broadcast(running_max, row)
+                total = _broadcast(running_sum, row)
+            tla.tile_view(destination, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
+                maximum, params=tla.params.UnalignStoreParams(), mask=one
+            )
+            tla.tile_view(destination, tla.make_shape(1, 1), tla.make_coord(row, 1)).store(
+                total, params=tla.params.UnalignStoreParams(), mask=one
+            )

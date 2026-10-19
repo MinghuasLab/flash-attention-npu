@@ -104,7 +104,9 @@ def test_varlen_scalar_dn_uses_known_rows_not_only_upper_bound(host, total_q, us
         block_sparse_tensors=blocks,
     )
     assert host.compiled[0][24:26] == (expected_dn, False)
-    assert host.launched[0][0][8][:2] == (cuq, cuk)
+    sequences, pages, partial_stats = host.launched[0][0][8]
+    assert sequences[0] is cuq and sequences[1] is cuk
+    assert pages is None and partial_stats is None
 
 
 @pytest.mark.parametrize(
@@ -264,9 +266,8 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
     assert len(host.compiled) == len(host.launched) == 1
     assert len(host.compiled[0]) == 31
     args, kwargs = host.launched[0]
-    assert len(args) == 10 and kwargs == {"block_num": 2}
+    assert len(args) == 9 and kwargs == {"block_num": 2}
     assert args[8] is None  # BSND has no packed sequence metadata.
-    assert args[9] is None  # Contiguous KV has no page table.
     assert (args[4] is None) == (not lse)
     assert args[5] is None
     assert (args[6] is None) == (tensors is None)
@@ -441,7 +442,7 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
     k = torch.empty(1, kv_len, 2, 64, dtype=torch.float16)
     interface.flash_attn_func(q, k, k, **options)
     assert host.compiled[0][24:26] == expected
-    assert len(host.launched[0][0]) == 10
+    assert len(host.launched[0][0]) == 9
 
 
 @pytest.mark.parametrize(
