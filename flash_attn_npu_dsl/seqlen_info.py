@@ -39,17 +39,23 @@ class SeqlenInfoQK(NamedTuple):
 
 
 @tla.jit
-def create_packed_seqlen_info(batch, metadata):
+def create_packed_seqlen_info(batch, metadata, fixed_q=0, fixed_k=0):
     """Read storage offsets separately from the optional effective lengths.
 
     The final two entries carry packed block offsets when sparse metadata is
     present. All values remain device-side, including when inputs are rebound.
     """
     cu_q, cu_k, used_q, used_k, cu_m, cu_idx = metadata
-    offset_q = cu_q[batch]
-    offset_k = cu_k[batch]
-    length_q = cu_q[batch + 1] - offset_q
-    length_k = cu_k[batch + 1] - offset_k
+    offset_q = tla.Int32(0)
+    offset_k = tla.Int32(0)
+    length_q = tla.Int32(fixed_q)
+    length_k = tla.Int32(fixed_k)
+    if tla.const_expr(cu_q is not None):
+        offset_q = cu_q[batch]
+        length_q = cu_q[batch + 1] - offset_q
+    if tla.const_expr(cu_k is not None):
+        offset_k = cu_k[batch]
+        length_k = cu_k[batch + 1] - offset_k
     if tla.const_expr(used_q is not None):
         length_q = used_q[batch]
     if tla.const_expr(used_k is not None):
@@ -66,15 +72,15 @@ def create_packed_seqlen_info(batch, metadata):
     return SeqlenInfoQK(
         offset_q,
         offset_k,
-        (offset_q + batch * 128) // 128 * 128,
-        (offset_k + batch * 128) // 128 * 128,
+        (offset_q + batch * 128) // 128 * 128 if cu_q is not None else 0,
+        (offset_k + batch * 128) // 128 * 128 if cu_k is not None else 0,
         length_q,
         length_k,
         m_offset,
         idx_offset,
         num_n,
-        True,
-        True,
+        cu_q is not None,
+        cu_k is not None,
         used_q is not None,
         used_k is not None,
         cu_idx is not None,

@@ -262,10 +262,11 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 29
+    assert len(host.compiled[0]) == 31
     args, kwargs = host.launched[0]
-    assert len(args) == 9 and kwargs == {"block_num": 2}
+    assert len(args) == 10 and kwargs == {"block_num": 2}
     assert args[8] is None  # BSND has no packed sequence metadata.
+    assert args[9] is None  # Contiguous KV has no page table.
     assert (args[4] is None) == (not lse)
     assert args[5] is None
     assert (args[6] is None) == (tensors is None)
@@ -307,7 +308,7 @@ def test_value_dimension_controls_output_binding_and_cache(host, dynamic):
         else:
             assert runtime_v is v and runtime_out is out
     assert len(host.compiled) == 2
-    assert [args[-1] for args in host.compiled] == [64, 128]
+    assert [args[28] for args in host.compiled] == [64, 128]
 
 
 def test_public_call_restores_device_guard_on_compile_error(host, monkeypatch):
@@ -326,8 +327,12 @@ def test_public_call_checks_external_storage_not_new_outputs(host, monkeypatch):
     aux = torch.ones(4)
     out, lse = interface.flash_attn_func(*host.inputs, aux_tensors=[aux], return_lse=True)
     expected = (*host.inputs, aux)
-    assert len(checked) == len(expected)
-    assert all(actual is original for actual, original in zip(checked, expected))
+    assert len(checked) == len(expected) + 1
+    assert checked[3] is None  # No page-table input in a contiguous call.
+    assert all(
+        actual is original
+        for actual, original in zip((x for x in checked if x is not None), expected)
+    )
     assert all(tensor is not out and tensor is not lse for tensor in checked)
 
 
@@ -436,7 +441,7 @@ def test_public_score_layout_selection(host, q_len, kv_len, options, expected):
     k = torch.empty(1, kv_len, 2, 64, dtype=torch.float16)
     interface.flash_attn_func(q, k, k, **options)
     assert host.compiled[0][24:26] == expected
-    assert len(host.launched[0][0]) == 9
+    assert len(host.launched[0][0]) == 10
 
 
 @pytest.mark.parametrize(

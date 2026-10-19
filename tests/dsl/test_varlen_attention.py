@@ -34,7 +34,6 @@ def _offset_score(s, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
 @pytest.mark.parametrize(
     "option,value",
     [
-        ("page_table", object()),
         ("scheduler_metadata", object()),
         ("num_splits", 2),
         ("min_seqlen_k", 1),

@@ -202,11 +202,11 @@ def _validate_aux(aux_tensors, aux_scalars, device):
     )
 
 
-def _validate_inputs(q, k, v, *, packed=False):
+def _validate_inputs(q, k, v, *, packed=False, paged=False):
     import torch
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
-        rank = 3 if packed else 4
+        rank = 3 if packed and (name == "q" or not paged) else 4
         if not isinstance(tensor, torch.Tensor) or tensor.ndim != rank:
             raise ValueError(f"{name} must be a rank-{rank} {'TND' if packed else 'BSND'} Tensor")
         if tensor.device.type != "npu" or tensor.device != q.device:
@@ -223,7 +223,7 @@ def _validate_inputs(q, k, v, *, packed=False):
             raise ValueError("head dimension must be in [1, 256] and dimensions nonempty")
         if tensor.requires_grad:
             raise ValueError("this implementation supports inference forward only")
-    if k.shape[:-1] != v.shape[:-1] or (not packed and q.shape[0] != k.shape[0]):
+    if k.shape[:-1] != v.shape[:-1] or (not packed and not paged and q.shape[0] != k.shape[0]):
         raise ValueError("k/v shapes and q/k batch sizes must match")
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Q and K head dimensions must match")
@@ -319,11 +319,13 @@ def _flash_attention(
     sequence_metadata=None,
     max_seqlen_q=None,
     max_seqlen_k=None,
+    page_table=None,
 ):
     """Prepare one shared forward kernel; only sequence addressing differs."""
     import torch
 
-    packed = sequence_metadata is not None
+    packed = q.ndim == 3
+    paged = page_table is not None
     softcap = float(softcap)
     if not math.isfinite(softcap) or softcap < 0:
         raise ValueError("softcap must be finite and nonnegative")
@@ -340,6 +342,8 @@ def _flash_attention(
     else:
         batch, q_len, q_heads, head_dim = q.shape
         kv_len, kv_heads = k.shape[1:3]
+        if paged:
+            kv_len = max_seqlen_k
     # One right-aligned Q row is centered on the last KV position.
     if q_len == 1 and not packed:
         window_right = None
@@ -363,6 +367,7 @@ def _flash_attention(
         and block_sparse_tensors is None
         and aux_tensors is None
         and aux_scalars is None
+        and sequence_metadata is None
     )
     with torch.npu.device(q.device.index):
         cores = max(1, int(torch.npu.get_device_properties(q.device.index).cube_core_num))
@@ -403,7 +408,7 @@ def _flash_attention(
             has_window=window_left is not None or window_right is not None,
             scale=scale,
             has_score_mod=score_mod is not None,
-            variable_lengths=packed,
+            variable_lengths=sequence_metadata is not None,
             average_q_len=(q.shape[0] / batch) if packed and sequence_metadata[2] is None else None,
             q_tile=q_tile,
         )
@@ -441,11 +446,11 @@ def _flash_attention(
         )
         tensors = (q, k, v, out, lse)
         sparse_tensors = sparse.tensors if sparse is not None else ()
-        sequence_tensors = sequence_metadata if packed else ()
+        sequence_tensors = sequence_metadata if sequence_metadata is not None else ()
         if not dynamic_lengths:
             # O/LSE are freshly allocated here; validate caller-owned storage.
             _check_launch_tensors(
-                (q, k, v, *sparse_tensors, *sequence_tensors, *(aux_tensors or ()))
+                (q, k, v, page_table, *sparse_tensors, *sequence_tensors, *(aux_tensors or ()))
             )
 
         def bind_tensor(tensor):
@@ -461,6 +466,7 @@ def _flash_attention(
             aux_tensors,
             aux_scalars,
             sequence_metadata,
+            page_table,
         )
         constants = (
             batch,
@@ -483,10 +489,10 @@ def _flash_attention(
             full_dn,
         )
         key = _compilation_key(
-            (*tensors, *sparse_tensors, *sequence_tensors),
+            (*tensors, page_table, *sparse_tensors, *sequence_tensors),
             aux_tensors,
             aux_scalars,
-            (*constants, packed, value_dim),
+            (*constants, packed, value_dim, k.shape[1] if paged else 0),
             q.device,
             dynamic_lengths=dynamic_lengths,
         )
@@ -523,7 +529,7 @@ def _flash_attention(
                     else None
                     for tensor in sequence_metadata
                 )
-                if packed
+                if sequence_metadata is not None
                 else None
             )
             return (
@@ -532,6 +538,8 @@ def _flash_attention(
                 sample_sequences,
                 original_shape[0] if packed else 0,
                 value_dim,
+                from_dlpack(page_table, layout_tag=tla.arch.RowMajor) if paged else None,
+                k.shape[1] if paged else 0,
             )
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
@@ -575,13 +583,14 @@ def flash_attn_varlen_func(
     seqlen_k_per_split=None,
     disable_scheduler_metadata=False,
 ):
-    """Return packed O [total_q,Hq,Dv] and optional natural-log LSE [Hq,total_q].
+    """Return O with Q's leading shape and V's dimension; LSE is head-major.
 
-    Both inputs must be nonpaged TND. Prefix sums describe storage; seqused
+    Nonpaged inputs use TND. Paged KV uses [page,token,Hkv,D] with TND or BSND Q.
+    Prefix sums describe storage; seqused
     optionally restricts valid lengths. Prefix contents, length bounds and
     max_seqlen upper bounds are caller guarantees, never scanned by this API.
     Unused Q storage rows have unspecified values. Callback indices are local
-    to each sequence; seqlen_info exposes the packed offsets.
+    to each sequence; physical page indices never enter callback coordinates.
     """
     import torch
 
@@ -589,10 +598,9 @@ def flash_attn_varlen_func(
         ("qv", qv is None),
         ("min_seqlen_k", min_seqlen_k is None),
         ("gather_kv_indices", gather_kv_indices is None),
-        ("page_table", page_table is None),
         ("learnable_sink", learnable_sink is None),
-        ("num_splits", num_splits == 1),
         ("pack_gqa", pack_gqa is None),
+        ("num_splits", num_splits == 1),
         ("score_mod_bwd", score_mod_bwd is None),
         ("scheduler_metadata", scheduler_metadata is None),
         ("seqlen_k_per_split", seqlen_k_per_split is None),
@@ -600,26 +608,51 @@ def flash_attn_varlen_func(
     ):
         if not supported:
             raise NotImplementedError(f"{name} is not supported by this forward implementation")
-    _validate_inputs(q, k, v, packed=True)
-    if (
-        not isinstance(cu_seqlens_q, torch.Tensor)
-        or cu_seqlens_q.ndim != 1
-        or cu_seqlens_q.numel() < 2
-    ):
-        raise ValueError("cu_seqlens_q must have shape [B+1] for B >= 1")
-    batch = cu_seqlens_q.numel() - 1
+    paged = page_table is not None
+    packed = not paged or q.ndim == 3
+    _validate_inputs(q, k, v, packed=packed, paged=paged)
+    if packed:
+        if (
+            not isinstance(cu_seqlens_q, torch.Tensor)
+            or cu_seqlens_q.ndim != 1
+            or cu_seqlens_q.numel() < 2
+        ):
+            raise ValueError("cu_seqlens_q must have shape [B+1] for B >= 1")
+        batch = cu_seqlens_q.numel() - 1
+    else:
+        if cu_seqlens_q is not None:
+            raise ValueError("BSND query does not accept cu_seqlens_q")
+        batch = q.shape[0]
+    if paged:
+        if cu_seqlens_k is not None:
+            raise ValueError("page_table cannot be combined with cu_seqlens_k")
+        if not isinstance(page_table, torch.Tensor) or page_table.ndim != 2:
+            raise ValueError("page_table must have shape [B,max_pages]")
+        if page_table.shape[0] != batch or page_table.shape[1] < 1:
+            raise ValueError("page_table must have matching B and positive capacity")
+        if page_table.dtype != torch.int32:
+            raise TypeError("page_table must use int32")
+        if page_table.device != q.device or not page_table.is_contiguous():
+            raise ValueError("page_table must be contiguous on the Q device")
+        if k.shape[1] not in (128, 256, 512, 1024):
+            raise ValueError("KV page size must be 128, 256, 512 or 1024")
     for name, tensor, size in (
         ("cu_seqlens_q", cu_seqlens_q, batch + 1),
         ("cu_seqlens_k", cu_seqlens_k, batch + 1),
         ("seqused_q", seqused_q, batch),
         ("seqused_k", seqused_k, batch),
     ):
-        if tensor is not None or name.startswith("cu_"):
+        required = (
+            (name == "cu_seqlens_q" and packed)
+            or (name == "cu_seqlens_k" and not paged)
+            or (name == "seqused_k" and paged)
+        )
+        if tensor is not None or required:
             validate_sequence_tensor(tensor, name, size, q.device)
     bounds = []
     for name, value, capacity in (
-        ("max_seqlen_q", max_seqlen_q, q.shape[0]),
-        ("max_seqlen_k", max_seqlen_k, k.shape[0]),
+        ("max_seqlen_q", max_seqlen_q, q.shape[0] if packed else q.shape[1]),
+        ("max_seqlen_k", max_seqlen_k, page_table.shape[1] * k.shape[1] if paged else k.shape[0]),
     ):
         if value is None:
             value = capacity
@@ -642,4 +675,5 @@ def flash_attn_varlen_func(
         return_lse,
         (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None),
         *bounds,
+        page_table,
     )

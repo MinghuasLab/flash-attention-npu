@@ -225,6 +225,8 @@ def flex_attention_kernel(
     sequence_metadata=None,
     total_q: tla.Constexpr[int] = 0,
     value_dim: tla.Constexpr[int | None] = None,
+    page_table=None,
+    page_size: tla.Constexpr[int] = 0,
 ) -> None:
     if tla.const_expr(value_dim is None):
         value_dim = head_dim
@@ -443,7 +445,9 @@ def flex_attention_kernel(
         curBatch = batch_head // q_heads
         kvHeadIdx = qHeadIdx // (q_heads // kv_heads)
         if tla.const_expr(sequence_metadata is not None):
-            seqlen_info = create_packed_seqlen_info(curBatch, sequence_metadata)
+            seqlen_info = create_packed_seqlen_info(
+                curBatch, sequence_metadata, q_len // packed_heads, kv_len
+            )
             curQSeqlen = seqlen_info.seqlen_q * packed_heads
             curKvSeqlen = seqlen_info.seqlen_k
             num_kv_tiles = seqlen_info.num_n_blocks
@@ -451,6 +455,9 @@ def flex_attention_kernel(
             kBOffset = seqlen_info.offset_k * kSOffset
             vBOffset = seqlen_info.offset_k * vSOffset
             oBOffset = seqlen_info.offset_q * packed_heads * oSOffset
+            if tla.const_expr(sequence_metadata[0] is None):
+                qBOffset = curBatch * q_len * qSOffset
+                oBOffset = curBatch * q_len * oSOffset
         else:
             seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
             curQSeqlen = q_len
@@ -502,7 +509,7 @@ def flex_attention_kernel(
             kvSLoopNum = max(0, end_kv - first_kv)
         else:
             full_count = 0
-            if tla.const_expr(sequence_metadata is not None):
+            if tla.const_expr(sequence_metadata is not None and sequence_metadata[0] is not None):
                 # Packed query rows still consume the caller's 128-row lists.
                 sparse_q_tile = qSTileIdx * qBaseTile_ // packed_heads // 128
                 count_row = seqlen_info.m_block_offset + sparse_q_tile
@@ -527,7 +534,10 @@ def flex_attention_kernel(
                     + qHeadIdx * sparse_strides[1][1]
                     + (qSTileIdx * qBaseTile_ // 128) * sparse_strides[1][2]
                 )
-            if tla.const_expr(sequence_metadata is None and sparse_tensors[3] is not None):
+            if tla.const_expr(
+                (sequence_metadata is None or sequence_metadata[0] is None)
+                and sparse_tensors[3] is not None
+            ):
                 full_count = sparse_tensors[2][
                     curBatch * sparse_strides[2][0]
                     + qHeadIdx * sparse_strides[2][1]
@@ -656,6 +666,20 @@ def flex_attention_kernel(
                                 layoutTag=tla.arch.ColumnMajor,
                             ),
                         )
+                        if tla.const_expr(page_table is not None):
+                            logical_k = gatheredKvSTileIdx * 128
+                            page = page_table[curBatch, logical_k // page_size]
+                            page_k = logical_k % page_size
+                            gm_k = tla.make_tensor(
+                                key.ptr
+                                + (page * page_size + page_k) * kSOffset
+                                + kvHeadIdx * head_dim,
+                                tla.make_layout(
+                                    tla.make_shape(head_dim, kvSTileSizeAct),
+                                    tla.make_stride(1, kSOffset),
+                                    layoutTag=tla.arch.ColumnMajor,
+                                ),
+                            )
 
                         prefixSumL0AStages = (
                             (validIdx * mm1L0ATotalStages_)
@@ -684,6 +708,10 @@ def flex_attention_kernel(
                             tla.make_shape(embed_, kvBaseTile_),
                             tla.make_coord(c0, gatheredKvSTileIdx),
                         )
+                        if tla.const_expr(page_table is not None):
+                            gm_k_tile = tla.tile_view(
+                                gm_k, tla.make_shape(head_dim, 128), tla.make_coord(0, 0)
+                            )
                         l1_k_tile = tla.make_tensor_like(l1K_ptr, gm_k_tile, layoutTag=tla.arch.nZ)
                         if l1BBufId == c0:
                             tla.wait_flag(k_l0b_ready_l1_0)  # MTE1_MTE2
@@ -1386,6 +1414,19 @@ def flex_attention_kernel(
                                 layoutTag=tla.arch.RowMajor,
                             ),
                         )
+                        if tla.const_expr(page_table is not None):
+                            logical_v = gatheredKvSTileIdxDe * 128
+                            page_v = page_table[curBatch, logical_v // page_size]
+                            page_offset_v = logical_v % page_size
+                            gm_v = tla.make_tensor(
+                                value.ptr
+                                + (page_v * page_size + page_offset_v) * vSOffset
+                                + kvHeadIdx * value_dim,
+                                tla.make_layout(
+                                    tla.make_shape(kvSTileSizeActDe, value_dim),
+                                    tla.make_stride(vSOffset, 1),
+                                ),
+                            )
                         # QK and PV share L0 operands: count issued QK and earlier PV loads.
                         prefixSumL0AStagesDe = (
                             min(step + 1, kvSLoopNum) * mm1L0ATotalStages_
@@ -1400,6 +1441,10 @@ def flex_attention_kernel(
                             tla.make_shape(kvBaseTile_, value_dim),
                             tla.make_coord(gatheredKvSTileIdxDe, c0),
                         )
+                        if tla.const_expr(page_table is not None):
+                            gm_v_tile = tla.tile_view(
+                                gm_v, tla.make_shape(128, value_dim), tla.make_coord(0, 0)
+                            )
                         l1_v_tile = tla.make_tensor_like(l1V_ptr, gm_v_tile, layoutTag=tla.arch.zN)
                         if l1BvBufId == c0:
                             tla.wait_flag(v_l0b_ready_l1_0)  # MTE1_MTE2
@@ -1721,7 +1766,9 @@ def flex_attention_kernel(
                 else:
                     tla.copy(final_gm_out, final_packed_valid)
                 if tla.const_expr(lse is not None):
-                    if tla.const_expr(sequence_metadata is not None):
+                    if tla.const_expr(
+                        sequence_metadata is not None and sequence_metadata[0] is not None
+                    ):
                         lse_head_group = qHeadIdx
                         lse_sequence_offset = seqlen_info.offset_q
                         lse_head_stride = total_q
@@ -1737,6 +1784,7 @@ def flex_attention_kernel(
                                 tla.make_shape(
                                     total_q * q_heads * packed_heads
                                     if sequence_metadata is not None
+                                    and sequence_metadata[0] is not None
                                     else batch * q_heads * q_len
                                 ),
                                 tla.make_stride(1),

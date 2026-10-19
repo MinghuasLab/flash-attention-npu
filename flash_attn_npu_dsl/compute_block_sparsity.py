@@ -35,11 +35,13 @@ def _classifier_context(
     metadata,
 ):
     """Locate one public count row and its matching packed index region."""
-    if tla.const_expr(metadata is None):
+    if tla.const_expr(metadata is None or metadata[0] is None):
         q_tile = work % q_tiles
         head = (work // q_tiles) % num_heads
         batch = work // (q_tiles * num_heads)
         info = create_seqlen_info(tla.Int32(q_length), tla.Int32(k_length))
+        if tla.const_expr(metadata is not None):
+            info = create_packed_seqlen_info(batch, metadata, q_length, k_length)
         index_row, index_base = work, 0
     else:
         head = work // counts_per_head
@@ -262,6 +264,7 @@ def flex_attention_block_offsets_kernel(
     batch: tla.Constexpr,
     write_m: tla.Constexpr,
     write_idx: tla.Constexpr,
+    used_k=None,
 ):
     """Scan per-thread contiguous segments, then add their shared prefix sums."""
     m_sums = [
@@ -293,7 +296,10 @@ def flex_attention_block_offsets_kernel(
                     m_rows = cu_m[b + 1] - cu_m[b]
                 m_sum += m_rows
                 if tla.const_expr(write_idx):
-                    n_blocks = (cu_k[b + 1] - cu_k[b] + 127) // 128
+                    if tla.const_expr(cu_k is not None):
+                        n_blocks = (cu_k[b + 1] - cu_k[b] + 127) // 128
+                    else:
+                        n_blocks = (used_k[b] + 127) // 128
                     idx_sum += m_rows * n_blocks
             m_sums[0][tid] = m_sum
             idx_sums[0][tid] = idx_sum
@@ -320,7 +326,11 @@ def flex_attention_block_offsets_kernel(
                 else:
                     write_rows = cu_m[write_b + 1] - cu_m[write_b]
                 if tla.const_expr(write_idx):
-                    idx_offset += write_rows * ((cu_k[write_b + 1] - cu_k[write_b] + 127) // 128)
+                    if tla.const_expr(cu_k is not None):
+                        write_columns = (cu_k[write_b + 1] - cu_k[write_b] + 127) // 128
+                    else:
+                        write_columns = (used_k[write_b] + 127) // 128
+                    idx_offset += write_rows * write_columns
                     cu_idx[write_b + 1] = idx_offset
             if tid == 0:
                 if tla.const_expr(write_m):
@@ -331,7 +341,7 @@ def flex_attention_block_offsets_kernel(
                 totals[1] = idx_sums[1][127] if write_idx else cu_idx[batch]
 
 
-def _packed_block_offsets(cu_q, cu_k, cu_m, cu_idx):
+def _packed_block_offsets(cu_q, cu_k, cu_m, cu_idx, used_k=None):
     import torch
 
     if cu_m is not None and cu_idx is not None:
@@ -345,15 +355,22 @@ def _packed_block_offsets(cu_q, cu_k, cu_m, cu_idx):
         cu_idx = torch.empty_like(cu_q)
     totals = torch.empty(2, dtype=torch.int32, device=cu_q.device)
     tensors = (cu_q, cu_k, cu_m, cu_idx, totals)
-    _check_launch_tensors(tensors)
+    _check_launch_tensors((*tensors, used_k))
     constants = (batch, write_m, write_idx)
-    key = _compilation_key(tensors, None, None, constants, cu_q.device)
+    key = _compilation_key((*tensors, used_k), None, None, constants, cu_q.device)
 
     def compile_args():
-        return (*tuple(from_dlpack(t, layout_tag=tla.arch.RowMajor) for t in tensors), *constants)
+        return (
+            *tuple(
+                from_dlpack(t, layout_tag=tla.arch.RowMajor) if t is not None else None
+                for t in tensors
+            ),
+            *constants,
+            from_dlpack(used_k, layout_tag=tla.arch.RowMajor) if used_k is not None else None,
+        )
 
     compiled = _compile_kernel(flex_attention_block_offsets_kernel, key, compile_args)
-    compiled(*tensors, block_num=1)
+    compiled(*tensors, used_k, block_num=1)
     return cu_m, cu_idx, totals.cpu().tolist()
 
 
@@ -387,11 +404,11 @@ def compute_block_sparsity(
     """
     if type(tile_m) is not int or type(tile_n) is not int or (tile_m, tile_n) != (128, 128):
         raise NotImplementedError("only tile_m=tile_n=128 is supported")
-    packed = cu_seqlens_q is not None or cu_seqlens_k is not None
-    if not packed and any(
-        x is not None for x in (seqused_q, seqused_k, cu_total_m_blocks, cu_block_idx_offsets)
-    ):
-        raise NotImplementedError("sequence metadata requires both cu_seqlens_q and cu_seqlens_k")
+    packed = cu_seqlens_q is not None
+    if not packed and cu_seqlens_k is not None:
+        raise NotImplementedError("cu_seqlens_k requires packed queries")
+    if not packed and any(x is not None for x in (cu_total_m_blocks, cu_block_idx_offsets)):
+        raise NotImplementedError("packed block offsets require cu_seqlens_q")
     if compute_full_blocks is not True:
         raise NotImplementedError("compute_full_blocks=False is not supported")
     if use_fast_sampling is not False or getattr(mask_mod, "use_fast_sampling", False):
@@ -417,7 +434,7 @@ def compute_block_sparsity(
     aux_tensors, aux_scalars = _validate_aux(aux_tensors, aux_scalars, device)
     with torch.npu.device(device):
         sequence_metadata = None
-        if packed:
+        if packed or seqused_q is not None or seqused_k is not None:
             for name, tensor, size in (
                 ("cu_seqlens_q", cu_seqlens_q, batch_size + 1),
                 ("cu_seqlens_k", cu_seqlens_k, batch_size + 1),
@@ -426,11 +443,16 @@ def compute_block_sparsity(
                 ("cu_total_m_blocks", cu_total_m_blocks, batch_size + 1),
                 ("cu_block_idx_offsets", cu_block_idx_offsets, batch_size + 1),
             ):
-                if tensor is not None or name in ("cu_seqlens_q", "cu_seqlens_k"):
+                required = (packed and name == "cu_seqlens_q") or (
+                    packed and cu_seqlens_k is None and name == "seqused_k"
+                )
+                if tensor is not None or required:
                     validate_sequence_tensor(tensor, name, size, device)
+            sequence_metadata = (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None)
+        if packed:
             cu_total_m_blocks, cu_block_idx_offsets, (total_m, total_indices) = (
                 _packed_block_offsets(
-                    cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets
+                    cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets, seqused_k
                 )
             )
             sequence_metadata = (
@@ -493,7 +515,7 @@ def compute_block_sparsity(
                     from_dlpack(t, layout_tag=tla.arch.RowMajor) if t is not None else None
                     for t in sequence_metadata
                 )
-                if packed
+                if sequence_metadata is not None
                 else None
             )
             return (*samples, *constants, sample_aux, aux_scalars, sample_sequences)

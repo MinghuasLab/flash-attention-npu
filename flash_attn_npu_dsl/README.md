@@ -8,7 +8,7 @@
 - 回调支持普通 Python 函数和 `@tla.jit` helper，按声明使用 SIMT 或显式 SIMD，
   内联到 attention 内核；需要跳过空块时，可显式建块并传入稀疏元数据。
 
-当前实现面向 Ascend 950 的推理前向，支持定长 BSND、非分页变长 TND、
+当前实现面向 Ascend 950 的推理前向，支持定长 BSND、变长 TND、只读分页 KV、
 FP16/BF16、1～256维 head dimension 和 GQA。
 Q/K 使用相同的 Dqk；V 可以独立选择1～256维的 Dv，O 的最后一维随 V。
 通过独立的 `flash_attn_npu_dsl` 包使用，不替换现有 V2/V3/V4 的 C++ 后端。
@@ -86,7 +86,7 @@ out, lse = flash_attn_func(q, k, v, mask_mod=causal_mask, return_lse=True)
 Q/K/V 为同设备、同 dtype、连续的 FP16 或 BF16 NPU 张量，采用 BSND 布局。
 Q 为 `(B, Sq, Hq, Dqk)`，K 为 `(B, Sk, Hkv, Dqk)`，V 为 `(B, Sk, Hkv, Dv)`；所有维度为正，
 `Dqk` 和 `Dv` 各支持1～256，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
-仅支持推理前向，不支持梯度或 paged KV；未实现的选项必须保持默认值。
+仅支持推理前向，不支持梯度或 KV cache 写入；未实现的选项必须保持默认值。
 
 `flash_attn_func` 始终返回 `(out, lse)`。O 为 `(B, Sq, Hq, Dv)`，dtype 与 Q 相同；
 `return_lse=True` 返回 FP32 自然对数 LSE，形状为 `(B, Hq, Sq)`，否则 LSE 为 `None`。
@@ -98,7 +98,7 @@ Q 为 `(B, Sq, Hq, Dqk)`，K 为 `(B, Sk, Hkv, Dqk)`，V 为 `(B, Sk, Hkv, Dv)`�
 和 V `[total_k,Hkv,Dv]`。
 `cu_seqlens_q/k` 是同设备连续 int32 `[B+1]` 累计存储偏移；可选的
 `seqused_q/k` 是 int32 `[B]` 有效长度，可以小于存储段长度。O 为 `[total_q,Hq,Dv]`，
-LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。仅支持 Q/K 同时使用 TND。
+LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。非分页输入仅支持 Q/K 同时使用 TND。
 
 ```python
 from flash_attn_npu_dsl import flash_attn_varlen_func
@@ -132,6 +132,40 @@ callback 的 q/kv 坐标仍是序列内坐标，`seqlen_info` 同时提供当前
 并且调度上界覆盖实际有效长度。接口只检查元数据的形状、dtype、设备和连续性。
 元数据原地更新或地址替换会在下次调用生效；地址和内容不进入编译 key，
 总容量或编译期策略变化则可能产生新编译对象。
+
+### 分页 KV
+
+`flash_attn_varlen_func(..., page_table=..., seqused_k=...)` 直接读取
+`[page,token,Hkv,Dqk或Dv]` 的 K/V；页长支持128、256、512、1024。
+Q 可使用 TND（提供 `cu_seqlens_q`）或 BSND（不传 `cu_seqlens_q`）。
+`page_table` 是同设备连续 int32 `[B,max_pages]`，`seqused_k` 是 int32 `[B]`。
+分页输入不能同时传 `cu_seqlens_k`，不在 host 重排或拼接 KV。
+
+```python
+# q_packed 与 cu_q 沿用上例；两个序列共享物理页1，页表无需排序。
+k_pages = torch.randn(4, 128, Hkv, D, dtype=q.dtype, device=q.device)
+v_pages = torch.randn_like(k_pages)
+pages = torch.tensor([[2, 1, 0], [1, 3, 0]], dtype=torch.int32, device=q.device)
+used_k = torch.tensor([128, 257], dtype=torch.int32, device=q.device)
+out, lse = flash_attn_varlen_func(
+    q_packed,
+    k_pages,
+    v_pages,
+    cu_seqlens_q=cu_q,
+    page_table=pages,
+    seqused_k=used_k,
+    max_seqlen_q=129,
+    max_seqlen_k=257,
+    causal=True,
+    return_lse=True,
+)
+```
+
+callback 接收序列内的逻辑 q/kv 坐标，不接收物理页号。现有 score/mask、
+auxiliary 和显式块表保持可用；建块时提供相同的 `cu_seqlens_q`、`seqused_q/k`，
+不传 `cu_seqlens_k`，classifier 不读取 K/V 或页表内容。
+页索引、长度及上界内容由调用方保证合法。页表原地修改和地址替换会在下次调用生效，
+不影响编译 key；长度或 auxiliary 改变可见性时，须重新生成或更新块表。
 
 - `softmax_scale`：基础分数缩放，默认 `1 / sqrt(Dqk)`。
 - `softcap`：默认 0（关闭）；正值 `c` 将缩放后分数变为 `c * tanh(score / c)`，
