@@ -2,7 +2,7 @@
 
 """Ascend 950 BSND/TND attention with callbacks and optional block sparsity.
 
-Each task processes one 128-row Q tile for one batch and Q head; packed
+Each task processes one Q tile (128 rows, or 64 for wide heads); packed
 tasks fold query heads sharing one KV head into those rows. Cube computes
 QK and PV; vector stages apply callbacks, online softmax and output rescaling.
 QK is issued two pipeline iterations before its PV. L1 P and UB alpha each use
@@ -231,6 +231,7 @@ def flex_attention_kernel(
     value_dim: tla.Constexpr[int | None] = None,
     page_size: tla.Constexpr[int] = 0,
     num_splits: tla.Constexpr[int] = 1,
+    storage_lengths: tla.Constexpr[tuple[int, int] | None] = None,
 ) -> None:
     sequence_metadata = None
     page_table = None
@@ -459,9 +460,10 @@ def flex_attention_kernel(
         curBatch = batch_head // q_heads
         kvHeadIdx = qHeadIdx // (q_heads // kv_heads)
         if tla.const_expr(sequence_metadata is not None):
-            seqlen_info = create_packed_seqlen_info(
-                curBatch, sequence_metadata, q_len // packed_heads, kv_len
-            )
+            fixed_q, fixed_k = q_len // packed_heads, kv_len
+            if tla.const_expr(storage_lengths is not None):
+                fixed_q, fixed_k = storage_lengths
+            seqlen_info = create_packed_seqlen_info(curBatch, sequence_metadata, fixed_q, fixed_k)
             curQSeqlen = seqlen_info.seqlen_q * packed_heads
             curKvSeqlen = seqlen_info.seqlen_k
             num_kv_tiles = seqlen_info.num_n_blocks
@@ -470,8 +472,11 @@ def flex_attention_kernel(
             vBOffset = seqlen_info.offset_k * vSOffset
             oBOffset = seqlen_info.offset_q * packed_heads * oSOffset
             if tla.const_expr(sequence_metadata[0] is None):
-                qBOffset = curBatch * q_len * qSOffset
-                oBOffset = curBatch * q_len * oSOffset
+                qBOffset = curBatch * fixed_q * packed_heads * qSOffset
+                oBOffset = curBatch * fixed_q * packed_heads * oSOffset
+            if tla.const_expr(sequence_metadata[1] is None and page_table is None):
+                kBOffset = curBatch * fixed_k * kSOffset
+                vBOffset = curBatch * fixed_k * vSOffset
         else:
             seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
             curQSeqlen = q_len
@@ -1859,8 +1864,13 @@ def flex_attention_kernel(
                         lse_head_group = curBatch * q_heads + qHeadIdx
                         lse_sequence_offset = 0
                         lse_head_stride = q_len // packed_heads
+                        if tla.const_expr(storage_lengths is not None):
+                            lse_head_stride = storage_lengths[0]
                     final_lse_layout = tla.make_layout(tla.make_shape(final_m), tla.make_stride(1))
                     if tla.const_expr(packed_heads > 1):
+                        lse_rows = batch * q_heads * q_len
+                        if tla.const_expr(storage_lengths is not None):
+                            lse_rows = batch * q_heads * packed_heads * storage_lengths[0]
                         final_gm_lse = tla.make_tensor(
                             lse.ptr,
                             tla.make_layout(
@@ -1868,7 +1878,7 @@ def flex_attention_kernel(
                                     total_q * q_heads * packed_heads
                                     if sequence_metadata is not None
                                     and sequence_metadata[0] is not None
-                                    else batch * q_heads * q_len
+                                    else lse_rows
                                 ),
                                 tla.make_stride(1),
                             ),

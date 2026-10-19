@@ -25,7 +25,8 @@ def _vector_score(s, b, h, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars)
 
 @pytest.mark.skipif(not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"), reason="explicit NPU opt-in")
 @pytest.mark.parametrize(
-    "layout,sparse", [("BSND", False), ("BSND", True), ("TND", True), ("paged", True)]
+    "layout,sparse",
+    [("BSND", False), ("BSND", True), ("BSND-used", True), ("TND", True), ("paged", True)],
 )
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_fullgraph_rebinds_inputs_metadata_and_auxiliary(layout, sparse, return_lse):
@@ -40,7 +41,7 @@ def test_fullgraph_rebinds_inputs_metadata_and_auxiliary(layout, sparse, return_
     q = torch.randn(2, 3, 4, 64, generator=gen).half()
     k = torch.randn(2, 129, 2, 64, generator=gen).half()
     v = torch.randn(2, 129, 2, 96, generator=gen).half()
-    if layout != "BSND":
+    if layout in ("TND", "paged"):
         q = q.flatten(0, 1)
     if layout == "TND":
         k, v = k.flatten(0, 1), v.flatten(0, 1)
@@ -48,9 +49,17 @@ def test_fullgraph_rebinds_inputs_metadata_and_auxiliary(layout, sparse, return_
         k = torch.randn(4, 128, 2, 64, generator=gen).half()
         v = torch.randn(4, 128, 2, 96, generator=gen).half()
     inputs = [x.to(device) for x in (q, k, v)]
-    cuq = torch.tensor([0, 3, 6], dtype=torch.int32, device=device) if layout != "BSND" else None
+    cuq = (
+        torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+        if layout in ("TND", "paged")
+        else None
+    )
     cuk = torch.tensor([0, 129, 258], dtype=torch.int32, device=device) if layout == "TND" else None
-    used = torch.tensor([129, 129], dtype=torch.int32, device=device) if layout == "paged" else None
+    used = (
+        torch.tensor([129, 129], dtype=torch.int32, device=device)
+        if layout in ("paged", "BSND-used")
+        else None
+    )
     pages = (
         torch.tensor([[2, 0], [0, 3]], dtype=torch.int32, device=device)
         if layout == "paged"
@@ -91,7 +100,8 @@ def test_fullgraph_rebinds_inputs_metadata_and_auxiliary(layout, sparse, return_
             inputs = [x.clone() for x in inputs]
             if used is not None:
                 used = torch.tensor([129, 0], dtype=torch.int32, device=device)
-                pages = pages.flip(1).contiguous()
+                if pages is not None:
+                    pages = pages.flip(1).contiguous()
             if cuq is not None:
                 cuq = cuq.clone()
         blocks = None

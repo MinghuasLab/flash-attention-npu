@@ -79,6 +79,7 @@ def _lower(
     window=(None, None),
     dn=False,
     full_dn=False,
+    effective_lengths=False,
 ):
     from flash_attn_npu_dsl.flash_fwd import flex_attention_kernel
 
@@ -93,6 +94,11 @@ def _lower(
         ).mark_compact_shape_dynamic(0)
 
     q_len, kv_len = lengths
+    sequence_metadata = (
+        (None, None, fake(tla.Int32, 1), fake(tla.Int32, 1), None, None)
+        if effective_lengths
+        else None
+    )
     sparse, sparse_strides = None, None
     if schedule:
         partial_capacity, full_capacity = (2, 2) if schedule is True else schedule
@@ -139,13 +145,23 @@ def _lower(
             1,
             dn,
             full_dn,
-            None,
+            (sequence_metadata, None, None) if effective_lengths else None,
             0,
             dim,
             0,  # Contiguous KV: no page size.
             1,  # No Split-KV workspace or merge.
+            lengths if effective_lengths else None,
         ),
     )
+
+
+@pytest.mark.parametrize("dim,lse", [(64, False), (64, True), (256, True)])
+def test_bsnd_effective_lengths_lower_as_two_runtime_metadata_tensors(dim, lse):
+    module = _lower(dim=dim, lse=lse, effective_lengths=True, lengths=(129, 257))
+    assert len(module.argument_trees) == 9  # Capacities are constexpr, not launch arguments.
+    assert module.argument_trees[8].runtime_leaf_count == 2
+    assert module.argument_trees[4].runtime_leaf_count == int(lse)
+    assert ("tla.log" in module.asm()) == lse
 
 
 @pytest.mark.parametrize("window,lse", [((None, None), False), ((None, 0), True), ((7, 3), False)])

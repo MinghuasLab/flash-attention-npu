@@ -98,7 +98,8 @@ Q 为 `(B, Sq, Hq, Dqk)`，K 为 `(B, Sk, Hkv, Dqk)`，V 为 `(B, Sk, Hkv, Dv)`�
 和 V `[total_k,Hkv,Dv]`。
 `cu_seqlens_q/k` 是同设备连续 int32 `[B+1]` 累计存储偏移；可选的
 `seqused_q/k` 是 int32 `[B]` 有效长度，可以小于存储段长度。O 为 `[total_q,Hq,Dv]`，
-LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。非分页输入仅支持 Q/K 同时使用 TND。
+LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。非分页输入接受 Q/K/V 全部为 TND
+或全部为 BSND，不混用两种存储形式。
 
 ```python
 from flash_attn_npu_dsl import flash_attn_varlen_func
@@ -132,6 +133,32 @@ callback 的 q/kv 坐标仍是序列内坐标，`seqlen_info` 同时提供当前
 并且调度上界覆盖实际有效长度。接口只检查元数据的形状、dtype、设备和连续性。
 元数据原地更新或地址替换会在下次调用生效；地址和内容不进入编译 key，
 总容量或编译期策略变化则可能产生新编译对象。
+
+### BSND 存储中的有效长度
+
+无需将带 Padding 的 BSND 输入重新打包成 TND。使用同一 varlen 入口，
+不传 `cu_seqlens_q/k`，通过连续 int32 `[B]` 的 `seqused_q/k` 指定有效长度：
+
+```python
+# 两条序列保留相同存储容量，但 KV 有效长度不同。
+q_bsnd = torch.randn(2, 65, Hq, D, dtype=q.dtype, device=q.device)
+k_bsnd = torch.randn(2, 257, Hkv, D, dtype=q.dtype, device=q.device)
+v_bsnd = torch.randn_like(k_bsnd)
+used_k = torch.tensor([129, 257], dtype=torch.int32, device=q.device)
+out, lse = flash_attn_varlen_func(
+    q_bsnd, k_bsnd, v_bsnd, seqused_k=used_k, causal=True, return_lse=True,
+)
+```
+
+未提供的有效长度按相应存储容量处理。O 保持 `[B,Sq,Hq,Dv]`，LSE 保持
+`[B,Hq,Sq]`；`seqused_q` 之外的存储行没有数值保证。有效 Q 行没有可见 KV 时，
+O=0、LSE=-inf。`max_seqlen_q/k` 只限制调度范围，不能改变物理存储跨度；
+调用方保证有效长度不超过存储容量和给定上界，入口不回读元数据。
+
+回调使用当前序列的有效长度和局部坐标；相同容量下更新有效长度或替换元数据地址
+可复用编译对象。显式建块时传入相同的 `seqused_q/k`，`seqlen_q/k` 使用 BSND
+存储容量；各 batch 长度不同时按真实 batch 数建表。有效长度或辅助数据改变可见性后，
+须更新或重新生成块表。没有有效长度参数的 BSND 调用复用普通定长入口的执行路径。
 
 ### 分页 KV
 

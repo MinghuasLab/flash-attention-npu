@@ -31,6 +31,119 @@ def _offset_score(s, b, h, *, q_idx, kv_idx, seqlen_info, aux_tensors):
     return s * 0.75 + (q_idx + seqlen_info.offset_q).to(tla.Float32) * 0.01
 
 
+@pytest.mark.skipif(not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"), reason="explicit NPU opt-in")
+@pytest.mark.parametrize(
+    "dtype,dq,dv,batch,q_capacity,k_capacity,mode,used_kind",
+    [
+        (torch.float16, 64, 96, 3, 129, 257, "builtin", "k"),
+        (torch.bfloat16, 128, 64, 3, 129, 257, "simt", "both"),
+        (torch.float16, 256, 192, 3, 129, 257, "simd", "q"),
+        (torch.bfloat16, 32, 80, 32, 65, 129, "mixed", "both"),
+    ],
+)
+def test_bsnd_effective_lengths_preserve_storage_and_rebind(
+    dtype, dq, dv, batch, q_capacity, k_capacity, mode, used_kind
+):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    torch.set_num_threads(1)
+    gen = torch.Generator().manual_seed(17)
+    host = [
+        torch.randn(s, generator=gen).to(dtype)
+        for s in (
+            (batch, q_capacity, 8, dq),
+            (batch, k_capacity, 2, dq),
+            (batch, k_capacity, 2, dv),
+        )
+    ]
+    inputs = [x.to(device) for x in host]
+    q_bound = 5 if mode == "mixed" else 65
+    q_lengths = [([q_bound, 0, 3][b % 3] if used_kind != "k" else q_capacity) for b in range(batch)]
+    k_lengths = [([129, 0, 1][b % 3] if used_kind != "q" else k_capacity) for b in range(batch)]
+    used_q = torch.tensor(q_lengths, dtype=torch.int32, device=device) if used_kind != "k" else None
+    used_k = torch.tensor(k_lengths, dtype=torch.int32, device=device) if used_kind != "q" else None
+    q_bound = q_bound if used_q is not None else q_capacity
+    k_bound = 129 if used_k is not None else k_capacity
+    mask = _causal if mode == "simt" else _vector_causal
+    options = {"causal": True} if mode == "builtin" else {"mask_mod": mask}
+    if mode == "mixed":
+        options["score_mod"] = _offset_score
+    interface._compiled_kernels.clear()
+    try:
+        for update in range(3):
+            if update == 1:
+                if used_q is not None:
+                    q_lengths[0] = 1
+                    used_q.copy_(torch.tensor(q_lengths, dtype=torch.int32, device=device))
+                if used_k is not None:
+                    k_lengths[0] = 0
+                    used_k.copy_(torch.tensor(k_lengths, dtype=torch.int32, device=device))
+            elif update == 2:
+                inputs = [x.clone() for x in inputs]
+                used_q = used_q.clone() if used_q is not None else None
+                used_k = used_k.clone() if used_k is not None else None
+            if mode != "builtin":
+                options["block_sparse_tensors"] = compute_block_sparsity(
+                    128,
+                    128,
+                    batch,
+                    1,
+                    q_capacity,
+                    k_capacity,
+                    mask,
+                    None,
+                    device,
+                    seqused_q=used_q,
+                    seqused_k=used_k,
+                )
+            previous = None
+            for return_lse in (True, False):
+                out, lse = flash_attn_varlen_func(
+                    *inputs,
+                    seqused_q=used_q,
+                    seqused_k=used_k,
+                    max_seqlen_q=q_bound,
+                    max_seqlen_k=k_bound,
+                    return_lse=return_lse,
+                    **options,
+                )
+                actual, actual_lse = out.cpu().float(), lse.cpu() if lse is not None else None
+                assert out.shape == (batch, q_capacity, 8, dv)
+                for b, (sq, sk) in enumerate(zip(q_lengths, k_lengths)):
+                    if not sq:
+                        continue
+                    q = host[0][b, :sq].float().transpose(0, 1)
+                    k, v = [
+                        x[b, :sk].float().repeat_interleave(4, 1).transpose(0, 1) for x in host[1:]
+                    ]
+                    scores = q @ k.transpose(-1, -2) * dq**-0.5
+                    if mode == "mixed":
+                        scores = scores * 0.75 + torch.arange(sq)[None, :, None] * 0.01
+                    keep = torch.arange(sk)[None, :] <= torch.arange(sq)[:, None] + sk - sq
+                    scores.masked_fill_(~keep, -torch.inf)
+                    expected_lse = scores.logsumexp(-1)
+                    expected = (scores.softmax(-1).nan_to_num() @ v).transpose(0, 1)
+                    torch.testing.assert_close(actual[b, :sq], expected, atol=0.05, rtol=0)
+                    empty = torch.isneginf(expected_lse)
+                    assert torch.count_nonzero(actual[b, :sq].transpose(0, 1)[empty]) == 0
+                    if return_lse:
+                        torch.testing.assert_close(
+                            actual_lse[b, :, :sq], expected_lse, atol=0.05, rtol=0
+                        )
+                    else:
+                        assert lse is None
+                        assert torch.equal(actual[b, :sq], previous[b, :sq])
+                previous = actual
+            if update == 0:
+                compiled_count = len(interface._compiled_kernels)
+            else:
+                assert len(interface._compiled_kernels) == compiled_count
+    finally:
+        interface._compiled_kernels.clear()
+
+
 @pytest.mark.parametrize(
     "option,value",
     [

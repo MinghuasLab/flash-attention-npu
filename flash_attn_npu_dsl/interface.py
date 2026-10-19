@@ -374,6 +374,7 @@ def _flash_attention(
 
     packed = q.ndim == 3
     paged = page_table is not None
+    storage_lengths = None
     softcap = float(softcap)
     if not math.isfinite(softcap) or softcap < 0:
         raise ValueError("softcap must be finite and nonnegative")
@@ -392,6 +393,11 @@ def _flash_attention(
         kv_len, kv_heads = k.shape[1:3]
         if paged:
             kv_len = max_seqlen_k
+        elif sequence_metadata is not None:
+            # Bounds limit work, not the distance between BSND batches.
+            storage_lengths = (q_len, kv_len)
+            q_len = min(q_len, max_seqlen_q)
+            kv_len = min(kv_len, max_seqlen_k)
     # One right-aligned Q row is centered on the last KV position.
     if q_len == 1 and not packed:
         window_right = None
@@ -437,8 +443,8 @@ def _flash_attention(
                     block_sparse_tensors,
                     batch_size=batch,
                     num_heads_q=q_heads,
-                    seqlen_q=q_len,
-                    seqlen_k=kv_len,
+                    seqlen_q=storage_lengths[0] if storage_lengths is not None else q_len,
+                    seqlen_k=storage_lengths[1] if storage_lengths is not None else kv_len,
                     device=q.device,
                 )
         packed_heads, use_dn, full_dn = _select_kernel_options(
@@ -578,7 +584,7 @@ def _flash_attention(
             key_tensors,
             aux_tensors,
             aux_scalars,
-            (*constants, packed, value_dim, k.shape[1] if paged else 0, splits),
+            (*constants, packed, value_dim, k.shape[1] if paged else 0, splits, storage_lengths),
             q.device,
             dynamic_lengths=dynamic_lengths,
         )
@@ -634,6 +640,7 @@ def _flash_attention(
                 value_dim,
                 k.shape[1] if paged else 0,
                 splits,
+                storage_lengths,
             )
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
@@ -682,7 +689,8 @@ def flash_attn_varlen_func(
 ):
     """Return O with Q's leading shape and V's dimension; LSE is head-major.
 
-    Nonpaged inputs use TND. Paged KV uses [page,token,Hkv,D] with TND or BSND Q.
+    Nonpaged inputs use all-TND or all-BSND storage. Paged KV uses
+    [page,token,Hkv,D] with TND or BSND Q.
     Prefix sums describe storage; seqused
     optionally restricts valid lengths. Prefix contents, length bounds and
     max_seqlen upper bounds are caller guarantees, never scanned by this API.
@@ -732,7 +740,7 @@ def flash_attn_varlen_func(
             block_sparse_tensors,
         )
     paged = page_table is not None
-    packed = not paged or q.ndim == 3
+    packed = q.ndim == 3
     _validate_inputs(q, k, v, packed=packed, paged=paged)
     if packed:
         if (
@@ -745,6 +753,8 @@ def flash_attn_varlen_func(
     else:
         if cu_seqlens_q is not None:
             raise ValueError("BSND query does not accept cu_seqlens_q")
+        if not paged and cu_seqlens_k is not None:
+            raise ValueError("BSND key/value do not accept cu_seqlens_k")
         batch = q.shape[0]
     if paged:
         if cu_seqlens_k is not None:
@@ -767,7 +777,7 @@ def flash_attn_varlen_func(
     ):
         required = (
             (name == "cu_seqlens_q" and packed)
-            or (name == "cu_seqlens_k" and not paged)
+            or (name == "cu_seqlens_k" and packed and not paged)
             or (name == "seqused_k" and paged)
         )
         if tensor is not None or required:
@@ -775,12 +785,21 @@ def flash_attn_varlen_func(
     bounds = []
     for name, value, capacity in (
         ("max_seqlen_q", max_seqlen_q, q.shape[0] if packed else q.shape[1]),
-        ("max_seqlen_k", max_seqlen_k, page_table.shape[1] * k.shape[1] if paged else k.shape[0]),
+        (
+            "max_seqlen_k",
+            max_seqlen_k,
+            page_table.shape[1] * k.shape[1] if paged else k.shape[0] if packed else k.shape[1],
+        ),
     ):
         if value is None:
             value = capacity
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer or None")
+        used = seqused_q if name == "max_seqlen_q" else seqused_k
+        if not packed and not paged and used is None and value < capacity:
+            raise ValueError(
+                f"{name} must cover storage length when the effective length is absent"
+            )
         bounds.append(value)
     if type(num_splits) is not int or num_splits < 0:
         raise ValueError("num_splits must be a nonnegative integer")
@@ -800,7 +819,9 @@ def flash_attn_varlen_func(
         aux_scalars,
         block_sparse_tensors,
         return_lse,
-        (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None),
+        (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, None, None)
+        if packed or paged or seqused_q is not None or seqused_k is not None
+        else None,
         *bounds,
         page_table,
         num_splits,

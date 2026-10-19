@@ -68,6 +68,60 @@ def test_public_exports():
     }
 
 
+def test_bsnd_varlen_without_lengths_reuses_fixed_entry(host):
+    inputs = tuple(
+        torch.empty(s, dtype=torch.float16)
+        for s in ((2, 65, 4, 64), (2, 129, 2, 64), (2, 129, 2, 96))
+    )
+    interface.flash_attn_func(*inputs, causal=True, return_lse=True)
+    interface.flash_attn_varlen_func(*inputs, causal=True, return_lse=True)
+    assert len(host.compiled) == 1
+    assert all(call[0][8] is None for call in host.launched)
+
+
+def test_bsnd_effective_lengths_bind_current_metadata_without_readback(host, monkeypatch):
+    inputs = tuple(
+        torch.empty(s, dtype=torch.float16)
+        for s in ((2, 129, 4, 64), (2, 257, 2, 64), (2, 257, 2, 96))
+    )
+    used_q, used_k = (torch.tensor(x, dtype=torch.int32) for x in ([65, 1], [129, 0]))
+
+    def no_read(*args, **kwargs):
+        raise AssertionError("effective lengths must stay on device")
+
+    monkeypatch.setattr(torch.Tensor, "item", no_read)
+    monkeypatch.setattr(torch.Tensor, "tolist", no_read)
+    for update in range(2):
+        if update:
+            used_q, used_k = used_q.clone(), used_k.clone()
+            used_q.zero_()
+        out, lse = interface.flash_attn_varlen_func(
+            *inputs,
+            seqused_q=used_q,
+            seqused_k=used_k,
+            max_seqlen_q=65,
+            max_seqlen_k=129,
+            return_lse=True,
+        )
+        assert out.shape == (2, 129, 4, 96) and lse.shape == (2, 4, 129)
+        metadata = host.launched[-1][0][8][0]
+        assert metadata[:2] == (None, None)
+        assert metadata[2] is used_q and metadata[3] is used_k
+    assert len(host.compiled) == 1
+    assert host.compiled[0][11:13] == (65, 129)
+    assert host.compiled[0][-1] == (129, 257)
+
+
+@pytest.mark.parametrize("option", ["cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k"])
+def test_bsnd_sequence_contract_rejects_invalid_static_metadata(host, option):
+    q = torch.empty(2, 129, 4, 64, dtype=torch.float16)
+    k = torch.empty(2, 257, 2, 64, dtype=torch.float16)
+    value = torch.zeros(3, dtype=torch.int32) if option.startswith("cu_") else 1
+    with pytest.raises(ValueError, match=option):
+        interface.flash_attn_varlen_func(q, k, k, **{option: value})
+    assert not host.compiled and not host.launched
+
+
 @pytest.mark.parametrize(
     "total_q,used,expected_dn",
     [
@@ -264,7 +318,8 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 31
+    assert len(host.compiled[0]) == 32
+    assert host.compiled[0][-1] is None  # No separate BSND capacity on the ordinary path.
     args, kwargs = host.launched[0]
     assert len(args) == 9 and kwargs == {"block_num": 2}
     assert args[8] is None  # BSND has no packed sequence metadata.
