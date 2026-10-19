@@ -385,13 +385,16 @@ def test_varlen_offsets_empty_sequences_and_rebinding(dtype, dim, mode, sparse):
 @pytest.mark.skipif(
     not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"), reason="explicit NPU opt-in required"
 )
-@pytest.mark.parametrize("kv_heads", [1, 2])
-def test_packed_head_writeback_matches_bsnd_and_fp32(kv_heads):
+@pytest.mark.parametrize(
+    "kv_heads,sq,sk,group",
+    [(1, 5, 17, 33), (2, 5, 17, 33), (1, 1, 257, 128), (2, 1, 511, 128)],
+)
+def test_packed_head_writeback_matches_bsnd_and_fp32(kv_heads, sq, sk, group):
     import torch_npu  # noqa: F401
 
     device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
     torch.npu.set_device(device)
-    batch, sq, sk, heads, dim = 32, 5, 17, 33 * kv_heads, 64
+    batch, heads, dim = 32, group * kv_heads, 64
     generator = torch.Generator().manual_seed(29)
     host = [
         torch.randn(shape, generator=generator).to(torch.bfloat16)
@@ -402,7 +405,7 @@ def test_packed_head_writeback_matches_bsnd_and_fp32(kv_heads):
         )
     ]
     q = host[0].float().permute(0, 2, 1, 3)
-    k, v = [t.float().repeat_interleave(33, 2).permute(0, 2, 1, 3) for t in host[1:]]
+    k, v = [t.float().repeat_interleave(group, 2).permute(0, 2, 1, 3) for t in host[1:]]
     scores = q @ k.transpose(-1, -2) / 8
     scores.masked_fill_(torch.arange(sk)[None, :] > torch.arange(sq)[:, None] + sk - sq, -torch.inf)
     expected = (scores.softmax(-1) @ v).permute(0, 2, 1, 3).reshape(-1, heads, dim)
@@ -425,6 +428,9 @@ def test_packed_head_writeback_matches_bsnd_and_fp32(kv_heads):
     torch.testing.assert_close(
         packed[1], fixed[1].permute(1, 0, 2).reshape(heads, -1), atol=0.05, rtol=0
     )
+    if sq == 1:
+        constants = next(reversed(interface._compiled_kernels))[1][-1]
+        assert constants[16][1] is True  # TND inherits the same DN eligibility as BSND.
 
 
 @pytest.mark.skipif(

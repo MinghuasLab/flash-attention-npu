@@ -421,8 +421,9 @@ def _flash_attention(
             storage_lengths = (q_len, kv_len)
             q_len = min(q_len, max_seqlen_q)
             kv_len = min(kv_len, max_seqlen_k)
-    # One right-aligned Q row is centered on the last KV position.
-    if q_len == 1 and not packed:
+    # With a one-row bound, every nonempty sequence has one Q row centered
+    # on its last KV position. Its nonnegative right window is redundant.
+    if q_len == 1:
         window_right = None
     scale = float(softmax_scale) if softmax_scale is not None else 1 / math.sqrt(head_dim)
     if not math.isfinite(scale):
