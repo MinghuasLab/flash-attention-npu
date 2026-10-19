@@ -9,7 +9,12 @@ if find_spec("catlass") is None:
     pytest.skip("CATLASS DSL runtime is not installed", allow_module_level=True)
 
 import catlass.tla as tla
-from flash_attn_npu_dsl import BlockSparseTensorsTorch, flash_attn_func, simd
+from flash_attn_npu_dsl import (
+    BlockSparseTensorsTorch,
+    flash_attn_func,
+    flash_attn_varlen_func,
+    simd,
+)
 from flash_attn_npu_dsl import interface
 
 torch = pytest.importorskip("torch")
@@ -128,7 +133,7 @@ def test_dn_packed_coordinates_sparse_rebinding(dtype, dim, kv_heads):
 
 
 @pytest.mark.parametrize("scale", [0.125, 0.0, -0.125])
-@pytest.mark.parametrize("q_len,kv_len", [(128, 256), (513, 512)])
+@pytest.mark.parametrize("q_len,kv_len", [(128, 256), (513, 512), (513, 513)])
 def test_dn_large_negative_and_nonpositive_scale(scale, q_len, kv_len):
     import torch_npu  # noqa: F401
 
@@ -144,6 +149,83 @@ def test_dn_large_negative_and_nonpositive_scale(scale, q_len, kv_len):
         torch.tensor(float(kv_len))
     )
     torch.testing.assert_close(lse.cpu(), expected.expand_as(lse.cpu()), rtol=0, atol=0.05)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["bsnd", "tnd"])
+@pytest.mark.parametrize("dtype,dim", [(torch.float16, 16), (torch.bfloat16, 128)])
+def test_dn_full_tail_first_preserves_output_across_active_counts(packed, dtype, dim):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(17)
+    host = tuple(
+        torch.randn(shape, generator=generator).to(dtype)
+        for shape in ((1, 513, 4, dim), (1, 513, 2, dim), (1, 513, 2, dim))
+    )
+    q, k, v = (value.float().permute(0, 2, 1, 3) for value in host)
+    k, v = (value.repeat_interleave(2, dim=1) for value in (k, v))
+    scores = (q @ k.transpose(-1, -2)) * dim**-0.5
+    inputs = tuple((value[0] if packed else value).to(device) for value in host)
+    counts = torch.zeros((1, 5) if packed else (1, 1, 5), dtype=torch.int32, device=device)
+    # The one-key physical tail is consumed first, followed by unordered full
+    # blocks. Counts cross both the two-slot PV and three-slot alpha rings.
+    order = torch.tensor([4, 1, 3, 0, 2], dtype=torch.int32)
+    indices = order.repeat(5).reshape((1, 25) if packed else (1, 1, 5, 5)).to(device)
+    blocks = BlockSparseTensorsTorch(
+        torch.zeros_like(counts),
+        torch.zeros_like(indices),
+        counts,
+        indices,
+        cu_total_m_blocks=torch.tensor([0, 5], dtype=torch.int32, device=device)
+        if packed
+        else None,
+        cu_block_idx_offsets=torch.tensor([0, 25], dtype=torch.int32, device=device)
+        if packed
+        else None,
+        block_size=(128, 128),
+    )
+    options = {}
+    if packed:
+        options = dict(
+            cu_seqlens_q=torch.tensor([0, 513], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, 513], dtype=torch.int32, device=device),
+            max_seqlen_q=513,
+            max_seqlen_k=513,
+        )
+    call = flash_attn_varlen_func if packed else flash_attn_func
+    interface._compiled_kernels.clear()
+    executables = {}
+    try:
+        for count in (0, 1, 2, 3, 5):
+            blocks.full_block_cnt.fill_(count)
+            blocks.full_block_cnt[..., 1] = 0  # Empty tasks between nonempty tasks.
+            keep = torch.isin(torch.arange(513) // 128, order[:count]).expand(513, 513).clone()
+            keep[128:256] = False
+            masked = scores.masked_fill(~keep, -torch.inf)
+            expected = (masked.softmax(-1).nan_to_num() @ v).permute(0, 2, 1, 3)
+            expected_lse = masked.logsumexp(-1)
+            for return_lse in (False, True):
+                out, lse = call(
+                    *inputs, **options, block_sparse_tensors=blocks, return_lse=return_lse
+                )
+                torch.npu.synchronize()
+                actual = out.cpu().float().reshape_as(expected)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0.05)
+                assert torch.count_nonzero(actual[:, ~keep.any(-1)]) == 0
+                if return_lse:
+                    torch.testing.assert_close(
+                        lse.cpu().reshape_as(expected_lse), expected_lse, rtol=0, atol=0.05
+                    )
+                else:
+                    assert lse is None
+                current = next(reversed(interface._compiled_kernels.values()))
+                if return_lse not in executables:
+                    executables[return_lse] = current
+                assert current is executables[return_lse]
+            assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()
 
 
 @pytest.mark.parametrize("dtype,dim", [(torch.float16, 16), (torch.bfloat16, 128)])

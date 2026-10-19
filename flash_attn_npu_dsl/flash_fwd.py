@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 
-"""Ascend 950 BSND attention with score/mask callbacks and optional block sparsity.
+"""Ascend 950 BSND/TND attention with callbacks and optional block sparsity.
 
 Each task processes one 128-row Q tile for one batch and Q head; packed
 tasks fold query heads sharing one KV head into those rows. Cube computes
@@ -119,6 +119,7 @@ def _store_grouped_output(
     dim: tla.Constexpr[int],
 ):
     """Scatter packed UB rows back to their original BSND head groups."""
+    row_stride = 64 if dim <= 64 else 128
     copied = tla.Int32(0)
     while copied < rows:
         index = start + copied
@@ -126,8 +127,8 @@ def _store_grouped_output(
         head = index - q * heads
         count = min(rows - copied, heads - head)
         src = tla.make_tensor(
-            source + copied * 128,
-            tla.make_layout(tla.make_shape(count, dim), tla.make_stride(128, 1)),
+            source + copied * row_stride,
+            tla.make_layout(tla.make_shape(count, dim), tla.make_stride(row_stride, 1)),
         )
         dst = tla.make_tensor(
             destination.ptr + batch_offset + (q * heads * groups + group * heads + head) * dim,
@@ -249,6 +250,9 @@ def flex_attention_kernel(
     qBaseTile_ = 128
     kvBaseTile_ = 128
     embed_ = head_dim
+    # Match small-D PV/O rows to one FP32 vector. Keep allocation sizes and
+    # buffer bases unchanged; FIX, rescaling and packing share this stride.
+    output_stride = 64 if head_dim <= 64 else 128
     qNOffset = head_dim
     qSOffset = q_heads * head_dim
     kNOffset = head_dim
@@ -447,6 +451,7 @@ def flex_attention_kernel(
         if tla.const_expr(use_dn):
             paddedRows = (rowNum + 31) // 32 * 32
         first_kv = 0
+        kv_compute_end = curKvSeqlen
         partial_count = 0
         partial_base = 0
         full_base = 0
@@ -462,13 +467,14 @@ def flex_attention_kernel(
             if tla.const_expr(window_right is not None):
                 # A tile can end partway through a group of heads at the same Q.
                 end_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads + 1
-                end_kv = min(
-                    num_kv_tiles,
+                kv_compute_end = min(
+                    curKvSeqlen,
                     max(
                         0,
-                        (end_q + curKvSeqlen - seqlen_info.seqlen_q + window_right + 127) // 128,
+                        end_q + curKvSeqlen - seqlen_info.seqlen_q + window_right,
                     ),
                 )
+                end_kv = (kv_compute_end + 127) // 128
             kvSLoopNum = max(0, end_kv - first_kv)
         else:
             full_count = 0
@@ -559,7 +565,9 @@ def flex_attention_kernel(
                             partial_base,
                             full_base,
                         )
-                    kvSTileSizeAct = min(128, curKvSeqlen - gatheredKvSTileIdx * 128)
+                    # QK, delayed PV and K/V copies share the visible end. A
+                    # window can truncate a block before the sequence ends.
+                    kvSTileSizeAct = min(128, kv_compute_end - gatheredKvSTileIdx * 128)
                     window_needs_mask = True
                     if tla.const_expr(
                         not use_dn
@@ -619,7 +627,7 @@ def flex_attention_kernel(
                         gm_k = tla.make_tensor(
                             key.ptr + (kBOffset + kvHeadIdx * kNOffset),
                             tla.make_layout(
-                                tla.make_shape(embed_, curKvSeqlen),
+                                tla.make_shape(embed_, kv_compute_end),
                                 tla.make_stride(1, kSOffset),
                                 layoutTag=tla.arch.ColumnMajor,
                             ),
@@ -884,8 +892,15 @@ def flex_attention_kernel(
                             running_sum = tla.make_tensor(lastSum_ptr, state_layout)
                             alpha = tla.make_tensor(expMax_ptr, state_layout)
                             if tla.const_expr(use_dn):
-                                for current_slot in tla.range_constexpr(2):
-                                    if ubSBufId == current_slot:
+                                # Two score/P banks and three delayed-alpha banks.
+                                # Each call exposes fixed UB addresses to the VF.
+                                for combined_slot in tla.range_constexpr(6):
+                                    current_slot = combined_slot // 3
+                                    state_slot = combined_slot % 3
+                                    if (ubSBufId == current_slot) & (l1PBufId == state_slot):
+                                        slot_alpha = tla.make_tensor(
+                                            expMax_ptrs[state_slot], state_layout
+                                        )
                                         # Pass the selected score/P bank explicitly so the
                                         # backend sees bank-specific addresses at each VF call.
                                         slot_scores = tla.make_tensor(
@@ -903,7 +918,7 @@ def flex_attention_kernel(
                                                 slot_probs,
                                                 running_max,
                                                 running_sum,
-                                                alpha,
+                                                slot_alpha,
                                                 validIdx == 0,
                                                 scale,
                                                 DTYPE_P,
@@ -914,7 +929,7 @@ def flex_attention_kernel(
                                                 slot_probs,
                                                 running_max,
                                                 running_sum,
-                                                alpha,
+                                                slot_alpha,
                                                 validIdx == 0,
                                                 scale,
                                                 kvSTileSizeAct,
@@ -1267,7 +1282,7 @@ def flex_attention_kernel(
                             partial_base,
                             full_base,
                         )
-                    kvSTileSizeActDe = min(128, curKvSeqlen - gatheredKvSTileIdxDe * 128)
+                    kvSTileSizeActDe = min(128, kv_compute_end - gatheredKvSTileIdxDe * 128)
                     ubOTmpBufId = validIdxDe % 2
                     ubOTmp_ptr = ubOTmp_ptrs[0] if ubOTmpBufId == 0 else ubOTmp_ptrs[1]
                     if tla.const_expr(use_dn):
@@ -1275,14 +1290,14 @@ def flex_attention_kernel(
                             ubOTmp_ptr,
                             tla.make_layout(
                                 tla.make_shape(paddedRows, head_dim),
-                                tla.make_stride(128, 1),
+                                tla.make_stride(output_stride, 1),
                             ),
                         )
                     else:
                         ubOTmpTensorTla = tla.make_tensor(
                             ubOTmp_ptr,
                             tla.make_layout(
-                                tla.make_shape(rowNum, head_dim), tla.make_stride(128, 1)
+                                tla.make_shape(rowNum, head_dim), tla.make_stride(output_stride, 1)
                             ),
                         )
                     l1PBufIdDe = validIdxDe % 3
@@ -1312,7 +1327,7 @@ def flex_attention_kernel(
 
                     # PV Mmad
                     with tla.cube():
-                        kvShapeRowDe = curKvSeqlen
+                        kvShapeRowDe = kv_compute_end
                         kvShapeColDe = tla.as_numeric(embed_)
                         gm_v = tla.make_tensor(
                             value.ptr + gmOffsetV,
@@ -1479,7 +1494,8 @@ def flex_attention_kernel(
                                 else (expMax_ptrs[1] if l1PBufIdDe == 1 else expMax_ptrs[2])
                             )
                             re_out_layout = tla.make_layout(
-                                tla.make_shape(re_m, 128), tla.make_stride(128, 1)
+                                tla.make_shape(re_m, output_stride),
+                                tla.make_stride(output_stride, 1),
                             )
                             re_state_layout = tla.make_layout(
                                 tla.make_shape(64), tla.make_stride(1)
@@ -1532,7 +1548,10 @@ def flex_attention_kernel(
                 if empty_m > 0:
                     empty_output_ub = tla.make_tensor(
                         ubO_ptr,
-                        tla.make_layout(tla.make_shape(empty_m, 128), tla.make_stride(128, 1)),
+                        tla.make_layout(
+                            tla.make_shape(empty_m, output_stride),
+                            tla.make_stride(output_stride, 1),
+                        ),
                     )
                     empty_lse_ub = None
                     if tla.const_expr(lse is not None):
@@ -1553,6 +1572,7 @@ def flex_attention_kernel(
                                 empty_row,
                                 empty_full_mask,
                                 empty_one_mask,
+                                head_dim,
                             )
                 tla.set_flag(mte3_ready_rescale)
 
@@ -1572,7 +1592,7 @@ def flex_attention_kernel(
             tla.wait_flag(mte3_ready_rescale)
             if final_m > 0:
                 final_out_layout = tla.make_layout(
-                    tla.make_shape(final_m, 128), tla.make_stride(128, 1)
+                    tla.make_shape(final_m, output_stride), tla.make_stride(output_stride, 1)
                 )
                 final_output_ub = tla.make_tensor(ubO_ptr, final_out_layout)
                 final_packed_output = tla.make_tensor(ubO16_ptr, final_out_layout)
@@ -1582,6 +1602,8 @@ def flex_attention_kernel(
                 with tla.vec.func(mode="simd"):
                     final_full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
                     final_packed_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float16)
+                    if tla.const_expr(head_dim <= 64):
+                        final_packed_mask, _ = tla.update_mask(64, dtype=tla.Float16)
                     for final_row in tla.range(final_m):
                         output_pack_row(
                             final_output_ub,

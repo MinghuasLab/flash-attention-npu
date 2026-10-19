@@ -1,8 +1,8 @@
 """Online softmax for fully initialized 128-by-64 KV-by-Q tiles.
 
-Unmodified tiles require valid coordinates and positive scale. Modified tiles
-already contain scaled scores with masked/padded entries set to -inf; they use
-unit scale and explicitly preserve the empty-row state.
+Unmodified tiles require valid coordinates and positive scale. Padded tiles
+initialize invalid positions to -inf and preserve the empty-row state. Modified
+tiles also contain pre-scaled scores and therefore use unit scale.
 """
 
 import catlass.tla as tla
@@ -69,7 +69,7 @@ def _full_dn_impl(
             m0 = tla.max(m0, previous_max, mask=full)
         if tla.const_expr(masked):
             mx.store(m0, mask=full)
-            # SIMT has initialized every padded/masked position to -inf.
+            # Every padded/masked position has been initialized to -inf.
             # Keep -inf as the true running maximum, but avoid -inf - -inf
             # in empty rows when forming exponentials and rescale factors.
             m0 = tla.where(

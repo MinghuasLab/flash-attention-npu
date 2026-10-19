@@ -414,3 +414,94 @@ def test_varlen_softcap_retains_scaled_score_before_mask(dtype):
         torch.testing.assert_close(out.cpu().float(), expected, atol=0.05, rtol=0)
         if want_lse:
             torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.05, rtol=0)
+
+
+@pytest.mark.skipif(
+    not os.getenv("FLASH_ATTN_DSL_TEST_DEVICE"), reason="explicit NPU opt-in required"
+)
+@pytest.mark.parametrize("packed", [False, True], ids=["bsnd", "tnd"])
+@pytest.mark.parametrize(
+    "dtype,dim,sq,sk,window",
+    [(torch.float16, 64, 193, 258, (32, 0)), (torch.bfloat16, 80, 513, 518, (512, 0))],
+    ids=["nd-65-column-end", "dn-5-column-end"],
+)
+def test_window_clips_compute_and_copy_extents_with_dynamic_reuse(
+    packed, dtype, dim, sq, sk, window
+):
+    import torch_npu  # noqa: F401
+
+    device = f"npu:{int(os.environ['FLASH_ATTN_DSL_TEST_DEVICE'])}"
+    torch.npu.set_device(device)
+    generator = torch.Generator().manual_seed(29)
+    capacity = sq + 32
+    host = [
+        torch.randn(shape, generator=generator).to(dtype)
+        for shape in ((2, capacity, 4, dim), (2, sk, 2, dim), (2, sk, 2, dim))
+    ]
+    cuq = torch.tensor([0, capacity, 2 * capacity], dtype=torch.int32, device=device)
+    cuk = torch.tensor([0, sk, 2 * sk], dtype=torch.int32, device=device)
+    used_q = torch.empty(2, dtype=torch.int32, device=device)
+    used_k = torch.empty_like(used_q)
+    interface._compiled_kernels.clear()
+    executables = {}
+    try:
+        for update in range(3):
+            current_q = capacity if update == 1 else sq
+            qlens = [current_q, 0 if update == 1 else sq - 1] if packed else [current_q] * 2
+            klens = [sk, sq - 129] if packed else [sk] * 2
+            current = host if packed else [host[0][:, :current_q].contiguous(), *host[1:]]
+            inputs = [t.flatten(0, 1).to(device) if packed else t.to(device) for t in current]
+            options = {}
+            if packed:
+                used_q.copy_(torch.tensor(qlens, dtype=torch.int32, device=device))
+                used_k.copy_(torch.tensor(klens, dtype=torch.int32, device=device))
+                if update == 2:
+                    cuq, cuk, used_q, used_k = (t.clone() for t in (cuq, cuk, used_q, used_k))
+                options = dict(
+                    cu_seqlens_q=cuq,
+                    cu_seqlens_k=cuk,
+                    seqused_q=used_q,
+                    seqused_k=used_k,
+                    max_seqlen_q=capacity,
+                    max_seqlen_k=sk,
+                )
+            expected, expected_lse, empty = [], [], []
+            for b, (nq, nk) in enumerate(zip(qlens, klens)):
+                q = host[0][b, :nq].float().permute(1, 0, 2)
+                k, v = [
+                    t[b, :nk].float().repeat_interleave(2, 1).permute(1, 0, 2) for t in host[1:]
+                ]
+                center = torch.arange(nq)[:, None] + nk - nq
+                keys = torch.arange(nk)[None, :]
+                keep = (keys >= center - window[0]) & (keys <= center + window[1])
+                scores = (q @ k.transpose(-1, -2)) * dim**-0.5
+                scores.masked_fill_(~keep, -torch.inf)
+                expected.append((scores.softmax(-1).nan_to_num() @ v).permute(1, 0, 2))
+                expected_lse.append(scores.logsumexp(-1))
+                empty.append(~keep.any(-1))
+            call = flash_attn_varlen_func if packed else interface.flash_attn_func
+            for return_lse in (False, True):
+                out, lse = call(*inputs, **options, window_size=window, return_lse=return_lse)
+                torch.npu.synchronize()
+                actual = out.cpu().float().reshape(2, -1, 4, dim)
+                actual_lse = None
+                if return_lse:
+                    actual_lse = lse.cpu()
+                    if packed:
+                        actual_lse = actual_lse.reshape(4, 2, capacity).permute(1, 0, 2)
+                for b, nq in enumerate(qlens):
+                    torch.testing.assert_close(actual[b, :nq], expected[b], atol=0.05, rtol=0)
+                    assert torch.count_nonzero(actual[b, :nq][empty[b]]) == 0
+                    if return_lse:
+                        torch.testing.assert_close(
+                            actual_lse[b, :, :nq], expected_lse[b], atol=0.05, rtol=0
+                        )
+                    else:
+                        assert lse is None
+                compiled = next(reversed(interface._compiled_kernels.values()))
+                if return_lse not in executables:
+                    executables[return_lse] = compiled
+                assert compiled is executables[return_lse]
+        assert len(interface._compiled_kernels) == 2
+    finally:
+        interface._compiled_kernels.clear()

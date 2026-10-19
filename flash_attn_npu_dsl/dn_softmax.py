@@ -234,6 +234,21 @@ def native_dn_softmax(
 
 
 @tla.jit
+def _fill_dn_padding(scores, rows, columns, clear_rows: tla.Constexpr):
+    with tla.vec.func(mode="simd"):
+        full = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
+        padding = tla.full(float("-inf"), tla.Float32)
+        if tla.const_expr(clear_rows):
+            invalid_rows = tla.cmp(tla.arange(0, dtype=tla.Int32), rows, "ge")
+            for k in tla.range(columns):
+                dst = tla.tile_view(scores, tla.make_shape(1, 64), tla.make_coord(k, 0))
+                dst.store(padding, mask=invalid_rows)
+        for k in tla.range(columns, 128):
+            dst = tla.tile_view(scores, tla.make_shape(1, 64), tla.make_coord(k, 0))
+            dst.store(padding, mask=full)
+
+
+@tla.jit
 def _vector_native_dn_softmax(
     scores,
     probs,
@@ -259,12 +274,11 @@ def _vector_native_dn_softmax(
     window_left,
     window_right,
 ):
-    # Both metadata and intrinsic windows can prove that a tile is fully
-    # visible. The same fast path also requires complete physical rows/columns
-    # and unmodified scores.
+    # Only a proved fully visible tile with unmodified scores can use this
+    # path. Padding is initialized explicitly before the common full-tile VF.
     eligible = False
     if tla.const_expr(score_mod is None and scale > 0):
-        eligible = (rows == 64) & (columns == 128)
+        eligible = True
         if tla.const_expr(mask_mod is not None):
             eligible = eligible & (not apply_mask)
         else:
@@ -281,9 +295,26 @@ def _vector_native_dn_softmax(
                     kv_start + columns - 1 <= first_q + info.seqlen_k - info.seqlen_q + window_right
                 )
     if eligible:
-        full_dn_softmax(
-            scores, probs, running_max, running_sum, alpha, first, scale, probability_dtype
-        )
+        if (rows == 64) & (columns == 128):
+            full_dn_softmax(
+                scores, probs, running_max, running_sum, alpha, first, scale, probability_dtype
+            )
+        else:
+            if rows == 64:
+                _fill_dn_padding(scores, rows, columns, False)
+            else:
+                _fill_dn_padding(scores, rows, columns, True)
+            full_dn_softmax(
+                scores,
+                probs,
+                running_max,
+                running_sum,
+                alpha,
+                first,
+                scale,
+                probability_dtype,
+                masked=True,
+            )
     else:
         _general_native_dn_softmax(
             scores,

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 
-"""SIMD online softmax and output correction with fixed 128-column scratch."""
+"""SIMD online softmax and output correction for 128-column score tiles."""
 
 import catlass.tla as tla
 
@@ -247,7 +247,7 @@ def output_update_row(pv, output, alpha, row, full_mask, head_mask):
     second.store(second.load() * rescale + even, mask=full_mask)
 
 
-def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, one_mask, chunks):
+def _output_normalization(running_max, running_sum, lse, row, full_mask, one_mask):
     total = _broadcast(running_sum, row)
     zero = tla.full(0.0, tla.Float32)
     valid = tla.cmp(total, zero, "gt", mask=full_mask)
@@ -261,6 +261,13 @@ def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, o
         tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
             logsumexp, params=tla.params.UnalignStoreParams(), mask=one_mask
         )
+    return valid, safe_total, zero
+
+
+def output_finalize_row(output, running_max, running_sum, lse, row, full_mask, one_mask, chunks):
+    valid, safe_total, zero = _output_normalization(
+        running_max, running_sum, lse, row, full_mask, one_mask
+    )
     for chunk in tla.range_constexpr(chunks):
         dst = _chunk(output, row, chunk)
         dst.store(tla.where(valid, dst.load() / safe_total, zero), mask=full_mask)
@@ -286,14 +293,15 @@ def output_pack_row(output, packed_output, row, output_dtype, full_mask, packed_
             _chunk(output, row, 1).load().to(output_dtype, one_slot, mask=full_mask),
             mask=packed_mask,
         )
-    tla.tile_view(packed_output, tla.make_shape(1, 128), tla.make_coord(row, 0)).store(
+    width = 64 if head_dim <= 64 else 128
+    tla.tile_view(packed_output, tla.make_shape(1, width), tla.make_coord(row, 0)).store(
         packed, mask=packed_mask
     )
 
 
-def output_empty_row(output, lse, row, full_mask, one_mask):
+def output_empty_row(output, lse, row, full_mask, one_mask, head_dim=128):
     zero = tla.full(0.0, tla.Float32)
-    for chunk in tla.range_constexpr(2):
+    for chunk in tla.range_constexpr((head_dim + 63) // 64):
         _chunk(output, row, chunk).store(zero, mask=full_mask)
     if tla.const_expr(lse is not None):
         tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
@@ -312,12 +320,11 @@ def _output_update_tile_impl(
     running_sum,
     lse,
     rows,
-    valid_idx,
-    active_tiles,
-    first,
+    first: tla.Constexpr,
+    last: tla.Constexpr,
     head_dim,
 ):
-    """Update O, order its UB stores, then normalize the final tile."""
+    """Update O; fuse final normalization for a single-vector output row."""
     with tla.vec.func(mode="simd"):
         full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
         one_mask, _ = tla.update_mask(1, dtype=tla.Float32)
@@ -334,6 +341,11 @@ def _output_update_tile_impl(
                 dst = _chunk(output, row, 0)
                 if tla.const_expr(not first):
                     value = dst.load() * _broadcast(alpha, row) + value
+                if tla.const_expr(last):
+                    valid, total, zero = _output_normalization(
+                        running_max, running_sum, lse, row, full_mask, one_mask
+                    )
+                    value = tla.where(valid, value / total, zero)
                 dst.store(value, mask=full_mask)
             elif tla.const_expr(first):
                 output_first_row(pv, output, row, full_mask, head_mask)
@@ -343,7 +355,7 @@ def _output_update_tile_impl(
             tla.params.MemType.VEC_STORE,
             tla.params.MemType.VEC_LOAD,
         )
-        if valid_idx == active_tiles - 1:
+        if tla.const_expr(last and head_dim > 64):
             for normalize_row in tla.range(rows):
                 output_finalize_row(
                     output,
@@ -372,34 +384,17 @@ def output_update_tile(
 ):
     """Initialize O from the first PV tile; rescale and accumulate later PV tiles.
 
-    Select initialization outside the SIMD row loops. Complete O's UB stores
-    before reading them for normalization, which runs only after the last PV tile.
+    Select first/last-tile behavior before entering SIMD row loops. Single-vector
+    rows normalize in registers; wider rows retain the ordered UB normalization.
     """
+    common = (pv, output, alpha, running_max, running_sum, lse, rows)
     if valid_idx == 0:
-        _output_update_tile_impl(
-            pv,
-            output,
-            alpha,
-            running_max,
-            running_sum,
-            lse,
-            rows,
-            valid_idx,
-            active_tiles,
-            True,
-            head_dim,
-        )
+        if active_tiles == 1:
+            _output_update_tile_impl(*common, True, True, head_dim)
+        else:
+            _output_update_tile_impl(*common, True, False, head_dim)
     else:
-        _output_update_tile_impl(
-            pv,
-            output,
-            alpha,
-            running_max,
-            running_sum,
-            lse,
-            rows,
-            valid_idx,
-            active_tiles,
-            False,
-            head_dim,
-        )
+        if valid_idx == active_tiles - 1:
+            _output_update_tile_impl(*common, False, True, head_dim)
+        else:
+            _output_update_tile_impl(*common, False, False, head_dim)
