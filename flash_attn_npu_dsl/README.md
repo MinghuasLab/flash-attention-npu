@@ -9,7 +9,8 @@
   内联到 attention 内核；需要跳过空块时，可显式建块并传入稀疏元数据。
 
 当前实现面向 Ascend 950 的推理前向，支持定长 BSND、非分页变长 TND、
-FP16/BF16、D8/16/32/64/80/96/128 和 GQA。
+FP16/BF16、1～256维 head dimension 和 GQA。
+Q/K 使用相同的 Dqk；V 可以独立选择1～256维的 Dv，O 的最后一维随 V。
 通过独立的 `flash_attn_npu_dsl` 包使用，不替换现有 V2/V3/V4 的 C++ 后端。
 
 静态 modifier／块表路径的 Tensor 使用连续 ND/NCHW 物理存储；特殊分块存储格式
@@ -46,6 +47,7 @@ python -m catlass.bc_compile
 python -m flash_attn_npu_dsl.example --device 0
 python -m flash_attn_npu_dsl.example --simd --sparse --dtype bf16 --head-dim 96
 python -m flash_attn_npu_dsl.example --simd-score --sparse --q-len 257 --kv-len 129
+python -m flash_attn_npu_dsl.example --head-dim 256 --value-dim 192 --simd --sparse
 ```
 
 DSL 的 Python 包、二进制扩展和 bitcode 必须配套。不要从未构建的 CATLASS Python
@@ -82,19 +84,20 @@ out, lse = flash_attn_func(q, k, v, mask_mod=causal_mask, return_lse=True)
 ## 输入、返回值与常用参数
 
 Q/K/V 为同设备、同 dtype、连续的 FP16 或 BF16 NPU 张量，采用 BSND 布局。
-Q 为 `(B, Sq, Hq, D)`，K/V 为 `(B, Sk, Hkv, D)`；所有维度为正，
-`D` 支持 8/16/32/64/80/96/128，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
+Q 为 `(B, Sq, Hq, Dqk)`，K 为 `(B, Sk, Hkv, Dqk)`，V 为 `(B, Sk, Hkv, Dv)`；所有维度为正，
+`Dqk` 和 `Dv` 各支持1～256，`Hq` 必须是 `Hkv` 的整数倍（GQA）。
 仅支持推理前向，不支持梯度或 paged KV；未实现的选项必须保持默认值。
 
-`flash_attn_func` 始终返回 `(out, lse)`。O 与 Q 的形状和 dtype 相同；
+`flash_attn_func` 始终返回 `(out, lse)`。O 为 `(B, Sq, Hq, Dv)`，dtype 与 Q 相同；
 `return_lse=True` 返回 FP32 自然对数 LSE，形状为 `(B, Hq, Sq)`，否则 LSE 为 `None`。
 完全被 mask 的行返回精确零 O 和 `-inf` LSE。
 
 ### 变长 TND
 
-`flash_attn_varlen_func` 接受连续的 Q `[total_q,Hq,D]` 和 K/V `[total_k,Hkv,D]`。
+`flash_attn_varlen_func` 接受连续的 Q `[total_q,Hq,Dqk]`、K `[total_k,Hkv,Dqk]`
+和 V `[total_k,Hkv,Dv]`。
 `cu_seqlens_q/k` 是同设备连续 int32 `[B+1]` 累计存储偏移；可选的
-`seqused_q/k` 是 int32 `[B]` 有效长度，可以小于存储段长度。O 与 Q 同形状，
+`seqused_q/k` 是 int32 `[B]` 有效长度，可以小于存储段长度。O 为 `[total_q,Hq,Dv]`，
 LSE 为 `[Hq,total_q]`，仍返回 `(out,lse)`。仅支持 Q/K 同时使用 TND。
 
 ```python
@@ -130,7 +133,7 @@ callback 的 q/kv 坐标仍是序列内坐标，`seqlen_info` 同时提供当前
 元数据原地更新或地址替换会在下次调用生效；地址和内容不进入编译 key，
 总容量或编译期策略变化则可能产生新编译对象。
 
-- `softmax_scale`：基础分数缩放，默认 `1 / sqrt(D)`。
+- `softmax_scale`：基础分数缩放，默认 `1 / sqrt(Dqk)`。
 - `softcap`：默认 0（关闭）；正值 `c` 将缩放后分数变为 `c * tanh(score / c)`，
   然后再应用 mask。内部使用 SIMD score helper，不可与显式 `score_mod` 同用；
   full 稀疏块仍执行 softcap。

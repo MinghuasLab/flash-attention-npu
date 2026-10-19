@@ -126,6 +126,12 @@ def test_static_launch_requires_dense_bound_storage(monkeypatch, storage_format,
 @pytest.mark.parametrize(
     "dim,dtype",
     [
+        (1, torch.float16),
+        (59, torch.bfloat16),
+        (129, torch.float16),
+        (192, torch.bfloat16),
+        (255, torch.float16),
+        (256, torch.bfloat16),
         (8, torch.float16),
         (16, torch.bfloat16),
         (32, torch.float16),
@@ -144,7 +150,7 @@ def test_supported_shapes(dim, dtype):
     [
         ((17, 4, 128), "rank-4"),
         ((1, 0, 4, 128), "nonempty"),
-        ((1, 17, 4, 72), "head dimension"),
+        ((1, 17, 4, 257), "head dimension"),
         ((1, 17, 4, 64), "dimensions must match"),
         ((1, 17, 3, 128), "divisible"),
         ((2, 17, 4, 128), "batch sizes"),
@@ -256,7 +262,7 @@ def test_public_call_preserves_logical_aux_and_optional_lse(host, lse, tensors, 
         *host.inputs, aux_tensors=tensors, aux_scalars=scalars, return_lse=lse
     )
     assert len(host.compiled) == len(host.launched) == 1
-    assert len(host.compiled[0]) == 28
+    assert len(host.compiled[0]) == 29
     args, kwargs = host.launched[0]
     assert len(args) == 9 and kwargs == {"block_num": 2}
     assert args[8] is None  # BSND has no packed sequence metadata.
@@ -283,6 +289,25 @@ def test_deterministic_inference_reuses_the_same_compiled_call(host):
         interface.flash_attn_func(*host.inputs, deterministic=deterministic)
     assert len(host.compiled) == 1
     assert len(host.launched) == 3
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_value_dimension_controls_output_binding_and_cache(host, dynamic):
+    q, k, _ = host.inputs
+    kwargs = {} if dynamic else {"mask_mod": causal_mask}
+    for dim in (64, 128, 64):
+        v = torch.empty(*k.shape[:-1], dim, dtype=k.dtype)
+        out, lse = interface.flash_attn_func(q, k, v, **kwargs)
+        assert out.shape == (*q.shape[:-1], dim)
+        assert lse is None
+        runtime_v, runtime_out = host.launched[-1][0][2:4]
+        if dynamic:
+            assert runtime_v.columns == k.shape[-2] * dim
+            assert runtime_out.columns == q.shape[-2] * dim
+        else:
+            assert runtime_v is v and runtime_out is out
+    assert len(host.compiled) == 2
+    assert [args[-1] for args in host.compiled] == [64, 128]
 
 
 def test_public_call_restores_device_guard_on_compile_error(host, monkeypatch):

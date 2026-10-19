@@ -141,6 +141,7 @@ def _lower(
             full_dn,
             None,
             0,
+            dim,
         ),
     )
 

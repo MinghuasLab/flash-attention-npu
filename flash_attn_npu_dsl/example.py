@@ -29,7 +29,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
-    parser.add_argument("--head-dim", type=int, choices=(8, 16, 32, 64, 80, 96, 128), default=128)
+    parser.add_argument("--head-dim", type=int, default=128, help="Q/K 维度，1～256")
+    parser.add_argument("--value-dim", type=int, help="V/O 维度，默认与 Q/K 相同")
     parser.add_argument("--q-len", type=int, default=129)
     parser.add_argument("--kv-len", type=int, default=257)
     parser.add_argument(
@@ -44,6 +45,9 @@ def main():
     args = parser.parse_args()
     if args.q_len <= 0 or args.kv_len <= 0:
         parser.error("q-len 和 kv-len 必须为正数")
+    value_dim = args.head_dim if args.value_dim is None else args.value_dim
+    if not 1 <= args.head_dim <= 256 or not 1 <= value_dim <= 256:
+        parser.error("head-dim 和 value-dim 必须在1～256之间")
 
     import torch
     import torch_npu  # noqa: F401
@@ -54,7 +58,7 @@ def main():
     sq, sk, dim = args.q_len, args.kv_len, args.head_dim
     q = torch.randn(1, sq, 2, dim, device=f"npu:{args.device}", dtype=dtype)
     k = torch.randn(1, sk, 1, dim, device=q.device, dtype=dtype)
-    v = torch.randn_like(k)
+    v = torch.randn(1, sk, 1, value_dim, device=q.device, dtype=dtype)
     mask_mod = vector_causal_mask if args.simd or args.simd_mask else causal_mask
     score_mod = vector_scale_score if args.simd or args.simd_score else scale_score
     aux_scalars = (0.75,)
@@ -95,7 +99,9 @@ def main():
         actual_lse = lse.detach().cpu()
         assert torch.equal(torch.isneginf(actual_lse), empty)
         torch.testing.assert_close(actual_lse[~empty], expected_lse[~empty], atol=0.05, rtol=0)
-    print(f"通过：{args.dtype} D={dim}，O{' only' if args.no_lse else '+LSE'}，绝对误差 ≤ 0.05")
+    print(
+        f"通过：{args.dtype} Dqk={dim}/Dv={value_dim}，O{' only' if args.no_lse else '+LSE'}，绝对误差 ≤ 0.05"
+    )
 
 
 if __name__ == "__main__":

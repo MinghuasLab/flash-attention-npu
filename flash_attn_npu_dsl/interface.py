@@ -34,6 +34,7 @@ def _select_kernel_options(
     has_score_mod,
     variable_lengths=False,
     average_q_len=None,
+    q_tile=128,
 ):
     """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
@@ -41,9 +42,9 @@ def _select_kernel_options(
         stride is None or stride[1] == 0 for stride in sparse.strides
     )
     packed_heads = 1
-    if q_len < 128 and group > 1 and shared_heads:
-        original_tasks = batch * q_heads * ((q_len + 127) // 128)
-        packed_tasks = batch * kv_heads * ((q_len * group + 127) // 128)
+    if q_len < q_tile and group > 1 and shared_heads:
+        original_tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
+        packed_tasks = batch * kv_heads * ((q_len * group + q_tile - 1) // q_tile)
         # Folding heads must reduce tasks without losing occupied cores.
         if min(original_tasks, cores) <= packed_tasks < original_tasks:
             packed_heads = group
@@ -56,7 +57,8 @@ def _select_kernel_options(
     # use the known average only when seqused_q does not hide valid row counts.
     # Full blocks bypass the mask, but a score callback would prevent that.
     use_dn = (
-        not (packed_heads > 1 and has_window)
+        q_tile == 128
+        and not (packed_heads > 1 and has_window)
         and (
             (not has_simt_mod and not has_aux)
             or (
@@ -215,18 +217,16 @@ def _validate_inputs(q, k, v, *, packed=False):
             raise TypeError("q, k and v must use FP16 or BF16")
         if tensor.dtype != q.dtype:
             raise TypeError("q, k and v must have the same dtype")
-        if tensor.shape[-1] not in (8, 16, 32, 64, 80, 96, 128) or any(
+        if not 1 <= tensor.shape[-1] <= 256 or any(
             size <= 0 for size in (tensor.shape[1:] if packed else tensor.shape)
         ):
-            raise ValueError(
-                "head dimension must be 8, 16, 32, 64, 80, 96 or 128 and dimensions nonempty"
-            )
+            raise ValueError("head dimension must be in [1, 256] and dimensions nonempty")
         if tensor.requires_grad:
             raise ValueError("this implementation supports inference forward only")
-    if k.shape != v.shape or (not packed and q.shape[0] != k.shape[0]):
+    if k.shape[:-1] != v.shape[:-1] or (not packed and q.shape[0] != k.shape[0]):
         raise ValueError("k/v shapes and q/k batch sizes must match")
     if q.shape[-1] != k.shape[-1]:
-        raise ValueError("Q, K and V head dimensions must match")
+        raise ValueError("Q and K head dimensions must match")
     if q.shape[-2] % k.shape[-2]:
         raise ValueError("Q head count must be divisible by KV head count")
 
@@ -348,8 +348,10 @@ def _flash_attention(
         raise ValueError("softmax_scale must be finite")
     mask_uses_simd, score_uses_simd = validate_modifiers(mask_mod, score_mod)
     aux_tensors, aux_scalars = _validate_aux(aux_tensors, aux_scalars, q.device)
+    value_dim = v.shape[-1]
+    q_tile = 64 if max(head_dim, value_dim) > 128 else 128
     if packed and (q.shape[0] == 0 or k.shape[0] == 0):
-        return torch.zeros_like(q), (
+        return torch.zeros((*q.shape[:-1], value_dim), dtype=q.dtype, device=q.device), (
             torch.full((q_heads, q.shape[0]), -torch.inf, dtype=torch.float32, device=q.device)
             if return_lse
             else None
@@ -403,6 +405,7 @@ def _flash_attention(
             has_score_mod=score_mod is not None,
             variable_lengths=packed,
             average_q_len=(q.shape[0] / batch) if packed and sequence_metadata[2] is None else None,
+            q_tile=q_tile,
         )
         if packed_heads > 1:
             # Only MQA has a contiguous folded view. GQA groups are gathered and
@@ -420,7 +423,11 @@ def _flash_attention(
                         for stride in sparse.strides
                     )
                 )
-        out = torch.empty_like(q)
+        out = (
+            torch.empty_like(q)
+            if value_dim == head_dim
+            else torch.empty((*q.shape[:-1], value_dim), dtype=q.dtype, device=q.device)
+        )
         lse = (
             torch.empty(
                 (original_shape[-2], original_shape[0])
@@ -445,7 +452,7 @@ def _flash_attention(
             if tensor is None:
                 return None
             if dynamic_lengths:
-                columns = tensor.shape[-2] * head_dim if tensor.ndim == 4 else 1
+                columns = tensor.shape[-2] * tensor.shape[-1] if tensor.ndim == 4 else 1
                 return _DynamicTensorArgument(tensor, columns)
             return tensor
 
@@ -479,7 +486,7 @@ def _flash_attention(
             (*tensors, *sparse_tensors, *sequence_tensors),
             aux_tensors,
             aux_scalars,
-            (*constants, packed),
+            (*constants, packed, value_dim),
             q.device,
             dynamic_lengths=dynamic_lengths,
         )
@@ -519,13 +526,19 @@ def _flash_attention(
                 if packed
                 else None
             )
-            return (*bindings, *constants, sample_sequences, original_shape[0] if packed else 0)
+            return (
+                *bindings,
+                *constants,
+                sample_sequences,
+                original_shape[0] if packed else 0,
+                value_dim,
+            )
 
         compiled = _compile_kernel(flex_attention_kernel, key, compile_args)
-        tasks = batch * q_heads * ((q_len + 127) // 128)
+        tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
         compiled(*runtime_args, block_num=max(1, min(tasks, int(cores))))
         if packed_heads > 1 and dynamic_lengths and kv_heads == 1:
-            out = out.view(original_shape)
+            out = out.view(*original_shape[:-1], value_dim)
         return out, lse
 
 
@@ -562,7 +575,7 @@ def flash_attn_varlen_func(
     seqlen_k_per_split=None,
     disable_scheduler_metadata=False,
 ):
-    """Return packed O [total_q,Hq,D] and optional natural-log LSE [Hq,total_q].
+    """Return packed O [total_q,Hq,Dv] and optional natural-log LSE [Hq,total_q].
 
     Both inputs must be nonpaged TND. Prefix sums describe storage; seqused
     optionally restricts valid lengths. Prefix contents, length bounds and

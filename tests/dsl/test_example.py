@@ -30,6 +30,8 @@ if find_spec("catlass") is None:
         ("bf16", 128, 257, 513, ["--simd"]),
         ("fp16", 64, 129, 257, ["--simd-mask"]),
         ("bf16", 96, 257, 129, ["--simd-score", "--sparse"]),
+        ("fp16", 256, 65, 129, ["--value-dim", "192", "--simd", "--sparse"]),
+        ("bf16", 59, 129, 257, ["--value-dim", "129", "--simd-mask", "--sparse"]),
     ],
 )
 def test_package_example(dtype, dim, q_len, kv_len, extra):

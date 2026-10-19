@@ -219,30 +219,30 @@ def online_softmax_tile(
         )
 
 
-def _load_pv_row(pv, row, head_mask):
-    odd, even = _chunk(pv, row, 0).load(
+def _load_pv_row(pv, row, head_mask, part=0):
+    odd, even = _chunk(pv, row, part * 2).load(
         params=tla.params.NormalLoadParams(load_dist=tla.params.LoadDist.DIST_DINTLV_B32)
     )
     if tla.const_expr(head_mask is not None):
         # FIX writes only D columns into a 128-column row. Each deinterleaved
-        # register has D/2 valid lanes; never propagate stale scratch padding.
+        # register has ceil(D/2) / floor(D/2) valid lanes, respectively.
         zero = tla.full(0.0, tla.Float32)
-        odd = tla.where(head_mask, odd, zero)
-        even = tla.where(head_mask, even, zero)
+        odd = tla.where(head_mask[0], odd, zero)
+        even = tla.where(head_mask[1], even, zero)
     return odd, even
 
 
-def output_first_row(pv, output, row, full_mask, head_mask):
-    odd, even = _load_pv_row(pv, row, head_mask)
-    _chunk(output, row, 0).store(odd, mask=full_mask)
-    _chunk(output, row, 1).store(even, mask=full_mask)
+def output_first_row(pv, output, row, full_mask, head_mask, part=0):
+    odd, even = _load_pv_row(pv, row, head_mask, part)
+    _chunk(output, row, part * 2).store(odd, mask=full_mask)
+    _chunk(output, row, part * 2 + 1).store(even, mask=full_mask)
 
 
-def output_update_row(pv, output, alpha, row, full_mask, head_mask):
+def output_update_row(pv, output, alpha, row, full_mask, head_mask, part=0):
     rescale = _broadcast(alpha, row)
-    odd, even = _load_pv_row(pv, row, head_mask)
-    first = _chunk(output, row, 0)
-    second = _chunk(output, row, 1)
+    odd, even = _load_pv_row(pv, row, head_mask, part)
+    first = _chunk(output, row, part * 2)
+    second = _chunk(output, row, part * 2 + 1)
     first.store(first.load() * rescale + odd, mask=full_mask)
     second.store(second.load() * rescale + even, mask=full_mask)
 
@@ -287,21 +287,24 @@ def output_pack_row(output, packed_output, row, output_dtype, full_mask, packed_
     if tla.const_expr(head_dim <= 64):
         lower = _chunk(output, row, 0).load().to(output_dtype, zero_slot, mask=full_mask)
         packed, unused = tla.deinterleave(lower, tla.full(0, output_dtype))
-    else:
-        packed = tla.bitwise_or(
-            _chunk(output, row, 0).load().to(output_dtype, zero_slot, mask=full_mask),
-            _chunk(output, row, 1).load().to(output_dtype, one_slot, mask=full_mask),
-            mask=packed_mask,
+        tla.tile_view(packed_output, tla.make_shape(1, 64), tla.make_coord(row, 0)).store(
+            packed, mask=packed_mask
         )
-    width = 64 if head_dim <= 64 else 128
-    tla.tile_view(packed_output, tla.make_shape(1, width), tla.make_coord(row, 0)).store(
-        packed, mask=packed_mask
-    )
+    else:
+        for part in tla.range_constexpr((head_dim + 127) // 128):
+            packed = tla.bitwise_or(
+                _chunk(output, row, part * 2).load().to(output_dtype, zero_slot, mask=full_mask),
+                _chunk(output, row, part * 2 + 1).load().to(output_dtype, one_slot, mask=full_mask),
+                mask=packed_mask,
+            )
+            tla.tile_view(packed_output, tla.make_shape(1, 128), tla.make_coord(row, part)).store(
+                packed, mask=packed_mask
+            )
 
 
 def output_empty_row(output, lse, row, full_mask, one_mask, head_dim=128):
     zero = tla.full(0.0, tla.Float32)
-    for chunk in tla.range_constexpr((head_dim + 63) // 64):
+    for chunk in tla.range_constexpr(1 if head_dim <= 64 else (head_dim + 127) // 128 * 2):
         _chunk(output, row, chunk).store(zero, mask=full_mask)
     if tla.const_expr(lse is not None):
         tla.tile_view(lse, tla.make_shape(1, 1), tla.make_coord(row, 0)).store(
@@ -328,29 +331,35 @@ def _output_update_tile_impl(
     with tla.vec.func(mode="simd"):
         full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
         one_mask, _ = tla.update_mask(1, dtype=tla.Float32)
-        head_mask = None
-        if tla.const_expr(head_dim < 128):
-            head_mask, _ = tla.update_mask(
-                head_dim if head_dim <= 64 else head_dim // 2, dtype=tla.Float32
-            )
-        for row in tla.range(rows):
+        for part in tla.range_constexpr((head_dim + 127) // 128):
+            head_mask = None
             if tla.const_expr(head_dim <= 64):
-                # Small D occupies one contiguous register; only larger D uses
-                # the two deinterleaved registers expected by the pack stage.
-                value = tla.where(head_mask, _chunk(pv, row, 0).load(), tla.full(0.0, tla.Float32))
-                dst = _chunk(output, row, 0)
-                if tla.const_expr(not first):
-                    value = dst.load() * _broadcast(alpha, row) + value
-                if tla.const_expr(last):
-                    valid, total, zero = _output_normalization(
-                        running_max, running_sum, lse, row, full_mask, one_mask
+                head_mask, _ = tla.update_mask(head_dim, dtype=tla.Float32)
+            elif tla.const_expr(min(128, head_dim - part * 128) < 128):
+                columns = min(128, head_dim - part * 128)
+                odd_mask, _ = tla.update_mask((columns + 1) // 2, dtype=tla.Float32)
+                even_mask, _ = tla.update_mask(columns // 2, dtype=tla.Float32)
+                head_mask = (odd_mask, even_mask)
+            for row in tla.range(rows):
+                if tla.const_expr(head_dim <= 64):
+                    # Small D occupies one contiguous register; only larger D uses
+                    # the two deinterleaved registers expected by the pack stage.
+                    value = tla.where(
+                        head_mask, _chunk(pv, row, 0).load(), tla.full(0.0, tla.Float32)
                     )
-                    value = tla.where(valid, value / total, zero)
-                dst.store(value, mask=full_mask)
-            elif tla.const_expr(first):
-                output_first_row(pv, output, row, full_mask, head_mask)
-            else:
-                output_update_row(pv, output, alpha, row, full_mask, head_mask)
+                    dst = _chunk(output, row, 0)
+                    if tla.const_expr(not first):
+                        value = dst.load() * _broadcast(alpha, row) + value
+                    if tla.const_expr(last):
+                        valid, total, zero = _output_normalization(
+                            running_max, running_sum, lse, row, full_mask, one_mask
+                        )
+                        value = tla.where(valid, value / total, zero)
+                    dst.store(value, mask=full_mask)
+                elif tla.const_expr(first):
+                    output_first_row(pv, output, row, full_mask, head_mask, part)
+                else:
+                    output_update_row(pv, output, alpha, row, full_mask, head_mask, part)
         tla.local_mem_bar(
             tla.params.MemType.VEC_STORE,
             tla.params.MemType.VEC_LOAD,
@@ -365,7 +374,7 @@ def _output_update_tile_impl(
                     normalize_row,
                     full_mask,
                     one_mask,
-                    (head_dim + 63) // 64,
+                    (head_dim + 127) // 128 * 2,
                 )
 
 

@@ -119,7 +119,7 @@ def _store_grouped_output(
     dim: tla.Constexpr[int],
 ):
     """Scatter packed UB rows back to their original BSND head groups."""
-    row_stride = 64 if dim <= 64 else 128
+    row_stride = 64 if dim <= 64 else ((dim + 127) // 128) * 128
     copied = tla.Int32(0)
     while copied < rows:
         index = start + copied
@@ -224,7 +224,10 @@ def flex_attention_kernel(
     full_dn: tla.Constexpr[bool] = False,
     sequence_metadata=None,
     total_q: tla.Constexpr[int] = 0,
+    value_dim: tla.Constexpr[int | None] = None,
 ) -> None:
+    if tla.const_expr(value_dim is None):
+        value_dim = head_dim
     if tla.const_expr(q_len is None):
         # Contiguous BSND roots use (B*S, H*D); B/H/D stay compile-time facts.
         q_len = query.shape[0] // batch
@@ -247,22 +250,23 @@ def flex_attention_kernel(
         DTYPE_P = tla.BFloat16
     c0 = 0
     c1 = 1
-    qBaseTile_ = 128
+    qBaseTile_ = 64 if max(head_dim, value_dim) > 128 else 128
     kvBaseTile_ = 128
     embed_ = head_dim
     # Match small-D PV/O rows to one FP32 vector. Keep allocation sizes and
     # buffer bases unchanged; FIX, rescaling and packing share this stride.
-    output_stride = 64 if head_dim <= 64 else 128
+    output_stride = 64 if value_dim <= 64 else ((value_dim + 127) // 128) * 128
     qNOffset = head_dim
     qSOffset = q_heads * head_dim
     kNOffset = head_dim
     kSOffset = kv_heads * head_dim
-    vSOffset = kv_heads * head_dim
-    mm1L0ATotalStages_ = 1
-    mm1L0BTotalStages_ = 1
-    mm2L0ATotalStages_ = 1
-    mm2L0BTotalStages_ = 1
-    q_tiles = (q_len + 127) // 128
+    vSOffset = kv_heads * value_dim
+    oSOffset = q_heads * value_dim
+    mm1L0ATotalStages_ = (head_dim + 127) // 128
+    mm1L0BTotalStages_ = (head_dim + 127) // 128
+    mm2L0ATotalStages_ = (value_dim + 127) // 128
+    mm2L0BTotalStages_ = (value_dim + 127) // 128
+    q_tiles = (q_len + qBaseTile_ - 1) // qBaseTile_
     kv_tiles = (kv_len + 127) // 128
     total_tasks = batch * q_heads * q_tiles
     # --- L1->L0 完成 -> GM->L1 可开始 ---
@@ -351,11 +355,17 @@ def flex_attention_kernel(
 
     # 片上内存分配
     l1Q_ptrs = [
-        tla.allocate(qBaseTile_ * 128, DTYPE_Q, tla.AddressSpace.l1, 512),
+        tla.allocate(
+            qBaseTile_ * max(128, (head_dim + 15) // 16 * 16), DTYPE_Q, tla.AddressSpace.l1, 512
+        ),
     ]
     l1K_ptrs = [
-        tla.allocate(128 * kvBaseTile_, DTYPE_K, tla.AddressSpace.l1, 512),
-        tla.allocate(128 * kvBaseTile_, DTYPE_K, tla.AddressSpace.l1, 512),
+        tla.allocate(
+            max(128, (head_dim + 15) // 16 * 16) * kvBaseTile_, DTYPE_K, tla.AddressSpace.l1, 512
+        ),
+        tla.allocate(
+            max(128, (head_dim + 15) // 16 * 16) * kvBaseTile_, DTYPE_K, tla.AddressSpace.l1, 512
+        ),
     ]
     l1P_ptrs = [
         tla.allocate(qBaseTile_ * kvBaseTile_, DTYPE_P, tla.AddressSpace.l1, 512),
@@ -363,8 +373,12 @@ def flex_attention_kernel(
         tla.allocate(qBaseTile_ * kvBaseTile_, DTYPE_P, tla.AddressSpace.l1, 512),
     ]
     l1V_ptrs = [
-        tla.allocate(kvBaseTile_ * 128, DTYPE_V, tla.AddressSpace.l1, 512),
-        tla.allocate(kvBaseTile_ * 128, DTYPE_V, tla.AddressSpace.l1, 512),
+        tla.allocate(
+            kvBaseTile_ * max(128, (value_dim + 15) // 16 * 16), DTYPE_V, tla.AddressSpace.l1, 512
+        ),
+        tla.allocate(
+            kvBaseTile_ * max(128, (value_dim + 15) // 16 * 16), DTYPE_V, tla.AddressSpace.l1, 512
+        ),
     ]
 
     l0a_ptrs = [
@@ -387,24 +401,30 @@ def flex_attention_kernel(
         tla.allocate(qBaseTile_ // 2 * kvBaseTile_, DTYPE_S, tla.AddressSpace.ub, 256),
     ]
     ubP_ptrs = [
-        tla.allocate((qBaseTile_ // 2 + 1) * kvBaseTile_, DTYPE_P, tla.AddressSpace.ub, 256),
-        tla.allocate((qBaseTile_ // 2 + 1) * kvBaseTile_, DTYPE_P, tla.AddressSpace.ub, 256),
+        tla.allocate(65 * kvBaseTile_, DTYPE_P, tla.AddressSpace.ub, 256),
+        tla.allocate(65 * kvBaseTile_, DTYPE_P, tla.AddressSpace.ub, 256),
     ]
     ubOTmp_ptrs = [
-        tla.allocate(qBaseTile_ // 2 * 128, DTYPE_OTMP, tla.AddressSpace.ub, 256),
-        tla.allocate(qBaseTile_ // 2 * 128, DTYPE_OTMP, tla.AddressSpace.ub, 256),
+        tla.allocate(
+            qBaseTile_ // 2 * max(128, output_stride), DTYPE_OTMP, tla.AddressSpace.ub, 256
+        ),
+        tla.allocate(
+            qBaseTile_ // 2 * max(128, output_stride), DTYPE_OTMP, tla.AddressSpace.ub, 256
+        ),
     ]
 
     # O 累加器 + 行统计标量
-    ubO_ptr = tla.allocate(qBaseTile_ // 2 * 128, DTYPE_OTMP, tla.AddressSpace.ub, 256)
+    ubO_ptr = tla.allocate(
+        qBaseTile_ // 2 * max(128, output_stride), DTYPE_OTMP, tla.AddressSpace.ub, 256
+    )
     ubO16_ptr = tla.recast_ptr(ubO_ptr, dtype=DTYPE_Q)
     expMax_ptrs = [
-        tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256),
-        tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256),
-        tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256),
+        tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256),
+        tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256),
+        tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256),
     ]
-    lastMax_ptr = tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256)
-    lastSum_ptr = tla.allocate(qBaseTile_ // 2, tla.Float32, tla.AddressSpace.ub, 256)
+    lastMax_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
+    lastSum_ptr = tla.allocate(64, tla.Float32, tla.AddressSpace.ub, 256)
 
     if tla.const_expr(lse is not None):
         lse_ub_ptr = tla.allocate(
@@ -429,6 +449,8 @@ def flex_attention_kernel(
             num_kv_tiles = seqlen_info.num_n_blocks
             qBOffset = seqlen_info.offset_q * packed_heads * qSOffset
             kBOffset = seqlen_info.offset_k * kSOffset
+            vBOffset = seqlen_info.offset_k * vSOffset
+            oBOffset = seqlen_info.offset_q * packed_heads * oSOffset
         else:
             seqlen_info = create_seqlen_info(q_len // packed_heads, kv_len)
             curQSeqlen = q_len
@@ -436,8 +458,10 @@ def flex_attention_kernel(
             num_kv_tiles = kv_tiles
             qBOffset = curBatch * q_len * qSOffset
             kBOffset = curBatch * kv_len * kSOffset
-        gmOffsetV = kBOffset + kvHeadIdx * head_dim
-        rowNum = min(128, curQSeqlen - qSTileIdx * 128)
+            vBOffset = curBatch * kv_len * vSOffset
+            oBOffset = curBatch * q_len * oSOffset
+        gmOffsetV = vBOffset + kvHeadIdx * value_dim
+        rowNum = min(qBaseTile_, curQSeqlen - qSTileIdx * qBaseTile_)
         if tla.const_expr(sequence_metadata is not None):
             rowNum = max(0, rowNum)
         if tla.const_expr(
@@ -446,8 +470,8 @@ def flex_attention_kernel(
             and score_mod is None
             and (window_left is not None or window_right is not None)
         ):
-            window_first_q = qSTileIdx * 128 // packed_heads
-            window_last_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads
+            window_first_q = qSTileIdx * qBaseTile_ // packed_heads
+            window_last_q = (qSTileIdx * qBaseTile_ + rowNum - 1) // packed_heads
         if tla.const_expr(use_dn):
             paddedRows = (rowNum + 31) // 32 * 32
         first_kv = 0
@@ -459,14 +483,14 @@ def flex_attention_kernel(
             end_kv = num_kv_tiles
             if tla.const_expr(window_left is not None):
                 # Packed rows interleave heads; window bounds use original Q positions.
-                first_q = qSTileIdx * 128 // packed_heads
+                first_q = qSTileIdx * qBaseTile_ // packed_heads
                 first_kv = min(
                     num_kv_tiles,
                     max(0, (first_q + curKvSeqlen - seqlen_info.seqlen_q - window_left) // 128),
                 )
             if tla.const_expr(window_right is not None):
                 # A tile can end partway through a group of heads at the same Q.
-                end_q = (qSTileIdx * 128 + rowNum - 1) // packed_heads + 1
+                end_q = (qSTileIdx * qBaseTile_ + rowNum - 1) // packed_heads + 1
                 kv_compute_end = min(
                     curKvSeqlen,
                     max(
@@ -480,7 +504,7 @@ def flex_attention_kernel(
             full_count = 0
             if tla.const_expr(sequence_metadata is not None):
                 # Packed query rows still consume the caller's 128-row lists.
-                sparse_q_tile = qSTileIdx * 128 // packed_heads // 128
+                sparse_q_tile = qSTileIdx * qBaseTile_ // packed_heads // 128
                 count_row = seqlen_info.m_block_offset + sparse_q_tile
                 index_row = seqlen_info.block_idx_offset + sparse_q_tile * num_kv_tiles
                 if rowNum > 0:
@@ -496,23 +520,23 @@ def flex_attention_kernel(
                 partial_count = sparse_tensors[0][
                     curBatch * sparse_strides[0][0]
                     + qHeadIdx * sparse_strides[0][1]
-                    + qSTileIdx * sparse_strides[0][2]
+                    + (qSTileIdx * qBaseTile_ // 128) * sparse_strides[0][2]
                 ]
                 partial_base = (
                     curBatch * sparse_strides[1][0]
                     + qHeadIdx * sparse_strides[1][1]
-                    + qSTileIdx * sparse_strides[1][2]
+                    + (qSTileIdx * qBaseTile_ // 128) * sparse_strides[1][2]
                 )
             if tla.const_expr(sequence_metadata is None and sparse_tensors[3] is not None):
                 full_count = sparse_tensors[2][
                     curBatch * sparse_strides[2][0]
                     + qHeadIdx * sparse_strides[2][1]
-                    + qSTileIdx * sparse_strides[2][2]
+                    + (qSTileIdx * qBaseTile_ // 128) * sparse_strides[2][2]
                 ]
                 full_base = (
                     curBatch * sparse_strides[3][0]
                     + qHeadIdx * sparse_strides[3][1]
-                    + qSTileIdx * sparse_strides[3][2]
+                    + (qSTileIdx * qBaseTile_ // 128) * sparse_strides[3][2]
                 )
             kvSLoopNum = partial_count + full_count
         if tla.const_expr(sequence_metadata is not None):
@@ -529,7 +553,7 @@ def flex_attention_kernel(
                     ),
                 )
                 gm_q_tile = tla.tile_view(
-                    gm_q, tla.make_shape(128, head_dim), tla.make_coord(qSTileIdx, 0)
+                    gm_q, tla.make_shape(qBaseTile_, head_dim), tla.make_coord(qSTileIdx, 0)
                 )
                 l1_q = tla.make_tensor_like(l1Q_ptrs[0], gm_q_tile, tla.arch.zN)
                 tla.wait_flag(q_l0a_ready_l1)
@@ -537,7 +561,7 @@ def flex_attention_kernel(
                     _load_grouped_query(
                         query,
                         l1Q_ptrs[0],
-                        qSTileIdx * 128,
+                        qSTileIdx * qBaseTile_,
                         rowNum,
                         qBOffset,
                         qHeadIdx,
@@ -683,104 +707,129 @@ def flex_attention_kernel(
                             l0c_ptr, ub_s_tile, layoutTag=tla.arch.L0Clayout
                         )
 
-                        l0ALoopCounter = prefixSumL0AStages
-                        l0BLoopCounter = prefixSumL0BStages
-                        l0ABufId = l0ALoopCounter % L0_STAGES
-                        l0BBufId = l0BLoopCounter % L0_STAGES
+                        for reduction_part in tla.range_constexpr(mm1L0ATotalStages_):
+                            q_fragment = l1_q
+                            k_fragment = l1_k_tile
+                            if tla.const_expr(head_dim > 128):
+                                q_fragment = tla.tile_view(
+                                    l1_q,
+                                    tla.make_shape(qBaseTile_, 128),
+                                    tla.make_coord(0, reduction_part),
+                                )
+                                k_fragment = tla.tile_view(
+                                    l1_k_tile,
+                                    tla.make_shape(128, kvBaseTile_),
+                                    tla.make_coord(reduction_part, 0),
+                                )
+                            l0ALoopCounter = prefixSumL0AStages + reduction_part
+                            l0BLoopCounter = prefixSumL0BStages + reduction_part
+                            l0ABufId = l0ALoopCounter % L0_STAGES
+                            l0BBufId = l0BLoopCounter % L0_STAGES
 
-                        # The A/B operands are Q/K in ND and K/Q in DN.
-                        l0a_ptr = l0a_ptrs[0] if l0ABufId == c0 else l0a_ptrs[1]
-                        if tla.const_expr(use_dn):
-                            q_transposed = tla.make_tensor(
-                                l1Q_ptrs[0],
-                                tla.make_layout(
-                                    tla.make_shape(embed_, rowNum),
-                                    tla.make_stride(1, embed_),
-                                    layoutTag=tla.arch.ColumnMajor,
-                                ),
-                            )
-                            q_transposed = tla.make_tensor_like(
-                                l1Q_ptrs[0], q_transposed, tla.arch.nZ
-                            )
-                            k_transposed = tla.make_tensor(
-                                l1K_ptr,
-                                tla.make_layout(
-                                    tla.make_shape(kvSTileSizeAct, embed_),
-                                    tla.make_stride(embed_, 1),
-                                ),
-                            )
-                            k_transposed = tla.make_tensor_like(l1K_ptr, k_transposed, tla.arch.zN)
-                            l0a_q_tensor = tla.make_tensor_like(l0a_ptr, k_transposed, tla.arch.zN)
-                        else:
-                            l0a_q_tensor = tla.make_tensor_like(l0a_ptr, l1_q, tla.arch.zN)
-
-                        if l0ABufId == 0:
-                            tla.wait_flag(mmad_ready_l0a_0)  # CUBE_MTE1
-                        else:
-                            tla.wait_flag(mmad_ready_l0a_1)
-                        if tla.const_expr(use_dn):
-                            if l1BBufId == c0:
-                                tla.wait_flag(k_l1_ready_l0_0)
+                            # The A/B operands are Q/K in ND and K/Q in DN.
+                            l0a_ptr = l0a_ptrs[0] if l0ABufId == c0 else l0a_ptrs[1]
+                            if tla.const_expr(use_dn):
+                                q_transposed = tla.make_tensor(
+                                    l1Q_ptrs[0],
+                                    tla.make_layout(
+                                        tla.make_shape(embed_, rowNum),
+                                        tla.make_stride(1, embed_),
+                                        layoutTag=tla.arch.ColumnMajor,
+                                    ),
+                                )
+                                q_transposed = tla.make_tensor_like(
+                                    l1Q_ptrs[0], q_transposed, tla.arch.nZ
+                                )
+                                k_transposed = tla.make_tensor(
+                                    l1K_ptr,
+                                    tla.make_layout(
+                                        tla.make_shape(kvSTileSizeAct, embed_),
+                                        tla.make_stride(embed_, 1),
+                                    ),
+                                )
+                                k_transposed = tla.make_tensor_like(
+                                    l1K_ptr, k_transposed, tla.arch.zN
+                                )
+                                l0a_q_tensor = tla.make_tensor_like(
+                                    l0a_ptr, k_transposed, tla.arch.zN
+                                )
                             else:
-                                tla.wait_flag(k_l1_ready_l0_1)
-                            tla.copy(l0a_q_tensor, k_transposed)
-                        else:
-                            tla.copy(l0a_q_tensor, l1_q)
-                        if l0ABufId == 0:
-                            tla.set_flag(l0a_ready_mmad_0)  # MTE1_CUBE
-                        else:
-                            tla.set_flag(l0a_ready_mmad_1)
+                                l0a_q_tensor = tla.make_tensor_like(
+                                    l0a_ptr, q_fragment, tla.arch.zN
+                                )
 
-                        l0b_ptr = l0b_ptrs[0] if l0BBufId == c0 else l0b_ptrs[1]
-                        if tla.const_expr(use_dn):
-                            l0b_k_tensor = tla.make_tensor_like(l0b_ptr, q_transposed, tla.arch.nZ)
-                        else:
-                            l0b_k_tensor = tla.make_tensor_like(l0b_ptr, l1_k_tile)
-                        if l0BBufId == 0:
-                            tla.wait_flag(mmad_ready_l0b_0)  # CUBE_MTE1
-                        else:
-                            tla.wait_flag(mmad_ready_l0b_1)
-                        if tla.const_expr(use_dn):
-                            tla.copy(l0b_k_tensor, q_transposed)
-                        else:
-                            if l1BBufId == c0:
-                                tla.wait_flag(k_l1_ready_l0_0)  # MTE2_MTE1
+                            if l0ABufId == 0:
+                                tla.wait_flag(mmad_ready_l0a_0)  # CUBE_MTE1
                             else:
-                                tla.wait_flag(k_l1_ready_l0_1)
-                            tla.copy(l0b_k_tensor, l1_k_tile)
+                                tla.wait_flag(mmad_ready_l0a_1)
+                            if tla.const_expr(use_dn):
+                                if l1BBufId == c0:
+                                    tla.wait_flag(k_l1_ready_l0_0)
+                                else:
+                                    tla.wait_flag(k_l1_ready_l0_1)
+                                tla.copy(l0a_q_tensor, k_transposed)
+                            else:
+                                tla.copy(l0a_q_tensor, q_fragment)
+                            if l0ABufId == 0:
+                                tla.set_flag(l0a_ready_mmad_0)  # MTE1_CUBE
+                            else:
+                                tla.set_flag(l0a_ready_mmad_1)
 
-                        if l0BBufId == 0:
-                            tla.set_flag(l0b_ready_mmad_0)  # MTE1_CUBE
-                        else:
-                            tla.set_flag(l0b_ready_mmad_1)
-                        if l1BBufId == 0:
-                            tla.set_flag(k_l0b_ready_l1_0)  # MTE1_MTE2
-                        else:
-                            tla.set_flag(k_l0b_ready_l1_1)
+                            l0b_ptr = l0b_ptrs[0] if l0BBufId == c0 else l0b_ptrs[1]
+                            if tla.const_expr(use_dn):
+                                l0b_k_tensor = tla.make_tensor_like(
+                                    l0b_ptr, q_transposed, tla.arch.nZ
+                                )
+                            else:
+                                l0b_k_tensor = tla.make_tensor_like(l0b_ptr, k_fragment)
+                            if l0BBufId == 0:
+                                tla.wait_flag(mmad_ready_l0b_0)  # CUBE_MTE1
+                            else:
+                                tla.wait_flag(mmad_ready_l0b_1)
+                            if tla.const_expr(use_dn):
+                                tla.copy(l0b_k_tensor, q_transposed)
+                            else:
+                                if tla.const_expr(reduction_part == 0):
+                                    if l1BBufId == c0:
+                                        tla.wait_flag(k_l1_ready_l0_0)  # MTE2_MTE1
+                                    else:
+                                        tla.wait_flag(k_l1_ready_l0_1)
+                                tla.copy(l0b_k_tensor, k_fragment)
 
-                        if l0ABufId == 0:
-                            tla.wait_flag(l0a_ready_mmad_0)  # MTE1_CUBE
-                        else:
-                            tla.wait_flag(l0a_ready_mmad_1)
-                        if l0BBufId == 0:
-                            tla.wait_flag(l0b_ready_mmad_0)  # MTE1_CUBE
-                        else:
-                            tla.wait_flag(l0b_ready_mmad_1)
-                        if l0CBufId == 0:
-                            tla.wait_flag(fix_ready_mmad_0)  # FIX_CUBE
-                        else:
-                            tla.wait_flag(fix_ready_mmad_1)
+                            if l0BBufId == 0:
+                                tla.set_flag(l0b_ready_mmad_0)  # MTE1_CUBE
+                            else:
+                                tla.set_flag(l0b_ready_mmad_1)
+                            if tla.const_expr(reduction_part == mm1L0ATotalStages_ - 1):
+                                if l1BBufId == 0:
+                                    tla.set_flag(k_l0b_ready_l1_0)  # MTE1_MTE2
+                                else:
+                                    tla.set_flag(k_l0b_ready_l1_1)
 
-                        tla.mmad(l0c_s, l0a_q_tensor, l0b_k_tensor, init_c=True)
+                            if l0ABufId == 0:
+                                tla.wait_flag(l0a_ready_mmad_0)  # MTE1_CUBE
+                            else:
+                                tla.wait_flag(l0a_ready_mmad_1)
+                            if l0BBufId == 0:
+                                tla.wait_flag(l0b_ready_mmad_0)  # MTE1_CUBE
+                            else:
+                                tla.wait_flag(l0b_ready_mmad_1)
+                            if tla.const_expr(reduction_part == 0):
+                                if l0CBufId == 0:
+                                    tla.wait_flag(fix_ready_mmad_0)  # FIX_CUBE
+                                else:
+                                    tla.wait_flag(fix_ready_mmad_1)
 
-                        if l0ABufId == 0:
-                            tla.set_flag(mmad_ready_l0a_0)  # CUBE_MTE1
-                        else:
-                            tla.set_flag(mmad_ready_l0a_1)
-                        if l0BBufId == 0:
-                            tla.set_flag(mmad_ready_l0b_0)  # CUBE_MTE1
-                        else:
-                            tla.set_flag(mmad_ready_l0b_1)
+                            tla.mmad(l0c_s, l0a_q_tensor, l0b_k_tensor, init_c=reduction_part == 0)
+
+                            if l0ABufId == 0:
+                                tla.set_flag(mmad_ready_l0a_0)  # CUBE_MTE1
+                            else:
+                                tla.set_flag(mmad_ready_l0a_1)
+                            if l0BBufId == 0:
+                                tla.set_flag(mmad_ready_l0b_0)  # CUBE_MTE1
+                            else:
+                                tla.set_flag(mmad_ready_l0b_1)
 
                         # ---- fixPipe：L0C(fp32) -> UB(fp32 S) ----
                         if ubSBufId == 0:
@@ -835,7 +884,7 @@ def flex_attention_kernel(
                         l1PTensorTla = tla.make_tensor_like(
                             l1p_ptr,
                             tla.tile_view(
-                                ubSTensorTla, tla.make_shape(128, 128), tla.make_coord(0, 0)
+                                ubSTensorTla, tla.make_shape(qBaseTile_, 128), tla.make_coord(0, 0)
                             ),
                             tla.arch.zN,
                         )
@@ -935,7 +984,7 @@ def flex_attention_kernel(
                                                 kvSTileSizeAct,
                                                 m,
                                                 DTYPE_P,
-                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
@@ -967,7 +1016,7 @@ def flex_attention_kernel(
                                     # the same UB tile. Custom masks override windows.
                                     coordinates = (
                                         m,
-                                        qSTileIdx * 128 + subIdxEff * mHalf,
+                                        qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                         gatheredKvSTileIdx * 128,
                                         curBatch,
                                         qHeadIdx,
@@ -1045,7 +1094,7 @@ def flex_attention_kernel(
                                         process_score_tile_simt(
                                             score_flat,
                                             m,
-                                            qSTileIdx * 128 + subIdxEff * mHalf,
+                                            qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                             gatheredKvSTileIdx * 128,
                                             curBatch,
                                             qHeadIdx,
@@ -1066,7 +1115,7 @@ def flex_attention_kernel(
                                             process_score_tile_simd(
                                                 ub_s,
                                                 m,
-                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
@@ -1087,7 +1136,7 @@ def flex_attention_kernel(
                                             process_score_tile_simd(
                                                 ub_s,
                                                 m,
-                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
@@ -1113,7 +1162,7 @@ def flex_attention_kernel(
                                             process_score_tile_simd(
                                                 ub_s,
                                                 m,
-                                                qSTileIdx * 128 + subIdxEff * mHalf,
+                                                qSTileIdx * qBaseTile_ + subIdxEff * mHalf,
                                                 gatheredKvSTileIdx * 128,
                                                 curBatch,
                                                 qHeadIdx,
@@ -1289,7 +1338,7 @@ def flex_attention_kernel(
                         ubOTmpTensorTla = tla.make_tensor(
                             ubOTmp_ptr,
                             tla.make_layout(
-                                tla.make_shape(paddedRows, head_dim),
+                                tla.make_shape(paddedRows, value_dim),
                                 tla.make_stride(output_stride, 1),
                             ),
                         )
@@ -1297,7 +1346,7 @@ def flex_attention_kernel(
                         ubOTmpTensorTla = tla.make_tensor(
                             ubOTmp_ptr,
                             tla.make_layout(
-                                tla.make_shape(rowNum, head_dim), tla.make_stride(output_stride, 1)
+                                tla.make_shape(rowNum, value_dim), tla.make_stride(output_stride, 1)
                             ),
                         )
                     l1PBufIdDe = validIdxDe % 3
@@ -1328,7 +1377,7 @@ def flex_attention_kernel(
                     # PV Mmad
                     with tla.cube():
                         kvShapeRowDe = kv_compute_end
-                        kvShapeColDe = tla.as_numeric(embed_)
+                        kvShapeColDe = tla.as_numeric(value_dim)
                         gm_v = tla.make_tensor(
                             value.ptr + gmOffsetV,
                             tla.make_layout(
@@ -1338,14 +1387,17 @@ def flex_attention_kernel(
                             ),
                         )
                         # QK and PV share L0 operands: count issued QK and earlier PV loads.
-                        prefixSumL0AStagesDe = min(step + 1, kvSLoopNum) + validIdxDe
+                        prefixSumL0AStagesDe = (
+                            min(step + 1, kvSLoopNum) * mm1L0ATotalStages_
+                            + validIdxDe * mm2L0ATotalStages_
+                        )
                         prefixSumL0BStagesDe = prefixSumL0AStagesDe
                         # Select V's L1 slot by active ordinal, not physical KV block index.
                         l1BvBufId = validIdxDe % V_L1_BUF
                         l1V_ptr = l1V_ptrs[0] if l1BvBufId == c0 else l1V_ptrs[1]
                         gm_v_tile = tla.tile_view(
                             gm_v,
-                            tla.make_shape(kvBaseTile_, embed_),
+                            tla.make_shape(kvBaseTile_, value_dim),
                             tla.make_coord(gatheredKvSTileIdxDe, c0),
                         )
                         l1_v_tile = tla.make_tensor_like(l1V_ptr, gm_v_tile, layoutTag=tla.arch.zN)
@@ -1372,79 +1424,103 @@ def flex_attention_kernel(
                         l0c_ptrDe = l0c_ptrs[2] if l0CBufIdDe == c0 else l0c_ptrs[3]
                         ub_o_tile = tla.tile_view(
                             ubOTmpTensorTla,
-                            tla.make_shape(qBaseTile_, embed_),
+                            tla.make_shape(qBaseTile_, value_dim),
                             tla.make_coord(c0, c0),
                         )
                         l0c_o = tla.make_tensor_like(
                             l0c_ptrDe, ub_o_tile, layoutTag=tla.arch.L0Clayout
                         )
 
-                        # Rotate operand slots using the combined QK/PV load count.
-                        l0ALoopCounterDe = prefixSumL0AStagesDe
-                        l0BLoopCounterDe = prefixSumL0BStagesDe
-                        l0ABufIdDe = l0ALoopCounterDe % L0_STAGES
-                        l0BBufIdDe = l0BLoopCounterDe % L0_STAGES
-                        # V: L1 -> L0B
-                        l0b_ptrDe = l0b_ptrs[0] if l0BBufIdDe == c0 else l0b_ptrs[1]
-                        l0_b2 = tla.make_tensor_like(l0b_ptrDe, l1_v_tile, tla.arch.nZ)
-                        if l0BBufIdDe == c0:
-                            tla.wait_flag(mmad_ready_l0b_0)  # M_MTE1
-                        else:
-                            tla.wait_flag(mmad_ready_l0b_1)
-                        tla.copy(l0_b2, l1_v_tile)  # copyL1ToL0B
-                        if l0BBufIdDe == c0:
-                            tla.set_flag(l0b_ready_mmad_0)  # MTE1_M
-                        else:
-                            tla.set_flag(l0b_ready_mmad_1)
-                        if l1BvBufId == c0:
-                            tla.set_flag(v_l0b_ready_l1_0)  # MTE1_MTE2
-                        else:
-                            tla.set_flag(v_l0b_ready_l1_1)
-                        l1_p_l0 = tla.tile_view(
-                            l1PTensorTlaDe,
-                            tla.make_shape(128, 128),
-                            tla.make_coord(c0, c0),
-                        )
-                        l0a_ptrDe = l0a_ptrs[0] if l0ABufIdDe == c0 else l0a_ptrs[1]
-                        l0_a2 = tla.make_tensor_like(l0a_ptrDe, l1PTensorTlaDe, tla.arch.zN)
-                        if l0ABufIdDe == c0:
-                            tla.wait_flag(mmad_ready_l0a_0)  # M_MTE1
-                        else:
-                            tla.wait_flag(mmad_ready_l0a_1)
-                        tla.copy(l0_a2, l1_p_l0)  # copyL1ToL0A
-                        if l0ABufIdDe == c0:
-                            tla.set_flag(l0a_ready_mmad_0)  # MTE1_M
-                        else:
-                            tla.set_flag(l0a_ready_mmad_1)
-                        if l1PBufIdDe == c0:
-                            tla.cross_core_set_flag(sm_ready_mm2_0, tla.arch.MTE1)
-                        elif l1PBufIdDe == c1:
-                            tla.cross_core_set_flag(sm_ready_mm2_1, tla.arch.MTE1)
-                        else:
-                            tla.cross_core_set_flag(sm_ready_mm2_2, tla.arch.MTE1)
+                        for output_part in tla.range_constexpr(mm2L0ATotalStages_):
+                            v_fragment = l1_v_tile
+                            c_fragment = l0c_o
+                            if tla.const_expr(value_dim > 128):
+                                v_fragment = tla.tile_view(
+                                    l1_v_tile,
+                                    tla.make_shape(kvBaseTile_, 128),
+                                    tla.make_coord(0, output_part),
+                                )
+                                c_fragment = tla.tile_view(
+                                    l0c_o,
+                                    tla.make_shape(qBaseTile_, 128),
+                                    tla.make_coord(0, output_part),
+                                )
+                                # MMAD writes from its C pointer. Column fragments
+                                # occupy consecutive aligned-M panels in L0C.
+                                c_fragment = tla.make_tensor_like(
+                                    l0c_ptrDe + output_part * ((rowNum + 15) // 16 * 16) * 128,
+                                    c_fragment,
+                                    tla.arch.L0Clayout,
+                                )
+                            # Rotate operand slots using the combined QK/PV load count.
+                            l0ALoopCounterDe = prefixSumL0AStagesDe + output_part
+                            l0BLoopCounterDe = prefixSumL0BStagesDe + output_part
+                            l0ABufIdDe = l0ALoopCounterDe % L0_STAGES
+                            l0BBufIdDe = l0BLoopCounterDe % L0_STAGES
+                            # V: L1 -> L0B
+                            l0b_ptrDe = l0b_ptrs[0] if l0BBufIdDe == c0 else l0b_ptrs[1]
+                            l0_b2 = tla.make_tensor_like(l0b_ptrDe, v_fragment, tla.arch.nZ)
+                            if l0BBufIdDe == c0:
+                                tla.wait_flag(mmad_ready_l0b_0)  # M_MTE1
+                            else:
+                                tla.wait_flag(mmad_ready_l0b_1)
+                            tla.copy(l0_b2, v_fragment)  # copyL1ToL0B
+                            if l0BBufIdDe == c0:
+                                tla.set_flag(l0b_ready_mmad_0)  # MTE1_M
+                            else:
+                                tla.set_flag(l0b_ready_mmad_1)
+                            if tla.const_expr(output_part == mm2L0ATotalStages_ - 1):
+                                if l1BvBufId == c0:
+                                    tla.set_flag(v_l0b_ready_l1_0)  # MTE1_MTE2
+                                else:
+                                    tla.set_flag(v_l0b_ready_l1_1)
+                            l1_p_l0 = tla.tile_view(
+                                l1PTensorTlaDe,
+                                tla.make_shape(qBaseTile_, 128),
+                                tla.make_coord(c0, c0),
+                            )
+                            l0a_ptrDe = l0a_ptrs[0] if l0ABufIdDe == c0 else l0a_ptrs[1]
+                            l0_a2 = tla.make_tensor_like(l0a_ptrDe, l1PTensorTlaDe, tla.arch.zN)
+                            if l0ABufIdDe == c0:
+                                tla.wait_flag(mmad_ready_l0a_0)  # M_MTE1
+                            else:
+                                tla.wait_flag(mmad_ready_l0a_1)
+                            tla.copy(l0_a2, l1_p_l0)  # copyL1ToL0A
+                            if l0ABufIdDe == c0:
+                                tla.set_flag(l0a_ready_mmad_0)  # MTE1_M
+                            else:
+                                tla.set_flag(l0a_ready_mmad_1)
+                            if tla.const_expr(output_part == mm2L0ATotalStages_ - 1):
+                                if l1PBufIdDe == c0:
+                                    tla.cross_core_set_flag(sm_ready_mm2_0, tla.arch.MTE1)
+                                elif l1PBufIdDe == c1:
+                                    tla.cross_core_set_flag(sm_ready_mm2_1, tla.arch.MTE1)
+                                else:
+                                    tla.cross_core_set_flag(sm_ready_mm2_2, tla.arch.MTE1)
 
-                        if l0ABufIdDe == c0:
-                            tla.wait_flag(l0a_ready_mmad_0)  # MTE1_M
-                        else:
-                            tla.wait_flag(l0a_ready_mmad_1)
-                        if l0BBufIdDe == c0:
-                            tla.wait_flag(l0b_ready_mmad_0)  # MTE1_M
-                        else:
-                            tla.wait_flag(l0b_ready_mmad_1)
-                        if l0CBufIdDe == c0:
-                            # FIX must finish reading this L0C slot before PV overwrites it.
-                            tla.wait_flag(fix_ready_mmad_2)
-                        else:
-                            tla.wait_flag(fix_ready_mmad_3)
-                        tla.mmad(l0c_o, l0_a2, l0_b2, init_c=True)
-                        if l0ABufIdDe == c0:
-                            tla.set_flag(mmad_ready_l0a_0)  # M_MTE1
-                        else:
-                            tla.set_flag(mmad_ready_l0a_1)
-                        if l0BBufIdDe == c0:
-                            tla.set_flag(mmad_ready_l0b_0)  # M_MTE1
-                        else:
-                            tla.set_flag(mmad_ready_l0b_1)
+                            if l0ABufIdDe == c0:
+                                tla.wait_flag(l0a_ready_mmad_0)  # MTE1_M
+                            else:
+                                tla.wait_flag(l0a_ready_mmad_1)
+                            if l0BBufIdDe == c0:
+                                tla.wait_flag(l0b_ready_mmad_0)  # MTE1_M
+                            else:
+                                tla.wait_flag(l0b_ready_mmad_1)
+                            if tla.const_expr(output_part == 0):
+                                if l0CBufIdDe == c0:
+                                    # FIX must finish reading this L0C slot before PV overwrites it.
+                                    tla.wait_flag(fix_ready_mmad_2)
+                                else:
+                                    tla.wait_flag(fix_ready_mmad_3)
+                            tla.mmad(c_fragment, l0_a2, l0_b2, init_c=True)
+                            if l0ABufIdDe == c0:
+                                tla.set_flag(mmad_ready_l0a_0)  # M_MTE1
+                            else:
+                                tla.set_flag(mmad_ready_l0a_1)
+                            if l0BBufIdDe == c0:
+                                tla.set_flag(mmad_ready_l0b_0)  # M_MTE1
+                            else:
+                                tla.set_flag(mmad_ready_l0b_1)
                         if ubOTmpBufId == c0:
                             tla.cross_core_wait_flag(mm2_ready_re_0, tla.arch.FIX)
                         else:
@@ -1524,7 +1600,7 @@ def flex_attention_kernel(
                                 re_m,
                                 validIdxDe,
                                 kvSLoopNum,
-                                head_dim,
+                                value_dim,
                             )
                         if ubOTmpBufId == 0:
                             tla.cross_core_set_flag(mm2_ready_re_0, tla.arch.VECTOR)
@@ -1572,7 +1648,7 @@ def flex_attention_kernel(
                                 empty_row,
                                 empty_full_mask,
                                 empty_one_mask,
-                                head_dim,
+                                value_dim,
                             )
                 tla.set_flag(mte3_ready_rescale)
 
@@ -1602,7 +1678,7 @@ def flex_attention_kernel(
                 with tla.vec.func(mode="simd"):
                     final_full_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float32)
                     final_packed_mask = tla.create_mask(pattern=tla.mask.ALL, dtype=tla.Float16)
-                    if tla.const_expr(head_dim <= 64):
+                    if tla.const_expr(value_dim <= 64):
                         final_packed_mask, _ = tla.update_mask(64, dtype=tla.Float16)
                     for final_row in tla.range(final_m):
                         output_pack_row(
@@ -1612,35 +1688,35 @@ def flex_attention_kernel(
                             DTYPE_Q,
                             final_full_mask,
                             final_packed_mask,
-                            head_dim,
+                            value_dim,
                         )
                 tla.set_flag(p_ub_ready_l1_0)
                 tla.wait_flag(p_ub_ready_l1_0)
                 final_gm_out = tla.make_tensor(
                     attention_out.ptr
-                    + qBOffset
-                    + qHeadIdx * head_dim
-                    + (qSTileIdx * 128 + final_subIdxEff * final_mHalf) * qSOffset,
+                    + oBOffset
+                    + qHeadIdx * value_dim
+                    + (qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf) * oSOffset,
                     tla.make_layout(
-                        tla.make_shape(final_m, head_dim), tla.make_stride(qSOffset, 1)
+                        tla.make_shape(final_m, value_dim), tla.make_stride(oSOffset, 1)
                     ),
                 )
                 final_packed_valid = tla.tile_view(
                     final_packed_output,
-                    tla.make_shape(final_m, head_dim),
+                    tla.make_shape(final_m, value_dim),
                     tla.make_coord(0, 0),
                 )
                 if tla.const_expr(packed_heads > 1 and kv_heads > 1):
                     _store_grouped_output(
                         ubO16_ptr,
                         attention_out,
-                        qSTileIdx * 128 + final_subIdxEff * final_mHalf,
+                        qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf,
                         final_m,
-                        qBOffset,
+                        oBOffset,
                         qHeadIdx,
                         packed_heads,
                         kv_heads,
-                        head_dim,
+                        value_dim,
                     )
                 else:
                     tla.copy(final_gm_out, final_packed_valid)
@@ -1672,7 +1748,7 @@ def flex_attention_kernel(
                                 tla.make_layout(tla.make_shape(64, 1), tla.make_stride(8, 1)),
                             ),
                             final_gm_lse,
-                            qSTileIdx * 128 + final_subIdxEff * final_mHalf,
+                            qSTileIdx * qBaseTile_ + final_subIdxEff * final_mHalf,
                             final_m,
                             lse_head_stride,
                             packed_heads,
@@ -1685,7 +1761,7 @@ def flex_attention_kernel(
                             lse.ptr
                             + lse_head_group * lse_head_stride
                             + lse_sequence_offset
-                            + qSTileIdx * 128
+                            + qSTileIdx * qBaseTile_
                             + final_subIdxEff * final_mHalf,
                             final_lse_layout,
                         )
