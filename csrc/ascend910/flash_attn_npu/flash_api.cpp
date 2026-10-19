@@ -494,6 +494,8 @@ std::vector<at::Tensor> mha_fwd_kvcache(
             }
         }
 
+        const bool fusedTask = !paged_KV && !appendKV;
+        tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
@@ -505,6 +507,10 @@ std::vector<at::Tensor> mha_fwd_kvcache(
             uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (fusedTask) {
+                curTaskNum = fa_fused::MakeTaskShape(
+                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, true).totalTasks;
+            }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
             }
@@ -859,6 +865,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
         tiling_cpu_ptr->set_dropMaskDevice(
             has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
+        const bool fusedTask = true;
+        tiling_cpu_ptr->set_fusedTask(1U);
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         uint32_t firstBatchTaskNum = 0;
@@ -871,6 +879,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
             uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (fusedTask) {
+                curTaskNum = fa_fused::MakeTaskShape(
+                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, true).totalTasks;
+            }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
                 firstBatchTaskNum = curTaskNum;
@@ -1165,6 +1177,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         int32_t* cu_seqlens_q_cpu = static_cast<int32_t*>(cu_seqlens_q_cpu_tensor.data_ptr());
         int32_t* cu_seqlens_k_cpu = static_cast<int32_t*>(cu_seqlens_k_cpu_tensor.data_ptr());
 
+        const bool fusedTask = !paged_KV;
+        tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
@@ -1176,6 +1190,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
             uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (fusedTask) {
+                curTaskNum = fa_fused::MakeTaskShape(
+                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+            }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
             }
