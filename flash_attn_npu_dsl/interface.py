@@ -35,6 +35,7 @@ def _select_kernel_options(
     variable_lengths=False,
     average_q_len=None,
     q_tile=128,
+    pack_gqa=None,
 ):
     """Choose head packing and score layout from the logical input shape."""
     group = q_heads // kv_heads
@@ -42,7 +43,7 @@ def _select_kernel_options(
         stride is None or stride[1] == 0 for stride in sparse.strides
     )
     packed_heads = 1
-    if q_len < q_tile and group > 1 and shared_heads:
+    if pack_gqa is not False and q_len < q_tile and group > 1 and shared_heads:
         original_tasks = batch * q_heads * ((q_len + q_tile - 1) // q_tile)
         packed_tasks = batch * kv_heads * ((q_len * group + q_tile - 1) // q_tile)
         # Folding heads must reduce tasks without losing occupied cores.
@@ -293,12 +294,41 @@ def flash_attn_func(
         ("gather_kv_indices", gather_kv_indices is None),
         ("learnable_sink", learnable_sink is None),
         ("num_splits", type(num_splits) is int and num_splits in (0, 1)),
-        ("pack_gqa", pack_gqa is None),
+        ("pack_gqa", pack_gqa is None or pack_gqa is False),
         ("score_mod_bwd", score_mod_bwd is None),
         ("block_sparse_tensors_bwd", block_sparse_tensors_bwd is None),
     ):
         if not supported:
             raise NotImplementedError(f"{name} is not supported by this forward implementation")
+    import torch
+
+    if torch.compiler.is_compiling():
+        from .torch_compile import call
+
+        return call(
+            "fixed",
+            q,
+            k,
+            v,
+            (
+                softmax_scale,
+                causal,
+                tuple(window_size),
+                softcap,
+                num_splits,
+                pack_gqa,
+                deterministic,
+                score_mod,
+                mask_mod,
+                return_lse,
+                None,
+                None,
+            ),
+            (None,) * 5,
+            aux_tensors,
+            aux_scalars,
+            block_sparse_tensors,
+        )
     _validate_inputs(q, k, v)
     return _flash_attention(
         q,
@@ -314,6 +344,7 @@ def flash_attn_func(
         aux_scalars,
         block_sparse_tensors,
         return_lse,
+        pack_gqa=pack_gqa,
     )
 
 
@@ -336,6 +367,7 @@ def _flash_attention(
     max_seqlen_k=None,
     page_table=None,
     num_splits=1,
+    pack_gqa=None,
 ):
     """Prepare one shared forward kernel; only sequence addressing differs."""
     import torch
@@ -427,6 +459,7 @@ def _flash_attention(
             variable_lengths=sequence_metadata is not None,
             average_q_len=(q.shape[0] / batch) if packed and sequence_metadata[2] is None else None,
             q_tile=q_tile,
+            pack_gqa=pack_gqa,
         )
         if packed_heads > 1:
             # Only MQA has a contiguous folded view. GQA groups are gathered and
@@ -663,7 +696,7 @@ def flash_attn_varlen_func(
         ("min_seqlen_k", min_seqlen_k is None),
         ("gather_kv_indices", gather_kv_indices is None),
         ("learnable_sink", learnable_sink is None),
-        ("pack_gqa", pack_gqa is None),
+        ("pack_gqa", pack_gqa is None or pack_gqa is False),
         ("score_mod_bwd", score_mod_bwd is None),
         ("scheduler_metadata", scheduler_metadata is None),
         ("seqlen_k_per_split", seqlen_k_per_split is None),
@@ -671,6 +704,33 @@ def flash_attn_varlen_func(
     ):
         if not supported:
             raise NotImplementedError(f"{name} is not supported by this forward implementation")
+    if torch.compiler.is_compiling():
+        from .torch_compile import call
+
+        return call(
+            "varlen",
+            q,
+            k,
+            v,
+            (
+                softmax_scale,
+                causal,
+                tuple(window_size),
+                softcap,
+                num_splits,
+                pack_gqa,
+                deterministic,
+                score_mod,
+                mask_mod,
+                return_lse,
+                max_seqlen_q,
+                max_seqlen_k,
+            ),
+            (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table),
+            aux_tensors,
+            aux_scalars,
+            block_sparse_tensors,
+        )
     paged = page_table is not None
     packed = not paged or q.ndim == 3
     _validate_inputs(q, k, v, packed=packed, paged=paged)
@@ -744,4 +804,5 @@ def flash_attn_varlen_func(
         *bounds,
         page_table,
         num_splits,
+        pack_gqa,
     )

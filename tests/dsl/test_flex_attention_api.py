@@ -389,6 +389,19 @@ def test_packed_public_call_preserves_layout_and_reuses_lengths(host, options):
     assert host.compiled[0][23] == 33
 
 
+def test_pack_gqa_false_disables_packing_without_creating_another_interface(host):
+    q = torch.empty(32, 3, 33, 64, dtype=torch.float16)
+    k = torch.empty(32, 129, 1, 64, dtype=torch.float16)
+    for choice, expected in ((None, 33), (False, 1), (None, 33)):
+        out, lse = interface.flash_attn_func(q, k, k, pack_gqa=choice)
+        assert out.shape == q.shape and lse is None
+        argument = host.launched[-1][0][0]
+        assert argument.tensor.shape[1:3] == (3 * expected, 33 // expected)
+    assert [args[23] for args in host.compiled] == [33, 1]
+    with pytest.raises(NotImplementedError, match="pack_gqa"):
+        interface.flash_attn_func(q, k, k, pack_gqa=True)
+
+
 @pytest.mark.parametrize(
     "mask,score,q_len,packed_heads",
     [

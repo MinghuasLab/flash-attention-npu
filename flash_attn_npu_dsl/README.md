@@ -192,6 +192,7 @@ O-only 仍需内部 max/sum，但不分配最终 LSE；确定性仅要求相同�
 - `score_mod` / `mask_mod`：自定义分数与掩码回调。自定义 `mask_mod` 覆盖上述内置掩码。
 - `aux_tensors` / `aux_scalars`：传给回调的辅助张量与运行时标量。
 - `block_sparse_tensors`：显式块元数据，见下文。
+- `pack_gqa`：None 自动选择 Q-head 合并，False 明确关闭；True 尚不支持。
 - `deterministic`：接受 True/False，不改变推理前向的计算或编译对象；该选项对应
   反向算法选择，本包仍不支持 backward。同一运行环境、编译产物、输入及块表顺序下，
   确定性回调的重复调用应得到逐位一致的结果；不同块表顺序或计算路径之间不要求逐位一致。
@@ -387,6 +388,26 @@ counts 为 `[H,total_m_blocks]`，indices 为 `[H,total_indices]`，每个张量
 固定表 attention 不扫描、回读或转换块表。改变有效长度、mask 数据或辅助数据后，
 必须先重建或更新表，再调用 attention；同形状表的原地修改和地址替换不要求重新编译。
 
+## torch.compile
+
+使用 PyTorch 2.7 与匹配的 TorchNPU，可将两个 attention 入口作为外部算子接入
+Inductor 图。DSL 仍负责内核编译；这不意味着 Inductor 会重写 DSL 内部计算。
+
+```python
+compiled_attention = torch.compile(
+    lambda q, k, v: flash_attn_func(q, k, v, causal=True, return_lse=True),
+    backend="inductor",
+    fullgraph=True,
+)
+out, lse = compiled_attention(q, k, v)
+```
+
+固定的 callback 可放在函数闭包中，逻辑在复用期间保持不变。辅助 Tensor、序列长度、
+页表及预先准备的块表应作为编译函数的实参传入；每次调用绑定当前值，不捕获旧地址。
+图内 `aux_scalars` 使用 Python bool/int/float，沿用 Dynamo 的标量守卫；eager 调用仍可
+使用 TLA Numeric。需要容量回读的 `compute_block_sparsity` 在图外执行。
+本接入不包含 backward、自动求导、NPUGraph 或跨进程导出已捕获图。
+
 ## 代码模块与执行流程
 
 | 文件 | 职责 |
@@ -402,6 +423,8 @@ counts 为 `[H,total_m_blocks]`，indices 为 `[H,total_indices]`，每个张量
 | [block_sparsity.py](block_sparsity.py) | 定义公开块元数据，只校验元数据规格并记录四个张量各自的广播步长和容量。 |
 | [compute_block_sparsity.py](compute_block_sparsity.py) | 根据 mask 在设备上分类空块、partial 块和 full 块，返回公开块元数据。 |
 | [seqlen_info.py](seqlen_info.py) | 构造 attention 与 classifier 共用的序列信息：有效长度、累计存储偏移和块偏移；检查元数据结构。 |
+| [split_kv.py](split_kv.py) | 按 max/sum 稳定归并分段 FP32 输出；只在显式或自动拆分时启动。 |
+| [torch_compile.py](torch_compile.py) | 私有 custom-op 与 fake 输出规格；静态 callback 和当前 Tensor 输入分开传递。 |
 
 1. 可选建块：`compute_block_sparsity` 调用 mask，产生 partial/full 元数据。
 2. 调用前向：`interface.py` 校验输入规格，直接绑定公开块张量，按编译缓存编译或复用后启动内核。
@@ -413,7 +436,7 @@ Cube 负责 QK/PV 矩阵乘；AIV 上的回调按声明使用 SIMT 或 SIMD，so
 `call_score_mod` 和 `call_mask_mod` 分别绑定并调用用户函数。
 同模式回调保留融合遍历；混合模式仍按 score→mask 执行，但需要额外的 UB 遍历与同步，
 并非零开销切换。各路径保留逐线程/逐向量的边界处理。
-这些 helper 内联到前向内核中；只有显式建块会另行启动 classifier 内核。
+计算 helper 内联到前向内核中；显式建块另行启动 classifier，Split-KV 另行启动归并内核。
 
 进程内缓存只保存编译结果，不保存启动参数、块内容或输出。无回调、`aux_tensors=None`、
 无辅助标量且未提供块表时，
@@ -426,7 +449,7 @@ Q 长度为 1 时，右对齐中心位于最后一个 KV 位置，内置右侧�
 ND 路径的内置窗口在整块可见且没有 score 修改时，直接由 softmax 完成缩放与 KV 尾部保护，
 不再额外改写 score；边界块仍执行逐元素窗口判断。
 
-对 Q 长度小于 128 的调用，内核可将共用同一 KV head 的 Q heads 合并，
+对 Q 长度小于所选 Q tile（常规128行、宽 D 64行）的调用，内核可将共用同一 KV head 的 Q heads 合并，
 以减少重复读取 KV。MQA 直接使用连续数据；一般 GQA 在设备上分段读取 Q、写回 O，
 不在 host 上转置或复制。传入块表时，要求所有已提供元数据张量的 head 维均为 1；
 合并后的计算块直接读取原来的单行 Q 块表，不复制元数据，仍允许按 batch 使用不同的列表。

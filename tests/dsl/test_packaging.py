@@ -30,6 +30,7 @@ _MODULES = {
     "seqlen_info.py",
     "softmax.py",
     "split_kv.py",
+    "torch_compile.py",
 }
 _FORBIDDEN_ROOTS = {
     "examples",
