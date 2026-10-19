@@ -13,6 +13,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "fa_split.h"
+#include "fused_task.h"
 #include "tilingdata.h"
 #include <cstdint>
 
@@ -132,6 +133,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
 
     const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
+    const bool fusedTask = metaArgs->pagedKV == 0U;
+    tilingData->fusedTask = fusedTask ? 1U : 0U;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
@@ -144,7 +147,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockTile = Q_TILE_CEIL;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
-        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const uint32_t curTaskNum = fusedTask
+            ? fa_fused::MakeTaskShape(qSeqlen, metaArgs->numHeads, metaArgs->numHeadsK, metaArgs->batch,
+                                      metaArgs->blockDim, metaArgs->isVarlen == 0U).totalTasks
+            : curQNBlockNum * curQSBlockNum;
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;
         }

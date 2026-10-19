@@ -56,7 +56,7 @@ struct FAInferTilingData {
     int64_t alibiSlopesBatchStride;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    uint32_t fusedTask; // Non-paged grouped-head scheduling; occupies the former padding3 slot.
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -98,7 +98,7 @@ struct FAInferTilingData {
     int64_t get_alibiSlopesBatchStride() const { return alibiSlopesBatchStride; }
     uint64_t get_padding1() const { return padding1; }
     uint64_t get_padding2() const { return padding2; }
-    uint32_t get_padding3() const { return padding3; }
+    uint32_t get_fusedTask() const { return fusedTask; }
     uint64_t get_splitLseTotalSize() const { return splitLseTotalSize; }
     uint64_t get_splitOTotalSize() const { return splitOTotalSize; }
     uint32_t get_totalSplitNodeNum() const { return totalSplitNodeNum; }
@@ -136,7 +136,7 @@ struct FAInferTilingData {
     void set_alibiSlopesBatchStride(int64_t value) { alibiSlopesBatchStride = value; }
     void set_padding1(uint64_t value) { padding1 = value; }
     void set_padding2(uint64_t value) { padding2 = value; }
-    void set_padding3(uint32_t value) { padding3 = value; }
+    void set_fusedTask(uint32_t value) { fusedTask = value; }
     void set_splitLseTotalSize(uint64_t value) { splitLseTotalSize = value; }
     void set_splitOTotalSize(uint64_t value) { splitOTotalSize = value; }
     void set_totalSplitNodeNum(uint32_t value) { totalSplitNodeNum = value; }

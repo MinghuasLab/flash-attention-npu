@@ -984,7 +984,7 @@ class _FAInferTilingData(ctypes.Structure):
         ("dropoutValue", ctypes.c_float),
         ("alibiSlopesBatchStride", ctypes.c_int64),
         ("padding1", ctypes.c_uint64), ("padding2", ctypes.c_uint64),
-        ("padding3", ctypes.c_uint32),
+        ("fusedTask", ctypes.c_uint32),
         ("windowSizeLeft", ctypes.c_int64), ("windowSizeRight", ctypes.c_int64),
         ("splitLseTotalSize", ctypes.c_uint64), ("splitOTotalSize", ctypes.c_uint64),
         ("totalSplitNodeNum", ctypes.c_uint32), ("needCoreNum", ctypes.c_uint32),
