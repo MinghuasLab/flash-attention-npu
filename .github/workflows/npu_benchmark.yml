@@ -1,0 +1,632 @@
+name: NPU Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target NPU architecture"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "910"
+          - "950"
+
+      fa_version:
+        description: "FlashAttention version"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "fa2"
+          - "fa3"
+          - "fa4"
+
+      layout:
+        description: "Input layout"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "bsnd"
+          - "tnd"
+
+      mode:
+        description: "Benchmark mode"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "fwd"
+          - "fwd_bwd"
+
+      causal:
+        description: "Causal attention"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "true"
+          - "false"
+
+      ref:
+        description: "Git branch or tag used when commit_id is empty"
+        required: false
+        type: string
+        default: "main"
+
+      commit_id:
+        description: "Exact commit SHA to benchmark; overrides ref"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+
+jobs:
+  benchmark:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request'
+
+    name: Benchmark (${{ matrix.arch_label }})
+
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+
+      matrix:
+        include:
+          # Ascend 950
+          - arch_label: x86_64-950
+            runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:950-cann9.1-torch2.9
+            require_healthy: "true"
+            max_tasks: "6"
+
+          # Ascend 910B
+          - arch_label: aarch64-910B
+            runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:910b-cann9.1-torch2.9
+            require_healthy: "false"
+            max_tasks: "4"
+
+
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+
+    timeout-minutes: 600
+
+
+    env:
+      # ----------------------------------------------------------------------
+      # Runner / Docker
+      # ----------------------------------------------------------------------
+      CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
+      CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
+
+      # ----------------------------------------------------------------------
+      # Benchmark task
+      # ----------------------------------------------------------------------
+      CI_TASK: benchmark
+
+      CI_BENCHMARK_FA_VERSION: ${{ inputs.fa_version || 'all' }}
+      CI_BENCHMARK_LAYOUT: ${{ inputs.layout || 'all' }}
+      CI_BENCHMARK_MODE: ${{ inputs.mode || 'all' }}
+      CI_BENCHMARK_CAUSAL: ${{ inputs.causal || 'both' }}
+
+      # ----------------------------------------------------------------------
+      # Source revision
+      #
+      # commit_id 非空：
+      #   commit_id > ref
+      #
+      # commit_id 为空：
+      #   使用 ref
+      # ----------------------------------------------------------------------
+      CI_REF: >-
+        ${{ github.event_name == 'pull_request'
+            && format('refs/pull/{0}/head', github.event.pull_request.number)
+            || inputs.ref || 'main' }}
+      CI_COMMIT_ID: >-
+        ${{ github.event_name == 'pull_request'
+            && github.event.pull_request.head.sha
+            || inputs.commit_id }}
+
+      # ----------------------------------------------------------------------
+      # 当前 job 的唯一作用域
+      # 用于：
+      #   - Docker container label
+      #   - cleanup
+      #   - benchmark output directory
+      # ----------------------------------------------------------------------
+      CI_CONTAINER_SCOPE: >-
+        ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+
+      CI_TEST_LOG_DIR_HOST: >-
+        /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+
+      GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
+
+
+    steps:
+      # ======================================================================
+      # 1. 根据 UI 输入判断当前 matrix job 是否需要执行
+      # ======================================================================
+      - name: Check arch match
+        id: arch
+        run: |
+          set -euo pipefail
+
+          arch="${{ inputs.arch || 'both' }}"
+          label="${{ matrix.arch_label }}"
+
+          if [ "$arch" = "both" ] ||
+             { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
+             { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
+
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "[CI] arch matches ($arch / $label), proceeding"
+
+          else
+
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "[CI] arch mismatch ($arch / $label), skipping"
+
+          fi
+
+
+      # ======================================================================
+      # 2. Clone benchmark source
+      #
+      # 保留原 NPU CI 的：
+      #   - proxy
+      #   - docker clone
+      #   - retry
+      #
+      # 增加：
+      #   commit_id 非空 -> fetch exact commit
+      #   commit_id 为空 -> fetch CI_REF
+      # ======================================================================
+      - name: Clone repo
+        if: steps.arch.outputs.match == 'true'
+
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+
+          # ------------------------------------------------------------------
+          # Repository
+          # ------------------------------------------------------------------
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+
+
+          # ------------------------------------------------------------------
+          # 清除 runner 本身可能存在的 proxy 环境变量。
+          # Git proxy 统一由下面逻辑显式配置。
+          # ------------------------------------------------------------------
+          unset \
+            HTTP_PROXY \
+            HTTPS_PROXY \
+            http_proxy \
+            https_proxy \
+            ALL_PROXY \
+            all_proxy \
+            NO_PROXY \
+            no_proxy \
+            || true
+
+
+          # ------------------------------------------------------------------
+          # 默认 proxy 配置
+          # ------------------------------------------------------------------
+          git_proxy=""
+
+          git_proxy_hosts="github.com,gist.github.com,api.github.com,raw.githubusercontent.com,codeload.github.com,objects.githubusercontent.com"
+
+
+          # ------------------------------------------------------------------
+          # 根据 runner IP 使用已有 proxy
+          # ------------------------------------------------------------------
+          case " $(hostname -I 2>/dev/null || true) " in
+
+            *" 192.168.13.241 "*)
+              git_proxy=http://127.0.0.1:18790
+              ;;
+
+            *" 192.168.9.226 "*)
+              git_proxy=http://127.0.0.1:17890
+              ;;
+
+          esac
+
+
+          # ------------------------------------------------------------------
+          # 从 proxy.conf 读取配置
+          # ------------------------------------------------------------------
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR}/proxy.conf}"
+
+          if [ -f "$proxy_file" ]; then
+
+            while IFS='=' read -r proxy_key proxy_value ||
+                  [ -n "$proxy_key" ]; do
+
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] &&
+                continue
+
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+
+              case "$proxy_key" in
+
+                GIT_PROXY|HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy)
+                  git_proxy="$proxy_value"
+                  ;;
+
+                GIT_PROXY_WHITELIST|PROXY_WHITELIST)
+                  git_proxy_hosts="$proxy_value"
+                  ;;
+
+              esac
+
+            done < "$proxy_file"
+
+          fi
+
+
+          # ------------------------------------------------------------------
+          # workflow / runner 显式环境变量优先级最高
+          # ------------------------------------------------------------------
+          [ "${CI_GIT_PROXY+x}" = x ] &&
+            git_proxy="$CI_GIT_PROXY"
+
+          [ "${CI_GIT_PROXY_WHITELIST+x}" = x ] &&
+            git_proxy_hosts="$CI_GIT_PROXY_WHITELIST"
+
+
+          # ------------------------------------------------------------------
+          # 生成供 clone container 使用的 git proxy config
+          # ------------------------------------------------------------------
+          git_proxy_conf="$(mktemp /tmp/ci-git-proxy.XXXXXX.conf)"
+
+          : > "$git_proxy_conf"
+
+
+          if [ -n "$git_proxy" ]; then
+
+            git_proxy_hosts="${git_proxy_hosts//,/ }"
+
+            for git_proxy_host in $git_proxy_hosts; do
+
+              git_proxy_host="${git_proxy_host#"${git_proxy_host%%[![:space:]]*}"}"
+
+              git_proxy_host="${git_proxy_host%"${git_proxy_host##*[![:space:]]}"}"
+
+              [ -n "$git_proxy_host" ] || continue
+
+
+              if [[ "$git_proxy_host" == *"://"* ]]; then
+
+                printf \
+                  '[http "%s"]\n\tproxy = %s\n' \
+                  "$git_proxy_host" \
+                  "$git_proxy" \
+                  >> "$git_proxy_conf"
+
+              else
+
+                printf \
+                  '[http "https://%s"]\n\tproxy = %s\n' \
+                  "$git_proxy_host" \
+                  "$git_proxy" \
+                  >> "$git_proxy_conf"
+
+                printf \
+                  '[http "https://%s/"]\n\tproxy = %s\n' \
+                  "$git_proxy_host" \
+                  "$git_proxy" \
+                  >> "$git_proxy_conf"
+
+                printf \
+                  '[http "http://%s"]\n\tproxy = %s\n' \
+                  "$git_proxy_host" \
+                  "$git_proxy" \
+                  >> "$git_proxy_conf"
+
+                printf \
+                  '[http "http://%s/"]\n\tproxy = %s\n' \
+                  "$git_proxy_host" \
+                  "$git_proxy" \
+                  >> "$git_proxy_conf"
+
+              fi
+
+            done
+
+          fi
+
+
+          chmod 644 "$git_proxy_conf" 2>/dev/null || true
+
+
+          proxy_args=()
+
+          if [ -s "$git_proxy_conf" ]; then
+
+            proxy_args+=(
+              -v "$git_proxy_conf:/tmp/ci-git-proxy.conf:ro"
+              -e GIT_CONFIG_COUNT=1
+              -e GIT_CONFIG_KEY_0=include.path
+              -e GIT_CONFIG_VALUE_0=/tmp/ci-git-proxy.conf
+            )
+
+          fi
+
+
+          # ------------------------------------------------------------------
+          # Clone
+          #
+          # 直接把 ref / commit 作为环境变量传进 container，
+          # 避免 shell 字符串拼接
+          # ------------------------------------------------------------------
+          docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
+            --network host \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            -e CI_REF="$CI_REF" \
+            -e CI_COMMIT_ID="${CI_COMMIT_ID:-}" \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -euo pipefail
+
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+
+
+              REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+
+
+              # --------------------------------------------------------------
+              # 决定本次 benchmark 的 source
+              #
+              # commit_id 非空：
+              #   benchmark exact commit
+              #
+              # 否则：
+              #   benchmark ref
+              # --------------------------------------------------------------
+              if [ -n "${CI_COMMIT_ID:-}" ]; then
+
+                FETCH_TARGET="$CI_COMMIT_ID"
+                FETCH_DEPTH=1
+
+                echo "[clone][docker] exact commit requested:"
+                echo "[clone][docker]   $CI_COMMIT_ID"
+
+              else
+
+                FETCH_TARGET="$CI_REF"
+                FETCH_DEPTH=50
+
+                echo "[clone][docker] ref requested:"
+                echo "[clone][docker]   $CI_REF"
+
+              fi
+
+
+              # --------------------------------------------------------------
+              # Retry clone/fetch 3 次
+              # --------------------------------------------------------------
+              for i in 1 2 3; do
+
+                echo "[clone][docker] attempt $i/3"
+
+
+                # 清理上一次尝试留下的内容
+                rm -rf \
+                  /workspace/.git \
+                  /workspace/csrc/catlass \
+                  2>/dev/null \
+                  || true
+
+
+                git init -q
+
+                git remote remove origin 2>/dev/null || true
+
+                git remote add origin "$REPO_URL"
+
+
+                if git fetch \
+                     --depth="$FETCH_DEPTH" \
+                     origin \
+                     "$FETCH_TARGET"; then
+
+
+                  rm -rf \
+                    /workspace/csrc/catlass \
+                    2>/dev/null \
+                    || true
+
+
+                  git clean -fdx -e .git
+
+
+                  # FETCH_HEAD 就是最终需要 benchmark 的 source
+                  git checkout -q --detach FETCH_HEAD
+
+
+                  echo "[clone][docker] success"
+
+                  echo "[clone][docker] benchmark source:"
+                  git log -1 --oneline
+
+                  echo "[clone][docker] exact commit:"
+                  git rev-parse HEAD
+
+
+                  chmod -R a+rw /workspace 2>/dev/null || true
+
+
+                  exit 0
+
+                fi
+
+
+                echo \
+                  "[clone][docker] attempt $i/3 failed, retry in 15s..."
+
+                sleep 15
+
+              done
+
+
+              echo "[clone][docker] all 3 attempts failed"
+
+              exit 1
+            '
+
+
+          # ------------------------------------------------------------------
+          # Clone 后基本检查
+          # ------------------------------------------------------------------
+          echo "[CI] repository cloned successfully"
+
+          ls -la ci/run_ci_container.sh
+
+          git log --oneline -3
+
+
+      # ======================================================================
+      # 3. 记录实际 benchmark 的 commit
+      #
+      # Clone step 已经完成 checkout
+      # 这里不再修改代码，只记录实际 SHA
+      # ======================================================================
+      - name: Record benchmark source
+        if: steps.arch.outputs.match == 'true'
+
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+
+          ACTUAL_COMMIT_SHA="$(git rev-parse HEAD)"
+
+
+          echo "[CI] requested ref:"
+          echo "[CI]   ${CI_REF}"
+
+          echo "[CI] requested commit:"
+          echo "[CI]   ${CI_COMMIT_ID:-<none>}"
+
+          echo "[CI] actual benchmark source:"
+          git log -1 --oneline
+
+          echo "[CI] exact benchmark commit:"
+          echo "[CI]   ${ACTUAL_COMMIT_SHA}"
+
+
+          # 后续 Build + Benchmark step 可以直接读取。
+          echo \
+            "CI_BENCHMARK_COMMIT_SHA=${ACTUAL_COMMIT_SHA}" \
+            >> "$GITHUB_ENV"
+
+
+      # ======================================================================
+      # 4. Build + Benchmark
+      #
+      # run_ci_container.sh：
+      #   Phase 1 -> build
+      #   Phase 2 -> dynamic NPU selection
+      #
+      # CI_TASK=benchmark：
+      #   run_ci_benchmark.sh
+      # ======================================================================
+      - name: Build + Benchmark
+        if: steps.arch.outputs.match == 'true'
+
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "[CI] benchmark configuration:"
+          echo "[CI]   arch=${{ matrix.arch_label }}"
+          echo "[CI]   fa_version=${CI_BENCHMARK_FA_VERSION}"
+          echo "[CI]   layout=${CI_BENCHMARK_LAYOUT}"
+          echo "[CI]   commit=${CI_BENCHMARK_COMMIT_SHA:-unknown}"
+
+          bash ci/run_ci_container.sh
+
+
+      # ======================================================================
+      # 5. Upload benchmark results
+      #
+      # 预计包含：
+      #   benchmark_results.csv
+      #   benchmark_results.json
+      #   profiler output
+      #   benchmark logs
+      # ======================================================================
+      - name: Upload benchmark results
+        if: always() && steps.arch.outputs.match == 'true'
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: benchmark-${{ matrix.arch_label }}
+
+          path: >-
+            ${{ format('/tmp/ci_test_logs/{0}-{1}-{2}-{3}/',
+            github.run_id, github.run_attempt, github.job, matrix.arch_label) }}
+
+          retention-days: 7
+
+          if-no-files-found: warn
+
+
+      # ======================================================================
+      # 6. Cleanup
+      # ======================================================================
+      - name: Clean up this job's CI containers
+        if: always() && steps.arch.outputs.match == 'true'
+
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+
+            bash ci/cleanup_ci_containers.sh
+
+          else
+
+            echo \
+              "[CI] cleanup script not found; skipping cleanup"
+
+          fi
