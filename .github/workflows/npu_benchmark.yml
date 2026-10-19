@@ -1,6 +1,10 @@
 name: NPU Benchmark
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
   workflow_dispatch:
     inputs:
       arch:
@@ -52,7 +56,9 @@ permissions:
 
 jobs:
   benchmark:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request'
 
     name: Benchmark (${{ matrix.arch_label }})
 
@@ -95,8 +101,8 @@ jobs:
       # ----------------------------------------------------------------------
       CI_TASK: benchmark
 
-      CI_BENCHMARK_FA_VERSION: ${{ inputs.fa_version }}
-      CI_BENCHMARK_LAYOUT: ${{ inputs.layout }}
+      CI_BENCHMARK_FA_VERSION: ${{ inputs.fa_version || 'all' }}
+      CI_BENCHMARK_LAYOUT: ${{ inputs.layout || 'all' }}
 
       # ----------------------------------------------------------------------
       # Source revision
@@ -107,8 +113,14 @@ jobs:
       # commit_id 为空：
       #   使用 ref
       # ----------------------------------------------------------------------
-      CI_REF: ${{ inputs.ref }}
-      CI_COMMIT_ID: ${{ inputs.commit_id }}
+      CI_REF: >-
+        ${{ github.event_name == 'pull_request'
+            && format('refs/pull/{0}/head', github.event.pull_request.number)
+            || inputs.ref || 'main' }}
+      CI_COMMIT_ID: >-
+        ${{ github.event_name == 'pull_request'
+            && github.event.pull_request.head.sha
+            || inputs.commit_id }}
 
       # ----------------------------------------------------------------------
       # 当前 job 的唯一作用域
@@ -135,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          arch="${{ inputs.arch }}"
+          arch="${{ inputs.arch || 'both' }}"
           label="${{ matrix.arch_label }}"
 
           if [ "$arch" = "both" ] ||
@@ -282,13 +294,9 @@ jobs:
 
             for git_proxy_host in $git_proxy_hosts; do
 
-              git_proxy_host="${
-                git_proxy_host#"${git_proxy_host%%[![:space:]]*}"
-              }"
+              git_proxy_host="${git_proxy_host#"${git_proxy_host%%[![:space:]]*}"}"
 
-              git_proxy_host="${
-                git_proxy_host%"${git_proxy_host##*[![:space:]]}"
-              }"
+              git_proxy_host="${git_proxy_host%"${git_proxy_host##*[![:space:]]}"}"
 
               [ -n "$git_proxy_host" ] || continue
 
