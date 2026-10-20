@@ -84,8 +84,9 @@ FLASH_ATTN_BUILD_NPU=950 python setup.py install
 支持 BSND、packed TND、只读分页 KV、FP16/BF16 和 GQA，不替换 V2/V3/V4 的入口。
 支持的 head dimension 及其他限制见下述指南。
 
-该可选包要求 Python `>=3.10,<3.14`、CANN `>=9.1.0`，并需单独安装 CATLASS DSL
-运行时、准备配套的 bitcode 模板（BC）。详见[安装与使用指南](flash_attn_npu_dsl/README.md)。
+该可选包要求 Python `>=3.10,<3.14`，并需单独安装 CATLASS DSL 运行时、
+准备配套的 bitcode 模板（BC）。CANN、PyTorch 与 torch_npu 的配套要求及已验证环境，
+详见[安装与使用指南](flash_attn_npu_dsl/README.md)。
 依赖准备完成后，在源码仓根目录运行：
 
 ```bash

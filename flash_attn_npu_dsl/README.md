@@ -20,8 +20,10 @@ Q/K 使用相同的 Dqk；V 可以独立选择1～256维的 Dv，O 的最后一�
 
 ## 安装、运行与最小调用
 
-本模块需要 Ascend 950、Linux、Python `>=3.10,<3.14` 和 CANN `>=9.1.0`。
-PyTorch 与 torch_npu 版本须匹配，并与所安装的 CATLASS DSL 二进制运行时兼容。
+本模块需要 Ascend 950、Linux 和 Python `>=3.10,<3.14`。
+CANN、PyTorch 与 torch_npu 须满足所选 CATLASS DSL 版本的配套要求。
+当前已验证组合为 Python 3.11.15、PyTorch 2.10.0、torch_npu 2.10.0.post7、
+CANN 9.2.0，以及 CATLASS `master` 的 `1466a1ab` 配套 wheel/BC。
 先按[本仓安装指南](../README.zh.md)准备 CANN 环境变量、PyTorch 和 torch_npu；
 在本仓源码根目录安装时使用：
 
@@ -32,9 +34,11 @@ FLASH_ATTENTION_FORCE_BUILD=TRUE python -m pip install . --no-build-isolation
 源码安装显式强制本地构建，以确保分发包包含当前源码中的 Python 模块。
 此命令沿用本仓现有 C++ 构建流程，不是独立的纯 Python 安装模式。
 
-CATLASS DSL 是额外依赖：使用 CATLASS `master` 分支中 `79f0ac18` 及之后的版本，按
-`python/tla_dsl/docs/zh/dsl_development/index.md` 构建 Release 模式的
-`ascend-catlass-dsl` wheel，再按其 `python/tla_dsl/docs/zh/quick_start.md` 安装。
+CATLASS DSL 是额外依赖，官方通过 [PyPI](https://pypi.org/project/ascend-catlass-dsl/)
+提供发布版 wheel；本包当前验收使用上述 master 提交的源码构建包，未将其他发布版视为已验证组合。
+复现该环境时，按 CATLASS 的 `python/tla_dsl/docs/zh/dsl_development/index.md`，
+使用该提交配套的 AscendNPU-IR 构建 Release 模式的 `ascend-catlass-dsl` wheel，
+再按其 `python/tla_dsl/docs/zh/quick_start.md` 安装。
 运行时需支持递归结构化参数、callable/JIT helper 和 SIMD。
 其 Python 导入名是 `catlass`；本仓的 `csrc/catlass` C++ 头文件子模块不能替代该运行时，
 安装本仓也不会自动构建或安装 DSL。将 `CATLASS_DSL_WHEEL` 设置为匹配当前环境的 wheel
@@ -325,6 +329,7 @@ out, lse = flash_attn_func(
 
 分类在 NPU 上只按 mask 的 SIMT/SIMD 模式精确执行，与 score 模式无关，仅支持 `(128, 128)` 块：
 空块跳过，partial 块执行 mask，full 块跳过自定义 mask，但仍执行 score 修改和尾块边界检查。
+这是整块跳过的粒度，不要求序列长度或 mask 边界对齐128；块内仍按逐元素规则处理。
 分类与前向必须使用相同的 mask 及其输入；mask、序列长度或所依赖的辅助数据变化后需重新分类。
 
 ### 按 mask 的实际依赖选择建块维度

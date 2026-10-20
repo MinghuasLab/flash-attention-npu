@@ -85,9 +85,10 @@ SIMT or explicit SIMD; optional block classification enables sparse execution.
 It supports BSND, packed TND, read-only paged KV, FP16/BF16, and GQA without replacing the V2/V3/V4 entry points.
 Supported head dimensions and other constraints are listed in the package guide below.
 
-This optional package requires Python `>=3.10,<3.14`, CANN `>=9.1.0`, and a separately
+This optional package requires Python `>=3.10,<3.14` and a separately
 installed CATLASS DSL runtime with matching bitcode templates (BC).
-See the [installation and usage guide (Chinese)](flash_attn_npu_dsl/README.md).
+See the [installation and usage guide (Chinese)](flash_attn_npu_dsl/README.md)
+for the validated environment and compatible CANN, PyTorch, and torch_npu versions.
 Once the dependencies are ready, run from the source checkout:
 
 ```bash
