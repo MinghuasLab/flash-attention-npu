@@ -5,3 +5,4 @@ recursive-include csrc/ascend910 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/ascend950 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/catlass/include *.h *.hpp *.cpp
 recursive-include csrc/catlass/tools/library *.h *.hpp *.cpp
+recursive-include flash_attn_npu_dsl *.py *.md
