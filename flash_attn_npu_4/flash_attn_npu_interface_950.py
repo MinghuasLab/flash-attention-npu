@@ -5,6 +5,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from .catlass_dsl import utils as _catlass_utils
+
 # isort: off
 import flash_attn_npu_4_950
 # isort: on
@@ -698,9 +700,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # Precompute the scheduler metadata, including FlashDecode schedules
         # when eligible, on the AICPU so the forward launch needs no
         # device->host->device round trip.
-        batch_size = (
-            cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
-        )
         kv_seqlens = seqused_k
         if kv_seqlens is None and cu_seqlens_k is not None:
             kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
@@ -766,8 +765,17 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             scheduler_metadata,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k,
-                              _full_contiguous(seqused_q), _full_contiguous(seqused_k))
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            _full_contiguous(seqused_q),
+            _full_contiguous(seqused_k),
+        )
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.softmax_scale = softmax_scale
@@ -794,7 +802,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = (
+            ctx.saved_tensors
+        )
         dlse = args[0] if ctx.return_lse and len(args) > 0 else None
         if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
             dlse = None
@@ -895,6 +905,43 @@ def flash_attn_func(
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
 ):
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        return _catlass_utils.attention(
+            q,
+            k,
+            v,
+            varlen=False,
+            qv=qv,
+            gather_kv_indices=gather_kv_indices,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors,
+            block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+            return_lse=return_lse,
+            scheduler_metadata=scheduler_metadata,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1018,6 +1065,49 @@ def flash_attn_varlen_func(
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
 ):
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        return _catlass_utils.attention(
+            q,
+            k,
+            v,
+            varlen=True,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_k=min_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            gather_kv_indices=gather_kv_indices,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            return_lse=return_lse,
+            scheduler_metadata=scheduler_metadata,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     return FlashAttnVarlenFunc.apply(
         q,
         k,

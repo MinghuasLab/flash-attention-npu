@@ -1,5 +1,11 @@
 global-exclude .*
 prune .github
+prune .cache
+prune tests
+prune build
+global-exclude __pycache__ *.py[cod]
+include flash_attn_npu_4/catlass_dsl/README.md
+recursive-include examples *.py
 
 recursive-include csrc/ascend910 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/ascend950 *.h *.hpp *.cpp *.aicpu
