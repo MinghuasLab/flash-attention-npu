@@ -446,13 +446,10 @@ def test_fa_kvcache_ops(
     add_unused_qkv,
 ):
 
-    # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     is_950 = "Ascend950" in name
     if head_size == 512 and is_950:
         pytest.skip("head_dim=512 is supported only on Ascend910")
-    if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
-        pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if not (1 <= head_size <= 256) and head_size != 512:
         pytest.skip("head_size must be in [1, 256] or exactly 512")
 

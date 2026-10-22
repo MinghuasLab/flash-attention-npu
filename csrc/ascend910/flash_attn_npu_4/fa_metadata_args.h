@@ -72,7 +72,6 @@ struct FAMetadataArgs {
     uint32_t blockDim;
     uint32_t isVarlen;
     uint32_t isVarlenKv;
-    uint32_t pagedKV;
     uint32_t numSplits;
 };
 

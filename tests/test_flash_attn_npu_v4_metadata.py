@@ -531,6 +531,132 @@ def test_flash_attn_varlen_metadata_flashdecode_matches_host_tiling():
     assert_fa_close(lse_metadata, lse_host, lse_host, name="metadata FlashDecode lse")
 
 
+@pytest.mark.skipif("Ascend910" not in _device_name, reason="Ascend910-only FD tiling ABI")
+@pytest.mark.parametrize(
+    ("num_splits", "expected_fd"),
+    [(0, True), (1, False), (2, True)],
+)
+def test_flashdecode_respects_num_splits(num_splits, expected_fd):
+    """num_splits=1 disables FD; 0 is auto and values >1 request splitting."""
+    batch_size, q_seqlen, kv_seqlen = 1, 8, 2048
+    num_heads, kv_heads, head_size = 32, 2, 128
+    used_k = _int32_npu([kv_seqlen])
+
+    scheduler_metadata = get_scheduler_metadata(
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        nheads=num_heads,
+        nheads_kv=kv_heads,
+        headdim=head_size,
+        headdim_v=head_size,
+        num_splits=num_splits,
+        seqused_k=used_k,
+    )
+    torch.npu.synchronize()
+
+    # FAInferStaticTilingData uint32 fields: totalSplitNodeNum,
+    # needCoreNum, flashDecodeFlag and numSplits at word offsets 30..33.
+    tiling_words = scheduler_metadata.cpu().view(torch.int32)
+    assert bool(tiling_words[32].item()) is expected_fd
+    assert tiling_words[33].item() == max(num_splits, 1)
+    if expected_fd:
+        assert tiling_words[30].item() > 0
+        assert tiling_words[31].item() > batch_size * kv_heads
+    else:
+        assert tiling_words[30].item() == 0
+        assert tiling_words[31].item() == 0
+
+
+@pytest.mark.skipif("Ascend910" not in _device_name, reason="Ascend910-only FD tiling ABI")
+@pytest.mark.parametrize("metadata_path", [True, False])
+def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
+    """One logical FD shape must work for dense/paged KV and BSND/TND Q."""
+    batch_size, q_seqlen, kv_seqlen = 1, 8, 2048
+    num_heads, kv_heads, head_size, page_size = 32, 2, 128, 128
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), torch.float16, device="npu"
+    )
+    key = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), torch.float16, device="npu"
+    )
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), torch.float16, device="npu"
+    )
+    cu_q = _int32_npu([0, q_seqlen])
+    cu_k = _int32_npu([0, kv_seqlen])
+    used_k = _int32_npu([kv_seqlen])
+    page_table = torch.arange(
+        kv_seqlen // page_size, dtype=torch.int32, device="npu"
+    ).view(batch_size, -1)
+    paged_key = key.view(-1, page_size, kv_heads, head_size)
+    paged_value = value.view(-1, page_size, kv_heads, head_size)
+
+    scheduler_metadata = get_scheduler_metadata(
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        nheads=num_heads,
+        nheads_kv=kv_heads,
+        headdim=head_size,
+        headdim_v=head_size,
+        num_splits=0,
+        seqused_k=used_k,
+    )
+    torch.npu.synchronize()
+    # FAInferStaticTilingData: needCoreNum and flashDecodeFlag are uint32
+    # fields at byte offsets 124 and 128 respectively.
+    tiling_words = scheduler_metadata.cpu().view(torch.int32)
+    assert tiling_words[32].item() == 1
+    assert tiling_words[31].item() > batch_size * kv_heads
+
+    scheduling = (
+        {"scheduler_metadata": scheduler_metadata, "num_splits": 0}
+        if metadata_path
+        else {"disable_scheduler_metadata": True, "num_splits": 2}
+    )
+    common = dict(
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        causal=True,
+        return_lse=True,
+        **scheduling,
+    )
+    cases = {
+        "dense_bsnd": (query, key, value, {}),
+        "dense_tnd": (
+            query.view(-1, num_heads, head_size),
+            key.view(-1, kv_heads, head_size),
+            value.view(-1, kv_heads, head_size),
+            {"cu_seqlens_q": cu_q, "cu_seqlens_k": cu_k},
+        ),
+        "paged_bsnd": (
+            query,
+            paged_key,
+            paged_value,
+            {"seqused_k": used_k, "page_table": page_table},
+        ),
+        "paged_tnd": (
+            query.view(-1, num_heads, head_size),
+            paged_key,
+            paged_value,
+            {"cu_seqlens_q": cu_q, "seqused_k": used_k, "page_table": page_table},
+        ),
+    }
+    results = {
+        name: flash_attn_varlen_func(q, k, v, **case_kwargs, **common)[:2]
+        for name, (q, k, v, case_kwargs) in cases.items()
+    }
+    reference_out, reference_lse = results["dense_bsnd"]
+    for name, (output, lse) in results.items():
+        torch.testing.assert_close(
+            output.view_as(reference_out), reference_out, rtol=2e-3, atol=2e-3,
+            msg=lambda message, case_name=name: f"{case_name} output: {message}",
+        )
+        torch.testing.assert_close(
+            lse.view_as(reference_lse), reference_lse, rtol=2e-3, atol=2e-3,
+            msg=lambda message, case_name=name: f"{case_name} LSE: {message}",
+        )
+
+
 @pytest.fixture
 def metadata_spy(monkeypatch):
     """Spy on get_scheduler_metadata to prove the training interfaces route

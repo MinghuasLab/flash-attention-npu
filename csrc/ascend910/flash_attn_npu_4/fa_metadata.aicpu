@@ -105,9 +105,11 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
-            (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
-            (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+        // FD scheduling only depends on the logical attention shape. Paged vs.
+        // dense KV and TND vs. BSND affect address calculation in the forward
+        // kernel, not whether the KV sequence can be split across cores.
+        const bool fdFlag = (metaArgs->numSplits != 1u) && (maxQ * groupSize <= 128u) &&
+            (maxQ <= 16u) && (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
         if (fdFlag) {
             fa_split::SplitContext ctx;
