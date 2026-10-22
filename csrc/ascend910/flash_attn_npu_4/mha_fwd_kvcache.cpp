@@ -297,6 +297,8 @@ class FAInferKernel {
         uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * qL1DynNum * sizeof(ElementQ);
         blockMmadQK.SetPingPongState(&pingPongState);
         blockMmadPV.SetPingPongState(&pingPongState);
+        blockMmadQK.SetPageStride(fARuntimeData->keyPageStride);
+        blockMmadPV.SetPageStride(fARuntimeData->valuePageStride);
         blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN, 0, qL1DynNum);
         blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE, vL1Stages, vSegLen, vSliceWidth);
 #endif
@@ -338,18 +340,20 @@ class FAInferKernel {
         //     (maxQSeqlen * D for Q, kvSeqlenAllocated * D for K/V).
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
             strideQ = static_cast<uint64_t>(embed);
-            strideK = static_cast<uint64_t>(embed);
-            strideV = static_cast<uint64_t>(embedV);
             qHeadStride = static_cast<uint64_t>(maxQSeqlen) * embed;
-            kvHeadStrideK = static_cast<uint64_t>(kvSeqlenAllocated) * embed;
-            kvHeadStrideV = static_cast<uint64_t>(kvSeqlenAllocated) * embedV;
+            strideK = PAGED_CACHE_FLAG ? fARuntimeData->keyTokenStride : static_cast<uint64_t>(embed);
+            strideV = PAGED_CACHE_FLAG ? fARuntimeData->valueTokenStride : static_cast<uint64_t>(embedV);
+            kvHeadStrideK = PAGED_CACHE_FLAG ? fARuntimeData->keyHeadStride
+                                             : static_cast<uint64_t>(kvSeqlenAllocated) * embed;
+            kvHeadStrideV = PAGED_CACHE_FLAG ? fARuntimeData->valueHeadStride
+                                             : static_cast<uint64_t>(kvSeqlenAllocated) * embedV;
         } else {
             strideQ = static_cast<uint64_t>(qHeads * embed);
-            strideK = static_cast<uint64_t>(kvHeads * embed);
-            strideV = static_cast<uint64_t>(kvHeads * embedV);
             qHeadStride = static_cast<uint64_t>(embed);
-            kvHeadStrideK = static_cast<uint64_t>(embed);
-            kvHeadStrideV = static_cast<uint64_t>(embedV);
+            strideK = PAGED_CACHE_FLAG ? fARuntimeData->keyTokenStride : static_cast<uint64_t>(kvHeads * embed);
+            strideV = PAGED_CACHE_FLAG ? fARuntimeData->valueTokenStride : static_cast<uint64_t>(kvHeads * embedV);
+            kvHeadStrideK = PAGED_CACHE_FLAG ? fARuntimeData->keyHeadStride : static_cast<uint64_t>(embed);
+            kvHeadStrideV = PAGED_CACHE_FLAG ? fARuntimeData->valueHeadStride : static_cast<uint64_t>(embedV);
         }
         // Q/K/V are read with the input layout's strides (BNSD stays zero-copy), but
         // O is always addressed with BSND semantics so the returned tensor is a

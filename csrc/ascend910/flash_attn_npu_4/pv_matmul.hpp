@@ -83,6 +83,11 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         pingPongState = state;
     }
 
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
+    }
+
     __aicore__ inline void init(Arch::Resource<ArchTag>& resource, uint32_t nDyn, uint32_t kDyn,
                                 uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0, uint32_t vL1Stages = 0,
                                 uint32_t vSegLen = 0, uint32_t vSliceWidth = 0)
@@ -119,17 +124,18 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         actualShape[COORD_DIM2] = nowLen;
     }
 
-    __aicore__ inline void getKVOffset(uint32_t& kOffset, uint32_t nIdx, uint32_t& strideKV)
+    __aicore__ inline void getKVOffset(uint64_t& kOffset, uint32_t nIdx, uint32_t& strideKV)
     {
-        kOffset = nIdx * maxKVStackLen * strideKV;
+        kOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV;
     }
 
-    __aicore__ inline void getKVOffset(AscendC::GlobalTensor<int32_t>& gBlockTable, uint32_t& kOffset,
+    __aicore__ inline void getKVOffset(AscendC::GlobalTensor<int32_t>& gBlockTable, uint64_t& kOffset,
                                        uint32_t blockStartOffset, uint32_t nowNIdx, uint32_t& strideKV,
                                        uint32_t& blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = blockTableId * blockSize * strideKV + blockStartOffset * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                  static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -178,7 +184,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         }
 
         GemmCoord actualShape{rowNum, embed, 0};
-        uint32_t gBOffset = 0;
+        uint64_t gBOffset = 0;
 
         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(stackSeqTile, embed);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
@@ -303,8 +309,8 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             while (dstRow < kChunkLen) {
                 const uint32_t segLen = AscendC::Std::min(kChunkLen - dstRow, blockSize - pageOff);
                 const uint32_t blockTableId = gBlockTable.GetValue(pageIdx);
-                const uint32_t gOffset =
-                    blockTableId * blockSize * strideKV + pageOff * strideKV + nSliceIdx * l1VSliceWidth;
+                    const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                                             static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(segLen, nSliceLen));
                 MatrixCoord l1BTileCoord{dstRow, 0};
                 auto l1BTile = l1VTensor[stage][layoutBInL1.GetOffset(l1BTileCoord)];
@@ -450,6 +456,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
     uint32_t blockStartOffset = 0;
     uint32_t maxKVStackLen = 0;
+    uint64_t pageStride = 0;
 };
 
 } // namespace Catlass::Gemm::Block

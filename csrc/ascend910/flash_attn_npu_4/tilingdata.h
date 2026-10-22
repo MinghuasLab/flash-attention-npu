@@ -256,6 +256,15 @@ struct FAInferRuntimeData {
     float softcapValue;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
+    // Element strides for paged KV. The API receives logical
+    // [page, token, head, dim] tensors; a transposed view can retain physical
+    // BNBD storage, whose token/head strides identify the inner layout.
+    uint64_t keyPageStride;
+    uint64_t valuePageStride;
+    uint64_t keyTokenStride;
+    uint64_t valueTokenStride;
+    uint64_t keyHeadStride;
+    uint64_t valueHeadStride;
 
     uint32_t get_numBlocks() const
     {
@@ -289,6 +298,30 @@ struct FAInferRuntimeData {
     {
         return windowSizeRight;
     }
+    uint64_t get_keyPageStride() const
+    {
+        return keyPageStride;
+    }
+    uint64_t get_valuePageStride() const
+    {
+        return valuePageStride;
+    }
+    uint64_t get_keyTokenStride() const
+    {
+        return keyTokenStride;
+    }
+    uint64_t get_valueTokenStride() const
+    {
+        return valueTokenStride;
+    }
+    uint64_t get_keyHeadStride() const
+    {
+        return keyHeadStride;
+    }
+    uint64_t get_valueHeadStride() const
+    {
+        return valueHeadStride;
+    }
 
     void set_numBlocks(uint32_t value)
     {
@@ -321,6 +354,30 @@ struct FAInferRuntimeData {
     void set_windowSizeRight(int64_t value)
     {
         windowSizeRight = value;
+    }
+    void set_keyPageStride(uint64_t value)
+    {
+        keyPageStride = value;
+    }
+    void set_valuePageStride(uint64_t value)
+    {
+        valuePageStride = value;
+    }
+    void set_keyTokenStride(uint64_t value)
+    {
+        keyTokenStride = value;
+    }
+    void set_valueTokenStride(uint64_t value)
+    {
+        valueTokenStride = value;
+    }
+    void set_keyHeadStride(uint64_t value)
+    {
+        keyHeadStride = value;
+    }
+    void set_valueHeadStride(uint64_t value)
+    {
+        valueHeadStride = value;
     }
 };
 

@@ -124,6 +124,18 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
 
 
+def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
+    if q.dim() != 3:
+        raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
+    if cu_seqlens_q.numel() <= 1:
+        raise RuntimeError("batch size must be positive")
+    # max_seqlen_q == 0 is the paged TND fast path, where every sequence has
+    # qlen 0. A nonzero declared max length with an empty packed query is
+    # inconsistent.
+    if q.shape[0] == 0 and max_seqlen_q != 0:
+        raise RuntimeError("total_q must be positive (q must contain at least one query token)")
+
+
 def _window_to_npu(window_size: Optional[int]) -> int:
     """FA4 uses None; FAG kernel uses -1 for 'disabled'."""
     return -1 if window_size is None else int(window_size)
@@ -161,6 +173,8 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     layout: int = _LAYOUT_BSND,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if cu_seqlens_q is not None:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
     q, k = [maybe_contiguous(x) for x in (q, k)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
@@ -409,6 +423,8 @@ def _flash_attn_forward_fake(
         )
 
     is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
     if not is_varlen_q and layout == _LAYOUT_BNSD:
         out = torch.empty(
             (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
@@ -866,6 +882,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqlen_k_per_split=None,
         disable_scheduler_metadata=False,
     ):
+        if cu_seqlens_q is not None:
+            _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
         assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
         assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
         if softmax_scale is None:
@@ -881,6 +899,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             scheduler_metadata is None
             and not disable_scheduler_metadata
             and cu_seqlens_q is not None
+            and q.shape[0] != 0
         ):
             num_heads = q.shape[1]
             head_size = q.shape[2]
@@ -1193,6 +1212,13 @@ def flash_attn_varlen_func(
 
     For paged KV cache, pass page_table and shape k/v as
     (num_pages, page_size, nheads_k, headdim).
+    For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass
+    ``k.transpose(1, 2)`` and ``v.transpose(1, 2)``. The transpose is a metadata-only
+    view; FA4 reads the original BNBD storage directly. The physical-page axis may
+    be non-contiguous and may use different strides for K and V, while the selected
+    layout's inner dimensions must be dense. TND batches may contain zero-length Q
+    or KV sequences; an all-zero-Q batch returns empty output/LSE tensors without
+    launching the attention kernel.
 
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
     than Q. The number of heads in Q must be divisible by the number of heads in KV.

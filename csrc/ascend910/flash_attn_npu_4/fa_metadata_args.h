@@ -15,7 +15,7 @@ static_assert(std::is_standard_layout<FAInferStaticTilingData>::value, "static t
 static_assert(sizeof(FAInferStaticTilingData) == 2336, "static metadata ABI changed; update Python fake size");
 static_assert(std::is_trivially_copyable<FAInferRuntimeData>::value, "runtime tiling must be trivially copyable");
 static_assert(std::is_standard_layout<FAInferRuntimeData>::value, "runtime tiling must have a stable layout");
-static_assert(sizeof(FAInferRuntimeData) == 40, "runtime tiling ABI changed");
+static_assert(sizeof(FAInferRuntimeData) == 88, "runtime tiling ABI changed");
 
 namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;

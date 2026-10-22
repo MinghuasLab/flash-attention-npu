@@ -691,8 +691,8 @@ def flash_attn_varlen_func(
     For paged KV cache, pass page_table and shape k/v as
     (num_pages, page_size, nheads_k, headdim).
     For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass `k.transpose(1, 2)`
-    and `v.transpose(1, 2)`. The transpose is a metadata-only view; FA3 recognizes its
-    token/head strides and reads the original BNBD storage directly.
+    and `v.transpose(1, 2)`. The transpose is a metadata-only view; FA3 and FA4 recognize its
+    token/head strides and read the original BNBD storage directly.
     Appending new K/V into a physical BNBD cache is not supported yet.
     The physical-page axis may be non-contiguous: `stride(0)` is honored independently
     for K and V, while the selected layout's inner dimensions must be dense. TND batches

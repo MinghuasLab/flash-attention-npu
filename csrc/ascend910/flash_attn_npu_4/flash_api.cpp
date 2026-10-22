@@ -177,6 +177,12 @@ std::vector<at::Tensor> mha_fwd(
         CHECK_CONTIGUOUS(cu_seqlens_q);
         TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
         TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
+        TORCH_CHECK(q.dim() == 3, "q must be 3-dimensional; got ", q.dim(), " dimensions");
+        TORCH_CHECK(cu_seqlens_q.numel() > 1, "batch size must be positive");
+        // total_q == 0 with max_seqlen_q == 0 is the paged TND fast path below.
+        // A nonzero declared max length with an empty packed query is inconsistent.
+        TORCH_CHECK(!(q.size(0) == 0 && max_seqlen_q_.value() > 0),
+                    "total_q must be positive (q must contain at least one query token)");
     }
 
     if (is_varlen_kv) {
@@ -254,6 +260,29 @@ std::vector<at::Tensor> mha_fwd(
     }
     const float softmax_scale = softmax_scale_.has_value() ? static_cast<float>(softmax_scale_.value())
                                                            : 1.0f / std::sqrt(static_cast<float>(head_size_og));
+    if (paged_KV) {
+        TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
+                    "paged KV cache must have shape (num_pages, page_size, num_heads, head_dim)");
+        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                    "paged key/value caches must have matching page, page-size, and head dimensions");
+        const int64_t keyPageElements = k.size(1) * k.size(2) * k.size(3);
+        const int64_t valuePageElements = v.size(1) * v.size(2) * v.size(3);
+        const bool keyBBND =
+            k.stride(1) == k.size(2) * k.size(3) && k.stride(2) == k.size(3) && k.stride(3) == 1;
+        const bool valueBBND =
+            v.stride(1) == v.size(2) * v.size(3) && v.stride(2) == v.size(3) && v.stride(3) == 1;
+        const bool keyBNBD =
+            k.stride(1) == k.size(3) && k.stride(2) == k.size(1) * k.size(3) && k.stride(3) == 1;
+        const bool valueBNBD =
+            v.stride(1) == v.size(3) && v.stride(2) == v.size(1) * v.size(3) && v.stride(3) == 1;
+        TORCH_CHECK((keyBBND && valueBBND) || (keyBNBD && valueBNBD),
+                    "paged key/value caches must use the same BBND or BNBD inner layout; only dimension 0 may "
+                    "otherwise be non-contiguous");
+        TORCH_CHECK(k.size(0) <= 1 || k.stride(0) >= keyPageElements,
+                    "paged key cache first-axis stride must not overlap physical pages");
+        TORCH_CHECK(v.size(0) <= 1 || v.stride(0) >= valuePageElements,
+                    "paged value cache first-axis stride must not overlap physical pages");
+    }
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
@@ -311,6 +340,13 @@ std::vector<at::Tensor> mha_fwd(
         at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    }
+
+    // TND permits every sequence in the batch to have qlen=0. There is no
+    // device work in that case; avoid allocating scheduler/workspace state or
+    // launching a zero-task FA kernel.
+    if (is_varlen_q && sizes[0] == 0) {
+        return {out, softmaxlse};
     }
 
     // Derive the max KV length used to collapse the window. The explicit
@@ -382,6 +418,12 @@ std::vector<at::Tensor> mha_fwd(
         runtimeData.set_scaleValue(softmax_scale);
     }
     runtimeData.set_softcapValue(softcap);
+    runtimeData.set_keyPageStride(paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U);
+    runtimeData.set_valuePageStride(paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U);
+    runtimeData.set_keyTokenStride(paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U);
+    runtimeData.set_valueTokenStride(paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U);
+    runtimeData.set_keyHeadStride(paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U);
+    runtimeData.set_valueHeadStride(paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U);
     if (use_explicit_metadata) {
         // Allocate a per-call device runtime buffer; it is written asynchronously
         // by the AICPU WriteFARuntime kernel below (a synchronous H2D copy is
@@ -738,7 +780,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q ? 1U : 0U;
     args.isVarlenKv = 0U; // cache_seqlens is always per-batch (python-normalized)
-    args.pagedKV = (num_splits > 1) ? 1U : 0U;
+    args.pagedKV = (num_splits != 1) ? 1U : 0U;
     args.numSplits = static_cast<uint32_t>(num_splits);
     return GetSchedulerMetadataImpl(args, cache_seqlens,
                                     seqlens_q.defined() ? std::optional<at::Tensor>(seqlens_q) : std::nullopt);
