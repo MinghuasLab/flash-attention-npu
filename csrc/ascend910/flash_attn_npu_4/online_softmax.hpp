@@ -863,17 +863,6 @@ public:
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffset;
 
-        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-        if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
-            if (isFirstStackTile && isFirstRowLoop) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
-            }
-        } else {
-            if (isFirstStackTile && isFirstRowLoop && isSplitKV) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
-            }
-        }
         if constexpr (!doTriUMask) {
             if (isLastNoMaskStackTile && isLastRowLoop) {
                 if (!startsWithMaskThenNomaskFlag) {

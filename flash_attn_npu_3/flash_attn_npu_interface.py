@@ -133,12 +133,15 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
 
 
-def _validate_varlen_query(q, cu_seqlens_q):
+def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
     if q.dim() != 3:
         raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
     if cu_seqlens_q.numel() <= 1:
         raise RuntimeError("batch size must be positive")
-    if q.shape[0] == 0:
+    # max_seqlen_q == 0 is the paged TND fast path, where every sequence has
+    # qlen 0. The training varlen API omits this argument and rejects any
+    # empty packed query, including one whose prefix still claims tokens.
+    if q.shape[0] == 0 and max_seqlen_q != 0:
         raise RuntimeError("total_q must be positive (q must contain at least one query token)")
 
 
@@ -290,7 +293,7 @@ def _flash_attn_forward_fake(
     # Determine if we're in varlen mode
     is_varlen_q = cu_seqlens_q is not None
     if is_varlen_q:
-        _validate_varlen_query(q, cu_seqlens_q)
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
 
     # Get dimensions from query tensor
     if is_varlen_q:
@@ -1305,11 +1308,15 @@ def flash_attn_with_kvcache(
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
-        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.).
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table.
+            With page_table, the logical shape is
+            (num_blocks, page_block_size, nheads_k, headdim). A physical BNBD tensor shaped
+            (num_blocks, nheads_k, page_block_size, headdim) can be passed as
+            k_cache.transpose(1, 2), which is a metadata-only view. page_block_size can be
+            arbitrary (e.g. 1, 2, 3, 64, etc.). Appending k/v into a physical BNBD cache is
+            not supported yet.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
+            with the same paged layout choices as k_cache if page_table is provided.
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.

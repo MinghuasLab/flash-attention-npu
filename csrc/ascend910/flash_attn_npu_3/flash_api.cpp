@@ -192,7 +192,10 @@ std::vector<at::Tensor> mha_fwd(
     if (cu_seqlens_q_.has_value()) {
         TORCH_CHECK(q.dim() == 3, "q must be 3-dimensional; got ", q.dim(), " dimensions");
         TORCH_CHECK(cu_seqlens_q_->numel() > 1, "batch size must be positive");
-        TORCH_CHECK(q.size(0) > 0, "total_q must be positive (q must contain at least one query token)");
+        // total_q == 0 with max_seqlen_q == 0 is the paged TND fast path below.
+        // A nonzero declared max length with an empty packed query is inconsistent.
+        TORCH_CHECK(!(q.size(0) == 0 && max_seqlen_q_.value_or(0) > 0),
+                    "total_q must be positive (q must contain at least one query token)");
     }
 
     auto q_dtype = q.dtype();
@@ -308,6 +311,31 @@ std::vector<at::Tensor> mha_fwd(
     // pitch in tokens. Unused (0) for BSND / TND.
     const int64_t kv_seqlen_allocated = is_bnsd ? static_cast<int64_t>(k.size(2)) : 0;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    if (paged_KV) {
+        TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
+                    "paged KV cache must have shape (num_pages, page_size, num_heads, head_dim)");
+        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                    "paged key/value caches must have matching page, page-size, and head dimensions");
+        const int64_t keyPageElements = k.size(1) * k.size(2) * k.size(3);
+        const int64_t valuePageElements = v.size(1) * v.size(2) * v.size(3);
+        const bool keyBBND =
+            k.stride(1) == k.size(2) * k.size(3) && k.stride(2) == k.size(3) && k.stride(3) == 1;
+        const bool valueBBND =
+            v.stride(1) == v.size(2) * v.size(3) && v.stride(2) == v.size(3) && v.stride(3) == 1;
+        const bool keyBNBD =
+            k.stride(1) == k.size(3) && k.stride(2) == k.size(1) * k.size(3) && k.stride(3) == 1;
+        const bool valueBNBD =
+            v.stride(1) == v.size(3) && v.stride(2) == v.size(1) * v.size(3) && v.stride(3) == 1;
+        TORCH_CHECK((keyBBND && valueBBND) || (keyBNBD && valueBNBD),
+                    "paged key/value caches must use the same BBND or BNBD inner layout; only dimension 0 may "
+                    "otherwise be non-contiguous");
+        TORCH_CHECK(!(appendKV && keyBNBD && !keyBBND),
+                    "paged BNBD cache does not support append-KV updates yet");
+        TORCH_CHECK(k.size(0) <= 1 || k.stride(0) >= keyPageElements,
+                    "paged key cache first-axis stride must not overlap physical pages");
+        TORCH_CHECK(v.size(0) <= 1 || v.stride(0) >= valuePageElements,
+                    "paged value cache first-axis stride must not overlap physical pages");
+    }
     // Keep the original 1..256 support tier and add 512 as a separate tier.
     // D=512 follows the same layout/KV routing matrix as the original path:
     // varlen-Q selects TND and BSND otherwise; paged K/V and dense/varlen K/V
@@ -395,6 +423,14 @@ std::vector<at::Tensor> mha_fwd(
         at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    }
+
+    // TND permits every sequence in the batch to have qlen=0. There is no
+    // device work in that case, and avoiding a zero-task launch also keeps the
+    // scheduler independent of empty-tensor data pointers.
+    if (is_varlen_q && sizes[0] == 0) {
+        TORCH_CHECK(!appendKV, "TND total_q=0 does not support append-KV cache updates");
+        return {out, softmaxlse, out_accum, softmax_lse_accum};
     }
 
     if (scheduler_metadata_.has_value()) {
@@ -686,8 +722,17 @@ std::vector<at::Tensor> mha_fwd(
     fwd_args.qSeqDevice = qSeqDevice;
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
-    fwd_args.tiling = {reinterpret_cast<uint64_t>(tilingDevice), has_softcap ? softmax_scale / softcap : softmax_scale,
-                       softcap};
+    fwd_args.tiling = {
+        reinterpret_cast<uint64_t>(tilingDevice),
+        has_softcap ? softmax_scale / softcap : softmax_scale,
+        softcap,
+        paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
+        paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
+        paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
+    };
     auto launch_fa_infer = [fwd_args, layout]() -> int {
         switch (layout) {
         case 0:

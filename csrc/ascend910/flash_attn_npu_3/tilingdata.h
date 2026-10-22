@@ -318,6 +318,15 @@ struct FAInferTilingParams {
     uint64_t tilingDataAddr;
     float scaleValue;
     float softcapValue;
+    // Element strides for paged KV. The API receives logical
+    // [page, token, head, dim] tensors; a transposed view can retain physical
+    // BNBD storage, whose token/head strides identify the inner layout.
+    uint64_t keyPageStride;
+    uint64_t valuePageStride;
+    uint64_t keyTokenStride;
+    uint64_t valueTokenStride;
+    uint64_t keyHeadStride;
+    uint64_t valueHeadStride;
 };
 
 #endif

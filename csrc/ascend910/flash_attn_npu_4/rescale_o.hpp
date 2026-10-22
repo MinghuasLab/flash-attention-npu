@@ -490,6 +490,28 @@ public:
                 }
             }
 
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+            // ***move O to GM: FD SplitKV writes partial fp32 O into gCombineo;
+            // otherwise writes fp16 O directly to gOutput.
+            if (splitParams.isSplitkv) {
+                CopyOToGmFp32(
+                    splitParams.gCombineo,
+                    proTokenIdx,
+                    proTokenNum,
+                    epiTokenNum,
+                    integralHeadNum,
+                    qSThisSubBlock,
+                    embed,
+                    embedRound,
+                    oHiddenSize, oHiddenSize_gmlo);
+            } else {
+                CopyOToGm(
+                    gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum,
+                    qSThisSubBlock, embed, embedRound, oHiddenSize, oHeadStride);
+            }
+
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
@@ -559,7 +581,8 @@ public:
                                     (lseHeadStrideGm - lseSeqLen) * sizeof(float),
                                     0));
                         } else {
-                            // MTE3 rounds UB blocks to 32 B; broadcast rows keep scalar sources aligned.
+                            // FA4 already has aligned broadcast rows in UB. Scatter them directly;
+                            // the FA3 GM staging round-trip regresses TND varlen workloads on FA4.
                             for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
                                 AscendC::DataCopyPad(
                                     gLse[sIdx],
@@ -573,9 +596,6 @@ public:
                             }
                         }
                     }
-                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
@@ -621,32 +641,8 @@ public:
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
-                        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-                        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }
-            }
-
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-
-            // ***move O to GM: FD SplitKV writes partial fp32 O into gCombineo;
-            // otherwise writes fp16 O directly to gOutput.
-            if (splitParams.isSplitkv) {
-                CopyOToGmFp32(
-                    splitParams.gCombineo,
-                    proTokenIdx,
-                    proTokenNum,
-                    epiTokenNum,
-                    integralHeadNum,
-                    qSThisSubBlock,
-                    embed,
-                    embedRound,
-                    oHiddenSize, oHiddenSize_gmlo);
-            } else {
-                CopyOToGm(gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, qSThisSubBlock, embed,
-                          embedRound, oHiddenSize, oHeadStride);
             }
         } else if (needRowLoop) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);

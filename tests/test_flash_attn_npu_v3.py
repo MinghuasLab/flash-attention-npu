@@ -1526,6 +1526,143 @@ def test_fa_kvcache_ops_with_hd_le_256(
     )
 
 
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("physical_layout", ["BBND", "BNBD"])
+def test_paged_tnd_dim0_noncontiguous_with_zero_lengths(physical_layout, causal, dtype):
+    batch_size, num_heads, kv_heads, head_size = 3, 4, 2, 64
+    page_size, pages_per_batch = 128, 2
+    num_pages = batch_size * pages_per_batch
+    q_lengths = [0, 3, 1]
+    kv_lengths = [5, 0, 129]
+
+    query = torch.randn((sum(q_lengths), num_heads, head_size), dtype=dtype, device="npu")
+    cu_q = make_cu_seqlens(q_lengths).npu()
+    cache_seqlens = torch.tensor(kv_lengths, dtype=torch.int32, device="npu")
+    page_table = torch.arange(num_pages, dtype=torch.int32, device="npu").reshape(
+        batch_size, pages_per_batch
+    )
+
+    # Give K and V different physical-page strides and a non-zero V storage
+    # offset. Only dimensions 1..3 remain dense.
+    inner_shape = (
+        (page_size, kv_heads, head_size)
+        if physical_layout == "BBND"
+        else (kv_heads, page_size, head_size)
+    )
+    key_storage = torch.randn((num_pages * 2, *inner_shape), dtype=dtype, device="npu")
+    value_storage = torch.randn((num_pages * 3, *inner_shape), dtype=dtype, device="npu")
+    key_physical = key_storage[::2]
+    value_physical = value_storage[1::3]
+    key_view = key_physical if physical_layout == "BBND" else key_physical.transpose(1, 2)
+    value_view = value_physical if physical_layout == "BBND" else value_physical.transpose(1, 2)
+    assert not key_view.is_contiguous() and not value_view.is_contiguous()
+    assert key_view.stride(0) != value_view.stride(0)
+    assert key_view.shape == (num_pages, page_size, kv_heads, head_size)
+    if physical_layout == "BNBD":
+        assert key_view.stride(1) == head_size
+        assert key_view.stride(2) == page_size * head_size
+
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max(q_lengths),
+        causal=causal,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+    out_view, lse_view, *_ = flash_attn_with_kvcache(query, key_view, value_view, **kwargs)
+    out_dense, lse_dense, *_ = flash_attn_with_kvcache(
+        query, key_view.contiguous(), value_view.contiguous(), **kwargs
+    )
+
+    torch.testing.assert_close(out_view, out_dense, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(lse_view, lse_dense, rtol=2e-3, atol=2e-3, equal_nan=True)
+    # Batch 1 owns packed Q rows [0, 3) and has kvlen=0.
+    torch.testing.assert_close(out_view[:3], torch.zeros_like(out_view[:3]), rtol=0, atol=0)
+    assert torch.isposinf(lse_view[:, :3]).all()
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize("head_size,kv_length,num_splits", [(512, 129, 1), (64, 2048, 2)])
+def test_paged_tnd_bnbd_dim0_noncontiguous_split_paths(head_size, kv_length, num_splits):
+    num_heads, kv_heads, page_size = 8, 2, 128
+    num_pages = (kv_length + page_size - 1) // page_size
+    query = torch.randn((1, num_heads, head_size), dtype=torch.float16, device="npu")
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    cache_seqlens = torch.tensor([kv_length], dtype=torch.int32, device="npu")
+    page_table = torch.arange(num_pages, dtype=torch.int32, device="npu").reshape(1, num_pages)
+    key_storage = torch.randn(
+        (num_pages * 2, kv_heads, page_size, head_size), dtype=torch.float16, device="npu"
+    )
+    value_storage = torch.randn(
+        (num_pages * 3, kv_heads, page_size, head_size), dtype=torch.float16, device="npu"
+    )
+    key_bnbd = key_storage[::2].transpose(1, 2)
+    value_bnbd = value_storage[1::3].transpose(1, 2)
+    assert key_bnbd.shape == (num_pages, page_size, kv_heads, head_size)
+    assert key_bnbd.stride(1) == head_size
+    assert key_bnbd.stride(2) == page_size * head_size
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=1,
+        causal=True,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+
+    out_bnbd, lse_bnbd, *_ = flash_attn_with_kvcache(query, key_bnbd, value_bnbd, **kwargs)
+    out_bbnd, lse_bbnd, *_ = flash_attn_with_kvcache(
+        query,
+        key_bnbd.contiguous(),
+        value_bnbd.contiguous(),
+        **kwargs,
+    )
+    torch.testing.assert_close(out_bnbd, out_bbnd, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(lse_bnbd, lse_bbnd, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+def test_paged_tnd_total_q_zero_fast_path():
+    batch_size, num_heads, kv_heads, head_size = 2, 4, 2, 64
+    query = torch.empty((0, num_heads, head_size), dtype=torch.float16, device="npu")
+    cu_q = torch.zeros((batch_size + 1,), dtype=torch.int32, device="npu")
+    cache_seqlens = torch.zeros((batch_size,), dtype=torch.int32, device="npu")
+    page_table = torch.arange(batch_size, dtype=torch.int32, device="npu").reshape(batch_size, 1)
+    key_storage = torch.randn(
+        (batch_size * 2, kv_heads, 128, head_size), dtype=torch.float16, device="npu"
+    )
+    value_storage = torch.randn_like(key_storage)
+
+    out, lse, *_ = flash_attn_with_kvcache(
+        query,
+        key_storage[::2].transpose(1, 2),
+        value_storage[::2].transpose(1, 2),
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=0,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+    assert out.shape == query.shape
+    assert lse.shape == (num_heads, 0)
+    assert out.numel() == 0 and lse.numel() == 0
+
+
 _FWD_INT32_MAX = 2**31 - 1
 
 
