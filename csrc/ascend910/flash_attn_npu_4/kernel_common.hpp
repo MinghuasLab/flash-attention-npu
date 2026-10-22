@@ -106,5 +106,19 @@ __aicore__ inline uint32_t GetQSBlockTile(uint32_t kvSeqlen)
     uint32_t qSBlockTile = Q_TILE_CEIL;
     return qSBlockTile;
 }
+
+__aicore__ inline uint32_t GetStackSeqTile(bool isNewBlock, uint32_t kvSIdx, uint32_t kvSIdxLocal,
+                                           uint32_t kvLoopNumTotalNew, uint32_t kvSLoopNumTotalOld, int64_t noSkipKvS,
+                                           uint32_t kvSeqlenOld, uint32_t kvNewSeqlen)
+{
+    if (isNewBlock) {
+        return (kvSIdxLocal + 1 > kvLoopNumTotalNew - 1U) ? (kvNewSeqlen - kvSIdxLocal * MAX_KV_STACK_LEN)
+                                                          : MAX_KV_STACK_LEN;
+    }
+    if (kvSIdx + 1 > kvSLoopNumTotalOld - 1U) {
+        return AscendC::Std::min(noSkipKvS, (int64_t)kvSeqlenOld) - kvSIdx * MAX_KV_STACK_LEN;
+    }
+    return MAX_KV_STACK_LEN;
+}
 } // namespace KernelCommon
 #endif
