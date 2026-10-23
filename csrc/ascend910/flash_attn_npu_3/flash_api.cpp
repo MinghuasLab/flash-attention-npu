@@ -425,15 +425,22 @@ std::vector<at::Tensor> mha_fwd(
             mask_gpu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_gpu_tensor.data_ptr());
         }
-        int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
-        int64_t wsSplit = 0;
+        const uint64_t normalWorkspace = fa_metadata::WorkSpaceSize(blockDim);
+        uint64_t splitWorkspace = normalWorkspace;
         if (paged_KV && is_varlen_q && !is_local) {
-            int64_t maxKvUpper = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
-            int64_t kvSegUpper = maxKvUpper / 512 + 1;
-            int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
-            wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
+            // The AICPU scheduler chooses the branch from actual sequence
+            // lengths. Reserve both paths without reading those lengths back
+            // to the host or scaling scratch space with page-table capacity.
+            // A core owns a contiguous task interval: only its first/last
+            // Q-head tiles can be split across cores. Each tile has at most
+            // Q_TILE_CEIL rows under the existing FlashDecode eligibility rule.
+            constexpr uint64_t maxPartialTilesPerCore = 2;
+            splitWorkspace += maxPartialTilesPerCore * blockDim * fa_split::Q_TILE_CEIL *
+                              (static_cast<uint64_t>(head_size_og) + 1) * sizeof(float);
         }
-        workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        const uint64_t workspaceSize = std::max(normalWorkspace, splitWorkspace);
+        workspace_tensor =
+            at::empty({static_cast<int64_t>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
     } else {
         at::Tensor tiling_cpu_tensor =
