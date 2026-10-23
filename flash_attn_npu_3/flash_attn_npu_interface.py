@@ -1226,6 +1226,28 @@ def flash_attn_varlen_func(
 
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """Merge split-KV partial attention outputs.
+
+    Mirrors ``flash_attn.flash_attn_combine`` from Dao-AILab/flash-attention:
+    ``lse = logsumexp_s(lse_partial)`` and ``out = sum_s exp(lse_s - lse) * O_s``.
+
+    Args:
+        out_partial: fp32 partial outputs. Dense (BSND):
+            (num_splits, batch, seqlen, nheads, headdim); varlen (TND):
+            (num_splits, total_q, nheads, headdim).
+        lse_partial: fp32 partial logsumexp, contiguous along the seqlen dim.
+            Dense: (num_splits, batch, seqlen, nheads); varlen:
+            (num_splits, total_q, nheads).
+        out [optional]: preallocated output, written in place.
+        out_dtype [optional]: output dtype (fp16 / bf16 / fp32). Defaults to
+            ``out_partial.dtype`` (fp32), matching the NV interface.
+
+    Returns:
+        (out, softmax_lse). ``out`` is (batch, seqlen, nheads, headdim) or
+        (total_q, nheads, headdim); ``softmax_lse`` is fp32 with shape
+        (batch, seqlen, nheads) or (total_q, nheads), i.e. seqlen-contiguous
+        (note this differs from ``flash_attn_func``'s (batch, nheads, seqlen)).
+    """
     return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 

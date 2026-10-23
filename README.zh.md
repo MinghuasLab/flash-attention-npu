@@ -634,6 +634,33 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    合并 split-KV 注意力的分片结果：
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    参数:
+        out_partial: fp32 分片输出。
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 分片 logsumexp，要求 seqlen 维连续。
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [可选]: 预分配输出，原地写回。
+        out_dtype [可选]: fp16 / bf16 / fp32；缺省取 out_partial.dtype（fp32），
+            与 flash-attention 一致。
+
+    返回:
+        (out, softmax_lse)。softmax_lse 为 fp32，形状 (batch, seqlen, nheads)
+        或 (total_q, nheads)；其 seqlen 维连续，与 flash_attn_func 返回的
+        (batch, nheads, seqlen) 布局不同。
+    """
+```
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -729,6 +756,21 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, return_lse=True):
+    """
+    FA4 的分片合并入口（合并数学与 v3 一致）。out_partial 为 4 维时按变长
+    (TND) 解释，为 5 维时按批量 (BSND) 解释。
+
+    cu_seqlens / seqused: 可选 int32 元信息，用于界定有效行。
+    return_lse=False 时返回 (out, None)。
+    virtual_batch_idx 在 NPU 上不支持。
+    """
+```
+
 ## 特性
 
 #### flash_attn_with_kvcache
@@ -778,6 +820,17 @@ def flash_attn_varlen_func(
 | Softcapping         | ✅ | ✅ | ✅ |
 | FP8 量化            | -  | -  | -  |
 | Dropout             | ✅ | -  | -  |
+
+#### flash_attn_combine
+
+| 特性                        | v3 | v4 |
+| --------------------------- | -- | -- |
+| FP32 partial / LSE 输入     | ✅ | ✅ |
+| FP16 / BF16 / FP32 输出     | ✅ | ✅ |
+| 批量 (BSND) 分片            | ✅ | ✅ |
+| 变长 (TND) 分片             | ✅ | ✅ |
+| cu_seqlens / seqused        | -  | ✅ |
+| 合并后的 LSE 输出           | ✅ | ✅ (`return_lse`) |
 
 ## 许可证
 

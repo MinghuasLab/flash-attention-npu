@@ -991,6 +991,25 @@ def flash_attn_func(
     )
 
 
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    virtual_batch_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Merge split-KV partial attention outputs (FA4, Ascend 950 backend)."""
+    if virtual_batch_idx is not None:
+        raise NotImplementedError("virtual_batch_idx is not supported on NPU")
+    result = flash_attn_npu_4_950.fwd_combine(
+        out_partial, lse_partial, out, out_dtype, cu_seqlens, seqused, return_lse
+    )
+    return result[0], result[1] if return_lse else None
+
+
 @_torch_register_fake_wrapper("flash_attn_npu_4_C::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,

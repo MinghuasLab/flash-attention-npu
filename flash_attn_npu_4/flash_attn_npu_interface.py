@@ -1290,3 +1290,43 @@ def flash_attn_varlen_func(
         seqlen_k_per_split,
         disable_scheduler_metadata,
     )
+
+
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    virtual_batch_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Merge split-KV partial attention outputs (FA4 signature).
+
+    Mirrors ``flash_attn.cute.interface.flash_attn_combine``.
+
+    Args:
+        out_partial: fp32 partial outputs. Batched (BSND):
+            (num_splits, batch, seqlen, nheads, headdim); varlen (TND, detected
+            by a 4-D input): (num_splits, total_q, nheads, headdim).
+        lse_partial: fp32 partial logsumexp, seqlen-contiguous. Batched:
+            (num_splits, batch, seqlen, nheads); varlen:
+            (num_splits, total_q, nheads).
+        out [optional]: preallocated output, written in place.
+        out_dtype [optional]: fp16 / bf16 / fp32; defaults to
+            ``out_partial.dtype`` (fp32).
+        cu_seqlens [optional]: 1-D int32 cumulative sequence lengths.
+        seqused [optional]: 1-D int32 per-sequence used lengths.
+        virtual_batch_idx [optional]: not supported on NPU.
+        return_lse: whether to return the combined logsumexp.
+
+    Returns:
+        (out, lse); ``lse`` is None when ``return_lse=False``.
+    """
+    if virtual_batch_idx is not None:
+        raise NotImplementedError("virtual_batch_idx is not supported on NPU")
+    result = flash_attn_npu_4.fwd_combine(
+        out_partial, lse_partial, out, out_dtype, cu_seqlens, seqused, return_lse
+    )
+    return result[0], result[1] if return_lse else None
