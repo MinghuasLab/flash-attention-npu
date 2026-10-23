@@ -397,8 +397,8 @@ class BishengBuildExt(build_ext):
         if not os.path.exists(aicpu_src):
             return None
         aicpu_obj = os.path.join(
-            os.path.dirname(ext_fullpath),
-            # All extensions share the build output directory.  Keep the
+            self.build_temp,
+            # All extensions share the temporary directory. Keep the
             # AICPU objects per extension; otherwise the later 950 build
             # overwrites the object already queued for the earlier one.
             f"fa_metadata_{ext_name.replace('.', '_')}.o",
@@ -477,6 +477,9 @@ class BishengBuildExt(build_ext):
         return aicpu_obj
 
     def build_extensions(self):
+        # Only runtime modules belong in build_lib; wheel installation copies
+        # that entire tree, including any compiler intermediates left in it.
+        os.makedirs(self.build_temp, exist_ok=True)
         toolchains = {ext.name: self._get_toolchain(ext) for ext in self.extensions}
         force = self._force_rebuild()
 
@@ -486,7 +489,7 @@ class BishengBuildExt(build_ext):
         for ext in self.extensions:
             ext_fullpath = self.get_ext_fullpath(ext.name)
             os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
-            obj_dir = os.path.join(os.path.dirname(ext_fullpath), ext.name + ".objs")
+            obj_dir = os.path.join(self.build_temp, ext.name + ".objs")
             os.makedirs(obj_dir, exist_ok=True)
             for src in ext.sources:
                 obj = os.path.join(obj_dir, os.path.splitext(os.path.basename(src))[0] + ".o")
@@ -544,7 +547,7 @@ class BishengBuildExt(build_ext):
         for ext in self.extensions:
             ext_fullpath = self.get_ext_fullpath(ext.name)
             objs = objs_by_ext[ext.name]
-            link_stamp = ext_fullpath + ".inputs"
+            link_stamp = os.path.join(self.build_temp, ext.name + ".inputs")
             link_inputs = [src for src in ext.sources]
             link_inputs.extend(
                 os.path.join(os.path.dirname(src), name)
@@ -806,12 +809,14 @@ setup(
             "csrc/ascend950",
             "include",
             "tests",
+            "tests.*",
             "dist",
             "docs",
             "benchmarks",
         )
     ),
     author="Minghua Shen",
+    package_data={"flash_attn_npu_4.catlass_dsl": ["README.md"]},
     author_email="shenmh6@mail.sysu.edu.cn",
     description="High-performance FlashAttention Implementation for Ascend NPU",
     long_description=long_description,

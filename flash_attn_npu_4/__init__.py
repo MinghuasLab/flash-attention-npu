@@ -2,6 +2,8 @@ __version__ = "0.4.2"
 
 import torch_npu
 
+__all__ = ["flash_attn_func", "flash_attn_varlen_func", "get_scheduler_metadata"]
+
 
 def is_ascend910() -> bool:
     """Return True if the current device belongs to Ascend 910B/C."""
@@ -23,7 +25,9 @@ if is_ascend910():
     )
 elif is_ascend950():
     from .flash_attn_npu_interface_950 import (
-        flash_attn_func, flash_attn_varlen_func, get_scheduler_metadata,
+        flash_attn_func,
+        flash_attn_varlen_func,
+        get_scheduler_metadata,
     )
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")
