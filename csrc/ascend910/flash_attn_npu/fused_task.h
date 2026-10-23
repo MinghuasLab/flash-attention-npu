@@ -42,6 +42,14 @@ FA_TASK_INLINE uint32_t HeadTile(uint32_t qRows, uint32_t groupSize, uint32_t nC
             } while (tile > 1 && groupSize % tile != 0);
         }
     }
+    // Keep the same number of tasks while balancing the groups per task.
+    if (tile >= groupSize) {
+        uint32_t kvHeads = qHeads / groupSize;
+        uint32_t groupsPerTask = tile / groupSize;
+        if (kvHeads > groupsPerTask) {
+            tile = Min(tile, CeilDiv(kvHeads, CeilDiv(kvHeads, groupsPerTask)) * groupSize);
+        }
+    }
     return tile;
 }
 
