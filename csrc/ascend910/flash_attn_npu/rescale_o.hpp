@@ -398,7 +398,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
             uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop;
             uint32_t subBlockStart = (qNThisSubBlock == 0U)
                                          ? rowStart
-                                         : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+                                         : qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop % qSThisSubBlock;
             if (!splitParams.isSplitkv) {
                 if (qNThisSubBlock == 0U) {
                     ClearInvalidOutputRows(0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen,
@@ -489,20 +489,22 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                                 AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0,
                                                            (lseHeadStrideGm - lseSeqLen) * sizeof(float), 0));
                         } else {
+                            // Fused tail tasks cover only lseSeqLen tokens per
+                            // head; layoutOutput.shape(0) is the full sequence.
                             AscendC::DataCopyPad(gUpdate, lseUbTensor,
                                                  AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
                             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
                             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
                             AscendC::DataCopyPad(
                                 lseStagingUbTensor, gUpdate,
-                                AscendC::DataCopyExtParams(lseHeadCount, qSBlockSize * sizeof(float), 0, 0, 0),
+                                AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0, 0, 0),
                                 AscendC::DataCopyPadExtParams<ElementLse>());
                             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
                             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
                             AscendC::DataCopyPad(
                                 gLse, lseStagingUbTensor,
-                                AscendC::DataCopyExtParams(lseHeadCount, qSBlockSize * sizeof(float), 0,
-                                                           (lseHeadStrideGm - qSBlockSize) * sizeof(float), 0));
+                                AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0,
+                                                           (lseHeadStrideGm - lseSeqLen) * sizeof(float), 0));
                         }
                     }
                 }
