@@ -1,0 +1,75 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Modified by Minghua Shen, 2026.
+ */
+
+#include "aicpu_api.h"
+#include "mla_tiling.cpp"
+#include "mla_split.cpp"
+#include "cann_split_core.cpp"
+#include "mla_metadata.cpp"
+#include "mla_metadata_consumer.h"
+
+namespace flash_attn::mla {
+namespace {
+struct MetadataWords {
+    uint64_t address;
+    uint32_t operator()(uint64_t word) const
+    {
+        return reinterpret_cast<const uint32_t*>(address)[word];
+    }
+};
+struct MetadataArrays {
+    uint64_t address[4];
+    uint32_t operator()(uint32_t axis, uint32_t word) const
+    {
+        return MetadataWords{address[axis]}(word);
+    }
+};
+MlaMetadataReadStatus CheckRecord(const MlaRecordArgs& a, MlaAutoSplitBsndSchedule& schedule)
+{
+    using S = MlaMetadataReadStatus;
+    const auto& c = a.context;
+    MlaLayout l{};
+    if (!MlaRecordLayout(c, l) || a.words != l.words || !ValidUsedMetadataAddress(a.output, a.words))
+        return S::InvalidBuffer;
+    const MetadataArrays arrays{{a.cuQuery, a.cuKv, a.usedQuery, a.usedKv}};
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint64_t count = uint64_t(c.batch) + (i < 2), address = arrays.address[i];
+        const bool present = i == 0 ? MlaTnd(c) : i == 1 ? c.layout == 1 : c.usedFlags & (1U << (i - 2));
+        if ((present && !ValidUsedMetadataAddress(address, count)) || (!present && address))
+            return S::InvalidBuffer;
+    }
+    const MetadataWords read{a.output};
+    auto status = ReadMlaMetadata(read, c, arrays, l, schedule);
+    if (status == S::Success && c.pageSize)
+        status = ReadMlaPages(read, c, a.cache, MetadataWords{a.cache.table.address});
+    return status;
+}
+} // namespace
+} // namespace flash_attn::mla
+__global__ __aicpu__ uint32_t ComputeMlaMetadata(void* args)
+{
+    using namespace flash_attn::mla;
+    if (!args)
+        return 1;
+    const auto& a = *static_cast<const MlaRecordArgs*>(args);
+    if (a.context.dtype == uint32_t(MlaMetadataDtype::Int8)) {
+        const bool ok = PrepareInt8Metadata(a);
+        AscendC::DataStoreBarrier();
+        return ok ? 0 : 1;
+    }
+    const bool ok = !a.generate || BuildNonquantMetadata(a);
+    if (a.checked) {
+        MlaCheckedAutoSplitSchedule checked;
+        MlaLayout layout{};
+        if (MlaRecordLayout(a.context, layout))
+            checked.blockDim = layout.cores;
+        checked.dtype = a.context.dtype;
+        if (ok)
+            checked.status = CheckRecord(a, checked.schedule);
+        std::memcpy(reinterpret_cast<void*>(a.checked), &checked, sizeof(checked));
+    }
+    AscendC::DataStoreBarrier();
+    return ok ? 0 : 1;
+}

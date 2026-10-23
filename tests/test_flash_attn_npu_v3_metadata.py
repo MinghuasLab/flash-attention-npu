@@ -1,9 +1,12 @@
 # Copyright (c) 2026, Minghua Shen.
+from contextlib import nullcontext
 import math
+import warnings
 
 import pytest
 import torch
 import torch_npu
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flash_attn_npu_3 import (
     flash_attn_func,
@@ -1901,3 +1904,154 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         rtol=0,
         atol=1e-6,
     )
+
+
+@pytest.mark.parametrize("fault", ["length-dtype", "prefix-dtype", "split"])
+def test_metadata_input_rejections(fault):
+    """Keep the ordinary scheduler's existing dtype and split rejections."""
+    if not _is_ascend910():
+        pytest.skip("FA3 910 metadata validation")
+    args = dict(
+        batch_size=2,
+        max_seqlen_q=1,
+        max_seqlen_k=128,
+        num_heads_q=4,
+        num_heads_kv=1,
+        headdim=64,
+        cache_seqlens=torch.full((2,), 128, dtype=torch.int32, device="npu"),
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device="npu"),
+        num_splits=1,
+    )
+    if fault == "split":
+        args["num_splits"] = -1
+    else:
+        key = "cache_seqlens" if fault == "length-dtype" else "cu_seqlens_q"
+        args[key] = args[key].float()
+    with pytest.raises(RuntimeError):
+        get_scheduler_metadata(**args)
+
+
+@pytest.mark.parametrize("varlen", [False, True], ids=["bsnd", "tnd"])
+def test_metadata_fake_matches_real(varlen):
+    if not _is_ascend910():
+        pytest.skip("FA3 910 metadata validation")
+    lengths = torch.full((2,), 128, dtype=torch.int32, device="npu")
+    prefix = torch.tensor([0, 1, 2], dtype=torch.int32, device="npu") if varlen else None
+    expected = get_scheduler_metadata(
+        2, 1, 128, 4, 1, 64, lengths, cu_seqlens_q=prefix, num_splits=1
+    )
+    with FakeTensorMode() as mode:
+        actual = get_scheduler_metadata(
+            2,
+            1,
+            128,
+            4,
+            1,
+            64,
+            mode.from_tensor(lengths),
+            cu_seqlens_q=mode.from_tensor(prefix) if varlen else None,
+            num_splits=1,
+        )
+        assert (actual.shape, actual.dtype, actual.device) == (
+            expected.shape,
+            expected.dtype,
+            expected.device,
+        )
+
+
+@pytest.mark.parametrize("symbolic", [False, True], ids=["concrete", "unbacked"])
+def test_metadata_fake_without_device_runtime(monkeypatch, symbolic):
+    if not _is_ascend910():
+        pytest.skip("FA3 910 metadata fake")
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    import flash_attn_npu_3.flash_attn_npu_interface as api
+
+    def native_unavailable(*args, **kwargs):
+        raise AssertionError("ordinary metadata fake must not query the native device runtime")
+
+    monkeypatch.setattr(api.flash_attn_npu_3, "get_scheduler_metadata", native_unavailable)
+    with FakeTensorMode(shape_env=ShapeEnv()) as mode:
+        lengths = torch.empty(2, dtype=torch.int32, device="npu")
+        max_q = mode.shape_env.create_unbacked_symint() if symbolic else 16
+        record = get_scheduler_metadata(2, max_q, 128, 4, 1, 64, lengths, num_splits=1)
+        assert record.shape == (2376,)
+        assert record.dtype == torch.uint8 and record.device == lengths.device
+
+
+@pytest.mark.parametrize("varlen", [False, True], ids=["bsnd", "tnd"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compile"])
+@pytest.mark.parametrize("inference", [False, True], ids=["grad", "inference"])
+def test_metadata_fresh_storage_and_compiled_fingerprint(varlen, compiled, inference):
+    if not _is_ascend910():
+        pytest.skip("FA3 910 metadata registration")
+    lengths = _int32_npu([16, 16])
+    prefix = _int32_npu([0, 2, 4]) if varlen else None
+    unused = torch.ones(3, device="npu", requires_grad=True)
+    inputs = [tensor for tensor in (lengths, prefix, unused) if tensor is not None]
+    versions = [tensor._version for tensor in inputs]
+
+    def metadata(lengths, prefix, unused):
+        return get_scheduler_metadata(
+            2,
+            2,
+            16,
+            4,
+            1,
+            64,
+            lengths,
+            cu_seqlens_q=prefix,
+            cu_seqlens_k_new=unused,
+            cache_leftpad=unused,
+            causal=True,
+            num_splits=1,
+        )
+
+    if compiled:
+        torch._dynamo.reset()
+        metadata = torch.compile(metadata, backend="aot_eager", fullgraph=True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with torch.inference_mode() if inference else nullcontext():
+            first = metadata(lengths, prefix, unused)
+            record = metadata(lengths, prefix, unused)
+    assert not caught
+    assert [tensor._version for tensor in inputs] == versions
+    assert record.dtype == torch.uint8 and not record.requires_grad and record.grad_fn is None
+    assert record.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+    assert all(
+        record.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+        for tensor in inputs
+    )
+    assert record._fa_scheduler_params == dict(
+        causal=True,
+        window_size=(-1, -1),
+        has_softcap=False,
+        page_size=None,
+        max_seqlen_q=2,
+        max_seqlen_k=16,
+        varlen_q=varlen,
+        num_splits=1,
+    )
+    with torch.inference_mode() if inference else nullcontext():
+        first.zero_()
+    torch.testing.assert_close(lengths.cpu(), torch.tensor([16, 16], dtype=torch.int32))
+    if prefix is not None:
+        torch.testing.assert_close(prefix.cpu(), torch.tensor([0, 2, 4], dtype=torch.int32))
+    torch.testing.assert_close(unused.detach().cpu(), torch.ones(3))
+    assert unused.grad is None
+    q = torch.zeros((4, 4, 64) if varlen else (2, 2, 4, 64), device="npu", dtype=torch.float16)
+    k = torch.zeros((2, 16, 1, 64), device="npu", dtype=torch.float16)
+    v = torch.full_like(k, 0.5)
+    out = flash_attn_with_kvcache(
+        q,
+        k,
+        v,
+        cache_seqlens=lengths,
+        cu_seqlens_q=prefix,
+        max_seqlen_q=2 if varlen else None,
+        causal=True,
+        num_splits=1,
+        scheduler_metadata=record,
+    )
+    torch.testing.assert_close(out.cpu(), torch.full_like(out.cpu(), 0.5), rtol=0, atol=0)
