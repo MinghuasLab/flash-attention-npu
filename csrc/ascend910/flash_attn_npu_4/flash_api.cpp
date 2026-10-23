@@ -338,10 +338,16 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
         int64_t wsSplit = 0;
         if (paged_KV && is_varlen_q) {
-            int64_t maxKvUpper = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
-            int64_t kvSegUpper = maxKvUpper / 512 + 1;
-            int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
-            wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
+            // Each batch/KV-head group contributes at most Q_TILE_CEIL
+            // partial rows, and each interior core boundary adds at most
+            // another tile. Independently, a core has at most two partial
+            // tiles. Bound rows rather than records to cover odd GQA tiles.
+            const int64_t coreNum = blockDim;
+            const int64_t kvGroups = static_cast<int64_t>(batch_size) * num_heads_k;
+            const int64_t rowBlocksUpper =
+                (coreNum == 0 || kvGroups == 0) ? 0 : std::min(2 * coreNum, kvGroups + coreNum - 1);
+            const int64_t partialRowsUpper = fa_split::Q_TILE_CEIL * rowBlocksUpper;
+            wsSplit = partialRowsUpper * (static_cast<int64_t>(head_size_og) + 1) * sizeof(float);
         }
         workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
