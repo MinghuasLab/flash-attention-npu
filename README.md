@@ -647,6 +647,33 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    Merge the partial outputs of a split-KV attention computation:
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    Arguments:
+        out_partial: fp32 partial outputs.
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 partial logsumexp, contiguous along the sequence dim.
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [optional]: preallocated output, written in place.
+        out_dtype [optional]: fp16 / bf16 / fp32. Defaults to out_partial.dtype
+            (fp32), matching flash-attention.
+
+    Returns:
+        (out, softmax_lse). softmax_lse is fp32 shaped (batch, seqlen, nheads)
+        or (total_q, nheads) - it is contiguous along seqlen, unlike
+        flash_attn_func's (batch, nheads, seqlen).
+    """
+```
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -772,6 +799,22 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, return_lse=True):
+    """
+    FA4 entry point for merging split attention partial outputs (same math as
+    the v3 helper). A 4-D out_partial selects the varlen (TND) layout; a 5-D
+    out_partial selects the batched (BSND) layout.
+
+    cu_seqlens / seqused: optional int32 metadata used to bound the valid rows.
+    return_lse=False returns (out, None).
+    virtual_batch_idx is not supported on NPU.
+    """
+```
+
 ## Features
 
 #### flash_attn_with_kvcache
@@ -818,6 +861,16 @@ def flash_attn_varlen_func(
 | Softcapping | ✅ | ✅ | ✅ |
 | FP8 Quantization | - | - | - |
 | Dropout | ✅ | - | - |
+
+#### flash_attn_combine
+| Feature | v3 | v4 |
+|---------|----|----|
+| FP32 partial / LSE input | ✅ | ✅ |
+| FP16 / BF16 / FP32 output | ✅ | ✅ |
+| Batched (BSND) partials | ✅ | ✅ |
+| Variable-length (TND) partials | ✅ | ✅ |
+| cu_seqlens / seqused | - | ✅ |
+| Combined LSE output | ✅ | ✅ (`return_lse`) |
 
 
 ## License

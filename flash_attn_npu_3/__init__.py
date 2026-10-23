@@ -17,6 +17,7 @@ def is_ascend950() -> bool:
 
 if is_ascend910():
     from .flash_attn_npu_interface import (
+        flash_attn_combine,
         flash_attn_func,
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
@@ -24,6 +25,7 @@ if is_ascend910():
     )
 elif is_ascend950():
     from .flash_attn_npu_interface_950 import (
+        flash_attn_combine,
         flash_attn_func,
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
