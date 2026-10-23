@@ -120,6 +120,6 @@ step "summary"
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL CHECKS PASSED"
 else
-  echo "SOME CHECKS FAILED - see [FAIL] lines above and README_FIRST.md §8"
+  echo "SOME CHECKS FAILED - see [FAIL] lines above and README.zh.md"
 fi
 exit "$FAIL"
