@@ -4,7 +4,7 @@
 #   bash package_a5_delivery.sh [output_dir]
 #
 # Produces <output_dir>/flash_attn_combine_a5_delivery_<date>.tar.gz containing:
-#   README_FIRST.md, flash-attention-npu/, atk/, docs/analysis/,
+#   README_FIRST.md, flash-attention-npu/, atk/,
 #   run_a5_verify.sh, MANIFEST.txt
 set -euo pipefail
 
@@ -20,7 +20,7 @@ DEST="$WORK/$PKG"
 echo "repo    : $REPO"
 echo "atk src : $ATK_SRC"
 echo "output  : $OUT_DIR/$PKG.tar.gz"
-mkdir -p "$DEST/flash-attention-npu" "$DEST/atk" "$DEST/docs/analysis"
+mkdir -p "$DEST/flash-attention-npu" "$DEST/atk"
 
 # ---------- 1. source tree (no build artifacts, no VCS, trimmed catlass) ----------
 rsync -a \
@@ -47,8 +47,7 @@ cp "$ATK_SRC"/memory-all_test_flash_attn_combine_bf16fp16_reports_*.xlsx "$DEST/
 cp "$ATK_SRC"/memory-all_test_flash_attn_combine_v4_bf16fp16_reports_*.xlsx "$DEST/atk/" 2>/dev/null || true
 cp "$REPO"/tests/st/atk_flash_attn_combine/{execute_flash_attn_combine.py,flash_attn_combine_constraint.py,test_flash_attn_combine.yaml,test_flash_attn_combine_v4.yaml,run_atk.sh,extend_cases_to_200.py,renumber_case_ids.py,rekey_report_ids.py,bench_combine.py} "$DEST/atk/"
 
-# ---------- 3. docs ----------
-cp "$REPO"/docs/analysis/*.md "$DEST/docs/analysis/"
+# ---------- 3. entry README ----------
 cp "$REPO/README.zh.md" "$DEST/README_FIRST.md"
 
 # ---------- 4. one-click script ----------
