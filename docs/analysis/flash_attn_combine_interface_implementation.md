@@ -279,7 +279,7 @@ UB ≈ num_splits × rows × 8        # LSE + 权重，各按 8 元素对齐
 | A5（950, dav-3510） | FA3 与 FA4 后端 **编译 + 链接成功**（`--npu-arch=dav-3510`）；本机无 950 设备，**未上板运行** |
 | 精度 | 与 `logsumexp` 参考实现对比：`lse` atol/rtol 1e-4；`out` 偏差 ≤ 2× 一次 cast 误差 + 1e-3 |
 | 接口契约 | 覆盖 fp32 partial 强制、`stride(-1)/stride(-2)`、`num_splits ≤ 256`、`out` 原地写、`out_dtype` 默认 fp32、`return_lse=False`、`virtual_batch_idx` not-supported |
-| ATK 精度（A2/A3） | FA3 **100/100**、FA4 **100/100** 通过（`cv_fused_double_benchmark` **L2: 2/1.2/1.2**，实测 max_re 2.0、avg_re 0.002、rmse 0.050）。详见 `docs/analysis/flash_attn_combine_atk_result.md` |
+| ATK 精度（A2/A3） | FA3 **100/100**、FA4 **100/100** 通过（`cv_fused_double_benchmark` **L2: 2/1.2/1.2**，实测 max_re 2.0、avg_re 0.002、rmse 0.050） |
 
 ### 7.3 实现中确认的硬件约束（重要，后续复用）
 

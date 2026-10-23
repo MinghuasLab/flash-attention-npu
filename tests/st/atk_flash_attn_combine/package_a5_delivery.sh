@@ -49,7 +49,7 @@ cp "$REPO"/tests/st/atk_flash_attn_combine/{execute_flash_attn_combine.py,flash_
 
 # ---------- 3. docs ----------
 cp "$REPO"/docs/analysis/*.md "$DEST/docs/analysis/"
-cp "$REPO/docs/analysis/flash_attn_combine_A5_handoff.md" "$DEST/README_FIRST.md"
+cp "$REPO/README.zh.md" "$DEST/README_FIRST.md"
 
 # ---------- 4. one-click script ----------
 cp "$REPO/tests/st/atk_flash_attn_combine/run_a5_verify.sh" "$DEST/run_a5_verify.sh"
