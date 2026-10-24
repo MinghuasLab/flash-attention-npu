@@ -49,6 +49,10 @@ struct FAIKernelParams {
     uint32_t numBlocks;
     uint32_t maxNumBlocksPerBatch;
 
+    GM_ADDR qDescale = nullptr;
+    GM_ADDR kDescale = nullptr;
+    GM_ADDR vDescale = nullptr;
+
     // Methods
     __aicore__ inline FAIKernelParams() {}
 

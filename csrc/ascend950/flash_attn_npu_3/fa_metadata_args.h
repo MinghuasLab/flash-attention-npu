@@ -90,13 +90,13 @@ struct FwdMaskDerivation {
 // (max_seqlen_k / cache capacity) instead of the device-side actual max KV
 // seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
 // allowed. Both metadata creation and fwd consumption use the same derivation.
-inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
+inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t max_seqlen_q,
                                        int64_t max_seqlen_k_bound)
 {
     if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
         window_left = -1;
     }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
+    if (max_seqlen_q > 0 && window_right >= max_seqlen_q) {
         window_right = -1;
     }
     if (causal) {
@@ -110,7 +110,7 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
             window_left = max_seqlen_k_bound;
         }
         if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
+            window_right = max_seqlen_q;
         }
     }
     derived.window_left = window_left;
@@ -137,6 +137,7 @@ struct FAMetadataArgs {
     uint32_t isVarlen;
     uint32_t isVarlenKv;
     uint32_t pagedKV;
+    uint32_t quantMode;
 };
 
 #endif

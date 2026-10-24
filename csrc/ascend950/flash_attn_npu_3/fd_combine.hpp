@@ -6,6 +6,7 @@
 #ifndef FLASH_ATTN_NPU_950_V3_FD_COMBINE_HPP
 #define FLASH_ATTN_NPU_950_V3_FD_COMBINE_HPP
 
+#include <limits>
 #include <type_traits>
 
 #include "kernel_operator.h"
@@ -17,15 +18,20 @@
 #include "tilingdata.h"
 #include "kernel_common.hpp"
 
-template <class ElementO>
+template <class ElementO, uint32_t quantMode = 0>
 class FlashDecodeCombine950 {
   public:
+    static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
-    // FD is gated to q_seqlen <= 16.  A fused Q-head task is combined one
-    // head at a time, so the UB requirement remains bounded by 16 rows.
+    // FD combines one Q head at a time, with at most 16 rows per partial.
+    // quantMode selects the FP8 partial layout and combine implementation.
     static constexpr uint32_t MAX_ROWS_PER_SUBBLOCK = 16U;
     static constexpr uint32_t MAX_HEAD_DIM = 256U;
-    static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
+    static constexpr uint32_t FLOATS_PER_BLOCK = Catlass::BYTE_PER_BLK / sizeof(float);
+    static constexpr uint32_t FP8_HEAD_DIM = 128U;
+    static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
+    // Padding entries do not contribute to the split reduction.
+    static constexpr float LSE_PADDING_VALUE = -std::numeric_limits<float>::max();
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROWS_PER_SUBBLOCK;
     static constexpr uint32_t MAX_O_ELEMS = MAX_ROWS_PER_SUBBLOCK * MAX_HEAD_DIM;
 
@@ -38,7 +44,10 @@ class FlashDecodeCombine950 {
         constexpr uint32_t LSE_SUM_OFFSET = LSE_MAX_OFFSET + MAX_ROWS_PER_SUBBLOCK * sizeof(float);
         constexpr uint32_t GLOBAL_LSE_OFFSET = LSE_SUM_OFFSET + MAX_ROWS_PER_SUBBLOCK * sizeof(float);
         constexpr uint32_t O_INPUT_OFFSET = GLOBAL_LSE_OFFSET + MAX_ROWS_PER_SUBBLOCK * sizeof(float);
-        constexpr uint32_t O_TMP_OFFSET = O_INPUT_OFFSET + MAX_O_ELEMS * sizeof(ElementO);
+        // FP8 stages all partials; the nonquantized path stages one partial.
+        constexpr uint32_t O_INPUT_ELEMS =
+            FULL_QUANT_FP8 ? MAX_SPLIT_NUM * MAX_ROWS_PER_SUBBLOCK * FP8_HEAD_DIM : MAX_O_ELEMS;
+        constexpr uint32_t O_TMP_OFFSET = O_INPUT_OFFSET + O_INPUT_ELEMS * sizeof(ElementO);
         constexpr uint32_t O_ACC_OFFSET = O_TMP_OFFSET + MAX_O_ELEMS * sizeof(float);
         constexpr uint32_t REDUCE_TMP_OFFSET = O_ACC_OFFSET + MAX_O_ELEMS * sizeof(float);
 
@@ -120,9 +129,9 @@ class FlashDecodeCombine950 {
         const uint32_t qStart = qTileIdx * tiling->qBaseTile;
         const uint32_t qRows = Min(tiling->qBaseTile, qLen - qStart);
         const uint32_t groupRows = qRows * qNBlockSize;
-        const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, FLOATS_PER_BLOCK) / subBlockNum);
+        const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / subBlockNum);
         const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        if (subBlockIdx != 0U || qRows == 0U) {
+        if ((!FULL_QUANT_FP8 && subBlockIdx != 0U) || qRows == 0U) {
             return;
         }
 
@@ -131,12 +140,14 @@ class FlashDecodeCombine950 {
         const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
         const uint32_t headDim = tiling->embeddingSizeV;
 
-        constexpr uint32_t O_ELEMS_PER_BLOCK = static_cast<uint32_t>(32U / sizeof(ElementO));
+        constexpr uint32_t O_ELEMS_PER_BLOCK = static_cast<uint32_t>(Catlass::BYTE_PER_BLK / sizeof(ElementO));
         const uint32_t dRound = RoundUp(headDim, O_ELEMS_PER_BLOCK);
         const uint32_t lsePartialStride = 2U * tiling->fdLseSubStride;
         const uint32_t qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;
 
-        for (uint32_t qHeadOffset = 0U; qHeadOffset < qNBlockSize; ++qHeadOffset) {
+        const uint32_t headStart = FULL_QUANT_FP8 ? subBlockIdx : 0U;
+        const uint32_t headStep = FULL_QUANT_FP8 ? subBlockNum : 1U;
+        for (uint32_t qHeadOffset = headStart; qHeadOffset < qNBlockSize; qHeadOffset += headStep) {
             const uint32_t rowStart = qHeadOffset * qRows;
             const uint32_t localRows = qRows;
             const uint32_t rowCountAlign = RoundUp(localRows, FLOATS_PER_BLOCK);
@@ -148,34 +159,63 @@ class FlashDecodeCombine950 {
 
             AscendC::Duplicate(oAccUb_, 0.0F, localRows * dRound);
             AscendC::PipeBarrier<PIPE_V>();
-            for (uint32_t partial = 0U; partial < partialCount; ++partial) {
+            if constexpr (FULL_QUANT_FP8) {
                 const uint64_t partialOOffset =
-                    (static_cast<uint64_t>(firstPartial + partial) * tiling->fdRowCapacity + rowStart) * headDim;
+                    (static_cast<uint64_t>(firstPartial) * tiling->fdRowCapacity + rowStart) * headDim;
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
                 AscendC::DataCopyPad(
                     oInputUb_, partialO[partialOOffset],
-                    AscendC::DataCopyExtParams(localRows, headDim * sizeof(ElementO), 0, 0, 0),
-                    AscendC::DataCopyPadExtParams<ElementO>(true, 0, dRound - headDim, static_cast<ElementO>(0.0F)));
+                    AscendC::DataCopyExtParams(partialCount, localRows * headDim * sizeof(ElementO),
+                                               (tiling->fdRowCapacity - localRows) * headDim * sizeof(ElementO), 0, 0),
+                    AscendC::DataCopyPadExtParams<ElementO>(false, 0, 0, static_cast<ElementO>(0.0F)));
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-                for (uint32_t row = 0U; row < localRows; ++row) {
-                    AscendC::Cast(oTmpUb_[row * dRound], oInputUb_[row * dRound], AscendC::RoundMode::CAST_NONE,
-                                  headDim);
+            }
+            for (uint32_t partial = 0U; partial < partialCount; ++partial) {
+                if constexpr (!FULL_QUANT_FP8) {
+                    const uint64_t partialOOffset =
+                        (static_cast<uint64_t>(firstPartial + partial) * tiling->fdRowCapacity + rowStart) * headDim;
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+                    AscendC::DataCopyPad(oInputUb_, partialO[partialOOffset],
+                                         AscendC::DataCopyExtParams(localRows, headDim * sizeof(ElementO), 0, 0, 0),
+                                         AscendC::DataCopyPadExtParams<ElementO>(true, 0, dRound - headDim,
+                                                                                 static_cast<ElementO>(0.0F)));
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+                }
+                if constexpr (FULL_QUANT_FP8) {
+                    AscendC::Cast(oTmpUb_, oInputUb_[partial * localRows * headDim], AscendC::RoundMode::CAST_NONE,
+                                  localRows * headDim);
                     AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Muls(oTmpUb_[row * dRound], oTmpUb_[row * dRound],
-                                  weightUb_.GetValue(partial * rowCountAlign + row), headDim);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add(oAccUb_[row * dRound], oAccUb_[row * dRound], oTmpUb_[row * dRound], headDim);
+                    AccumulateWeightedRows((__ubuf__ float*)oAccUb_.GetPhyAddr(), (__ubuf__ float*)oTmpUb_.GetPhyAddr(),
+                                           (__ubuf__ float*)weightUb_[partial * rowCountAlign].GetPhyAddr(), localRows);
+                } else {
+                    for (uint32_t row = 0U; row < localRows; ++row) {
+                        AscendC::Cast(oTmpUb_[row * dRound], oInputUb_[row * dRound], AscendC::RoundMode::CAST_NONE,
+                                      headDim);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Muls(oTmpUb_[row * dRound], oTmpUb_[row * dRound],
+                                      weightUb_.GetValue(partial * rowCountAlign + row), headDim);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Add(oAccUb_[row * dRound], oAccUb_[row * dRound], oTmpUb_[row * dRound], headDim);
+                    }
                 }
                 AscendC::PipeBarrier<PIPE_V>();
             }
 
-            for (uint32_t row = 0U; row < localRows; ++row) {
-                if (std::is_same<ElementO, bfloat16_t>::value) {
-                    AscendC::Cast(oOutUb_[row * dRound], oAccUb_[row * dRound], AscendC::RoundMode::CAST_RINT, headDim);
-                } else {
-                    AscendC::Cast(oOutUb_[row * dRound], oAccUb_[row * dRound], AscendC::RoundMode::CAST_NONE, headDim);
+            if constexpr (FULL_QUANT_FP8) {
+                AscendC::Cast(oOutUb_, oAccUb_, AscendC::RoundMode::CAST_RINT, localRows * headDim);
+            } else {
+                for (uint32_t row = 0U; row < localRows; ++row) {
+                    if (std::is_same<ElementO, bfloat16_t>::value) {
+                        AscendC::Cast(oOutUb_[row * dRound], oAccUb_[row * dRound], AscendC::RoundMode::CAST_RINT,
+                                      headDim);
+                    } else {
+                        AscendC::Cast(oOutUb_[row * dRound], oAccUb_[row * dRound], AscendC::RoundMode::CAST_NONE,
+                                      headDim);
+                    }
                 }
             }
             AscendC::PipeBarrier<PIPE_V>();
@@ -183,6 +223,11 @@ class FlashDecodeCombine950 {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
 
             const uint32_t qHeadIdx = qHeadStart + qHeadOffset;
+            if constexpr (FULL_QUANT_FP8) {
+                const uint32_t totalQ = static_cast<uint32_t>(actualQ.GetValue(tiling->batch));
+                AscendC::DataCopyPad(outputLse[static_cast<uint64_t>(qHeadIdx) * totalQ + qTokenBase], globalLseUb_,
+                                     AscendC::DataCopyExtParams(1, localRows * sizeof(float), 0, 0, 0));
+            }
             for (uint32_t row = 0U; row < localRows; ++row) {
                 const uint64_t token = qTokenBase + row;
                 const uint64_t outputOffset = (token * tiling->numHeads + qHeadIdx) * headDim;
@@ -193,24 +238,44 @@ class FlashDecodeCombine950 {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
         }
 
-        // On arch35 scalar GM stores are only reliable from the leading AIV.
-        // O remains parallel across combine tasks; AIV0 serializes the small
-        // (FD-gated) set of LSE reductions and scalar stores.
-        if (AscendC::GetBlockIdx() == 0U) {
-            WriteAllLse(tiling, partialLse, actualQ, seqUsedQ, params.seqUsedQ != nullptr, outputLse);
+        // The legacy path retains scalar LSE stores from the leading AIV.
+        if constexpr (!FULL_QUANT_FP8) {
+            if (AscendC::GetBlockIdx() == 0U) {
+                WriteAllLse(tiling, partialLse, actualQ, seqUsedQ, params.seqUsedQ != nullptr, outputLse);
+            }
         }
 #endif
     }
 
   private:
 #ifdef __DAV_VEC__
+    __simd_vf__ static inline void AccumulateWeightedRows(__ubuf__ float* acc, __ubuf__ float* value,
+                                                          __ubuf__ float* weights, uint32_t rows)
+    {
+        using namespace AscendC::Reg;
+        MaskReg allB32Mask = CreateMask<float, MaskPattern::ALL>();
+        RegTensor<float> weightVreg, value0Vreg, value1Vreg;
+        RegTensor<float> acc0Vreg, acc1Vreg;
+        for (uint32_t row = 0; row < rows; ++row) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(weightVreg, weights + row);
+            LoadAlign(value0Vreg, value + row * FP8_HEAD_DIM);
+            LoadAlign(value1Vreg, value + row * FP8_HEAD_DIM + FLOAT_VECTOR_SIZE);
+            LoadAlign(acc0Vreg, acc + row * FP8_HEAD_DIM);
+            LoadAlign(acc1Vreg, acc + row * FP8_HEAD_DIM + FLOAT_VECTOR_SIZE);
+            MulAddDst(acc0Vreg, value0Vreg, weightVreg, allB32Mask);
+            MulAddDst(acc1Vreg, value1Vreg, weightVreg, allB32Mask);
+            StoreAlign(acc + row * FP8_HEAD_DIM, acc0Vreg, allB32Mask);
+            StoreAlign(acc + row * FP8_HEAD_DIM + FLOAT_VECTOR_SIZE, acc1Vreg, allB32Mask);
+        }
+    }
+
     __aicore__ inline void PrepareWeights(AscendC::GlobalTensor<float>& partialLse, uint32_t firstPartial,
                                           uint32_t partialCount, uint32_t partialCountAlign, uint32_t sourceRowStart,
                                           uint32_t sourceRowSplit, uint32_t rowCount, uint32_t rowCountAlign,
                                           uint32_t lseSubStride, uint32_t lsePartialStride)
     {
         const uint32_t calcElems = partialCountAlign * rowCountAlign;
-        AscendC::Duplicate(lseUb_, -3.402823466e+38F, calcElems);
+        AscendC::Duplicate(lseUb_, LSE_PADDING_VALUE, calcElems);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         for (uint32_t partial = 0U; partial < partialCount; ++partial) {
@@ -353,7 +418,7 @@ class FlashDecodeCombine950 {
     AscendC::LocalTensor<uint8_t> reduceTmpUb_;
 };
 
-template <class InDtype>
+template <class InDtype, uint32_t quantMode = 0>
 CATLASS_GLOBAL void FAFlashDecodeCombine(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
                                          GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                                          GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
@@ -362,7 +427,7 @@ CATLASS_GLOBAL void FAFlashDecodeCombine(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADD
     FAIKernelParams params{
         q,   k,         v,      mask,       blockTables,  actualQseqlen, actualKvseqlen,      seqUsedQ, seqUsedKv, o,
         lse, workspace, tiling, scaleValue, softcapValue, numBlocks,     maxNumBlocksPerBatch};
-    FlashDecodeCombine950<InDtype> combine;
+    FlashDecodeCombine950<InDtype, quantMode> combine;
     combine(params);
 }
 

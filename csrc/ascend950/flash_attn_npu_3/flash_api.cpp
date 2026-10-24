@@ -66,7 +66,8 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                                   int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
                                   std::optional<at::Tensor> seqlens_q, std::optional<at::Tensor> cu_seqlens_k,
                                   std::optional<int64_t> page_size, bool causal, bool hasSoftcap, int64_t num_splits,
-                                  int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right)
+                                  int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right,
+                                  int64_t quant_mode)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
@@ -75,6 +76,8 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
+    TORCH_CHECK(quant_mode != 1 || (headdim == 128 && headdim_v == 128),
+                "950 V3 FP8 requires Q/K/V head dimensions of 128");
 
     const bool is_varlen_q = seqlens_q.has_value();
     const bool is_varlen_kv = cu_seqlens_k.has_value();
@@ -120,6 +123,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
+    args.quantMode = quant_mode;
     // Schedule is scale/softcap independent; hasSoftcap is API parity only.
     (void)hasSoftcap;
     return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);

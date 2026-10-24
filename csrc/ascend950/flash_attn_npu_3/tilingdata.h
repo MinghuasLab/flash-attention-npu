@@ -126,6 +126,7 @@ struct FAInferTilingData {
     uint32_t kL1BufNum;
     uint32_t vL1BufNum;
     uint32_t pL1BufNum;
+    uint32_t quantMode = 0;
 
     // Getter functions
     uint32_t get_numHeads() const

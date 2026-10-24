@@ -69,7 +69,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto q_dtype = q.dtype();
     const bool is_bf16 = (q_dtype == torch::kBFloat16);
     const bool is_fp16 = (q_dtype == torch::kFloat16);
-    TORCH_CHECK(is_bf16 || is_fp16, "FlashAttention only supports FP16 and BF16 data types");
+    const uint32_t quantMode = q_dtype == at::ScalarType::Float8_e4m3fn ? 1U : 0U;
+    TORCH_CHECK(is_bf16 || is_fp16 || quantMode == 1, "FlashAttention supports FP16, BF16 and FP8_E4M3FN inputs");
     TORCH_CHECK(q.device().type() == at::kPrivateUse1, "query must be on NPU");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
                 "query, key and value must be on the same NPU device");
@@ -85,8 +86,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     TORCH_CHECK(!leftpad_k_.has_value(), "950 backend (v3) does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value(),
                 "950 backend (v3) does not support rotary embedding");
-    TORCH_CHECK(!q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value(),
-                "950 backend (v3) does not support FP8 descales");
+    TORCH_CHECK(quantMode == 1 || (!q_descale_ && !k_descale_ && !v_descale_), "descales require FP8_E4M3FN inputs");
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
@@ -207,18 +207,38 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         TORCH_CHECK(page_table.size(0) == batch_size, "page_table batch dimension must match query batch size");
     }
 
+    TORCH_CHECK(quantMode == 0 || (head_size_q == 128 && head_size_v == 128),
+                "950 V3 FP8 requires Q/K/V head dimensions of 128");
+    GM_ADDR qDescale = nullptr;
+    GM_ADDR kDescale = nullptr;
+    GM_ADDR vDescale = nullptr;
+    auto set_descale = [&](const std::optional<at::Tensor>& scale, GM_ADDR& ptr) {
+        if (!scale)
+            return;
+        TORCH_CHECK(scale->device() == q.device() && scale->scalar_type() == at::kFloat,
+                    "descale must be FP32 on the query device");
+        TORCH_CHECK(scale->dim() == 2 && scale->size(0) == batch_size && scale->size(1) == num_heads_k,
+                    "descale must have shape [batch, num_kv_heads]");
+        TORCH_CHECK(scale->is_contiguous(), "descale must be contiguous");
+        ptr = static_cast<uint8_t*>(scale->data_ptr());
+    };
+    set_descale(q_descale_, qDescale);
+    set_descale(k_descale_, kDescale);
+    set_descale(v_descale_, vDescale);
+    const auto out_dtype = quantMode == 1 ? at::kBFloat16 : q.scalar_type();
+
     std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
     output_sizes.back() = head_size_v;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_dtype, "output dtype must be BF16 for FP8, otherwise match inputs");
         TORCH_CHECK(out.device() == q.device(), "output must be on the same device as query");
         TORCH_CHECK(out.sizes().vec() == output_sizes,
                     "output shape must match query except for the last dimension, which must match value");
         CHECK_CONTIGUOUS(out);
     } else {
-        out = at::empty(output_sizes, q.options());
+        out = at::empty(output_sizes, q.options().dtype(out_dtype));
     }
 
     // ============================================================
@@ -259,8 +279,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         } else {
             kvSeqlenBound = k.size(1);
         }
-        FwdMaskDerivation maskDer =
-            DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
+        const auto maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != 0u;
@@ -270,7 +289,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        if (hasMask) {
+        if (hasMask && quantMode == 0) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -294,25 +313,11 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                 max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_ptr[i]);
             }
         }
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-            window_size_left = -1;
-        }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-            window_size_right = -1;
-        }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        is_causal = (window_size_left < 0 && window_size_right == 0);
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-        if (is_local) {
-            if (window_size_left < 0) {
-                window_size_left = max_kv_seqlen;
-            }
-            if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
-            }
-        }
+        const auto maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, max_kv_seqlen);
+        window_size_left = maskDer.window_left;
+        window_size_right = maskDer.window_right;
+        is_causal = maskDer.is_causal;
+        is_local = maskDer.is_local;
 
         int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
         int64_t max_q_seqlen = 0;
@@ -346,7 +351,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
                                /* window_size_left= */ is_local ? window_size_left : 0,
                                /* window_size_right= */ is_local ? window_size_right : 0, is_varlen_q, is_bf16,
-                               batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
+                               quantMode, batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
                                return_softmax_lse, is_varlen_q);
         ctx.flashDecodeFlag = flash_decode;
@@ -369,7 +374,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if (is_causal || is_local) {
+        if ((is_causal || is_local) && quantMode == 0) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -479,8 +484,12 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 scale_value,
                                 softcap,
                                 static_cast<uint32_t>(num_blocks),
-                                static_cast<uint32_t>(max_num_blocks_per_seq)};
-    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_]() -> int {
+                                static_cast<uint32_t>(max_num_blocks_per_seq),
+                                quantMode,
+                                qDescale,
+                                kDescale,
+                                vDescale};
+    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
         launch_fwd(fwdArgs);
         return 0;
     };

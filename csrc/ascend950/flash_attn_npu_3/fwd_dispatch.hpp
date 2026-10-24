@@ -39,6 +39,10 @@ struct FwdLaunchArgs {
     float softcap_value;
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
+    uint32_t quant_mode = 0;
+    uint8_t* q_descale_device = nullptr;
+    uint8_t* k_descale_device = nullptr;
+    uint8_t* v_descale_device = nullptr;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and
@@ -54,7 +58,13 @@ void launch_fwd_impl(const FwdLaunchArgs& a);
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
     const bool is_bsnd = (a.layout == Format::BSND);
-    if (a.is_bf16) {
+    if (a.quant_mode == 1) {
+        if (is_bsnd) {
+            launch_fwd_impl<float8_e4m3_t, false>(a);
+        } else {
+            launch_fwd_impl<float8_e4m3_t, true>(a);
+        }
+    } else if (a.is_bf16) {
         if (is_bsnd) {
             launch_fwd_impl<bfloat16_t, false>(a);
         } else {
