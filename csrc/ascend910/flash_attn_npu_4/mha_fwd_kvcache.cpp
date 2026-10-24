@@ -282,32 +282,33 @@ class FAInferKernel {
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
         // Addressing is derived from the (compile-time) input layout.
-        //   BSND / TND: Q/K/O are (..., S, H*D) row-major; the sequence step is
-        //     H*D (= strideQ/strideO/strideK/strideV) and the head step is D.
-        //   BNSD: Q/K/O are (B, H, S, D) with one contiguous plane per head; the
+        //   BSND / TND: Q/K are (..., S, H*D) row-major; the sequence step is
+        //     H*D (= strideQ/strideK/strideV) and the head step is D.
+        //   BNSD: Q/K are (B, H, S, D) with one contiguous plane per head; the
         //     sequence step is D and the head step is the per-head plane size
-        //     (maxQSeqlen * D for Q/O, kvSeqlenAllocated * D for K/V).
+        //     (maxQSeqlen * D for Q, kvSeqlenAllocated * D for K/V).
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
             strideQ = static_cast<uint64_t>(embed);
-            strideO = static_cast<uint64_t>(embedV);
             strideK = static_cast<uint64_t>(embed);
             strideV = static_cast<uint64_t>(embedV);
             qHeadStride = static_cast<uint64_t>(maxQSeqlen) * embed;
-            oHeadStride = static_cast<uint64_t>(maxQSeqlen) * embedV;
             kvHeadStrideK = static_cast<uint64_t>(kvSeqlenAllocated) * embed;
             kvHeadStrideV = static_cast<uint64_t>(kvSeqlenAllocated) * embedV;
-            oRowStride = static_cast<uint64_t>(embedV);
         } else {
             strideQ = static_cast<uint64_t>(qHeads * embed);
-            strideO = static_cast<uint64_t>(qHeads * embedV);
             strideK = static_cast<uint64_t>(kvHeads * embed);
             strideV = static_cast<uint64_t>(kvHeads * embedV);
             qHeadStride = static_cast<uint64_t>(embed);
-            oHeadStride = static_cast<uint64_t>(embedV);
             kvHeadStrideK = static_cast<uint64_t>(embed);
             kvHeadStrideV = static_cast<uint64_t>(embedV);
-            oRowStride = static_cast<uint64_t>(qHeads * embedV);
         }
+        // Q/K/V are read with the input layout's strides (BNSD stays zero-copy), but
+        // O is always addressed with BSND semantics so the returned tensor is a
+        // contiguous (B, S, H, D) block regardless of the input layout. The head
+        // plane is D wide and the token (row) stride is H*D in BSND.
+        strideO = static_cast<uint64_t>(qHeads * embedV);
+        oHeadStride = static_cast<uint64_t>(embedV);
+        oRowStride = static_cast<uint64_t>(qHeads * embedV);
         embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
         embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
         groupSize = qHeads / kvHeads;
@@ -543,9 +544,9 @@ class FAInferKernel {
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
             // BNSD: each batch is a fixed set of qHeads / kvHeads planes; the batch
             // base is the plane size times the head count (no dependence on the
-            // per-batch used sequence lengths).
+            // per-batch used sequence lengths). O is not affected: it is written as
+            // contiguous BSND and uses the formula below.
             qBOffset = static_cast<uint64_t>(BIdx) * qHeads * qHeadStride;
-            oBOffset = static_cast<uint64_t>(BIdx) * qHeads * oHeadStride;
             if constexpr (!PAGED_CACHE_FLAG) {
                 kBOffset = static_cast<uint64_t>(BIdx) * kvHeads * kvHeadStrideK;
                 vBOffset = static_cast<uint64_t>(BIdx) * kvHeads * kvHeadStrideV;
@@ -554,7 +555,6 @@ class FAInferKernel {
             }
         } else {
             qBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideQ;
-            oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
             if constexpr (!PAGED_CACHE_FLAG) {
                 kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
                 vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
@@ -562,6 +562,8 @@ class FAInferKernel {
                 blockBOffset = static_cast<uint64_t>(BIdx) * blockTableStride;
             }
         }
+        // O is always contiguous BSND: one batch is prevQSeqlenSum rows of strideO.
+        oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
         // LSE flat offset depends on the output layout the host allocates:
         //   BSND -> (batch, num_heads, seqlen) batch-major: head stride = maxQSeqlen,
         //           each batch occupies prevQSeqlenSum * qHeads elements.
@@ -933,7 +935,7 @@ class FAInferKernel {
     uint64_t oHeadStride;
     uint64_t kvHeadStrideK;
     uint64_t kvHeadStrideV;
-    // Output row pitch: qHeads * embedV (BSND / TND) or embedV (BNSD).
+    // Output row pitch: qHeads * embedV (contiguous BSND for every input layout).
     uint64_t oRowStride;
     uint32_t embedRound;
     uint32_t embedRoundV;

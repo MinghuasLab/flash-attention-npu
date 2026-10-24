@@ -277,14 +277,16 @@ class FAIKernel950 {
         if constexpr (qFormat == Format::BNSD) {
             strideQ = embed_;
             qHeadStride = static_cast<int64_t>(faiTilingData->maxQSeqlen) * embed_;
-            strideO = embedV_;
-            oHeadStride = static_cast<int64_t>(faiTilingData->maxQSeqlen) * embedV_;
         } else {
             strideQ = qHeads_ * embed_;
             qHeadStride = embed_;
-            strideO = qHeads_ * embedV_;
-            oHeadStride = embedV_;
         }
+        // Q/K/V are read with the input layout's strides (BNSD stays zero-copy),
+        // but O is always addressed with BSND semantics so the returned tensor is
+        // a contiguous (B, S, H, D) block regardless of the input layout. The
+        // head plane is D wide and the token stride is H*D in BSND.
+        strideO = qHeads_ * embedV_;
+        oHeadStride = embedV_;
         kvHeadStrideK = embed_;
         kvHeadStrideV = embedV_;
         if constexpr (cacheLayout == CacheLayout::nd) {
@@ -353,14 +355,14 @@ class FAIKernel950 {
                 // BSND forms depend on the physical (region) seqlen of the batch
                 // being left.  BNSD planes are maxSeqlen sized so they are constant.
                 int64_t qBatchStride = 0;
-                int64_t oBatchStride = 0;
                 if constexpr (qFormat == Format::BNSD) {
                     qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
-                    oBatchStride = static_cast<int64_t>(qHeads_) * oHeadStride;
                 } else {
                     qBatchStride = qPhysicalSeqlen * strideQ;
-                    oBatchStride = qPhysicalSeqlen * strideO;
                 }
+                // O always follows BSND: one batch is qPhysicalSeqlen rows of
+                // strideO elements each.
+                int64_t oBatchStride = qPhysicalSeqlen * strideO;
                 int64_t kBatchStride = 0;
                 int64_t vBatchStride = 0;
                 if constexpr (kvFormat == Format::BNSD) {

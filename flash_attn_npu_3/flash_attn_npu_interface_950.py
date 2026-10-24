@@ -234,14 +234,11 @@ def _flash_attn_forward_fake(
     else:
         if layout == _LAYOUT_BNSD:
             batch_size, num_heads, seqlen_q, _ = q.shape
-            out = torch.empty(
-                (batch_size, num_heads, seqlen_q, head_size_v), dtype=out_dtype, device=q.device
-            )
         else:
             batch_size, seqlen_q, num_heads, _ = q.shape
-            out = torch.empty(
-                (batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device
-            )
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device
+        )
         softmax_lse = (
             torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
             if return_softmax_lse
@@ -669,9 +666,6 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        if out_transposed:
-            # Report the result in the shape the caller passed in, not the BNSD view.
-            out = out.transpose(1, 2)
         return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
 
     @staticmethod
@@ -1209,7 +1203,4 @@ def flash_attn_with_kvcache(
         return_softmax_lse=return_softmax_lse,
         layout=layout,
     )
-    if out_transposed:
-        # Report the result in the shape the caller passed in, not the BNSD view.
-        out = out.transpose(1, 2)
     return (out, softmax_lse, *rest) if return_softmax_lse else out

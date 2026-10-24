@@ -223,6 +223,10 @@ std::vector<at::Tensor> mha_fwd(
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+    } else if (is_bnsd_layout) {
+        // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
+        // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
+        out = torch::empty({q.size(0), q.size(2), q.size(1), v.size(-1)}, q.options());
     } else {
         out = torch::empty_like(q);
     }

@@ -9,6 +9,7 @@ from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
     make_block_table,
+    make_golden_attention_mask,
     make_local_attention_mask,
     make_packed_random_tensor,
     make_paged_kv_cache,
@@ -1134,3 +1135,54 @@ def test_fa_kvcache_ops_with_hd_le_256(
         softcap=softcap,
         add_unused_qkv=False,
     )
+
+
+def _bnsd_inputs(batch, sq, sk, dtype, num_heads, num_heads_kv, head_size, seed=2026):
+    gen = torch.Generator().manual_seed(seed)
+    shapes = (
+        (batch, num_heads, sq, head_size),
+        (batch, num_heads_kv, sk, head_size),
+        (batch, num_heads_kv, sk, head_size),
+    )
+    return tuple(
+        make_random_tensor(
+            shape, dtype, generator=gen, device="npu", requires_grad=False
+        ).transpose(1, 2)
+        for shape in shapes
+    )
+
+
+def _bnsd_golden(q, k, v, dtype, scale, causal=False):
+    q, k, v = (t.contiguous().cpu() for t in (q, k, v))
+    mask, _, _ = make_golden_attention_mask(q.shape[1], k.shape[1], causal, -1, -1)
+    return ref_flash_attention_pair(q, k, v, scale, mask, dtype, 0.0)
+
+
+# BNSD (B, H, S, D) QKV layout gate cases (v4 exposes ``flash_attn_func`` only).
+# batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+flash_attn_func_bnsd_cases = [
+    (2, torch.float16, 8, 2, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, False),
+    (2, torch.float16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 16, 4, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 256, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 128, 100, 192, False),
+]
+
+
+@pytest.mark.parametrize(
+    "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
+    flash_attn_func_bnsd_cases,
+)
+def test_v4_bnsd_flash_attn_func(
+    batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+):
+    scale = 1.0 / (head_size**0.5)
+    q, k, v = _bnsd_inputs(batch, q_seqlen, kv_seqlen, data_type, num_heads, kv_heads, head_size)
+    out_ref, lse_ref, out_pt, lse_pt = _bnsd_golden(q, k, v, data_type, scale, causal=is_causal)
+
+    out, lse = flash_attn_func(q, k, v, softmax_scale=scale, causal=is_causal, return_lse=True)
+    assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
+    assert_fa_close(out, out_ref, out_pt, name="v4_bnsd_func_out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="v4_bnsd_lse")

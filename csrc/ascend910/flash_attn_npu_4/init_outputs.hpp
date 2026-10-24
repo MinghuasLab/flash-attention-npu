@@ -47,10 +47,9 @@ class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, Lse
                                           const LayoutLseOut& layoutLse, uint32_t qSThisSubBlock,
                                           uint32_t qNThisSubBlock, uint32_t embedV, uint32_t oHeadStride)
     {
-        // layoutOutput.shape(1) is the output row pitch (oHiddenSize): qHeads *
-        // embedV for BSND, embedV for BNSD. embedV itself cannot be recovered
-        // from it under BNSD, so it is passed in explicitly; the per-head target
-        // step is oHeadStride (embedV for BSND, maxQSeqlen * embedV for BNSD).
+        // layoutOutput.shape(1) is the contiguous BSND output row pitch (oHiddenSize
+        // = qHeads * embedV) for every input layout; the per-head target step is
+        // oHeadStride (embedV). embedV is passed explicitly.
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t embedRoundV = RoundUp(embedV, HALF_ELEM_NUM_PER_BLK);
         AscendC::PipeBarrier<PIPE_ALL>();

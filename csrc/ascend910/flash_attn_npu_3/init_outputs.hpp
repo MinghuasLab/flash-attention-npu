@@ -47,6 +47,8 @@ class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, Lse
                                           const LayoutLseOut& layoutLse, uint32_t qSThisSubBlock,
                                           uint32_t qNThisSubBlock, uint32_t outputStride, uint32_t oHeadStride)
     {
+        // layoutOutput.shape(1) is the contiguous BSND O token stride (qHeads*embedV)
+        // for every input layout, so dividing it by qHeads recovers embedV.
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t embedV = oHiddenSize / qHeads;
@@ -93,8 +95,8 @@ class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, Lse
         uint32_t outRowOffsetSubBlock = (qNBlockSize == 1U) ? rowOffsetSubBlock : 0;
         uint32_t outHeadOffsetSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
         uint32_t qSThisSubBlock = (qNBlockSize == 1U) ? rowActualSubBlock : qSBlockSize;
-        // Rows step by the token stride, heads by the per-head plane pitch (BSND:
-        // qHeads*embedV / embedV; BNSD: embedV / S_alloc*embedV).
+        // Rows step by the contiguous BSND token stride (qHeads*embedV) and heads
+        // by the per-head plane pitch (embedV), for every input layout.
         int64_t outOffsetSubBlock = static_cast<int64_t>(outRowOffsetSubBlock) * outputStride +
                                     static_cast<int64_t>(outHeadOffsetSubBlock) * oHeadStride;
         auto gOutputSubBlock = gOutput[outOffsetSubBlock];

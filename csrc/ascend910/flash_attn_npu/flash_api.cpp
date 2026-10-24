@@ -298,6 +298,10 @@ std::vector<at::Tensor> mha_fwd_kvcache(
     }
     if (out_.has_value()) {
         out = out_.value();
+    } else if (layout == 2) {
+        // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
+        // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
+        out = torch::empty({q.size(0), q.size(2), q.size(1), vcache.size(-1)}, q.options());
     } else {
         out = torch::empty_like(q);
     }
@@ -719,7 +723,11 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     }
 
     // init output tensors
-    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
+    // BNSD (B,H,S,D) input: the kernel writes contiguous BSND, so allocate (B, S, H, dv).
+    at::Tensor out = (out_.has_value())
+                         ? out_.value()
+                         : (is_bnsd ? torch::empty({batch_size, seqlen_q, num_heads, head_size}, q.options())
+                                    : torch::empty_like(q));
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {

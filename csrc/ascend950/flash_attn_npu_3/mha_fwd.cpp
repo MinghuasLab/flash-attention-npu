@@ -244,6 +244,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
     output_sizes.back() = head_size_v;
+    if (layout_enum == FwdLayout::BNSD) {
+        // The BNSD zero-copy path reads Q/K/V as (B, H, S, D) but the kernel
+        // writes O with BSND addressing, so the returned tensor is a contiguous
+        // (B, S, H, D) block equal to the caller's BSND query shape.
+        output_sizes = {batch_size, seqlen_q, num_heads, head_size_v};
+    }
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();

@@ -624,9 +624,6 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.aux_tensors = aux_tensors
         ctx.aux_scalars = aux_scalars
 
-        if out_transposed:
-            # Report the result in the shape the caller passed in, not the BNSD view.
-            out = out.transpose(1, 2)
         if return_lse:
             return out, softmax_lse
         return out
@@ -1035,7 +1032,7 @@ def _flash_attn_forward_fake(
     elif layout == _LAYOUT_BNSD:
         batch_size, num_heads, seqlen_q = q.shape[0], q.shape[1], q.shape[2]
         out = torch.empty(
-            (batch_size, num_heads, seqlen_q, head_size_v),
+            (batch_size, seqlen_q, num_heads, head_size_v),
             dtype=out_dtype,
             device=q.device,
         )

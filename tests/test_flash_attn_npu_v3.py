@@ -8,7 +8,10 @@ import re
 import torch
 import torch_npu
 import pytest
-from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention_pair
+from tests.common.attention_ref import (
+    cached_autograd_grads,
+    ref_flash_attention_pair,
+)
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv,
@@ -1627,3 +1630,111 @@ class TestQueryDimensionBounds:
         )
         with pytest.raises(RuntimeError, match=error):
             compiled(q, k, v, num_splits=1)
+
+
+def _bnsd_inputs(batch, sq, sk, dtype, num_heads, num_heads_kv, head_size, seed=2026):
+    gen = torch.Generator().manual_seed(seed)
+    shapes = (
+        (batch, num_heads, sq, head_size),
+        (batch, num_heads_kv, sk, head_size),
+        (batch, num_heads_kv, sk, head_size),
+    )
+    return tuple(
+        make_random_tensor(
+            shape, dtype, generator=gen, device="npu", requires_grad=False
+        ).transpose(1, 2)
+        for shape in shapes
+    )
+
+
+def _bnsd_golden(q, k, v, dtype, scale, causal=False):
+    q, k, v = (t.contiguous().cpu() for t in (q, k, v))
+    mask, _, _ = make_golden_attention_mask(q.shape[1], k.shape[1], causal, -1, -1)
+    return ref_flash_attention_pair(q, k, v, scale, mask, dtype, 0.0)
+
+
+# BNSD (B, H, S, D) QKV layout gate cases for the v3 backend (910 and 950).
+# batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+flash_attn_func_bnsd_cases = [
+    (2, torch.float16, 8, 2, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, False),
+    (2, torch.float16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 16, 4, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 192, 64, 128, False),
+]
+
+
+@pytest.mark.parametrize(
+    "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
+    flash_attn_func_bnsd_cases,
+)
+def test_v3_bnsd_flash_attn_func(
+    batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+):
+    scale = 1.0 / (head_size**0.5)
+    q, k, v = _bnsd_inputs(batch, q_seqlen, kv_seqlen, data_type, num_heads, kv_heads, head_size)
+    out_ref, _, out_pt, _ = _bnsd_golden(q, k, v, data_type, scale, causal=is_causal)
+
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        causal=is_causal,
+        return_attn_probs=True,
+    )
+    assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
+    assert_fa_close(out, out_ref, out_pt, name="v3_bnsd_func_out")
+
+
+# batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen
+flash_attn_with_kvcache_bnsd_cases = [
+    (2, torch.bfloat16, 8, 2, 128, 1024, 300, 32),
+    (2, torch.float16, 8, 2, 128, 1024, 512, 32),
+]
+
+
+@pytest.mark.parametrize(
+    "batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen",
+    flash_attn_with_kvcache_bnsd_cases,
+)
+def test_v3_bnsd_flash_attn_with_kvcache(
+    batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen
+):
+    """BNSD KV cache: the head-plane pitch comes from the allocated length."""
+    scale = 1.0 / (head_size**0.5)
+    gen = torch.Generator().manual_seed(2026)
+    q_cpu = torch.randn(batch, num_heads, q_seqlen, head_size, dtype=data_type, generator=gen)
+    k_alloc = torch.randn(batch, kv_heads, s_alloc, head_size, dtype=data_type, generator=gen)
+    v_alloc = torch.randn(batch, kv_heads, s_alloc, head_size, dtype=data_type, generator=gen)
+
+    mask, _, _ = make_golden_attention_mask(q_seqlen, cache_seqlen, True, -1, -1)
+    out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+        q_cpu.transpose(1, 2).contiguous(),
+        k_alloc[:, :, :cache_seqlen].transpose(1, 2).contiguous(),
+        v_alloc[:, :, :cache_seqlen].transpose(1, 2).contiguous(),
+        scale,
+        mask,
+        data_type,
+    )
+
+    # A plane pitch taken from the used length would read this sentinel tail.
+    k_junk, v_junk = k_alloc.clone(), v_alloc.clone()
+    k_junk[:, :, cache_seqlen:, :] = 1e4
+    v_junk[:, :, cache_seqlen:, :] = 1e4
+    q, k_junk, v_junk = q_cpu.npu(), k_junk.npu(), v_junk.npu()
+    cache_seqlens = torch.full((batch,), cache_seqlen, dtype=torch.int32).npu()
+
+    out, lse, *_ = flash_attn_with_kvcache(
+        q.transpose(1, 2),
+        k_junk.transpose(1, 2),
+        v_junk.transpose(1, 2),
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
+        causal=True,
+        return_softmax_lse=True,
+    )
+    assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
+    assert_fa_close(out, out_ref, out_pt, name="v3_bnsd_kvcache_out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="v3_bnsd_kvcache_lse")

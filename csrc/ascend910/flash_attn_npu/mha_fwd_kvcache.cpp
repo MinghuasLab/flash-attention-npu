@@ -227,28 +227,28 @@ class FAInferKernel {
             gOFD, gS, gP, gOTmp, gOUpdate,    gPret,          gDrop,           gAlibiSlopes, gKNew, gVNew};
 
         kvSeqlenAllocated = static_cast<uint64_t>(params.kvSeqlenAllocated);
+        // Q/K/V keep the input-layout strides: BNSD (B,H,S,D) reads its head planes
+        // in place (token stride = head dim, head plane = S_alloc wide for KV), while
+        // BSND/TND are token-major.
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
-            // BNSD (B,H,S,D): the token stride is the head dim, the head plane is
-            // S_alloc elements wide (KV use the allocated KV length, not maxKvSeqlen),
-            // so the batch stride is also a compile-time-shaped constant.
             strideQ = static_cast<uint64_t>(embed);
-            strideO = static_cast<uint64_t>(embedV);
             strideK = static_cast<uint64_t>(embed);
             strideV = static_cast<uint64_t>(embedV);
             qHeadStride = static_cast<uint64_t>(maxQSeqlen) * embed;
-            oHeadStride = static_cast<uint64_t>(maxQSeqlen) * embedV;
             kvHeadStrideK = kvSeqlenAllocated * embed;
             kvHeadStrideV = kvSeqlenAllocated * embedV;
         } else {
             strideQ = static_cast<uint64_t>(qHeads * embed);
-            strideO = static_cast<uint64_t>(qHeads * embedV);
             strideK = static_cast<uint64_t>(kvHeads * embed);
             strideV = static_cast<uint64_t>(kvHeads * embedV);
             qHeadStride = static_cast<uint64_t>(embed);
-            oHeadStride = static_cast<uint64_t>(embedV);
             kvHeadStrideK = static_cast<uint64_t>(embed);
             kvHeadStrideV = static_cast<uint64_t>(embedV);
         }
+        // O is written as contiguous BSND (b, s, h, dv) regardless of the input
+        // layout: the token stride is qHeads*embedV and the head stride is embedV.
+        strideO = static_cast<uint64_t>(qHeads * embedV);
+        oHeadStride = static_cast<uint64_t>(embedV);
         stridePret = static_cast<uint64_t>(maxQSeqlen * maxKvSeqlen);
         strideDrop = static_cast<uint64_t>(maxQSeqlen * CeilDiv(maxKvSeqlen, 8));
 
@@ -625,11 +625,11 @@ class FAInferKernel {
         }
         uint64_t oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
-            // BNSD batches are S_alloc-aligned head planes: the batch base advances by
-            // the whole plane, never by prevQSeqlenSum/prevKvSeqlenSum * token stride
+            // BNSD QKV batches are S_alloc-aligned head planes: the batch base advances
+            // by the whole plane, never by prevQSeqlenSum/prevKvSeqlenSum * token stride
             // (strideQ == embed here, so the BSND formula would be off by qHeads).
+            // O is untouched here: it is contiguous BSND and uses the formula above.
             qBOffset = static_cast<uint64_t>(BIdx) * qHeads * qHeadStride;
-            oBOffset = static_cast<uint64_t>(BIdx) * qHeads * oHeadStride;
             if constexpr (!PAGED_CACHE_FLAG) {
                 kBOffset = static_cast<uint64_t>(BIdx) * kvHeads * kvHeadStrideK;
                 vBOffset = static_cast<uint64_t>(BIdx) * kvHeads * kvHeadStrideV;
@@ -800,8 +800,8 @@ class FAInferKernel {
 #ifdef __DAV_C220_VEC__
             if (!isSplitKV) {
                 // layoutOInit.shape(1) is the O token stride (the dst row gap source):
-                // qHeads*embedV for BSND/TND, embedV for BNSD (the head plane is dense).
-                LayoutO layoutOInit(qSeqlen, (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) ? embedV : embed * qHeads);
+                // qHeads*embedV for the contiguous BSND output of every input layout.
+                LayoutO layoutOInit(qSeqlen, qHeads * embedV);
                 LayoutLse layoutLseInit(qHeads, lseHeadStride);
                 EpilogueInitOut epilogueInitOut(resource);
                 epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize,
@@ -1045,8 +1045,7 @@ class FAInferKernel {
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
 #ifdef __DAV_C220_VEC__
-                LayoutO layoutO(pvDesc.qSeqlen,
-                                (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) ? embedV : embed * qHeads);
+                LayoutO layoutO(pvDesc.qSeqlen, qHeads * embedV);
                 LayoutUpdate layoutUpdate(pvDesc.rowNum, embed, embedRound);
                 // Head-major LSE: (num_heads, headStride). stride(0)=headStride is
                 // maxQSeqlen (BSND) or totalQTokens (TND) — the correct per-layout head
@@ -1119,7 +1118,8 @@ class FAInferKernel {
     uint64_t strideO;
     uint64_t strideK;
     uint64_t strideV;
-    // Per-layout head-plane strides (BNSD: S_alloc-aligned planes; BSND/TND: embed).
+    // Per-layout Q/K/V head-plane strides (BNSD: S_alloc-aligned planes;
+    // BSND/TND: embed). O is always contiguous BSND (oHeadStride = embedV).
     uint64_t qHeadStride;
     uint64_t oHeadStride;
     uint64_t kvHeadStrideK;
