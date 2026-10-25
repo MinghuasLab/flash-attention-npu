@@ -183,6 +183,12 @@ class FAInferKernel {
         // BNSD only: allocated per-head KV plane length (k.size(2)); 0 otherwise.
         kvSeqlenAllocated = static_cast<uint32_t>(params.kvSeqlenAllocated);
         flashDecodeFlag = fATilingData->flashDecodeFlag;
+        // Reusable scheduler metadata may still raise flashDecodeFlag for a
+        // SWA shape (q<=16, long KV). Split-KV combine of the fully-masked
+        // prefix tiles is wrong, so local/SWA never runs FD.
+        if (maskType == static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)) {
+            flashDecodeFlag = 0U;
+        }
 
         // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
         uint64_t Lsesize = 0;
@@ -368,7 +374,9 @@ class FAInferKernel {
 
         totalQTokens = 0;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-            totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));
+            // LSE is (num_heads, q.size(0)). Host passes that length; it may
+            // exceed cu_seqlens_q[-1] when the packed tail is unused.
+            totalQTokens = static_cast<uint32_t>(fARuntimeData->totalQTokens);
         }
 
         StackDescriptor descriptors[STACK_SLOTS];
@@ -423,15 +431,11 @@ class FAInferKernel {
                         bool isSplitKV = (enS2IdxNow - stS2IdxNow) > 0 &&
                                          (enS2IdxNow - stS2IdxNow) < static_cast<int32_t>(curKSBlockNumTmp);
 
-                        uint32_t pipelineDrain = 0;
-                        if (BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow) {
-                            pipelineDrain = PRE_LAUNCH;
-                        }
                         const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
                         const bool hasTaskWork = runMainLoop(
                             coreIdx, BIdx, qSeqlenCur, kvSeqlenCur, (uint32_t)n1Idx, (uint32_t)s1Idx, isSplitKV,
                             stS2IdxNow, enS2IdxNow, gmOffsetLseFD, gmOffsetOFD, globalTensors, descriptors,
-                            currentTaskStateSlot, issuedStackCount, pipelineDrain, softmaxPingPongFlag);
+                            currentTaskStateSlot, issuedStackCount, PRE_LAUNCH, softmaxPingPongFlag);
                         taskStateSequence += static_cast<uint32_t>(hasTaskWork);
 
                         if (isSplitKV) {
@@ -497,14 +501,10 @@ class FAInferKernel {
                 uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
                 uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
 
-                uint32_t pipelineDrain = 0;
-                if (taskIdx + uint32_t(coreNum) >= totalTaskNum) {
-                    pipelineDrain = PRE_LAUNCH;
-                }
                 const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
                 const bool hasTaskWork = runMainLoop(
                     coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0, 0, 0, 0,
-                    globalTensors, descriptors, currentTaskStateSlot, issuedStackCount, pipelineDrain,
+                    globalTensors, descriptors, currentTaskStateSlot, issuedStackCount, PRE_LAUNCH,
                     softmaxPingPongFlag);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
@@ -808,6 +808,11 @@ class FAInferKernel {
         uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
         uint32_t taskStackCount = 0;
 
+        // Each Q tile fully drains its own KV stacks. Cross-task delayed PV
+        // left 2-stack dense tiles with no PV of their own and systematically
+        // wrong O (max|err|~8 on long KV). Within-task PRE_LAUNCH overlap is kept.
+        issuedStackCount = 0;
+
         const bool taskOwnsSink = hasSink && (stS2IdxNow == 0);
         const bool isEmptyTask = kvStart >= kvEnd;
         if (__builtin_expect(isEmptyTask, false)) {
@@ -819,19 +824,18 @@ class FAInferKernel {
                 epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize,
                                 embedV, static_cast<uint32_t>(oHeadStride));
                 if (taskOwnsSink) {
+                    // gLse is the full BNS/NT buffer. lseBOffset is the batch base;
+                    // head and token offsets are applied inside the overwrite.
                     epilogueRescaleO.OverwriteEmptyTaskLse(
-                        gLse, lseHeadStride, qSBlockIdx * curQSBlockTile, qSBlockSize, qNBlockSize, qNStartIdx, gSink);
+                        gLse[lseBOffset], lseHeadStride, qSBlockIdx * curQSBlockTile, qSBlockSize, qNBlockSize,
+                        qNStartIdx, gSink);
                 }
             } else if (taskOwnsSink) {
                 epilogueRescaleO.OverwriteEmptySplitLse(
                     gLseFD[gmOffsetLseFD], qSBlockSize, qNBlockSize, qNStartIdx, gSink);
             }
 #endif
-            if (pipelineDrain == 0) {
-                return false;
-            }
-            // A final empty task still drains the preceding tasks' delayed PV.
-            kvStart = kvEnd;
+            return false;
         }
 
 #ifdef __DAV_C220_CUBE__

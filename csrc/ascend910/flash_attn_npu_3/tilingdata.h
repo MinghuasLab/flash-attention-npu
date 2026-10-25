@@ -327,6 +327,9 @@ struct FAInferTilingParams {
     uint64_t valueTokenStride;
     uint64_t keyHeadStride;
     uint64_t valueHeadStride;
+    // TND LSE is (num_heads, q.size(0)). q.size(0) may exceed cu_seqlens_q[-1];
+    // the extra tail is unused storage and this stride keeps head rows apart.
+    uint64_t totalQTokens;
 };
 
 #endif

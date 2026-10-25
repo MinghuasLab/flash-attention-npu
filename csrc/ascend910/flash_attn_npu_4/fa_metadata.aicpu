@@ -105,11 +105,14 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        // FD scheduling only depends on the logical attention shape. Paged vs.
-        // dense KV and TND vs. BSND affect address calculation in the forward
-        // kernel, not whether the KV sequence can be split across cores.
-        const bool fdFlag = (metaArgs->numSplits != 1u) && (maxQ * groupSize <= 128u) &&
-            (maxQ <= 16u) && (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+        // FD scheduling depends on the logical attention shape plus isLocal.
+        // Sliding-window valid keys sit in the last KV stacks; split-KV
+        // combine of the empty prefix tiles is wrong (matches host !is_local).
+        // Paged vs. dense KV and TND vs. BSND affect address calculation, not
+        // whether a non-local KV sequence can be split across cores.
+        const bool fdFlag = (metaArgs->numSplits != 1u) && (metaArgs->isLocal == 0u) &&
+            (maxQ * groupSize <= 128u) && (maxQ <= 16u) && (maxKvSeqlen >= 1024u) &&
+            (minQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
         if (fdFlag) {
             fa_split::SplitContext ctx;

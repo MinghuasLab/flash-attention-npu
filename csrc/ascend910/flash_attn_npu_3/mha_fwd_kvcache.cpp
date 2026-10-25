@@ -394,7 +394,9 @@ class FAInferKernel {
 
         totalQTokens = 0;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-            totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));
+            // LSE is (num_heads, q.size(0)). Host passes that length; it may
+            // exceed cu_seqlens_q[-1] when the packed tail is unused.
+            totalQTokens = static_cast<uint32_t>(params.tiling.totalQTokens);
         }
 
         StackDescriptor descriptors[STACK_SLOTS];
@@ -687,7 +689,8 @@ class FAInferKernel {
         }
         // LSE output is head-major (BNS). The batch base and the per-head stride
         // depend on layout:
-        //   TND  -> {num_heads, total_q}:  batch folded into global token, head stride = totalQTokens
+        //   TND  -> {num_heads, q.size(0)}: batch folded into global token,
+        //           head stride = totalQTokens (may exceed cu_seqlens_q[-1])
         //   BSND -> {batch, num_heads, seqlen_q}: batch base = prevQSeqlenSum*qHeads, head stride = maxQSeqlen
         //   BNSD -> same (B, num_heads, seqlen_q) storage as BSND.
         uint64_t lseBOffset;

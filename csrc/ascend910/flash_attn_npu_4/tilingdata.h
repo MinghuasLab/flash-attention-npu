@@ -265,6 +265,9 @@ struct FAInferRuntimeData {
     uint64_t valueTokenStride;
     uint64_t keyHeadStride;
     uint64_t valueHeadStride;
+    // TND LSE is (num_heads, q.size(0)). q.size(0) may exceed cu_seqlens_q[-1];
+    // the extra tail is unused storage and this stride keeps head rows apart.
+    uint64_t totalQTokens;
 
     uint32_t get_numBlocks() const
     {
@@ -322,6 +325,10 @@ struct FAInferRuntimeData {
     {
         return valueHeadStride;
     }
+    uint64_t get_totalQTokens() const
+    {
+        return totalQTokens;
+    }
 
     void set_numBlocks(uint32_t value)
     {
@@ -378,6 +385,10 @@ struct FAInferRuntimeData {
     void set_valueHeadStride(uint64_t value)
     {
         valueHeadStride = value;
+    }
+    void set_totalQTokens(uint64_t value)
+    {
+        totalQTokens = value;
     }
 };
 

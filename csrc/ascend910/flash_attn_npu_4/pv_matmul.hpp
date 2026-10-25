@@ -320,8 +320,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 pageOff = 0U;
             }
         } else {
-            const uint32_t gOffset =
-                nIdx * maxKVStackLen * strideKV + kChunkIdx * l1KDynamic * strideKV + nSliceIdx * l1VSliceWidth;
+            const uint64_t gOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV +
+                                     static_cast<uint64_t>(kChunkIdx) * l1KDynamic * strideKV +
+                                     static_cast<uint64_t>(nSliceIdx) * l1VSliceWidth;
             auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kChunkLen, nSliceLen));
             copyGmToL1B(l1VTensor[stage], gB[gOffset], layoutBInL1, layoutBTile);
         }
@@ -342,23 +343,19 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
         Arch::CrossCoreWaitFlag(softmaxFlag);
 
-        // Head-dim slice is the outer loop; L0C holds one 128-wide O slice and
-        // V uses the dedicated two-stage pool.
+        // D>256 has many inner L1 tiles. Shared QK/PV ping-pong desynchronizes
+        // event 0/1 across those extra loops; keep the pre-pipeline local cadence.
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             const uint32_t nL1Actual = (nL1Idx < nL1Loop - 1U) ? L0TileShape::N : (embed - nL1Idx * L0TileShape::N);
             for (uint32_t mL1Idx = 0; mL1Idx < mL1Loop; ++mL1Idx) {
                 const uint32_t mL1Actual =
                     (mL1Idx < mL1Loop - 1U) ? L1TileShape::M : (rowNum - mL1Idx * L1TileShape::M);
-                l0CPingPongFlag = pingPongState->l0CPingPongFlag;
-                pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
 
                 for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; ++kL1Idx) {
                     const uint32_t kL1Actual =
                         (kL1Idx < kL1Loop - 1U) ? l1KDynamic : (stackSeqTile - kL1Idx * l1KDynamic);
                     const uint32_t vStage = kL1Idx % l1VStages;
-                    l1PPingPongFlag = pingPongState->l1PingPongFlag;
-                    pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
 
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1PPingPongFlag);
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
@@ -377,8 +374,6 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     for (uint32_t kL0Idx = 0; kL0Idx < kL0Loop; ++kL0Idx) {
                         const uint32_t kL0Actual =
                             (kL0Idx < kL0Loop - 1U) ? L0TileShape::K : (kL1Actual - kL0Idx * L0TileShape::K);
-                        l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
-                        pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
 
                         LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL1Actual, kL0Actual);
                         MatrixCoord l1ATileCoord{0, kL0Idx * L0TileShape::K};
@@ -412,7 +407,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                  mL0Align, nL1Actual, kL0Actual, (kL1Idx == 0U && kL0Idx == 0U));
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
+                        l0ABPingPongFlag = 1U - l0ABPingPongFlag;
                     }
+                    l1PPingPongFlag = 1U - l1PPingPongFlag;
                 }
 
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -422,6 +419,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL1Actual, nL1Actual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
+                l0CPingPongFlag = 1U - l0CPingPongFlag;
             }
         }
     }

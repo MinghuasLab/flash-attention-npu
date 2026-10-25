@@ -80,6 +80,45 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if (
+        x.stride(1) == num_heads * head_dim
+        and x.stride(2) == head_dim
+        and x.stride(3) == 1
+    ):
+        return "BBND"
+    if (
+        x.stride(1) == head_dim
+        and x.stride(2) == page_size * head_dim
+        and x.stride(3) == 1
+    ):
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table):
+    """Match FIA's stride policy before entering the packed FA4 kernel.
+
+    Q and dense K/V are materialized because the kernel uses fixed packed
+    strides. Paged K/V keep their zero-copy path when both caches have the
+    same packed BBND or BNBD inner layout; dimension 0 may still be strided.
+    Unsupported paged inner layouts fall back to contiguous logical BBND.
+    """
+    q = q.contiguous()
+    if page_table is None:
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    return q, k.contiguous(), v.contiguous()
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -175,8 +214,7 @@ def _flash_attn_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if cu_seqlens_q is not None:
         _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
-    q, k = [maybe_contiguous(x) for x in (q, k)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q, k, v = _prepare_forward_qkv(q, k, v, page_table)
     cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
     seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
     page_table = maybe_contiguous(page_table)
@@ -693,8 +731,6 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors_bwd=None,
         return_lse=False,
     ):
-        assert k.stride(-1) == 1, "k must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
 
@@ -884,8 +920,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     ):
         if cu_seqlens_q is not None:
             _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
-        assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # cu_seqlens_q packs the query (TND); otherwise the rank-4 data is BSND.
@@ -895,35 +929,37 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_k = maybe_contiguous(seqused_k)
 
         fwd_max_seqlen_k = max_seqlen_k
-        if (
-            scheduler_metadata is None
-            and not disable_scheduler_metadata
-            and cu_seqlens_q is not None
-            and q.shape[0] != 0
-        ):
-            num_heads = q.shape[1]
-            head_size = q.shape[2]
+        if scheduler_metadata is None and not disable_scheduler_metadata and q.shape[0] != 0:
+            is_varlen_q = cu_seqlens_q is not None
+            num_heads = q.shape[1] if is_varlen_q else q.shape[2]
+            head_size = q.shape[2] if is_varlen_q else q.shape[3]
             head_size_v = v.shape[-1]
             num_heads_k = k.shape[1] if k.dim() == 3 else k.shape[2]
             if seqused_k is not None:
                 cache_seqlens = seqused_k
+            elif not is_varlen_q:
+                cache_seqlens = torch.full(
+                    (q.shape[0],), k.shape[1], dtype=torch.int32, device=q.device
+                )
             else:
                 cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             if seqused_q is not None:
                 seqlens_q_arg = seqused_q
+            elif not is_varlen_q:
+                seqlens_q_arg = None
             else:
                 seqlens_q_arg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            metadata_max_seqlen_q = max_seqlen_q if is_varlen_q else q.shape[1]
             metadata_max_seqlen_k = max_seqlen_k
+            if metadata_max_seqlen_k is None and not is_varlen_q and page_table is None:
+                metadata_max_seqlen_k = k.shape[1]
             if metadata_max_seqlen_k is None and page_table is not None and k.dim() == 4:
-                # Paged KV: normalize the SWA window against the actual max KV
-                # seqlen (not the page capacity), matching the host tiling /
-                # golden rule "both sides vs actual seqlen_k". Otherwise a
-                # finite window smaller than the page capacity but larger than
-                # the actual seqlen fails to collapse and yields a wrong mask.
-                metadata_max_seqlen_k = int(cache_seqlens.max().item())
+                # Match FIA: classify the window against paged-cache capacity;
+                # seqused_k still supplies the actual lengths used for alignment.
+                metadata_max_seqlen_k = page_table.shape[1] * k.shape[1]
                 fwd_max_seqlen_k = metadata_max_seqlen_k
             scheduler_metadata = get_scheduler_metadata(
-                max_seqlen_q=max_seqlen_q,
+                max_seqlen_q=metadata_max_seqlen_q,
                 max_seqlen_k=metadata_max_seqlen_k,
                 nheads=num_heads,
                 nheads_kv=num_heads_k,

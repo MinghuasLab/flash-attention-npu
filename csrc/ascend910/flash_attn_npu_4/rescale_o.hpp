@@ -601,6 +601,9 @@ public:
                             }
                         }
                     }
+                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
@@ -646,6 +649,9 @@ public:
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
+                        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
+                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }
             }
@@ -688,7 +694,8 @@ public:
             sinkRows.SetValue(row, 0.0f);
             scale.SetValue(row, 1.0f);
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
 
         for (uint32_t off = 0; off < curRowNum; off += FLOAT_VECTOR_SIZE) {
             uint32_t n = AscendC::Std::min(FLOAT_VECTOR_SIZE, curRowNum - off);
@@ -696,29 +703,22 @@ public:
             AscendC::Adds<float, false>(
                 oldMax[off], gmUbTensor[stateRowOffset + off], 0.0f, (uint64_t)0, 1,
                 AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Max<float, false>(
                 gmUbTensor[stateRowOffset + off], oldMax[off], sinkRows[off], (uint64_t)0, 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Sub<float, false>(
                 scale[off], oldMax[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp<float, false>(
                 scale[off], scale[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul<float, false>(
                 glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], scale[off], (uint64_t)0, 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Sub<float, false>(
                 sinkRows[off], sinkRows[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp<float, false>(
                 sinkRows[off], sinkRows[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add<float, false>(
                 glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], sinkRows[off], (uint64_t)0, 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -759,9 +759,17 @@ public:
             uint32_t n = AscendC::Std::min(FLOAT_VECTOR_SIZE, count - off);
             AscendC::Duplicate(lseStagingUbTensor, value, n);
             AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopyPad(
-                dst[off * stride], lseStagingUbTensor,
-                AscendC::DataCopyExtParams(n, sizeof(float), 0, (stride - 1U) * sizeof(float), 0));
+            // stride=1 must be one contiguous block. blockCount=n / blockLen=4
+            // with dstStride=0 only lands one 32B burst (8 floats) on MTE3.
+            if (stride <= 1U) {
+                AscendC::DataCopyPad(
+                    dst[off], lseStagingUbTensor,
+                    AscendC::DataCopyExtParams(1, n * sizeof(float), 0, 0, 0));
+            } else {
+                AscendC::DataCopyPad(
+                    dst[off * stride], lseStagingUbTensor,
+                    AscendC::DataCopyExtParams(n, sizeof(float), 0, (stride - 1U) * sizeof(float), 0));
+            }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
