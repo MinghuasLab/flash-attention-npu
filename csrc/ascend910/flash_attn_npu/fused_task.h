@@ -32,8 +32,9 @@ FA_TASK_INLINE uint32_t HeadTile(uint32_t qRows, uint32_t groupSize, uint32_t nC
             --tile;
         }
     }
-    // Limit the row state occupied by one fused task.
-    while (tile > 1 && tile * qRows > SUB_CORE_ROWS) {
+    // v2 splits whole heads between vectors (except a single head). Each
+    // vector owns 64 state rows; an odd head count must fit the larger half.
+    while (tile > 1 && CeilDiv(tile, 2) * qRows > SUB_CORE_ROWS) {
         if (tile > groupSize) {
             tile -= groupSize;
         } else {
