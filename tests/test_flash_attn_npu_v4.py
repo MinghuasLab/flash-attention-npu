@@ -1006,7 +1006,7 @@ def _assert_causal_empty_prefix(out, lse, sink, seqlen_q, seqlen_k):
         (640, 128),
     ],
 )
-def test_flash_attn_output(
+def test_flash_attn_sink(
     seqlen_q,
     seqlen_k,
     d,
@@ -1089,6 +1089,265 @@ def test_flash_attn_output(
         assert_fa_close(lse, lse_ref, lse_pt, name=f"softmax_lse splits={num_splits}")
         if causal:
             _assert_causal_empty_prefix(out, lse, sink, seqlen_q, seqlen_k)
+
+
+# Subset of tests/test_flash_attn_npu_v4_generalize.py sink cases: dense BSND,
+# packed TND, and paged BBND/BNBD, mixing short and long sequences. Softcap,
+# SWA, head-dim 512, and noncontiguous paged caches are left in generalize.
+_SINK_PAGE = 128
+_SINK_LAYOUT_CASES = [
+    # dense BSND: short
+    {"id": "bsnd-s-mha", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [8, 8], "kv": [8, 8], "causal": False},
+    {"id": "bsnd-s-mqa", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 64, "q": [16, 16], "kv": [16, 16], "causal": False},
+    {"id": "bsnd-s-gqa-causal", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32, 32], "kv": [32, 32], "causal": True},
+    {"id": "bsnd-decode", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [128], "causal": True},
+    # dense BSND: medium / empty prefix
+    {"id": "bsnd-m-128", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 128, "q": [128, 128], "kv": [128, 128], "causal": False},
+    {"id": "bsnd-m-256-causal", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [256, 256], "kv": [256, 256], "causal": True},
+    {"id": "bsnd-empty-prefix", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [192], "kv": [64], "causal": True},
+    # dense BSND: long
+    {"id": "bsnd-l-decode-2k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1], "kv": [2048], "causal": True},
+    {"id": "bsnd-l-decode-4k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [16], "kv": [4096], "causal": False},
+    {"id": "bsnd-l-prefill-1k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 128, "q": [1024], "kv": [1024], "causal": True},
+    {"id": "bsnd-fp16-mid", "api": "func", "layout": "BSND", "dtype": torch.float16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64, 64], "kv": [128, 128], "causal": False},
+    {"id": "bsnd-fp16-decode", "api": "func", "layout": "BSND", "dtype": torch.float16, "nheads": 8, "kv_heads": 8, "d": 128, "q": [1, 1], "kv": [512, 512], "causal": True},
+    {"id": "bsnd-d192", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 192, "q": [64], "kv": [128], "causal": False},
+    {"id": "bsnd-d256", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 256, "q": [32], "kv": [128], "causal": False},
+    # packed TND: short
+    {"id": "tnd-s", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [4, 7, 1], "kv": [8, 9, 5], "causal": False},
+    {"id": "tnd-s-gqa", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [8, 16], "kv": [16, 32], "causal": False},
+    {"id": "tnd-uneven-causal", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [3, 17, 9], "kv": [20, 40, 16], "causal": True},
+    {"id": "tnd-tiny", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [2, 3, 4], "kv": [8, 8, 8], "causal": False},
+    {"id": "tnd-decode", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 1, 1], "kv": [128, 256, 64], "causal": True},
+    # packed TND: medium / long
+    {"id": "tnd-m", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64, 128], "kv": [128, 256], "causal": False},
+    {"id": "tnd-prefill", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [256], "kv": [256], "causal": True},
+    {"id": "tnd-l-kv", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1, 1], "kv": [2048, 1024], "causal": True},
+    {"id": "tnd-l-mix", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [8, 1, 32], "kv": [512, 2048, 128], "causal": False},
+    {"id": "tnd-qgtkv-causal", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [128, 64], "kv": [32, 80], "causal": True},
+    {"id": "tnd-fp16", "api": "varlen", "layout": "TND", "dtype": torch.float16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [16, 24], "kv": [32, 48], "causal": False},
+    {"id": "tnd-mqa", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [5, 7], "kv": [64, 96], "causal": True},
+    # paged BBND
+    {"id": "bbnd-decode-128", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 64, "q": [1], "kv": [128], "causal": True},
+    {"id": "bbnd-decode-gqa", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1, 1], "kv": [256, 128], "causal": True},
+    {"id": "bbnd-s", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [16, 16], "kv": [128, 128], "causal": False},
+    {"id": "bbnd-m", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [64], "kv": [256], "causal": False},
+    {"id": "bbnd-prefill", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 8, "d": 64, "q": [128], "kv": [128], "causal": True},
+    {"id": "bbnd-causal", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32, 16], "kv": [256, 128], "causal": True},
+    {"id": "bbnd-l-2k", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [2048], "causal": True},
+    {"id": "bbnd-l-4k", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [8], "kv": [4096], "causal": False},
+    {"id": "bbnd-fp16-decode", "api": "paged", "layout": "BBND", "dtype": torch.float16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [1], "kv": [512], "causal": True},
+    {"id": "bbnd-d192", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 192, "q": [4], "kv": [256], "causal": False},
+    {"id": "bbnd-mqa", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 2], "kv": [128, 256], "causal": True},
+    {"id": "bbnd-gqa-mid", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [48, 80], "kv": [192, 320], "causal": False},
+    # paged BNBD
+    {"id": "bnbd-decode-128", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [1], "kv": [128], "causal": True},
+    {"id": "bnbd-s", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 128, "q": [8, 12], "kv": [64, 96], "causal": False},
+    {"id": "bnbd-m-causal", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32], "kv": [256], "causal": True},
+    {"id": "bnbd-prefill", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64], "kv": [256], "causal": False},
+    {"id": "bnbd-l-2k", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [2048], "causal": True},
+    {"id": "bnbd-l-4k", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [4], "kv": [4096], "causal": False},
+    {"id": "bnbd-fp16", "api": "paged", "layout": "BNBD", "dtype": torch.float16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [16, 8], "kv": [128, 192], "causal": False},
+    {"id": "bnbd-d256", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 256, "q": [1], "kv": [256], "causal": True},
+    {"id": "bnbd-gqa", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 128, "q": [24, 40], "kv": [160, 288], "causal": True},
+    {"id": "bnbd-uneven", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [1, 16, 8], "kv": [256, 128, 512], "causal": False},
+    {"id": "bnbd-mqa-long", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 1], "kv": [1024, 2048], "causal": True},
+    {"id": "bnbd-tiny", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [3, 5], "kv": [64, 128], "causal": False},
+]
+
+
+def _sink_causal_mask(qlen, kvlen):
+    if qlen == 0 or kvlen == 0:
+        return None
+    return torch.triu(torch.ones(qlen, kvlen), diagonal=(kvlen - qlen + 1)).bool()
+
+
+def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal):
+    qlen, kvlen, nheads = query.shape[1], key.shape[1], query.shape[2]
+    if qlen == 0:
+        empty = query[:, :0]
+        empty_lse = query.new_empty((query.shape[0], nheads, 0), dtype=torch.float32)
+        return empty, empty_lse, empty.clone(), empty_lse.clone()
+    if kvlen == 0:
+        zeros = torch.zeros_like(query)
+        lse = sink.detach().float().view(1, nheads, 1).expand(query.shape[0], nheads, qlen).contiguous()
+        return zeros, lse, zeros.clone(), lse.clone()
+    mask = _sink_causal_mask(qlen, kvlen) if causal else None
+    sink_matrix = _sink_matrix(sink, query.shape[0], nheads, qlen)
+    out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+        query, key, value, scale, mask, dtype, rescale_threshold=None, sink_matrix=sink_matrix
+    )
+    if mask is not None:
+        fully = mask.all(dim=-1)
+        out_ref = out_ref.clone()
+        out_pt = out_pt.clone()
+        out_ref[:, fully] = 0
+        out_pt[:, fully] = 0
+    return out_ref, lse_ref, out_pt, lse_pt
+
+
+def _sink_page_table(kv_lens):
+    pages = [max(1, (length + _SINK_PAGE - 1) // _SINK_PAGE) for length in kv_lens]
+    width = max(pages)
+    table = torch.zeros((len(kv_lens), width), dtype=torch.int32)
+    cursor = 0
+    for row, count in enumerate(pages):
+        table[row, :count] = torch.arange(cursor, cursor + count, dtype=torch.int32)
+        cursor += count
+    return table, cursor
+
+
+def _sink_paged_view(logical, layout):
+    if layout == "BBND":
+        return logical
+    pages, page, heads, dim = logical.shape
+    physical = torch.empty(pages, heads, page, dim, dtype=logical.dtype, device=logical.device)
+    physical.copy_(logical.transpose(1, 2))
+    return physical.transpose(1, 2)
+
+
+def _sink_gather(cache, table_row, kvlen):
+    if kvlen == 0:
+        return cache.new_empty((0, cache.shape[2], cache.shape[3]))
+    positions = torch.arange(kvlen, device=cache.device)
+    table = table_row.to(device=cache.device, dtype=torch.long)
+    return cache[table[positions // _SINK_PAGE], positions % _SINK_PAGE]
+
+
+def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sink, causal, table=None):
+    pieces = []
+    q_off = 0
+    k_off = 0
+    for row, (qlen, kvlen) in enumerate(zip(q_lens, kv_lens)):
+        query_i = query[q_off : q_off + qlen]
+        q_off += qlen
+        if table is None:
+            key_i = key[k_off : k_off + kvlen]
+            value_i = value[k_off : k_off + kvlen]
+            k_off += kvlen
+        else:
+            key_i = _sink_gather(key, table[row], kvlen)
+            value_i = _sink_gather(value, table[row], kvlen)
+        if qlen == 0:
+            continue
+        out_ref, lse_ref, out_pt, lse_pt = _sink_reference_bsnd(
+            query_i.unsqueeze(0),
+            key_i.unsqueeze(0),
+            value_i.unsqueeze(0),
+            scale,
+            dtype,
+            sink,
+            causal,
+        )
+        pieces.append((out_ref[0], lse_ref[0], out_pt[0], lse_pt[0]))
+    if not pieces:
+        empty = query.new_empty((0, query.shape[1], query.shape[2]))
+        empty_lse = query.new_empty((query.shape[1], 0), dtype=torch.float32)
+        return empty, empty_lse, empty.clone(), empty_lse.clone()
+    out_refs, lse_refs, out_pts, lse_pts = zip(*pieces)
+    return (
+        torch.cat(out_refs, dim=0),
+        torch.cat(lse_refs, dim=-1),
+        torch.cat(out_pts, dim=0),
+        torch.cat(lse_pts, dim=-1),
+    )
+
+
+@pytest.mark.parametrize("cfg", _SINK_LAYOUT_CASES, ids=[c["id"] for c in _SINK_LAYOUT_CASES])
+def test_flash_attn_sink_layouts(cfg):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend950" in name:
+        pytest.skip("learnable_sink is supported only on Ascend910")
+    if "Ascend910" not in name:
+        pytest.skip("flash_attn sink layouts require Ascend910")
+
+    torch.manual_seed(0)
+    q_lens, kv_lens = cfg["q"], cfg["kv"]
+    nheads, kv_heads, head_dim, dtype = cfg["nheads"], cfg["kv_heads"], cfg["d"], cfg["dtype"]
+    scale = head_dim ** -0.5
+    sink = make_random_tensor((nheads,), torch.bfloat16, device="npu")
+    sink_cpu = sink.detach().cpu()
+    kwargs = dict(
+        softmax_scale=scale,
+        causal=cfg["causal"],
+        learnable_sink=sink,
+        num_splits=1,
+        return_lse=True,
+    )
+
+    if cfg["api"] == "func":
+        batch = len(q_lens)
+        query = make_random_tensor((batch, q_lens[0], nheads, head_dim), dtype, device="npu")
+        key = make_random_tensor((batch, kv_lens[0], kv_heads, head_dim), dtype, device="npu")
+        value = make_random_tensor((batch, kv_lens[0], kv_heads, head_dim), dtype, device="npu")
+        out, lse = flash_attn_func(query, key, value, **kwargs)
+        out_ref, lse_ref, out_pt, lse_pt = _sink_reference_bsnd(
+            query.detach().cpu(),
+            key.detach().cpu(),
+            value.detach().cpu(),
+            scale,
+            dtype,
+            sink_cpu,
+            cfg["causal"],
+        )
+        assert_fa_close(out, out_ref, out_pt, name="out")
+        assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")
+        if cfg["causal"]:
+            _assert_causal_empty_prefix(out, lse, sink, q_lens[0], kv_lens[0])
+        return
+
+    query = make_packed_random_tensor(q_lens, max(q_lens), nheads, head_dim, dtype, device="npu")
+    if cfg["api"] == "varlen":
+        key = make_packed_random_tensor(kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu")
+        value = make_packed_random_tensor(kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu")
+        table = None
+        out, lse = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=make_cu_seqlens(q_lens).npu(),
+            cu_seqlens_k=make_cu_seqlens(kv_lens).npu(),
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(kv_lens),
+            **kwargs,
+        )
+        key_ref, value_ref = key.detach().cpu(), value.detach().cpu()
+    else:
+        table, num_pages = _sink_page_table(kv_lens)
+        key_logical = make_random_tensor(
+            (num_pages, _SINK_PAGE, kv_heads, head_dim), dtype, device="npu"
+        )
+        value_logical = make_random_tensor(
+            (num_pages, _SINK_PAGE, kv_heads, head_dim), dtype, device="npu"
+        )
+        key = _sink_paged_view(key_logical, cfg["layout"])
+        value = _sink_paged_view(value_logical, cfg["layout"])
+        out, lse = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=make_cu_seqlens(q_lens).npu(),
+            max_seqlen_q=max(q_lens),
+            seqused_k=torch.tensor(kv_lens, dtype=torch.int32, device="npu"),
+            page_table=table.npu(),
+            **kwargs,
+        )
+        key_ref, value_ref = key_logical.detach().cpu(), value_logical.detach().cpu()
+
+    out_ref, lse_ref, out_pt, lse_pt = _sink_packed_reference(
+        query.detach().cpu(),
+        key_ref,
+        value_ref,
+        q_lens,
+        kv_lens,
+        scale,
+        dtype,
+        sink_cpu,
+        cfg["causal"],
+        table=table,
+    )
+    assert_fa_close(out, out_ref, out_pt, name="out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")
 
 
 # flash_attn_varlen_func test parameters (Ascend950 head_dim<=256 coverage, NPU only)

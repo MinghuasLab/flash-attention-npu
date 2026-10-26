@@ -80,6 +80,57 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if (
+        x.stride(1) == num_heads * head_dim
+        and x.stride(2) == head_dim
+        and x.stride(3) == 1
+    ):
+        return "BBND"
+    if (
+        x.stride(1) == head_dim
+        and x.stride(2) == page_size * head_dim
+        and x.stride(3) == 1
+    ):
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
+    """Apply the same forward stride policy as FA4 and FIA.
+
+    Dense operands use fixed packed kernel strides and are materialized. Paged
+    K/V remain zero-copy when both caches have the same packed BBND or BNBD
+    inner layout; dimension 0 may still be strided. Other paged views fall
+    back to packed BBND storage.
+
+    Append-KV is the exception: replacing a cache with a temporary contiguous
+    copy would lose the API's in-place cache update, so an unsupported cache
+    view is rejected instead of copied.
+    """
+    q = q.contiguous()
+    if page_table is None:
+        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
+            raise RuntimeError(
+                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
+            )
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    if append_kv:
+        raise RuntimeError(
+            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
+        )
+    return q, k.contiguous(), v.contiguous()
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -189,8 +240,22 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     layout: int = _LAYOUT_BSND,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = max_seqlen_q
+    elif layout == _LAYOUT_BNSD:
+        batch_size, _, seqlen_q, _ = q.shape
+    else:
+        batch_size, seqlen_q, _, _ = q.shape
+    _check_fwd_dimension(batch_size, "batch_size")
+    _check_fwd_dimension(seqlen_q, "max_seqlen_q" if is_varlen_q else "seqlen_q")
+
+    q, k, v = _prepare_forward_qkv(
+        q, k, v, page_table, append_kv=k_new is not None or v_new is not None
+    )
+    k_new, v_new = [maybe_contiguous(x) for x in (k_new, v_new)]
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     ]

@@ -1663,6 +1663,143 @@ def test_paged_tnd_total_q_zero_fast_path():
     assert out.numel() == 0 and lse.numel() == 0
 
 
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize(
+    "q_lengths,kv_lengths,extra_q,extra_kv,causal,paged",
+    [
+        ([4, 7, 1], [8, 9, 5], 6, 0, False, False),
+        ([4, 7, 1], [8, 9, 5], 6, 5, True, False),
+        ([0, 3, 6], [4, 0, 20], 9, 0, True, True),
+        ([2, 5], [16, 12], 4, 0, False, True),
+    ],
+)
+def test_tnd_total_exceeds_cu_seqlens_q(q_lengths, kv_lengths, extra_q, extra_kv, causal, paged):
+    """Packed TND storage may be longer than cu_seqlens[-1]; the tail is unused."""
+    num_heads, kv_heads, head_size = 4, 2, 64
+    dtype = torch.float16
+    used_q = sum(q_lengths)
+    used_k = sum(kv_lengths)
+    cu_q = make_cu_seqlens(q_lengths).npu()
+    assert int(cu_q[-1]) == used_q
+
+    query = torch.randn((used_q, num_heads, head_size), dtype=dtype, device="npu")
+    query_padded = torch.cat(
+        [query, torch.randn((extra_q, num_heads, head_size), dtype=dtype, device="npu")],
+        dim=0,
+    )
+    assert query_padded.shape[0] > int(cu_q[-1])
+
+    if paged:
+        page_size = 128
+        num_pages = len(kv_lengths)
+        key = torch.randn((num_pages, page_size, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        kwargs = dict(
+            cache_seqlens=torch.tensor(kv_lengths, dtype=torch.int32, device="npu"),
+            page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(num_pages, 1),
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max(q_lengths),
+            causal=causal,
+            num_splits=1,
+            return_softmax_lse=True,
+        )
+        out_ref, lse_ref, *_ = flash_attn_with_kvcache(query, key, value, **kwargs)
+        out_pad, lse_pad, *_ = flash_attn_with_kvcache(query_padded, key, value, **kwargs)
+    else:
+        cu_k = make_cu_seqlens(kv_lengths).npu()
+        key = torch.randn((used_k, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        if extra_kv:
+            key = torch.cat(
+                [key, torch.randn((extra_kv, kv_heads, head_size), dtype=dtype, device="npu")],
+                dim=0,
+            )
+            value = torch.cat(
+                [value, torch.randn((extra_kv, kv_heads, head_size), dtype=dtype, device="npu")],
+                dim=0,
+            )
+            assert key.shape[0] > int(cu_k[-1])
+        out_ref, lse_ref = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_q,
+            cu_k,
+            max(q_lengths),
+            max(kv_lengths),
+            causal=causal,
+            return_attn_probs=True,
+        )
+        out_pad, lse_pad = flash_attn_varlen_func(
+            query_padded,
+            key,
+            value,
+            cu_q,
+            cu_k,
+            max(q_lengths),
+            max(kv_lengths),
+            causal=causal,
+            return_attn_probs=True,
+        )
+
+    assert out_pad.shape[0] == used_q + extra_q
+    assert lse_pad.shape == (num_heads, used_q + extra_q)
+    torch.testing.assert_close(out_pad[:used_q], out_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(lse_pad[:, :used_q], lse_ref, rtol=2e-3, atol=2e-3, equal_nan=True)
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize("paged", [False, True])
+def test_tnd_total_shorter_than_cu_seqlens_q_errors(paged):
+    """Packed T smaller than cu_seqlens_q[-1] would read past q."""
+    num_heads, kv_heads, head_size = 4, 2, 64
+    dtype = torch.float16
+    q_lengths = [4, 7, 1]
+    kv_lengths = [8, 9, 5]
+    cu_q = make_cu_seqlens(q_lengths).npu()
+    used_q = int(cu_q[-1])
+    query = torch.randn((used_q - 1, num_heads, head_size), dtype=dtype, device="npu")
+    assert query.shape[0] < used_q
+    if paged:
+        page_size = 128
+        num_pages = len(kv_lengths)
+        key = torch.randn((num_pages, page_size, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        with pytest.raises(RuntimeError, match="cu_seqlens_q"):
+            flash_attn_with_kvcache(
+                query,
+                key,
+                value,
+                cache_seqlens=torch.tensor(kv_lengths, dtype=torch.int32, device="npu"),
+                page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(num_pages, 1),
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=max(q_lengths),
+                causal=True,
+                num_splits=1,
+            )
+    else:
+        used_k = sum(kv_lengths)
+        key = torch.randn((used_k, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        with pytest.raises(RuntimeError, match="cu_seqlens_q"):
+            flash_attn_varlen_func(
+                query,
+                key,
+                value,
+                cu_q,
+                make_cu_seqlens(kv_lengths).npu(),
+                max(q_lengths),
+                max(kv_lengths),
+                causal=True,
+            )
+
+
 _FWD_INT32_MAX = 2**31 - 1
 
 
@@ -1875,3 +2012,112 @@ def test_v3_bnsd_flash_attn_with_kvcache(
     assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
     assert_fa_close(out, out_ref, out_pt, name="v3_bnsd_kvcache_out")
     assert_fa_close(lse, lse_ref, lse_pt, name="v3_bnsd_kvcache_lse")
+
+
+def _fa3_inner_strided(source):
+    """Keep logical values and the last-dimension stride while padding every row."""
+    padded = torch.zeros(
+        *source.shape[:-1], source.shape[-1] + 1, dtype=source.dtype, device=source.device
+    )
+    view = padded[..., : source.shape[-1]]
+    view.copy_(source)
+    assert view.stride(-1) == 1 and not view.is_contiguous()
+    return view
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize(
+    "targets",
+    (("key",), ("value",), ("key", "value")),
+    ids=("key", "value", "all-caches"),
+)
+def test_fa3_paged_inner_noncontiguous_falls_back_to_contiguous(targets):
+    """Match FA4/FIA: unsupported paged inner strides are materialized."""
+    page_size, num_heads, kv_heads, head_size = 128, 8, 2, 128
+    kv_length = 129
+    num_pages = (kv_length + page_size - 1) // page_size
+    query = torch.randn((1, 1, num_heads, head_size), dtype=torch.float16, device="npu")
+    key = torch.randn(
+        (num_pages, page_size, kv_heads, head_size), dtype=torch.float16, device="npu"
+    )
+    value = torch.randn_like(key)
+    key_view = _fa3_inner_strided(key) if "key" in targets else key
+    value_view = _fa3_inner_strided(value) if "value" in targets else value
+    cache_seqlens = torch.tensor([kv_length], dtype=torch.int32, device="npu")
+    page_table = torch.arange(num_pages, dtype=torch.int32, device="npu").reshape(1, num_pages)
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+
+    out_view, lse_view, *_ = flash_attn_with_kvcache(query, key_view, value_view, **kwargs)
+    out_ref, lse_ref, *_ = flash_attn_with_kvcache(query, key, value, **kwargs)
+    torch.testing.assert_close(out_view, out_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(lse_view, lse_ref, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize(
+    "targets",
+    (("query",), ("key",), ("value",), ("query", "key", "value")),
+    ids=("query", "key", "value", "all-qkv"),
+)
+def test_fa3_dense_outer_noncontiguous_qkv_falls_back_to_contiguous(targets):
+    """Match FA4/FIA: dense outer-strided QKV are materialized."""
+    batch, q_seqlen, kv_seqlen = 2, 16, 32
+    num_heads, kv_heads, head_size = 4, 2, 64
+    query = torch.randn(
+        (batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu"
+    )
+    key = torch.randn(
+        (batch, kv_seqlen, kv_heads, head_size), dtype=torch.float16, device="npu"
+    )
+    value = torch.randn_like(key)
+    query_view = _fa3_inner_strided(query) if "query" in targets else query
+    key_view = _fa3_inner_strided(key) if "key" in targets else key
+    value_view = _fa3_inner_strided(value) if "value" in targets else value
+
+    out_view = flash_attn_func(query_view, key_view, value_view, num_splits=1)
+    out_ref = flash_attn_func(query, key, value, num_splits=1)
+    torch.testing.assert_close(out_view, out_ref, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+def test_fa3_append_kv_rejects_noncontiguous_dense_cache():
+    """A cache fallback must not hide append-KV's in-place update target."""
+    batch, q_seqlen, cache_len, new_len = 1, 1, 16, 1
+    num_heads, kv_heads, head_size = 4, 2, 64
+    query = torch.randn(
+        (batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu"
+    )
+    key_cache = _fa3_inner_strided(
+        torch.randn((batch, cache_len, kv_heads, head_size), dtype=torch.float16, device="npu")
+    )
+    value_cache = _fa3_inner_strided(torch.randn_like(key_cache.contiguous()))
+    key_new = torch.randn(
+        (batch, new_len, kv_heads, head_size), dtype=torch.float16, device="npu"
+    )
+    value_new = torch.randn_like(key_new)
+    cache_seqlens = torch.tensor([cache_len - new_len], dtype=torch.int32, device="npu")
+
+    with pytest.raises(RuntimeError, match="append-KV requires contiguous dense K/V caches"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            k=key_new,
+            v=value_new,
+            cache_seqlens=cache_seqlens,
+            num_splits=1,
+        )

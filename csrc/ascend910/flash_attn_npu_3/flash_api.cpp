@@ -334,6 +334,18 @@ std::vector<at::Tensor> mha_fwd(
         num_heads = sizes[2];
         head_size_og = sizes[3];
     }
+
+    // FA3 uses fixed packed strides for Q and for dense K/V. The Python
+    // interface follows FA4/FIA and materializes unsupported non-append
+    // views; these checks protect direct callers from silent misaddressing.
+    // Keep them after CheckedFwdDimension so oversized broadcast views retain
+    // the dimension-bound error instead of failing first on their strides.
+    TORCH_CHECK(q.is_contiguous(), "Input tensor q must be contiguous because FA3 uses packed Q strides");
+    if (!paged_KV) {
+        TORCH_CHECK(k.is_contiguous(), "Dense key tensor must be contiguous because FA3 uses packed KV strides");
+        TORCH_CHECK(v.is_contiguous(), "Dense value tensor must be contiguous because FA3 uses packed KV strides");
+    }
+
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
@@ -384,7 +396,7 @@ std::vector<at::Tensor> mha_fwd(
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous because FA3 uses packed output strides");
     } else if (is_bnsd) {
         // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
         // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
