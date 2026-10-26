@@ -422,67 +422,72 @@ class FAInferKernel {
                 }
             }
         } else if (flashDecodeFlag == 0U) {
-            // Reuse the batch cursor across monotonically increasing tasks.
-            uint32_t curBatchTmp = 0;
-            uint32_t preTotalTaskNumTmp = 0;
-            uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
-            uint32_t cachedBatch = 0xFFFFFFFFU;
-            uint32_t curQNBlockNumCur = 0;
-            uint32_t curQSBlockNumCur = 0;
-            for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
-                while (taskIdx >= curTotalTaskNumTmp) {
-                    ++curBatchTmp;
-                    preTotalTaskNumTmp = curTotalTaskNumTmp;
-                    uint32_t qSeqlenTmp = maxQSeqlen;
-                    uint32_t kvSeqlenTmp = maxKvSeqlen;
-                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        uint32_t prevQSeqlenSumTmp = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
-                        qSeqlenTmp =
-                            static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumTmp;
-                        if constexpr (!PAGED_CACHE_FLAG) {
-                            uint32_t prevKvSeqlenSumTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
-                            kvSeqlenTmp =
-                                static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp + 1)) - prevKvSeqlenSumTmp;
+            if (supportsShortTaskPipe()) {
+                runShortBatchPipeLoop(coreIdx, coreNum, globalTensors);
+            } else {
+                // Reuse the batch cursor across monotonically increasing tasks.
+                uint32_t curBatchTmp = 0;
+                uint32_t preTotalTaskNumTmp = 0;
+                uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
+                uint32_t cachedBatch = 0xFFFFFFFFU;
+                uint32_t curQNBlockNumCur = 0;
+                uint32_t curQSBlockNumCur = 0;
+                for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
+                    while (taskIdx >= curTotalTaskNumTmp) {
+                        ++curBatchTmp;
+                        preTotalTaskNumTmp = curTotalTaskNumTmp;
+                        uint32_t qSeqlenTmp = maxQSeqlen;
+                        uint32_t kvSeqlenTmp = maxKvSeqlen;
+                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                            uint32_t prevQSeqlenSumTmp = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
+                            qSeqlenTmp =
+                                static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumTmp;
+                            if constexpr (!PAGED_CACHE_FLAG) {
+                                uint32_t prevKvSeqlenSumTmp =
+                                    static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
+                                kvSeqlenTmp = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp + 1)) -
+                                              prevKvSeqlenSumTmp;
+                            }
                         }
+
+                        uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
+                        uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
+                        uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
+                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp);
+                        uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenTmp, curQSBlockTileTmp);
+                        curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                     }
 
-                    uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
-                    uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
-                    uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp);
-                    uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenTmp, curQSBlockTileTmp);
-                    curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
-                }
-
-                if (curBatchTmp != cachedBatch) {
-                    uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
-                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                        uint32_t prevQSeqlenSumCur = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
-                        qSeqlenCur =
-                            static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumCur;
+                    if (curBatchTmp != cachedBatch) {
+                        uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
+                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                            uint32_t prevQSeqlenSumCur = static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp));
+                            qSeqlenCur =
+                                static_cast<uint32_t>(gActualQseqlen.GetValue(curBatchTmp + 1)) - prevQSeqlenSumCur;
+                        }
+                        uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
+                        uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
+                        curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
+                        curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
+                        cachedBatch = curBatchTmp;
                     }
-                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
-                    uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
-                    curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
-                    curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
-                    cachedBatch = curBatchTmp;
+
+                    uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
+
+                    uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
+                    uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+
+                    uint32_t pipelineDrain = 0;
+                    if (taskIdx + uint32_t(coreNum) >= totalTaskNum) {
+                        pipelineDrain = PRE_LAUNCH;
+                    }
+
+                    const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+                    const bool hasTaskWork = runMainLoop(coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur, false, 0,
+                                                         0, 0, 0, globalTensors, descriptors, currentTaskStateSlot,
+                                                         issuedStackCount, pipelineDrain, softmaxPingPongFlag);
+                    taskStateSequence += static_cast<uint32_t>(hasTaskWork);
                 }
-
-                uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
-
-                uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
-                uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
-
-                uint32_t pipelineDrain = 0;
-                if (taskIdx + uint32_t(coreNum) >= totalTaskNum) {
-                    pipelineDrain = PRE_LAUNCH;
-                }
-
-                const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
-                const bool hasTaskWork = runMainLoop(coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur, false, 0, 0, 0,
-                                                     0, globalTensors, descriptors, currentTaskStateSlot,
-                                                     issuedStackCount, pipelineDrain, softmaxPingPongFlag);
-                taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
         }
 
@@ -538,6 +543,275 @@ class FAInferKernel {
                          gActualQseqlen, INPUT_LAYOUT == FaiKenel::inputLayout::TND, maxQSeqlen,
                          (LSE_MODE == Epilogue::LseModeT::OUT_ONLY), gLse, totalQTokens);
 #endif
+        }
+    }
+
+    struct ShortTaskParams {
+        uint32_t BIdx;
+        uint32_t qNIdx;
+        uint32_t qSBlockIdx;
+        uint32_t qSeqlen;
+        uint32_t kvSeqlen;
+        uint32_t qSBlockSize;
+        uint32_t qNBlockSize;
+        uint32_t rowNum;
+        uint64_t gmOffsetQ;
+        uint64_t gmOffsetK;
+        uint64_t gmOffsetV;
+        uint64_t gmOffsetO;
+        uint64_t gmOffsetLse;
+        uint64_t gmOffsetPret;
+        uint64_t gmOffsetDrop;
+        int64_t qKSeqDiff;
+        int64_t slopesBatchOffset;
+    };
+
+    __aicore__ inline bool supportsShortTaskPipe() const
+    {
+        if constexpr (INPUT_LAYOUT != FaiKenel::inputLayout::TND || PAGED_CACHE_FLAG ||
+                      MASK_TYPE != FaiKenel::MaskType::MASK_CAUSAL) {
+            return false;
+        }
+        return flashDecodeFlag == 0U && maskType == 1U && kvNewSeqlen == 0U && softcapValue == 0.0F &&
+               dropoutValue == 0.0F && alibiSlopesBatchStride == 0 && groupSize == 1U && qHeads == kvHeads &&
+               kvHeads % 2U == 0U && kvHeads <= 16U && embed == NUM_128 && embedV == NUM_128 &&
+               maxQSeqlen >= 1U && maxQSeqlen <= 3U &&
+               maxKvSeqlen >= 1U && maxKvSeqlen <= 3U && totalTaskNum == batch * kvHeads;
+    }
+
+    // Short-path workspace: per-head sub-blocks sub-allocated at the head of
+    // this core's existing 3-slot region (kvHeads * 3 * 512 of 3 * 128 * 512
+    // elements per tensor; no host-side workspace change). The head-parallel
+    // phases (all QK -> all softmax -> all PV) never alias because every head
+    // owns its own S/P/OTmp/Update sub-block.
+    __aicore__ inline uint64_t shortBatchWsOffset(uint32_t coreIdx, uint32_t set, uint32_t headIdx) const
+    {
+        return static_cast<uint64_t>(coreIdx) * STACK_SLOTS * WORKSPACE_BLOCK_SIZE_DB +
+               static_cast<uint64_t>(set) * kvHeads * SHORT_TASK_HEAD_BLOCK +
+               static_cast<uint64_t>(headIdx) * SHORT_TASK_HEAD_BLOCK;
+    }
+
+    __aicore__ inline bool buildShortBatchParams(uint32_t BIdx, GlobalTensorBundle& globalTensors,
+                                                 ShortTaskParams& task) const
+    {
+        if (BIdx >= batch) {
+            return false;
+        }
+
+        auto& gActualQseqlen = globalTensors.gActualQseqlen;
+        auto& gActualKvseqlen = globalTensors.gActualKvseqlen;
+        uint32_t prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
+        uint32_t qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1U)) - prevQSeqlenSum;
+        uint32_t prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+        uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1U)) - prevKvSeqlenSum;
+        if (qSeqlen == 0U || qSeqlen > 3U || kvSeqlen == 0U || kvSeqlen > 3U) {
+            return false;
+        }
+
+        uint64_t qBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideQ;
+        uint64_t kBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideK;
+        uint64_t vBOffset = static_cast<uint64_t>(prevKvSeqlenSum) * strideV;
+        uint64_t oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
+
+        task.BIdx = BIdx;
+        task.qNIdx = 0U;
+        task.qSBlockIdx = 0U;
+        task.qSeqlen = qSeqlen;
+        task.kvSeqlen = kvSeqlen;
+        task.qSBlockSize = qSeqlen;
+        task.qNBlockSize = 1U;
+        task.rowNum = qSeqlen;
+        // Head 0 bases; the head loop adds h * embed (q/k/v/o) or h * totalQTokens (lse).
+        task.gmOffsetQ = qBOffset;
+        task.gmOffsetK = kBOffset;
+        task.gmOffsetV = vBOffset;
+        task.gmOffsetO = oBOffset;
+        task.gmOffsetLse = static_cast<uint64_t>(prevQSeqlenSum);
+        task.gmOffsetPret = static_cast<uint64_t>(BIdx * qHeads) * stridePret;
+        task.gmOffsetDrop = static_cast<uint64_t>(BIdx * qHeads) * strideDrop;
+        task.qKSeqDiff = (kvSeqlen > qSeqlen) ? static_cast<int64_t>(kvSeqlen - qSeqlen) : 0;
+        task.slopesBatchOffset = static_cast<int64_t>(BIdx) * alibiSlopesBatchStride;
+        return true;
+    }
+
+    __aicore__ inline void runShortBatchQKHead(uint32_t coreIdx, const ShortTaskParams& task, uint32_t headIdx,
+                                               uint32_t set, GlobalTensorBundle& globalTensors)
+    {
+#ifdef __DAV_C220_CUBE__
+        auto& gQ = globalTensors.gQ;
+        auto& gK = globalTensors.gK;
+        auto& gS = globalTensors.gS;
+        auto& gBlockTable = globalTensors.gBlockTable;
+
+        uint64_t gmOffsetQ = task.gmOffsetQ + static_cast<uint64_t>(headIdx) * embed;
+        uint64_t gmOffsetK = task.gmOffsetK + static_cast<uint64_t>(headIdx) * embed;
+        LayoutQ layoutQ(task.rowNum, embed);
+        LayoutK layoutK(strideK, task.kvSeqlen);
+        LayoutS layoutS(task.rowNum, task.kvSeqlen, MAX_KV_STACK_LEN);
+        uint64_t gmOffsetS = shortBatchWsOffset(coreIdx, set, headIdx);
+        GemmCoord actualBlockShapeQK{task.rowNum, task.kvSeqlen, embed};
+
+        blockMmadQK.resetBlockStart(0U, pagedBlockSize);
+        uint32_t qRows = task.rowNum;
+        uint32_t qNBlockSize = task.qNBlockSize;
+        blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQ, qRows, qNBlockSize, static_cast<int64_t>(qHeadStride),
+                            static_cast<uint32_t>(strideQ));
+        blockMmadQK(gQ[gmOffsetQ], gK[gmOffsetK], gS[gmOffsetS], gBlockTable, layoutQ, layoutK, layoutS,
+                    actualBlockShapeQK, 0U, 1U, pagedBlockSize, strideK, false, gK[gmOffsetK], 0U);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+#endif
+    }
+
+    __aicore__ inline void runShortBatchPVHead(uint32_t coreIdx, const ShortTaskParams& task, uint32_t headIdx,
+                                               uint32_t set, GlobalTensorBundle& globalTensors)
+    {
+#ifdef __DAV_C220_CUBE__
+        auto& gP = globalTensors.gP;
+        auto& gV = globalTensors.gV;
+        auto& gOTmp = globalTensors.gOTmp;
+        auto& gBlockTable = globalTensors.gBlockTable;
+
+        uint64_t gmOffsetV = task.gmOffsetV + static_cast<uint64_t>(headIdx) * embedV;
+        uint64_t gmOffsetP = shortBatchWsOffset(coreIdx, set, headIdx);
+        uint32_t blockStackNum = (MAX_KV_STACK_LEN - 1U + pagedBlockSize) / pagedBlockSize;
+        LayoutP layoutP(task.rowNum, task.kvSeqlen, MAX_KV_STACK_LEN);
+        LayoutV layoutV(task.kvSeqlen, strideV);
+        LayoutOTmp layoutOTmp(task.rowNum, embedV, embedRoundV);
+        GemmCoord actualBlockShapePV{task.rowNum, embedV, task.kvSeqlen};
+        uint32_t pvNIdx = 0U;
+        uint32_t pvNLoop = 1U;
+        uint32_t pvBlockSize = pagedBlockSize;
+
+        blockMmadPV.resetBlockStart(0U, pagedBlockSize);
+        // smReady is consumed once per batch task before the PV loop starts.
+        Arch::CrossCoreFlag smReady{static_cast<Arch::FlagID>(SHORT_BATCH_SM_READY_ID)};
+        blockMmadPV(gP[gmOffsetP], gV[gmOffsetV], gOTmp[gmOffsetP], gBlockTable, layoutP, layoutV, layoutOTmp,
+                    actualBlockShapePV, pvNIdx, pvNLoop, pvBlockSize, task.kvSeqlen, strideV, blockStackNum,
+                    smReady, false, gV[gmOffsetV], 0U, AscendC::GlobalTensor<int32_t>(), 0U, 0U, true);
+#endif
+    }
+
+    __aicore__ inline void runShortBatchSoftmaxHead(uint32_t coreIdx, const ShortTaskParams& task, uint32_t headIdx,
+                                                    uint32_t set, uint32_t stateRowBase,
+                                                    GlobalTensorBundle& globalTensors,
+                                                    uint32_t& softmaxPingPongFlag)
+    {
+#ifdef __DAV_C220_VEC__
+        auto& gS = globalTensors.gS;
+        auto& gP = globalTensors.gP;
+        auto& gMask = globalTensors.gMask;
+
+        LayoutP layoutP(task.rowNum, task.kvSeqlen, MAX_KV_STACK_LEN);
+        LayoutS layoutS(task.rowNum, task.kvSeqlen, MAX_KV_STACK_LEN);
+        LayoutMask layoutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
+        uint64_t gmOffsetWs = shortBatchWsOffset(coreIdx, set, headIdx);
+        GemmCoord actualBlockShapeQK{task.rowNum, task.kvSeqlen, embed};
+        int64_t triUp = (task.kvSeqlen > task.qSeqlen) ? static_cast<int64_t>(task.kvSeqlen - task.qSeqlen) : 0;
+        uint32_t triDown = task.kvSeqlen;
+
+        epilogueOnlineSoftmax.set_gmOffsetPret(task.gmOffsetPret + static_cast<uint64_t>(headIdx) * stridePret);
+        epilogueOnlineSoftmax.set_gmOffsetDrop(task.gmOffsetDrop + static_cast<uint64_t>(headIdx) * strideDrop);
+        // qkReady is consumed once per batch task before the head loop starts.
+        Arch::CrossCoreFlag qkReady{static_cast<Arch::FlagID>(SHORT_BATCH_QK_READY_ID)};
+        epilogueOnlineSoftmax(gP[gmOffsetWs], gS[gmOffsetWs], gMask, layoutP, layoutS, layoutMask, actualBlockShapeQK,
+                              true, task.qSBlockSize, task.qNBlockSize, 0U, 0U, qkReady, softmaxPingPongFlag, triUp,
+                              triDown, 0U, task.kvSeqlen, false, 0U, 0U, task.qKSeqDiff,
+                              task.slopesBatchOffset, true, true,
+                              true /*wholeTilePerSubBlock*/, true /*skipQkReadyWait*/, stateRowBase);
+#endif
+    }
+
+    __aicore__ inline void runShortBatchRescaleHead(uint32_t coreIdx, const ShortTaskParams& task, uint32_t headIdx,
+                                                    uint32_t set, uint32_t stateRowBase,
+                                                    GlobalTensorBundle& globalTensors)
+    {
+#ifdef __DAV_C220_VEC__
+        auto& gO = globalTensors.gO;
+        auto& gLse = globalTensors.gLse;
+        auto& gOTmp = globalTensors.gOTmp;
+        auto& gOUpdate = globalTensors.gOUpdate;
+
+        uint64_t gmOffsetWs = shortBatchWsOffset(coreIdx, set, headIdx);
+        uint64_t gmOffsetO = task.gmOffsetO + static_cast<uint64_t>(headIdx) * embedV;
+        uint64_t gmOffsetLse = task.gmOffsetLse + static_cast<uint64_t>(headIdx) * totalQTokens;
+        LayoutO layoutO(task.qSeqlen, embed * qHeads);
+        LayoutOTmp layoutOTmp(task.rowNum, embedV, embedRoundV);
+        LayoutUpdate layoutUpdate(task.rowNum, embed, embedRound);
+        LayoutLse layoutLse(qHeads, totalQTokens);
+        GemmCoord actualBlockShapePV{task.rowNum, embedV, task.kvSeqlen};
+
+        // pvReady is consumed once per batch task before the rescale loop starts.
+        Arch::CrossCoreFlag pvReady{static_cast<Arch::FlagID>(SHORT_BATCH_PV_READY_ID)};
+        epilogueRescaleO(gO[gmOffsetO], gOTmp[gmOffsetWs], gOUpdate[gmOffsetWs], gLse[gmOffsetLse],
+                         layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, pvReady, task.qSBlockSize,
+                         task.qNBlockSize, embedV, true, true, 0U, 0U, typename EpilogueRescaleO::SplitKVParams(),
+                         0, task.qSeqlen, task.qSeqlen, 0U, 1U,
+                         true /*wholeTilePerSubBlock*/, true /*skipPvReadyWait*/, stateRowBase);
+#endif
+    }
+
+    // One short-path batch task covers every head of one batch index.
+    // Handshake: all QK -> qkReady -> all softmax -> smReady -> all PV ->
+    // pvReady -> all rescale. Each head has its own S/P/OTmp/Update sub-block
+    // (see shortBatchWsOffset), so the head-parallel phases never alias; across
+    // tasks the next QK(h) is issued after the previous task's smReady (its
+    // softmax(h) consumed S) and its PV(h) read P, per the AIC program order.
+    __aicore__ inline void runShortBatchStep(uint32_t coreIdx, const ShortTaskParams& task,
+                                             GlobalTensorBundle& globalTensors, uint32_t& softmaxPingPongFlag)
+    {
+#ifdef __DAV_C220_CUBE__
+        for (uint32_t h = 0; h < kvHeads; ++h) {
+            runShortBatchQKHead(coreIdx, task, h, 0U, globalTensors);
+        }
+        Arch::CrossCoreFlag qkReady{static_cast<Arch::FlagID>(SHORT_BATCH_QK_READY_ID)};
+        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);
+
+        Arch::CrossCoreFlag smReady{static_cast<Arch::FlagID>(SHORT_BATCH_SM_READY_ID)};
+        Arch::CrossCoreWaitFlag(smReady);
+        for (uint32_t h = 0; h < kvHeads; ++h) {
+            runShortBatchPVHead(coreIdx, task, h, 0U, globalTensors);
+        }
+        Arch::CrossCoreFlag pvReady{static_cast<Arch::FlagID>(SHORT_BATCH_PV_READY_ID)};
+        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
+#endif
+#ifdef __DAV_C220_VEC__
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t headBegin = subBlockIdx * (kvHeads / 2U);
+        uint32_t headEnd = headBegin + kvHeads / 2U;
+
+        Arch::CrossCoreFlag qkReady{static_cast<Arch::FlagID>(SHORT_BATCH_QK_READY_ID)};
+        Arch::CrossCoreWaitFlag(qkReady);
+        uint32_t hh = 0U;
+        for (uint32_t h = headBegin; h < headEnd; ++h, ++hh) {
+            // 8 state rows (RoundUp(qSeqlen, 8)) per head, 8 heads per AIV.
+            runShortBatchSoftmaxHead(coreIdx, task, h, 0U, hh * 8U, globalTensors, softmaxPingPongFlag);
+        }
+        Arch::CrossCoreFlag smReady{static_cast<Arch::FlagID>(SHORT_BATCH_SM_READY_ID)};
+        Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(smReady);
+
+        Arch::CrossCoreFlag pvReady{static_cast<Arch::FlagID>(SHORT_BATCH_PV_READY_ID)};
+        Arch::CrossCoreWaitFlag(pvReady);
+        hh = 0U;
+        for (uint32_t h = headBegin; h < headEnd; ++h, ++hh) {
+            runShortBatchRescaleHead(coreIdx, task, h, 0U, hh * 8U, globalTensors);
+        }
+#endif
+    }
+
+    __aicore__ inline void runShortBatchPipeLoop(uint32_t coreIdx, uint32_t coreNum, GlobalTensorBundle& globalTensors)
+    {
+        uint32_t softmaxPingPongFlag = 0U;
+        uint32_t perCoreNum = CeilDiv(batch, coreNum);
+        uint32_t beginBIdx = coreIdx * perCoreNum;
+        uint32_t endBIdx = beginBIdx + perCoreNum;
+        endBIdx = endBIdx > batch ? batch : endBIdx;
+
+        for (uint32_t BIdx = beginBIdx; BIdx < endBIdx; ++BIdx) {
+            ShortTaskParams task{};
+            if (!buildShortBatchParams(BIdx, globalTensors, task)) {
+                continue;
+            }
+            runShortBatchStep(coreIdx, task, globalTensors, softmaxPingPongFlag);
         }
     }
 
@@ -599,16 +873,19 @@ class FAInferKernel {
             prevQSeqlenSum = BIdx * maxQSeqlen;
             if constexpr (!PAGED_CACHE_FLAG) {
                 if (appendKVFlag) {
-                    // Capacity-aligned cache: cache batch occupies [BIdx * kvCacheSeqlen, ...).
+                    // Capacity-aligned cache: cache batch occupies [BIdx *
+                    // kvCacheSeqlen, ...).
                     prevKvSeqlenSum = BIdx * kvCacheSeqlen;
                 } else {
-                    // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
+                    // BSND K seqlens are not variable, just multiply by the batch index
+                    // to get the offset.
                     prevKvSeqlenSum = maxKvSeqlen * BIdx;
                 }
             }
         }
 
-        // TND non-paged read the per-batch old length from prefix sums; re-add new.
+        // TND non-paged read the per-batch old length from prefix sums; re-add
+        // new.
         if (appendKVFlag) {
             kvSeqlen = kvSeqlenOld + kvNewSeqlen;
         }
@@ -625,9 +902,10 @@ class FAInferKernel {
         }
         uint64_t oBOffset = static_cast<uint64_t>(prevQSeqlenSum) * strideO;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
-            // BNSD batches are S_alloc-aligned head planes: the batch base advances by
-            // the whole plane, never by prevQSeqlenSum/prevKvSeqlenSum * token stride
-            // (strideQ == embed here, so the BSND formula would be off by qHeads).
+            // BNSD batches are S_alloc-aligned head planes: the batch base advances
+            // by the whole plane, never by prevQSeqlenSum/prevKvSeqlenSum * token
+            // stride (strideQ == embed here, so the BSND formula would be off by
+            // qHeads).
             qBOffset = static_cast<uint64_t>(BIdx) * qHeads * qHeadStride;
             oBOffset = static_cast<uint64_t>(BIdx) * qHeads * oHeadStride;
             if constexpr (!PAGED_CACHE_FLAG) {
@@ -635,10 +913,11 @@ class FAInferKernel {
                 vBOffset = static_cast<uint64_t>(BIdx) * kvHeads * kvHeadStrideV;
             }
         }
-        // LSE output is head-major (BNS for BSND, NT for TND). The batch base and the
-        // per-head stride depend on layout:
-        //   TND  -> {num_heads, total_q}:  batch folded into global token, head stride = totalQTokens
-        //   BSND -> {batch, num_heads, seqlen_q}: batch base = prevQSeqlenSum*qHeads, head stride = maxQSeqlen
+        // LSE output is head-major (BNS for BSND, NT for TND). The batch base and
+        // the per-head stride depend on layout:
+        //   TND  -> {num_heads, total_q}:  batch folded into global token, head
+        //   stride = totalQTokens BSND -> {batch, num_heads, seqlen_q}: batch
+        //   base = prevQSeqlenSum*qHeads, head stride = maxQSeqlen
         uint64_t lseBOffset;
         uint32_t lseHeadStride;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
@@ -753,7 +1032,8 @@ class FAInferKernel {
             kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
         }
 
-        // Match FA GPU split-KV: n_block_min/max = split ∩ window (do not overwrite SWA).
+        // Match FA GPU split-KV: n_block_min/max = split ∩ window (do not
+        // overwrite SWA).
         uint32_t winKvStart = kvStart;
         uint32_t winKvEnd = kvSLoopNumTotal;
         uint32_t kvEnd = winKvEnd;

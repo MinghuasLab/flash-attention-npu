@@ -128,6 +128,30 @@ public:
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
         alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
         dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
+
+        // Inline causal-mask scratch (short-task path): the condition bytes and
+        // the float column ramp / zero tile / threshold tile live in the raw GM
+        // mask staging region, which only CopyMaskGmToUb and the mask up-cast
+        // chain touch — both are bypassed on the inline path. The 6 x 32 float
+        // mask row table (row k: 0 for c <= k, else -3e38, k = r + triUp <= 4)
+        // is built once here; each task then applies its two rows with one Add.
+        auto maskUbTensorF = maskUbTensor.template ReinterpretCast<float>();
+        colRampUbTensor = maskUbTensorF[FLOAT_VECTOR_SIZE];
+        zeroUbTensor = maskUbTensorF[2 * FLOAT_VECTOR_SIZE];
+        inlineThreshUbTensor = maskUbTensorF[3 * FLOAT_VECTOR_SIZE];
+        inlineMaskTabUbTensor = maskUbTensorF[6 * FLOAT_VECTOR_SIZE];
+        // Column index within one 32-col tile row, repeated for the second row:
+        // tile position i covers column (i % columnNumRound) of its mask row.
+        for (uint32_t i = 0; i < FLOAT_VECTOR_SIZE; ++i) {
+            colRampUbTensor.SetValue(
+                i, static_cast<float>(static_cast<int32_t>(i % BLOCK_SIZE_IN_BYTE)));
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
+        AscendC::Duplicate<float, false>(zeroUbTensor, 0.0f, (uint64_t)0, 1, 1, 8);
+        BuildInlineTriuMaskTile(0, inlineMaskTabUbTensor);
+        BuildInlineTriuMaskTile(2, inlineMaskTabUbTensor[2 * BLOCK_SIZE_IN_BYTE]);
+        BuildInlineTriuMaskTile(4, inlineMaskTabUbTensor[4 * BLOCK_SIZE_IN_BYTE]);
     }
     
     __aicore__ inline
@@ -622,6 +646,44 @@ public:
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
         }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // Inline causal mask (short-task path): keep(r, c) = (c <= r + triUp), so
+    // mask_add = keep ? 0 : -3e38, matching the GM triu-mask read it replaces.
+    // Padding cols c in [kvSeqlen, columnNumRound) are -3e38 on both paths since
+    // c > triUp + r always holds there. Builds the 2 x columnNumRound float tile
+    // (one 64-lane pass) at maskDst; init-only, used to fill the mask row table.
+    __aicore__ inline
+    void BuildInlineTriuMaskTile(uint32_t rowBase, const AscendC::LocalTensor<float> &maskDst)
+    {
+        float thresh0 = static_cast<float>(static_cast<int32_t>(rowBase));
+        float thresh1 = static_cast<float>(static_cast<int32_t>(rowBase + 1));
+        AscendC::Duplicate<float>(inlineThreshUbTensor, thresh0, FLOAT_VECTOR_SIZE);
+        AscendC::Duplicate<float>(inlineThreshUbTensor[FLOAT_VECTOR_SIZE / 2], thresh1, FLOAT_VECTOR_SIZE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(maskUbTensor, colRampUbTensor, inlineThreshUbTensor, AscendC::CMPMODE::LE,
+            FLOAT_VECTOR_SIZE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(maskDst, maskUbTensor, zeroUbTensor, (float)-3e38f,
+            AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, FLOAT_VECTOR_SIZE);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // ApplyMask with the inline mask table: mask row k covers columns with
+    // threshold k (k = r + triUp); rows k and k + 1 are contiguous in the table,
+    // so one Add covers both live rows of the tile.
+    __aicore__ inline
+    void ApplyInlineMaskAdd(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound,
+        uint32_t maskRowBase)
+    {
+        AscendC::Add<float, false>(
+            lsUbTensor[sUbOffset],
+            lsUbTensor[sUbOffset],
+            inlineMaskTabUbTensor[maskRowBase * columnNumRound],
+            (uint64_t)0,
+            CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+            AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -1150,7 +1212,9 @@ public:
         uint32_t& softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false,
         int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
-        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
+        int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0,
+        bool useInlineMask = false, bool shortSinglePass = false,
+        bool wholeTilePerSubBlock = false, bool skipQkReadyWait = false, uint32_t stateRowBase = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1163,15 +1227,109 @@ public:
         uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
         uint32_t qNThisSubBlock = (qNBlockSize == 1) ?
             0 : (subBlockIdx == 1) ? (qNBlockSize - qNSplitSubBlock) : qNSplitSubBlock;
-        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
-            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
-            (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
-        uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        // Short-path batch tasks hand whole heads to each AIV: both subblocks
+        // process the full tile (all qSeqlen rows) of their own head, so the row
+        // split is bypassed and no subblock sits idle. Only used together with
+        // the inline-mask single pass.
+        uint32_t rowSplitSubBlock;
+        uint32_t rowActualThisSubBlock;
+        uint32_t rowOffsetThisSubBlock;
+        if (wholeTilePerSubBlock) {
+            rowSplitSubBlock = rowNum;
+            rowActualThisSubBlock = rowNum;
+            rowOffsetThisSubBlock = 0;
+        } else {
+            rowSplitSubBlock = (qNBlockSize == 1) ?
+                (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
+            rowActualThisSubBlock = (subBlockIdx == 1) ?
+                (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
+            rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        }
 
         uint32_t tokenNumPerHeadThisSubBlock = Min(qSBlockSize, rowActualThisSubBlock);
         uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ?
             rowOffsetThisSubBlock : 0;
+
+        // The idle vector core must still consume this stack's QK-ready flag.
+        if (rowActualThisSubBlock == 0) {
+            Arch::CrossCoreWaitFlag(qkReady);
+            return;
+        }
+
+        // Inline causal mask: the keep(r, c) = (c <= r + triUp) relation only
+        // reproduces the GM triu-mask read for a single full-width 32-col tile
+        // anchored at kvSStartIdx = 0; up to three whole-tile rows (batch task)
+        // or two split rows (per-head pass) fit the six-row inline mask table.
+        const bool inlineMaskActive = useInlineMask && shortSinglePass &&
+            columnNumRound == BLOCK_SIZE_IN_BYTE && rowActualThisSubBlock <= 3 && kvSStartIdx == 0U;
+
+        // Short-path single pass: rowLoopNum == 1, so the preLoad second loop
+        // trip only re-derives the same indices and flips the ping-pong flag
+        // once more. Run load S -> inline mask -> SubCoreCompute straight line
+        // instead, keeping the QK-ready wait at the first S load.
+        if (inlineMaskActive) {
+            uint32_t pingpongFlag = softmaxPingPongFlag % 2;
+            uint32_t rowNumCurLoop = rowActualThisSubBlock;
+            uint32_t rowOffsetIoGm = rowOffsetThisSubBlock;
+            int64_t offsetInput = layoutInput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
+            auto gInputCurLoop = gInput[offsetInput];
+
+            // The mask table lives in the raw-mask staging region, far away from
+            // the P staging buffers; keep the EVENT_ID4 / MTE3_V set-wait pairs
+            // balanced with SubCoreCompute like the loop path does.
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
+            uint32_t maskRowBase = static_cast<uint32_t>(triUp) + rowOffsetThisSubBlock;
+
+            // Delay QK-ready until the first S load to overlap scalar setup.
+            // The batch task consumes qkReady once before its head loop, so
+            // per-head calls skip the wait here.
+            if (!skipQkReadyWait) {
+                Arch::CrossCoreWaitFlag(qkReady);
+            }
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
+            CopySGmToUb(
+                gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+            ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+            }
+            if constexpr (HAS_ALIBI_) {
+                ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                    static_cast<int64_t>(rowOffsetThisSubBlock), rowNumCurLoop, qSBlockSize,
+                    qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
+                    alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                    static_cast<int64_t>(kvSStartIdx));
+            }
+            ApplyInlineMaskAdd(
+                (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, maskRowBase);
+
+            int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
+            auto gOutputCurLoop = gOutput[offsetOutput];
+            auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
+            SubCoreCompute<true>(
+                gOutputCurLoop,
+                layoutOutputCurLoop,
+                stateRowBase,
+                isFirstStackTile,
+                0,
+                true,
+                true,
+                columnNumRound,
+                pingpongFlag,
+                curStackTileMod,
+                taskStateSlot,
+                rowOffsetIoGm,
+                qSBlockSize,
+                isSplitKV);
+            softmaxPingPongFlag++;
+            return;
+        }
 
         // Causal mask tile: the UNIT triangle read from the mask origin at
         // rows [rowShift, rowShift+rowNum), cols [0, maskColumn), applied at
@@ -1238,10 +1396,6 @@ public:
         uint32_t rowLoopNum = CeilDiv(rowActualThisSubBlock, rowNumTile);
         uint32_t preLoad = 1;
 
-        if (rowActualThisSubBlock == 0) {
-            Arch::CrossCoreWaitFlag(qkReady);
-            return;
-        }
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
                 uint32_t pingpongFlag = softmaxPingPongFlag % 2;
@@ -1631,6 +1785,10 @@ private:
     AscendC::LocalTensor<ElementMask> maskUbTensor;
     AscendC::LocalTensor<half> maskUbTensor16;
     AscendC::LocalTensor<float> maskUbTensor32;
+    AscendC::LocalTensor<float> colRampUbTensor;
+    AscendC::LocalTensor<float> zeroUbTensor;
+    AscendC::LocalTensor<float> inlineThreshUbTensor;
+    AscendC::LocalTensor<float> inlineMaskTabUbTensor;
     AscendC::LocalTensor<float> lmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> gmUbTensor;

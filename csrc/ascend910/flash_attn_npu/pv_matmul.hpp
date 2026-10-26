@@ -184,7 +184,8 @@ public:
         uint64_t cacheRowBase = 0,
         AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
         uint32_t cachePageSize = 0,
-        uint32_t cacheTableBase = 0)
+        uint32_t cacheTableBase = 0,
+        bool skipSoftmaxFlagWait = false)
     {
         (void)doCopyback;
         (void)gBCache;
@@ -265,7 +266,9 @@ public:
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
                     // Delay P-ready until the first GM -> L1 load to overlap scalar setup.
-                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                    // The batch task consumes smReady once before its PV loop,
+                    // so per-head PV calls skip this wait.
+                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U && !skipSoftmaxFlagWait) {
                         Arch::CrossCoreWaitFlag(softmaxFlag);
                     }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);

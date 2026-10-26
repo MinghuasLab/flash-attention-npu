@@ -12,8 +12,20 @@ constexpr uint32_t QK_READY_ID = 1;
 constexpr uint32_t SOFTMAX_READY_ID = 2;
 constexpr uint32_t PV_READY_ID = 3;
 constexpr uint32_t PRE_LAUNCH = 2;
+// Short-path (head-merged batch task) cross-core handshake flags: one
+// task-level triple reused by every batch task (all QK -> qkReady -> all
+// softmax -> smReady -> all PV -> pvReady -> all rescale).
+constexpr uint32_t SHORT_BATCH_QK_READY_ID = 1;
+constexpr uint32_t SHORT_BATCH_SM_READY_ID = 2;
+constexpr uint32_t SHORT_BATCH_PV_READY_ID = 3;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MAX_KV_STACK_LEN = 512;
+// One head's S/P/OTmp/Update footprint inside the per-core 3-slot workspace
+// (S: 3 x 512 fp32 is the largest). The short path sub-allocates per-head
+// blocks at the head of the core's existing region: gmOffset =
+// core * (3 * 65536) + set * (kvHeads * HEAD_BLOCK) + headIdx * HEAD_BLOCK.
+// The set dimension is reserved for deeper per-head pipelining and is 0 today.
+constexpr uint32_t SHORT_TASK_HEAD_BLOCK = 3 * MAX_KV_STACK_LEN;
 constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
 constexpr uint32_t L1_MAX_SIZE = 524288;

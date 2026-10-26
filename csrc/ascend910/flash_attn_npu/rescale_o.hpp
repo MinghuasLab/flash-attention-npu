@@ -270,7 +270,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                    uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
                    const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow,
                    int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t rowNum,
-                   uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint64_t oHeadStride)
+                   uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint64_t oHeadStride,
+                   uint32_t stateRowBase = 0)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
@@ -280,7 +281,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
-        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
+        uint32_t stateRowOffset = taskStateSlot * 64 + stateRowBase + rowOffsetLoop;
+        const uint32_t stateSlotRowBase = taskStateSlot * 64 + stateRowBase;
         auto lseUbTensor = lseStagingUbTensor;
         auto lseBroadcastUbTensor = lseUbTensor[FLOAT_VECTOR_SIZE];
 
@@ -439,12 +441,12 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Ln<float, false>(lseUbTensor, glUbTensor[taskStateSlot * 64], (uint64_t)0,
+                    AscendC::Ln<float, false>(lseUbTensor, glUbTensor[stateSlotRowBase], (uint64_t)0,
                                               CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                                               AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                     AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[taskStateSlot * 64], (uint64_t)0,
+                    AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[stateSlotRowBase], (uint64_t)0,
                                                CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                                                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -512,12 +514,12 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                 if (splitParams.isSplitkv) {
                     if (isLastRowLoop) {
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Ln<float, false>(lseUbTensor, glUbTensor[taskStateSlot * 64], (uint64_t)0,
+                        AscendC::Ln<float, false>(lseUbTensor, glUbTensor[stateSlotRowBase], (uint64_t)0,
                                                   CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                                                   AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[taskStateSlot * 64],
+                        AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[stateSlotRowBase],
                                                    (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                                                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -562,7 +564,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                uint32_t isLastStackTile, uint32_t curStackTileMod, uint32_t taskStateSlot,
                const SplitKVParams& splitParams = SplitKVParams(), int32_t invalidSuffixStartRow = 0,
                int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0, uint32_t qSBlockIdx = 0,
-               uint32_t curQNBlockTile = 1)
+               uint32_t curQNBlockTile = 1, bool wholeTilePerSubBlock = false, bool skipPvReadyWait = false,
+               uint32_t stateRowBase = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
@@ -577,10 +580,22 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         uint32_t qNThisSubBlock = (qNBlockSize == 1U)   ? 0
                                   : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock)
                                                         : qNSplitSubBlock;
-        uint32_t inRowSplitSubBlock =
-            (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t inRowActualThisSubBlock = (subBlockIdx == 1U) ? (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
-        uint32_t inRowOffsetThisSubBlock = subBlockIdx * inRowSplitSubBlock;
+        // Short-path batch tasks hand whole heads to each AIV: bypass the
+        // subblock row split so both subblocks process the full tile of their own
+        // head. The per-head UB state then needs its own 8-row slice (stateRowBase).
+        uint32_t inRowSplitSubBlock;
+        uint32_t inRowActualThisSubBlock;
+        uint32_t inRowOffsetThisSubBlock;
+        if (wholeTilePerSubBlock) {
+            inRowSplitSubBlock = rowNum;
+            inRowActualThisSubBlock = rowNum;
+            inRowOffsetThisSubBlock = 0;
+        } else {
+            inRowSplitSubBlock =
+                (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
+            inRowActualThisSubBlock = (subBlockIdx == 1U) ? (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
+            inRowOffsetThisSubBlock = subBlockIdx * inRowSplitSubBlock;
+        }
         uint32_t outRowOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0;
         uint32_t outColOffsetThisSubBlock =
             (qNBlockSize == 1U) ? 0 : static_cast<uint32_t>(subBlockIdx * qNSplitSubBlock * oHeadStride);
@@ -619,7 +634,9 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
 
         // Idle vectors must consume PV-ready to avoid leaving a stale flag for the next task.
         if (inRowActualThisSubBlock == 0U) {
-            Arch::CrossCoreWaitFlag(pvReady);
+            if (!skipPvReadyWait) {
+                Arch::CrossCoreWaitFlag(pvReady);
+            }
             return;
         }
 
@@ -669,7 +686,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                 integralHeadNum = (rowActualCurLoop - proTokenNum) / qSThisSubBlock;
                 epiTokenNum = rowActualCurLoop - proTokenNum - integralHeadNum * qSThisSubBlock;
 
-                if (rowLoopIdx == 0) {
+                // The batch task consumes pvReady once before its rescale loop.
+                if (rowLoopIdx == 0 && !skipPvReadyWait) {
                     Arch::CrossCoreWaitFlag(pvReady);
                 }
                 SubCoreCompute(gOutputCurLoop, gInputCurLoop, gUpdateCurLoop, gLseThisSubBlock, layoutOutputCurLoop,
@@ -678,7 +696,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                                curStackTileMod, taskStateSlot, needRowLoop, (rowLoopIdx == rowLoop - 1U), rowOffsetLoop,
                                proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, blockParams, rowOffsetCurLoop,
                                invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, qSBlockIdx, rowNum,
-                               inRowOffsetThisSubBlock, curQNBlockTile, oHeadStride);
+                               inRowOffsetThisSubBlock, curQNBlockTile, oHeadStride, stateRowBase);
             }
         }
     }
