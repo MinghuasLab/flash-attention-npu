@@ -78,6 +78,13 @@ FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32
     shape.tailRows = qSeqlen % Q_ROWS;
     shape.tailHeadTile = shape.tailRows ? HeadTile(shape.tailRows, groupSize, nCap, qHeads) : 1;
     shape.tailHeadBlocks = shape.tailRows ? CeilDiv(qHeads, shape.tailHeadTile) : 0;
+    // Avoid repeatedly assigning the expensive MHA tail to the same cores
+    // when one batch barely fills a core wave (minFA 1881c78).
+    if (fixedLayout && groupSize == 1 && shape.tailHeadBlocks > 0 &&
+        shape.normTasks + shape.tailHeadBlocks <= coreNum + 2) {
+        shape.tailHeadTile = Min(shape.tailHeadTile, 2);
+        shape.tailHeadBlocks = CeilDiv(qHeads, shape.tailHeadTile);
+    }
     shape.totalTasks = shape.normTasks + shape.tailHeadBlocks;
     return shape;
 }
