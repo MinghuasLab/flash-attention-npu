@@ -11,3 +11,6 @@ exclude = ["build", "dist"]
 # Keep the policy intentionally small: these rules catch concrete errors
 # without imposing a repository-wide lint expansion when Ruff defaults change.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
