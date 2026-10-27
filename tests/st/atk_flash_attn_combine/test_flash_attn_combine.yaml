@@ -1,0 +1,99 @@
+# ATK case design for flash_attn_combine (FA3 interface).
+#
+# Operator facts (source: flash_attn_npu_3/flash_attn_npu_interface.py +
+# csrc/ascend910/flash_attn_npu_3/flash_api.cpp::mha_combine):
+#   out_partial : fp32, rank 5 (NS,B,S,H,D) or rank 4 (NS,T,H,D)
+#   lse_partial : fp32, shape == out_partial.shape[:-1], seqlen-contiguous
+#   out_dtype   : fp16 / bf16 / fp32 (default fp32 when omitted)
+#   returns     : (out, lse), lse always fp32
+#
+# The two tensors are shape-coupled, so flash_attn_combine_constraint.py
+# derives lse_partial from out_partial and clamps the sampled dimensions.
+name: flash_attn_combine
+api: pytorch
+api_type: function_flash_attn_combine
+version: v2.1
+generate: generate_flash_attn_combine
+dtype_numbers: 192
+extra_numbers: 8
+shape_distributions:
+  - [0, 1.0]
+standard:
+  acc:
+    cv_fused_double_benchmark:
+      max_re_ratio: 2
+      avg_re_ratio: 1.2
+      root_mean_squared_ratio: 1.2
+  perf: not_key
+inputs:
+  - name: out_partial
+    type: tensor
+    required: true
+    dtypes:
+      values: [fp32]
+    ranges:
+      valid:
+        values: [[-0.001, 0.001], [-5, 5]]
+        random_types:
+          - name: nd
+            mean: [-100, 100]
+            std: [1, 25]
+        # L1/L2 mix: 10% narrow uniform, 50% wide uniform, 40% normal.
+        # (The 20% outlier bucket is disabled: this ATK build rejects the
+        #  input-level `outlier_values` field with a validator bug.)
+        custom_dist_ratio: [[0.1, 0.5, 0.0], [0.4, 0.0]]
+      invalid:
+        values: []
+    shapes:
+      dim_numbers:
+        values: [5, 4]
+      dim_values:
+        values: [1, 2, 3, 5, 8, 16, 17, 32, 64, 96, 113, 128, 192, 256]
+      max_length: 1048576
+    boundary:
+      has_empty: true
+      has_scalar: true
+      has_infnan: false
+      has_upper_border: false
+      has_lower_border: true
+  # Shape is overwritten by the constraint generator to exactly
+  # out_partial.shape[:-1]; the candidates below only seed ATK's sampler.
+  - name: lse_partial
+    type: tensor
+    required: true
+    dtypes:
+      values: [fp32]
+    ranges:
+      valid:
+        values: [[-5, 5]]
+        random_types:
+          - name: nd
+            mean: [-100, 100]
+            std: [1, 25]
+        custom_dist_ratio: [[0.6, 0.0], [0.4, 0.0]]
+      invalid:
+        # -inf marks "this split does not cover the row"; NV explicitly maps
+        # the resulting weight to 0.
+        values: ["-inf"]
+    # +inf / NaN have no defined meaning for the combine contract; only the
+    # all-masked (-inf) path is specified, so suppress ATK's generic infnan
+    # boundary cases for this tensor.
+    boundary:
+      has_empty: false
+      has_scalar: false
+      has_infnan: false
+      has_upper_border: false
+      has_lower_border: false
+    shapes:
+      dim_numbers:
+        values: [4, 3]
+      dim_values:
+        values: [1, 2, 3, 5, 8, 16, 17, 32, 64, 96, 113, 128, 192, 256]
+      max_length: 1048576
+  - name: out_dtype
+    type: attr
+    dtypes:
+      values: [string]
+    ranges:
+      valid:
+        values: [fp16, bf16]
