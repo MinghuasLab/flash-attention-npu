@@ -286,8 +286,8 @@ def make_local_attention_mask(q_seqlen, kv_seqlen, window_size_left, window_size
 def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right):
     """Normalize window parameters and build the reference attention mask.
 
-    ``-1`` means unlimited context in that direction; windows extending beyond
-    the KV length are also treated as unlimited. Causal mode normalizes the
+    ``-1`` means unlimited context in that direction; left/right windows covering
+    the KV/Q axis respectively are also treated as unlimited. Causal mode normalizes the
     right window to zero. Returns
     ``(mask, is_causal_golden, is_local_golden)``. ``mask`` is ``None`` when no
     mask is needed; otherwise ``True`` marks masked positions.
@@ -296,7 +296,7 @@ def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left,
     wr = window_size_right
     if kv_seqlen > 0 and wl >= kv_seqlen:
         wl = -1
-    if kv_seqlen > 0 and wr >= kv_seqlen:
+    if q_seqlen > 0 and wr >= q_seqlen:
         wr = -1
     if is_causal:
         wr = 0
@@ -306,7 +306,7 @@ def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left,
         if wl < 0:
             wl = kv_seqlen
         if wr < 0:
-            wr = kv_seqlen
+            wr = q_seqlen
     if is_causal_golden:
         diagonal = kv_seqlen - q_seqlen + 1
         mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=diagonal).to(torch.bool)
@@ -336,7 +336,7 @@ def make_padded_varlen_mask(
     col = torch.arange(max_kv_seqlen)[None, None, :]
     if max_kv_seqlen > 0 and window_size_left >= max_kv_seqlen:
         window_size_left = -1
-    if max_kv_seqlen > 0 and window_size_right >= max_kv_seqlen:
+    if max_q_seqlen > 0 and window_size_right >= max_q_seqlen:
         window_size_right = -1
     if is_causal:
         window_size_right = 0
@@ -346,11 +346,15 @@ def make_padded_varlen_mask(
     if is_causal_golden:
         mask = mask | (col - row >= offsets + 1)
     elif is_local_golden:
-        left = max_kv_seqlen if window_size_left < 0 else window_size_left
-        right = max_kv_seqlen if window_size_right < 0 else window_size_right
+        # Preserve the original bottom-right window semantics. Unlimited sides
+        # impose no bound; finite right windows must not be clamped to KV.
         diff = col - row
-        mask = mask | (diff < offsets - left) | (diff > offsets + right)
+        if window_size_left >= 0:
+            mask = mask | (diff < offsets - window_size_left)
+        if window_size_right >= 0:
+            mask = mask | (diff > offsets + window_size_right)
     return q_valid, k_valid, mask
+
 
 def check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,
                           k_new, v_new, cache_seqlens, block_tables, block_size):

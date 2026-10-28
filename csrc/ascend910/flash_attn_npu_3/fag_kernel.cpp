@@ -138,6 +138,7 @@ public:
 
         s1Token = fagTilingData->s1Token;
         s2Token = fagTilingData->s2Token;
+        maskType = fagTilingData->maskType;
         actualCalcS1Token = s1Token;
         actualCalcS2Token = s2Token;
 
@@ -286,8 +287,14 @@ public:
                 cachedBatch = static_cast<uint32_t>(bDimIdx);
                 GetSeqQlenKvlenByBidx(bDimIdx, cachedActualSeqQlen, cachedActualSeqKvlen);
                 if constexpr (IS_ATTEN_MASK == ENABLE) {
-                    actualCalcS1Token = s1Token + cachedActualSeqQlen - cachedActualSeqKvlen;
-                    actualCalcS2Token = s2Token - cachedActualSeqQlen + cachedActualSeqKvlen;
+                    int64_t s1TokenCur = s1Token;
+                    int64_t s2TokenCur = s2Token;
+                    if (maskType == static_cast<uint32_t>(FAGTiling::MaskType::MASK_BAND)) {
+                        s1TokenCur = s1TokenCur >= cachedActualSeqKvlen ? cachedActualSeqKvlen : s1TokenCur;
+                        s2TokenCur = s2TokenCur >= cachedActualSeqQlen ? cachedActualSeqQlen : s2TokenCur;
+                    }
+                    actualCalcS1Token = s1TokenCur + cachedActualSeqQlen - cachedActualSeqKvlen;
+                    actualCalcS2Token = s2TokenCur - cachedActualSeqQlen + cachedActualSeqKvlen;
                 }
                 s1Outer = (cachedActualSeqQlen + s1CvInner - 1) / s1CvInner;
                 s2Outer = (cachedActualSeqKvlen + s2CvInner - 1) / s2CvInner;
@@ -919,6 +926,7 @@ private:
     // optional control
     int64_t s1Token;
     int64_t s2Token;
+    uint32_t maskType;
     int64_t actualCalcS1Token;
     int64_t actualCalcS2Token;
 

@@ -385,8 +385,14 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         int32_t actualS1Len = 0;
         int32_t actualS2Len = 0;
         GetUsedSeqQlenKvlenByBidx(bIdx, actualS1Len, actualS2Len);
-        actualCalcS1Token = s1Token + actualS1Len - actualS2Len;
-        actualCalcS2Token = s2Token - actualS1Len + actualS2Len;
+        int64_t s1TokenCur = s1Token;
+        int64_t s2TokenCur = s2Token;
+        if (compressMode == BAND_COMPRESS_MODE) {
+            s1TokenCur = s1TokenCur >= actualS2Len ? actualS2Len : s1TokenCur;
+            s2TokenCur = s2TokenCur >= actualS1Len ? actualS1Len : s2TokenCur;
+        }
+        actualCalcS1Token = s1TokenCur + actualS1Len - actualS2Len;
+        actualCalcS2Token = s2TokenCur - actualS1Len + actualS2Len;
     }
 
     CATLASS_DEVICE

@@ -90,7 +90,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     if (maxKvSeqlen > 0 && wl >= static_cast<int64_t>(maxKvSeqlen)) {
         wl = -1;
     }
-    if (maxKvSeqlen > 0 && wr >= static_cast<int64_t>(maxKvSeqlen)) {
+    if (metaArgs->maxQSeqlen > 0 && wr >= static_cast<int64_t>(metaArgs->maxQSeqlen)) {
         wr = -1;
     }
     if (metaArgs->maskType == MASK_TYPE_CAUSAL) {
@@ -103,7 +103,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
             wl = static_cast<int64_t>(maxKvSeqlen);
         }
         if (wr < 0) {
-            wr = static_cast<int64_t>(maxKvSeqlen);
+            wr = static_cast<int64_t>(metaArgs->maxQSeqlen);
         }
     }
     tilingData->windowSizeLeft = wl;

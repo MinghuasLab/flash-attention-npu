@@ -546,7 +546,7 @@ def test_fa_kvcache_ops(
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
     if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
         window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen:
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
@@ -558,7 +558,7 @@ def test_fa_kvcache_ops(
         if window_size_left_golden < 0:
             window_size_left_golden = kv_seqlen
         if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
+            window_size_right_golden = q_seqlen
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -859,7 +859,7 @@ def test_flash_attn_func(
     window_size_right_golden = window_size_right
     if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
         window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen:
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
@@ -871,7 +871,7 @@ def test_flash_attn_func(
         if window_size_left_golden < 0:
             window_size_left_golden = kv_seqlen
         if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
+            window_size_right_golden = q_seqlen
     atten_mask = None
     if is_causal_golden:
         atten_mask = torch.triu(
@@ -1016,7 +1016,7 @@ def test_flash_attn_sink(
     dtype,
 ):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name and "Ascend950" not in name:
+    if "Ascend910" not in name:
         pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
     torch.manual_seed(0)
     batch_size = 2

@@ -78,13 +78,13 @@ struct FwdMaskDerivation {
 // Window normalization + mask-type derivation for the metadata *layout*.
 // The KV bound is the declared logical length / cache capacity (no D2H).
 // AICPU later refines maskType / windows against the actual max KV length.
-static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
+static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t max_seqlen_q,
                                        int64_t max_seqlen_k_bound)
 {
     if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
         window_left = -1;
     }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
+    if (max_seqlen_q > 0 && window_right >= max_seqlen_q) {
         window_right = -1;
     }
     if (causal) {
@@ -93,14 +93,14 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
     FwdMaskDerivation derived;
     derived.is_causal = (window_left < 0 && window_right == 0);
     derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    // Match the host tiling: infinite local side -> finite KV bound, not
+    // Match host tiling: bound the infinite left/right sides by KV/Q, not
     // WINDOW_SIZE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
     if (derived.is_local) {
         if (window_left < 0) {
             window_left = max_seqlen_k_bound;
         }
         if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
+            window_right = max_seqlen_q;
         }
     }
     derived.window_left = window_left;
@@ -467,11 +467,11 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
         tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
 
-        // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
+        // Bottom-right alignment: left is bounded by KV, right by Q.
         if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
             window_size_left = -1;
         }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+        if (seqlen_q > 0 && window_size_right >= seqlen_q) {
             window_size_right = -1;
         }
         if (is_causal) {
@@ -488,7 +488,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
                 window_size_left = max_kv_seqlen;
             }
             if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
+                window_size_right = seqlen_q;
             }
         }
 
@@ -705,7 +705,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     if (seqlen_k > 0 && window_size_left >= seqlen_k) {
         window_size_left = -1;
     }
-    if (seqlen_k > 0 && window_size_right >= seqlen_k) {
+    if (seqlen_q > 0 && window_size_right >= seqlen_q) {
         window_size_right = -1;
     }
     if (is_causal) {
@@ -718,7 +718,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
             window_size_left = seqlen_k;
         }
         if (window_size_right < 0) {
-            window_size_right = seqlen_k;
+            window_size_right = seqlen_q;
         }
     }
 
@@ -1027,11 +1027,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
     }
 
     bool is_local = false;
-    // Match Tri Dao GPU: both sides vs max_seqlen_k.
+    // Bottom-right alignment: left is bounded by KV, right by Q.
     if (max_seqlen_k > 0 && window_size_left >= max_seqlen_k) {
         window_size_left = -1;
     }
-    if (max_seqlen_k > 0 && window_size_right >= max_seqlen_k) {
+    if (max_seqlen_q > 0 && window_size_right >= max_seqlen_q) {
         window_size_right = -1;
     }
     if (is_causal) {
@@ -1044,7 +1044,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
             window_size_left = max_seqlen_k;
         }
         if (window_size_right < 0) {
-            window_size_right = max_seqlen_k;
+            window_size_right = max_seqlen_q;
         }
     }
 

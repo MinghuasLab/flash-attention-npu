@@ -264,7 +264,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     if (declared_k > 0 && window_size_left >= declared_k) {
         window_size_left = -1;
     }
-    if (declared_k > 0 && window_size_right >= declared_k) {
+    if (seqlen_q > 0 && window_size_right >= seqlen_q) {
         window_size_right = -1;
     }
     if (is_causal) {
@@ -277,7 +277,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             window_size_left = declared_k;
         }
         if (window_size_right < 0) {
-            window_size_right = declared_k;
+            window_size_right = seqlen_q;
         }
     }
     if (!scheduler_metadata_.has_value()) {

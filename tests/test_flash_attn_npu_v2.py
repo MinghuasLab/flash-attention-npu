@@ -137,6 +137,12 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
     (torch.bfloat16, 1, 13, 1, 17, 1, 1, 1, 128, False, 0, 0, 0.0, False, False),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
+    # Paged SWA Sq>>Sk regressions ported from FA3/FA4.
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 1, 128, False, 8, -1, 0.0, False, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 1, 128, False, 23, -1, 0.0, False, False),
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 1, 128, False, 3, -3, 0.0, False, False),
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 1, 128, False, 0, 2, 0.0, False, False),
+    (torch.float16, 2, 16, 4, 256, 8, 32, 1, 128, False, 4, -1, 0.0, False, False),
     # ALiBi
     (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True, False),
     (torch.bfloat16, 2, 8, 8, 1024, 2077, 128, 0, 128, True, -1, -1, 0.0, True, False),
@@ -309,7 +315,7 @@ def test_fa_kvcache_ops(
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
     if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
         window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen:
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
@@ -322,7 +328,7 @@ def test_fa_kvcache_ops(
         if window_size_left_golden < 0:
             window_size_left_golden = kv_seqlen
         if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
+            window_size_right_golden = q_seqlen
 
     out_out, softmax_lse = flash_attn_with_kvcache(
         query,
@@ -449,6 +455,88 @@ def test_fa_kvcache_ops(
             block_size,
         )
     return
+
+
+def test_fa_kvcache_paged_swa_mixed_logical_kv_lengths():
+    """Mixed paged-KV lengths must preserve an unlimited right SWA window."""
+
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 2, 4, 2
+    q_seqlen, max_kv_seqlen, head_size, block_size = 512, 64, 32, 128
+    kv_seqlens = [64, 32]
+    window_size = (8, -1)
+    scale = head_size**-0.5
+    generator = torch.Generator().manual_seed(2030)
+
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size),
+        data_type,
+        generator=generator,
+        device="npu",
+    )
+    key_cache, value_cache = make_paged_kv_cache(
+        batch_size,
+        max_kv_seqlen,
+        block_size,
+        kv_heads,
+        head_size,
+        data_type,
+        generator=generator,
+        device="npu",
+    )
+    block_table = make_block_table(batch_size, max_kv_seqlen, block_size).npu()
+    output, softmax_lse = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=torch.tensor(kv_seqlens, dtype=torch.int32, device="npu"),
+        block_table=block_table,
+        window_size=window_size,
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+
+    query_cpu = query.cpu()
+    key_cache_cpu = key_cache.cpu()
+    value_cache_cpu = value_cache.cpu()
+    block_table_cpu = block_table.cpu()
+    for batch_idx, kv_seqlen in enumerate(kv_seqlens):
+        key, value = gather_paged_kv(
+            key_cache_cpu,
+            value_cache_cpu,
+            block_table_cpu[batch_idx],
+            kv_seqlen,
+            block_size,
+        )
+        atten_mask, _, _ = make_golden_attention_mask(
+            q_seqlen, kv_seqlen, False, *window_size
+        )
+        output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
+            query_cpu[batch_idx : batch_idx + 1],
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            scale,
+            atten_mask,
+            data_type,
+            0.0,
+        )
+        fully_masked = atten_mask.all(dim=-1)
+        output_ref[:, fully_masked] = 0
+        output_pt[:, fully_masked] = 0
+        lse_ref[:, :, fully_masked] = torch.inf
+        lse_pt[:, :, fully_masked] = torch.inf
+        assert_fa_close(
+            output[batch_idx : batch_idx + 1],
+            output_ref,
+            output_pt,
+            name=f"mixed-kv out batch={batch_idx}",
+        )
+        assert_fa_close(
+            softmax_lse[batch_idx : batch_idx + 1],
+            lse_ref,
+            lse_pt,
+            name=f"mixed-kv lse batch={batch_idx}",
+        )
 
 
 @pytest.mark.parametrize("num_splits", [0, 1, 2, 4])

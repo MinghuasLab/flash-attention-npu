@@ -179,19 +179,24 @@ test_cases = [
     # SWA Sq>>Sk (empty-prefix / neg-empty / overlong-wR).
     (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "TND", False, 8, -1, 0.0, 0, False),
     (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "BSND", False, 8, -1, 0.0, 0, False),
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 1, 128, False, "TND", False, 8, -1, 0.0, 0, False),
     (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "TND", False, 0, -1, 0.0, 0, False),
     (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "BSND", False, 0, -1, 0.0, 0, False),
     (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "TND", False, 23, -1, 0.0, 0, False),
     (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "BSND", False, 23, -1, 0.0, 0, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 1, 128, False, "TND", False, 23, -1, 0.0, 0, False),
     # 2) negative right window with empty prefix (EndLen<=0)
     (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "TND", False, 3, -3, 0.0, 0, False),
     (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "BSND", False, 3, -3, 0.0, 0, False),
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 1, 128, False, "TND", False, 3, -3, 0.0, 0, False),
     # 3) overlong wR (>=Sk collapses to infinite, then to Sk)
     (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "TND", False, 0, 2, 0.0, 0, False),
     (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "BSND", False, 0, 2, 0.0, 0, False),
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 1, 128, False, "TND", False, 0, 2, 0.0, 0, False),
     # 4) GQA + medium Sq>>Sk
     (torch.float16, 2, 16, 4, 256, 8, 32, 0, 128, False, "TND", False, 4, -1, 0.0, 0, False),
     (torch.bfloat16, 2, 16, 4, 256, 8, 32, 0, 128, False, "BSND", False, 4, -1, 0.0, 0, False),
+    (torch.float16, 2, 16, 4, 256, 8, 32, 1, 128, False, "TND", False, 4, -1, 0.0, 0, False),
     # 5) paged Sq>>Sk SWA (TND equal-len)
     (torch.bfloat16, 2, 8, 2, 128, 4, 64, 1, 128, False, "TND", False, 2, -1, 0.0, 0, False),
     # 6) Sk>>Sq left-infinite band (complement; no empty prefix)
@@ -470,10 +475,10 @@ def test_fa_kvcache_ops(
     declared_kv = (
         ((kv_seqlen + block_size - 1) // block_size) * block_size if cache_mode == 1 else kv_seqlen
     )
-    # Match the host rule: both sides vs the declared KV bound.
+    # Bottom-right alignment bounds the left side by KV and the right by Q.
     if declared_kv > 0 and window_size_left_golden >= declared_kv:
         window_size_left_golden = -1
-    if declared_kv > 0 and window_size_right_golden >= declared_kv:
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen:
         window_size_right_golden = -1
     if is_causal:
         window_size_right_golden = 0
@@ -485,7 +490,12 @@ def test_fa_kvcache_ops(
         if window_size_left_golden < 0:
             window_size_left_golden = declared_kv
         if window_size_right_golden < 0:
-            window_size_right_golden = declared_kv
+            window_size_right_golden = q_seqlen
+        # The host must use the paged capacity to select the SWA kernel, but
+        # mask alignment is per batch and uses the logical KV length. Equal-len
+        # cases clamp here; varied TND clamps once more against each batch below.
+        window_size_left_golden = min(window_size_left_golden, kv_seqlen)
+        window_size_right_golden = min(window_size_right_golden, q_seqlen)
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -693,12 +703,19 @@ def test_fa_kvcache_ops(
         )
     elif is_local_golden:
         diff = col - row
+        kv_lengths = torch.tensor(kv_sequences)[:, None, None]
+        window_left_per_batch = torch.minimum(
+            torch.full_like(kv_lengths, window_size_left_golden), kv_lengths
+        )
+        window_right_per_batch = torch.minimum(
+            torch.full_like(kv_lengths, window_size_right_golden), torch.tensor(q_sequences)[:, None, None]
+        )
         left = (torch.tensor(kv_sequences) - torch.tensor(q_sequences))[
             :, None, None
-        ] - window_size_left_golden
+        ] - window_left_per_batch
         right = (torch.tensor(kv_sequences) - torch.tensor(q_sequences))[
             :, None, None
-        ] + window_size_right_golden
+        ] + window_right_per_batch
         atten_mask = atten_mask | (diff < left) | (diff > right)
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap

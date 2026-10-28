@@ -705,6 +705,13 @@ class FAInferKernel {
         int32_t invalidPrefixEndRow = qSeqlen; // qSeqlen disables prefix clearing.
         bool startsWithMaskTile = false;
         bool startsWithMaskThenNomaskFlag = false;
+        // Bottom-right alignment bounds the left window by KV length and
+        // the right window by Q length. KV is not a safe right-side bound
+        // when Q is longer than KV.
+        const int64_t windowSizeLeftCur =
+            windowSizeLeft >= static_cast<int64_t>(kvSeqlen) ? static_cast<int64_t>(kvSeqlen) : windowSizeLeft;
+        const int64_t windowSizeRightCur =
+            windowSizeRight >= static_cast<int64_t>(qSeqlen) ? static_cast<int64_t>(qSeqlen) : windowSizeRight;
         if (maskType == 1U) {
             int64_t diffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
             int64_t causalKvEnd = static_cast<int64_t>((qSBlockIdx + 1U) * curQSBlockTile) + diffS;
@@ -715,10 +722,10 @@ class FAInferKernel {
         } else if (maskType == 2U) {
             int32_t leftPointwindowSizeLeft = kvSeqlen;
             int32_t leftPointwindowSizeRight = 0;
-            if (windowSizeLeft < 0 && windowSizeLeft * (-1) >= qSeqlen) {
+            if (windowSizeLeftCur < 0 && windowSizeLeftCur * (-1) >= qSeqlen) {
                 kvStart = kvSeqlen / MAX_KV_STACK_LEN + 1;
-            } else if (windowSizeLeft != WINDOW_SIZE_INT_MAX) {
-                leftPointwindowSizeLeft = kvSeqlen - qSeqlen - windowSizeLeft;
+            } else if (windowSizeLeftCur != WINDOW_SIZE_INT_MAX) {
+                leftPointwindowSizeLeft = kvSeqlen - qSeqlen - windowSizeLeftCur;
                 windowSizeLeftStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeLeft;
                 windowSizeLeftEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeLeft;
                 kvStart = AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) /
@@ -727,10 +734,10 @@ class FAInferKernel {
             } else {
                 kvStart = 0;
             }
-            if (windowSizeRight < 0 && windowSizeRight * (-1) >= kvSeqlen) {
+            if (windowSizeRightCur < 0 && windowSizeRightCur * (-1) >= kvSeqlen) {
                 kvSLoopNumTotal = 0;
-            } else if (windowSizeRight != WINDOW_SIZE_INT_MAX) {
-                leftPointwindowSizeRight = kvSeqlen - qSeqlen + windowSizeRight;
+            } else if (windowSizeRightCur != WINDOW_SIZE_INT_MAX) {
+                leftPointwindowSizeRight = kvSeqlen - qSeqlen + windowSizeRightCur;
                 windowSizeRightStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeRight;
                 windowSizeRightEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeRight;
                 int32_t nsk = AscendC::Std::min(static_cast<int32_t>(kvSeqlen),
@@ -743,9 +750,10 @@ class FAInferKernel {
                 noSkipKvS = kvSeqlen;
                 kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
             }
-            if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) && windowSizeLeft != WINDOW_SIZE_INT_MAX) {
+            if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) &&
+                windowSizeLeftCur != WINDOW_SIZE_INT_MAX) {
                 invalidSuffixStartRow = kvSeqlen - leftPointwindowSizeLeft;
-            } else if (windowSizeRightStartLen < 0 && windowSizeRight != WINDOW_SIZE_INT_MAX) {
+            } else if (windowSizeRightStartLen < 0 && windowSizeRightCur != WINDOW_SIZE_INT_MAX) {
                 invalidPrefixEndRow = -leftPointwindowSizeRight;
             }
         } else {

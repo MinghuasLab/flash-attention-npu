@@ -80,13 +80,13 @@ struct FwdMaskDerivation {
     uint32_t maskType;
 };
 
-static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
+static void NormalizeAttentionWindow(bool causal, int64_t max_q, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
                                      bool& is_local)
 {
     if (max_k > 0 && left >= max_k) {
         left = -1;
     }
-    if (max_k > 0 && right >= max_k) {
+    if (max_q > 0 && right >= max_q) {
         right = -1;
     }
     if (causal) {
@@ -99,16 +99,16 @@ static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, 
             left = max_k;
         }
         if (right < 0) {
-            right = max_k;
+            right = max_q;
         }
     }
 }
 
 static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
-                                       int64_t max_seqlen_k_bound)
+                                       int64_t max_seqlen_q_bound, int64_t max_seqlen_k_bound)
 {
     FwdMaskDerivation derived;
-    NormalizeAttentionWindow(causal, max_seqlen_k_bound, window_left, window_right, derived.is_causal,
+    NormalizeAttentionWindow(causal, max_seqlen_q_bound, max_seqlen_k_bound, window_left, window_right, derived.is_causal,
                              derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
@@ -495,7 +495,7 @@ std::vector<at::Tensor> mha_fwd(
         } else {
             kvSeqlenBound = is_bnsd ? k.size(2) : k.size(1);
         }
-        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, kvSeqlenBound);
+        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
@@ -569,7 +569,7 @@ std::vector<at::Tensor> mha_fwd(
         const int64_t declared_k =
             max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                                             : (k.dim() == 4 ? k.size(1) : static_cast<int64_t>(max_kv_seqlen)));
-        NormalizeAttentionWindow(is_causal, declared_k, window_size_left, window_size_right, is_causal, is_local);
+        NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right, is_causal, is_local);
         TORCH_CHECK(!(appendKV && is_local),
                     "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
         if (is_local) {
@@ -821,7 +821,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                 "] (0 = auto; upper bound = number of AI cores). ");
     TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && is_varlen_q),
                 "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
-    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_k);
+    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_q, max_seqlen_k);
     FAMetadataArgs args{};
     args.seqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(seqlensQDev) : 0ULL;
     args.cacheSeqlensAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
@@ -1006,7 +1006,7 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);

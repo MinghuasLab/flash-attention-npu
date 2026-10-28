@@ -63,13 +63,13 @@ extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
+static void NormalizeAttentionWindow(bool causal, int64_t max_q, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
                                      bool& is_local)
 {
     if (max_k > 0 && left >= max_k) {
         left = -1;
     }
-    if (max_k > 0 && right >= max_k) {
+    if (max_q > 0 && right >= max_q) {
         right = -1;
     }
     if (causal) {
@@ -82,7 +82,7 @@ static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, 
             left = max_k;
         }
         if (right < 0) {
-            right = max_k;
+            right = max_q;
         }
     }
 }
@@ -437,7 +437,7 @@ std::vector<at::Tensor> mha_fwd(
         paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                  : (k.dim() == 4 ? (is_bnsd_layout ? k.size(2) : k.size(1))
                                  : (use_explicit_metadata ? k.size(0) : static_cast<int64_t>(max_kv_seqlen))));
-    NormalizeAttentionWindow(is_causal, declared_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right, is_causal, is_local);
 
     // Per-call runtime values (block/scale/mask) never live in the reusable
     // metadata; serialize them into a small FAInferRuntimeData and transfer H2D.
@@ -799,7 +799,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     if (max_seqlen_k > 0 && wl >= max_seqlen_k) {
         wl = -1;
     }
-    if (max_seqlen_k > 0 && wr >= max_seqlen_k) {
+    if (max_seqlen_q > 0 && wr >= max_seqlen_q) {
         wr = -1;
     }
     if (causal) {
@@ -977,7 +977,7 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
