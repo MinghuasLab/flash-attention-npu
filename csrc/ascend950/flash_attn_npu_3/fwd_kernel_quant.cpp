@@ -271,6 +271,9 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -323,6 +326,8 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -365,7 +370,7 @@ class FAIKernel950 {
             uint64_t lseOffset = static_cast<uint64_t>(qBOffset / strideQ) * qHeads_ +
                                  static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
                 lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             } else if constexpr (qFormat == Format::BNSD) {
@@ -856,7 +861,7 @@ CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask
                                    GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                                    GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                                    float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                                   GM_ADDR qDescale, GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated)
+                                   GM_ADDR qDescale, GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -922,7 +927,8 @@ CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     params.qDescale = qDescale;
     params.kDescale = kDescale;
     params.vDescale = vDescale;

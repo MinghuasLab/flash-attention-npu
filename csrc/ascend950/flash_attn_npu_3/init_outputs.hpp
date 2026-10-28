@@ -28,7 +28,6 @@ class InitOutputs950 {
 
     static constexpr uint32_t OUTPUT_UB_OFFSET = 6U * 32768U;
     static constexpr uint32_t LSE_UB_OFFSET = 7U * 32768U + 2048U;
-    static constexpr uint32_t LSE_ELEMS_PER_ROW = 8U;
 
     __aicore__ inline explicit InitOutputs950(Arch::Resource<ArchTag>& resource)
     {
@@ -90,18 +89,19 @@ class InitOutputs950 {
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
 
         if constexpr (LseMode) {
-            uint32_t lseElems = rowCount * LSE_ELEMS_PER_ROW;
+            uint32_t qSThisSubBlock = qNBlockSize == 1U ? rowCount : qSBlockSize;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
-            AscendC::Duplicate(lseUbTensor, std::numeric_limits<float>::infinity(), lseElems);
+            AscendC::Duplicate(lseUbTensor, std::numeric_limits<float>::infinity(), qSThisSubBlock);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             if (qNBlockSize == 1U) {
                 AscendC::DataCopyPad(gLse[rowStart], lseUbTensor,
-                                     AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
+                                     AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
             } else {
                 for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
-                    AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor[qNIdx * qSBlockSize],
-                                         AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
+                    // Every head reuses the same contiguous +inf rows.
+                    AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor,
+                                         AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
