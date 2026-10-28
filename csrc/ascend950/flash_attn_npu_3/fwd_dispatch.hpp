@@ -38,6 +38,7 @@ struct FwdLaunchArgs {
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
     int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD head plane)
+    FwdStorageParams storage;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

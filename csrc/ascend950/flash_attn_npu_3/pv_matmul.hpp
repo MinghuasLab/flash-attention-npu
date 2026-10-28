@@ -247,6 +247,13 @@ public:
         return outterLoopItr * curLoopNum + curLoopItr;
     }
     
+    uint64_t pageStride = 0;
+
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
+    }
+
     template <class TensorB, class L1BTile>
     __aicore__ inline
     void CopyGmToL1BwithNZ(TensorB& gBTile, L1BTile& l1BTile, uint32_t blockIdx, uint32_t blockOffset, uint32_t len,
@@ -305,8 +312,11 @@ public:
                 uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                 uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                 auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                auto gBTensorTlaTile = GetTile(gBTensor,
-                    tla::MakeCoord(blockIdx * blockSize + blockOffset, 0), tla::MakeShape(curBaseTileSize, embed));
+                auto gPageTensor = tla::MakeTensor(
+                    gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                    gBTensor.layout(), Arch::PositionGM{});
+                auto gBTensorTlaTile = GetTile(gPageTensor,
+                    tla::MakeCoord(blockOffset, 0), tla::MakeShape(curBaseTileSize, embed));
                 copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
             } else {
                 if (isShrink == 1) {

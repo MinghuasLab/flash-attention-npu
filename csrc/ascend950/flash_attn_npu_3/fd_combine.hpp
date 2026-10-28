@@ -82,7 +82,7 @@ class FlashDecodeCombine950 {
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch)) : 0U;
+        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
         const uint32_t combineIdx = tiling->fdCombineCoreSchedules[aivIdx].combineTaskIdx;
         const uint32_t sourceSubBlock = tiling->fdCombineCoreSchedules[aivIdx].sourceSubBlock;
         const uint32_t assignedStart = tiling->fdCombineCoreSchedules[aivIdx].sourceLocalRow;
@@ -181,7 +181,7 @@ class FlashDecodeCombine950 {
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch)) : 0U;
+        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
         uint32_t workBase = 0U;
         for (uint32_t combineIdx = 0U; combineIdx < tiling->fdCombineTaskNum; ++combineIdx) {
             const uint32_t baseTask = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].baseTask);

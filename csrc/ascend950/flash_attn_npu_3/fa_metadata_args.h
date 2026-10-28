@@ -85,20 +85,13 @@ struct FwdMaskDerivation {
     uint32_t maskType;
 };
 
-// Window normalization + mask-type derivation, mirroring the host tiling
-// branch in mha_fwd, but bounding the KV side with a host-known upper bound
-// (max_seqlen_k / cache capacity) instead of the device-side actual max KV
-// seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
-// allowed. Both metadata creation and fwd consumption use the same derivation.
+// Select the kernel from the requested window, independently of length bounds.
+// Metadata creation can know a tight per-sequence bound while its consumer
+// only knows total packed KV or padded page capacity. Folding finite windows
+// using those different bounds can launch a kernel incompatible with metadata.
 inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
-                                       int64_t max_seqlen_k_bound)
+                                       int64_t max_seqlen_q_bound, int64_t max_seqlen_k_bound)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
-        window_left = -1;
-    }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
-        window_right = -1;
-    }
     if (causal) {
         window_right = 0;
     }
@@ -106,11 +99,14 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
     derived.is_causal = (window_left < 0 && window_right == 0);
     derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
     if (derived.is_local) {
+        // Only replace unbounded sides. Bottom-right alignment requires at
+        // most K - 1 on the left and Q - 1 on the right; either valid bound
+        // covers the actual sequence. Device tiling clips finite windows.
         if (window_left < 0) {
-            window_left = max_seqlen_k_bound;
+            window_left = max_seqlen_k_bound > 0 ? max_seqlen_k_bound - 1 : 0;
         }
         if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
+            window_right = max_seqlen_q_bound > 0 ? max_seqlen_q_bound - 1 : 0;
         }
     }
     derived.window_left = window_left;

@@ -242,6 +242,8 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx();
         BlockMmadQK blockMmadQK(resource, qkL1TileHelper);
         BlockMmadPV blockMmadPV(resource, pvL1AddrStart_, pvL1TileHelper);
+        blockMmadQK.SetPageStride(params.storage.keyPageStride);
+        blockMmadPV.SetPageStride(params.storage.valuePageStride);
 #endif
 
 #ifdef __DAV_VEC__
@@ -298,6 +300,13 @@ class FAIKernel950 {
         } else {
             strideK = 16;
             strideV = 16;
+        }
+
+        if constexpr (kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd) {
+            strideK = params.storage.keyTokenStride;
+            strideV = params.storage.valueTokenStride;
+            kvHeadStrideK = params.storage.keyHeadStride;
+            kvHeadStrideV = params.storage.valueHeadStride;
         }
 
         uint32_t embedVRound = RoundUp(embedV_, 16);
@@ -431,7 +440,7 @@ class FAIKernel950 {
                 lseOffset = static_cast<uint64_t>(curBatch) * qHeads_ * lseHeadStride +
                             static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             } else if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
                 lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             }
@@ -485,8 +494,8 @@ class FAIKernel950 {
                 const int32_t qSTileLen = static_cast<int32_t>(qSBlockSize);
                 const int32_t kvSeqlenI = static_cast<int32_t>(kvSeqlen);
                 const int32_t qSeqlenI = static_cast<int32_t>(qSeqlen);
-                const int32_t wL = static_cast<int32_t>(windowSizeLeft_);
-                const int32_t wR = static_cast<int32_t>(windowSizeRight_);
+                const int32_t wL = static_cast<int32_t>(AscendC::Std::min(windowSizeLeft_, kvSeqlen));
+                const int32_t wR = static_cast<int32_t>(AscendC::Std::min(windowSizeRight_, qSeqlen));
                 int32_t kvSLoopNumI = 0;
                 int32_t leftPoint_L = kvSeqlenI;
                 int32_t leftPoint_R = 0;
@@ -980,7 +989,7 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated)
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1058,7 +1067,8 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1069,7 +1079,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                              int64_t kvSeqlenAllocated)
+                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1140,7 +1150,8 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }

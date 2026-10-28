@@ -33,6 +33,7 @@
 #include "fa_metadata_args.h"
 #include "device_triu_mask.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
@@ -41,6 +42,20 @@
 
 using flash_attn_npu_950_v3::fill_inference_context;
 using flash_attn_npu_950_v3::SeqlenScratch;
+
+namespace {
+void CheckPackedExtent(const at::Tensor& tensor, const at::Tensor& cu, const char* name)
+{
+    // Reading a device scalar is forbidden during graph capture. The warmup
+    // call validates the packed extent before the same graph is captured.
+    if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) {
+        return;
+    }
+    const int32_t last = cu.index({-1}).item<int32_t>();
+    TORCH_CHECK(last >= 0 && tensor.size(0) >= last, name,
+                "[-1] must not exceed the packed tensor length (", tensor.size(0), "); got ", last);
+}
+} // namespace
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_new_, std::optional<at::Tensor> v_new_,
@@ -77,8 +92,10 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     CHECK_CONTIGUOUS(q);
-    CHECK_CONTIGUOUS(k);
-    CHECK_CONTIGUOUS(v);
+    if (!page_table_.has_value()) {
+        CHECK_CONTIGUOUS(k);
+        CHECK_CONTIGUOUS(v);
+    }
 
     // ============================================================
     // 2. reject list
@@ -117,6 +134,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     if (paged_KV) {
         page_table = page_table_.value();
+        TORCH_CHECK(page_table.dim() == 2, "page_table must be rank 2");
         TORCH_CHECK(page_table.device() == q.device(), "page_table must be on the same NPU device as query");
         TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype int32");
         CHECK_CONTIGUOUS(page_table);
@@ -166,6 +184,13 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.numel() >= 2,
                     "cu_seqlens_q must be a rank-1 tensor with at least two elements");
+        CheckPackedExtent(q, cu_seqlens_q, "cu_seqlens_q");
+    }
+    if (is_varlen_kv) {
+        TORCH_CHECK(cu_seqlens_k.dim() == 1 && cu_seqlens_k.numel() == cu_seqlens_q.numel(),
+                    "cu_seqlens_k must be a rank-1 tensor of length batch_size + 1");
+        CheckPackedExtent(k, cu_seqlens_k, "cu_seqlens_k");
+        CheckPackedExtent(v, cu_seqlens_k, "cu_seqlens_k");
     }
     const auto sizes = q.sizes();
     int batch_size, seqlen_q, num_heads, head_size_q;
@@ -223,7 +248,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(seqlen_q > 0 && num_heads > 0, "query sequence length and head count must be positive");
+    const bool empty_query = is_varlen_q && q.size(0) == 0 && seqlen_q == 0;
+    TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
+                "query sequence length and head count must be positive unless TND total_q=max_seqlen_q=0");
+    TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query,
+                "total_q must be positive when max_seqlen_q is positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
     TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
@@ -237,6 +266,21 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(q.size(0) == k.size(0), "query and key/value batch sizes must match in BSND layout");
     }
     if (paged_KV) {
+        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                    "paged key/value caches must have matching page, page-size, and head dimensions");
+        const auto isBBND = [](const at::Tensor& t) {
+            return t.stride(1) == t.size(2) * t.size(3) && t.stride(2) == t.size(3) && t.stride(3) == 1;
+        };
+        const auto isBNBD = [](const at::Tensor& t) {
+            return t.stride(1) == t.size(3) && t.stride(2) == t.size(1) * t.size(3) && t.stride(3) == 1;
+        };
+        TORCH_CHECK((isBBND(k) && isBBND(v)) || (isBNBD(k) && isBNBD(v)),
+                    "paged key/value caches must use the same BBND or BNBD inner layout; "
+                    "only dimension 0 may otherwise be non-contiguous");
+        TORCH_CHECK(k.size(0) <= 1 || k.stride(0) >= k.size(1) * k.size(2) * k.size(3),
+                    "paged key cache first-axis stride must not overlap physical pages");
+        TORCH_CHECK(v.size(0) <= 1 || v.stride(0) >= v.size(1) * v.size(2) * v.size(3),
+                    "paged value cache first-axis stride must not overlap physical pages");
         TORCH_CHECK(num_blocks > 0 && max_num_blocks_per_seq > 0,
                     "paged KV cache and page_table must contain at least one block");
         TORCH_CHECK(page_table.size(0) == batch_size, "page_table batch dimension must match query batch size");
@@ -260,6 +304,15 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         CHECK_CONTIGUOUS(out);
     } else {
         out = at::empty(output_sizes, q.options());
+    }
+
+    if (empty_query) {
+        auto lse = at::empty(return_softmax_lse ? std::vector<int64_t>{num_heads, 0}
+                                               : std::vector<int64_t>{0},
+                             q.options().dtype(at::kFloat));
+        auto empty_accum = at::empty({0}, q.options().dtype(at::kFloat));
+        auto empty_lse_accum = at::empty({0}, q.options().dtype(at::kFloat));
+        return {out, lse, empty_accum, empty_lse_accum};
     }
 
     // ============================================================
@@ -303,7 +356,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         } else {
             kvSeqlenBound = k.size(1);
         }
-        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, kvSeqlenBound);
+        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != 0u;
@@ -345,25 +398,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         const int64_t declared_k = max_seqlen_k_.value_or(
             paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                      : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
-        if (declared_k > 0 && window_size_left >= declared_k) {
-            window_size_left = -1;
-        }
-        if (declared_k > 0 && window_size_right >= declared_k) {
-            window_size_right = -1;
-        }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        is_causal = window_size_left < 0 && window_size_right == 0;
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-        if (is_local) {
-            if (window_size_left < 0) {
-                window_size_left = declared_k;
-            }
-            if (window_size_right < 0) {
-                window_size_right = declared_k;
-            }
-        }
+        const FwdMaskDerivation maskDer =
+            DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, declared_k);
+        is_causal = maskDer.is_causal;
+        is_local = maskDer.is_local;
+        window_size_left = maskDer.window_left;
+        window_size_right = maskDer.window_right;
 
         int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
         int64_t max_q_seqlen = 0;
@@ -377,7 +417,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                     ? static_cast<int64_t>(q_used_ptr[batch_idx])
                     : (is_varlen_q ? static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] : seqlen_q);
             const int64_t kv_len = kv_len_ptr[batch_idx];
-            TORCH_CHECK(q_len > 0 && kv_len > 0, "950 backend (v3) requires positive Q and KV lengths");
+            TORCH_CHECK(q_len >= 0 && kv_len >= 0, "950 backend (v3) requires non-negative Q and KV lengths");
             if (q_used_ptr != nullptr) {
                 TORCH_CHECK(q_len <= static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx],
                             "seqused_q must lie within the allocated sequence length");
@@ -522,7 +562,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                                 softcap,
                                 static_cast<uint32_t>(num_blocks),
                                 static_cast<uint32_t>(max_num_blocks_per_seq),
-                                kv_seqlen_allocated};
+                                kv_seqlen_allocated,
+                                {paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U,
+                                 paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
+                                 paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U,
+                                 paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
+                                 paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U,
+                                 paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
+                                 is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
     auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_]() -> int {
         launch_fwd(fwdArgs);
         return 0;

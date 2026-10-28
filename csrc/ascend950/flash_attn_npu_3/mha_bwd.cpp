@@ -135,7 +135,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.kvHeadNum = num_heads_kv;
     fag_info.vHeadDim = v_head_dim;
     fag_info.totalQ = is_varlen ? static_cast<uint64_t>(q_sizes[0]) : static_cast<uint64_t>(batch_size * q_seqlen);
-    fag_info.totalKv = is_varlen ? static_cast<uint64_t>(k_sizes[0]) : static_cast<uint64_t>(batch_size * kv_seqlen);
+    // K and V may have different unused packed tails. The common workspace
+    // extent must fit both gradient outputs; longer tails are zeroed below.
+    fag_info.totalKv = is_varlen ? static_cast<uint64_t>(std::min(k_sizes[0], v_sizes[0]))
+                                : static_cast<uint64_t>(batch_size * kv_seqlen);
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
@@ -179,9 +182,24 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                             kv_lengths[batch_idx + 1] - kv_lengths[batch_idx] <= kv_seqlen,
                         "Ascend950 v3 bwd: an actual sequence length exceeds max_seqlen");
         }
-        TORCH_CHECK(q_lengths[batch_size] == static_cast<int64_t>(fag_info.totalQ) &&
-                        kv_lengths[batch_size] == static_cast<int64_t>(fag_info.totalKv),
-                    "Ascend950 v3 bwd: final cu_seqlens values must match packed tensor lengths");
+        TORCH_CHECK(q_lengths[batch_size] <= static_cast<int64_t>(fag_info.totalQ) &&
+                        kv_lengths[batch_size] <= static_cast<int64_t>(fag_info.totalKv),
+                    "Ascend950 v3 bwd: final cu_seqlens values must not exceed packed tensor lengths");
+        if (deterministic) {
+            // Deterministic schedules can write gradients directly per active
+            // tile, bypassing the full-buffer zeroed-workspace post pass.
+            // Packed tails have no tiles and must still receive zero gradients.
+            if (q_lengths[batch_size] < static_cast<int64_t>(fag_info.totalQ)) {
+                dq.slice(0, q_lengths[batch_size]).zero_();
+            }
+        }
+        const int64_t kvGradEnd = deterministic ? kv_lengths[batch_size] : static_cast<int64_t>(fag_info.totalKv);
+        if (kvGradEnd < k_sizes[0]) {
+            dk.slice(0, kvGradEnd).zero_();
+        }
+        if (kvGradEnd < v_sizes[0]) {
+            dv.slice(0, kvGradEnd).zero_();
+        }
         at::Tensor used_q_cpu = seqused_q_.has_value()
             ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
         at::Tensor used_k_cpu = seqused_k_.has_value()

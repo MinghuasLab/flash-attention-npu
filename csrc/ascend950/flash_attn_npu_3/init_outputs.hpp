@@ -93,7 +93,10 @@ class InitOutputs950 {
                                      AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
             } else {
                 for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
-                    AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor[qNIdx * qSBlockSize],
+                    // Each scalar row occupies a 32-byte UB block. Keep the
+                    // next head's source aligned even for odd Q lengths.
+                    AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride],
+                                         lseUbTensor[qNIdx * qSBlockSize * LSE_ELEMS_PER_ROW],
                                          AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
                 }
             }

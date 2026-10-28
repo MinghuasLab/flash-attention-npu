@@ -111,7 +111,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.maxQSeqlen = static_cast<uint32_t>(max_seqlen_q);
     // Match paged forward's mask selection using cache capacity.
     const int64_t maskKvBound = page_size.has_value() ? static_cast<int64_t>(maxNumBlocksPerBatch) * ps : max_seqlen_k;
-    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, maskKvBound);
+    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_q, maskKvBound);
     args.maskType = maskDer.maskType;
     args.windowSizeLeft = static_cast<int32_t>(maskDer.window_left);
     args.windowSizeRight = static_cast<int32_t>(maskDer.window_right);
