@@ -158,6 +158,34 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     return meta;
 }
 
+// Reuse identical, fully prepared tiling for nonpaged, dropout-free TND. Task
+// counts are prepared on Host before this lookup and are part of the key.
+// Separate device/stream keys keep uploads and launches ordered.
+static at::Tensor GetCachedVarlenTiling(const at::Tensor& tilingCpu)
+{
+    static thread_local std::unordered_map<std::string, at::Tensor> cache;
+    const auto stream = c10_npu::getCurrentNPUStream();
+    const auto device = stream.device_index();
+    const auto streamId = stream.id();
+    // The caller zeros the entire existing FAInferTilingData, including padding.
+    std::string key(reinterpret_cast<const char*>(&device), sizeof(device));
+    key.append(reinterpret_cast<const char*>(&streamId), sizeof(streamId));
+    key.append(static_cast<const char*>(tilingCpu.data_ptr()), tilingCpu.nbytes());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    at::Tensor tilingDevice = tilingCpu.to(at::Device(at::kPrivateUse1));
+    // Bound retained device buffers and keys even for highly variable workloads.
+    // Each entry is allocated and consumed on its keyed stream, so the caching
+    // allocator can safely retire an evicted buffer after queued work.
+    if (cache.size() >= 32) {
+        cache.erase(cache.begin());
+    }
+    cache.emplace(std::move(key), tilingDevice);
+    return tilingDevice;
+}
+
 // Patch fields that are only known by the forward consuming the metadata.
 // The copies run on the current stream after the AICPU metadataDone event.
 static void PatchTilingRuntimeFields(const at::Tensor& schedMd, uint64_t tilingOffset, float dropoutValue,
@@ -1170,35 +1198,60 @@ std::vector<at::Tensor> mha_varlen_fwd(
         tiling_cpu_ptr->set_UpdateSize(UpdateSize);
         tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
 
-        at::Tensor cu_seqlens_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
-        at::Tensor cu_seqlens_k_cpu_tensor = cu_seqlens_k.to(at::Device(at::kCPU));
-        int32_t* cu_seqlens_q_cpu = static_cast<int32_t*>(cu_seqlens_q_cpu_tensor.data_ptr());
-        int32_t* cu_seqlens_k_cpu = static_cast<int32_t*>(cu_seqlens_k_cpu_tensor.data_ptr());
-
         const bool fusedTask = !paged_KV;
         tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
-        uint32_t totalTaskNum = 0;
-        uint32_t groupSize = num_heads / num_heads_k;
-        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-            uint64_t qSeqlen = static_cast<uint64_t>(cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
-            uint64_t kvSeqlen = static_cast<uint64_t>(cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
-            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
-            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
-            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
-            if (fusedTask) {
-                curTaskNum = fa_fused::MakeTaskShape(
-                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+        // For valid packed inputs, sum(q_lengths) == batch * max_q implies
+        // every sequence reaches the declared upper bound. Count this common
+        // uniform case directly on Host without copying prefix sums to CPU.
+        const bool uniformQ = fusedTask &&
+            static_cast<int64_t>(T) == static_cast<int64_t>(batch_size) * max_seqlen_q;
+        if (uniformQ) {
+            const uint32_t tasksPerBatch = fa_fused::MakeTaskShape(
+                max_seqlen_q, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+            tiling_cpu_ptr->set_firstBatchTaskNum(tasksPerBatch);
+            tiling_cpu_ptr->set_totalTaskNum(tasksPerBatch * batch_size);
+        } else {
+            // Always read current Q lengths: pointer identity or unchanged tensor
+            // shape does not guarantee that the sequence lengths are unchanged.
+            at::Tensor cu_seqlens_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
+            const int32_t* cu_seqlens_q_cpu = cu_seqlens_q_cpu_tensor.data_ptr<int32_t>();
+            at::Tensor cu_seqlens_k_cpu_tensor;
+            const int32_t* cu_seqlens_k_cpu = nullptr;
+            if (!fusedTask) {
+                cu_seqlens_k_cpu_tensor = cu_seqlens_k.to(at::Device(at::kCPU));
+                cu_seqlens_k_cpu = cu_seqlens_k_cpu_tensor.data_ptr<int32_t>();
             }
-            if (batchIdx == 0) {
-                tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+            uint32_t totalTaskNum = 0;
+            const uint32_t groupSize = num_heads / num_heads_k;
+            for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+                const uint32_t qSeqlen = static_cast<uint32_t>(
+                    cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
+                uint32_t curTaskNum;
+                if (fusedTask) {
+                    // Grouped task geometry depends only on Q, not on KV lengths.
+                    curTaskNum = fa_fused::MakeTaskShape(
+                        qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+                } else {
+                    const uint32_t kvSeqlen = static_cast<uint32_t>(
+                        cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
+                    const uint32_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+                    const uint32_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+                    const uint32_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+                    const uint32_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+                    curTaskNum = qNBlockNumPerGroup * num_heads_k * curQSBlockNum;
+                }
+                if (batchIdx == 0) {
+                    tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+                }
+                totalTaskNum += curTaskNum;
             }
-            totalTaskNum += curTaskNum;
+            tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
         }
-        tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
-        tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
+        if (fusedTask && !has_dropout && !return_softmax) {
+            tiling_gpu_tensor = GetCachedVarlenTiling(tiling_cpu_tensor);
+        } else {
+            tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        }
         tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.data_ptr()));
 
         // attention mask
