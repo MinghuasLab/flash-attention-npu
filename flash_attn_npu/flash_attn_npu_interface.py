@@ -24,12 +24,12 @@ _LAYOUT_BNSD = 2
 
 def _transposed_bnsd_view(t):
     """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
-    if t is None or t.dim() != 4 or t.is_contiguous():
+    if t is None or t.dim() != 4:
         return None
-    _, n1, _, n3 = t.shape
-    if t.stride(3) == 1 and t.stride(1) == n3 and t.stride(2) == n1 * n3:
-        return t.transpose(1, 2)
-    return None
+    # Singleton sequence/head axes may make both layouts contiguous. They
+    # must remain compatible with the unambiguous BNSD operands in the group.
+    bnsd = t.transpose(1, 2)
+    return bnsd if bnsd.is_contiguous() else None
 
 
 def _detect_layout(q, k, v, page_table, cu_seqlens_k):
@@ -51,7 +51,8 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     q_bnsd = _transposed_bnsd_view(q)
     k_bnsd = _transposed_bnsd_view(k)
     v_bnsd = _transposed_bnsd_view(v)
-    if q_bnsd is not None and k_bnsd is not None and v_bnsd is not None:
+    if (q_bnsd is not None and k_bnsd is not None and v_bnsd is not None
+            and any(not t.is_contiguous() for t in (q, k, v))):
         return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, True
 
     return _LAYOUT_BSND, q, k, v, False

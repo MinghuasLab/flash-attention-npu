@@ -148,7 +148,7 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
             Muls(vecIn, vecIn, scaleValue, dataSize);
             AscendC::PipeBarrier<PIPE_V>();
-            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_ROUND, dataSize);
+            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_RINT, dataSize);
             event_t Mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
@@ -176,7 +176,7 @@ public:
 
             Muls(vecIn, vecIn, scaleValue, dataSize);
             AscendC::PipeBarrier<PIPE_V>();
-            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_ROUND, dataSize);
+            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_RINT, dataSize);
 
             event_t Mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
@@ -197,7 +197,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
 
-            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_ROUND, dataSize);
+            Cast(vecOut, vecIn, AscendC::RoundMode::CAST_RINT, dataSize);
             event_t Mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);

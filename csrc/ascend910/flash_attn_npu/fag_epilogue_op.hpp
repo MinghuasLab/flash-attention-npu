@@ -115,6 +115,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
     int64_t g;
     int64_t s1;
     int64_t s2;
+    int64_t dropMaskMaxQ;
+    int64_t dropMaskMaxK;
     int64_t d;
     int64_t value_d;
     int64_t dAlign;
@@ -262,6 +264,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         g = tilingData->g;
         s1 = tilingData->qSeqlen;
         s2 = tilingData->kvSeqlen;
+        dropMaskMaxQ = tilingData->dropMaskMaxQ;
+        dropMaskMaxK = tilingData->dropMaskMaxK;
         d = tilingData->qkHeadDim;
         value_d = tilingData->vHeadDim;
         t1 = tilingData->t1;
@@ -591,7 +595,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         int64_t qHeadNumLocal = n2 * g;
         int64_t headIdx = dbParam.n2Idx * g + dbParam.gIdx;
         int64_t s1Pos = dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize;
-        return ((dbParam.bIdx * qHeadNumLocal + headIdx) * s1 + s1Pos) * static_cast<int64_t>(dropMaskS2Stride) +
+        return ((dbParam.bIdx * qHeadNumLocal + headIdx) * dropMaskMaxQ + s1Pos) * static_cast<int64_t>(dropMaskS2Stride) +
                static_cast<int64_t>(s2VBegin / 8);
     }
 
@@ -723,7 +727,6 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             } else {
                 qKSeqDiff = s2 - s1;
             }
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
             int64_t qNBlockBaseIdx = dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
             int64_t slopesBatchOffset = static_cast<int64_t>(dbParam.bIdx) * alibiSlopesBatchStride;
             AscendC::LocalTensor<float> bwdWorkUb =
@@ -772,7 +775,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             // rows fill the 32B slots contiguously, allowing a single
             // full-tile Select; smaller rows go through the per-row loop.
             uint32_t maskRowBytes = CeilDiv(s2Extend, 8);
-            uint32_t dropMaskS2Stride = CeilDiv(s2, 8);
+            uint32_t dropMaskS2Stride = CeilDiv(dropMaskMaxK, 8);
             int64_t dropMaskOffset = GetDropMaskOffset(dbParam, curS1Idx, s2VBegin, dropMaskS2Stride);
             LocalTensor<uint8_t> dropMaskU8 =
                 unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), ubBufferOffset + U8Begin);
@@ -810,7 +813,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(vecCopyOutBuffer, vecDropBuffer, RoundMode::CAST_ROUND, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::Cast(vecCopyOutBuffer, vecDropBuffer, RoundMode::CAST_RINT, s1ExtendSubGraph * s2ExtendAlign);
         }
         int64_t copyOutOffset = 0;
         DataCopyParams copyOutParam;
@@ -900,6 +903,38 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
                           s1ExtendSubGraph * s2ExtendAlign);
         }
 
+        // When this vector tile contains the complete key row, form D
+        // directly from FP32 P*dP. dot(dO, rounded_O) loses the small softmax
+        // derivative for concentrated distributions (especially BF16).
+        int64_t fullKeyCount = INPUT_LAYOUT == TND ? dbParam.actualS2Len : s2;
+        if (dbParam.s2oIdx == 0 && curS2Idx == 0 && fullKeyCount <= s2Extend) {
+            constexpr uint32_t partialStride = 128;
+            LocalTensor<float> rowSums = unifiedBuffer.GetWithOffset<float>(512, 181 * 1024);
+            LocalTensor<float> products = unifiedBuffer.GetWithOffset<float>(1536, 183 * 1024);
+            LocalTensor<float> probabilities = unifiedBuffer.GetWithOffset<float>(8192, DbBegin);
+            uint32_t rowsPerTile = 1536 / s2ExtendAlign;
+            for (uint32_t first = 0; first < s1ExtendSubGraph; first += rowsPerTile) {
+                uint32_t rows = AscendC::Std::min(rowsPerTile, s1ExtendSubGraph - first);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mul(products, probabilities[first * s2ExtendAlign],
+                              vecClc1Buffer[first * s2ExtendAlign], rows * s2ExtendAlign);
+                AscendC::PipeBarrier<PIPE_V>();
+                uint32_t chunks = CeilDiv(s2Extend, cal_repeat_num);
+                for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+                    uint32_t lanes = AscendC::Std::min(cal_repeat_num, s2Extend - chunk * cal_repeat_num);
+                    AscendC::WholeReduceSum(rowSums[chunk * partialStride], products[chunk * cal_repeat_num],
+                                           lanes, rows, 1, 1, s2ExtendAlign / 8);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+                for (uint32_t chunk = 1; chunk < chunks; ++chunk) {
+                    AscendC::Add(rowSums, rowSums, rowSums[chunk * partialStride], rows);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                AscendC::Brcb(sfmgClc3[first * 8], rowSums, static_cast<uint8_t>(CeilDiv(rows, 8)), {1, 8});
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+
         uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t subIdx = 0; subIdx < sub_block_cout; subIdx++) {
@@ -935,10 +970,32 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             AscendC::PipeBarrier<PIPE_V>();
         }
 
+        // With zero or one valid key, softmax is constant with respect to
+        // Q/K. Do not let the rounded O used by SFMG create a spurious dS.
+        int64_t validKvLen = s2;
+        if constexpr (INPUT_LAYOUT == TND) {
+            validKvLen = dbParam.actualS2Len;
+        }
+        if constexpr (IS_ATTEN_MASK == ENABLE) {
+            int64_t firstRow = dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize;
+            for (uint32_t r = 0; r < s1ExtendSubGraph; ++r) {
+                int64_t row = firstRow + r;
+                int64_t firstKey = AscendC::Std::max(static_cast<int64_t>(0), row - actualCalcS1Token);
+                int64_t lastKey = AscendC::Std::min(validKvLen, row + actualCalcS2Token + 1);
+                if (lastKey - firstKey <= 1) {
+                    AscendC::Duplicate(vecClc1Buffer[r * s2ExtendAlign], 0.0f, s2ExtendAlign);
+                }
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        } else if (validKvLen <= 1) {
+            AscendC::Duplicate(vecClc1Buffer, 0.0f, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         LocalTensor<T1> vecCopyOutBuffer = vecClc1Buffer.template ReinterpretCast<T1>();
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);
-            AscendC::Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_ROUND, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_RINT, s1ExtendSubGraph * s2ExtendAlign);
         }
 
         int64_t copyOutOffset = 0;
@@ -1388,7 +1445,6 @@ class BlockEpilogue<EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_, HAS_ALIBI_>, 
             int64_t actualS2LenBwd = 0;
             GetSeqQlenKvlenByBidx(static_cast<int64_t>(blockInfo.batchIdx), actualS1LenBwd, actualS2LenBwd);
             int64_t qKSeqDiff = actualS2LenBwd - actualS1LenBwd;
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
             int64_t qSBlockBaseIdx = static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
             int64_t qNBlockBaseIdx = static_cast<int64_t>(blockInfo.nheadsKIdx) * g + blockInfo.gIdx;
             int64_t slopesBatchOffset = static_cast<int64_t>(blockInfo.batchIdx) * alibiSlopesBatchStride;
@@ -1424,7 +1480,7 @@ class BlockEpilogue<EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_, HAS_ALIBI_>, 
         LocalTensor<ElementVecDtype> vecCopyOutBuffer =
             unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 / sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
         AscendC::PipeBarrier<PIPE_V>();
-        Cast(vecCopyOutBuffer, vecDropBuffer, RoundMode::CAST_ROUND, s1Extend * s2ExtendAlign);
+        Cast(vecCopyOutBuffer, vecDropBuffer, RoundMode::CAST_RINT, s1Extend * s2ExtendAlign);
 
         event_t mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(mte3WaitV);
@@ -1511,9 +1567,24 @@ class BlockEpilogue<EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_, HAS_ALIBI_>, 
             AscendC::PipeBarrier<PIPE_V>();
         }
 
+        // The optimized TND route has the same exact single-key Jacobian.
+        int64_t queryLen = cuQSeqLen;
+        int64_t keyLen = cuKSeqLen;
+        int64_t firstRow = static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
+        for (uint32_t r = 0; r < s1Extend; ++r) {
+            int64_t validKeys = keyLen;
+            if constexpr (MASK_TYPE == static_cast<uint32_t>(MaskType::MASK_CAUSAL)) {
+                validKeys = AscendC::Std::min(keyLen, firstRow + r + keyLen - queryLen + 1);
+            }
+            if (validKeys <= 1) {
+                AscendC::Duplicate(vecClc1Buffer[r * s2ExtendAlign], 0.0f, s2ExtendAlign);
+            }
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
         LocalTensor<ElementVecDtype> vecCopyOutBuffer =
             unifiedBuffer.GetWithOffset<ElementVecDtype>(17 * 1024 / sizeof(ElementVecDtype), ubBufferOffset + T1Begin);
-        Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_ROUND, s1Extend * s2ExtendAlign);
+        Cast(vecCopyOutBuffer, vecClc1Buffer, RoundMode::CAST_RINT, s1Extend * s2ExtendAlign);
 
         event_t mte3WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(mte3WaitV);

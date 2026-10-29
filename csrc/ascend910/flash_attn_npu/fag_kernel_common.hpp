@@ -91,6 +91,8 @@ struct FAGTilingData {
     SoftMaxTiling softmaxTilingData;
     SoftMaxTiling softmaxGradTilingData;
     int64_t alibiSlopesBatchStride = 0;
+    int64_t dropMaskMaxQ = 0;
+    int64_t dropMaskMaxK = 0;
 };
 
 struct FAGv2TilingData {

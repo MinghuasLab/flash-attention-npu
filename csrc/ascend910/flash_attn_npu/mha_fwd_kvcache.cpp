@@ -160,6 +160,7 @@ class FAInferKernel {
         dropoutValue = fATilingData->dropoutValue;
         maxQSeqlen = fATilingData->maxQSeqlen;
         maxKvSeqlen = fATilingData->maxKvSeqlen;
+        hasKvLengths = params.actualKvseqlen != nullptr;
         kvNewSeqlen = fATilingData->kvNewSeqlen;
         kvCacheSeqlen = fATilingData->kvCacheSeqlen;
 
@@ -612,7 +613,7 @@ class FAInferKernel {
         // total S = old + new
         // TODO: modify to constexpr, change appendKVFlag to template param
         uint32_t kvSeqlenOld;
-        if (INPUT_LAYOUT == FaiKenel::inputLayout::TND || appendKVFlag || PAGED_CACHE_FLAG) {
+        if (hasKvLengths) {
             kvSeqlenOld = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
         } else {
             kvSeqlenOld = maxKvSeqlen;
@@ -641,8 +642,8 @@ class FAInferKernel {
                     // Capacity-aligned cache: cache batch occupies [BIdx * kvCacheSeqlen, ...).
                     prevKvSeqlenSum = BIdx * kvCacheSeqlen;
                 } else {
-                    // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
-                    prevKvSeqlenSum = maxKvSeqlen * BIdx;
+                    // Logical cache lengths do not change the allocated batch stride.
+                    prevKvSeqlenSum = (kvSeqlenAllocated ? kvSeqlenAllocated : maxKvSeqlen) * BIdx;
                 }
             }
         }
@@ -815,11 +816,13 @@ class FAInferKernel {
         uint32_t kvLoopNumTotalNew = 0;
         uint32_t kvSLoopNumTotalOld = kvSLoopNumTotal;
         if (appendKVFlag) {
-            kvStartOld = CeilDiv(kvSeqlenOld, MAX_KV_STACK_LEN);
             kvSLoopNumTotalOld =
                 CeilDiv(AscendC::Std::max((int64_t)0, AscendC::Std::min(static_cast<int64_t>(noSkipKvS),
                                                                         static_cast<int64_t>(kvSeqlenOld))),
                         (int64_t)MAX_KV_STACK_LEN);
+            // The loop contains only visible old blocks. New KV must start
+            // immediately after them, even when causal masking hides all old KV.
+            kvStartOld = kvSLoopNumTotalOld;
             kvLoopNumTotalNew = CeilDiv(kvNewSeqlen, MAX_KV_STACK_LEN);
             kvSLoopNumTotal = kvSLoopNumTotalOld + kvLoopNumTotalNew;
             kvEnd = kvSLoopNumTotal;
@@ -832,8 +835,19 @@ class FAInferKernel {
         // slice is final and must not be overridden by append's kvEnd.
         if constexpr (FLASH_DECODE_FLAG) {
             uint32_t fdStart = static_cast<uint32_t>(stS2IdxNow);
-            uint32_t fdEnd =
-                (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) ? winKvEnd : static_cast<uint32_t>(enS2IdxNow);
+            uint32_t fdEnd = static_cast<uint32_t>(enS2IdxNow);
+            if (appendKVFlag) {
+                // Metadata partitions the full old+new block range. Remove the
+                // masked old suffix from both split bounds, keeping each new
+                // block in its original split (including its cache writeback).
+                uint32_t oldBlockNum = CeilDiv(kvSeqlenOld, MAX_KV_STACK_LEN);
+                fdStart = fdStart < oldBlockNum ? AscendC::Std::min(fdStart, kvStartOld)
+                                               : fdStart - oldBlockNum + kvStartOld;
+                fdEnd = fdEnd < oldBlockNum ? AscendC::Std::min(fdEnd, kvStartOld)
+                                           : fdEnd - oldBlockNum + kvStartOld;
+            } else if (enS2IdxNow == static_cast<int32_t>(curKSBlockNum)) {
+                fdEnd = winKvEnd;
+            }
             kvStart = AscendC::Std::max(fdStart, winKvStart);
             kvEnd = AscendC::Std::min(fdEnd, winKvEnd);
         }
@@ -867,7 +881,6 @@ class FAInferKernel {
 
 #ifdef __DAV_C220_VEC__
         int64_t qKSeqDiff = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
-        qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
         int64_t qSBlockBaseIdx = qSBlockIdx * curQSBlockTile;
         int64_t qNBlockBaseIdx = qNStartIdx;
         int64_t slopesBatchOffset = static_cast<int64_t>(BIdx) * alibiSlopesBatchStride;
@@ -1048,7 +1061,7 @@ class FAInferKernel {
                                               qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                     } else {
                         bool isLastNoMaskStackTile =
-                            (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
+                            notNextMask || (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                         uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
                         uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile
                                                             ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN)
@@ -1178,6 +1191,7 @@ class FAInferKernel {
     uint32_t totalTaskNum;
     uint32_t blockSize;
     uint32_t maskType;
+    bool hasKvLengths;
     int64_t windowSizeLeft;
     int64_t windowSizeRight;
     float scaleValue;

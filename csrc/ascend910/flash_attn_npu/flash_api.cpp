@@ -79,30 +79,23 @@ struct FwdMaskDerivation {
 
 // Window normalization + mask-type derivation for the metadata *layout*.
 // The KV bound is the declared logical length / cache capacity (no D2H).
-// AICPU later refines maskType / windows against the actual max KV length.
+// AICPU preserves these logical windows for each actual sequence.
 static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
                                        int64_t max_seqlen_k_bound)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
-        window_left = -1;
-    }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
-        window_right = -1;
-    }
     if (causal) {
         window_right = 0;
     }
     FwdMaskDerivation derived;
     derived.is_causal = (window_left < 0 && window_right == 0);
     derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    // Match the host tiling: infinite local side -> finite KV bound, not
-    // WINDOW_SIZE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+    // Keep unlimited sides distinct from any finite KV length.
     if (derived.is_local) {
         if (window_left < 0) {
-            window_left = max_seqlen_k_bound;
+            window_left = INT32_MAX;
         }
         if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
+            window_right = INT32_MAX;
         }
     }
     derived.window_left = window_left;
@@ -352,7 +345,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
     const int page_block_size = !paged_KV ? 128 : kcache.size(1);
     const int num_heads_k = is_bnsd ? static_cast<int>(kcache.size(1)) : static_cast<int>(kcache.size(2));
     // BNSD: the KV head-plane width is the allocated KV S (k.size(2) in BNSD terms).
-    const int64_t kv_seqlen_allocated = is_bnsd ? static_cast<int64_t>(kcache.size(2)) : 0;
+    const int64_t kv_seqlen_allocated = paged_KV ? 0 : static_cast<int64_t>(kcache.size(is_bnsd ? 2 : 1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256, "FlashAttention only supports head dimension in [1, 256]");
@@ -497,13 +490,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
         tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
 
-        // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-            window_size_left = -1;
-        }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-            window_size_right = -1;
-        }
+        // Preserve finite windows, including when Q is longer than KV.
         if (is_causal) {
             window_size_right = 0;
         }
@@ -511,14 +498,13 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
         TORCH_CHECK(!(appendKV && is_local),
                     "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
-        // Match Tri Dao set_params_fprop: infinite local side → seqlen_k (finite),
-        // not WINDOW_SIZE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+        // Encode an infinite side with the device mask's explicit sentinel.
         if (is_local) {
             if (window_size_left < 0) {
-                window_size_left = max_kv_seqlen;
+                window_size_left = INT32_MAX;
             }
             if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
+                window_size_right = INT32_MAX;
             }
         }
 
@@ -737,13 +723,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     bool is_local = false;
-    // Match Tri Dao GPU: both sides vs seqlen_k.
-    if (seqlen_k > 0 && window_size_left >= seqlen_k) {
-        window_size_left = -1;
-    }
-    if (seqlen_k > 0 && window_size_right >= seqlen_k) {
-        window_size_right = -1;
-    }
+    // Keep the caller's right-bottom aligned window unchanged.
     if (is_causal) {
         window_size_right = 0;
     }
@@ -751,10 +731,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     if (is_local) {
         if (window_size_left < 0) {
-            window_size_left = seqlen_k;
+            window_size_left = INT32_MAX;
         }
         if (window_size_right < 0) {
-            window_size_right = seqlen_k;
+            window_size_right = INT32_MAX;
         }
     }
 
@@ -1069,13 +1049,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
     }
 
     bool is_local = false;
-    // Match Tri Dao GPU: both sides vs max_seqlen_k.
-    if (max_seqlen_k > 0 && window_size_left >= max_seqlen_k) {
-        window_size_left = -1;
-    }
-    if (max_seqlen_k > 0 && window_size_right >= max_seqlen_k) {
-        window_size_right = -1;
-    }
+    // Declared maxima must not alter per-sequence window semantics.
     if (is_causal) {
         window_size_right = 0;
     }
@@ -1083,10 +1057,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
     is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     if (is_local) {
         if (window_size_left < 0) {
-            window_size_left = max_seqlen_k;
+            window_size_left = INT32_MAX;
         }
         if (window_size_right < 0) {
-            window_size_right = max_seqlen_k;
+            window_size_right = INT32_MAX;
         }
     }
 
@@ -1397,12 +1371,6 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
 
     int local_window_size_left = window_size_left;
     int local_window_size_right = window_size_right;
-    if (local_window_size_left >= max_seqlen_k - 1) {
-        local_window_size_left = -1;
-    }
-    if (local_window_size_right >= max_seqlen_q - 1) {
-        local_window_size_right = -1;
-    }
     if (is_causal) {
         local_window_size_right = 0;
     }

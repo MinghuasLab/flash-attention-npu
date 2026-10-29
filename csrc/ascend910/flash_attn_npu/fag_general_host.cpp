@@ -119,12 +119,6 @@ std::vector<at::Tensor> launch_fag_general(
 
     bool has_dropout = (p_dropout > 0.0f);
     fagInfo.keepProb = 1.0f - p_dropout;
-    if (window_size_left >= max_seqlen_k - 1) {
-        window_size_left = -1;
-    }
-    if (window_size_right >= max_seqlen_q - 1) {
-        window_size_right = -1;
-    }
     if (is_causal) {
         window_size_right = 0;
     }
@@ -202,6 +196,8 @@ std::vector<at::Tensor> launch_fag_general(
         FAGTilingData fagTilingData{};
         int64_t tilingStatus = FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
         TORCH_CHECK(tilingStatus == 0, "launch_fag_general: GetFAGTilingParam failed.");
+        fagTilingData.dropMaskMaxQ = max_seqlen_q;
+        fagTilingData.dropMaskMaxK = max_seqlen_k;
         fagTilingData.actualSeqQlen.clear();
         fagTilingData.actualSeqKvlen.clear();
         auto tiling_cpu_tensor = at::empty({static_cast<long>(tilingSize)}, at::device(c10::kCPU).dtype(at::kByte));

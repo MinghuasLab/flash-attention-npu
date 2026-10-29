@@ -22,7 +22,7 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
 
     int n = 8;  // FLOAT_PER_DATABLOCK，only use scalar operation for the first datablock
     for (int i = 0; i < n; i++) {
-        workUb.SetValue(i, static_cast<float>(baseColIdx + i) * slope);
+        workUb.SetValue(i, static_cast<float>(baseColIdx + i));
     }
 
     AscendC::SetFlag<AscendC::HardEvent::S_V>(eventIdSToV);  
@@ -30,21 +30,22 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
     
     while (n < count) {
         if (2 * n < count) {
-            AscendC::Adds(workUb[n], workUb, static_cast<float>(n) * slope, n);
+            AscendC::Adds(workUb[n], workUb, static_cast<float>(n), n);
             AscendC::PipeBarrier<PIPE_V>();
             n *= 2;
         } else {
-            AscendC::Adds(workUb[n], workUb, static_cast<float>(n) * slope, count - n);
+            AscendC::Adds(workUb[n], workUb, static_cast<float>(n), count - n);
             AscendC::PipeBarrier<PIPE_V>();
             break;
         }
     }
     
-    if (baseColIdx < 0) {
-        AscendC::Abs(workUb, workUb,
-            AscendC::Std::min(-baseColIdx, static_cast<int64_t>(count)));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
+    // Build exact integer distances before scaling. Scaling partial ranges
+    // and then adding them leaves a nonzero FP32 bias on the diagonal.
+    AscendC::Abs(workUb, workUb, count);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(workUb, workUb, slope, count);
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 __aicore__ inline void SubBiasToScoreRow(AscendC::LocalTensor<float> &scoreUb, uint32_t rowOff,

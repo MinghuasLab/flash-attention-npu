@@ -124,6 +124,13 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         if (singleGroupHeads == 1U) {
             LayoutA denseSrc(rowNum, embed, static_cast<int64_t>(qTokenStride));
             copyGmToL1A(l1Q, gA, layoutAInL1, denseSrc);
+        } else if (qHeadStride >= 65536) {
+            LayoutA oneHead(1, embed, 0);
+            for (uint32_t h = 0; h < singleGroupHeads; ++h) {
+                copyGmToL1A(l1Q[h * tokenNumPerGroup * BLOCK_SIZE], gA[h * qHeadStride],
+                            layoutAInL1, oneHead, tokenNumPerGroup, qTokenStride,
+                            tokenNumPerGroup, BLOCK_SIZE, rowNumRound);
+            }
         } else {
             LayoutA layoutSingleANd(singleGroupHeads, embed, qHeadStride);
             copyGmToL1A(l1Q, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, qTokenStride, tokenNumPerGroup,
