@@ -32,6 +32,8 @@
 #include "varlen_bwd_dispatch.hpp"
 #include <cmath>
 #include <unordered_map>
+#include <deque>
+#include <tuple>
 
 // mha_fwd_kvcache.cpp / mha_varlen_bwd.cpp used to carry these using-directives
 // into this TU; restore them so the unqualified KernelCommon constants
@@ -1411,7 +1413,18 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     bool has_alibi = alibi.ptr != nullptr;
 
     // varlen optimized kernel only supports headdim equal to 128
-    if (!seqlens_q.equal(seqlens_k) || is_local || p_dropout > 0.0f || headdim != 128) {
+    // Valid packed prefixes start at zero, end at tensor total, and each
+    // segment is <= max_seqlen. If total == batch*max, every segment must
+    // equal max. This proves equality without reading or caching device data.
+    const int64_t bwdBatch = seqlens_q.numel() - 1;
+    const bool uniformEqualPrefixes = bwdBatch > 0 && seqlens_k.numel() == seqlens_q.numel() &&
+        max_seqlen_q == max_seqlen_k && max_seqlen_q > 0 &&
+        qsizes[0] == bwdBatch * max_seqlen_q && ksizes[0] == bwdBatch * max_seqlen_k;
+    const bool preferSingleTileFull = !local_is_causal && !is_local && !deterministic &&
+        !has_alibi && softcap == 0.0f && headdim == 128 && nheads == nheads_k &&
+        max_seqlen_q <= 512 && max_seqlen_k <= 512;
+    if (preferSingleTileFull || is_local || p_dropout > 0.0f || headdim != 128 ||
+        qsizes[0] != ksizes[0] || (!uniformEqualPrefixes && !seqlens_q.is_same(seqlens_k) && !seqlens_q.equal(seqlens_k))) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q,
                                   max_seqlen_k, scale, softcap, local_is_causal, local_window_size_left,
@@ -1420,8 +1433,6 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     }
 
     // tiling args set
-    uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
-    at::Tensor tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
     int64_t sum_of_list = qsizes[0];
     fagInfo.seqQShapeSize = cu_seqlens_q.sizes()[0] - 1;
@@ -1438,10 +1449,31 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     }
     fagInfo.softcapValue = softcap;
     fagInfo.alibiSlopesBatchStride = alibi.batchStride;
+    const auto bwdStream = c10_npu::getCurrentNPUStream();
+    auto tilingKey = std::make_tuple(q.get_device(), bwdStream.id(), fagInfo.seqQShapeSize,
+        sum_of_list, nheads, nheads_k, headdim, softmax_scale, softcap, alibi.batchStride, blockDim);
+    struct BwdTilingEntry { decltype(tilingKey) key; at::Tensor tensor; uint64_t workspace; };
+    static thread_local std::deque<BwdTilingEntry> bwdTilingCache;
+    at::Tensor tiling_gpu_tensor;
     uint64_t workspaceSize = 0;
-    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t*>(tiling_cpu_tensor.data_ptr<uint8_t>()),
-                                workspaceSize);
-    at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+    for (const auto& entry : bwdTilingCache) {
+        if (entry.key == tilingKey) {
+            tiling_gpu_tensor = entry.tensor;
+            workspaceSize = entry.workspace;
+            break;
+        }
+    }
+    if (!tiling_gpu_tensor.defined()) {
+        const uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
+        auto tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
+        FAGTiling::GetFATilingParam(fagInfo, blockDim,
+            reinterpret_cast<int64_t*>(tiling_cpu_tensor.data_ptr<uint8_t>()), workspaceSize);
+        tiling_gpu_tensor = tiling_cpu_tensor.to(q.device());
+        // Each immutable entry is initialized and consumed on its keyed stream.
+        // Dynamic prefixes are still read by every kernel invocation.
+        if (bwdTilingCache.size() == 32) bwdTilingCache.pop_front();
+        bwdTilingCache.push_back({tilingKey, tiling_gpu_tensor, workspaceSize});
+    }
 
     // alloc workspace
     at::Tensor workspace_tensor =
@@ -1450,8 +1482,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     // alloc custom attn_mask
     at::Tensor mask_gpu_tensor;
     if (is_causal) {
-        mask_gpu_tensor = at::empty({2048, 2048}, at::device(at::kPrivateUse1).dtype(at::kByte));
-        mask_gpu_tensor = at::triu(at::ones_like(mask_gpu_tensor), 1);
+        mask_gpu_tensor = MakeDeviceTriuMask();
     }
     at::Tensor seqlenq_gpu_tensor = seqlens_q.to(at::Device(at::kPrivateUse1));
     at::Tensor seqlenk_gpu_tensor = seqlens_k.to(at::Device(at::kPrivateUse1));

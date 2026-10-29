@@ -448,12 +448,7 @@ def _flash_attn_backward_fake(
 _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper(
-    "flash_attn_npu::_flash_attn_varlen_backward",
-    mutates_args=("dq", "dk", "dv"),
-    device_types="npu",
-)
-def _flash_attn_varlen_backward(
+def _flash_attn_varlen_backward_impl(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -516,6 +511,12 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
+_flash_attn_varlen_backward = _torch_custom_op_wrapper(
+    "flash_attn_npu::_flash_attn_varlen_backward",
+    mutates_args=("dq", "dk", "dv"), device_types="npu",
+)(_flash_attn_varlen_backward_impl)
+
+
 @_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_varlen_backward")
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
@@ -562,7 +563,15 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-_wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
+def _wrapped_flash_attn_varlen_backward(*args, **kwargs):
+    # Autograd owns these fresh gradient buffers in ordinary eager execution.
+    # Keep the registered mutation schema/fake for tracing and transformations.
+    if (not torch.compiler.is_compiling() and not torch.jit.is_tracing()
+            and not is_in_torch_dispatch_mode()
+            and not torch._C._are_functorch_transforms_active()
+            and not torch.overrides.has_torch_function((*args, *kwargs.values()))):
+        return _flash_attn_varlen_backward_impl(*args, **kwargs)
+    return _flash_attn_varlen_backward(*args, **kwargs)
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
@@ -1005,9 +1014,10 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., :head_size_og]  # We could have padded the head dimension
-        dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        if dq.shape[-1] != head_size_og:
+            dq = dq[..., :head_size_og]
+            dk = dk[..., :head_size_og]
+            dv = dv[..., :head_size_og]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
@@ -1077,6 +1087,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
             ctx.head_size_og = head_size_og
+            # Forward establishes these invariant dimensions once. Autograd
+            # checks dout's shape before entering backward; unaligned or
+            # unequal dimensions still use the full padding/validation path.
+            ctx.needs_bwd_padding = not (
+                0 < head_size_og <= 256 and head_size_og % _HEADDIM_BWD_ALIGN == 0
+                and k.size(-1) == head_size_og and v.size(-1) == head_size_og
+                and out_padded.size(-1) == head_size_og
+            )
 
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
@@ -1084,7 +1102,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        head_size_og = ctx.head_size_og
+        if ctx.needs_bwd_padding:
+            dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, head_size_og)
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _wrapped_flash_attn_varlen_backward(
             dout,
@@ -1110,9 +1130,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., :head_size_og]  # We could have padded the head dimension
-        dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        if dq.shape[-1] != head_size_og:
+            dq = dq[..., :head_size_og]
+            dk = dk[..., :head_size_og]
+            dv = dv[..., :head_size_og]
         return (
             dq,
             dk,

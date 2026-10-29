@@ -1,6 +1,8 @@
 #include "fag_general_host.hpp"
 
 #include <cstring>
+#include <deque>
+#include <tuple>
 
 #include "acl/acl.h"
 #include "catlass/catlass.hpp"
@@ -10,6 +12,7 @@
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "runtime/rt_ffts.h"
 #include "fag_general_dispatch.hpp"
+#include "device_triu_mask.h"
 
 std::vector<at::Tensor> launch_fag_general(
     const at::Tensor &dout,
@@ -92,8 +95,18 @@ std::vector<at::Tensor> launch_fag_general(
     uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
+    // Empty K/V produces a constant zero output. There is no attention work
+    // for the tiler, whose mask preprocessing requires at least one element.
+    if (k.numel() == 0) {
+        dq.zero_();
+        dk.zero_();
+        dv.zero_();
+        auto softmax_d = at::zeros({batch_size, static_cast<int64_t>(nheads), max_seqlen_q},
+                                  q.options().dtype(at::kFloat));
+        return {dq, dk, dv, softmax_d};
+    }
+
     uint32_t tilingSize = sizeof(FAGTilingData);
-    at::Tensor tiling_cpu_tensor = at::empty({static_cast<long>(tilingSize)}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
     
     bool has_softcap = (softcap > 0.0f);
@@ -144,36 +157,70 @@ std::vector<at::Tensor> launch_fag_general(
     bool has_alibi = alibi_slopes_ptr != nullptr;
     fagInfo.alibiSlopesBatchStride = alibi_slopes_batch_stride;
 
-    at::Tensor cu_seqlens_q_cpu_for_tiling;
-    at::Tensor cu_seqlens_k_cpu_for_tiling;
-    if (is_varlen_q) {
-        cu_seqlens_q_cpu_for_tiling = cu_seqlens_q_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        cu_seqlens_k_cpu_for_tiling = cu_seqlens_k_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        fagInfo.qSeqlenList = static_cast<int32_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
-        fagInfo.kvSeqlenList = static_cast<int32_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
-    }
-
+    const bool uniformPrefixes = is_varlen_q && batch_size > 0 && max_seqlen_q > 0 && max_seqlen_k > 0 &&
+        qsizes[0] == batch_size * max_seqlen_q && ksizes[0] == batch_size * max_seqlen_k;
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     uint64_t ubSize = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-    FAGTilingData fagTilingData;
-    int64_t tilingStatus = FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
-    TORCH_CHECK(tilingStatus == 0, "launch_fag_general: GetFAGTilingParam failed.");
-    fagTilingData.actualSeqQlen.clear();
-    fagTilingData.actualSeqKvlen.clear();
-    std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
-    at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+    const auto stream = c10_npu::getCurrentNPUStream();
+    auto key = std::make_tuple(q.get_device(), stream.id(), batch_size, qsizes[0], ksizes[0],
+        nheads, nheads_k, q_headdim, v_headdim, max_seqlen_q, max_seqlen_k,
+        fagInfo.scaleValue, softcap, p_dropout, fagInfo.maskType, window_size_left,
+        window_size_right, deterministic, alibi_slopes_batch_stride, blockDim, aivNum, ubSize);
+    struct Entry { decltype(key) key; at::Tensor tensor; uint64_t workspace; };
+    static thread_local std::deque<Entry> tilingCache;
+    at::Tensor tiling_gpu_tensor;
+    uint64_t workspaceSize = 0;
+    if (uniformPrefixes) {
+        for (const auto& entry : tilingCache) {
+            if (entry.key == key) {
+                tiling_gpu_tensor = entry.tensor;
+                workspaceSize = entry.workspace;
+                break;
+            }
+        }
+    }
+    if (!tiling_gpu_tensor.defined()) {
+        at::Tensor cu_seqlens_q_cpu_for_tiling, cu_seqlens_k_cpu_for_tiling;
+        std::vector<int32_t> uniformQ, uniformK;
+        if (uniformPrefixes) {
+            // Totals equal batch*maximum, so all valid segments are maximum
+            // length. Reconstruct the unique endpoints without a device sync.
+            uniformQ.resize(batch_size); uniformK.resize(batch_size);
+            for (int64_t i = 0; i < batch_size; ++i) {
+                uniformQ[i] = (i + 1) * max_seqlen_q;
+                uniformK[i] = (i + 1) * max_seqlen_k;
+            }
+            fagInfo.qSeqlenList = uniformQ.data();
+            fagInfo.kvSeqlenList = uniformK.data();
+        } else if (is_varlen_q) {
+            cu_seqlens_q_cpu_for_tiling = cu_seqlens_q_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            cu_seqlens_k_cpu_for_tiling = cu_seqlens_k_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            fagInfo.qSeqlenList = static_cast<int32_t *>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
+            fagInfo.kvSeqlenList = static_cast<int32_t *>(cu_seqlens_k_cpu_for_tiling.data_ptr()) + 1;
+        }
+        FAGTilingData fagTilingData{};
+        int64_t tilingStatus = FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+        TORCH_CHECK(tilingStatus == 0, "launch_fag_general: GetFAGTilingParam failed.");
+        fagTilingData.actualSeqQlen.clear();
+        fagTilingData.actualSeqKvlen.clear();
+        auto tiling_cpu_tensor = at::empty({static_cast<long>(tilingSize)}, at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
+        tiling_gpu_tensor = tiling_cpu_tensor.to(q.device());
+        workspaceSize = static_cast<uint64_t>(fagTilingData.workspaceSize);
+        if (uniformPrefixes) {
+            if (tilingCache.size() == 32) tilingCache.pop_front();
+            tilingCache.push_back({key, tiling_gpu_tensor, workspaceSize});
+        }
+    }
 
-    uint64_t workspaceSize = static_cast<uint64_t>(fagTilingData.workspaceSize);
     TORCH_CHECK(workspaceSize > 0, "launch_fag_general: invalid workspace size from tiling.");
     at::Tensor workspace_tensor =
         at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
-        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
-        mask_gpu_tensor = at::triu(
-            at::ones({mask_dim, mask_dim}, at::device(at::kPrivateUse1).dtype(at::kByte)), 1);
+        mask_gpu_tensor = MakeDeviceTriuMask();
     }
 
     uint64_t fftsAddr{0};

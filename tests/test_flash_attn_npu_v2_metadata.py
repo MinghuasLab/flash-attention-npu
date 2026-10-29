@@ -210,19 +210,73 @@ def _assert_tnd_matches_ref(
 
 @pytest.fixture
 def metadata_spy(monkeypatch):
-    """Spy on get_scheduler_metadata to prove the training interfaces route
-    through the AICPU scheduler-metadata path internally (official flash-attn
-    only exposes scheduler_metadata on flash_attn_with_kvcache)."""
+    """Record and inject AICPU metadata at the native forward boundary.
+
+    Public training APIs no longer create metadata in Python, so inject it
+    here to keep testing explicit metadata consumption and dropout patches.
+    """
     from flash_attn_npu import flash_attn_npu_interface as interface
+
     calls = []
-    original = interface.get_scheduler_metadata
+    fixed_forward = interface._wrapped_flash_attn_forward
+    varlen_forward = interface._wrapped_flash_attn_varlen_forward
 
-    def _spy(*args, **kwargs):
-        result = original(*args, **kwargs)
-        calls.append((args, kwargs, result))
-        return result
+    def make_metadata(q, softmax_scale, forward_kwargs, **shape_kwargs):
+        slopes = forward_kwargs.get("alibi_slopes")
+        metadata_kwargs = dict(
+            **shape_kwargs,
+            headdim=q.shape[-1],
+            qkv_dtype=q.dtype,
+            causal=forward_kwargs["causal"],
+            window_size=(forward_kwargs["window_size_left"], forward_kwargs["window_size_right"]),
+            softcap=forward_kwargs["softcap"],
+            softmax_scale=softmax_scale,
+            alibi_slopes_batch_stride=(
+                slopes.stride(0) if slopes is not None and slopes.dim() == 2 else 0
+            ),
+        )
+        metadata = interface.get_scheduler_metadata(**metadata_kwargs)
+        calls.append(((), metadata_kwargs, metadata))
+        return metadata
 
-    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
+    def fixed(q, k, v, dropout_p, softmax_scale, **kwargs):
+        assert kwargs["scheduler_metadata"] is None
+        bnsd = kwargs["layout"] == interface._LAYOUT_BNSD
+        batch, sq, hq = (q.shape[0], q.shape[2], q.shape[1]) if bnsd else q.shape[:3]
+        sk, hk = (k.shape[2], k.shape[1]) if bnsd else k.shape[1:3]
+        kwargs["scheduler_metadata"] = make_metadata(
+            q,
+            softmax_scale,
+            kwargs,
+            batch_size=batch,
+            max_seqlen_q=sq,
+            max_seqlen_k=sk,
+            num_heads_q=hq,
+            num_heads_kv=hk,
+            cache_seqlens=torch.full((batch,), sk, dtype=torch.int32, device=q.device),
+        )
+        return fixed_forward(q, k, v, dropout_p, softmax_scale, **kwargs)
+
+    def varlen(q, k, v, cuq, cuk, maxq, maxk, dropout_p, softmax_scale, **kwargs):
+        assert kwargs["scheduler_metadata"] is None
+        paged = kwargs.get("block_table") is not None
+        kwargs["scheduler_metadata"] = make_metadata(
+            q,
+            softmax_scale,
+            kwargs,
+            batch_size=cuq.numel() - 1,
+            max_seqlen_q=maxq,
+            max_seqlen_k=maxk,
+            num_heads_q=q.shape[1],
+            num_heads_kv=k.shape[2] if paged else k.shape[1],
+            cache_seqlens=cuk[1:] - cuk[:-1],
+            cu_seqlens_q=cuq,
+            page_size=k.shape[1] if paged else None,
+        )
+        return varlen_forward(q, k, v, cuq, cuk, maxq, maxk, dropout_p, softmax_scale, **kwargs)
+
+    monkeypatch.setattr(interface, "_wrapped_flash_attn_forward", fixed)
+    monkeypatch.setattr(interface, "_wrapped_flash_attn_varlen_forward", varlen)
     return calls
 
 

@@ -34,3 +34,30 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+scripts/
+PRO*
+batch*
+OPP*
+
+ZJ.py
+ZJ_BSND.py
+bench.py
+bench_onerec_ops.py
+benchmark_fa2_backward.py
+benchmark_results/
+docs/
+npu_fa.py
+npu_fa_v1.py
+ops_benchmark.py
+test_flash_attn_npu_v2_short_varlen.py
+tests/test_flash_attn_npu_v2_backward_cache.py
+tests/test_flash_attn_npu_v2_forward_parity.py
+tests/test_flash_attn_npu_v2_host_task_counts.py
+
+# Local experiment snapshots and profiler artifacts
+host_only_manifest.json
+validation.json
+npu_before.txt
+npu_after.txt
+benchmark_backward_paired.py
+excluded_device_wiring.patch
