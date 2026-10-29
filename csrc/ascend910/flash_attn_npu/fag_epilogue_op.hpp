@@ -1599,15 +1599,18 @@ class BlockEpilogue<EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_, HAS_ALIBI_>, 
                            curSeqQIdx * s1VecSize) *
                           8;
 
-            // copyIn cube_workspace params
+            // copyIn cube_workspace params (float mm1/mm2)
             copyInOffset = cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset +
                            curSeqQIdx * s1VecSize * s2CubeExtend;
             copyInParam = {static_cast<uint16_t>(s1Extend), static_cast<uint16_t>(s2ExtendAlign * sizeof(float)),
                            static_cast<uint16_t>((s2CubeExtend - s2ExtendAlign) * sizeof(float)), 0};
 
-            // copyOut cube_workspace params
-            copyOutOffset = (cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset) +
-                            (curSeqQIdx * s1VecSize * s2CubeExtend);
+            // Match basic vec_op_fasg_arch22.h exactly: half aliases float mm WS with
+            // copyOutOffset = 2 * float_idx (incl. curS1 term). Cube2/3 must use mUp/mDown.
+            copyOutOffset =
+                DTYPE_FACTOR *
+                ((cubeBlockIdx * cubeBaseMN * 2 + pingpongIdx * cubeBaseMN + blockInfo.offset) +
+                 (curSeqQIdx * s1VecSize * s2CubeExtend));
             copyOutParam = {static_cast<uint16_t>(s1Extend),
                             static_cast<uint16_t>(s2ExtendAlign * sizeof(ElementVecDtype)), 0,
                             static_cast<uint16_t>((s2CubeExtend - s2ExtendAlign) * sizeof(ElementVecDtype))};

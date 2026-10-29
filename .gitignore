@@ -61,3 +61,5 @@ npu_before.txt
 npu_after.txt
 benchmark_backward_paired.py
 excluded_device_wiring.patch
+basic_opt_port.json
+basic_opt_validation.json

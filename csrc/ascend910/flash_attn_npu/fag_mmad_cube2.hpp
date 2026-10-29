@@ -140,7 +140,8 @@ namespace Catlass::Gemm::Block
             for (uint32_t i = 0; i < addrs.blockLength; ++i) {
                 auto &shapeInfo = addrs.addrInfo[i];
 
-                auto gm_a = left + (shapeInfo.out + globalBlockOffset);
+                // *2: half* view into float mm workspace (basic cube2_op.h); P/dS overwrite mm1/mm2.
+                auto gm_a = left + (shapeInfo.out + globalBlockOffset) * 2;
                 auto gm_b = right + shapeInfo.right;
                 auto gm_c = out + shapeInfo.left;
 
@@ -174,7 +175,6 @@ namespace Catlass::Gemm::Block
                 int32_t n_loop = CeilDiv<SIZE_128>(kn);
                 bool upperRight = !shapeInfo.upperRight;
 
-                LayoutA layoutA(km, kn, 128);
                 int32_t skip_num = 0;
                 for (uint32_t n_loop_index = 0; n_loop_index < n_loop; n_loop_index++) {
                     int32_t n_remain = (n_loop_index == n_loop - 1) ? l1_n_block_size_tail : 128;
@@ -196,6 +196,11 @@ namespace Catlass::Gemm::Block
 
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
 
+                    // Overlap vec epilogue with first K (L1B) load — match basic cube2_op.h.
+                    if (n_loop_index == 0 && i == 0) {
+                        AscendC::WaitEvent(VEC2CUBE);
+                    }
+
                     // Load Left_GM matrix A -> L1A
                     pingpongFlagL1A = 0;
                     for (uint32_t m_loop_index = 0; m_loop_index < m_loop; m_loop_index++) {
@@ -213,11 +218,28 @@ namespace Catlass::Gemm::Block
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
 
                         if (!is_skip) {
-                            auto layoutTileA = layoutA.GetTileLayout(MakeCoord(static_cast<uint32_t>(m_remain),
-                                static_cast<uint32_t>(n_remain)));
-                            LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(m_remain, n_remain);
-                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(m_loop * n_loop_index + m_loop_index - skip_num) * 128 * 128],
-                                layoutAInL1, layoutTileA);
+                            // basic cube2_op.h: split m into mUp/mDown to match vec's
+                            // 2*(float_idx) strip gap between the two s1 halves.
+                            int32_t tileIdx = m_loop * n_loop_index + m_loop_index - skip_num;
+                            int32_t mUp = (m_remain + 1) / 2;
+                            int32_t mDown = m_remain - mUp;
+                            auto gmTile = gLeft[2 * tileIdx * 128 * 128];
+                            // dstNzC0Stride = full m_remain_align; L1 fractal offset for mDown = mUp*C0.
+                            AscendC::Nd2NzParams nd2nzParams;
+                            nd2nzParams.ndNum = 1;
+                            nd2nzParams.nValue = mUp;
+                            nd2nzParams.dValue = n_remain;
+                            nd2nzParams.srcNdMatrixStride = 0;
+                            nd2nzParams.srcDValue = 128;
+                            nd2nzParams.dstNzC0Stride = m_remain_align;
+                            nd2nzParams.dstNzNStride = 1;
+                            nd2nzParams.dstNzMatrixStride = 0;
+                            AscendC::DataCopy(*l1_a_buf_tensor, gmTile, nd2nzParams);
+                            if (mDown > 0) {
+                                nd2nzParams.nValue = mDown;
+                                AscendC::DataCopy((*l1_a_buf_tensor)[mUp * C0_SIZE],
+                                    gmTile[2 * mUp * 128], nd2nzParams);
+                            }
                         }
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
                         pingpongFlagL1A = 1 - pingpongFlagL1A;

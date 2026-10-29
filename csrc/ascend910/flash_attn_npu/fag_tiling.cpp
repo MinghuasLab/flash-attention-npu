@@ -114,14 +114,11 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     workspaceOffset = 
         (workspaceOffset + coreNum * matmulSize * sizeof(float) * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
 
-    constexpr uint32_t size_of_half = 2;
-    fagV2TilingData->pWorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
-        (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
-
-    fagV2TilingData->dsWorkSpaceOffset = workspaceOffset;
-    workspaceOffset = 
-        (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    // Match ops-transformer basic: P/dS half overwrite the same mm1/mm2 float workspaces
+    // (Cube1 float → Vec half → Cube2/3 half). Avoids a second MTE3 GM footprint.
+    // dS ← mm1 (dout@V / dp path), P ← mm2 (Q@K / softmax path).
+    fagV2TilingData->dsWorkSpaceOffset = fagV2TilingData->mm1WorkSpaceOffset;
+    fagV2TilingData->pWorkSpaceOffset = fagV2TilingData->mm2WorkSpaceOffset;
     workspaceSize = workspaceOffset;
 
     std::memcpy(&(fagV2TilingData->softmaxTilingData), &softmaxTilingData, sizeof(SoftMaxTiling));

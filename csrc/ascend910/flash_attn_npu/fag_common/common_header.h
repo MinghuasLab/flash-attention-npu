@@ -60,6 +60,11 @@ struct AddrInfo {
     int32_t lineStride = 0;
     bool lowerLeft;
     bool upperRight;
+    // Absolute S1/S2 block indices for causal in-rectangle skips (Cube3 ROW_4 packing).
+    int32_t S1Idx = 0;
+    int32_t S2Idx = 0;
+    // 1 = MASK_CAUSAL (enable S1Idx/S2Idx skips in Cube3); 0 = NO_MASK.
+    int32_t isCausal = 0;
 };
 
 struct CubeAddrInfo {

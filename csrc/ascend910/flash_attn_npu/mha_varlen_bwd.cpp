@@ -159,7 +159,9 @@ public:
         int64_t mixCoreNum = (coreNum + 1) / 2;
         uint32_t seq_q_len = 0;
         uint32_t seq_k_len = 0;
+        // Dual ping-pong lists: cubeAddr for Cube1/Cube2, cube3Addr for Cube3 (ROW_4).
         struct CubeAddrInfo cubeAddrInfo[2];
+        struct CubeAddrInfo cube3AddrInfo[2];
         int32_t taskId = 0;
         bool running = true;
         __gm__ uint8_t * actucal_seq_q_addr = params.cu_seq_qlen;
@@ -189,10 +191,10 @@ public:
         
         while (running) {
             cubeAddrInfo[taskId % 2].taskId = taskId;
-            cubeAddr.addr_mapping(&cubeAddrInfo[taskId % 2]);
+            cube3AddrInfo[taskId % 2].taskId = taskId;
+            cubeAddr.addr_mapping(&cubeAddrInfo[taskId % 2], &cube3AddrInfo[taskId % 2]);
             if (cubeAddrInfo[taskId % 2].blockLength > 0) {
                 SetFlag();
-                CubeAddrInfo addrs = cubeAddrInfo[taskId % 2];
                 blockMmadFAGCube1(cubeAddrInfo[taskId % 2], (__gm__ ElementA1*)(params.q),
                     (__gm__ ElementB1 *)(params.k), (__gm__ float*)(params.workspace + mm2WorkspaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
@@ -203,23 +205,24 @@ public:
                 AscendC::CrossCoreSetFlag<2, PIPE_FIX>(CUBE2VEC);
             }
             if (taskId > 0 && cubeAddrInfo[(taskId - 1) % 2].blockLength > 0) {
-                AscendC::WaitEvent(VEC2CUBE);
+                // Match basic non-mix path: no outer WaitEvent(VEC2CUBE) — Cube2 waits after
+                // first L1B copy so K load overlaps vec; then one SetFlag/WaitFlag around
+                // Cube3(dk)+Cube3(dv) back-to-back (basic order: dk then dv).
                 SetFlag();
+                // Cube2 uses cubeAddrInfo; Cube3 uses cube3AddrInfo (ROW packing / dual list).
                 blockMmadFAGCube2(cubeAddrInfo[(taskId - 1) % 2],
                     (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB2*)(params.k),
-                    (__gm__ float*)(params.workspace + dqWorkSpaceOffset), 
+                    (__gm__ float*)(params.workspace + dqWorkSpaceOffset),
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B);
                 WaitFlag();
                 SetFlag();
-                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
-                    (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout),
-                    (__gm__ float*)(params.workspace + dvWorkSpaceOffset), 
-                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
-                WaitFlag();
-                SetFlag();
-                blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
+                blockMmadFAGCube3(cube3AddrInfo[(taskId - 1) % 2],
                     (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB3*)(params.q),
-                    (__gm__ float*)(params.workspace + dkWorkSpaceOffset), 
+                    (__gm__ float*)(params.workspace + dkWorkSpaceOffset),
+                    pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
+                blockMmadFAGCube3(cube3AddrInfo[(taskId - 1) % 2],
+                    (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout),
+                    (__gm__ float*)(params.workspace + dvWorkSpaceOffset),
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
                 WaitFlag();
             }

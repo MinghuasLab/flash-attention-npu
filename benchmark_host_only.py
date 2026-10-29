@@ -4,8 +4,10 @@ import csv
 import gc
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
+import subprocess
 import time
 
 
@@ -107,6 +109,9 @@ def main():
     assert binary.is_relative_to(root), (binary, root)
     files = [binary, root / 'flash_attn_npu/flash_attn_npu_interface.py', root / 'npu_fa_v1.py', root / 'npu_fa.py', root / 'bench.py', Path(__file__)]
     metadata = dict(device=args.device, device_name=torch.npu.get_device_name(), torch=torch.__version__, torch_npu=torch_npu.__version__,
+                    started_at_utc=datetime.now(timezone.utc).isoformat(),
+                    git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+                    git_status=subprocess.check_output(['git', 'status', '--short'], cwd=root, text=True),
                     rep=args.rep, rounds=args.rounds, profile_iters=args.profile_iters, threads=8,
                     files={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
                     interfaces={'FA2': 'npu_fa_v1.flash_attn -> flash_attn_npu.flash_attn_npu_interface.flash_attn_varlen_func',

@@ -1420,11 +1420,12 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     const bool uniformEqualPrefixes = bwdBatch > 0 && seqlens_k.numel() == seqlens_q.numel() &&
         max_seqlen_q == max_seqlen_k && max_seqlen_q > 0 &&
         qsizes[0] == bwdBatch * max_seqlen_q && ksizes[0] == bwdBatch * max_seqlen_k;
-    const bool preferSingleTileFull = !local_is_causal && !is_local && !deterministic &&
-        !has_alibi && softcap == 0.0f && headdim == 128 && nheads == nheads_k &&
-        max_seqlen_q <= 512 && max_seqlen_k <= 512;
-    if (preferSingleTileFull || is_local || p_dropout > 0.0f || headdim != 128 ||
-        qsizes[0] != ksizes[0] || (!uniformEqualPrefixes && !seqlens_q.is_same(seqlens_k) && !seqlens_q.equal(seqlens_k))) {
+    // The ported Opt kernel supports independent Q/K prefixes for full attention.
+    // Only causal attention needs the equality check; retain Host proofs/identity fast paths.
+    const bool unequalCausalPrefixes = local_is_causal &&
+        (qsizes[0] != ksizes[0] || (!uniformEqualPrefixes &&
+         !seqlens_q.is_same(seqlens_k) && !seqlens_q.equal(seqlens_k)));
+    if (is_local || p_dropout > 0.0f || headdim != 128 || unequalCausalPrefixes) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q,
                                   max_seqlen_k, scale, softcap, local_is_causal, local_window_size_left,
@@ -1437,7 +1438,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     int64_t sum_of_list = qsizes[0];
     fagInfo.seqQShapeSize = cu_seqlens_q.sizes()[0] - 1;
     fagInfo.queryShape_0 = sum_of_list;
-    fagInfo.keyShape_0 = sum_of_list;
+    fagInfo.keyShape_0 = ksizes[0];
     fagInfo.queryShape_1 = nheads;
     fagInfo.keyShape_1 = nheads_k;
     fagInfo.queryShape_2 = headdim;
@@ -1451,7 +1452,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     fagInfo.alibiSlopesBatchStride = alibi.batchStride;
     const auto bwdStream = c10_npu::getCurrentNPUStream();
     auto tilingKey = std::make_tuple(q.get_device(), bwdStream.id(), fagInfo.seqQShapeSize,
-        sum_of_list, nheads, nheads_k, headdim, softmax_scale, softcap, alibi.batchStride, blockDim);
+        sum_of_list, ksizes[0], nheads, nheads_k, headdim, softmax_scale, softcap, alibi.batchStride, blockDim);
     struct BwdTilingEntry { decltype(tilingKey) key; at::Tensor tensor; uint64_t workspace; };
     static thread_local std::deque<BwdTilingEntry> bwdTilingCache;
     at::Tensor tiling_gpu_tensor;

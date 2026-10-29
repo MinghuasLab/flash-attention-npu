@@ -1,5 +1,7 @@
 # 保持原项目 Host 优化的实验副本
 
+此文记录 `bf5eaed` 的纯 Host 基线。当前工作树随后按用户要求移植了上游设备优化，详见 [BASIC_OPT_PORT.md](BASIC_OPT_PORT.md)；纯 Host 快照位于 `../host_original_before_basic_opt`。
+
 本副本替代旧 `host_only` 作为“保留原项目 Host 优化”的实验版本。
 旧副本及历史结果保留不动，原项目 `/home/hxb/flash-attention-npu` 保持不动。
 

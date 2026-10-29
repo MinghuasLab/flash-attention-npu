@@ -160,7 +160,8 @@ namespace Catlass::Gemm::Block
                 uint32_t m_loop = CeilDiv<SIZE_128>(km);
                 uint32_t n_loop = CeilDiv<SIZE_128>(kn);
 
-                __gm__ ElementA* gm_a = left + (shapeInfo.out + globalBlockOffset);
+                // *2: half* view into float mm workspace (basic cube3_op.h); P/dS overwrite mm1/mm2.
+                __gm__ ElementA* gm_a = left + (shapeInfo.out + globalBlockOffset) * 2;
                 __gm__ ElementB* gm_b = right + shapeInfo.left;
                 __gm__ float* gm_out = out + shapeInfo.right;
 
@@ -178,45 +179,28 @@ namespace Catlass::Gemm::Block
 
                 LocalTensor<ElementB> *l1_b_buf_tensor = pingpongFlagL1B ? &l1_b_pong_tensor : &l1_b_ping_tensor;
                 
-                LayoutA layoutA(km, kn, 128);
                 LayoutB layoutB(km, headdim, nheads * headdim);
                 // move right matrix Q(ky, headdim) from GM to L1B
+                // Use aligned M in L1 (basic dstNzC0Stride) so ky=1 pads to C0=16.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1B);
 
                 auto layoutTileB = layoutB.GetTileLayout(MakeCoord(l1_m_size, l1_k_size));
-                LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(l1_m_size, l1_k_size);
+                LayoutBInL1 layoutBInL1 =
+                    LayoutBInL1::template MakeLayout<ElementB>(l1_m_size_align, l1_k_size);
                 copyGmToL1B(*l1_b_buf_tensor, gRight, layoutBInL1, layoutTileB);
 
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1B);
                 
+                // Match basic cube3_op.h: load L0B per (n,m) from L1B (no one-shot preload).
+                AscendC::LoadData2dParams loadParamsB{0, 128, 128, 0, 0, true, 0};
                 for (uint32_t n_loop_index = 0; n_loop_index < n_loop; n_loop_index++) {
-                    if (n_loop_index == 0) {
-                        // only load once when n_loop_index == 0
-                        // load right matrix Q(ky, headdim)[m_loop_index] from L1B to L0B
-                        
-                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(ping_pong_flag_l0_b_last + 2 + FLAG_SHIFT);
-
-                        for (uint32_t m_loop_index = 0; m_loop_index < m_loop; m_loop_index++) {
-                            int32_t m_remain = (m_loop_index == m_loop - 1) ? l1_m_block_size_align_tail : 128;
-                            int32_t l1_b_buf_offset = (m_loop_index == 0) ? 0 : 128 * 16;
-                            int32_t l0_b_buf_offset = (m_loop_index == 0) ? 0 : 128 * 128;
-
-                            LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(m_remain, l1_k_size);
-                            copyL1ToL0B(l0_b_ping_tensor[l0_b_buf_offset], (*l1_b_buf_tensor)[l1_b_buf_offset],
-                                layoutBInL0, layoutBInL1);
-
-                            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0B + 2);
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0B + 2);
-                            pingpongFlagL0B = 1 - pingpongFlagL0B;
-                        }
-                    }
-
                     for (uint32_t m_loop_index = 0; m_loop_index < m_loop; m_loop_index++) {
                         LocalTensor<ElementA>* l1_a_buf_tensor = pingpongFlagL1A ? &l1_a_pong_tensor : &l1_a_ping_tensor;
                         LocalTensor<ElementA>* l0_a_buf_tensor = pingpongFlagL0A ? &l0_a_pong_tensor : &l0_a_ping_tensor;
-                        LocalTensor<ElementB>* l0_b_buf_tensor = m_loop_index ? &l0_b_pong_tensor : &l0_b_ping_tensor;
-                        LocalTensor<float>* l0_c_buf_tensor = pingpongFlagC ? &l0_c_pong_tensor : &l0_c_ping_tensor;   
+                        LocalTensor<ElementB>* l0_b_buf_tensor =
+                            ping_pong_flag_l0_b_last ? &l0_b_ping_tensor : &l0_b_pong_tensor;
+                        LocalTensor<float>* l0_c_buf_tensor = pingpongFlagC ? &l0_c_pong_tensor : &l0_c_ping_tensor;
 
                         uint32_t real_m = (m_loop_index == m_loop - 1) ? l1_m_block_size_tail : 128;
                         uint32_t real_n = (n_loop_index == n_loop - 1) ? l1_n_block_size_tail : 128;
@@ -230,72 +214,87 @@ namespace Catlass::Gemm::Block
                         }
 
                         bool is_skip = false;
-                        if (n_loop_index == (n_loop - 1) && m_loop_index == 0 && upperRight)
-                        {
+                        if (n_loop_index == (n_loop - 1) && m_loop_index == 0 && upperRight) {
                             is_skip = true;
                         }
-
-                        if (n_loop_index == 0 && m_loop_index == (m_loop - 1) && lowerLeft)
-                        {
+                        if (n_loop_index == 0 && m_loop_index == (m_loop - 1) && lowerLeft) {
                             is_skip = true;
                         }
-
                         if (is_skip) {
                             skip_num++;
                         }
 
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
                         if (!is_skip) {
-                            // load left matrix dS(kx, ky)[n_loop_index, m_loop_index] from GM to L1A
-                            uint32_t dstNzC0Stride = (m_loop_index == m_loop - 1) ? l1_m_block_size_align_tail : 128;
-                            auto layoutTileA = layoutA.GetTileLayout(MakeCoord(real_n, real_m));
-                            LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(real_n, real_m);
-                            copyGmToL1A(*l1_a_buf_tensor, gLeft[(n_loop_index * m_loop + m_loop_index - skip_num) * SIZE_128 * SIZE_128],
-                                layoutAInL1, layoutTileA);
+                            // L1B → L0B (basic: srcStride = l1_m_size_align/16)
+                            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(ping_pong_flag_l0_b_last + 2 + FLAG_SHIFT);
+                            int32_t m_remain_align =
+                                (m_loop_index == m_loop - 1) ? static_cast<int32_t>(l1_m_block_size_align_tail) : 128;
+                            int32_t l1_b_buf_offset = 128 * 16 * static_cast<int32_t>(m_loop_index);
+                            loadParamsB.repeatTimes = static_cast<uint16_t>(l1_k_size / C0_SIZE);
+                            loadParamsB.srcStride = static_cast<uint16_t>(l1_m_size_align / C0_SIZE);
+                            for (int32_t j = 0; j < m_remain_align / static_cast<int32_t>(C0_SIZE); ++j) {
+                                AscendC::LoadData(
+                                    (*l0_b_buf_tensor)[j * static_cast<int32_t>(l1_k_size) * static_cast<int32_t>(C0_SIZE)],
+                                    (*l1_b_buf_tensor)[l1_b_buf_offset + j * 16 * 16], loadParamsB);
+                            }
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(ping_pong_flag_l0_b_last + 2);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(ping_pong_flag_l0_b_last + 2);
                         }
 
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
+                        if (!is_skip) {
+                            // half alias: mUp/mDown + 2*tile (basic vec/cube3)
+                            uint32_t tileIdx = n_loop_index * m_loop + m_loop_index - skip_num;
+                            int32_t mUp = (static_cast<int32_t>(real_m) + 1) / 2;
+                            int32_t mDown = static_cast<int32_t>(real_m) - mUp;
+                            auto gmTile = gLeft[2 * tileIdx * SIZE_128 * SIZE_128];
+                            AscendC::Nd2NzParams nd2nzParams;
+                            nd2nzParams.ndNum = 1;
+                            nd2nzParams.nValue = mUp;
+                            nd2nzParams.dValue = real_n;
+                            nd2nzParams.srcNdMatrixStride = 0;
+                            nd2nzParams.srcDValue = 128;
+                            nd2nzParams.dstNzC0Stride = real_m_align;
+                            nd2nzParams.dstNzNStride = 1;
+                            nd2nzParams.dstNzMatrixStride = 0;
+                            AscendC::DataCopy(*l1_a_buf_tensor, gmTile, nd2nzParams);
+                            if (mDown > 0) {
+                                nd2nzParams.nValue = mDown;
+                                AscendC::DataCopy((*l1_a_buf_tensor)[mUp * C0_SIZE],
+                                    gmTile[2 * mUp * 128], nd2nzParams);
+                            }
+                        }
                         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(pingpongFlagL1A + 2);
 
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(pingpongFlagL0A + FLAG_SHIFT);
                         if (!is_skip) {
-                            // load left matrix dS(kx, ky) from L1A to L0A
-                            uint32_t m_c0_loop = (real_m + 15) / 16;
-                            uint32_t n_c0_loop = (real_n + 15) / 16;
-                            LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(real_m, real_n);
-                            LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(real_m, real_n);
-                            copyL1ToL0A((*l0_a_buf_tensor), (*l1_a_buf_tensor), layoutAInL0, layoutAInL1);
+                            // Match basic: fractal LoadData (handles real_m=1 / ky=1).
+                            AscendC::LoadData2dParams loadParamsA{0, 1, 1, 0, 0, true, 0};
+                            uint32_t m_c0_loop = (real_m + C0_SIZE - 1) / C0_SIZE;
+                            uint32_t n_c0_loop = (real_n + C0_SIZE - 1) / C0_SIZE;
+                            loadParamsA.repeatTimes = static_cast<uint16_t>(m_c0_loop * n_c0_loop);
+                            loadParamsA.srcStride = 1;
+                            AscendC::LoadData(*l0_a_buf_tensor, *l1_a_buf_tensor, loadParamsA);
                         }
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(pingpongFlagL1A + 2);
-                        
+
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0A);
                         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(pingpongFlagL0A);
-
                         if (!is_skip) {
-                            // cube3 mad(init/unit_flag depends on m_loop_index and RightFlag)
-                            int unit_flag = 0b10;
-                            if (out_c) {
-                                unit_flag = 0b11;
-                            }
-                            // ColumnMajor dS/P is loaded in a matrix fractal layout. On A2,
-                            // m=1 selects GEMV, which expects a vector layout instead.
-                            // Compute the padded matrix row block; Fixpipe still writes real_n.
-                            uint32_t matmul_m = real_n == 1 ? 16 : real_n;
-                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, matmul_m, l1_k_size, real_m,
+                            int unit_flag = out_c ? 0b11 : 0b10;
+                            // Preserve the corrected baseline matrix-mode padding for one-row tails.
+                            uint32_t m_mad = (real_n == 1) ? 16 : real_n;
+                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, m_mad, l1_k_size, real_m,
                                 init_c, unit_flag);
-                        }
-
-                        if (out_c && n_loop_index == n_loop - 1) {
                             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(ping_pong_flag_l0_b_last + 2 + FLAG_SHIFT);
+                            AscendC::PipeBarrier<PIPE_M>();
                             ping_pong_flag_l0_b_last = 1 - ping_pong_flag_l0_b_last;
                         }
-                        
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(pingpongFlagL0A + FLAG_SHIFT);
 
                         if (!is_skip && out_c) {
-                            // cube3 fixp (m_loop_index == m_loop - 1)
                             AscendC::SetAtomicType<float>();
-
                             auto blockShape = MakeCoord(real_n, l1_k_size);
                             auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(blockShape);
                             LayoutC layoutC(real_n, l1_k_size, nheads_k * headdim);
