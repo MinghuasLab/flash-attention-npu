@@ -277,7 +277,11 @@ namespace Catlass::Gemm::Block
                             if (out_c) {
                                 unit_flag = 0b11;
                             }
-                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, real_n, l1_k_size, real_m,
+                            // ColumnMajor dS/P is loaded in a matrix fractal layout. On A2,
+                            // m=1 selects GEMV, which expects a vector layout instead.
+                            // Compute the padded matrix row block; Fixpipe still writes real_n.
+                            uint32_t matmul_m = real_n == 1 ? 16 : real_n;
+                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, matmul_m, l1_k_size, real_m,
                                 init_c, unit_flag);
                         }
 

@@ -105,7 +105,14 @@ public:
                 guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
             }
             int32_t reserve = limit - blockNum;
-            int32_t realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            // A full rectangle must fit every row. Only the causal layout
+            // may use ceil here: its skipped corner saves one block.
+            int32_t realLenAlign;
+            if constexpr (maskType == MaskType::NO_MASK) {
+                realLenAlign = reserve / s1GuardInterval;
+            } else {
+                realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            }
             if (realLenAlign >= guardLen) {
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t index = globalCubeAddr->blockLength;
