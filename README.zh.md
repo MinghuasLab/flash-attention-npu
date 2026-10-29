@@ -94,18 +94,29 @@ pytest -q -s tests/test_flash_attn_npu_v4.py
 
 ## 使用 msSanitizer 进行内存检测
 
-编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 即可使能 Ascend msSanitizer 内存异常检测：
+编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`，运行时通过 `mssanitizer` 启动测试：
 
 ```bash
 # 使能内存检测编译
 FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 
-# Ascend 910：静态插桩已编译进算子，直接运行测试即可
-pytest -q -s tests/test_flash_attn_npu_v3.py
-
-# Ascend 950：通过 msSanitizer 运行时注入检测内存（注意 `--` 分隔符）
+# Ascend 910 / 950 均须通过 msSanitizer 启动（注意 `--` 分隔符）
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# 可选：跳过 golden / 精度比对，只 launch kernel 做内存检测
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
 ```
+图执行请单独构建不含静态插桩的版本：
+
+```bash
+# FA4 将 v3 改为 v4。静态 eager 检测产物请另行保存。
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` 支持 `auto`（默认：910 static、950 runtime）、`static`（仅 910）和 `runtime`（`-g -fno-jump-tables`，不链接静态桩），仅在 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 时生效。
 
 ## 使用方法
 

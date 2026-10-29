@@ -98,12 +98,25 @@ BUILD_NPU = get_build_npu()
 # 开启后：
 #  - 910 (dav-2201)：编译追加 "-g --cce-enable-sanitizer"，链接追加 "--cce-enable-sanitizer"（静态插桩）；
 #  - 950 (dav-3510)：CANN 9.1.0 未提供 sanitizer stub（libsanitizer_stub_dav-c310），无法静态插桩，
-#                    仅追加 "-g"（报告定位信息），内存检测需配合 mssanitizer 运行时注入：
-#                    mssanitizer --tool=memcheck python -m pytest ...
+#                    追加 "-g -fno-jump-tables"，内存检测需配合 mssanitizer 运行时注入：
+#                    mssanitizer --tool=memcheck -- python -m pytest ...
+# 910 / 950 均须通过 mssanitizer --tool=memcheck -- python -m pytest ... 启动。
+# 静态插桩也依赖检测运行时初始化，不能直接运行插桩后的二进制。
+# FLASH_ATTN_MSSANITIZER_MODE=auto（默认：910 static / 950 runtime）、static、runtime。
+# 910 图捕获须使用 runtime 或普通构建；静态插桩会触发 AssignGlobalHead 107030。
+# runtime 仅准备运行时插桩产物，是否覆盖图内 kernel 仍须检查工具日志和越界对照。
 # "-g" 用于异常报告输出文件名/行号/调用栈；静态插桩可检测越界访问、多核踩踏、非对齐访问等。
 # 仅用于调试定位，会显著增大二进制并降低性能。建议通过 bdist_wheel 独立产出检测版，
 # 避免覆盖正常版本（editable 安装下正常 .so 位于 flash_attn_npu/ 目录内）。
 ENABLE_MSSANITIZER = os.getenv("FLASH_ATTN_ENABLE_MSSANITIZER", "FALSE") == "TRUE"
+# Static instrumentation is for eager checking. Graph execution needs a build
+# without static stubs; runtime mode retains symbols for optional tool checking.
+MSSANITIZER_MODE = os.getenv("FLASH_ATTN_MSSANITIZER_MODE", "auto").lower()
+if MSSANITIZER_MODE not in ("auto", "static", "runtime"):
+    raise RuntimeError(
+        f"Invalid FLASH_ATTN_MSSANITIZER_MODE={MSSANITIZER_MODE!r}; "
+        "choose auto, static, or runtime."
+    )
 
 
 def get_platform():
@@ -288,7 +301,13 @@ class BishengBuildExt(build_ext):
         # （libsanitizer_stub_dav-c310 缺失），950 编译时加 "--cce-enable-sanitizer" 会在设备链接阶段
         # 报 "unable to find library -lsanitizer_stub_dav-c310"。
         # 950 (dav-3510) 请改用 mssanitizer 运行时注入（编译不加插桩，运行测试命令前加 mssanitizer 前缀）。
-        use_ms_static = ENABLE_MSSANITIZER and not is_ascend950
+        if ENABLE_MSSANITIZER and MSSANITIZER_MODE == "static" and is_ascend950:
+            raise RuntimeError(
+                "Static msSanitizer instrumentation is unavailable for Ascend950; use runtime."
+            )
+        use_ms_static = (
+            ENABLE_MSSANITIZER and not is_ascend950 and MSSANITIZER_MODE != "runtime"
+        )
         if use_ms_static:
             link_arch_flags = ["--cce-enable-sanitizer", *link_arch_flags]
 
@@ -344,18 +363,18 @@ class BishengBuildExt(build_ext):
             # --cce-enable-sanitizer 开启内存异常检测插桩。
             compile_common += ["-g", "--cce-enable-sanitizer"]
             print(
-                f"[mssanitizer] {ext_name}: 已追加 -g（报告定位信息）；"
-                f"内存检测请用运行时注入：mssanitizer --tool=memcheck python -m pytest ..."
+                f"[mssanitizer] {ext_name}: 已启用静态插桩 -g --cce-enable-sanitizer；"
+                f"必须通过检测运行时启动：mssanitizer --tool=memcheck -- python -m pytest ...；"
+                f"图捕获检测请使用 FLASH_ATTN_MSSANITIZER_MODE=runtime 重新构建"
             )
         elif ENABLE_MSSANITIZER:
-            # 950 (dav-3510)：静态插桩 "--cce-enable-sanitizer" 在此 CANN 下不可用
-            # （缺少 libsanitizer_stub_dav-c310，链接阶段报 unable to find library），
-            # 内存检测改由 mssanitizer 运行时注入完成，无需重新编译算子；
-            # 这里仍追加 "-g"，让运行时注入的异常报告能输出文件名/行号/调用栈。
+            # Runtime instrumentation: retain symbols and avoid jump tables.
+            # Do not link static stubs, which cannot initialize during capture.
             compile_common += ["-g", "-fno-jump-tables"]
             print(
-                f"[mssanitizer] {ext_name}: 已追加 -g（报告定位信息）；"
-                f"内存检测请用运行时注入：mssanitizer --tool=memcheck python -m pytest ..."
+                f"[mssanitizer] {ext_name}: 运行时插桩模式，已追加 -g -fno-jump-tables；"
+                f"内存检测请用：mssanitizer --tool=memcheck -- python -m pytest ...；"
+                f"图回放成功不代表图内 kernel 已被检测，请核对检测日志与越界对照"
             )
 
         self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)

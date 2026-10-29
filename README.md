@@ -94,18 +94,29 @@ pytest -q -s tests/test_flash_attn_npu_v4.py
 
 ## Memory Checking with msSanitizer
 
-Set env `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time to enable Ascend msSanitizer memory exception detection:
+Set `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time and launch tests through `mssanitizer`:
 
 ```bash
 # Build with memory checking enabled
 FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 
-# Ascend 910: static instrumentation is compiled into the kernels - run tests directly
-pytest -q -s tests/test_flash_attn_npu_v3.py
-
-# Ascend 950: memory checking via runtime injection (note the `--` separator)
+# Ascend 910 / 950: launch through msSanitizer (note the `--` separator)
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Optional: skip golden/precision compares so memcheck only launches kernels
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
 ```
+Use a separate build without static instrumentation for graph execution:
+
+```bash
+# Repeat with v4 for FA4. Keep static eager-check artifacts in a separate location.
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` accepts `auto` (default: static on 910, runtime on 950), `static` (910 only), and `runtime` (`-g -fno-jump-tables`, no static stubs). This option takes effect only with `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`.
 
 ## Usage
 
