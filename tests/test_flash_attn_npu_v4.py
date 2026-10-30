@@ -12,7 +12,6 @@ from tests.common.test_utils import (
     gather_paged_kv_batch,
     make_block_table,
     make_golden_attention_mask,
-    make_local_attention_mask,
     make_packed_random_tensor,
     make_paged_kv_cache,
     make_padded_varlen_mask,
@@ -548,24 +547,6 @@ def test_fa_kvcache_ops(
     new_kv_seqlen_list = None
     new_q_seqlen_list_cpu = None
     new_kv_seqlen_list_cpu = None
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    # Match Tri Dao GPU host: both sides vs kv_seqlen.
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
-        window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = window_size_left_golden < 0 and window_size_right_golden == 0
-    is_local_golden = (
-        window_size_left_golden >= 0 or window_size_right_golden > 0
-    ) and not is_causal_golden
-    if is_local_golden:
-        if window_size_left_golden < 0:
-            window_size_left_golden = kv_seqlen
-        if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -628,19 +609,9 @@ def test_fa_kvcache_ops(
         golden_lseL_gpu_ref = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
         golden_lseL_gpu_pt = torch.empty_like(golden_lseL_gpu_ref)
     if layout == "BSND":
-        atten_mask = None
-        if is_causal_golden:
-            atten_mask = torch.triu(
-                torch.ones(q_seqlen, kv_seqlen),
-                diagonal=(kv_seqlen - q_seqlen + 1),
-            ).bool()
-        elif is_local_golden:
-            atten_mask = make_local_attention_mask(
-                q_seqlen,
-                kv_seqlen,
-                window_size_left_golden,
-                window_size_right_golden,
-            )
+        atten_mask, _, _ = make_golden_attention_mask(
+            q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right
+        )
         if cache_mode == 1:
             key_batched, value_batched = gather_paged_kv_batch(
                 key_ref, value_ref, block_tables_cpu, kv_seqlen, block_size
@@ -679,9 +650,9 @@ def test_fa_kvcache_ops(
         used_k_lengths,
         q_seqlen,
         kv_seqlen,
-        is_causal_golden,
-        window_size_left_golden,
-        window_size_right_golden,
+        is_causal,
+        window_size_left,
+        window_size_right,
     )
 
     def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
@@ -861,37 +832,9 @@ def test_flash_attn_func(
     )
     scale = 1.0 / (head_size**0.5)
 
-    # Match Tri Dao GPU host: both sides vs kv_seqlen.
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
-        window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = window_size_left_golden < 0 and window_size_right_golden == 0
-    is_local_golden = (
-        window_size_left_golden >= 0 or window_size_right_golden > 0
-    ) and not is_causal_golden
-    if is_local_golden:
-        if window_size_left_golden < 0:
-            window_size_left_golden = kv_seqlen
-        if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
-    atten_mask = None
-    if is_causal_golden:
-        atten_mask = torch.triu(
-            torch.ones(q_seqlen, kv_seqlen),
-            diagonal=(kv_seqlen - q_seqlen + 1),
-        ).bool()
-    elif is_local_golden:
-        atten_mask = make_local_attention_mask(
-            q_seqlen,
-            kv_seqlen,
-            window_size_left_golden,
-            window_size_right_golden,
-        )
+    atten_mask, _, _ = make_golden_attention_mask(
+        q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right
+    )
 
     out, softmax_lse = flash_attn_func(
         query,

@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Union
 
 import math
 import torch
+from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 # isort: off
 # We need to import the kernels after importing torch
@@ -230,10 +231,7 @@ def _flash_attn_forward_fake(
 _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper(
-    "flash_attn_npu::_flash_attn_varlen_forward", mutates_args=(), device_types="npu"
-)
-def _flash_attn_varlen_forward(
+def _flash_attn_varlen_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -283,6 +281,11 @@ def _flash_attn_varlen_forward(
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
     return out, softmax_lse, S_dmask, rng_state
+
+
+_flash_attn_varlen_forward = _torch_custom_op_wrapper(
+    "flash_attn_npu::_flash_attn_varlen_forward", mutates_args=(), device_types="npu"
+)(_flash_attn_varlen_forward_impl)
 
 
 @_torch_register_fake_wrapper("flash_attn_npu::_flash_attn_varlen_forward")
@@ -369,7 +372,11 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     (
         dq,
         dk,
@@ -420,7 +427,11 @@ def _flash_attn_backward_fake(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     if dq is None:
         dq = torch.empty_like(q)
     if dk is None:
@@ -476,7 +487,11 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     (
         dq,
         dk,
@@ -539,7 +554,11 @@ def _flash_attn_varlen_backward_fake(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
 
@@ -949,32 +968,6 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        if layout == _LAYOUT_BNSD:
-            batch_size, num_heads, seqlen_q, head_size = q.shape
-            seqlen_k, num_heads_k = k.shape[2], k.shape[1]
-        else:
-            batch_size, seqlen_q, num_heads, head_size = q.shape
-            seqlen_k, num_heads_k = k.shape[1], k.shape[2]
-        cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
-        if alibi_slopes is None:
-            alibi_slopes_batch_stride = 0
-        else:
-            alibi_slopes_batch_stride = alibi_slopes.shape[1] if alibi_slopes.dim() == 2 else 0
-        scheduler_metadata = get_scheduler_metadata(
-            batch_size,
-            seqlen_q,
-            seqlen_k,
-            num_heads,
-            num_heads_k,
-            head_size,
-            cache_seqlens,
-            qkv_dtype=q.dtype,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            softmax_scale=softmax_scale,
-            alibi_slopes_batch_stride=alibi_slopes_batch_stride,
-        )
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
@@ -987,7 +980,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
-            scheduler_metadata=scheduler_metadata,
+            scheduler_metadata=None,
             layout=layout,
         )
         if is_grad:
@@ -1065,43 +1058,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        # Training interfaces do not expose scheduler_metadata (aligned with
-        # official flash-attn); the scheduler metadata is computed internally on
-        # the AICPU so no D2H/H2D sync breaks the pipeline. cache_seqlens holds
-        # the per-batch KV lengths and stays on device.
-        batch_size = cu_seqlens_q.shape[0] - 1
-        num_heads, head_size = q.shape[1], q.shape[2]
-        if block_table is not None:
-            # Paged KV: k/v are (num_blocks, page_size, num_heads_k, headdim);
-            # scheduler metadata uses the logical max KV length for SWA. The
-            # physical page-table stride is supplied by mha_varlen_fwd.
-            page_size = k.shape[1]
-            num_heads_k = k.shape[2]
-        else:
-            page_size = None
-            num_heads_k = k.shape[1]
-        cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        if alibi_slopes is None:
-            alibi_slopes_batch_stride = 0
-        else:
-            alibi_slopes_batch_stride = alibi_slopes.shape[1] if alibi_slopes.dim() == 2 else 0
-        scheduler_metadata = get_scheduler_metadata(
-            batch_size,
-            max_seqlen_q,
-            max_seqlen_k,
-            num_heads,
-            num_heads_k,
-            head_size,
-            cache_seqlens,
-            qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
-            page_size=page_size,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            softmax_scale=softmax_scale,
-            alibi_slopes_batch_stride=alibi_slopes_batch_stride,
-        )
+        # The native entry schedules nonpaged, dropout-free TND directly from
+        # device sequence lengths. Other modes retain their host tiling path.
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
             k,
@@ -1119,7 +1077,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
-            scheduler_metadata=scheduler_metadata,
+            scheduler_metadata=None,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1637,6 +1595,27 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # # Inference needs neither an autograd context nor an output slice when the
+    # # head dimension is already aligned. Instrumented/traced calls keep the
+    # # registered custom op; ordinary eager tensors can call its implementation.
+    # if (dropout_p == 0.0 and q.dim() == 3 and q.shape[-1] % 8 == 0 and
+    #         (not torch.is_grad_enabled() or not (q.requires_grad or k.requires_grad or v.requires_grad))):
+    #     _validate_varlen_query(q, cu_seqlens_q)
+    #     forward = _wrapped_flash_attn_varlen_forward
+    #     tensors = (q, k, v, cu_seqlens_q, cu_seqlens_k, alibi_slopes, block_table)
+    #     if (not torch.compiler.is_compiling() and not torch.jit.is_tracing()
+    #             and not is_in_torch_dispatch_mode()
+    #             and all(x is None or type(x) is torch.Tensor for x in tensors)
+    #             and not torch.overrides.has_torch_function(tensors)):
+    #         forward = _flash_attn_varlen_forward_impl
+    #     out, lse, mask, _ = forward(
+    #         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+    #         0.0, q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale,
+    #         causal=causal, window_size_left=window_size[0], window_size_right=window_size[1],
+    #         softcap=softcap, alibi_slopes=alibi_slopes, block_table=block_table,
+    #     )
+    #     return (out, lse, mask) if return_attn_probs else out
+
     return FlashAttnVarlenFunc.apply(
         q,
         k,

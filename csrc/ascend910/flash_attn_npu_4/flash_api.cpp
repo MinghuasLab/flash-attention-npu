@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include "../attention_window.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -28,6 +30,7 @@
 // into this TU; restore them so unqualified KernelCommon constants resolve.
 using namespace Catlass;
 using namespace KernelCommon;
+using fa_window::NormalizeAttentionWindow;
 
 #include "fa_metadata_args.h"
 #include "device_triu_mask.h"
@@ -64,29 +67,6 @@ extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-static void NormalizeAttentionWindow(bool causal, int64_t max_k, int64_t& left, int64_t& right, bool& is_causal,
-                                     bool& is_local)
-{
-    if (max_k > 0 && left >= max_k) {
-        left = -1;
-    }
-    if (max_k > 0 && right >= max_k) {
-        right = -1;
-    }
-    if (causal) {
-        right = 0;
-    }
-    is_causal = left < 0 && right == 0;
-    is_local = (left >= 0 || right >= 0) && !is_causal;
-    if (is_local) {
-        if (left < 0) {
-            left = max_k;
-        }
-        if (right < 0) {
-            right = max_k;
-        }
-    }
-}
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
                                            const std::optional<at::Tensor>& seqlensQ)
@@ -438,7 +418,7 @@ std::vector<at::Tensor> mha_fwd(
         paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                  : (k.dim() == 4 ? (is_bnsd_layout ? k.size(2) : k.size(1))
                                  : (use_explicit_metadata ? k.size(0) : static_cast<int64_t>(max_kv_seqlen))));
-    NormalizeAttentionWindow(is_causal, declared_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right, is_causal, is_local);
 
     // Per-call runtime values (block/scale/mask) never live in the reusable
     // metadata; serialize them into a small FAInferRuntimeData and transfer H2D.
@@ -797,17 +777,9 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     // live in the last KV stacks; empty prefix splits corrupt combine).
     int64_t wl = window_left;
     int64_t wr = window_right;
-    if (max_seqlen_k > 0 && wl >= max_seqlen_k) {
-        wl = -1;
-    }
-    if (max_seqlen_k > 0 && wr >= max_seqlen_k) {
-        wr = -1;
-    }
-    if (causal) {
-        wr = 0;
-    }
-    const bool is_causal_meta = (wl < 0 && wr == 0);
-    const bool is_local_meta = (wl >= 0 || wr >= 0) && !is_causal_meta;
+    bool is_causal_meta = false;
+    bool is_local_meta = false;
+    NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k, wl, wr, is_causal_meta, is_local_meta);
 
     FAMetadataArgs args{};
     args.seqlensQAddr = seqlens_q.defined() ? reinterpret_cast<uint64_t>(seqlens_q.data_ptr()) : 0ULL;
@@ -978,6 +950,14 @@ std::vector<at::Tensor> mha_bwd(
     TORCH_CHECK(!is_varlen_q || max_seqlen_k_.has_value(), "max_seqlen_k must be provided in varlen bwd.");
     int64_t max_seqlen_q = is_varlen_q ? max_seqlen_q_.value() : qsizes[1];
     int64_t max_seqlen_k = is_varlen_q ? max_seqlen_k_.value() : ksizes[1];
+    // No Q/K pairs means zero gradients; do not enter zero-work FAG tiling.
+    if (q.numel() == 0 || k.numel() == 0) {
+        dq.zero_();
+        dk.zero_();
+        dv.zero_();
+        auto softmax_d = torch::zeros({batch_size, nheads, max_seqlen_q}, q.options().dtype(at::kFloat));
+        return {dq, dk, dv, softmax_d};
+    }
     TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0, "mha_bwd: sequence lengths must be positive");
 
     uint32_t tilingSize = sizeof(FAGTilingData);
@@ -992,7 +972,7 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);

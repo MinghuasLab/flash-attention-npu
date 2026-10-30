@@ -118,8 +118,8 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     const int64_t maskKvBound = page_size.has_value() ? static_cast<int64_t>(maxNumBlocksPerBatch) * ps : max_seqlen_k;
     FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_q, maskKvBound);
     args.maskType = maskDer.maskType;
-    args.windowSizeLeft = static_cast<int32_t>(maskDer.window_left);
-    args.windowSizeRight = static_cast<int32_t>(maskDer.window_right);
+    args.windowSizeLeft = maskDer.window_left;
+    args.windowSizeRight = maskDer.window_right;
     args.blockDim = blockDim;
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;

@@ -24,7 +24,6 @@ from flash_attn_npu_4 import (  # noqa: E402
 )
 
 
-@pytest.mark.skipif("Ascend910" not in _device_name, reason="Ascend910 window normalization")
 @pytest.mark.parametrize("layout", ["BSND", "TND"])
 @pytest.mark.parametrize("num_pages", [1, 2])
 def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages):
@@ -50,13 +49,13 @@ def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages)
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
     torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
 
-    # With the existing used-KV normalization, the right window is 32.
-    # Right alignment is -480, so query rows 0..447 have no visible key.
+    # An unlimited right window preserves visible keys even when Q > K.
+    # Q=K=0 gives uniform attention over each row's visible keys.
     rows = out.reshape(512, 16)
-    assert torch.equal(rows[:448], torch.zeros_like(rows[:448]))
-    torch.testing.assert_close(rows[448:], torch.ones_like(rows[448:]), rtol=0, atol=0)
-    assert torch.isposinf(lse.reshape(512)[:448]).all()
-    assert torch.isfinite(lse.reshape(512)[448:]).all()
+    torch.testing.assert_close(rows, torch.ones_like(rows), rtol=0, atol=0)
+    first_key = (torch.arange(512, device=lse.device) + 32 - 512 - 8).clamp(0, 32)
+    expected_lse = (32 - first_key).float().log()
+    torch.testing.assert_close(lse.reshape(512), expected_lse, rtol=0, atol=1e-6)
 
 
 def test_950_scheduler_metadata_matches_signature():

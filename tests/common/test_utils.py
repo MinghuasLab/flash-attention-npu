@@ -280,40 +280,26 @@ def make_local_attention_mask(q_seqlen, kv_seqlen, window_size_left, window_size
     right_boundary = kv_seqlen - q_seqlen + window_size_right
     row = torch.arange(q_seqlen)[:, None]
     col = torch.arange(kv_seqlen)[None, :]
-    return ((-row + col) < left_boundary) | ((-row + col) > right_boundary)
+    mask = torch.zeros(q_seqlen, kv_seqlen, dtype=torch.bool)
+    if window_size_left >= 0:
+        mask |= col - row < left_boundary
+    if window_size_right >= 0:
+        mask |= col - row > right_boundary
+    return mask
 
 
 def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right):
-    """Normalize window parameters and build the reference attention mask.
+    """Build the reference directly from the API inequalities, without Host rewrites.
 
-    ``-1`` means unlimited context in that direction; windows extending beyond
-    the KV length are also treated as unlimited. Causal mode normalizes the
-    right window to zero. Returns
-    ``(mask, is_causal_golden, is_local_golden)``. ``mask`` is ``None`` when no
-    mask is needed; otherwise ``True`` marks masked positions.
+    Negative sides are unlimited; causal takes precedence over the right side.
+    Returns (mask, is_causal_golden, is_local_golden), with True meaning masked.
     """
     wl = window_size_left
-    wr = window_size_right
-    if kv_seqlen > 0 and wl >= kv_seqlen:
-        wl = -1
-    if kv_seqlen > 0 and wr >= kv_seqlen:
-        wr = -1
-    if is_causal:
-        wr = 0
+    wr = 0 if is_causal else window_size_right
     is_causal_golden = wl < 0 and wr == 0
-    is_local_golden = (wl >= 0 or wr > 0) and not is_causal_golden
-    if is_local_golden:
-        if wl < 0:
-            wl = kv_seqlen
-        if wr < 0:
-            wr = kv_seqlen
-    if is_causal_golden:
-        diagonal = kv_seqlen - q_seqlen + 1
-        mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=diagonal).to(torch.bool)
-    elif is_local_golden:
-        mask = make_local_attention_mask(q_seqlen, kv_seqlen, wl, wr)
-    else:
-        mask = None
+    is_local_golden = (wl >= 0 or wr >= 0) and not is_causal_golden
+    mask = (make_local_attention_mask(q_seqlen, kv_seqlen, wl, wr)
+            if is_causal_golden or is_local_golden else None)
     return mask, is_causal_golden, is_local_golden
 
 
@@ -334,22 +320,14 @@ def make_padded_varlen_mask(
     mask = (~q_valid[:, :, None]) | (~k_valid[:, None, :])
     row = torch.arange(max_q_seqlen)[None, :, None]
     col = torch.arange(max_kv_seqlen)[None, None, :]
-    if max_kv_seqlen > 0 and window_size_left >= max_kv_seqlen:
-        window_size_left = -1
-    if max_kv_seqlen > 0 and window_size_right >= max_kv_seqlen:
-        window_size_right = -1
-    if is_causal:
-        window_size_right = 0
-    is_causal_golden = window_size_left < 0 and window_size_right == 0
-    is_local_golden = (window_size_left >= 0 or window_size_right > 0) and not is_causal_golden
     offsets = (kv_seqlens - q_seqlens)[:, None, None]
-    if is_causal_golden:
-        mask = mask | (col - row >= offsets + 1)
-    elif is_local_golden:
-        left = max_kv_seqlen if window_size_left < 0 else window_size_left
-        right = max_kv_seqlen if window_size_right < 0 else window_size_right
-        diff = col - row
-        mask = mask | (diff < offsets - left) | (diff > offsets + right)
+    diff = col - row
+    if window_size_left >= 0:
+        mask |= diff < offsets - window_size_left
+    if is_causal:
+        mask |= diff > offsets
+    elif window_size_right >= 0:
+        mask |= diff > offsets + window_size_right
     return q_valid, k_valid, mask
 
 def check_kvcache_inplace(key_cache_orig, value_cache_orig, key_cache, value_cache,

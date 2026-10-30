@@ -392,10 +392,10 @@ class FAIKernel950 {
             uint32_t kvStart = 0;
             uint32_t noSkipKvS = static_cast<uint32_t>(kvSeqlen);
             uint32_t kvSLoopNum = 0;
-            int32_t windowSizeLeftStartLen = 0;
-            int32_t windowSizeLeftEndLen = 0;
-            int32_t windowSizeRightStartLen = 0;
-            int32_t windowSizeRightEndLen = 0;
+            int64_t windowSizeLeftStartLen = 0;
+            int64_t windowSizeLeftEndLen = 0;
+            int64_t windowSizeRightStartLen = 0;
+            int64_t windowSizeRightEndLen = 0;
             int32_t delStartRow = 0;
             int32_t delEndRow = static_cast<int32_t>(qSeqlen);
             const int32_t qSTileStart = static_cast<int32_t>(qSTileIdx * qBaseTile_);
@@ -409,50 +409,40 @@ class FAIKernel950 {
                 noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, (uint32_t)causalKvEnd);
                 kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
             } else if constexpr (maskCategory == SLIDING_WINDOW_MASK) {
-                const int32_t T = static_cast<int32_t>(kvBaseTile_);
-                // Window bounds are in Q-token space; use real S tile length, not rowNum (qS*qN).
-                const int32_t qSTileLen = static_cast<int32_t>(qSBlockSize);
-                const int32_t kvSeqlenI = static_cast<int32_t>(kvSeqlen);
-                const int32_t qSeqlenI = static_cast<int32_t>(qSeqlen);
-                const int32_t wL = static_cast<int32_t>(windowSizeLeft_);
-                const int32_t wR = static_cast<int32_t>(windowSizeRight_);
-                int32_t kvSLoopNumI = 0;
-                int32_t leftPoint_L = kvSeqlenI;
-                int32_t leftPoint_R = 0;
-
-                if (wL < 0 && (-wL) >= qSeqlenI) {
-                    kvStart = static_cast<uint32_t>(kvSeqlenI / T + 1);
-                } else {
-                    leftPoint_L = kvSeqlenI - qSeqlenI - wL;
-                    windowSizeLeftStartLen = qSTileStart + leftPoint_L;
-                    windowSizeLeftEndLen = qSTileStart + qSTileLen + leftPoint_L;
-                    kvStart =
-                        static_cast<uint32_t>(AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) / T);
-                }
-
-                if (wR < 0 && (-wR) >= kvSeqlenI) {
-                    noSkipKvS = 0;
-                    kvSLoopNumI = 0;
-                } else {
-                    leftPoint_R = kvSeqlenI - qSeqlenI + wR;
-                    windowSizeRightStartLen = qSTileStart + leftPoint_R;
-                    windowSizeRightEndLen = qSTileStart + qSTileLen + leftPoint_R;
-                    if (windowSizeRightEndLen <= 0) {
-                        noSkipKvS = 0;
-                        kvSLoopNumI = 0;
-                    } else {
-                        int32_t noSkipI = AscendC::Std::min(kvSeqlenI, RoundUp(windowSizeRightEndLen, T));
-                        noSkipKvS = static_cast<uint32_t>(noSkipI);
-                        kvSLoopNumI = static_cast<int32_t>(CeilDiv(noSkipI, T));
+                // Use the actual ragged lengths and signed bounds before clipping.
+                // Negative windows are unlimited; Q and K have different bounds.
+                const int64_t qLength = static_cast<int64_t>(qSeqlen);
+                const int64_t kvLength = static_cast<int64_t>(kvSeqlen);
+                const int64_t seqDiff = kvLength - qLength;
+                const int64_t qBlockBase = static_cast<int64_t>(qSTileIdx) * qBaseTile_;
+                const bool notPreMask = windowSizeLeft_ < 0 || windowSizeLeft_ >= kvLength - 1;
+                const bool notNextMask = windowSizeRight_ < 0 || windowSizeRight_ >= qLength - 1;
+                if (!notPreMask) {
+                    const int64_t leftOrigin = seqDiff - windowSizeLeft_;
+                    windowSizeLeftStartLen = qBlockBase + leftOrigin;
+                    windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
+                    const int64_t firstKey = AscendC::Std::min(kvLength,
+                        AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                    kvStart = static_cast<uint32_t>(firstKey) / kvBaseTile_;
+                    if (windowSizeLeftEndLen > kvLength) {
+                        delStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
+                            AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
                     }
                 }
-                kvSLoopNum = static_cast<uint32_t>(kvSLoopNumI < 0 ? 0 : kvSLoopNumI);
-
-                if (windowSizeLeftEndLen > kvSeqlenI) {
-                    delStartRow = kvSeqlenI - leftPoint_L;
-                } else if (windowSizeRightStartLen < 0) {
-                    delEndRow = -leftPoint_R;
+                if (!notNextMask) {
+                    const int64_t rightOrigin = seqDiff + windowSizeRight_;
+                    windowSizeRightStartLen = qBlockBase + rightOrigin;
+                    // Exclusive upper bound for the last Q row in this tile.
+                    windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
+                    const int64_t endKey = AscendC::Std::min(kvLength,
+                        AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                    noSkipKvS = static_cast<uint32_t>(endKey);
+                    if (windowSizeRightStartLen < 0) {
+                        delEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
+                            AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                    }
                 }
+                kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
             }
 
             uint32_t fullyMaskedRowsPerHead = 0;
