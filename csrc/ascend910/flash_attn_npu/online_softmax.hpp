@@ -1220,7 +1220,11 @@ public:
             // tile fully below the diagonal (all-visible prefix): full-width
             // triangle shifted right so its diagonal lands at triUp.
             gmOffsetMaskRow = 0;
-            gmOffsetMaskColumn = static_cast<uint32_t>(-diagColLocal);
+            // A diagonal farther left than this Q tile masks every element.
+            // Use an equivalent in-range all-one triangle slice, including
+            // append writeback blocks far beyond the causal visible range.
+            gmOffsetMaskColumn = static_cast<uint32_t>(
+                AscendC::Std::min(-diagColLocal, static_cast<int64_t>(qSBlockSize)));
             maskColumn = columnNum;
             addMaskUbOffset = 0;
         }
@@ -1359,9 +1363,9 @@ public:
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
-        uint32_t& softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
-        bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
-        int32_t nextTokenEndLen, bool isSplitKV = false,
+        uint32_t& softmaxPingPongFlag, int64_t kvSStartIdx, bool doTriUPreMask,
+        bool doTriUNextMask, int64_t preTokenStartLen, int64_t preTokenEndLen, int64_t nextTokenStartLen,
+        int64_t nextTokenEndLen, bool isSplitKV = false,
         int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0,
         int64_t qKSeqDiff = 0, int64_t slopesBatchOffset = 0)
     {
@@ -1386,13 +1390,13 @@ public:
 
         uint32_t addMaskUbOffset = 0;
 
-        uint32_t gmOffsetMaskRowPre;
-        uint32_t gmOffsetMaskColumnPre;
-        uint32_t maskColumnPre;
+        uint32_t gmOffsetMaskRowPre = 0;
+        uint32_t gmOffsetMaskColumnPre = 0;
+        uint32_t maskColumnPre = 0;
 
-        uint32_t gmOffsetMaskRowNext;
-        uint32_t gmOffsetMaskColumnNext;
-        uint32_t maskColumnNext;
+        uint32_t gmOffsetMaskRowNext = 0;
+        uint32_t gmOffsetMaskColumnNext = 0;
+        uint32_t maskColumnNext = 0;
         if (doTriUPreMask) {
             if (preTokenStartLen > kvSStartIdx) {
                 gmOffsetMaskRowPre = preTokenStartLen - kvSStartIdx - 1;

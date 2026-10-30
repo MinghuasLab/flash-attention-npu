@@ -83,47 +83,12 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     }
     tilingData->maxKvSeqlen = maxKvSeqlen;
 
-    // get_scheduler_metadata derived maskType from cache capacity (no D2H).
-    // Re-apply the host window rule against the actual max KV length; layout
-    // and host template dispatch stay on the capacity-derived mask.
-    int64_t wl = metaArgs->windowSizeLeft;
-    int64_t wr = metaArgs->windowSizeRight;
-    if (maxKvSeqlen > 0 && wl >= static_cast<int64_t>(maxKvSeqlen)) {
-        wl = -1;
-    }
-    if (maxKvSeqlen > 0 && wr >= static_cast<int64_t>(maxKvSeqlen)) {
-        wr = -1;
-    }
-    if (metaArgs->maskType == MASK_TYPE_CAUSAL) {
-        wr = 0;
-    }
-    const bool isCausal = (wl < 0 && wr == 0);
-    const bool isLocal = (wl >= 0 || wr >= 0) && !isCausal;
-    if (isLocal) {
-        if (wl < 0) {
-            wl = static_cast<int64_t>(maxKvSeqlen);
-        }
-        if (wr < 0) {
-            wr = static_cast<int64_t>(maxKvSeqlen);
-        }
-    }
-    tilingData->windowSizeLeft = wl;
-    tilingData->windowSizeRight = wr;
-    if (isLocal) {
-        tilingData->maskType = MASK_TYPE_BAND;
-    } else if (isCausal) {
-        // Host may have launched MASK_SWA; MASK_CAUSAL softmax is a different
-        // compile-time path, so encode causal as SWA with unlimited left.
-        if (metaArgs->maskType == MASK_TYPE_BAND) {
-            tilingData->maskType = MASK_TYPE_BAND;
-            tilingData->windowSizeLeft = WINDOW_SIZE_INT_MAX;
-            tilingData->windowSizeRight = 0;
-        } else {
-            tilingData->maskType = MASK_TYPE_CAUSAL;
-        }
-    } else {
-        tilingData->maskType = MASK_TYPE_NO_MASK;
-    }
+    // Keep Host mask/layout selection and unlimited sides unchanged. Actual
+    // per-sequence lengths are applied in the attention kernel, not to the
+    // declared window here (in particular, right coverage depends on Q).
+    tilingData->maskType = metaArgs->maskType;
+    tilingData->windowSizeLeft = metaArgs->windowSizeLeft;
+    tilingData->windowSizeRight = metaArgs->windowSizeRight;
 
     const uint64_t blockDim = static_cast<uint64_t>(metaArgs->blockDim);
     tilingData->mm1OutSize = fa_metadata::Mm1OutSize(blockDim);

@@ -723,7 +723,6 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             } else {
                 qKSeqDiff = s2 - s1;
             }
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
             int64_t qNBlockBaseIdx = dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
             int64_t slopesBatchOffset = static_cast<int64_t>(dbParam.bIdx) * alibiSlopesBatchStride;
             AscendC::LocalTensor<float> bwdWorkUb =
@@ -1388,7 +1387,6 @@ class BlockEpilogue<EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_, HAS_ALIBI_>, 
             int64_t actualS2LenBwd = 0;
             GetSeqQlenKvlenByBidx(static_cast<int64_t>(blockInfo.batchIdx), actualS1LenBwd, actualS2LenBwd);
             int64_t qKSeqDiff = actualS2LenBwd - actualS1LenBwd;
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
             int64_t qSBlockBaseIdx = static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
             int64_t qNBlockBaseIdx = static_cast<int64_t>(blockInfo.nheadsKIdx) * g + blockInfo.gIdx;
             int64_t slopesBatchOffset = static_cast<int64_t>(blockInfo.batchIdx) * alibiSlopesBatchStride;

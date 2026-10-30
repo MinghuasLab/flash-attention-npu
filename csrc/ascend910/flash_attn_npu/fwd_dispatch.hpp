@@ -28,7 +28,7 @@ struct FwdLaunchArgs {
     bool return_softmax = false;
     bool has_dropout = false;
     KernelCommon::FaiKenel::inputLayout layout = KernelCommon::FaiKenel::inputLayout::BSND;
-    int64_t kv_seqlen_allocated = 0; // BNSD: KV S_alloc (k.size(2)); 0 otherwise
+    int64_t kv_seqlen_allocated = 0; // Dense cache capacity, or BNSD fixed-attention KV head-plane width.
     uint8_t* alibiSlopesDevice;
     uint8_t* qDevice;
     uint8_t* kDevice;
