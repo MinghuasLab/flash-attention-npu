@@ -107,6 +107,11 @@ def main() -> int:
           f"size={before_bytes / 1024**3:.3f}->{after_bytes / 1024**3:.3f} GiB "
           f"added={(after_bytes - before_bytes) / 1024**3:.3f} GiB")
     print(f"[{args.label}] report={run_dir / 'report.json'} log={log_file}")
+    if result.returncode:
+        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        print(f"[{args.label}] pytest log (last {min(40, len(lines))} lines):")
+        for line in lines[-40:]:
+            print(line)
     return result.returncode
 
 
