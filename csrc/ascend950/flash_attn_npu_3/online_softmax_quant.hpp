@@ -63,10 +63,14 @@ class BlockEpilogue<EpilogueFAQuantOnlineSoftmax<HAS_SOFTCAP, maskCategory>, Gem
     template <class TensorP>
     __aicore__ inline void
     operator()(TensorP& l1PTensorTla, uint32_t rowNum, uint32_t qSBlockSize, uint32_t qSTileStart,
-               uint32_t kvSTileStart, uint32_t kvSTileSize, int32_t qSeqlen, int32_t kvSeqlen, int32_t windowSizeLeft,
-               int32_t windowSizeRight, float scaleValue, bool isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
+               uint32_t kvSTileStart, uint32_t kvSTileSize, int32_t qSeqlen, int32_t kvSeqlen, int64_t windowLeft,
+               int64_t windowRight, float scaleValue, bool isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
                Arch::CrossCoreFlag mm1ToSmFlag, Arch::CrossCoreFlag smToMm2Flag)
     {
+        const int32_t windowSizeLeft = static_cast<int32_t>(
+            windowLeft < 0 ? kvSeqlen - 1 : min(windowLeft, static_cast<int64_t>(kvSeqlen - 1)));
+        const int32_t windowSizeRight = static_cast<int32_t>(
+            windowRight < 0 ? qSeqlen - 1 : min(windowRight, static_cast<int64_t>(qSeqlen - 1)));
         constexpr uint32_t rowAlign = 32;
         const uint32_t rowSplit = RoundUp(rowNum, rowAlign) / 2;
         const uint32_t rowNumFirstSubCore = min(rowNum, rowSplit);
@@ -218,7 +222,7 @@ class BlockEpilogue<EpilogueFAQuantOnlineSoftmax<HAS_SOFTCAP, maskCategory>, Gem
             Adds(windowDistanceVreg, (RegTensor<uint32_t>&)qIndexVreg,
                  static_cast<uint32_t>(windowSizeRight - kvPosition), validRowB32Mask);
             CompareScalar<uint32_t, AscendC::CMPMODE::LE>(visibleMask, windowDistanceVreg,
-                                                          static_cast<uint32_t>(windowSizeLeft + windowSizeRight),
+                                                          static_cast<uint32_t>(windowSizeLeft) + static_cast<uint32_t>(windowSizeRight),
                                                           validRowB32Mask);
             if constexpr (!IsFullKvTile) {
                 MergeKvTailMask(visibleMask, kvRow, kvSTileSize, validRowB32Mask);

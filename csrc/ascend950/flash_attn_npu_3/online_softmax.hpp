@@ -517,10 +517,10 @@ public:
     void operator()(TensorP &l1PTensorTla, TensorMask &gmMaskTensorTla, GemmCoord actualBlockShape,
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-        int32_t kvSStartIdx,
+        int64_t kvSStartIdx,
         bool doTriUPreMask, bool doTriUNextMask,
-        int32_t preTokenStartLen, int32_t /*preTokenEndLen*/,
-        int32_t nextTokenStartLen, int32_t /*nextTokenEndLen*/,
+        int64_t preTokenStartLen, int64_t /*preTokenEndLen*/,
+        int64_t nextTokenStartLen, int64_t /*nextTokenEndLen*/,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t /*swaPathTag*/)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
