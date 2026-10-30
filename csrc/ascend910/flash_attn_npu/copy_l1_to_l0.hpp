@@ -21,9 +21,8 @@ struct CopyL1ToL0AImpl {
     using LayoutSrc = layout::zN;
 
     CATLASS_DEVICE
-    void operator()(
-        LocalTensor<Element> const& dstTensor, LocalTensor<Element> const& srcTensor, LayoutDst const& layoutDst,
-        LayoutSrc const& layoutSrc)
+    void operator()(LocalTensor<Element> const& dstTensor, LocalTensor<Element> const& srcTensor,
+                    LayoutDst const& layoutDst, LayoutSrc const& layoutSrc)
     {
         constexpr uint8_t PAD_LIST[4] = {0, 0, 0, 0};
         uint16_t l1M = layoutSrc.shape(0) * layoutSrc.shape(1);
@@ -47,9 +46,8 @@ struct CopyL1ToL0BImpl {
     using LayoutSrc = layout::zN;
 
     CATLASS_DEVICE
-    void operator()(
-        LocalTensor<Element> const& dstTensor, LocalTensor<Element> const& srcTensor, LayoutDst const& layoutDst,
-        LayoutSrc const& layoutSrc)
+    void operator()(LocalTensor<Element> const& dstTensor, LocalTensor<Element> const& srcTensor,
+                    LayoutDst const& layoutDst, LayoutSrc const& layoutSrc)
     {
         constexpr uint8_t PAD_LIST[4] = {0, 0, 0, 0};
         uint16_t l1K = layoutSrc.shape(0) * layoutSrc.shape(1);

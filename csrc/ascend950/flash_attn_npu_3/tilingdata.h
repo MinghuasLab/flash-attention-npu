@@ -163,6 +163,7 @@ struct FAInferTilingData {
     uint32_t kL1BufNum;
     uint32_t vL1BufNum;
     uint32_t pL1BufNum;
+    uint32_t quantMode = 0;
 
     // Append combine-only metadata to preserve all main-attention field offsets.
     FdCombineTaskInfo fdCombineTaskInfo[MAX_FD_COMBINE_TASK_NUM];

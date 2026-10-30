@@ -1037,7 +1037,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                            TileCopyRescaleO, Arch::PositionL0C>;
+                                                            ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
@@ -1119,7 +1119,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
     using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                            TileCopyRescaleO, Arch::PositionL0C>;
+                                                            ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;

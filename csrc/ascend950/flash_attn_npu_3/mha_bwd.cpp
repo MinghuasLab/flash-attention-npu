@@ -29,11 +29,18 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                 std::optional<at::Tensor> seqused_k_, std::optional<int64_t> max_seqlen_q_,
                                 std::optional<int64_t> max_seqlen_k_, std::optional<double> softmax_scale_,
                                 bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap,
-                                bool deterministic, int64_t sm_margin)
+                                bool deterministic, int64_t sm_margin, int64_t layout)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     const bool is_varlen = cu_seqlens_q_.has_value();
+    TORCH_CHECK(layout >= 0 && layout <= 2, "mha_bwd: invalid layout");
+    const bool is_bnsd = layout == 2;
+    TORCH_CHECK(layout != 0 || is_varlen, "mha_bwd: TND requires cu_seqlens_q/k");
+    TORCH_CHECK(!is_bnsd ||
+                    (!is_varlen && !cu_seqlens_k_.has_value() && !seqused_q_.has_value() && !seqused_k_.has_value()),
+                "mha_bwd: BNSD does not support cu_seqlens or seqused");
+
     const uint32_t aic_num = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     const uint32_t aiv_num = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
 
@@ -42,8 +49,6 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // seqused caps used lengths only; offsets and sizing still follow cu.
     TORCH_CHECK(!seqused_q_.has_value() || is_varlen, "Ascend950 v3 bwd: seqused_q requires cu_seqlens_q");
     TORCH_CHECK(!seqused_k_.has_value() || is_varlen, "Ascend950 v3 bwd: seqused_k requires cu_seqlens_q");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "Ascend950 v3 bwd does not support sliding-window attention now");
     TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0 && softcap <= std::numeric_limits<float>::max(),
                 "Ascend950 v3 bwd: softcap must be finite and non-negative");
     TORCH_CHECK(sm_margin == 0, "Ascend950 v3 bwd does not support sm_margin");
@@ -97,20 +102,70 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     TORCH_CHECK(dout.size(-1) == v_head_dim && out.size(-1) == v_head_dim,
                 "Ascend950 v3 bwd: dout/out head dimension must match v");
 
-    at::Tensor dq = dq_.has_value() ? dq_.value() : at::empty_like(q);
-    at::Tensor dk = dk_.has_value() ? dk_.value() : at::empty_like(k);
-    at::Tensor dv = dv_.has_value() ? dv_.value() : at::empty_like(v);
+    at::Tensor dq = dq_.has_value() ? dq_.value() : at::empty(q.sizes(), q.options());
+    at::Tensor dk = dk_.has_value() ? dk_.value() : at::empty(k.sizes(), k.options());
+    at::Tensor dv = dv_.has_value() ? dv_.value() : at::empty(v.sizes(), v.options());
+    if (is_bnsd) {
+
+        TORCH_CHECK(k.sizes().slice(0, 3) == v.sizes().slice(0, 3), "mha_bwd: BNSD k/v must share logical B/S/N shape");
+        TORCH_CHECK(q.size(0) == k.size(0) && q.sizes().slice(0, 3) == out.sizes().slice(0, 3) &&
+                        out.sizes() == dout.sizes(),
+                    "mha_bwd: invalid BNSD batch or out/dout shape");
+        TORCH_CHECK(dq.sizes() == q.sizes() && dk.sizes() == k.sizes() && dv.sizes() == v.sizes(),
+                    "mha_bwd: dq/dk/dv must match q/k/v shapes");
+        TORCH_CHECK(dq.dtype() == q.dtype() && dk.dtype() == q.dtype() && dv.dtype() == q.dtype(),
+                    "mha_bwd: dq/dk/dv must match q dtype");
+        TORCH_CHECK(softmax_lse.dim() == 3 && softmax_lse.size(0) == batch_size && softmax_lse.size(1) == num_heads &&
+                        softmax_lse.size(2) == q_seqlen && softmax_lse.scalar_type() == at::kFloat &&
+                        softmax_lse.device() == q.device(),
+                    "mha_bwd: BNSD LSE must be float32 [B,Nq,Sq] on q device");
+        softmax_lse = softmax_lse.contiguous();
+    }
 
     // ============================================================
     // FAG tiling (host)
     // ============================================================
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(-1) == 1 && tensor.device() == q.device(),
+                    "mha_bwd: inputs require contiguous D and the same device");
+    }
+    for (const auto& tensor : {dq, dk, dv}) {
+        TORCH_CHECK(tensor.is_contiguous() && tensor.device() == q.device(),
+                    "mha_bwd: gradients must be contiguous BSND/TND on q device");
+    }
+
     FAGTiling950::FAGInfo fag_info{};
     fag_info.scaleValue =
         static_cast<float>(softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
     const bool has_softcap = softcap > 0.0;
     fag_info.softcapValue = static_cast<float>(softcap);
-    fag_info.layout = is_varlen ? FAGTiling950::Layout::TND : FAGTiling950::Layout::BSND;
-    fag_info.maskType = is_causal ? FAGTiling950::MaskType::CAUSAL : FAGTiling950::MaskType::NO_MASK;
+    fag_info.layout =
+        is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
+    if (window_size_left >= kv_seqlen - 1) {
+        window_size_left = -1;
+    }
+    if (window_size_right >= q_seqlen - 1) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const bool has_attn_mask = is_causal || is_local;
+    if (is_causal) {
+        fag_info.maskType = FAGTiling950::MaskType::CAUSAL;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = 0;
+    } else if (is_local) {
+        fag_info.maskType = FAGTiling950::MaskType::BAND;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = window_size_right;
+    } else {
+        fag_info.maskType = FAGTiling950::MaskType::NO_MASK;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = window_size_right;
+    }
     fag_info.deterministic = deterministic ? 1U : 0U;
     // Deterministic accumulation strategy.  BN2S2 applies the opst arch35
     // column-private schedule when the shape is covered; otherwise fall back
@@ -182,10 +237,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(q_lengths[batch_size] == static_cast<int64_t>(fag_info.totalQ) &&
                         kv_lengths[batch_size] == static_cast<int64_t>(fag_info.totalKv),
                     "Ascend950 v3 bwd: final cu_seqlens values must match packed tensor lengths");
-        at::Tensor used_q_cpu = seqused_q_.has_value()
-            ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
-        at::Tensor used_k_cpu = seqused_k_.has_value()
-            ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        at::Tensor used_q_cpu =
+            seqused_q_.has_value() ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        at::Tensor used_k_cpu =
+            seqused_k_.has_value() ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
         const int32_t* used_q = used_q_cpu.defined() ? used_q_cpu.data_ptr<int32_t>() : nullptr;
         const int32_t* used_kv = used_k_cpu.defined() ? used_k_cpu.data_ptr<int32_t>() : nullptr;
         for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
@@ -239,6 +294,30 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     FAGTiling950::FAGTilingData fag_tiling_data{};
     const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v3 bwd: arch35 GetFAGTilingParam failed");
+    // A BAND window can skip every task of a KV column. Private-column
+    // accumulation has no post pass for such columns, so preserve exact zeros.
+    if (is_local && fag_tiling_data.detPrivDkv != 0) {
+        bool hasEmptyKvColumns = !is_varlen && kv_seqlen - q_seqlen > fag_tiling_data.s1Token;
+        for (int64_t b = 0; is_varlen && b < batch_size && !hasEmptyKvColumns; ++b) {
+            hasEmptyKvColumns = actual_seq_kv[b] - actual_seq_q[b] > fag_tiling_data.s1Token;
+        }
+        if (hasEmptyKvColumns) {
+            dk.zero_();
+            dv.zero_();
+        }
+    }
+    if (is_local && fag_tiling_data.dqPostAbsorb != 0) {
+        dq.zero_();
+    }
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
+    }
+    auto tensor_strides = [is_varlen](const at::Tensor& tensor) {
+        return FagTensorStrides{is_varlen ? 0 : tensor.stride(0), tensor.stride(is_varlen ? 0 : 1),
+                                tensor.stride(is_varlen ? 1 : 2)};
+    };
+    fag_tiling_data.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
+                                    tensor_strides(dout), tensor_strides(out), 1};
     // The old in-loop VecDTM deterministic fallback was replaced by the cube
     // BN2S2 schedule.  Any deterministic shape the tiler cannot map to BN2S2
     // must fail loudly instead of silently running a non-deterministic loop.
@@ -314,7 +393,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     at::Tensor mask_cpu_tensor;
     at::Tensor mask_npu_tensor;
     uint8_t* mask = nullptr;
-    if (is_causal) {
+    if (has_attn_mask) {
         mask_cpu_tensor =
             at::triu(at::ones({256, 256}, at::device(c10::kCPU).dtype(at::kByte)), 1).to(at::Device(at::kPrivateUse1));
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -333,15 +412,15 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>         \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>         \
         <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace), \
+                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
                                             ptr(tiling_device))
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
     do {                                                                                                               \
-        if (is_causal) {                                                                                               \
+        if (has_attn_mask) {                                                                                               \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
                     LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
@@ -375,12 +454,16 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     if (q.dtype() == at::kBFloat16) {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
+        } else if (is_bnsd) {
+            DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
         } else {
             DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
         }
     } else {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(half, TND);
+        } else if (is_bnsd) {
+            DISPATCH_BWD950_FLAGS(half, BNSD);
         } else {
             DISPATCH_BWD950_FLAGS(half, BSND);
         }

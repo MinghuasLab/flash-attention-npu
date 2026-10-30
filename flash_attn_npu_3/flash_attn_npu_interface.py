@@ -80,6 +80,57 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if (
+        x.stride(1) == num_heads * head_dim
+        and x.stride(2) == head_dim
+        and x.stride(3) == 1
+    ):
+        return "BBND"
+    if (
+        x.stride(1) == head_dim
+        and x.stride(2) == page_size * head_dim
+        and x.stride(3) == 1
+    ):
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
+    """Apply the same forward stride policy as FA4 and FIA.
+
+    Dense operands use fixed packed kernel strides and are materialized. Paged
+    K/V remain zero-copy when both caches have the same packed BBND or BNBD
+    inner layout; dimension 0 may still be strided. Other paged views fall
+    back to packed BBND storage.
+
+    Append-KV is the exception: replacing a cache with a temporary contiguous
+    copy would lose the API's in-place cache update, so an unsupported cache
+    view is rejected instead of copied.
+    """
+    q = q.contiguous()
+    if page_table is None:
+        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
+            raise RuntimeError(
+                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
+            )
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    if append_kv:
+        raise RuntimeError(
+            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
+        )
+    return q, k.contiguous(), v.contiguous()
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -133,12 +184,15 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
 
 
-def _validate_varlen_query(q, cu_seqlens_q):
+def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
     if q.dim() != 3:
         raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
     if cu_seqlens_q.numel() <= 1:
         raise RuntimeError("batch size must be positive")
-    if q.shape[0] == 0:
+    # max_seqlen_q == 0 is the paged TND fast path, where every sequence has
+    # qlen 0. The training varlen API omits this argument and rejects any
+    # empty packed query, including one whose prefix still claims tokens.
+    if q.shape[0] == 0 and max_seqlen_q != 0:
         raise RuntimeError("total_q must be positive (q must contain at least one query token)")
 
 
@@ -186,8 +240,22 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     layout: int = _LAYOUT_BSND,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = max_seqlen_q
+    elif layout == _LAYOUT_BNSD:
+        batch_size, _, seqlen_q, _ = q.shape
+    else:
+        batch_size, seqlen_q, _, _ = q.shape
+    _check_fwd_dimension(batch_size, "batch_size")
+    _check_fwd_dimension(seqlen_q, "max_seqlen_q" if is_varlen_q else "seqlen_q")
+
+    q, k, v = _prepare_forward_qkv(
+        q, k, v, page_table, append_kv=k_new is not None or v_new is not None
+    )
+    k_new, v_new = [maybe_contiguous(x) for x in (k_new, v_new)]
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     ]
@@ -290,7 +358,7 @@ def _flash_attn_forward_fake(
     # Determine if we're in varlen mode
     is_varlen_q = cu_seqlens_q is not None
     if is_varlen_q:
-        _validate_varlen_query(q, cu_seqlens_q)
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
 
     # Get dimensions from query tensor
     if is_varlen_q:
@@ -413,6 +481,12 @@ def _flash_attn_backward(
     deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
+    # Same storage detection as forward; retain logical BSND shapes for host/output.
+    if cu_seqlens_q is not None:
+        layout = _LAYOUT_TND
+    else:
+        layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -443,6 +517,7 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        layout,
     )
     return softmax_d
 
@@ -1225,8 +1300,73 @@ def flash_attn_varlen_func(
     )
 
 
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)[1]
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_3::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    """Merge split-KV partial attention outputs.
+
+    Mirrors ``flash_attn.flash_attn_combine`` from Dao-AILab/flash-attention:
+    ``lse = logsumexp_s(lse_partial)`` and ``out = sum_s exp(lse_s - lse) * O_s``.
+
+    Args:
+        out_partial: fp32 partial outputs. Dense (BSND):
+            (num_splits, batch, seqlen, nheads, headdim); varlen (TND):
+            (num_splits, total_q, nheads, headdim).
+        lse_partial: fp32 partial logsumexp in logical (..., seqlen, heads) order.
+            Dense: (num_splits, batch, seqlen, nheads); varlen:
+            (num_splits, total_q, nheads).
+        out [optional]: preallocated output, written in place. When supplied,
+            its dtype takes precedence over out_dtype.
+        out_dtype [optional]: output dtype (fp16 / bf16 / fp32). Defaults to
+            ``out_partial.dtype`` (fp32), matching the NV interface.
+
+    Returns:
+        (out, softmax_lse). ``out`` is (batch, seqlen, nheads, headdim) or
+        (total_q, nheads, headdim); ``softmax_lse`` is fp32 with shape
+        (batch, seqlen, nheads) or (total_q, nheads), i.e. seqlen-contiguous
+        (note this differs from ``flash_attn_func``'s (batch, nheads, seqlen)).
+
+    The in-tree v3 forward does not currently expose real split accumulators;
+    callers must provide partials from an external split-attention producer.
+    """
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(out_partial, lse_partial, out, out_dtype)
+    return out, lse
 
 
 def flash_attn_with_kvcache(
@@ -1305,11 +1445,15 @@ def flash_attn_with_kvcache(
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
-        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.).
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table.
+            With page_table, the logical shape is
+            (num_blocks, page_block_size, nheads_k, headdim). A physical BNBD tensor shaped
+            (num_blocks, nheads_k, page_block_size, headdim) can be passed as
+            k_cache.transpose(1, 2), which is a metadata-only view. page_block_size can be
+            arbitrary (e.g. 1, 2, 3, 64, etc.). Appending k/v into a physical BNBD cache is
+            not supported yet.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
-            or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
+            with the same paged layout choices as k_cache if page_table is provided.
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.

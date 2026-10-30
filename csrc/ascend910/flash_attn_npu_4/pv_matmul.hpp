@@ -78,6 +78,16 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
     __aicore__ inline ~BlockMmad() {}
 
+    __aicore__ inline void SetPingPongState(BlockPingPongState* state)
+    {
+        pingPongState = state;
+    }
+
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
+    }
+
     __aicore__ inline void init(Arch::Resource<ArchTag>& resource, uint32_t nDyn, uint32_t kDyn,
                                 uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0, uint32_t vL1Stages = 0,
                                 uint32_t vSegLen = 0, uint32_t vSliceWidth = 0)
@@ -114,17 +124,18 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         actualShape[COORD_DIM2] = nowLen;
     }
 
-    __aicore__ inline void getKVOffset(uint32_t& kOffset, uint32_t nIdx, uint32_t& strideKV)
+    __aicore__ inline void getKVOffset(uint64_t& kOffset, uint32_t nIdx, uint32_t& strideKV)
     {
-        kOffset = nIdx * maxKVStackLen * strideKV;
+        kOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV;
     }
 
-    __aicore__ inline void getKVOffset(AscendC::GlobalTensor<int32_t>& gBlockTable, uint32_t& kOffset,
+    __aicore__ inline void getKVOffset(AscendC::GlobalTensor<int32_t>& gBlockTable, uint64_t& kOffset,
                                        uint32_t blockStartOffset, uint32_t nowNIdx, uint32_t& strideKV,
                                        uint32_t& blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = blockTableId * blockSize * strideKV + blockStartOffset * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                  static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -155,7 +166,12 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       AscendC::GlobalTensor<ElementC> gC, AscendC::GlobalTensor<int32_t> gBlockTable,
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t& nIdx, uint32_t& nLoop, uint32_t& blockSize, uint32_t kvSeqlen,
-                                      uint32_t strideKV, uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag)
+                                      uint32_t strideKV, uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag,
+                                      bool = false,
+                                      AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
+                                      uint64_t = 0,
+                                      AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(), uint32_t = 0,
+                                      uint32_t = 0)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t embed = actualOriShape[COORD_DIM1];
@@ -168,7 +184,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         }
 
         GemmCoord actualShape{rowNum, embed, 0};
-        uint32_t gBOffset = 0;
+        uint64_t gBOffset = 0;
 
         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(stackSeqTile, embed);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
@@ -199,7 +215,6 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-        Arch::CrossCoreWaitFlag(softmaxFlag);
 
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);
         uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);
@@ -209,14 +224,22 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             uint32_t nL1Actual = (nL1Idx < nL1Loop - 1U) ? L0TileShape::N : (embed - nL1Idx * L0TileShape::N);
             for (uint32_t mL1Idx = 0; mL1Idx < mL1Loop; mL1Idx++) {
                 uint32_t mL1Actual = (mL1Idx < mL1Loop - 1U) ? L1TileShape::M : (rowNum - mL1Idx * L1TileShape::M);
+                l0CPingPongFlag = pingPongState->l0CPingPongFlag;
+                pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
                 for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; kL1Idx++) {
                     uint32_t kL1Actual = (kL1Idx < kL1Loop - 1U) ? l1KDynamic : (stackSeqTile - kL1Idx * l1KDynamic);
+                    l1PPingPongFlag = pingPongState->l1PingPongFlag;
+                    pingPongState->l1PingPongFlag = 1U - pingPongState->l1PingPongFlag;
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1PPingPongFlag);
                     MatrixCoord gmATileCoord{mL1Idx * L1TileShape::M, kL1Idx * l1KDynamic};
                     auto gmTileA = gA[layoutA.GetOffset(gmATileCoord)];
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
+                    // Overlap scalar address/layout setup with the preceding softmax.
+                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                        Arch::CrossCoreWaitFlag(softmaxFlag);
+                    }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1PPingPongFlag);
 
@@ -227,6 +250,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                         LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL1Actual, kL0Actual);
                         MatrixCoord l1ATileCoord{0, kL0Idx * L0TileShape::K};
                         auto l1ATile = l1ATensor[l1PPingPongFlag][layoutAInL1.GetOffset(l1ATileCoord)];
+
+                        l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
+                        pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
 
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         if (kL0Idx == 0U) {
@@ -253,9 +279,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                  mL0Align, nL1Actual, kL0Actual, initMmad);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                        l0ABPingPongFlag = 1U - l0ABPingPongFlag;
                     }
-                    l1PPingPongFlag = 1U - l1PPingPongFlag;
                 }
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
@@ -264,7 +288,6 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL1Actual, nL1Actual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                l0CPingPongFlag = 1U - l0CPingPongFlag;
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
@@ -286,8 +309,8 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             while (dstRow < kChunkLen) {
                 const uint32_t segLen = AscendC::Std::min(kChunkLen - dstRow, blockSize - pageOff);
                 const uint32_t blockTableId = gBlockTable.GetValue(pageIdx);
-                const uint32_t gOffset =
-                    blockTableId * blockSize * strideKV + pageOff * strideKV + nSliceIdx * l1VSliceWidth;
+                    const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                                             static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(segLen, nSliceLen));
                 MatrixCoord l1BTileCoord{dstRow, 0};
                 auto l1BTile = l1VTensor[stage][layoutBInL1.GetOffset(l1BTileCoord)];
@@ -297,8 +320,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 pageOff = 0U;
             }
         } else {
-            const uint32_t gOffset =
-                nIdx * maxKVStackLen * strideKV + kChunkIdx * l1KDynamic * strideKV + nSliceIdx * l1VSliceWidth;
+            const uint64_t gOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV +
+                                     static_cast<uint64_t>(kChunkIdx) * l1KDynamic * strideKV +
+                                     static_cast<uint64_t>(nSliceIdx) * l1VSliceWidth;
             auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kChunkLen, nSliceLen));
             copyGmToL1B(l1VTensor[stage], gB[gOffset], layoutBInL1, layoutBTile);
         }
@@ -319,8 +343,8 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
         Arch::CrossCoreWaitFlag(softmaxFlag);
 
-        // Head-dim slice is the outer loop; L0C holds one 128-wide O slice and
-        // V uses the dedicated two-stage pool.
+        // D>256 has many inner L1 tiles. Shared QK/PV ping-pong desynchronizes
+        // event 0/1 across those extra loops; keep the pre-pipeline local cadence.
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             const uint32_t nL1Actual = (nL1Idx < nL1Loop - 1U) ? L0TileShape::N : (embed - nL1Idx * L0TileShape::N);
             for (uint32_t mL1Idx = 0; mL1Idx < mL1Loop; ++mL1Idx) {
@@ -415,6 +439,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
     CopyL1ToL0B copyL1ToL0B;
     CopyL0CToGm copyL0CToGm;
 
+    BlockPingPongState* pingPongState = nullptr;
     uint32_t l1PPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;
     uint32_t l0ABPingPongFlag = 0;
@@ -429,6 +454,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
     uint32_t blockStartOffset = 0;
     uint32_t maxKVStackLen = 0;
+    uint64_t pageStride = 0;
 };
 
 } // namespace Catlass::Gemm::Block

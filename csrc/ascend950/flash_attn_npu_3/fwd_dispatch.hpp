@@ -38,6 +38,10 @@ struct FwdLaunchArgs {
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
     int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD head plane)
+    uint32_t quant_mode = 0;
+    uint8_t* q_descale_device = nullptr;
+    uint8_t* k_descale_device = nullptr;
+    uint8_t* v_descale_device = nullptr;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and
@@ -51,7 +55,13 @@ void launch_fwd_impl(const FwdLaunchArgs& a);
 // per (dtype, Format) in the autogen TUs.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
-    if (a.is_bf16) {
+    if (a.quant_mode == 1) {
+        if (a.layout == Format::TND) {
+            launch_fwd_impl<float8_e4m3_t, Format::TND>(a);
+        } else {
+            launch_fwd_impl<float8_e4m3_t, Format::BSND>(a);
+        }
+    } else if (a.is_bf16) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<bfloat16_t, Format::TND>(a);
         } else if (a.layout == Format::BNSD) {

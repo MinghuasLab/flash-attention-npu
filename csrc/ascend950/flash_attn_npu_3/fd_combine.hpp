@@ -16,13 +16,15 @@
 #include "tilingdata.h"
 #include "kernel_common.hpp"
 
-template <class ElementO, bool OutputLse>
+template <class ElementO, bool OutputLse, uint32_t quantMode = 0>
 class FlashDecodeCombine950 {
   public:
+    static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
     static constexpr uint32_t MAX_HEAD_DIM = 256U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
+    static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;
     static constexpr uint32_t MAX_O_ELEMS = MAX_ROW_TILE * MAX_HEAD_DIM;
     static constexpr uint32_t MAX_O_INPUT_ELEMS = FD_COMBINE_O_INPUT_ELEMS;
@@ -91,7 +93,8 @@ class FlashDecodeCombine950 {
         const uint32_t qRows = tiling->fdCombineTaskInfo[combineIdx].qRows;
         const uint32_t qHeadStart = tiling->fdCombineTaskInfo[combineIdx].qHeadStart;
         const uint32_t groupRows = tiling->fdCombineTaskInfo[combineIdx].rowNum;
-        const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, FLOATS_PER_BLOCK) / FD_SOURCE_SUB_BLOCK_NUM);
+        const uint32_t sourceRowSplit =
+            Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / FD_SOURCE_SUB_BLOCK_NUM);
         // Host task geometry uses seqused_q, but packed storage follows cu-Q.
         const uint32_t qTokenBase =
             static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + tiling->fdCombineTaskInfo[combineIdx].qStart;
@@ -220,7 +223,7 @@ class FlashDecodeCombine950 {
             const uint32_t qStart = qTileIdx * tiling->qBaseTile;
             const uint32_t qRows = Min(tiling->qBaseTile, qLen - qStart);
             const uint32_t groupRows = qRows * qNBlockSize;
-            const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, FLOATS_PER_BLOCK) / subBlockNum);
+            const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / subBlockNum);
             const uint32_t sub0Tiles = CeilDiv(sourceRowSplit, rowTile);
             const uint32_t tilesPerTask = sub0Tiles + CeilDiv(groupRows - sourceRowSplit, rowTile);
             const uint32_t qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;

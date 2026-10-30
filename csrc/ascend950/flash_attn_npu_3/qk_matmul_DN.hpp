@@ -130,7 +130,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16; // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
 
     static constexpr uint32_t STRIDE_LIMIT = 65535;
-    static constexpr uint32_t C0_ELEMS = 16;
+    static constexpr bool FULL_QUANT_FP8 = std::is_same_v<ElementA, float8_e4m3_t>;
+    static constexpr uint32_t C0_ELEMS = 32 / sizeof(ElementA);
 
     __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
     {
@@ -286,12 +287,15 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
         // therefore, FixPipe won't launch until each portion(chunked only by columns, based on nbuffer strategy)
         // of the base tile is ready on l0C
+        uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
+            uint32_t kvL0Start = kvTileStart + nL0Itr * L0_TILE_N;
             uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
             uint32_t l0CLoopCounter = kvSTileRelIdx;
-            uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
+            // A full FP8 DN tile occupies the lower 128 KiB; PV retains its two upper 64 KiB slots.
+            uint32_t l0CBufId = FULL_QUANT_FP8 ? 0 : l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId;
             auto l0CLayoutTla = tla::MakeLayoutL0C(l0TileNAct, rowNum);
             auto l0CTensorTla = tla::MakeTensor(l0CTensor[l0CBufId], l0CLayoutTla, Arch::PositionL0C{});
@@ -301,19 +305,37 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(l0TileNAct, embed));
             if constexpr (PAGED_CACHE_FLAG_) {
                 if constexpr (!PA_BNNBSD_FLAG_) {
-                    uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
-                    uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
-                    auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(blockIdx * blockSize + blockOffset, 0),
-                                                   tla::MakeShape(l0TileNAct, embed));
-                    copyGmToL1A(l1BTensorTlaTile, gBTensorTlaTile);
+                    if constexpr (FULL_QUANT_FP8) {
+                        uint32_t l1RowOffset = 0;
+                        while (l1RowOffset < l0TileNAct) {
+                            uint32_t kvRowOffset = kvL0Start + l1RowOffset;
+                            uint32_t logicalPageIndex = kvRowOffset / blockSize;
+                            uint32_t pageOffset = kvRowOffset % blockSize;
+                            uint32_t copyRows = min(l0TileNAct - l1RowOffset, blockSize - pageOffset);
+                            auto physicalPageIndex = gBlockTable.GetValue(logicalPageIndex);
+                            auto gBTensorTlaTile =
+                                GetTile(gBTensor, tla::MakeCoord(physicalPageIndex * blockSize + pageOffset, 0),
+                                        tla::MakeShape(copyRows, embed));
+                            auto l1BTensorTlaPart =
+                                GetTile(l1BTensorTla, tla::MakeCoord(l1RowOffset, 0), tla::MakeShape(copyRows, embed));
+                            copyGmToL1A(l1BTensorTlaPart, gBTensorTlaTile);
+                            l1RowOffset += copyRows;
+                        }
+                    } else {
+                        uint32_t blockTableIdx = kvL0Start / blockSize;
+                        uint32_t blockOffset = kvL0Start % blockSize;
+                        auto blockIdx = gBlockTable.GetValue(blockTableIdx);
+                        auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(blockIdx * blockSize + blockOffset, 0),
+                                                       tla::MakeShape(l0TileNAct, embed));
+                        copyGmToL1A(l1BTensorTlaTile, gBTensorTlaTile);
+                    }
                 } else {
                     if (isShrink == 1) {
                         uint32_t globalRemain = 0;
                         if (kvSTileIdx == 0) {
                             globalRemain = globalWindowSize;
-                            uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
-                            uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
+                            uint32_t blockTableIdx = kvL0Start / blockSize;
+                            uint32_t blockOffset = kvL0Start % blockSize;
                             auto blockIdx = gBlockTable.GetValue(blockTableIdx);
                             auto gBTensorTlaTile =
                                 GetTile(gBTensor, tla::MakeCoord((blockIdx * blockSize) * kvHeads + blockOffset, 0),
@@ -327,7 +349,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                 copyGmToL1A(l1BTensorTlaTile0, gBTensorTlaTile);
                             }
                         }
-                        uint32_t curKvSeqlenStart = kvSeqlenTriDown - rowNum + 1 - localWindowSize + kvSTileIdx * 128 -
+                        uint32_t curKvSeqlenStart = kvSeqlenTriDown - rowNum + 1 - localWindowSize + kvL0Start -
                                                     globalWindowSize * !(kvSTileIdx == 0);
                         uint32_t blockTableIdx = curKvSeqlenStart / blockSize;
                         uint32_t blockOffset = curKvSeqlenStart % blockSize;
@@ -367,8 +389,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                             }
                         }
                     } else {
-                        uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
-                        uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
+                        uint32_t blockTableIdx = kvL0Start / blockSize;
+                        uint32_t blockOffset = kvL0Start % blockSize;
                         auto blockIdx = gBlockTable.GetValue(blockTableIdx);
                         auto gBTensorTlaTile =
                             GetTile(gBTensor, tla::MakeCoord((blockIdx * blockSize) * kvHeads + blockOffset, 0),
@@ -384,7 +406,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             } else {
                 if constexpr (NZ_LAYOUT_FLAG_) {
                     auto gBTensorTlaTile =
-                        GetTile(gBTensor, tla::MakeCoord(kvSTileIdx * 128, 0), tla::MakeShape(l0TileNAct, embed));
+                        GetTile(gBTensor, tla::MakeCoord(kvL0Start, 0), tla::MakeShape(l0TileNAct, embed));
 
                     const uint32_t blockCount = embed / 16; // headdim / 16
                     const uint32_t blockLen = l0TileNAct;
@@ -398,7 +420,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                         repeatParams.srcStride = srcStride; // num tokens - blockLen
                         repeatParams.dstStride = RoundUp(blockLen, 16) - curBaseTileSize;
                         auto dstOffset = 0;
-                        auto srcOffset = kvSTileIdx * 128 * 16;
+                        auto srcOffset = kvL0Start * 16;
 
                         AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
                                           repeatParams);
@@ -409,14 +431,14 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                         repeatParams.dstStride = 0;
                         for (uint32_t i = 0; i < blockCount; ++i) {
                             auto dstOffset = i * RoundUp(blockLen, 16) * 16;
-                            auto srcOffset = kvSTileIdx * 128 * 16 + kvNumTokens * i * 16;
+                            auto srcOffset = kvL0Start * 16 + kvNumTokens * i * 16;
                             AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
                                               repeatParams);
                         }
                     }
                 } else {
                     auto gBTensorTlaTile =
-                        GetTile(gBTensor, tla::MakeCoord(kvSTileIdx * 128, 0), tla::MakeShape(l0TileNAct, embed));
+                        GetTile(gBTensor, tla::MakeCoord(kvL0Start, 0), tla::MakeShape(l0TileNAct, embed));
                     copyGmToL1A(l1BTensorTlaTile, gBTensorTlaTile);
                 }
             }

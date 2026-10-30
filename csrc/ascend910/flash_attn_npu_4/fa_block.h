@@ -52,5 +52,16 @@ namespace Catlass::Gemm {
         static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 
     };
+
+    namespace Block {
+        // QK and PV share the same physical L1/L0 buffers across task boundaries.
+        // Keep their ping-pong phase in one kernel-wide state so delayed PV cannot
+        // reuse a bank that a later QK task still owns.
+        struct BlockPingPongState {
+            uint32_t l1PingPongFlag = 0;
+            uint32_t l0CPingPongFlag = 0;
+            uint32_t l0ABPingPongFlag = 0;
+        };
+    }
 }
 #endif // FAI_BLOCK_HPP

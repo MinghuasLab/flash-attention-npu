@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-# Splits the v3 (950) forward FAInfer dispatch into six per-(dtype, layout)
+# Splits the v3 (950) forward FAInfer dispatch into eight per-(dtype, layout)
 # translation units so the FAInfer / FAInferDn kernel templates compile in
 # parallel. head_dim is a runtime tiling axis (not a template parameter), so it
 # is not a generation axis. Each generated .cpp holds exactly ONE explicit
@@ -18,6 +18,7 @@ from typing import List, Optional
 DTYPE_MAP = {
     "fp16": "half",
     "bf16": "bfloat16_t",
+    "fp8": "float8_e4m3_t",
 }
 
 # layout key -> (display name, Format token)
@@ -64,7 +65,12 @@ def fwd_kernel(dtype_key: str, layout: tuple) -> Kernel:
 
 
 def get_all_kernels() -> List[Kernel]:
-    return [fwd_kernel(dtype, layout) for dtype in DTYPE_MAP for layout in LAYOUTS]
+    return [
+        fwd_kernel(dtype, layout)
+        for dtype in DTYPE_MAP
+        for layout in LAYOUTS
+        if dtype != "fp8" or layout[0] != "bnsd"
+    ]
 
 
 def main(output_dir: Optional[str]) -> None:

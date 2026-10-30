@@ -51,7 +51,6 @@ static constexpr uint16_t SYNC_C34_TO_V5_FLAG = 11; // dk column ready
 static constexpr uint16_t SYNC_C5_TO_V6_FLAG = 12;  // dv column ready
 static constexpr uint16_t SYNC_V5_TO_C34_FLAG = 13; // dk buffer free
 static constexpr uint16_t SYNC_V6_TO_C5_FLAG = 14;  // dv buffer free
-static constexpr uint32_t DET_CAST_CHUNK_ROWS = 32;
 
 /*
  * FAG arch35 task pipeline and L1-buffer ownership:
@@ -100,6 +99,17 @@ class FlashAttentionScoreGrad950 {
     void Init(FAGKernelParams const& params)
     {
         tiling_ = reinterpret_cast<const __gm__ TilingData*>(params.tiling);
+        inputStrides_.q = {tiling_->inputStrides.q.batch, tiling_->inputStrides.q.sequence,
+                           tiling_->inputStrides.q.head};
+        inputStrides_.k = {tiling_->inputStrides.k.batch, tiling_->inputStrides.k.sequence,
+                           tiling_->inputStrides.k.head};
+        inputStrides_.v = {tiling_->inputStrides.v.batch, tiling_->inputStrides.v.sequence,
+                           tiling_->inputStrides.v.head};
+        inputStrides_.dout = {tiling_->inputStrides.dout.batch, tiling_->inputStrides.dout.sequence,
+                              tiling_->inputStrides.dout.head};
+        inputStrides_.out = {tiling_->inputStrides.out.batch, tiling_->inputStrides.out.sequence,
+                             tiling_->inputStrides.out.head};
+        inputStrides_.enabled = tiling_->inputStrides.enabled;
 
         doutGm_.SetGlobalBuffer((__gm__ DataType*)params.dout);
         qGm_.SetGlobalBuffer((__gm__ DataType*)params.q);
@@ -186,15 +196,16 @@ class FlashAttentionScoreGrad950 {
                 totalRounds_ = static_cast<uint32_t>(tiling_->detMaxRound);
                 totalBlockNum_ = static_cast<uint64_t>(totalRounds_) * waveSize_;
 
-                // AIV dk/dv cast buffers live in a dedicated tail region of
-                // UB; fag_tiling.cpp checks the budget against ubSize.
-                castChunkRows_ = kvBlockSize_ < DET_CAST_CHUNK_ROWS ? kvBlockSize_ : DET_CAST_CHUNK_ROWS;
-                const uint64_t inCol = qkHeadDimAlign_ > vHeadDimAlign_ ? qkHeadDimAlign_ : vHeadDimAlign_;
-                const uint64_t headCol = qkHeadDim_ > vHeadDim_ ? qkHeadDim_ : vHeadDim_;
-                const uint64_t castInBytes = RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * inCol * sizeof(float));
-                const uint64_t castOutBytes =
-                    RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * headCol * sizeof(DataType));
-                if (tiling_->ubSize > castInBytes + castOutBytes) {
+                // Use the host's UB-budgeted chunk size. The cast tail must
+                // remain disjoint from both live pipeline slots.
+                if (detPrivDkv_) {
+                    castChunkRows_ = tiling_->detCastChunkRows;
+                    const uint64_t inCol = qkHeadDimAlign_ > vHeadDimAlign_ ? qkHeadDimAlign_ : vHeadDimAlign_;
+                    const uint64_t headCol = qkHeadDim_ > vHeadDim_ ? qkHeadDim_ : vHeadDim_;
+                    const uint64_t castInBytes =
+                        RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * inCol * sizeof(float));
+                    const uint64_t castOutBytes =
+                        RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * headCol * sizeof(DataType));
                     castInUb_ =
                         resource.ubBuf.template GetBufferByByte<float>(tiling_->ubSize - castInBytes - castOutBytes);
                     castOutUb_ = resource.ubBuf.template GetBufferByByte<DataType>(tiling_->ubSize - castOutBytes);
@@ -354,30 +365,52 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    uint32_t FirstValidS1Block(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx)
+    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx,
+                              uint32_t& firstValidS1, uint32_t& validS1Num)
     {
+        validS1Num = 0;
+        // No mask: every S1 block is valid.
         if constexpr (!IS_ATTEN_MASK) {
-            return 0;
+            validS1Num = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+            return;
+        }
+        firstValidS1 = 0;
+        const int64_t s2Start = static_cast<int64_t>(s2BlockIdx) * kvBlockSize_;
+        const int64_t delta = static_cast<int64_t>(s2Length) - s1Length;
+        // Causal: only the first S1 block is restricted; the range extends
+        // to the final Q block, without a left-window or KV-tail calculation.
+        if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL)) {
+            const int64_t s1IdxUp = Max(static_cast<int64_t>(0), s2Start - delta);
+            if (s1IdxUp >= s1Length) {
+                return;
+            }
+            firstValidS1 = static_cast<uint32_t>(s1IdxUp / qBlockSize_);
+            validS1Num = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_)) - firstValidS1;
+            return;
         }
 
-        // floor((s2BlockIdx * kvBlockSize - (s2Length - s1Length)) /
-        //       qBlockSize), clamped to [0, ceil(s1Length / qBlockSize)].
-        const int64_t numerator =
-            static_cast<int64_t>(s2BlockIdx) * kvBlockSize_ - (static_cast<int64_t>(s2Length) - s1Length);
-        if (numerator <= 0) {
-            return 0;
+        // BAND: both S1 boundaries depend on the window and actual KV tile size.
+        const int64_t s1IdxUp = tiling_->s2Token == INT32_MAX ? 0 :
+            Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
+        const int64_t s2RealSize = Min(static_cast<int64_t>(kvBlockSize_), static_cast<int64_t>(s2Length) - s2Start);
+        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length :
+            Min(static_cast<int64_t>(s1Length), s2Start + s2RealSize - delta + tiling_->s1Token);
+        if (s1IdxUp >= s1IdxDown) {
+            return;
         }
-        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
-        return Min(static_cast<uint32_t>(numerator / qBlockSize_), s1BlockNum);
+        firstValidS1 = static_cast<uint32_t>(s1IdxUp / qBlockSize_);
+        validS1Num = static_cast<uint32_t>((s1IdxDown + qBlockSize_ - 1) / qBlockSize_) - firstValidS1;
     }
 
     CATLASS_DEVICE
     uint64_t CountValidS1Blocks(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockNum)
     {
-        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
         uint64_t count = 0;
         for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx) {
-            count += s1BlockNum - FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
+            uint32_t firstValidS1 = 0;
+            uint32_t validS1Num = 0;
+            GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
+            count += validS1Num;
         }
         return count;
     }
@@ -387,27 +420,48 @@ class FlashAttentionScoreGrad950 {
     CATLASS_DEVICE
     uint32_t ValidS2BlockNum(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
-        const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
         if constexpr (!IS_ATTEN_MASK) {
+            const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
             return s2BlockNum;
         }
-
-        // Causal: kv col j is visible to q row i iff
-        // j <= i + (s2Length - s1Length).  The last visible col of this s1
-        // block is (s1BlockIdx + 1) * qBlockSize - 1 + (s2Length - s1Length).
-        const int64_t lastCol =
-            static_cast<int64_t>(s1BlockIdx + 1) * qBlockSize_ - 1 + (static_cast<int64_t>(s2Length) - s1Length);
-        if (lastCol < 0) {
+        const int64_t s1Start = static_cast<int64_t>(s1BlockIdx) * qBlockSize_;
+        if (s1Start >= s1Length || s2Length == 0) {
             return 0;
         }
-        return Min(static_cast<uint32_t>(lastCol / kvBlockSize_), s2BlockNum - 1) + 1;
+        const int64_t s1RealSize = Min(static_cast<int64_t>(qBlockSize_), static_cast<int64_t>(s1Length) - s1Start);
+        const int64_t s1End = s1Start + s1RealSize;
+        int64_t firstCol = 0;
+        int64_t endCol = s2Length;
+        if constexpr (IS_ATTEN_MASK) {
+            const int64_t delta = static_cast<int64_t>(s2Length) - s1Length;
+            if (tiling_->s1Token != INT32_MAX) {
+                firstCol = Max(static_cast<int64_t>(0), s1Start + delta - tiling_->s1Token);
+            }
+            if (tiling_->s2Token != INT32_MAX) {
+                endCol = Min(endCol, s1End + delta + tiling_->s2Token);
+            }
+        }
+        if (firstCol >= endCol) {
+            return 0;
+        }
+        return static_cast<uint32_t>((endCol + kvBlockSize_ - 1) / kvBlockSize_ - firstCol / kvBlockSize_);
     }
 
     CATLASS_DEVICE
     uint32_t LastValidS2Block(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
-        // Mirror of FirstValidS1Block; requires ValidS2BlockNum > 0.
-        return ValidS2BlockNum(s1Length, s2Length, s1BlockIdx) - 1;
+        // Requires ValidS2BlockNum > 0.
+        int64_t endCol = s2Length;
+        if constexpr (IS_ATTEN_MASK) {
+            if (tiling_->s2Token != INT32_MAX) {
+                const int64_t s1Start = static_cast<int64_t>(s1BlockIdx) * qBlockSize_;
+                const int64_t s1RealSize =
+                    Min(static_cast<int64_t>(qBlockSize_), static_cast<int64_t>(s1Length) - s1Start);
+                const int64_t s1End = s1Start + s1RealSize;
+                endCol = Min(endCol, s1End + static_cast<int64_t>(s2Length) - s1Length + tiling_->s2Token);
+            }
+        }
+        return static_cast<uint32_t>((endCol + kvBlockSize_ - 1) / kvBlockSize_ - 1);
     }
 
     CATLASS_DEVICE
@@ -553,6 +607,18 @@ class FlashAttentionScoreGrad950 {
         }
     }
 
+    CATLASS_DEVICE uint64_t InputOffset(const FagTensorStrides& strides, const FAGBlockInfo& block, bool isQ) const
+    {
+        uint64_t token = isQ ? block.s1Start : block.s2Start;
+        uint64_t batchOffset = block.batchIdx * strides.batch;
+        if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+            token = isQ ? block.totalS1Start : block.totalS2Start;
+            batchOffset = 0;
+        }
+        const uint64_t head = isQ ? block.n2Idx * groupNum_ + block.groupIdx : block.n2Idx;
+        return batchOffset + token * strides.sequence + head * strides.head;
+    }
+
     CATLASS_DEVICE
     bool DecodeBlock(uint64_t blockId, FAGBlockInfo& block)
     {
@@ -587,17 +653,18 @@ class FlashAttentionScoreGrad950 {
                     return false;
                 }
                 FillBlockInfoBn2s2(blockId, c, block);
-                // Causal mask is right-down aligned (j <= i + (sk - sq)); a block
-                // entirely above the diagonal contributes exact zeros, so skip it
-                // and let the dense schedule pay only for the causal region.
-                // Semantic no-op (the epilogue would mask the whole block).
-                if (tiling_->maskType != 0 && detBufNum_ <= 1 &&
+                // Keep the round/core schedule, but skip tiles outside the
+                // right-down causal or BAND window. All cores still join barriers.
+                if (tiling_->maskType != static_cast<uint32_t>(FAGTiling950::MaskType::NO_MASK) && detBufNum_ <= 1 &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
-                    const int64_t diagOffset =
-                        static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
-                    if (static_cast<int64_t>(block.s2Start) >
-                        static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(block.s1Extend) - 1 + diagOffset) {
+                    const int64_t delta = static_cast<int64_t>(block.curBatchS2) - block.curBatchS1;
+                    const int64_t firstCol = tiling_->s1Token == INT32_MAX ? 0 :
+                        static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
+                    const int64_t endCol = tiling_->s2Token == INT32_MAX ? block.curBatchS2 :
+                        static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
+                    if (static_cast<int64_t>(block.s2Start) + block.s2Extend <= firstCol ||
+                        static_cast<int64_t>(block.s2Start) >= endCol) {
                         return false;
                     }
                 }
@@ -649,7 +716,16 @@ class FlashAttentionScoreGrad950 {
             // ------------gIdx & s2Idx------------
             const uint64_t blockInS1 = blockInN2 - decoderS1BlockBegin_;
             const uint32_t groupIdx = static_cast<uint32_t>(blockInS1 / validS2Num);
-            const uint32_t s2BlockIdx = static_cast<uint32_t>(blockInS1 % validS2Num);
+            int64_t firstCol = 0;
+            if constexpr (IS_ATTEN_MASK) {
+                if (tiling_->s1Token != INT32_MAX) {
+                    firstCol = Max(static_cast<int64_t>(0),
+                        static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
+                        static_cast<int64_t>(decoderS2Length_) - decoderS1Length_ - tiling_->s1Token);
+                }
+            }
+            const uint32_t s2BlockIdx = static_cast<uint32_t>(firstCol / kvBlockSize_) +
+                static_cast<uint32_t>(blockInS1 % validS2Num);
             FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
             return true;
         }
@@ -657,8 +733,7 @@ class FlashAttentionScoreGrad950 {
         uint32_t firstValidS1 = 0;
         uint32_t validS1Num = 0;
         while (decoderS2BlockIdx_ < decoderS2BlockNum_) {
-            firstValidS1 = FirstValidS1Block(decoderS1Length_, decoderS2Length_, decoderS2BlockIdx_);
-            validS1Num = decoderS1BlockNum_ - firstValidS1;
+            GetValidS1BlockRange(decoderS1Length_, decoderS2Length_, decoderS2BlockIdx_, firstValidS1, validS1Num);
             const uint64_t s2BlockTasks = static_cast<uint64_t>(groupNum_) * validS1Num;
             if (blockInN2 < decoderS2BlockBegin_ + s2BlockTasks) {
                 break;
@@ -867,7 +942,6 @@ class FlashAttentionScoreGrad950 {
             uint32_t s1Length = 0;
             uint32_t s2Length = 0;
             GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
-            const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
             const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
 
             for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
@@ -876,12 +950,9 @@ class FlashAttentionScoreGrad950 {
                         continue;
                     }
 
-                    const uint32_t firstValidS1 = FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
-                    if (firstValidS1 >= s1BlockNum) {
-                        continue;
-                    }
-
-                    const uint32_t validS1Num = s1BlockNum - firstValidS1;
+                    uint32_t firstValidS1 = 0;
+                    uint32_t validS1Num = 0;
+                    GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
                     const uint32_t tasksInGroup = groupNum_ * validS1Num;
                     if (tasksInGroup == 0) {
                         continue;
@@ -1028,9 +1099,12 @@ class FlashAttentionScoreGrad950 {
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
-        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto q = MakeGmTensor(qGm_, InputOffset(inputStrides_.q, block, true), block.s1Extend, qkHeadDim_,
+                              inputStrides_.q.sequence);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
+        auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
+                              inputStrides_.v.sequence);
         auto sLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                        tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto s = tla::MakeTensor(ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
@@ -1046,8 +1120,10 @@ class FlashAttentionScoreGrad950 {
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
-        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend, vHeadDim_, qHeadNum_ * vHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto dy = MakeGmTensor(doutGm_, InputOffset(inputStrides_.dout, block, true), block.s1Extend, vHeadDim_,
+                               inputStrides_.dout.sequence);
+        auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
+                              inputStrides_.v.sequence);
         auto dpLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                         tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto dp = tla::MakeTensor(ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
@@ -1070,13 +1146,15 @@ class FlashAttentionScoreGrad950 {
         // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
         // with dv cube; subsequent C34 tasks in the group reuse it.
         if (block.initDkv && qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                                  inputStrides_.k.sequence);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
 
-        // Reuse L1 dY from C2. Single AIC owns (b,n2,s2) → no GM atomic on dv.
+        // Reuse L1 dY from C2. Small D accumulates in L0C until flush;
+        // large D flushes each slice/task into the zero-initialized full workspace.
         mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
-                        block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
+                        block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG);
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
@@ -1090,16 +1168,19 @@ class FlashAttentionScoreGrad950 {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
         auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
         // D<=128: waitResidentK on first task (C5 prefetched); later tasks hit
-        // resident K. D>128: ComputeDqDk streams K via DY scratch.
+        // resident K. D>128 streams K via DY scratch and accumulates each
+        // flushed slice/task into the zero-initialized full workspace.
         mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk, Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
                           slot,
                           /*waitResidentK=*/block.initDkv,
-                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
+                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv,
+                          /*enAtomicDk=*/qkHeadDim_ > BlockMmaddQKV::BASE);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG);
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
@@ -1142,7 +1223,8 @@ class FlashAttentionScoreGrad950 {
         // Prefetch RowMajor K for the following C34 (D<=128).  Per-task group:
         // the previous C34 released the resident slot on its flush.
         if (qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                                  inputStrides_.k.sequence);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
         // dY is already in L1 DY[slot] from C2; release it here.
@@ -1197,7 +1279,8 @@ class FlashAttentionScoreGrad950 {
         dkBufOpen_[parity] = true;
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
         // Q is read from L1 Q[slot] (loaded by C1), K from the resident slot
         // (prefetched by C5) for D<=128; D>128 streams K through DY scratch.
@@ -1295,9 +1378,10 @@ class FlashAttentionScoreGrad950 {
         const uint32_t firstHalf = (s2Extend + 1U) / 2U;
         const uint32_t rowBegin = subBlockIdx * firstHalf;
         const uint32_t rowLimit = (rowBegin + firstHalf < s2Extend) ? rowBegin + firstHalf : s2Extend;
+        const uint32_t chunkRows = (headDim * sizeof(DataType)) % 32U == 0U ? castChunkRows_ : 1U;
         uint32_t row = rowBegin;
         while (row < rowLimit) {
-            const uint32_t rows = (rowLimit - row < castChunkRows_) ? rowLimit - row : castChunkRows_;
+            const uint32_t rows = (rowLimit - row < chunkRows) ? rowLimit - row : chunkRows;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
             AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rows),
                                                 static_cast<uint32_t>(headDim * sizeof(float)),
@@ -1421,7 +1505,7 @@ class FlashAttentionScoreGrad950 {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
             epilogueScaledMaskSoftmax_(block, attenMaskGmTensor, softmaxLseGmTensor, attenMaskUbTensor[flagSlot],
                                        lseUbTensor[flagSlot], ubMm1ResTensor[flagSlot], ubPTensor[flagSlot],
-                                       l1PTensor[flagSlot], mte2ToVEvent, vToMte3Event, mte3ToVEvent,
+                                       l1PTensor[flagSlot], mte2ToVEvent, vToMte2Event, vToMte3Event, mte3ToVEvent,
                                        softcapInputScale_, softcapValue_, subBlockRealS1, subBlockIdx);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
         }
@@ -1574,6 +1658,7 @@ class FlashAttentionScoreGrad950 {
     uint32_t batchNum_ = 0;
     uint32_t qSeqlen_ = 0;
     uint32_t kvSeqlen_ = 0;
+    FagInputStrides inputStrides_;
     uint64_t qHeadNum_ = 0;
     uint64_t kvHeadNum_ = 0;
     uint32_t groupNum_ = 0;
@@ -1613,8 +1698,8 @@ class FlashAttentionScoreGrad950 {
 template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
                                            GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
-                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq,
-                                           GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
+                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
+                                           GM_ADDR workspace, GM_ADDR tiling)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -1645,8 +1730,8 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
     using FAGKernel950 =
         FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
                                    INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>;
-    FAGKernelParams params{dout,         q,  k,  v,  out,       mask,  softmax_lse, cu_seqlens_q,
-                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk, dv, workspace, tiling};
+    FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
+                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     FAGKernel950 fag;
     fag(params);
 }

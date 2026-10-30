@@ -94,18 +94,29 @@ pytest -q -s tests/test_flash_attn_npu_v4.py
 
 ## 使用 msSanitizer 进行内存检测
 
-编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 即可使能 Ascend msSanitizer 内存异常检测：
+编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`，运行时通过 `mssanitizer` 启动测试：
 
 ```bash
 # 使能内存检测编译
 FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 
-# Ascend 910：静态插桩已编译进算子，直接运行测试即可
-pytest -q -s tests/test_flash_attn_npu_v3.py
-
-# Ascend 950：通过 msSanitizer 运行时注入检测内存（注意 `--` 分隔符）
+# Ascend 910 / 950 均须通过 msSanitizer 启动（注意 `--` 分隔符）
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# 可选：跳过 golden / 精度比对，只 launch kernel 做内存检测
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
 ```
+图执行请单独构建不含静态插桩的版本：
+
+```bash
+# FA4 将 v3 改为 v4。静态 eager 检测产物请另行保存。
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` 支持 `auto`（默认：910 static、950 runtime）、`static`（仅 910）和 `runtime`（`-g -fno-jump-tables`，不链接静态桩），仅在 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 时生效。
 
 ## 使用方法
 
@@ -634,6 +645,37 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    合并 split-KV 注意力的分片结果：
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    参数:
+        out_partial: fp32 分片输出。
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 分片 logsumexp，逻辑布局为 (..., seqlen, nheads)。
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [可选]: 预分配输出，原地写回。
+            传入时以 out.dtype 为准。
+        out_dtype [可选]: fp16 / bf16 / fp32；缺省取 out_partial.dtype（fp32），
+            与 flash-attention 一致。
+
+    返回:
+        (out, softmax_lse)。softmax_lse 为 fp32，形状 (batch, seqlen, nheads)
+        或 (total_q, nheads)；其 seqlen 维连续，与 flash_attn_func 返回的
+        (batch, nheads, seqlen) 布局不同。
+
+    当前仓内 v3 forward 尚未暴露真实的 split accumulator；调用方需从外部
+    split-attention 生产者获取 out_partial/lse_partial。
+    """
+```
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -729,6 +771,24 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, virtual_batch_idx=None,
+                       return_lse=True):
+    """
+    FA4 的分片合并入口（合并数学与 v3 一致）。out_partial 为 4 维时按变长
+    (TND) 解释，为 5 维时按批量 (BSND) 解释。
+
+    out_partial 支持 fp16 / bf16 / fp32；低精度 partial 会转换为 fp32 后累加。
+    传入 out 时以 out.dtype 为准。
+    cu_seqlens / seqused: 为接口兼容而接受并校验，当前不参与行数限定。
+    virtual_batch_idx: dense 布局下从虚拟 batch 槽位到真实 batch 的映射。
+    return_lse=False 时返回 (out, None)。
+    """
+```
+
 ## 特性
 
 #### flash_attn_with_kvcache
@@ -778,6 +838,19 @@ def flash_attn_varlen_func(
 | Softcapping         | ✅ | ✅ | ✅ |
 | FP8 量化            | -  | -  | -  |
 | Dropout             | ✅ | -  | -  |
+
+#### flash_attn_combine
+
+| 特性                        | v3 | v4 |
+| --------------------------- | -- | -- |
+| FP16 / BF16 / FP32 partial 输入 | -  | ✅ |
+| FP32 LSE 输入               | ✅ | ✅ |
+| FP16 / BF16 / FP32 输出     | ✅ | ✅ |
+| 批量 (BSND) 分片            | ✅ | ✅ |
+| 变长 (TND) 分片             | ✅ | ✅ |
+| cu_seqlens / seqused        | -  | ✅ 接受但当前忽略 |
+| virtual_batch_idx           | -  | ✅ dense |
+| 合并后的 LSE 输出           | ✅ | ✅ (`return_lse`) |
 
 ## 许可证
 

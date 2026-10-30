@@ -39,13 +39,15 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
         tiling_ = reinterpret_cast<const __gm__ TilingData*>(tiling);
     }
 
-    template <class TensorAttenMaskGm, class TensorAttenMaskUb, class TensorSoftmaxLseGm, class TensorLseUb,
+    template <class TensorAttenMaskGm, class TensorAttenMaskUb, class TensorSoftmaxLseGm,
+              class TensorLseUb,
               class TensorS, class TensorPUb, class TensorPL1>
-    CATLASS_DEVICE void
-    operator()(FAGBlockInfo const& block, TensorAttenMaskGm const& attenMaskGm, TensorSoftmaxLseGm const& softmaxLseGm,
-               TensorAttenMaskUb& attenMaskUbTensor, TensorLseUb& lseUbTensor, TensorS const& ubMm1Tensor,
-               TensorPUb& ubPTensor, TensorPL1& l1PTensor, event_t mte2ToVEvent, event_t vToMte3Event,
-               event_t mte3ToVEvent, float scaleValue, float softcapValue, uint64_t s1RealSize, uint32_t subBlockIdx)
+    CATLASS_DEVICE void operator()(FAGBlockInfo const& block, TensorAttenMaskGm const& attenMaskGm,
+                                   TensorSoftmaxLseGm const& softmaxLseGm, TensorAttenMaskUb& attenMaskUbTensor,
+                                   TensorLseUb& lseUbTensor, TensorS const& ubMm1Tensor, TensorPUb& ubPTensor,
+                                   TensorPL1& l1PTensor, event_t mte2ToVEvent, event_t vToMte2Event,
+                                   event_t vToMte3Event, event_t mte3ToVEvent, float scaleValue, float softcapValue,
+                                   uint64_t s1RealSize, uint32_t subBlockIdx)
     {
         // Intermediate row stride is always 128 elements. s2Extend is the
         // number of valid columns in this basic block.
@@ -55,40 +57,46 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
         // ubPTensor: [128 / C0, s1RealSize + 1, C0]
         // l1PTensor: [128 / C0, AlignUp(block.s1Extend, 16), C0]
 
-        // 1. Copy in attenMask (only support causal now)
-        if constexpr (IS_ATTEN_MASK_) {
-            const int64_t diagOffset = static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
-            const int64_t rowStart =
-                static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(subBlockIdx) * block.firstHalfRealS1;
-            const int64_t colEnd = static_cast<int64_t>(block.s2Start) + block.s2Extend;
-            if (colEnd - 1 > rowStart + diagOffset) {
-                // [maskRowStart, maskRowStart + s1RealSize)
-                // [maskColStart, maskColStart + s2Extend)
-                const int64_t delta = static_cast<int64_t>(block.s2Start) - rowStart - diagOffset;
-                if (delta >= static_cast<int64_t>(s1RealSize)) {
-                    // Whole slice above the causal diagonal (only reachable when
-                    // a dense schedule feeds masked-invalid blocks): mask all
-                    // rows; the 256x256 mask window would be out of range.
-                    AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(1),
-                                       static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
-                } else {
-                    const uint32_t maskRowStart = Max(-delta, (int64_t)0);
-                    const uint32_t maskColStart = Max(delta, (int64_t)0);
-                    const auto maskGmOffset = attenMaskGm.layout()(tla::MakeCoord(maskRowStart, maskColStart));
+        // 1. Copy in attenMask
+        if constexpr (IS_ATTEN_MASK) {
+            if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL)) {
+                const int64_t diagOffset =
+                    static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
+                const int64_t rowStart =
+                    static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(subBlockIdx) * block.firstHalfRealS1;
+                const int64_t colEnd = static_cast<int64_t>(block.s2Start) + block.s2Extend;
+                if (colEnd - 1 > rowStart + diagOffset) {
+                    // [maskRowStart, maskRowStart + s1RealSize)
+                    // [maskColStart, maskColStart + s2Extend)
+                    const int64_t delta = static_cast<int64_t>(block.s2Start) - rowStart - diagOffset;
+                    if (delta >= static_cast<int64_t>(s1RealSize)) {
+                        // Whole slice above the causal diagonal (only reachable when
+                        // a dense schedule feeds masked-invalid blocks): mask all
+                        // rows; the 256x256 mask window would be out of range.
+                        AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(1),
+                                           static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
+                    } else {
+                        const uint32_t maskRowStart = Max(-delta, (int64_t)0);
+                        const uint32_t maskColStart = Max(delta, (int64_t)0);
+                        const auto maskGmOffset = attenMaskGm.layout()(tla::MakeCoord(maskRowStart, maskColStart));
 
-                    AscendC::DataCopyExtParams maskCopyParams{
-                        static_cast<uint16_t>(s1RealSize), static_cast<uint32_t>(S2_ROW_STRIDE * sizeof(uint8_t)),
-                        static_cast<int64_t>((256U - S2_ROW_STRIDE) * sizeof(uint8_t)), 0, 0};
-                    AscendC::DataCopyPadExtParams<uint8_t> maskPadParams{false, 0, 0, 0};
-                    AscendC::DataCopyPad(attenMaskUbTensor, attenMaskGm.data()[maskGmOffset], maskCopyParams,
-                                         maskPadParams);
+                        AscendC::DataCopyExtParams maskCopyParams{
+                            static_cast<uint16_t>(s1RealSize), static_cast<uint32_t>(S2_ROW_STRIDE * sizeof(uint8_t)),
+                            static_cast<int64_t>((ATTENTION_MASK_SIZE - S2_ROW_STRIDE) * sizeof(uint8_t)), 0, 0};
+                        AscendC::DataCopyPadExtParams<uint8_t> maskPadParams{false, 0, 0, 0};
+                        AscendC::DataCopyPad(attenMaskUbTensor, attenMaskGm.data()[maskGmOffset], maskCopyParams,
+                                             maskPadParams);
+                    }
+                } else {
+                    // This AIV slice lies completely below the causal diagonal.
+                    // Clear the reusable ping/pong mask slot so a previous masked
+                    // tile cannot leak into the current unmasked tile.
+                    AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(0),
+                                       static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
                 }
-            } else {
-                // This AIV slice lies completely below the causal diagonal.
-                // Clear the reusable ping/pong mask slot so a previous masked
-                // tile cannot leak into the current unmasked tile.
-                AscendC::Duplicate(attenMaskUbTensor, static_cast<uint8_t>(0),
-                                   static_cast<uint32_t>(s1RealSize) * S2_ROW_STRIDE);
+            } else if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::BAND)) {
+                ProcessBandMask(block, attenMaskGm, attenMaskUbTensor, ubPTensor, mte2ToVEvent,
+                                vToMte2Event, mte3ToVEvent, s1RealSize, subBlockIdx);
             }
         }
 
@@ -100,7 +108,10 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
+        if (tiling_->maskType != static_cast<uint32_t>(FAGTiling950::MaskType::BAND)) {
+            // band mask will reuse PUb
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
+        }
 
         // 3. scale + optional softcap + mask + exp(S-LSE) + Cast + Nd2Nz
         MulsMaskSimpleSoftmax<IS_ATTEN_MASK, IS_SOFTCAP>(
@@ -273,9 +284,78 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
                 dstUb, dstVreg, nzBlockStride, 1, pregFullP);
         }
     }
+    template <class TensorMaskGm, class TensorMaskUb, class TensorPUb>
+    CATLASS_DEVICE void ProcessBandMask(FAGBlockInfo const& block, TensorMaskGm const& maskGm, TensorMaskUb maskUb,
+                                        TensorPUb preMaskUb, event_t mte2ToVEvent, event_t vToMte2Event,
+                                        event_t mte3ToVEvent, uint32_t rows, uint32_t subBlockIdx)
+    {
+        const int64_t causalDelta = static_cast<int64_t>(block.s1Start) +
+                                    static_cast<int64_t>(subBlockIdx) * block.firstHalfRealS1 +
+                                    static_cast<int64_t>(block.curBatchS2) -
+                                    static_cast<int64_t>(block.curBatchS1) - block.s2Start;
+        const int64_t nextDelta = causalDelta + tiling_->s2Token;
+        const int64_t preDelta = causalDelta - tiling_->s1Token - 1;
+        const bool applyNext = tiling_->s2Token != INT32_MAX && nextDelta < block.s2Extend;
+        const bool applyPre = tiling_->s1Token != INT32_MAX && preDelta + 1 + rows > 0;
+        if (applyNext) {
+            CopyBandMask(maskGm, maskUb, nextDelta, rows, block.s2Extend);
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+        if (applyPre) {
+            auto pre = preMaskUb.template ReinterpretCast<uint8_t>();
+            CopyBandMask(maskGm, pre, preDelta, rows, block.s2Extend);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
+            MergeBandMasks(reinterpret_cast<__ubuf__ uint8_t*>(maskUb.GetPhyAddr()),
+                           reinterpret_cast<__ubuf__ uint8_t*>(pre.GetPhyAddr()), rows * S2_ROW_STRIDE, applyNext);
+        } else if (!applyNext) {
+            AscendC::Duplicate(maskUb, static_cast<uint8_t>(0), rows * S2_ROW_STRIDE);
+        }
+    }
+
+    template <class TensorMaskGm, class TensorMaskUb>
+    CATLASS_DEVICE void CopyBandMask(TensorMaskGm const& maskGm, TensorMaskUb& maskUb, int64_t delta, uint32_t rows,
+                                     uint32_t columns)
+    {
+        const uint32_t row = Min(Max(delta, int64_t(0)), int64_t(columns));
+        const uint32_t col = Min(Max(-delta, int64_t(0)), int64_t(rows));
+        const auto offset = maskGm.layout()(tla::MakeCoord(row, col));
+        AscendC::DataCopyExtParams copyParams{static_cast<uint16_t>(rows), S2_ROW_STRIDE * sizeof(uint8_t),
+                                              static_cast<int64_t>((ATTENTION_MASK_SIZE - S2_ROW_STRIDE) * sizeof(uint8_t)), 0, 0};
+        AscendC::DataCopyPadExtParams<uint8_t> padParams{false, 0, 0, 0};
+        AscendC::DataCopyPad(maskUb, maskGm.data()[offset], copyParams, padParams);
+    }
+
+    // Combine template bytes before touching logits. Pack two mask bytes in
+    // each uint16_t lane; XOR 0x0101 reverses Pre's two 0/1 bytes together.
+    __simd_vf__ static inline void MergeBandMasks(__ubuf__ uint8_t* maskUb, __ubuf__ uint8_t* preUb, uint32_t bytes,
+                                                  bool hasNext)
+    {
+        using namespace AscendC::MicroAPI;
+        constexpr uint32_t wordsPerReg = FP32_PER_VREG * sizeof(float) / sizeof(uint16_t);
+        uint32_t remaining = bytes / sizeof(uint16_t);
+        const uint32_t repeats = (remaining + wordsPerReg - 1U) / wordsPerReg;
+        auto mask = reinterpret_cast<__ubuf__ uint16_t*>(maskUb);
+        auto pre = reinterpret_cast<__ubuf__ uint16_t*>(preUb);
+        RegTensor<uint16_t> preReg, nextReg, ones;
+        Duplicate(ones, static_cast<uint16_t>(0x0101));
+        for (uint32_t i = 0; i < repeats; ++i) {
+            MaskReg active = UpdateMask<uint16_t>(remaining);
+            LoadAlign(preReg, pre + i * wordsPerReg);
+            Xor(preReg, preReg, ones, active);
+            if (hasNext) {
+                LoadAlign(nextReg, mask + i * wordsPerReg);
+                Or(preReg, preReg, nextReg, active);
+            }
+            StoreAlign(mask + i * wordsPerReg, preReg, active);
+        }
+    }
 
   private:
     static constexpr uint32_t S2_ROW_STRIDE = 128;
+    static constexpr uint32_t ATTENTION_MASK_SIZE = 256;
     static constexpr uint32_t FP32_PER_VREG = 64;
     static constexpr float MASKED_VALUE = -3.0e38f;
     static constexpr uint32_t NZ_C0_SIZE = 32U / sizeof(ElementP);

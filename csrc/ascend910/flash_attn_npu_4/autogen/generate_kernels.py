@@ -68,6 +68,24 @@ def fwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
     )
 
 
+def bwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
+    ctype = DTYPE_MAP[dtype_key]
+    layout_key, display, enum = layout
+    body = (
+        _header("backward FAGGeneral dispatch", display)
+        + '#include "../bwd_dispatch_common.hpp"\n\n'
+        + f"template void bwd_dispatch_run<{ctype}, {enum}>(const BwdLaunchArgs &);"
+        f"  // {display}\n"
+    )
+    return Kernel(
+        family="bwd",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"bwd_dispatch_{dtype_key}_{layout_key}.cpp",
+        content=body,
+    )
+
+
 @dataclass
 class Kernel:
     family: str
@@ -82,6 +100,8 @@ def get_all_kernels() -> List[Kernel]:
     for dtype in DTYPE_MAP:
         for layout in LAYOUTS:
             kernels.append(fwd_kernel(dtype, layout))
+        for name in ("bsnd", "tnd", "bnsd"):
+            kernels.append(bwd_kernel(dtype, (name, name.upper(), name.upper())))
     return kernels
 
 

@@ -1,6 +1,8 @@
 global-exclude .*
 prune .github
 
+include csrc/fag_tensor_strides.h
+
 recursive-include csrc/ascend910 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/ascend950 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/catlass/include *.h *.hpp *.cpp

@@ -16,8 +16,8 @@ from typing import List, Optional
 # dropped here.
 #
 # The real compile-time axes are dtype and input layout. The forward supports
-# the three input layouts (TND / BSND / BNSD); the backward only two (TND /
-# BSND — BNSD never enters the backward). Each generated .cpp holds exactly ONE
+# the three input layouts (TND / BSND / BNSD), as does the backward.
+# Each generated .cpp holds exactly ONE
 # explicit instantiation of the per-family dispatch template, so the heavy
 # kernel templates land in separate, parallel-compiled translation units. The
 # impl bodies live in the shared fwd_dispatch_impl.hpp / bwd_dispatch_common.hpp
@@ -42,6 +42,7 @@ FWD_LAYOUTS = [
 BWD_LAYOUTS = [
     ("bsnd", "BSND", "BSND"),
     ("tnd", "TND", "TND"),
+    ("bnsd", "BNSD", "BNSD"),
 ]
 
 PRELUDE = (

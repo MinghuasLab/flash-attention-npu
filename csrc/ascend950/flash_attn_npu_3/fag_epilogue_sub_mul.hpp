@@ -74,10 +74,13 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
         const uint64_t head =
             static_cast<uint64_t>(block.n2Idx) * static_cast<uint64_t>(tiling_->groupSize) + block.groupIdx;
 
-        // DeltaGm: [T1, N1] --> DeltaUB: [m, 8]
-        const uint64_t deltaOffset = qBase * tiling_->qHeadNum + head;
-        AscendC::DataCopyExtParams deltaCopyParams{static_cast<uint16_t>(m), static_cast<uint32_t>(sizeof(float)),
-                                                   static_cast<int64_t>((tiling_->qHeadNum - 1U) * sizeof(float)), 0,
+        // Delta is BNS for dense inputs and N,T for packed inputs, for every storage layout.
+        const uint64_t deltaOffset =
+            INPUT_LAYOUT == FAGTiling950::Layout::TND
+                ? head * tiling_->totalQ + qBase
+                : (static_cast<uint64_t>(block.batchIdx) * tiling_->qHeadNum + head) * tiling_->qSeqlen +
+                      block.s1Start + rowOffset;
+        AscendC::DataCopyExtParams deltaCopyParams{static_cast<uint16_t>(m), static_cast<uint32_t>(sizeof(float)), 0, 0,
                                                    0};
         AscendC::DataCopyPadExtParams<float> deltaPadParams{false, 0, 0, 0};
         AscendC::DataCopyPad(deltaUbTensor, deltaWorkspaceGm_[deltaOffset], deltaCopyParams, deltaPadParams);

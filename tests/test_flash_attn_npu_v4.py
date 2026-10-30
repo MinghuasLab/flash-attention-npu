@@ -1,5 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 
+from torch._subclasses.fake_tensor import FakeTensorMode
+
 import os
 import torch
 import torch_npu
@@ -19,7 +21,11 @@ from tests.common.test_utils import (
     make_varlen_seqlens,
     make_varlen_seqlens_with_unused,
 )
-from flash_attn_npu_4 import flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_4 import (
+    flash_attn_combine,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 
 
 def build_cann_causal_mask():
@@ -1135,6 +1141,671 @@ def test_fa_kvcache_ops_with_hd_le_256(
         softcap=softcap,
         add_unused_qkv=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# flash_attn_combine
+# ---------------------------------------------------------------------------
+
+
+def _combine_ref(out_partial, lse_partial):
+    lse = torch.logsumexp(lse_partial, dim=0)
+    scale = torch.exp(lse_partial - lse)
+    scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
+    return (scale.unsqueeze(-1) * out_partial).sum(0), lse
+
+
+def _assert_combine_close(out, lse, out_ref, lse_ref, data_type):
+    torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    diff = (out.float() - out_ref).abs().max().item()
+    assert diff <= 2.0 * cast_err + 1e-3, f"out max diff {diff:.6f} vs cast err {cast_err:.6f}"
+
+
+# data_type, num_splits, head_dim
+flash_attn_combine_dense_cases = [
+    # data_type=torch.float16
+    (torch.float16, 2, 64),
+    (torch.float16, 2, 96),
+    (torch.float16, 2, 128),
+    (torch.float16, 2, 256),
+    (torch.float16, 5, 64),
+    (torch.float16, 5, 96),
+    (torch.float16, 5, 128),
+    (torch.float16, 5, 256),
+    (torch.float16, 16, 64),
+    (torch.float16, 16, 96),
+    (torch.float16, 16, 128),
+    (torch.float16, 16, 256),
+    # data_type=torch.bfloat16
+    (torch.bfloat16, 2, 64),
+    (torch.bfloat16, 2, 96),
+    (torch.bfloat16, 2, 128),
+    (torch.bfloat16, 2, 256),
+    (torch.bfloat16, 5, 64),
+    (torch.bfloat16, 5, 96),
+    (torch.bfloat16, 5, 128),
+    (torch.bfloat16, 5, 256),
+    (torch.bfloat16, 16, 64),
+    (torch.bfloat16, 16, 96),
+    (torch.bfloat16, 16, 128),
+    (torch.bfloat16, 16, 256),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, num_splits, head_dim",
+    flash_attn_combine_dense_cases,
+)
+def test_combine_dense_with_seqused(
+    data_type,
+    num_splits,
+    head_dim,
+):
+    batch, seqlen, heads = 3, 64, 4
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    seqused = torch.tensor([64, 33, 1], device="npu", dtype=torch.int32)
+    lse_partial[num_splits // 2 :, 1] = float("-inf")
+
+    # seqused is accepted for API parity, but currently does not limit rows.
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        seqused=seqused,
+    )
+    assert out.shape == (batch, seqlen, heads, head_dim)
+    assert lse.shape == (batch, seqlen, heads)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, data_type)
+
+
+# data_type, num_splits
+flash_attn_combine_varlen_cases = [
+    # data_type=torch.float16
+    (torch.float16, 2),
+    (torch.float16, 3),
+    (torch.float16, 32),
+    # data_type=torch.bfloat16
+    (torch.bfloat16, 2),
+    (torch.bfloat16, 3),
+    (torch.bfloat16, 32),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, num_splits",
+    flash_attn_combine_varlen_cases,
+)
+def test_combine_varlen_with_cu_seqlens(
+    data_type,
+    num_splits,
+):
+    seqlens = [17, 1, 64, 33]
+    heads, head_dim = 2, 128
+    cu = torch.tensor([0, 17, 18, 82, 115], device="npu", dtype=torch.int32)
+    total_q = int(cu[-1].item())
+    out_partial = torch.randn(
+        num_splits,
+        total_q,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        heads,
+        total_q,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    lse_partial[num_splits // 2 :, : total_q // 4] = float("-inf")
+    seqused = torch.tensor(seqlens, device="npu", dtype=torch.int32)
+
+    # cu_seqlens/seqused are accepted for API parity, but do not alter row processing.
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu,
+        seqused=seqused,
+    )
+    assert out.shape == (total_q, heads, head_dim)
+    assert lse.shape == (total_q, heads)
+    out_ref, lse_ref = _combine_ref(
+        out_partial.unsqueeze(1),
+        lse_partial.unsqueeze(1),
+    )
+    _assert_combine_close(
+        out,
+        lse,
+        out_ref.squeeze(0),
+        lse_ref.squeeze(0),
+        data_type,
+    )
+
+
+def test_combine_return_lse_false_and_inplace():
+    num_splits, batch, seqlen, heads, head_dim = 4, 1, 32, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    out = torch.empty(
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    ptr = out.data_ptr()
+
+    result, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out=out,
+        return_lse=False,
+    )
+    assert result.data_ptr() == ptr
+    assert lse is None
+    out_ref, _ = _combine_ref(out_partial, lse_partial)
+    cast_ref = out_ref.to(torch.bfloat16)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (result.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+def test_combine_low_precision_partial(data_type):
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=data_type,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+    )
+    out_ref, lse_ref = _combine_ref(out_partial.float(), lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, data_type)
+
+
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+def test_combine_accepts_standard_lse_layout(layout):
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96
+    if layout == "BSND":
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    else:
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
+
+
+def test_combine_virtual_batch_idx():
+    num_splits, batch, seqlen, heads, head_dim = 2, 3, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    virtual_batch_idx = torch.tensor([2, 0, 1], device="npu", dtype=torch.int32)
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        virtual_batch_idx=virtual_batch_idx,
+    )
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.float32)
+
+
+def test_combine_fake_tensor():
+    with FakeTensorMode():
+        out_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            64,
+            device="npu",
+            dtype=torch.bfloat16,
+        )
+        lse_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out, lse = flash_attn_combine(out_partial, lse_partial)
+    assert out.shape == (1, 8, 2, 64)
+    assert out.dtype == torch.bfloat16
+    assert lse.shape == (1, 8, 2)
+
+
+def test_combine_torch_compile():
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+    compiled = torch.compile(
+        flash_attn_combine,
+        backend="aot_eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    out, lse = compiled(out_partial, lse_partial)
+    out_ref, lse_ref = _combine_ref(out_partial.float(), lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
+
+
+def test_combine_error_contract():
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    with pytest.raises(RuntimeError, match="fp16, bf16, or fp32"):
+        flash_attn_combine(
+            out_partial.to(torch.int32),
+            lse_partial,
+            out_dtype=torch.bfloat16,
+        )
+    with pytest.raises(RuntimeError, match="shape"):
+        flash_attn_combine(
+            out_partial,
+            torch.randn(
+                num_splits,
+                batch,
+                seqlen + 1,
+                heads,
+                device="npu",
+                dtype=torch.float32,
+            ),
+            out_dtype=torch.bfloat16,
+        )
+    with pytest.raises(RuntimeError, match="virtual_batch_idx"):
+        flash_attn_combine(
+            out_partial,
+            lse_partial,
+            virtual_batch_idx=torch.arange(
+                batch + 1,
+                device="npu",
+                dtype=torch.int32,
+            ),
+        )
+
+    oversized_partial = torch.randn(
+        1,
+        1,
+        1,
+        1,
+        1024,
+        device="npu",
+        dtype=torch.float32,
+    )
+    oversized_lse = torch.randn(1, 1, 1, 1, device="npu", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="UB budget"):
+        flash_attn_combine(oversized_partial, oversized_lse, out_dtype=torch.float16)
+
+
+# data_type, layout, num_splits, head_dim, seqlen, return_lse
+flash_attn_combine_additional_cases = [
+    (torch.float16, "BSND", 256, 64, 1, True),
+    (torch.float16, "TND", 256, 64, 17, True),
+    (torch.bfloat16, "BSND", 256, 64, 1, True),
+    (torch.bfloat16, "TND", 256, 64, 17, True),
+    (torch.float16, "BSND", 1, 113, 7, True),
+    (torch.float16, "TND", 1, 200, 3, True),
+    (torch.bfloat16, "BSND", 1, 113, 9, True),
+    (torch.bfloat16, "TND", 1, 200, 5, True),
+    (torch.float16, "BSND", 8, 113, 17, False),
+    (torch.float16, "TND", 8, 200, 17, False),
+    (torch.bfloat16, "BSND", 8, 113, 13, False),
+    (torch.bfloat16, "TND", 8, 200, 13, False),
+    (torch.float16, "BSND", 32, 256, 17, True),
+    (torch.float16, "TND", 32, 256, 17, True),
+    (torch.bfloat16, "BSND", 32, 256, 17, True),
+    (torch.bfloat16, "TND", 32, 256, 17, True),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, layout, num_splits, head_dim, seqlen, return_lse",
+    flash_attn_combine_additional_cases,
+)
+def test_combine_additional_coverage(
+    data_type,
+    layout,
+    num_splits,
+    head_dim,
+    seqlen,
+    return_lse,
+):
+    heads = 3
+    if layout == "BSND":
+        batch = 2
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor(
+            [seqlen, max(1, seqlen - 1)],
+            device="npu",
+            dtype=torch.int32,
+        )
+        cu_seqlens = None
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+        expected_shape = (batch, seqlen, heads, head_dim)
+    else:
+        batch = 1
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor([seqlen], device="npu", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, seqlen], device="npu", dtype=torch.int32)
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+        expected_shape = (seqlen, heads, head_dim)
+
+    if num_splits > 1:
+        if layout == "BSND":
+            lse_partial[num_splits // 2 :, 1, : max(1, seqlen // 3)] = float("-inf")
+        else:
+            lse_partial[num_splits // 2 :, : max(1, seqlen // 3)] = float("-inf")
+        if layout == "BSND":
+            out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+        else:
+            out_ref, lse_ref = _combine_ref(
+                out_partial.unsqueeze(1),
+                lse_partial.unsqueeze(1),
+            )
+            out_ref = out_ref.squeeze(0)
+            lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        return_lse=return_lse,
+    )
+    assert tuple(out.shape) == expected_shape
+    assert out.dtype == data_type
+    if return_lse:
+        assert tuple(lse.shape) == expected_shape[:-1]
+        torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    else:
+        assert lse is None
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (out.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+# data_type, layout, num_splits, head_dim, seqlen, return_lse
+flash_attn_combine_extra_cases = [
+    (torch.float16, "BSND", 64, 59, 31, True),
+    (torch.float16, "TND", 64, 111, 65, True),
+    (torch.float16, "BSND", 128, 160, 127, True),
+    (torch.float16, "TND", 128, 192, 65, True),
+    (torch.float16, "BSND", 256, 255, 31, True),
+    (torch.float16, "TND", 256, 59, 31, True),
+    (torch.bfloat16, "BSND", 64, 111, 65, True),
+    (torch.bfloat16, "TND", 64, 160, 127, True),
+    (torch.bfloat16, "BSND", 128, 192, 31, True),
+    (torch.bfloat16, "TND", 128, 255, 65, True),
+    (torch.bfloat16, "BSND", 256, 111, 31, False),
+    (torch.bfloat16, "TND", 256, 160, 31, False),
+    (torch.float32, "BSND", 5, 160, 31, True),
+    (torch.float32, "TND", 5, 192, 65, True),
+    (torch.float32, "BSND", 1, 255, 1, False),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, layout, num_splits, head_dim, seqlen, return_lse",
+    flash_attn_combine_extra_cases,
+)
+def test_combine_extra_coverage(
+    data_type,
+    layout,
+    num_splits,
+    head_dim,
+    seqlen,
+    return_lse,
+):
+    heads = 2
+    if layout == "BSND":
+        batch = 2
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor(
+            [seqlen, max(1, seqlen - 1)],
+            device="npu",
+            dtype=torch.int32,
+        )
+        cu_seqlens = None
+        expected_shape = (batch, seqlen, heads, head_dim)
+    else:
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor([seqlen], device="npu", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, seqlen], device="npu", dtype=torch.int32)
+        expected_shape = (seqlen, heads, head_dim)
+
+    if num_splits > 1:
+        if layout == "BSND":
+            lse_partial[num_splits // 2 :, 1, : max(1, seqlen // 3)] = float("-inf")
+        else:
+            lse_partial[num_splits // 2 :, : max(1, seqlen // 3)] = float("-inf")
+
+    if layout == "BSND":
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    else:
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        return_lse=return_lse,
+    )
+    assert tuple(out.shape) == expected_shape
+    assert out.dtype == data_type
+    if return_lse:
+        assert tuple(lse.shape) == expected_shape[:-1]
+        torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    else:
+        assert lse is None
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (out.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
 
 
 def _bnsd_inputs(batch, sq, sk, dtype, num_heads, num_heads_kv, head_size, seed=2026):

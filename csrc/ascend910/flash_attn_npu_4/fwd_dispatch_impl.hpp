@@ -26,7 +26,7 @@
                        SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tilingDevice, runtimeDevice, a.blockTableStride, sequsedQDevice,                 \
-        sequsedKVDevice, kvSeqlenAllocated)
+        sequsedKVDevice, kvSeqlenAllocated, sinkDevice)
 
 #define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)                                                                         \
     do {                                                                                                               \
@@ -81,6 +81,7 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     uint8_t* runtimeDevice = a.runtimeDevice;
     uint8_t* sequsedQDevice = a.sequsedQDevice;
     uint8_t* sequsedKVDevice = a.sequsedKVDevice;
+    uint8_t* sinkDevice = a.sinkDevice;
     (void)flashDecodeFlag;
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {

@@ -46,7 +46,9 @@ struct DecodeParams {
     uint32_t qBlockSize = 0;
     uint32_t kvBlockSize = 0;
     bool isTnd = false;
-    bool isAttenMask = false;
+    FAGTiling950::MaskType maskType = FAGTiling950::MaskType::NO_MASK;
+    int64_t s1Token = 0;
+    int64_t s2Token = 0;
     AscendC::GlobalTensor<int32_t> cuSeqQ;   // TND cumulative lens (B entries)
     AscendC::GlobalTensor<int32_t> cuSeqKv;
 };
@@ -90,44 +92,47 @@ CATLASS_DEVICE BatchShape GetBatchShape(
     return bs;
 }
 
-// Valid s2-block count of one s1 block.  Causal: kv col j is visible to q
-// row i iff j <= i + (s2Len - s1Len); the last visible col of the s1 block
-// is (s1BlockIdx + 1) * qBlk - 1 + (s2Len - s1Len).
-CATLASS_DEVICE uint32_t ValidS2BlockNum(
+// Match the main kernel's right-down causal/BAND bounds, including Q tails.
+CATLASS_DEVICE void GetValidS2BlockRange(
     uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockIdx,
-    uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
+    uint32_t qBlk, uint32_t kvBlk, const DecodeParams &p,
+    uint32_t &firstValidS2, uint32_t &validS2Num)
 {
-    const uint32_t s2BlockNum = (s2Len + kvBlk - 1) / kvBlk;
-    if (!isAttenMask) {
-        return s2BlockNum;
+    firstValidS2 = 0;
+    validS2Num = 0;
+    if (p.maskType == FAGTiling950::MaskType::NO_MASK) {
+        validS2Num = (s2Len + kvBlk - 1) / kvBlk;
+        return;
     }
-    const int64_t lastCol =
-        static_cast<int64_t>(s1BlockIdx + 1) * qBlk - 1 +
-        (static_cast<int64_t>(s2Len) - s1Len);
-    if (lastCol < 0) {
-        return 0;
+    const int64_t s1Start = static_cast<int64_t>(s1BlockIdx) * qBlk;
+    const int64_t s1RealSize = Min(static_cast<int64_t>(qBlk), static_cast<int64_t>(s1Len) - s1Start);
+    const int64_t s1End = s1Start + s1RealSize;
+    int64_t firstCol = 0;
+    int64_t endCol = s2Len;
+    const int64_t delta = static_cast<int64_t>(s2Len) - s1Len;
+    if (p.s1Token != INT32_MAX) {
+        firstCol = Max(static_cast<int64_t>(0), s1Start + delta - p.s1Token);
     }
-    const uint32_t lastBlk = static_cast<uint32_t>(lastCol / kvBlk);
-    return (lastBlk < s2BlockNum - 1 ? lastBlk : s2BlockNum - 1) + 1;
-}
-
-CATLASS_DEVICE uint32_t LastValidS2Block(
-    uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockIdx,
-    uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
-{
-    // Requires ValidS2BlockNum > 0.
-    return ValidS2BlockNum(
-        s1Len, s2Len, s1BlockIdx, qBlk, kvBlk, isAttenMask) - 1;
+    if (p.s2Token != INT32_MAX) {
+        endCol = Min(endCol, s1End + delta + p.s2Token);
+    }
+    if (firstCol >= endCol) {
+        return;
+    }
+    firstValidS2 = static_cast<uint32_t>(firstCol / kvBlk);
+    validS2Num = static_cast<uint32_t>((endCol + kvBlk - 1) / kvBlk) - firstValidS2;
 }
 
 CATLASS_DEVICE uint64_t CountValidS2Blocks(
     uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockNum,
-    uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
+    uint32_t qBlk, uint32_t kvBlk, const DecodeParams &p)
 {
     uint64_t count = 0;
     for (uint32_t s1Blk = 0; s1Blk < s1BlockNum; ++s1Blk) {
-        count += ValidS2BlockNum(
-            s1Len, s2Len, s1Blk, qBlk, kvBlk, isAttenMask);
+        uint32_t firstValidS2 = 0;
+        uint32_t validS2Num = 0;
+        GetValidS2BlockRange(s1Len, s2Len, s1Blk, qBlk, kvBlk, p, firstValidS2, validS2Num);
+        count += validS2Num;
     }
     return count;
 }
@@ -148,7 +153,7 @@ CATLASS_DEVICE bool DecodeBlockById(
         const uint32_t s1BlkNum = (bs.s1Len + p.qBlockSize - 1) / p.qBlockSize;
         batchBlocks = static_cast<uint64_t>(p.kvHeadNum) * p.groupNum *
             CountValidS2Blocks(bs.s1Len, bs.s2Len, s1BlkNum,
-                p.qBlockSize, p.kvBlockSize, p.isAttenMask);
+                p.qBlockSize, p.kvBlockSize, p);
         if (blockId < batchBegin + batchBlocks) {
             break;
         }
@@ -160,8 +165,7 @@ CATLASS_DEVICE bool DecodeBlockById(
     // ---- n2 ----
     const uint32_t s1BlkNum = (bs.s1Len + p.qBlockSize - 1) / p.qBlockSize;
     const uint64_t validPerN2 = CountValidS2Blocks(
-        bs.s1Len, bs.s2Len, s1BlkNum, p.qBlockSize, p.kvBlockSize,
-        p.isAttenMask);
+        bs.s1Len, bs.s2Len, s1BlkNum, p.qBlockSize, p.kvBlockSize, p);
     const uint64_t blocksPerN2 = static_cast<uint64_t>(p.groupNum) * validPerN2;
     const uint64_t blockInBatch = blockId - batchBegin;
     const uint32_t n2Idx = static_cast<uint32_t>(blockInBatch / blocksPerN2);
@@ -169,10 +173,11 @@ CATLASS_DEVICE bool DecodeBlockById(
     // ---- s1: variable-length linear scan, seg = groupNum * validS2Num(s1) ----
     uint64_t s1Begin = 0;
     uint32_t s1Blk = 0;
+    uint32_t firstValidS2 = 0;
     uint32_t validS2Num = 0;
     for (; s1Blk < s1BlkNum; ++s1Blk) {
-        validS2Num = ValidS2BlockNum(bs.s1Len, bs.s2Len, s1Blk,
-            p.qBlockSize, p.kvBlockSize, p.isAttenMask);
+        GetValidS2BlockRange(bs.s1Len, bs.s2Len, s1Blk,
+            p.qBlockSize, p.kvBlockSize, p, firstValidS2, validS2Num);
         const uint64_t seg = static_cast<uint64_t>(p.groupNum) * validS2Num;
         if (blockInN2 < s1Begin + seg) {
             break;
@@ -182,10 +187,10 @@ CATLASS_DEVICE bool DecodeBlockById(
     if (s1Blk >= s1BlkNum) {
         return false;
     }
-    // ---- g & s2 (s2 innermost, 0-based) ----
+    // ---- g & s2 (s2 innermost, relative to the window start) ----
     const uint64_t blockInS1 = blockInN2 - s1Begin;
     const uint32_t groupIdx = static_cast<uint32_t>(blockInS1 / validS2Num);
-    const uint32_t s2Blk = static_cast<uint32_t>(blockInS1 % validS2Num);
+    const uint32_t s2Blk = firstValidS2 + static_cast<uint32_t>(blockInS1 % validS2Num);
 
     const uint32_t s1Start = s1Blk * p.qBlockSize;
     const uint32_t s2Start = s2Blk * p.kvBlockSize;
@@ -262,11 +267,12 @@ public:
             s1Begin_ = 0;
         }
 
+        uint32_t firstValidS2 = 0;
         uint32_t validS2Num = 0;
         while (s1BlockIdx_ < s1BlockNum_) {
-            validS2Num = ValidS2BlockNum(
+            GetValidS2BlockRange(
                 bs_.s1Len, bs_.s2Len, s1BlockIdx_, p_->qBlockSize,
-                p_->kvBlockSize, p_->isAttenMask);
+                p_->kvBlockSize, *p_, firstValidS2, validS2Num);
             const uint64_t segment =
                 static_cast<uint64_t>(p_->groupNum) * validS2Num;
             if (blockInN2 < s1Begin_ + segment) {
@@ -282,8 +288,7 @@ public:
         const uint64_t blockInS1 = blockInN2 - s1Begin_;
         const uint32_t groupIdx =
             static_cast<uint32_t>(blockInS1 / validS2Num);
-        const uint32_t s2BlockIdx =
-            static_cast<uint32_t>(blockInS1 % validS2Num);
+        const uint32_t s2BlockIdx = firstValidS2 + static_cast<uint32_t>(blockInS1 % validS2Num);
         const uint32_t s1Start = s1BlockIdx_ * p_->qBlockSize;
         const uint32_t s2Start = s2BlockIdx * p_->kvBlockSize;
         const uint64_t totalS1Start = bs_.qStart + s1Start;
@@ -326,7 +331,7 @@ private:
             (bs_.s1Len + p_->qBlockSize - 1) / p_->qBlockSize;
         validPerN2_ = CountValidS2Blocks(
             bs_.s1Len, bs_.s2Len, s1BlockNum_, p_->qBlockSize,
-            p_->kvBlockSize, p_->isAttenMask);
+            p_->kvBlockSize, *p_);
         batchBlockNum_ = static_cast<uint64_t>(p_->kvHeadNum) *
             p_->groupNum * validPerN2_;
         n2Idx_ = 0;
@@ -411,9 +416,9 @@ public:
         decodeParams_.isTnd =
             tiling_->layout ==
             static_cast<uint32_t>(FAGTiling950::Layout::TND);
-        decodeParams_.isAttenMask =
-            tiling_->maskType ==
-            static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL);
+        decodeParams_.maskType = static_cast<FAGTiling950::MaskType>(tiling_->maskType);
+        decodeParams_.s1Token = tiling_->s1Token;
+        decodeParams_.s2Token = tiling_->s2Token;
         decodeParams_.cuSeqQ = cuSeqQGm_;
         decodeParams_.cuSeqKv = cuSeqKvGm_;
 
@@ -662,8 +667,8 @@ private:
     // CONSECUTIVE blockIds (s2 innermost), so a single ascending scan can
     // process run by run:
     //   1. merge the run's det slots in order (same as ProcessDkv step 2);
-    //   2. existFirst = run contains s2BlockIdx == 0;
-    //      existLast  = run contains s2BlockIdx == fag_det::LastValidS2Block(s1);
+    //   2. existFirst = run contains the window's first s2BlockIdx;
+    //      existLast  = run contains the window's last s2BlockIdx;
     //   3. four branches:
     //      last && !first: Add(acc, read-back dqWorkspace_) [old value LAST]
     //                      -> Muls(scaleValue_) -> Cast -> write dqGm_ at
@@ -703,10 +708,14 @@ private:
             } else if (headBlockInfo.s1Extend < rowEnd) {
                 rowNum = headBlockInfo.s1Extend - rowBegin;
             }
-            uint32_t lastValidS2Block = fag_det::LastValidS2Block(
-                headBlockInfo.curBatchS1, headBlockInfo.curBatchS2, 
-                headBlockInfo.s1BlockIdx, decodeParams_.qBlockSize, decodeParams_.kvBlockSize, decodeParams_.isAttenMask);
-            bool existFirst = (headBlockInfo.s2BlockIdx == 0);
+            uint32_t firstValidS2Block = 0;
+            uint32_t validS2Num = 0;
+            fag_det::GetValidS2BlockRange(
+                headBlockInfo.curBatchS1, headBlockInfo.curBatchS2,
+                headBlockInfo.s1BlockIdx, decodeParams_.qBlockSize, decodeParams_.kvBlockSize, decodeParams_,
+                firstValidS2Block, validS2Num);
+            const uint32_t lastValidS2Block = firstValidS2Block + validS2Num - 1;
+            bool existFirst = (headBlockInfo.s2BlockIdx == firstValidS2Block);
             bool existLast = (headBlockInfo.s2BlockIdx == lastValidS2Block);
 
             // 1. Copy valid rows of the head Dq block from det-GM into acc-UB.

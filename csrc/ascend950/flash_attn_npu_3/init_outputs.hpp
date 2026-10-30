@@ -16,6 +16,7 @@
 #include "catlass/arch/resource.hpp"
 #include "kernel_operator.h"
 #include "kernel_common.hpp"
+#include "fa_block.h"
 
 namespace Catlass::Epilogue::Block {
 
@@ -33,6 +34,12 @@ class InitOutputs950 {
     {
         outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(OUTPUT_UB_OFFSET);
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
+    }
+
+    __aicore__ inline InitOutputs950(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
+    {
+        outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(ub.goStartOffset);
+        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lseStartOffset);
     }
 
     template <bool LseMode>

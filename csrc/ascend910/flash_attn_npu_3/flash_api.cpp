@@ -35,9 +35,29 @@ using namespace KernelCommon;
 #include "fa_split.h"
 #include "fwd_dispatch.hpp"
 #include "bwd_dispatch.hpp"
+#include "combine_dispatch.hpp"
 #include <cmath>
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+
+// cu_seqlens[-1] is the last token the offsets address. Packed T may be longer
+// (unused tail) but must not be shorter, or the kernel reads past the tensor.
+// Returns false during NPU graph capture when cu lives on device: .item() is a
+// D2H sync (LocalScalarDense) and is forbidden inside capture. Warmup already
+// validated the same packed-T invariant.
+bool PackedCuLast(const at::Tensor& cu, int32_t& last)
+{
+    TORCH_CHECK(cu.numel() > 0, "cu_seqlens must be non-empty");
+    if (cu.is_cpu()) {
+        last = cu.data_ptr<int32_t>()[cu.numel() - 1];
+        return true;
+    }
+    if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) {
+        return false;
+    }
+    last = cu.index({-1}).item<int32_t>();
+    return true;
+}
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void* args);
 
@@ -192,7 +212,10 @@ std::vector<at::Tensor> mha_fwd(
     if (cu_seqlens_q_.has_value()) {
         TORCH_CHECK(q.dim() == 3, "q must be 3-dimensional; got ", q.dim(), " dimensions");
         TORCH_CHECK(cu_seqlens_q_->numel() > 1, "batch size must be positive");
-        TORCH_CHECK(q.size(0) > 0, "total_q must be positive (q must contain at least one query token)");
+        // total_q == 0 with max_seqlen_q == 0 is the paged TND fast path below.
+        // A nonzero declared max length with an empty packed query is inconsistent.
+        TORCH_CHECK(!(q.size(0) == 0 && max_seqlen_q_.value_or(0) > 0),
+                    "total_q must be positive (q must contain at least one query token)");
     }
 
     auto q_dtype = q.dtype();
@@ -230,6 +253,12 @@ std::vector<at::Tensor> mha_fwd(
         CHECK_CONTIGUOUS(cu_seqlens_q);
         TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
         TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
+        int32_t cuQLast = 0;
+        if (PackedCuLast(cu_seqlens_q, cuQLast)) {
+            TORCH_CHECK(q.size(0) >= cuQLast,
+                        "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
+                        "; packed T must be at least cu_seqlens_q[-1]");
+        }
     }
 
     if (is_varlen_kv) {
@@ -237,6 +266,12 @@ std::vector<at::Tensor> mha_fwd(
         CHECK_CONTIGUOUS(cu_seqlens_k);
         TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then paged table is not supported");
+        int32_t cuKLast = 0;
+        if (PackedCuLast(cu_seqlens_k, cuKLast)) {
+            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast,
+                        "k/v have ", k.size(0), "/", v.size(0), " tokens but cu_seqlens_k[-1] is ", cuKLast,
+                        "; packed T must be at least cu_seqlens_k[-1]");
+        }
     }
 
     TORCH_CHECK(!seqused_q_.has_value() || is_varlen_q, "seqused_q forward requires TND (varlen-q) layout");
@@ -300,6 +335,18 @@ std::vector<at::Tensor> mha_fwd(
         num_heads = sizes[2];
         head_size_og = sizes[3];
     }
+
+    // FA3 uses fixed packed strides for Q and for dense K/V. The Python
+    // interface follows FA4/FIA and materializes unsupported non-append
+    // views; these checks protect direct callers from silent misaddressing.
+    // Keep them after CheckedFwdDimension so oversized broadcast views retain
+    // the dimension-bound error instead of failing first on their strides.
+    TORCH_CHECK(q.is_contiguous(), "Input tensor q must be contiguous because FA3 uses packed Q strides");
+    if (!paged_KV) {
+        TORCH_CHECK(k.is_contiguous(), "Dense key tensor must be contiguous because FA3 uses packed KV strides");
+        TORCH_CHECK(v.is_contiguous(), "Dense value tensor must be contiguous because FA3 uses packed KV strides");
+    }
+
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
@@ -308,6 +355,31 @@ std::vector<at::Tensor> mha_fwd(
     // pitch in tokens. Unused (0) for BSND / TND.
     const int64_t kv_seqlen_allocated = is_bnsd ? static_cast<int64_t>(k.size(2)) : 0;
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    if (paged_KV) {
+        TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
+                    "paged KV cache must have shape (num_pages, page_size, num_heads, head_dim)");
+        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                    "paged key/value caches must have matching page, page-size, and head dimensions");
+        const int64_t keyPageElements = k.size(1) * k.size(2) * k.size(3);
+        const int64_t valuePageElements = v.size(1) * v.size(2) * v.size(3);
+        const bool keyBBND =
+            k.stride(1) == k.size(2) * k.size(3) && k.stride(2) == k.size(3) && k.stride(3) == 1;
+        const bool valueBBND =
+            v.stride(1) == v.size(2) * v.size(3) && v.stride(2) == v.size(3) && v.stride(3) == 1;
+        const bool keyBNBD =
+            k.stride(1) == k.size(3) && k.stride(2) == k.size(1) * k.size(3) && k.stride(3) == 1;
+        const bool valueBNBD =
+            v.stride(1) == v.size(3) && v.stride(2) == v.size(1) * v.size(3) && v.stride(3) == 1;
+        TORCH_CHECK((keyBBND && valueBBND) || (keyBNBD && valueBNBD),
+                    "paged key/value caches must use the same BBND or BNBD inner layout; only dimension 0 may "
+                    "otherwise be non-contiguous");
+        TORCH_CHECK(!(appendKV && keyBNBD && !keyBBND),
+                    "paged BNBD cache does not support append-KV updates yet");
+        TORCH_CHECK(k.size(0) <= 1 || k.stride(0) >= keyPageElements,
+                    "paged key cache first-axis stride must not overlap physical pages");
+        TORCH_CHECK(v.size(0) <= 1 || v.stride(0) >= valuePageElements,
+                    "paged value cache first-axis stride must not overlap physical pages");
+    }
     // Keep the original 1..256 support tier and add 512 as a separate tier.
     // D=512 follows the same layout/KV routing matrix as the original path:
     // varlen-Q selects TND and BSND otherwise; paged K/V and dense/varlen K/V
@@ -325,7 +397,7 @@ std::vector<at::Tensor> mha_fwd(
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous because FA3 uses packed output strides");
     } else if (is_bnsd) {
         // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
         // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
@@ -395,6 +467,14 @@ std::vector<at::Tensor> mha_fwd(
         at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    }
+
+    // TND permits every sequence in the batch to have qlen=0. There is no
+    // device work in that case, and avoiding a zero-task launch also keeps the
+    // scheduler independent of empty-tensor data pointers.
+    if (is_varlen_q && sizes[0] == 0) {
+        TORCH_CHECK(!appendKV, "TND total_q=0 does not support append-KV cache updates");
+        return {out, softmaxlse, out_accum, softmax_lse_accum};
     }
 
     if (scheduler_metadata_.has_value()) {
@@ -686,8 +766,18 @@ std::vector<at::Tensor> mha_fwd(
     fwd_args.qSeqDevice = qSeqDevice;
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
-    fwd_args.tiling = {reinterpret_cast<uint64_t>(tilingDevice), has_softcap ? softmax_scale / softcap : softmax_scale,
-                       softcap};
+    fwd_args.tiling = {
+        reinterpret_cast<uint64_t>(tilingDevice),
+        has_softcap ? softmax_scale / softcap : softmax_scale,
+        softcap,
+        paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
+        paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
+        paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U,
+        paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
+        is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U,
+    };
     auto launch_fa_infer = [fwd_args, layout]() -> int {
         switch (layout) {
         case 0:
@@ -778,7 +868,7 @@ std::vector<at::Tensor> mha_bwd(
     std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int64_t> max_seqlen_q_, std::optional<int64_t> max_seqlen_k_, std::optional<double> softmax_scale_,
     bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap, bool deterministic,
-    int64_t sm_margin)
+    int64_t sm_margin, int64_t layout)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -796,22 +886,28 @@ std::vector<at::Tensor> mha_bwd(
     if (dq_.has_value()) {
         dq = dq_.value();
     } else {
-        dq = torch::empty_like(q);
+        dq = torch::empty(q.sizes(), q.options());
     }
     if (dk_.has_value()) {
         dk = dk_.value();
     } else {
-        dk = torch::empty_like(k);
+        dk = torch::empty(k.sizes(), k.options());
     }
     if (dv_.has_value()) {
         dv = dv_.value();
     } else {
-        dv = torch::empty_like(v);
+        dv = torch::empty(v.sizes(), v.options());
     }
     TORCH_CHECK(dq.dtype() == q_dtype && dk.dtype() == q_dtype && dv.dtype() == q_dtype,
                 "mha_bwd: dq/dk/dv must have the same dtype as q/k/v");
 
     const bool is_varlen_q = cu_seqlens_q_.has_value();
+    TORCH_CHECK(layout >= 0 && layout <= 2, "mha_bwd: layout must be 0 (TND), 1 (BSND), or 2 (BNSD)");
+    const bool is_bnsd = layout == 2;
+    TORCH_CHECK(layout != 0 || is_varlen_q, "mha_bwd: TND requires cu_seqlens_q/k");
+    TORCH_CHECK(!is_bnsd ||
+                    (!is_varlen_q && !cu_seqlens_k_.has_value() && !seqused_q_.has_value() && !seqused_k_.has_value()),
+                "mha_bwd: BNSD does not support cu_seqlens or seqused");
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!is_varlen_q || is_varlen_kv, "If cu_seqlens_q is provided in bwd, cu_seqlens_k must also be provided");
@@ -824,9 +920,21 @@ std::vector<at::Tensor> mha_bwd(
     at::Tensor cu_seqlens_k;
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
+        int32_t cuQLast = 0;
+        if (PackedCuLast(cu_seqlens_q, cuQLast)) {
+            TORCH_CHECK(q.size(0) >= cuQLast,
+                        "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
+                        "; packed T must be at least cu_seqlens_q[-1]");
+        }
     }
     if (is_varlen_kv) {
         cu_seqlens_k = cu_seqlens_k_.value();
+        int32_t cuKLast = 0;
+        if (PackedCuLast(cu_seqlens_k, cuKLast)) {
+            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast,
+                        "k/v have ", k.size(0), "/", v.size(0), " tokens but cu_seqlens_k[-1] is ", cuKLast,
+                        "; packed T must be at least cu_seqlens_k[-1]");
+        }
     }
 
     // parse shape args (BSND vs TND)
@@ -843,6 +951,14 @@ std::vector<at::Tensor> mha_bwd(
     TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
                 "mha_bwd: dq/dk/dv must match q/k/v shapes");
 
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(-1) == 1, "mha_bwd: input last dimension must be contiguous");
+        TORCH_CHECK(tensor.device() == q.device(), "mha_bwd: inputs must share q device");
+    }
+    for (const auto& tensor : {dq, dk, dv}) {
+        TORCH_CHECK(tensor.is_contiguous() && tensor.device() == q.device(),
+                    "mha_bwd: gradients must be contiguous BSND/TND on q device");
+    }
     uint32_t nheads = is_varlen_q ? qsizes[1] : qsizes[2];
     uint32_t nheads_k = is_varlen_q ? ksizes[1] : ksizes[2];
     uint32_t q_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
@@ -928,8 +1044,8 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;
     fagInfo.isDeterministic = deterministic;
-    // Tiling uses FAG layout constants (BSND=2, TND=3), not kernel inputLayout enum (BSND=0, TND=1).
-    fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
+    // Use FAG constants, independently of the public layout codes.
+    fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : (is_bnsd ? BNSD : BSND));
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
     at::Tensor seqused_q_cpu_for_tiling;
@@ -955,6 +1071,15 @@ std::vector<at::Tensor> mha_bwd(
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
     FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(is_varlen_q ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
+    }
+    auto tensor_strides = [is_varlen_q](const at::Tensor& tensor) {
+        return FagTensorStrides{is_varlen_q ? 0 : tensor.stride(0), tensor.stride(is_varlen_q ? 0 : 1),
+                                tensor.stride(is_varlen_q ? 1 : 2)};
+    };
+    fagTilingData.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
+                                  tensor_strides(dout), tensor_strides(out), 1};
     // Host-only std::vector members must not be shallow-copied into the GM tiling buffer.
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
@@ -979,19 +1104,24 @@ std::vector<at::Tensor> mha_bwd(
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
-    auto qDevice = static_cast<uint8_t*>(const_cast<void*>(q.storage().data()));
-    auto kDevice = static_cast<uint8_t*>(const_cast<void*>(k.storage().data()));
-    auto vDevice = static_cast<uint8_t*>(const_cast<void*>(v.storage().data()));
-    auto outDevice = static_cast<uint8_t*>(const_cast<void*>(out.storage().data()));
-    auto dOutDevice = static_cast<uint8_t*>(const_cast<void*>(dout.storage().data()));
+    auto qDevice = static_cast<uint8_t*>(q.data_ptr());
+    auto kDevice = static_cast<uint8_t*>(k.data_ptr());
+    auto vDevice = static_cast<uint8_t*>(v.data_ptr());
+    auto outDevice = static_cast<uint8_t*>(out.data_ptr());
+    auto dOutDevice = static_cast<uint8_t*>(dout.data_ptr());
     uint8_t* attenMaskDevice = nullptr;
     if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t*>(const_cast<void*>(mask_gpu_tensor.storage().data()));
     }
+    if (is_bnsd) {
+        TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat && softmax_lse.device() == q.device(),
+                    "mha_bwd: BNSD LSE must be float32 on q device");
+    }
     at::Tensor softmax_lse_kernel = softmax_lse;
     if (!is_varlen_q) {
         TORCH_CHECK(softmax_lse.dim() == 3, "mha_bwd: softmax_lse for BSND must be a 3D tensor.");
-        TORCH_CHECK(softmax_lse.size(1) == nheads && softmax_lse.size(2) == max_seqlen_q,
+        TORCH_CHECK(softmax_lse.size(0) == batch_size && softmax_lse.size(1) == nheads &&
+                        softmax_lse.size(2) == max_seqlen_q,
                     "mha_bwd: softmax_lse must be BNS in BSND mode.");
         if (!softmax_lse.is_contiguous()) {
             softmax_lse_kernel = softmax_lse.contiguous();
@@ -1005,13 +1135,13 @@ std::vector<at::Tensor> mha_bwd(
             softmax_lse_kernel = softmax_lse.contiguous();
         }
     }
-    auto softMaxLseDevice = static_cast<uint8_t*>(const_cast<void*>(softmax_lse_kernel.storage().data()));
+    auto softMaxLseDevice = static_cast<uint8_t*>(softmax_lse_kernel.data_ptr());
 
     auto workspaceDevice = static_cast<uint8_t*>(const_cast<void*>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.storage().data()));
-    auto dqDevice = static_cast<uint8_t*>(const_cast<void*>(dq.storage().data()));
-    auto dkDevice = static_cast<uint8_t*>(const_cast<void*>(dk.storage().data()));
-    auto dvDevice = static_cast<uint8_t*>(const_cast<void*>(dv.storage().data()));
+    auto dqDevice = static_cast<uint8_t*>(dq.data_ptr());
+    auto dkDevice = static_cast<uint8_t*>(dk.data_ptr());
+    auto dvDevice = static_cast<uint8_t*>(dv.data_ptr());
     uint8_t* cuSeqQlenDevice = nullptr;
     uint8_t* cuSeqKvlenDevice = nullptr;
     uint8_t* seqUsedQDevice = nullptr;
@@ -1064,6 +1194,8 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.tilingDevice = tilingDevice;
     if (is_varlen_q) {
         launch_bwd<TND>(bwd_args);
+    } else if (is_bnsd) {
+        launch_bwd<BNSD>(bwd_args);
     } else {
         launch_bwd<BSND>(bwd_args);
     }
@@ -1073,10 +1205,207 @@ std::vector<at::Tensor> mha_bwd(
     return {dq, dk, dv, softmax_d};
 }
 
+// ---------------------------------------------------------------------------
+// Split-attention combine (flash_attn_combine / fwd_combine).
+//
+// The FA2/FA3/FA4 forward kernels already merge FlashDecode partials inside
+// their own workspace; that path is gated to paged-KV/TND decode shapes and its
+// buffers are not caller-visible. This operator is the standalone, public
+// counterpart: it consumes caller-owned dense fp32 partials
+// (num_splits, B, S, H, D) or (num_splits, T, H, D) and mirrors the NV
+// flash_attn_3::fwd_combine contract.
+// ---------------------------------------------------------------------------
+std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_partial,
+                                    std::optional<at::Tensor> out_ = std::nullopt,
+                                    std::optional<at::ScalarType> out_dtype_ = std::nullopt,
+                                    std::optional<at::Tensor> cu_seqlens = std::nullopt,
+                                    std::optional<at::Tensor> seqused = std::nullopt, bool return_lse = true)
+{
+    TORCH_CHECK(out_partial.device().type() == at::kPrivateUse1, "out_partial must be on NPU");
+    TORCH_CHECK(lse_partial.device().type() == at::kPrivateUse1, "lse_partial must be on NPU");
+    TORCH_CHECK(out_partial.scalar_type() == at::kFloat, "Attention combine function only support fp32 data type");
+    TORCH_CHECK(lse_partial.scalar_type() == at::kFloat, "Attention combine function only support fp32 data type");
+    TORCH_CHECK(out_partial.dim() == 4 || out_partial.dim() == 5, "out_partial must have 4 or 5 dimensions");
+    TORCH_CHECK(out_partial.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+    const bool is_dense = out_partial.dim() == 5;
+    TORCH_CHECK(lse_partial.dim() == out_partial.dim() - 1,
+                "lse_partial must have one dimension less than out_partial");
+
+    const int64_t num_splits = out_partial.size(0);
+    TORCH_CHECK(num_splits >= 1, "num_splits must be positive");
+    TORCH_CHECK(num_splits <= 256, "FlashAttention combine only supports num_splits at most 256");
+
+    int64_t batch_size = 1;
+    int64_t seqlen = 0;
+    int64_t num_heads = 0;
+    int64_t head_dim = 0;
+    if (is_dense) {
+        batch_size = out_partial.size(1);
+        seqlen = out_partial.size(2);
+        num_heads = out_partial.size(3);
+        head_dim = out_partial.size(4);
+        TORCH_CHECK(lse_partial.size(0) == num_splits && lse_partial.size(1) == batch_size &&
+                        lse_partial.size(2) == seqlen && lse_partial.size(3) == num_heads,
+                    "lse_partial shape must match out_partial, got lse_partial=", lse_partial.sizes(),
+                    " out_partial=", out_partial.sizes());
+    } else {
+        seqlen = out_partial.size(1);
+        num_heads = out_partial.size(2);
+        head_dim = out_partial.size(3);
+        TORCH_CHECK(lse_partial.size(0) == num_splits && lse_partial.size(1) == seqlen &&
+                        lse_partial.size(2) == num_heads,
+                    "lse_partial shape must match out_partial, got lse_partial=", lse_partial.sizes(),
+                    " out_partial=", out_partial.sizes());
+    }
+
+    const auto out_type = out_.has_value() ? out_->scalar_type() : out_dtype_.value_or(out_partial.scalar_type());
+    TORCH_CHECK(out_type == at::kFloat || out_type == at::kHalf || out_type == at::kBFloat16,
+                "Output type must be FP32, FP16 or BF16");
+
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.device().type() == at::kPrivateUse1, "out must be on NPU");
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        if (is_dense) {
+            TORCH_CHECK(out.dim() == 4 && out.size(0) == batch_size && out.size(1) == seqlen &&
+                            out.size(2) == num_heads && out.size(3) == head_dim,
+                        "out shape must be (batch, seqlen, num_heads, head_dim)");
+        } else {
+            TORCH_CHECK(out.dim() == 3 && out.size(0) == seqlen && out.size(1) == num_heads && out.size(2) == head_dim,
+                        "out shape must be (total_q, num_heads, head_dim)");
+        }
+    } else if (is_dense) {
+        out = at::empty({batch_size, seqlen, num_heads, head_dim}, out_partial.options().dtype(out_type));
+    } else {
+        out = at::empty({seqlen, num_heads, head_dim}, out_partial.options().dtype(out_type));
+    }
+
+    // NV returns the combined LSE as (B, S, H) / (T, H) with the seqlen dim
+    // contiguous; allocate (B, H, S) / (H, T) and return the transposed view.
+    at::Tensor lse_out;
+    if (return_lse) {
+        if (is_dense) {
+            lse_out =
+                at::empty({batch_size, num_heads, seqlen}, out_partial.options().dtype(at::kFloat)).transpose(1, 2);
+        } else {
+            lse_out = at::empty({num_heads, seqlen}, out_partial.options().dtype(at::kFloat)).transpose(0, 1);
+        }
+    }
+
+    // cu_seqlens/seqused are validated only; combine processes every row independently.
+    if (cu_seqlens.has_value()) {
+        TORCH_CHECK(cu_seqlens->scalar_type() == at::kInt && cu_seqlens->dim() == 1 && cu_seqlens->numel() >= 2,
+                    "cu_seqlens must be a 1-D int32 tensor with at least 2 elements");
+    }
+    if (seqused.has_value()) {
+        TORCH_CHECK(seqused->scalar_type() == at::kInt && seqused->dim() == 1 && seqused->numel() >= 1,
+                    "seqused must be a 1-D int32 tensor");
+    }
+
+    if (seqlen == 0 || num_heads == 0 || head_dim == 0) {
+        return {out, lse_out};
+    }
+
+    const uint32_t ns = static_cast<uint32_t>(num_splits);
+    const uint32_t ns_align = (ns + 7U) / 8U * 8U;
+    const uint32_t out_bytes = (out_type == at::kFloat) ? 4U : 2U;
+    const uint32_t elem_align = (out_bytes == 4U) ? 8U : 16U;
+    const uint32_t d_align = (static_cast<uint32_t>(head_dim) + elem_align - 1U) / elem_align * elem_align;
+    // Choose tileRows up to 32 while per-tile UB usage stays below 150 KiB.
+    const uint64_t per_row =
+        static_cast<uint64_t>(ns_align) * 16U + static_cast<uint64_t>(16U + out_bytes + 4U) * d_align;
+    uint32_t tile_rows = 8U;
+    for (uint32_t candidate : {32U, 24U, 16U, 8U}) {
+        if (static_cast<uint64_t>(candidate) * per_row <= 150U * 1024U) {
+            tile_rows = candidate;
+            break;
+        }
+    }
+    TORCH_CHECK(static_cast<uint64_t>(tile_rows) * per_row <= 150U * 1024U,
+                "combine tile exceeds 150 KiB UB budget for head_dim=", head_dim);
+
+    const uint64_t head_batch =
+        is_dense ? static_cast<uint64_t>(batch_size) * num_heads : static_cast<uint64_t>(num_heads);
+    const uint64_t row_blocks = (static_cast<uint64_t>(seqlen) + tile_rows - 1U) / tile_rows;
+    const uint64_t total_tasks = head_batch * row_blocks;
+    const uint32_t aiv = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    const uint32_t launch_block_dim =
+        static_cast<uint32_t>(std::min<uint64_t>(std::max<uint64_t>(aiv, 1U), std::max<uint64_t>(total_tasks, 1U)));
+
+    CombineLaunchArgs args{};
+    args.aclStream = c10_npu::getCurrentNPUStream().stream(false);
+    uint64_t ffts_addr{0};
+    uint32_t ffts_len{0};
+    (void)rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
+    args.fftsAddr = ffts_addr;
+    args.launchBlockDim = launch_block_dim;
+    args.isDense = is_dense ? 1U : 0U;
+    args.writeLse = return_lse ? 1U : 0U;
+    args.numSplits = ns;
+    args.batch = static_cast<uint32_t>(batch_size);
+    args.seqlen = static_cast<uint32_t>(seqlen);
+    args.numHeads = static_cast<uint32_t>(num_heads);
+    args.headDim = static_cast<uint32_t>(head_dim);
+    args.tileRows = tile_rows;
+    args.outPartial = static_cast<uint8_t*>(out_partial.data_ptr());
+    args.lsePartial = static_cast<uint8_t*>(lse_partial.data_ptr());
+    args.out = static_cast<uint8_t*>(out.data_ptr());
+    args.lseOut = return_lse ? static_cast<uint8_t*>(lse_out.data_ptr()) : nullptr;
+    if (is_dense) {
+        args.oSplit = out_partial.stride(0);
+        args.oBatch = out_partial.stride(1);
+        args.oSeq = out_partial.stride(2);
+        args.oHead = out_partial.stride(3);
+        args.lSplit = lse_partial.stride(0);
+        args.lBatch = lse_partial.stride(1);
+        args.lSeq = lse_partial.stride(2);
+        args.lHead = lse_partial.stride(3);
+        args.outBatch = out.stride(0);
+        args.outSeq = out.stride(1);
+        args.outHead = out.stride(2);
+        args.lseOutBatch = num_heads * seqlen;
+        args.lseOutHead = seqlen;
+    } else {
+        args.oSplit = out_partial.stride(0);
+        args.oBatch = 0;
+        args.oSeq = out_partial.stride(1);
+        args.oHead = out_partial.stride(2);
+        args.lSplit = lse_partial.stride(0);
+        args.lBatch = 0;
+        args.lSeq = lse_partial.stride(1);
+        args.lHead = lse_partial.stride(2);
+        args.outBatch = 0;
+        args.outSeq = out.stride(0);
+        args.outHead = out.stride(1);
+        args.lseOutBatch = 0;
+        args.lseOutHead = seqlen;
+    }
+
+    const bool is_fp16 = (out_type == at::kHalf);
+    const bool is_bf16 = (out_type == at::kBFloat16);
+    auto launch_combine = [args, is_fp16, is_bf16]() -> int {
+        if (is_fp16) {
+            launch_combine_fp16(args);
+        } else if (is_bf16) {
+            launch_combine_bf16(args);
+        } else {
+            launch_combine_fp32(args);
+        }
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_combine", launch_combine);
+    return {out, lse_out};
+}
+
 PYBIND11_MODULE(flash_attn_npu_3, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
+    m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
+          py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
+          py::arg("cu_seqlens") = py::none(), py::arg("seqused") = py::none(), py::arg("return_lse") = true);
 }

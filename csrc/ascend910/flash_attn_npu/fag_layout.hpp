@@ -16,5 +16,6 @@
 
 constexpr static uint32_t BSND = 0;
 constexpr static uint32_t TND = 1;
+constexpr static uint32_t BNSD = 2;
 
-#endif  // FAG_LAYOUT_HPP
+#endif // FAG_LAYOUT_HPP

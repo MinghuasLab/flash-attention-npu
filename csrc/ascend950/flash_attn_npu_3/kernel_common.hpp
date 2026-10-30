@@ -52,6 +52,10 @@ struct FAIKernelParams {
     // BSND / TND, whose layout is the compile-time Format template parameter.
     int64_t kvSeqlenAllocated;
 
+    GM_ADDR qDescale = nullptr;
+    GM_ADDR kDescale = nullptr;
+    GM_ADDR vDescale = nullptr;
+
     // Methods
     __aicore__ inline FAIKernelParams() {}
 

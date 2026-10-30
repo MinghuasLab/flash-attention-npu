@@ -41,7 +41,8 @@ enum class MaskType : uint32_t {
 
 enum class DataType : uint32_t {
     FP16 = 0,
-    BF16 = 1
+    BF16 = 1,
+    FP8 = 2
 };
 
 struct FAInferContext {
@@ -147,7 +148,7 @@ uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t kSBlockTile = 128;
+    uint32_t kSBlockTile = faInfo_.dataType == DataType::FP8 ? 256U : 128U;
     return kSBlockTile;
 }
 
@@ -181,7 +182,9 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_windowSizeRight(faInfo_.windowSizeRight);
 
     auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
-    auto kvBaseTile_ = BASE_KV_SIZE;
+    const uint32_t quantMode = faInfo_.dataType == DataType::FP8 ? 1U : 0U;
+    auto kvBaseTile_ = quantMode == 1 ? 256U : BASE_KV_SIZE;
+    faTilingData.quantMode = quantMode;
     auto embeddingSizeAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
     auto qkL1TileM_ = Q_TILE_CEIL;
@@ -189,7 +192,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     auto qL1BufNum_ = 1;
     // K矩阵开启2buf，D按128分割，S2按256分割
     auto qkL1TileN_ = 256;
-    auto qkL1TileKRight_ = 192;
+    auto qkL1TileKRight_ = quantMode == 1 ? 128 : 192;
     auto kL1BufNum_ = 2;
     // V矩阵开启db，D按128分割，kvBaseTile_不分割，指令同样提前于核间同步下发
     // 如果kvBaseTile_进一步增大，考虑关闭db，使得kvBaseTile_不分割
@@ -282,8 +285,8 @@ void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
     uint64_t totalLoad = 0U;
     for (uint32_t task = 0U; task < tiling.fdCombineTaskNum; ++task) {
         const uint32_t rows = tiling.fdCombineTaskInfo[task].rowNum;
-        const uint32_t sourceSplit =
-            std::min(rows, static_cast<uint32_t>(AlignUpU64(rows, 8U)) / FD_SOURCE_SUB_BLOCK_NUM);
+        const uint32_t sourceSplit = std::min(
+            rows, static_cast<uint32_t>(AlignUpU64(rows, tiling.quantMode == 1 ? 32U : 8U)) / FD_SOURCE_SUB_BLOCK_NUM);
         const uint32_t sourceRows[FD_SOURCE_SUB_BLOCK_NUM] = {sourceSplit, rows - sourceSplit};
         for (uint32_t sub = 0U; sub < FD_SOURCE_SUB_BLOCK_NUM; ++sub) {
             if (sourceRows[sub] != 0U) {
@@ -394,7 +397,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
         }
         const uint32_t qTile = GetQSBlockTile(kvLen);
         const uint32_t qTileNum = (qLen + qTile - 1U) / qTile;
-        const uint32_t kvTileNum = (kvLen + BASE_KV_SIZE - 1U) / BASE_KV_SIZE;
+        const uint32_t kvTileNum = (kvLen + tiling.kvBaseTile - 1U) / tiling.kvBaseTile;
         const uint32_t qNBlockTile = GetQNBlockTile(qLen, groupSize);
         const uint32_t qNBlockNumPerGroup = (groupSize + qNBlockTile - 1U) / qNBlockTile;
         const uint32_t qNTaskNum = qNBlockNumPerGroup * faInfo_.kvHeads;
@@ -534,7 +537,9 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
         maxFdRows = std::max(maxFdRows, base.rowNum);
     }
     tiling.fdRowCapacity = static_cast<uint32_t>(AlignUpU64(maxFdRows, 8U));
-    tiling.fdLseSubStride = static_cast<uint32_t>(AlignUpU64((tiling.fdRowCapacity + 1U) / 2U, 8U));
+    tiling.fdLseSubStride = tiling.quantMode == 1
+                                ? static_cast<uint32_t>(AlignUpU64(tiling.fdRowCapacity, 32U) / 2U)
+                                : static_cast<uint32_t>(AlignUpU64((tiling.fdRowCapacity + 1U) / 2U, 8U));
 
     // The Ascend950 FD pipeline keeps QK, softmax, PV and rescale buffers
     // on chip. Its GM workspace only needs the partial LSE and O regions.

@@ -353,9 +353,14 @@ def _flash_attn_backward_op(
     softcap: float,
     deterministic: bool,
 ) -> torch.Tensor:
-    dout, q, k, v, out, softmax_lse = [
-        _full_contiguous(x) for x in (dout, q, k, v, out, softmax_lse)
-    ]
+    # Same storage detection as forward; retain logical BSND shapes for host/output.
+    if cu_seqlens_q is not None:
+        layout = _LAYOUT_TND
+    else:
+        layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
+
+    dout, q, k, v, out = [x.contiguous() if x.stride(-1) != 1 else x for x in (dout, q, k, v, out)]
+    softmax_lse = softmax_lse.contiguous()
     _dq, _dk, _dv, softmax_d = flash_attn_npu_4_950.bwd(
         dout,
         q,
@@ -379,6 +384,7 @@ def _flash_attn_backward_op(
         softcap,
         deterministic,
         0,  # sm_margin
+        layout,
     )
     return softmax_d
 
@@ -473,11 +479,11 @@ def _flash_attn_backward(
     assert learnable_sink is None, "flash_attn_npu_v4 950 bwd does not support learnable_sink"
 
     if dq is None:
-        dq = torch.empty_like(q)
+        dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if dk is None:
-        dk = torch.empty_like(k)
+        dk = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     if dv is None:
-        dv = torch.empty_like(v)
+        dv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
     seqused_q_c = _full_contiguous(seqused_q) if seqused_q is not None else None
     seqused_k_c = _full_contiguous(seqused_k) if seqused_k is not None else None
@@ -986,6 +992,92 @@ def flash_attn_func(
         scheduler_metadata,
         disable_scheduler_metadata,
     )
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_4_950::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    result = flash_attn_npu_4_950.fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
+    )
+    return result[1] if return_lse else torch.empty(0, dtype=torch.float32, device=result[0].device)
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4_950::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    if not return_lse:
+        return torch.empty(0, dtype=torch.float32, device=out.device)
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    virtual_batch_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Merge split-KV partial attention outputs (FA4, Ascend 950 backend).
+
+    ``cu_seqlens``/``seqused`` are accepted and validated for API parity but do
+    not currently limit the processed rows.
+    """
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
+    )
+    return out, lse if return_lse else None
 
 
 @_torch_register_fake_wrapper("flash_attn_npu_4_C::_flash_attn_forward")

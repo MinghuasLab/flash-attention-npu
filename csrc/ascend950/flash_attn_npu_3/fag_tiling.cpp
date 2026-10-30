@@ -5,6 +5,7 @@
  */
 
 #include "fag_common.h"
+#include "fag_cast_ub_plan.hpp"
 #include "fag_det_schedule_host.hpp"
 
 #include <algorithm>
@@ -29,29 +30,13 @@ uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
 
 // BN2S2 UB budget: the main pipeline owns two ping/pong halves and the dk/dv
 // cast owns a chunked tail region (mirrors the kernel Init formula).
-int64_t CheckBn2s2CastUb(const FAGTilingData& tiling, const FAGInfo& info)
+int64_t CheckBn2s2CastUb(FAGTilingData& tiling, const FAGInfo& info)
 {
-    const uint64_t FP32_BYTES = sizeof(float);
-    const uint64_t rowsPerSub = RoundUpU64(tiling.qTile, 16) / 2;
-    const uint64_t mmResBytes = rowsPerSub * tiling.kvTile * FP32_BYTES;
-    const uint64_t attenMaskBytes = rowsPerSub * tiling.kvTile;
-    const uint64_t lseBytes = RoundUpU64(rowsPerSub, 8) * 8 * FP32_BYTES;
-    const uint64_t pBytes = (rowsPerSub + 1) * tiling.kvTile * 2;
-    const uint64_t deltaBytes = rowsPerSub * 8 * FP32_BYTES;
-    const uint64_t pOff = RoundUpU64(RoundUpU64(2 * mmResBytes + attenMaskBytes, 32) + lseBytes, 32);
-    const uint64_t dSOff = RoundUpU64(pOff + pBytes, 32);
-    const uint64_t deltaOff = RoundUpU64(dSOff + pBytes, 32);
-    const uint64_t halfUb = RoundUpU64(deltaOff + deltaBytes, 32);
-    const uint64_t pipelineUb = 2 * halfUb;
-    const uint64_t chunkRows = tiling.kvTile < 32 ? tiling.kvTile : 32;
-    const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
-    const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
-    const uint64_t inCol = dAlign > dvAlign ? dAlign : dvAlign;
-    const uint64_t headCol = info.qkHeadDim > info.vHeadDim ? info.qkHeadDim : info.vHeadDim;
-    const uint64_t castUb = chunkRows * inCol * FP32_BYTES + chunkRows * headCol * 2;
-    if (pipelineUb + castUb > info.ubSize) {
-        fprintf(stderr, "FAG950 det bn2s2: UB too small: pipeline %llu + cast %llu > %llu\n",
-                (unsigned long long)pipelineUb, (unsigned long long)castUb, (unsigned long long)info.ubSize);
+    const CastUbPlan plan = PlanBn2s2CastUb(tiling.qTile, tiling.kvTile, info.qkHeadDim, info.vHeadDim, info.ubSize);
+    tiling.detCastChunkRows = plan.chunkRows;
+    if (plan.chunkRows == 0) {
+        fprintf(stderr, "FAG950 det bn2s2: UB too small for one cast row: pipeline %llu, UB %llu\n",
+                (unsigned long long)plan.pipelineBytes, (unsigned long long)info.ubSize);
         return -1;
     }
     return 0;
@@ -70,7 +55,21 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
 
     tiling = FAGTilingData{};
     tiling.layout = static_cast<uint32_t>(info.layout);
+    tiling.s1Token = info.window_size_left;
+    tiling.s2Token = info.window_size_right;
     tiling.maskType = static_cast<uint32_t>(info.maskType);
+
+    if (info.maskType == MaskType::NO_MASK) {
+        tiling.s1Token = INT32_MAX;
+        tiling.s2Token = INT32_MAX;
+    } else if (info.maskType == MaskType::CAUSAL) {
+        tiling.s1Token = INT32_MAX;
+        tiling.s2Token = 0;
+    } else if (info.maskType == MaskType::BAND) {
+        tiling.s1Token = (info.window_size_left < 0) ? INT32_MAX : info.window_size_left;
+        tiling.s2Token = (info.window_size_right < 0) ? INT32_MAX : info.window_size_right;
+    }
+
     tiling.deterministic = info.deterministic;
     tiling.detSchedule = info.deterministic ? info.detSchedule : static_cast<uint32_t>(DetSchedule::LEGACY);
     tiling.aicNum = info.aicNum;
@@ -285,7 +284,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
             tiling.dvDetOffset = 0;
             return CheckBn2s2CastUb(tiling, info);
         }
-        if (info.layout != Layout::BSND) {
+        if (info.layout != Layout::BSND && info.layout != Layout::BNSD) {
             fprintf(stderr, "FAG950 det bn2s2: only BSND/TND are supported\n");
             return -1;
         }
