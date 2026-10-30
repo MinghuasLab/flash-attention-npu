@@ -678,6 +678,7 @@ def test_dense_outer_noncontiguous_qkv_falls_back(targets):
     torch.testing.assert_close(out_nc, out_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(lse_nc, lse_ref, rtol=0.0, atol=0.0)
 
+@pytest.mark.golden_api("flash_attn_func")
 @skip_unless_910
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -847,7 +848,7 @@ def _sink_causal_mask(qlen, kvlen):
     return torch.triu(torch.ones(qlen, kvlen), diagonal=(kvlen - qlen + 1)).bool()
 
 
-def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal):
+def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal, *, api_name=None):
     qlen, kvlen, nheads = query.shape[1], key.shape[1], query.shape[2]
     if qlen == 0:
         empty = query[:, :0]
@@ -860,7 +861,8 @@ def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal):
     mask = _sink_causal_mask(qlen, kvlen) if causal else None
     sink_matrix = _sink_matrix(sink, query.shape[0], nheads, qlen)
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-        query, key, value, scale, mask, dtype, rescale_threshold=None, sink_matrix=sink_matrix
+        query, key, value, scale, mask, dtype, rescale_threshold=None,
+        sink_matrix=sink_matrix, api_name=api_name,
     )
     if mask is not None:
         fully = mask.all(dim=-1)
@@ -899,7 +901,8 @@ def _sink_gather(cache, table_row, kvlen):
     return cache[table[positions // _SINK_PAGE], positions % _SINK_PAGE]
 
 
-def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sink, causal, table=None):
+def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sink, causal,
+                           table=None, api_name=None):
     pieces = []
     q_off = 0
     k_off = 0
@@ -923,6 +926,7 @@ def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sin
             dtype,
             sink,
             causal,
+            api_name=api_name,
         )
         pieces.append((out_ref[0], lse_ref[0], out_pt[0], lse_pt[0]))
     if not pieces:
@@ -975,6 +979,7 @@ def test_flash_attn_sink_layouts(cfg):
             dtype,
             sink_cpu,
             cfg["causal"],
+            api_name="flash_attn_func",
         )
         assert_fa_close(out, out_ref, out_pt, name="out")
         assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")
@@ -1031,6 +1036,7 @@ def test_flash_attn_sink_layouts(cfg):
         sink_cpu,
         cfg["causal"],
         table=table,
+        api_name="flash_attn_varlen_func",
     )
     assert_fa_close(out, out_ref, out_pt, name="out")
     assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")

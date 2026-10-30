@@ -714,6 +714,7 @@ def metadata_spy(monkeypatch):
     return calls
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -767,6 +768,7 @@ def test_flash_attn_func_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
@@ -865,6 +867,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
         )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
@@ -933,6 +936,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
@@ -1004,6 +1008,7 @@ def test_flash_attn_kvcache_metadata_tnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize("is_causal", [False])
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     """FD + metadata path with idle cores (needCoreNum < blockDim)."""
@@ -1105,6 +1110,7 @@ KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
@@ -1160,6 +1166,7 @@ def test_flash_attn_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
@@ -1219,6 +1226,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
@@ -1283,6 +1291,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
@@ -1361,6 +1370,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,

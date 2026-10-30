@@ -290,6 +290,7 @@ ALIBI_VARLEN_CASES = [
     (torch.float16, 2, 4, 4, 512, 512, 128, False),
 ]
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -373,6 +374,7 @@ def test_flash_attn_kvcache_metadata_num_splits_mismatch_rejected():
         )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
@@ -431,6 +433,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
     FLASH_ATTN_FUNC_SWA_SOFTCAP_CASES,
@@ -481,6 +484,7 @@ def test_flash_attn_func_metadata_swa_softcap(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
     FLASH_ATTN_VARLEN_SWA_SOFTCAP_CASES,
@@ -542,6 +546,7 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
         softcap=softcap,
     )
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     ALIBI_FUNC_CASES,
@@ -593,6 +598,7 @@ def test_flash_attn_func_metadata_alibi(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     ALIBI_VARLEN_CASES,
@@ -656,6 +662,7 @@ def test_flash_attn_varlen_func_metadata_alibi(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize("dropout_p", [0.1, 0.5])
 def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
     batch_size, num_heads, kv_heads = 2, 4, 2
@@ -707,6 +714,7 @@ def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
     num_heads, kv_heads, head_size = 4, 1, 128
     max_q, max_k = 512, 1024
@@ -778,6 +786,7 @@ def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
     assert_fa_close(lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_BSND_CASES,
@@ -852,6 +861,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,
@@ -1007,6 +1017,7 @@ def _tiling_from_metadata(scheduler_metadata):
     return tiling
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal, num_splits):
@@ -1218,6 +1229,7 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
         )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 def test_flash_attn_kvcache_metadata_alibi_bsnd():
     """Paged KV + explicit scheduler_metadata + per-batch ALiBi slopes: the
     stride baked into the metadata must drive the kernel's per-batch indexing."""

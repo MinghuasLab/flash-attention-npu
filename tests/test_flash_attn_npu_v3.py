@@ -293,6 +293,7 @@ test_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -818,6 +819,7 @@ func_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap",
     func_cases,
@@ -1044,6 +1046,7 @@ varlen_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, add_unused_qkv",
     varlen_cases,
@@ -2333,6 +2336,7 @@ flash_attn_func_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
     flash_attn_func_bnsd_cases,
@@ -2363,6 +2367,7 @@ flash_attn_with_kvcache_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen",
     flash_attn_with_kvcache_bnsd_cases,

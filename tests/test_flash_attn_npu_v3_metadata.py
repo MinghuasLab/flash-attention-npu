@@ -435,6 +435,7 @@ def metadata_spy_950(monkeypatch):
     return calls
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -489,6 +490,7 @@ def test_flash_attn_func_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
@@ -593,6 +595,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
         )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
@@ -667,6 +670,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
@@ -744,6 +748,7 @@ def test_flash_attn_kvcache_metadata_tnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, q_seqlen, num_heads, head_size, num_splits, is_causal, softcap, new_length",
     KV_CACHE_FLASH_DECODE_CASES,
@@ -925,6 +930,7 @@ KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
@@ -981,6 +987,7 @@ def test_flash_attn_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
@@ -1039,6 +1046,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
@@ -1104,6 +1112,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
@@ -1219,6 +1228,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,
@@ -1586,6 +1596,7 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
         )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize(
     "data_type, is_causal",
@@ -1641,6 +1652,7 @@ def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
 def test_flash_attn_with_kvcache_metadata_matches(data_type):
@@ -1719,6 +1731,7 @@ def test_flash_attn_with_kvcache_metadata_matches(data_type):
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
 def test_flash_attn_kvcache_metadata_reuse_scale_softcap_950(data_type):
@@ -1810,6 +1823,7 @@ def test_flash_attn_kvcache_metadata_reuse_scale_softcap_950(data_type):
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
     # 3D TND kvcache (total_tokens, kv_heads, head_dim): regression for the

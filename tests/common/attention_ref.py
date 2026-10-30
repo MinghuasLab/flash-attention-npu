@@ -1,4 +1,6 @@
 # Copyright (c) 2026, Minghua Shen.
+import hashlib
+import inspect
 import os
 
 import torch
@@ -298,6 +300,7 @@ def cached_ref_flash_attention_pair(
     q_seqlens=None,
     kv_seqlens=None,
     metadata=None,
+    api_name=None,
 ):
     """Cached wrapper for the two forward reference implementations."""
     case_metadata = _golden_metadata(
@@ -332,9 +335,11 @@ def cached_ref_flash_attention_pair(
         return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
 
     cache_args = dict(
-        nodeid=nodeid or _current_nodeid(), metadata=case_metadata, inputs=inputs,
+        nodeid=nodeid or _current_nodeid(),
+        api_name=_current_api_name() if api_name is None else api_name,
+        metadata=case_metadata, inputs=inputs,
         compute_fn=compute, expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
-        source_files=[__file__], test_source_files=_golden_test_source_files(),
+        source_files=[__file__],
     )
     values, status = get_or_compute_golden(**cache_args, return_status=True)
     if status == "hit":
@@ -343,7 +348,7 @@ def cached_ref_flash_attention_pair(
 
 
 def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=None,
-                          rebuild=None):
+                          rebuild=None, api_name=None):
     """Cache an existing pair of reference autograd results.
 
     ``rebuild(query, key, value, differentiable=True)`` is called only when a
@@ -354,6 +359,7 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
         "gradient": True,
         "metadata": _json_metadata(metadata),
         "output_shapes": [list(outputs[0].shape), list(outputs[1].shape)],
+        "rebuild_source": _callable_source_digest(rebuild),
     }
     caller_inputs = inputs if inputs is not None else {
         "query": query,
@@ -391,10 +397,13 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
         }
 
     cache_args = dict(
-        nodeid=nodeid, metadata=case_metadata, inputs=cache_inputs,
+        nodeid=nodeid, api_name=_current_api_name() if api_name is None else api_name,
+        metadata=case_metadata, inputs=cache_inputs,
         compute_fn=compute,
         expected_keys=("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"),
-        source_files=[__file__], test_source_files=_golden_test_source_files(),
+        # Rebuild closures in v2/v3/v4 use the shared padding and paged-KV
+        # helpers; their derivative behavior is part of the gradient golden.
+        source_files=[__file__, os.path.join(os.path.dirname(__file__), "test_utils.py")],
     )
     values, status = get_or_compute_golden(**cache_args, return_status=True)
     if status == "hit":
@@ -410,9 +419,29 @@ def _json_metadata(value):
     return {"value": value}
 
 
-def _golden_test_source_files():
-    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE")
-    return [test_file] if test_file else []
+def _callable_source_digest(function):
+    if function is None:
+        return None
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        # A dynamic callable has no stable source identity; do not reuse its
+        # gradient cache across processes on the basis of an incomplete key.
+        source = repr(function)
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def _current_api_name():
+    api_name = os.environ.get("GOLDEN_CACHE_API_NAME")
+    if api_name:
+        return api_name
+    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE", "")
+    if os.path.basename(test_file).startswith("test_flash_attn_npu"):
+        raise ValueError(
+            "NPU golden tests must declare @pytest.mark.golden_api(interface_name) "
+            "or pass api_name to the reference call"
+        )
+    return "reference"
 
 
 def _current_nodeid():
@@ -435,6 +464,7 @@ def ref_flash_attention_pair(
     q_seqlens=None,
     kv_seqlens=None,
     differentiable=False,
+    api_name=None,
 ):
     """Return the two BSND golden references used by the comparator.
 
@@ -452,6 +482,7 @@ def ref_flash_attention_pair(
     return cached_ref_flash_attention_pair(
         query, key, value, scale, mask, data_type, softcap,
         nodeid=_current_nodeid(),
+        api_name=_current_api_name() if api_name is None else api_name,
         rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
         drop_mask=drop_mask, dropout_p=dropout_p,
         alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
