@@ -1,3 +1,4 @@
+#include "../attention_window.h"
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
@@ -136,17 +137,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout =
         is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
-    if (window_size_left >= kv_seqlen - 1) {
-        window_size_left = -1;
-    }
-    if (window_size_right >= q_seqlen - 1) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = window_size_left < 0 && window_size_right == 0;
-    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    bool is_local = false;
+    fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right,
+                                        is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fag_info.maskType = FAGTiling950::MaskType::CAUSAL;

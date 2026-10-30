@@ -30,6 +30,7 @@
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"
+#include "../attention_window.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
@@ -285,25 +286,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const int64_t declared_k = max_seqlen_k_.value_or(
         paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                  : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
-    if (declared_k > 0 && window_size_left >= declared_k) {
-        window_size_left = -1;
-    }
-    if (declared_k > 0 && window_size_right >= declared_k) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = window_size_left < 0 && window_size_right == 0;
-    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = declared_k;
-        }
-        if (window_size_right < 0) {
-            window_size_right = declared_k;
-        }
-    }
+    fa_window::NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right,
+                                        is_causal, is_local);
     if (!scheduler_metadata_.has_value()) {
         // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
         at::Tensor seqused_q_cpu;

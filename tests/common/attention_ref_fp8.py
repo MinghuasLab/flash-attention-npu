@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 """Pure-PyTorch FP8 forward references for the 950 V3 tests.
 
-Window normalization matches the currently retained legacy KV-bound behavior.
+Windows use bottom-right alignment; negative sides are unlimited.
 The low reference models one unsplit KV stream, independently of host tiling,
 metadata layout and FD scheduling. ATK owns exact schedule-aware validation.
 """
@@ -71,28 +71,15 @@ def read_inputs(kwargs, entry, metadata=False):
     else:
         kv_lengths = (k.shape[1],) * len(q_lengths)
     table = native.get("page_table")
-    # Match the legacy DeriveFwdMask KV bound; keep native arguments unchanged.
-    if entry == "varlen":
-        kv_seqlen_bound = native["max_seqlen_k"]
-    elif table is not None:
-        kv_seqlen_bound = table.shape[1] * k.shape[1]
-    else:
-        kv_seqlen_bound = k.shape[0 if cuq is not None else 1]
+    # Keep the API bounds verbatim: visible() applies them to each actual
+    # sequence independently, without copying the host normalization logic.
     window_left, window_right = native["window_size"]
-    if kv_seqlen_bound > 0 and window_left >= kv_seqlen_bound:
-        window_left = -1
-    if kv_seqlen_bound > 0 and window_right >= kv_seqlen_bound:
-        window_right = -1
     if native["causal"]:
         window_right = 0
     if window_left < 0 and window_right == 0:
         mask = "causal"
     elif window_left >= 0 or window_right >= 0:
         mask = "window"
-        if window_left < 0:
-            window_left = kv_seqlen_bound
-        if window_right < 0:
-            window_right = kv_seqlen_bound
     else:
         mask = "none"
     windows = (window_left, window_right)

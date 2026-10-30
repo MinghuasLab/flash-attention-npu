@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "tilingdata.h"
+#include "../attention_window.h"
 
 static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
               "FAInferTilingData must be trivially copyable to cross the AICPU/device boundary");
@@ -90,29 +91,12 @@ struct FwdMaskDerivation {
 // (max_seqlen_k / cache capacity) instead of the device-side actual max KV
 // seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
 // allowed. Both metadata creation and fwd consumption use the same derivation.
-inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
+inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t max_seqlen_q,
                                        int64_t max_seqlen_k_bound)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
-        window_left = -1;
-    }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
-        window_right = -1;
-    }
-    if (causal) {
-        window_right = 0;
-    }
     FwdMaskDerivation derived;
-    derived.is_causal = (window_left < 0 && window_right == 0);
-    derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    if (derived.is_local) {
-        if (window_left < 0) {
-            window_left = max_seqlen_k_bound;
-        }
-        if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
-        }
-    }
+    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k_bound, window_left, window_right,
+                                        derived.is_causal, derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? 4u : (derived.is_causal ? 1u : 0u);
@@ -131,8 +115,8 @@ struct FAMetadataArgs {
     uint32_t blockSize;
     uint32_t maxQSeqlen;
     uint32_t maskType;
-    int32_t windowSizeLeft;
-    int32_t windowSizeRight;
+    int64_t windowSizeLeft;
+    int64_t windowSizeRight;
     uint32_t blockDim;
     uint32_t isVarlen;
     uint32_t isVarlenKv;

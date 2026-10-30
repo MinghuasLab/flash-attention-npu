@@ -210,9 +210,11 @@ def _assert_tnd_matches_ref(
 
 @pytest.fixture
 def metadata_spy(monkeypatch):
-    """Spy on get_scheduler_metadata to prove the training interfaces route
-    through the AICPU scheduler-metadata path internally (official flash-attn
-    only exposes scheduler_metadata on flash_attn_with_kvcache)."""
+    """Explicitly exercise metadata on training shapes.
+
+    The public v2 training functions now select native scheduling. Inject
+    metadata into their low-level forward calls without changing that default.
+    """
     from flash_attn_npu import flash_attn_npu_interface as interface
     calls = []
     original = interface.get_scheduler_metadata
@@ -222,7 +224,40 @@ def metadata_spy(monkeypatch):
         calls.append((args, kwargs, result))
         return result
 
-    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
+    def metadata(q, k, maxq, maxk, lengths, cuq, scale, kwargs, heads, kvheads):
+        slopes = kwargs.get("alibi_slopes")
+        return _spy(
+            batch_size=lengths.numel(), max_seqlen_q=maxq, max_seqlen_k=maxk,
+            num_heads_q=heads, num_heads_kv=kvheads, headdim=q.shape[-1],
+            cache_seqlens=lengths, qkv_dtype=q.dtype, cu_seqlens_q=cuq,
+            page_size=k.shape[1] if kwargs.get("block_table") is not None else None,
+            causal=kwargs.get("causal", False),
+            window_size=(kwargs.get("window_size_left", -1), kwargs.get("window_size_right", -1)),
+            softcap=kwargs.get("softcap", 0.0), softmax_scale=scale,
+            alibi_slopes_batch_stride=slopes.stride(0) if slopes is not None and slopes.ndim == 2 else 0,
+        )
+
+    fixed = interface._wrapped_flash_attn_forward
+    varlen = interface._wrapped_flash_attn_varlen_forward
+
+    def fixed_with_metadata(q, k, v, dropout, scale, **kwargs):
+        bnsd = kwargs.get("layout", interface._LAYOUT_BSND) == interface._LAYOUT_BNSD
+        seqdim, headdim = (2, 1) if bnsd else (1, 2)
+        lengths = torch.full((q.shape[0],), k.shape[seqdim], dtype=torch.int32, device=q.device)
+        kwargs["scheduler_metadata"] = metadata(
+            q, k, q.shape[seqdim], k.shape[seqdim], lengths, None, scale, kwargs,
+            q.shape[headdim], k.shape[headdim],
+        )
+        return fixed(q, k, v, dropout, scale, **kwargs)
+
+    def varlen_with_metadata(q, k, v, cuq, cuk, maxq, maxk, dropout, scale, **kwargs):
+        kwargs["scheduler_metadata"] = metadata(
+            q, k, maxq, maxk, cuk[1:] - cuk[:-1], cuq, scale, kwargs, q.shape[1], k.shape[-2],
+        )
+        return varlen(q, k, v, cuq, cuk, maxq, maxk, dropout, scale, **kwargs)
+
+    monkeypatch.setattr(interface, "_wrapped_flash_attn_forward", fixed_with_metadata)
+    monkeypatch.setattr(interface, "_wrapped_flash_attn_varlen_forward", varlen_with_metadata)
     return calls
 
 

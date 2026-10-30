@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Minghua Shen.
-"""950 V4 FP8: 135 cases; all check O and LSE.
+"""950 V4 FP8: 137 cases; all check O and LSE.
 
 Run from the repository root:
     python -m pytest tests/test_flash_attn_npu_v4_fp8.py -v
@@ -175,13 +175,15 @@ test_cases_descale = [
     ((65, 129), (257, 385), (), "v_descale"),
 ]
 
-# Single key, zero V, empty rows, and the retained legacy window behavior.
+# Single key, zero V, empty rows, and asymmetric window behavior.
 # entry, mask, q_lengths, kv_lengths, window_size, zero_v
 test_cases_semantics = [
     ("dense", "none", (1,), (1,), (33, 17), False),
     ("cache", "window", (65, 129), (257, 385), (33, 17), True),
     ("varlen", "causal", (129, 65), (1, 33), (33, 17), False),
     ("dense", "window", (8,), (4,), (-1, 4), False),
+    ("varlen", "window", (512, 257), (32, 17), (8, -1), False),
+    ("dense", "window", (65, 65), (257, 257), (-1, 8), False),
 ]
 
 

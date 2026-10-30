@@ -115,17 +115,13 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q;
     args.numSplits = num_splits;
-    if (max_seqlen_k > 0 && window_left >= max_seqlen_k)
-        window_left = -1;
-    if (max_seqlen_k > 0 && window_right >= max_seqlen_k)
-        window_right = -1;
-    if (causal)
-        window_right = 0;
-    const bool normalized_causal = window_left < 0 && window_right == 0;
-    const bool local = (window_left >= 0 || window_right >= 0) && !normalized_causal;
+    bool normalized_causal = false;
+    bool local = false;
+    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k, window_left, window_right,
+                                        normalized_causal, local);
     args.maskType = normalized_causal ? 1 : (local ? 2 : 0);
-    args.windowSizeLeft = local && window_left < 0 ? max_seqlen_k : window_left;
-    args.windowSizeRight = local && window_right < 0 ? max_seqlen_k : window_right;
+    args.windowSizeLeft = window_left;
+    args.windowSizeRight = window_right;
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, seqused_q);
 }
 
