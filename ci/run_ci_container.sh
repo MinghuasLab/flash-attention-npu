@@ -28,7 +28,7 @@
 #   GOLDEN_CACHE_DIR      (默认 /var/cache/flash-attention-npu/golden_cache)
 #   GOLDEN_CACHE_MODE     (默认 cache) cache|off
 #   GOLDEN_CACHE_STATS_FILE (容器内固定为 /tmp/ci_test_logs/golden_cache_events.tsv)
-#   GOLDEN_CACHE_MAX_BYTES (默认 100 GiB, 缓存总容量上限; 0 为不限)
+#   GOLDEN_CACHE_MAX_BYTES (默认 40 GiB, 缓存总容量上限; 0 为不限)
 #   GOLDEN_CACHE_MAX_AGE_DAYS (默认 30, 最长未命中天数; 0 为不限)
 #   GOLDEN_CACHE_EVICT_INTERVAL_SECONDS (默认 60, 清理扫描最短间隔)
 #   PROXY_CONFIG_FILE (默认 $GOLDEN_CACHE_HOST_DIR/proxy.conf)
@@ -205,7 +205,7 @@ run_docker_test() {
     -e GOLDEN_CACHE_DIR="$GOLDEN_CACHE_DIR" \
     -e GOLDEN_CACHE_STATS_FILE="/tmp/ci_test_logs/golden_cache_events.tsv" \
     -e GOLDEN_CACHE_REFRESH="${GOLDEN_CACHE_REFRESH:-0}" \
-    -e GOLDEN_CACHE_MAX_BYTES="${GOLDEN_CACHE_MAX_BYTES:-107374182400}" \
+    -e GOLDEN_CACHE_MAX_BYTES="${GOLDEN_CACHE_MAX_BYTES:-42949672960}" \
     -e GOLDEN_CACHE_MAX_AGE_DAYS="${GOLDEN_CACHE_MAX_AGE_DAYS:-30}" \
     -e GOLDEN_CACHE_EVICT_INTERVAL_SECONDS="${GOLDEN_CACHE_EVICT_INTERVAL_SECONDS:-60}" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \

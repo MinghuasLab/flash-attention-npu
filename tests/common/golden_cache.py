@@ -177,7 +177,7 @@ def _cache_limits() -> tuple[int, int]:
             return default
 
     return (
-        get("GOLDEN_CACHE_MAX_BYTES", 100 * 1024**3),
+        get("GOLDEN_CACHE_MAX_BYTES", 40 * 1024**3),
         get("GOLDEN_CACHE_MAX_AGE_DAYS", 30),
     )
 
