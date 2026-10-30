@@ -20,7 +20,6 @@ from tests.common.test_utils import (
     make_block_table,
     make_cu_seqlens,
     make_golden_attention_mask,
-    make_local_attention_mask,
     make_packed_random_tensor,
     make_paged_kv_cache,
     make_padded_varlen_mask,
@@ -470,27 +469,6 @@ def test_fa_kvcache_ops(
     new_q_seqlen_list = None
     new_q_seqlen_list_cpu = None
     new_kv_seqlen_list_cpu = None
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    declared_kv = (
-        ((kv_seqlen + block_size - 1) // block_size) * block_size if cache_mode == 1 else kv_seqlen
-    )
-    # Match the host rule: both sides vs the declared KV bound.
-    if declared_kv > 0 and window_size_left_golden >= declared_kv:
-        window_size_left_golden = -1
-    if declared_kv > 0 and window_size_right_golden >= declared_kv:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = window_size_left_golden < 0 and window_size_right_golden == 0
-    is_local_golden = (
-        window_size_left_golden >= 0 or window_size_right_golden > 0
-    ) and not is_causal_golden
-    if is_local_golden:
-        if window_size_left_golden < 0:
-            window_size_left_golden = declared_kv
-        if window_size_right_golden < 0:
-            window_size_right_golden = declared_kv
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -646,19 +624,9 @@ def test_fa_kvcache_ops(
     value_cache_cpu = value_cache.detach().cpu()
     block_tables_cpu = block_tables.cpu() if cache_mode == 1 else None
     if layout == "BSND":
-        atten_mask = None
-        if is_causal_golden:
-            atten_mask = torch.triu(
-                torch.ones(q_seqlen, kv_seqlen),
-                diagonal=(kv_seqlen - q_seqlen + 1),
-            ).bool()
-        elif is_local_golden:
-            atten_mask = make_local_attention_mask(
-                q_seqlen,
-                kv_seqlen,
-                window_size_left_golden,
-                window_size_right_golden,
-            )
+        atten_mask, _, _ = make_golden_attention_mask(
+            q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right
+        )
         if cache_mode == 1:
             key_batched, value_batched = gather_paged_kv_batch(
                 key_cache_cpu, value_cache_cpu, block_tables_cpu, kv_seqlen, block_size
@@ -687,24 +655,11 @@ def test_fa_kvcache_ops(
     else:
         key_padded = pad_packed_tensor(key_cache_cpu, kv_sequences, kv_seqlen)
         value_padded = pad_packed_tensor(value_cache_cpu, kv_sequences, kv_seqlen)
-    q_valid = torch.arange(q_seqlen) < torch.tensor(q_sequences)[:, None]
-    k_valid = torch.arange(kv_seqlen) < torch.tensor(kv_sequences)[:, None]
-    atten_mask = (~q_valid[:, :, None]) | (~k_valid[:, None, :])
-    row = torch.arange(q_seqlen)[None, :, None]
-    col = torch.arange(kv_seqlen)[None, None, :]
-    if is_causal_golden:
-        atten_mask = atten_mask | (
-            col - row >= (torch.tensor(kv_sequences) - torch.tensor(q_sequences))[:, None, None] + 1
-        )
-    elif is_local_golden:
-        diff = col - row
-        left = (torch.tensor(kv_sequences) - torch.tensor(q_sequences))[
-            :, None, None
-        ] - window_size_left_golden
-        right = (torch.tensor(kv_sequences) - torch.tensor(q_sequences))[
-            :, None, None
-        ] + window_size_right_golden
-        atten_mask = atten_mask | (diff < left) | (diff > right)
+    # Align each sequence using its actual Q/K lengths, not padded bounds.
+    q_valid, _, atten_mask = make_padded_varlen_mask(
+        q_sequences, kv_sequences, q_seqlen, kv_seqlen,
+        is_causal, window_size_left, window_size_right,
+    )
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap
     )

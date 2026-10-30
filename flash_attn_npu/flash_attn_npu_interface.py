@@ -372,7 +372,11 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     (
         dq,
         dk,
@@ -423,7 +427,11 @@ def _flash_attn_backward_fake(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     if dq is None:
         dq = torch.empty_like(q)
     if dk is None:
@@ -479,7 +487,11 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     (
         dq,
         dk,
@@ -542,7 +554,11 @@ def _flash_attn_varlen_backward_fake(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # The backward kernels use packed dO strides, including across heads/tokens.
+    # A last-dimension-contiguous transposed view still needs materialization.
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    q, k, v, out = [maybe_contiguous(x) for x in (q, k, v, out)]
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
 

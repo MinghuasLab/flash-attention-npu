@@ -304,26 +304,6 @@ def test_fa_kvcache_ops(
     else:
         alibi_slopes = None
         alibi_slopes_cpu = None
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    # Match Tri Dao GPU host: both sides vs kv_seqlen.
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
-        window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = window_size_left_golden < 0 and window_size_right_golden == 0
-    is_local_golden = (
-        window_size_left_golden >= 0 or window_size_right_golden > 0
-    ) and not is_causal_golden
-    # Tri Dao / NPU fwd: infinite side (-1) → seqlen_k so mask math has no bound
-    if is_local_golden:
-        if window_size_left_golden < 0:
-            window_size_left_golden = kv_seqlen
-        if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
-
     out_out, softmax_lse = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -416,12 +396,14 @@ def test_fa_kvcache_ops(
             golden_lseL_ref[i] = lse_ref
             golden_lseL_pt[i] = lse_pt
     else:
+        # The shared helper decides whether a mask is needed from the API
+        # inequalities; do not discard it after another window normalization.
         golden_out_ref, golden_lseL_ref, golden_out_pt, golden_lseL_pt = ref_flash_attention_pair(
             query_cpu,
             key_batched,
             value_batched,
             scale,
-            atten_mask if (is_causal_golden or is_local_golden) else None,
+            atten_mask,
             data_type,
             softcap,
             alibi_slopes=alibi_slopes_cpu,

@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include "../attention_window.h"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -40,6 +42,7 @@
 // (Q_TILE_CEIL, ...) used by the host helpers below resolve.
 using namespace Catlass;
 using namespace KernelCommon;
+using fa_window::NormalizeAttentionWindow;
 
 #define CHECK_SHAPE(x, ...)                                                                                            \
     TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -79,32 +82,13 @@ struct FwdMaskDerivation {
 
 // Window normalization + mask-type derivation for the metadata *layout*.
 // The KV bound is the declared logical length / cache capacity (no D2H).
-// AICPU later refines maskType / windows against the actual max KV length.
-static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t /*max_seqlen_q*/,
+// AICPU preserves this mask layout; the kernel clips windows per sequence.
+static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t max_seqlen_q,
                                        int64_t max_seqlen_k_bound)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
-        window_left = -1;
-    }
-    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
-        window_right = -1;
-    }
-    if (causal) {
-        window_right = 0;
-    }
     FwdMaskDerivation derived;
-    derived.is_causal = (window_left < 0 && window_right == 0);
-    derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
-    // Match the host tiling: infinite local side -> finite KV bound, not
-    // WINDOW_SIZE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
-    if (derived.is_local) {
-        if (window_left < 0) {
-            window_left = max_seqlen_k_bound;
-        }
-        if (window_right < 0) {
-            window_right = max_seqlen_k_bound;
-        }
-    }
+    NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k_bound, window_left, window_right,
+                             derived.is_causal, derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)
@@ -351,8 +335,9 @@ std::vector<at::Tensor> mha_fwd_kvcache(
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 128 : kcache.size(1);
     const int num_heads_k = is_bnsd ? static_cast<int>(kcache.size(1)) : static_cast<int>(kcache.size(2));
-    // BNSD: the KV head-plane width is the allocated KV S (k.size(2) in BNSD terms).
-    const int64_t kv_seqlen_allocated = is_bnsd ? static_cast<int64_t>(kcache.size(2)) : 0;
+    // Dense cache storage advances by its capacity, independently of each batch's
+    // effective length. Also supplies the KV head-plane width for BNSD.
+    const int64_t kv_seqlen_allocated = paged_KV ? 0 : static_cast<int64_t>(kcache.size(is_bnsd ? 2 : 1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og >= 1 && head_size_og <= 256, "FlashAttention only supports head dimension in [1, 256]");
@@ -497,30 +482,10 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
         tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
 
-        // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
-        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-            window_size_left = -1;
-        }
-        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-            window_size_right = -1;
-        }
-        if (is_causal) {
-            window_size_right = 0;
-        }
-        is_causal = (window_size_left < 0 && window_size_right == 0);
-        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        NormalizeAttentionWindow(is_causal, seqlen_q, max_kv_seqlen, window_size_left, window_size_right,
+                                 is_causal, is_local);
         TORCH_CHECK(!(appendKV && is_local),
                     "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
-        // Match Tri Dao set_params_fprop: infinite local side → seqlen_k (finite),
-        // not WINDOW_SIZE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
-        if (is_local) {
-            if (window_size_left < 0) {
-                window_size_left = max_kv_seqlen;
-            }
-            if (window_size_right < 0) {
-                window_size_right = max_kv_seqlen;
-            }
-        }
 
         const bool fusedTask = !paged_KV && !appendKV;
         tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
@@ -737,26 +702,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     bool is_local = false;
-    // Match Tri Dao GPU: both sides vs seqlen_k.
-    if (seqlen_k > 0 && window_size_left >= seqlen_k) {
-        window_size_left = -1;
-    }
-    if (seqlen_k > 0 && window_size_right >= seqlen_k) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = (window_size_left < 0 && window_size_right == 0);
-    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = seqlen_k;
-        }
-        if (window_size_right < 0) {
-            window_size_right = seqlen_k;
-        }
-    }
+    NormalizeAttentionWindow(is_causal, seqlen_q, seqlen_k, window_size_left, window_size_right,
+                             is_causal, is_local);
 
     // init output tensors
     // BNSD (B,H,S,D) input: the kernel writes contiguous BSND, so allocate (B, S, H, dv).
@@ -1069,26 +1016,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     }
 
     bool is_local = false;
-    // Match Tri Dao GPU: both sides vs max_seqlen_k.
-    if (max_seqlen_k > 0 && window_size_left >= max_seqlen_k) {
-        window_size_left = -1;
-    }
-    if (max_seqlen_k > 0 && window_size_right >= max_seqlen_k) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = (window_size_left < 0 && window_size_right == 0);
-    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = max_seqlen_k;
-        }
-        if (window_size_right < 0) {
-            window_size_right = max_seqlen_k;
-        }
-    }
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right,
+                             is_causal, is_local);
 
     at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
     auto opts = q.options().device(at::kPrivateUse1);
@@ -1397,11 +1326,10 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
 
     int local_window_size_left = window_size_left;
     int local_window_size_right = window_size_right;
-    if (is_causal) {
-        local_window_size_right = 0;
-    }
-    const bool local_is_causal = local_window_size_left < 0 && local_window_size_right == 0;
-    const bool is_local = (local_window_size_left >= 0 || local_window_size_right >= 0) && !local_is_causal;
+    bool local_is_causal = false;
+    bool is_local = false;
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, local_window_size_left,
+                             local_window_size_right, local_is_causal, is_local);
 
     AlibiSlopes alibi = set_params_alibi(alibi_slopes_, seqlens_q.numel() - 1, qsizes[1]);
     bool has_alibi = alibi.ptr != nullptr;

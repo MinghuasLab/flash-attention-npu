@@ -751,10 +751,10 @@ class FAInferKernel {
         uint32_t noSkipKvS = kvSeqlen;
         uint32_t kvSLoopNumTotal = 0;
         uint32_t kvStart = 0;
-        int32_t windowSizeLeftStartLen = 0;
-        int32_t windowSizeLeftEndLen = 0;
-        int32_t windowSizeRightStartLen = 0;
-        int32_t windowSizeRightEndLen = 0;
+        int64_t windowSizeLeftStartLen = 0;
+        int64_t windowSizeLeftEndLen = 0;
+        int64_t windowSizeRightStartLen = 0;
+        int64_t windowSizeRightEndLen = 0;
         bool notPreMask = true;
         bool notNextMask = true;
         int32_t invalidSuffixStartRow = 0;     // 0 disables suffix clearing.
@@ -767,41 +767,41 @@ class FAInferKernel {
             kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
             invalidPrefixEndRow = qSeqlen > kvSeqlen ? static_cast<int32_t>(qSeqlen - kvSeqlen) : invalidPrefixEndRow;
         } else if (maskType == 2U) {
-            int32_t leftPointwindowSizeLeft = kvSeqlen;
-            int32_t leftPointwindowSizeRight = 0;
-            if (windowSizeLeft < 0 && windowSizeLeft * (-1) >= qSeqlen) {
-                kvStart = kvSeqlen / kvStackLen + 1;
-            } else if (windowSizeLeft != WINDOW_SIZE_INT_MAX) {
-                leftPointwindowSizeLeft = kvSeqlen - qSeqlen - windowSizeLeft;
-                windowSizeLeftStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeLeft;
-                windowSizeLeftEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeLeft;
-                kvStart = AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) /
-                          static_cast<int32_t>(kvStackLen);
-                notPreMask = false;
-            } else {
-                kvStart = 0;
+            // Apply the API's bottom-right window to the actual sequence.
+            // Do arithmetic in signed 64-bit before clipping or converting to
+            // block indices; declared ragged bounds can be much larger than Q/K.
+            const int64_t qLength = static_cast<int64_t>(qSeqlen);
+            const int64_t kvLength = static_cast<int64_t>(kvSeqlen);
+            const int64_t seqDiff = kvLength - qLength;
+            const int64_t qBlockBase = static_cast<int64_t>(qSBlockIdx) * curQSBlockTile;
+            notPreMask = windowSizeLeft < 0 || windowSizeLeft >= kvLength - 1;
+            notNextMask = windowSizeRight < 0 || windowSizeRight >= qLength - 1;
+            if (!notPreMask) {
+                const int64_t leftOrigin = seqDiff - windowSizeLeft;
+                windowSizeLeftStartLen = qBlockBase + leftOrigin;
+                windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
+                const int64_t firstKey = AscendC::Std::min(kvLength,
+                    AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                kvStart = static_cast<uint32_t>(firstKey) / kvStackLen;
+                if (windowSizeLeftEndLen > kvLength) {
+                    invalidSuffixStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
+                        AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
+                }
             }
-            if (windowSizeRight < 0 && windowSizeRight * (-1) >= kvSeqlen) {
-                kvSLoopNumTotal = 0;
-            } else if (windowSizeRight != WINDOW_SIZE_INT_MAX) {
-                leftPointwindowSizeRight = kvSeqlen - qSeqlen + windowSizeRight;
-                windowSizeRightStartLen = qSBlockIdx * curQSBlockTile + leftPointwindowSizeRight;
-                windowSizeRightEndLen = qSBlockIdx * curQSBlockTile + qSBlockSize + leftPointwindowSizeRight;
-                int32_t nsk = AscendC::Std::min(static_cast<int32_t>(kvSeqlen),
-                                                RoundUp(windowSizeRightEndLen, static_cast<int32_t>(kvStackLen)));
-                nsk = nsk <= 0 ? static_cast<int32_t>(kvSeqlen) : nsk;
-                noSkipKvS = static_cast<uint32_t>(nsk);
-                kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
-                notNextMask = false;
-            } else {
-                noSkipKvS = kvSeqlen;
-                kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
+            if (!notNextMask) {
+                const int64_t rightOrigin = seqDiff + windowSizeRight;
+                windowSizeRightStartLen = qBlockBase + rightOrigin;
+                // Exclusive upper bound: the inclusive end of the last row + 1.
+                windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
+                const int64_t endKey = AscendC::Std::min(kvLength,
+                    AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                noSkipKvS = static_cast<uint32_t>(endKey);
+                if (windowSizeRightStartLen < 0) {
+                    invalidPrefixEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
+                        AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                }
             }
-            if (windowSizeLeftEndLen > static_cast<int32_t>(kvSeqlen) && windowSizeLeft != WINDOW_SIZE_INT_MAX) {
-                invalidSuffixStartRow = kvSeqlen - leftPointwindowSizeLeft;
-            } else if (windowSizeRightStartLen < 0 && windowSizeRight != WINDOW_SIZE_INT_MAX) {
-                invalidPrefixEndRow = -leftPointwindowSizeRight;
-            }
+            kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
         } else {
             noSkipKvS = kvSeqlen;
             kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
@@ -819,11 +819,15 @@ class FAInferKernel {
         uint32_t kvLoopNumTotalNew = 0;
         uint32_t kvSLoopNumTotalOld = kvSLoopNumTotal;
         if (appendKVFlag) {
-            kvStartOld = CeilDiv(kvSeqlenOld, kvStackLen);
             kvSLoopNumTotalOld =
                 CeilDiv(AscendC::Std::max((int64_t)0, AscendC::Std::min(static_cast<int64_t>(noSkipKvS),
                                                                         static_cast<int64_t>(kvSeqlenOld))),
                         (int64_t)kvStackLen);
+            // Phase indices count the old blocks actually issued after causal
+            // clipping. The logical new-KV origin remains kvSeqlenOld below.
+            // Using ceil(oldLength / tile) here skips new blocks when the
+            // writeback owner's Q tile has a fully masked old-KV prefix.
+            kvStartOld = kvSLoopNumTotalOld;
             kvLoopNumTotalNew = CeilDiv(kvNewSeqlen, kvStackLen);
             kvSLoopNumTotal = kvSLoopNumTotalOld + kvLoopNumTotalNew;
             kvEnd = kvSLoopNumTotal;
@@ -974,10 +978,10 @@ class FAInferKernel {
                                           desc.taskStateSlot, qkReady, softmaxPingPongFlag, diagS0, doTriUMask,
                                           isSplitKV);
                 } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
-                    // StartLen can be negative when Sq>>Sk; compare in int32 so
+                    // StartLen can be negative when Sq>>Sk; compare in int64 so
                     // it is not promoted against uint32 kvSStartIdx/kvSEndIdx.
-                    int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
-                    int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
+                    int64_t kvStartI = static_cast<int64_t>(kvSStartIdx);
+                    int64_t kvEndI = static_cast<int64_t>(kvSEndIdx);
                     bool doTriUPreMask =
                         (maskType != 2 || notPreMask)
                             ? false

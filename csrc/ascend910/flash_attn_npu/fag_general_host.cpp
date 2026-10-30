@@ -1,4 +1,5 @@
 #include "fag_general_host.hpp"
+#include "../attention_window.h"
 
 #include <cstring>
 #include <deque>
@@ -78,14 +79,13 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
     uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
-    // Empty K/V produces a constant zero output. There is no attention work
-    // for the tiler, whose mask preprocessing requires at least one element.
-    if (k.numel() == 0) {
+    // Empty attention has zero derivatives. FAG tiling divides by the number
+    // of KV work blocks, which is zero when the packed K tensor is empty.
+    if (q.numel() == 0 || k.numel() == 0) {
         dq.zero_();
         dk.zero_();
         dv.zero_();
-        auto softmax_d =
-            at::zeros({batch_size, static_cast<int64_t>(nheads), max_seqlen_q}, q.options().dtype(at::kFloat));
+        auto softmax_d = torch::zeros({batch_size, nheads, max_seqlen_q}, q.options().dtype(at::kFloat));
         return {dq, dk, dv, softmax_d};
     }
 
@@ -102,11 +102,9 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
 
     bool has_dropout = (p_dropout > 0.0f);
     fagInfo.keepProb = 1.0f - p_dropout;
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = window_size_left < 0 && window_size_right == 0;
-    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    bool is_local = false;
+    fa_window::NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left,
+                                       window_size_right, is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
