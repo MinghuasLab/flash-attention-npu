@@ -66,11 +66,14 @@ class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, Lse
         }
         if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
             // init lseOut with inf
-            uint32_t count = qSThisSubBlock * qNThisSubBlock;
-            AscendC::Duplicate(lseOutUbTensor, LSE_OUT_INI, count);
+            uint32_t lseHeadStride = layoutLse.shape(1);
+            AscendC::Duplicate(lseOutUbTensor, LSE_OUT_INI, qSThisSubBlock);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-            AscendC::DataCopyPad(gLse, lseOutUbTensor, AscendC::DataCopyExtParams(1, count * sizeof(float), 0, 0, 0));
+            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
+                AscendC::DataCopyPad(gLse[qNIdx * lseHeadStride], lseOutUbTensor,
+                                     AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }

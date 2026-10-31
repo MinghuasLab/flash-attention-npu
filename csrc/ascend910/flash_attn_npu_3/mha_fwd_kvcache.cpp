@@ -650,20 +650,15 @@ class FAInferKernel {
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
             prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
             if constexpr (!PAGED_CACHE_FLAG) {
-                prevKvSeqlenSum =
-                    appendKVFlag ? BIdx * kvCacheSeqlen : static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                prevKvSeqlenSum = (kvSeqlenAllocated != 0) ? static_cast<uint64_t>(BIdx) * kvSeqlenAllocated
+                                                           : static_cast<uint64_t>(gActualKvseqlen.GetValue(BIdx));
             }
         } else {
             // BSND: Q/O/LSE per-batch storage step is maxQSeqlen.
             prevQSeqlenSum = BIdx * maxQSeqlen;
             if constexpr (!PAGED_CACHE_FLAG) {
-                if (appendKVFlag) {
-                    // Capacity-aligned cache: cache batch occupies [BIdx * kvCacheSeqlen, ...).
-                    prevKvSeqlenSum = BIdx * kvCacheSeqlen;
-                } else {
-                    // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
-                    prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(0)) * BIdx;
-                }
+                // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
+                prevKvSeqlenSum = static_cast<uint64_t>(BIdx) * kvSeqlenAllocated;
             }
         }
 
@@ -852,6 +847,13 @@ class FAInferKernel {
         uint32_t stackSeqTile = kvStackLen;
         uint32_t stackSeqTilePad = kvStackLen;
         uint32_t taskStackCount = 0;
+        // Append's fully-masked old stacks form one contiguous index gap between the
+        // last visible old stack and the first new stack; clamp the range end and
+        // jump the gap so the loop only enumerates visible stacks.
+        const uint32_t kvEndOld = AscendC::Std::min(kvSLoopNumTotalOld, kvEnd);
+        if (kvEnd <= kvStartOld) {
+            kvEnd = kvEndOld;
+        }
         const bool isEmptyTask = kvStart >= kvEnd;
         if (__builtin_expect(isEmptyTask, false)) {
 #ifdef __DAV_C220_VEC__
@@ -918,9 +920,13 @@ class FAInferKernel {
         }
         for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + pipelineDrain; ++kvSIdx) {
             if (kvSIdx < kvEnd) {
+                if (kvSIdx >= kvEndOld && kvSIdx < kvStartOld) {
+                    kvSIdx = kvStartOld;
+                }
                 StackDescriptor& desc = descriptors[issuedStackCount % STACK_SLOTS];
                 const bool isAppendBlock = appendKVFlag && (kvSIdx >= kvStartOld);
-                const bool doCopyback = isAppendBlock && (qSBlockIdx == (BIdx % curQSBlockNum));
+                const uint32_t copybackBlockIdx = (maskType == 1U) ? (curQSBlockNum - 1U) : (BIdx % curQSBlockNum);
+                const bool doCopyback = isAppendBlock && (qSBlockIdx == copybackBlockIdx);
                 const uint32_t kvSIdxLocal = isAppendBlock ? kvSIdx - kvStartOld : kvSIdx;
                 auto gQKSrc = isAppendBlock ? gKNew : gK;
                 const uint64_t qkSrcOffset = isAppendBlock ? gmOffsetKNew : gmOffsetK;

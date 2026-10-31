@@ -330,9 +330,10 @@ std::vector<at::Tensor> mha_fwd(
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
     const int num_heads_k = k.dim() == 3 ? k.size(1) : (is_bnsd ? k.size(1) : k.size(2));
-    // BNSD only: the allocated KV sequence length (k.size(2)) is the KV head-plane
-    // pitch in tokens. Unused (0) for BSND / TND.
-    const int64_t kv_seqlen_allocated = is_bnsd ? static_cast<int64_t>(k.size(2)) : 0;
+    // Allocated KV sequence length is the batch stride in BSND/TND and the
+    // head-plane pitch in BNSD. Used cache lengths are not storage strides.
+    const int64_t kv_seqlen_allocated =
+        is_bnsd ? static_cast<int64_t>(k.size(2)) : (k.dim() == 4 ? static_cast<int64_t>(k.size(1)) : 0);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     if (paged_KV) {
         TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
