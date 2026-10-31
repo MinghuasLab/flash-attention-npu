@@ -211,6 +211,7 @@ test_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv",
     test_cases,
@@ -433,6 +434,7 @@ def test_fa_kvcache_ops(
     return
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
 def test_fa_kvcache_fd_num_splits(num_splits):
     """The BSND paged-KV FD path supports auto, no-split and fixed-split schedules."""
@@ -471,6 +473,7 @@ def test_fa_kvcache_fd_num_splits(num_splits):
     assert_fa_close(softmax_lse_npu, lse_ref, lse_pt, name=f"softmax_lse num_splits={num_splits}")
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("num_splits", [0, 1])
 def test_fa_kvcache_fd_append_tail_regression(num_splits):
     """The final core must compute and write back the separate new-KV block."""
@@ -529,6 +532,7 @@ def test_fa_kvcache_fd_append_tail_regression(num_splits):
     assert_fa_close(lse, lse_ref, lse_pt, name="append-tail softmax_lse")
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("num_splits", [0, 1, 20])
 def test_fa_kvcache_fd_gqa_tail_regression(num_splits):
     """Uneven batches and a partial head group must not lose the final KV tasks."""
@@ -705,6 +709,7 @@ func_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi",
     func_cases,
@@ -962,6 +967,7 @@ varlen_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi",
     varlen_cases,
@@ -1164,6 +1170,7 @@ def test_fa_varlen_ops(
         assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 def test_fa_varlen_paged_swa_overprovisioned_block_table():
     """V2 forward must use the physical block-table row width for paging."""
 
@@ -1253,6 +1260,7 @@ def test_fa_varlen_paged_swa_overprovisioned_block_table():
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 def test_fa_varlen_swa_invalid_prefix_clear_regression():
     """ATK SWA #146: guard multi-head output clearing for q_len > kv_len."""
 
@@ -1453,6 +1461,7 @@ class TestVarlenValidation:
         if native:
             torch.npu.synchronize()
 
+    @pytest.mark.golden_api("flash_attn_varlen_func")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("execution", ["eager", "fake", "compile"])
     def test_valid_swa_varlen(self, api, dtype, execution):
@@ -1510,6 +1519,7 @@ flash_attn_func_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
     flash_attn_func_bnsd_cases,
@@ -1541,6 +1551,7 @@ flash_attn_with_kvcache_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen",
     flash_attn_with_kvcache_bnsd_cases,

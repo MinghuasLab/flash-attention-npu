@@ -200,6 +200,12 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "golden_api(name): interface name used to namespace CPU golden artifacts"
+    )
+
+
 def pytest_report_header(config):
     n = config.getoption("--random-sample") or 0
     if n <= 0:
@@ -276,6 +282,15 @@ def _seed_per_case(request):
         torch.npu.manual_seed(seed)
     os.environ["GOLDEN_CACHE_NODEID"] = request.node.nodeid
     os.environ["GOLDEN_CACHE_TEST_FILE"] = str(request.path)
+    api_marker = request.node.get_closest_marker("golden_api")
+    if api_marker is not None:
+        if (
+            len(api_marker.args) != 1
+            or not isinstance(api_marker.args[0], str)
+            or not api_marker.args[0].strip()
+        ):
+            raise ValueError("golden_api marker requires one interface-name string")
+        os.environ["GOLDEN_CACHE_API_NAME"] = api_marker.args[0]
     state = begin()
     set_current_state(state)
     import tests.common.golden_cache as golden_cache
@@ -341,3 +356,4 @@ def _seed_per_case(request):
     set_current_state(None)
     os.environ.pop("GOLDEN_CACHE_NODEID", None)
     os.environ.pop("GOLDEN_CACHE_TEST_FILE", None)
+    os.environ.pop("GOLDEN_CACHE_API_NAME", None)
