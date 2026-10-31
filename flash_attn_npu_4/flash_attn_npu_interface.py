@@ -5,6 +5,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from .catlass_dsl import utils as _catlass_utils
+
 # isort: off
 # We need to import the kernels after importing torch
 from . import flash_attn_npu_4  # Registers operators with PyTorch
@@ -85,17 +87,9 @@ def _paged_kv_inner_layout(x):
     if x is None or x.dim() != 4:
         return None
     page_size, num_heads, head_dim = x.shape[1:]
-    if (
-        x.stride(1) == num_heads * head_dim
-        and x.stride(2) == head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
         return "BBND"
-    if (
-        x.stride(1) == head_dim
-        and x.stride(2) == page_size * head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
         return "BNBD"
     return None
 
@@ -1188,6 +1182,20 @@ def flash_attn_func(
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen).
     """
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        raise NotImplementedError(
+            "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1330,6 +1338,19 @@ def flash_attn_varlen_func(
             (nheads, total_q) for varlen. The logsumexp of each row of the matrix
             QK^T * scaling (e.g., log of the softmax normalization factor).
     """
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        raise NotImplementedError(
+            "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     return FlashAttnVarlenFunc.apply(
         q,
         k,
