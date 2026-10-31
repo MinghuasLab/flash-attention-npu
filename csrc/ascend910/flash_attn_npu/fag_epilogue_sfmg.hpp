@@ -299,6 +299,32 @@ class BlockEpilogue<EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT_>, ElementVecDtype, Tili
         }
     }
 
+    // Partial planes use the same row order as sfmgWorkspaceGm. Each tile
+    // writes a disjoint plane, and every core sums planes in increasing order.
+    CATLASS_DEVICE
+    void ReducePartials(GM_ADDR partials, int64_t rows, int64_t parts, uint32_t cores)
+    {
+        GlobalTensor<float> source;
+        source.SetGlobalBuffer((__gm__ float*)partials);
+        auto sum = cast1Buf.Get<float>();
+        auto input = cast2Buf.Get<float>();
+        constexpr int64_t chunk = 12288;
+        const int64_t size = rows * 8;
+        for (int64_t offset = cBlockIdx * chunk; offset < size; offset += cores * chunk) {
+            uint32_t count = static_cast<uint32_t>(AscendC::Std::min(chunk, size - offset));
+            AscendC::Duplicate(sum, 0.0f, count);
+            for (int64_t part = 0; part < parts; ++part) {
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopy(input, source[part * size + offset], count);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::Add(sum, sum, input, count);
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopy(sfmgWorkspaceGm[offset], sum, count);
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+    }
+
   protected:
     /// Data members
     constexpr static int64_t BLOCK_BYTE_SIZE = 32;

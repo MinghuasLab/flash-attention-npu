@@ -103,6 +103,10 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
 
     float keepProb;
     float scaleValue;
+    bool scaleDsBeforeCast = false;
+    uint32_t sfmgPass = 0;
+    int64_t sfmgRows = 0;
+    GlobalTensor<float> sfmgPartialsGm;
     float softcapValue;
     int64_t alibiSlopesBatchStride = 0;
     int64_t s1Token;
@@ -304,7 +308,8 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         compressMode = tilingData->attenMaskCompressMode;
 
         // From tiling: cu[b - 1] would undercount after used-length tail trimming.
-        int64_t sfmgOutputSize = static_cast<int64_t>(tilingData->sfmgNormalAxisSize) * 8;
+        sfmgRows = tilingData->sfmgNormalAxisSize;
+        int64_t sfmgOutputSize = sfmgRows * 8;
 
         int64_t dqWorkSpaceOffset = tilingData->dqWorkSpaceOffset;
         int64_t dkWorkSpaceOffset = tilingData->dkWorkSpaceOffset;
@@ -858,7 +863,11 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
         if (preS1Idx != curS1Idx) {
             preS1Idx = curS1Idx;
-            AscendC::DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset + curS1Idx * s1VecSize * 8], s1ExtendSubGraph * 8);
+            if (sfmgPass == 1) {
+                AscendC::Duplicate(sfmgClc3, 0.0f, s1ExtendSubGraph * 8);
+            } else {
+                AscendC::DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset + curS1Idx * s1VecSize * 8], s1ExtendSubGraph * 8);
+            }
         }
 
         LocalTensor<uint8_t> dropMaskU8 = unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), U8Begin);
@@ -905,7 +914,7 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
         // directly from FP32 P*dP. dot(dO, rounded_O) loses the small softmax
         // derivative for concentrated distributions (especially BF16).
         int64_t fullKeyCount = INPUT_LAYOUT == TND ? dbParam.actualS2Len : s2;
-        if (dbParam.s2oIdx == 0 && curS2Idx == 0 && fullKeyCount <= s2Extend) {
+        if (sfmgPass == 1 || (dbParam.s2oIdx == 0 && curS2Idx == 0 && fullKeyCount <= s2Extend)) {
             constexpr uint32_t partialStride = 128;
             LocalTensor<float> rowSums = unifiedBuffer.GetWithOffset<float>(512, 181 * 1024);
             LocalTensor<float> products = unifiedBuffer.GetWithOffset<float>(1536, 183 * 1024);
@@ -931,6 +940,14 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
                 AscendC::Brcb(sfmgClc3[first * 8], rowSums, static_cast<uint8_t>(CeilDiv(rows, 8)), {1, 8});
                 AscendC::PipeBarrier<PIPE_V>();
             }
+        }
+
+        if (sfmgPass == 1) {
+            const int64_t part = dbParam.s2oIdx * CeilDiv(s2CvInner, VEC_S2_LEN) + curS2Idx;
+            const int64_t offset = part * sfmgRows * 8 + sfmgOffset + curS1Idx * s1VecSize * 8;
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopy(sfmgPartialsGm[offset], sfmgClc3, s1ExtendSubGraph * 8);
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
 
         uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
@@ -990,6 +1007,12 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
             AscendC::PipeBarrier<PIPE_V>();
         }
 
+        // Fold the softcap/softmax scale into the FP32 derivative before its
+        // sole low-precision rounding. Postprocessing must not scale again.
+        if (scaleDsBeforeCast) {
+            AscendC::Muls(vecClc1Buffer, vecClc1Buffer, scaleValue, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         LocalTensor<T1> vecCopyOutBuffer = vecClc1Buffer.template ReinterpretCast<T1>();
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);

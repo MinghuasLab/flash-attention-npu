@@ -761,14 +761,17 @@ class FAInferKernel {
         int32_t invalidPrefixEndRow = qSeqlen; // qSeqlen disables prefix clearing.
         bool startsWithMaskTile = false;
         bool startsWithMaskThenNomaskFlag = false;
-        if (maskType == 1U) {
+        // Host dispatch and the metadata producer select the same mask family.
+        // Keep finite-window clipping out of full/causal kernel instantiations;
+        // the signed 64-bit window bounds remain intact in the SWA family.
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
             int64_t diffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
             int64_t causalKvEnd = static_cast<int64_t>((qSBlockIdx + 1U) * curQSBlockTile) + diffS;
             causalKvEnd = causalKvEnd < 0 ? 0 : causalKvEnd;
             noSkipKvS = AscendC::Std::min(causalKvEnd, static_cast<int64_t>(kvSeqlen));
             kvSLoopNumTotal = CeilDiv(noSkipKvS, MAX_KV_STACK_LEN);
             invalidPrefixEndRow = qSeqlen > kvSeqlen ? static_cast<int32_t>(qSeqlen - kvSeqlen) : invalidPrefixEndRow;
-        } else if (maskType == 2U) {
+        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             // Apply the API's bottom-right window to the actual sequence.
             // Do arithmetic in signed 64-bit before clipping or converting to
             // block indices; declared ragged bounds can be much larger than Q/K.

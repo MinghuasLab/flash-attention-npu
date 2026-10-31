@@ -168,6 +168,9 @@ struct FAGKernelParams {
     GM_ADDR alibi_slopes;
     GM_ADDR workspace;
     GM_ADDR tiling;
+    GM_ADDR sfmgPartials = nullptr;
+    uint32_t sfmgPass = 0;
+    bool scaleDsBeforeCast = false;
     // Methods
     CATLASS_DEVICE
     FAGKernelParams() {}

@@ -146,15 +146,20 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
         decltype(key) key;
         at::Tensor tensor;
         uint64_t workspace;
+        int64_t sfmgRows;
+        int64_t sfmgParts;
     };
     static thread_local std::deque<Entry> tilingCache;
     at::Tensor tiling_gpu_tensor;
     uint64_t workspaceSize = 0;
+    int64_t sfmgRows = 0, sfmgParts = 0;
     if (uniformPrefixes) {
         for (const auto& entry : tilingCache) {
             if (entry.key == key) {
                 tiling_gpu_tensor = entry.tensor;
                 workspaceSize = entry.workspace;
+                sfmgRows = entry.sfmgRows;
+                sfmgParts = entry.sfmgParts;
                 break;
             }
         }
@@ -190,16 +195,29 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
         std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
         tiling_gpu_tensor = tiling_cpu_tensor.to(q.device());
         workspaceSize = static_cast<uint64_t>(fagTilingData.workspaceSize);
+        sfmgRows = fagTilingData.sfmgNormalAxisSize;
+        sfmgParts = fagTilingData.s2Outer * ((fagTilingData.s2CvInner + 255) / 256);
+        // Without a mask, a short KV row is fully contained in one vector
+        // tile. The epilogue already replaces D with its FP32 P*dP sum.
+        if (!has_attn_mask && fagTilingData.kvSeqlen <= 256) sfmgParts = 0;
         if (uniformPrefixes) {
             if (tilingCache.size() == 32)
                 tilingCache.pop_front();
-            tilingCache.push_back({key, tiling_gpu_tensor, workspaceSize});
+            tilingCache.push_back({key, tiling_gpu_tensor, workspaceSize, sfmgRows, sfmgParts});
         }
     }
 
     TORCH_CHECK(workspaceSize > 0, "launch_fag_general: invalid workspace size from tiling.");
     at::Tensor workspace_tensor =
         at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+
+    // Each key tile owns one FP32 row sum, including eight replicated lanes.
+    // Zero sparse/skipped tiles and reduce in key order; no atomic reduction,
+    // so deterministic backward remains deterministic across cores.
+    at::Tensor sfmg_partials;
+    if (sfmgParts > 1) {
+        sfmg_partials = at::zeros({sfmgParts, sfmgRows, 8}, q.options().dtype(at::kFloat));
+    }
 
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
@@ -306,6 +324,8 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
     gen_args.dvDevice = dvDevice;
     gen_args.workspaceDevice = workspaceDevice;
     gen_args.tilingDevice = tilingDevice;
+    gen_args.sfmgPartialsDevice = sfmg_partials.defined()
+        ? reinterpret_cast<uint8_t*>(sfmg_partials.data_ptr<float>()) : nullptr;
 
     if (is_varlen_q) {
         launch_fag_general_dispatch<TND>(is_bf16, gen_args);

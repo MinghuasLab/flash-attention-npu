@@ -717,6 +717,21 @@ class FlashAttentionScoreGrad {
         cBlockIdx = cCubeBlockIdx * 2;
         Init(params, fagTilingData);
 
+        if (params.sfmgPass == 1) {
+            int64_t task = 0;
+            while (blockStartIdx != -1) {
+                bool ready = false;
+                int64_t startCore = 0;
+                while (!ready) ready = CalcValidBlock(blockStartIdx, startCore, dbParams[0]);
+                if (dbParams[0].blockId == -1) break;
+                dbParams[0].taskId = task++;
+                ComputeMM1(dbParams[0]);
+                AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_C1_V1_FLAG[dbParams[0].taskId % 2]);
+                AscendC::CrossCoreWaitFlag(SYNC_V1_C2_FLAG[dbParams[0].taskId % 2]);
+            }
+            return;
+        }
+
         bool isFinish = false;
         int64_t startCoreId = 0;
         while (!isFinish) {
@@ -796,8 +811,18 @@ class FlashAttentionScoreGrad {
         AscendC::TPipe pipeSoftmaxGrad;
         EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, params.cu_seq_qlen,
                                         params.workspace, params.tiling);
-        epilogueFagSfmg();
+        if (params.sfmgPass != 1) {
+            if (params.sfmgPartials != nullptr) {
+                __gm__ FAGTilingData* td = reinterpret_cast<__gm__ FAGTilingData*>(params.tiling);
+                epilogueFagSfmg.ReducePartials(params.sfmgPartials, td->sfmgNormalAxisSize,
+                    td->s2Outer * ((td->s2CvInner + 255) / 256), td->coreNum);
+            } else {
+                epilogueFagSfmg();
+            }
+        }
         pipeSoftmaxGrad.Destroy();
+        // The task scheduler may assign a row to a different core than SFMG.
+        AscendC::SyncAll();
 
         // 给L1custom的变量
         cBlockIdx = AscendC::GetBlockIdx();
@@ -816,6 +841,26 @@ class FlashAttentionScoreGrad {
             resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
             params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.seqUsedQ, params.seqUsedKv,
             params.dq, params.dk, params.dv, params.alibi_slopes, params.workspace, params.tiling, unifiedBuffer);
+
+        epilogueFAGSabVec.sfmgPass = params.sfmgPass;
+        epilogueFAGSabVec.scaleDsBeforeCast = params.scaleDsBeforeCast;
+        epilogueFAGSabVec.sfmgPartialsGm.SetGlobalBuffer((__gm__ float*)params.sfmgPartials);
+        if (params.sfmgPass == 1) {
+            int64_t task = 0;
+            while (blockStartIdx != -1) {
+                bool ready = false;
+                int64_t startCore = 0;
+                while (!ready) ready = CalcValidBlock(blockStartIdx, startCore, dbParams[0]);
+                if (dbParams[0].blockId == -1) break;
+                dbParams[0].taskId = task++;
+                AscendC::CrossCoreWaitFlag(SYNC_C1_V1_FLAG[dbParams[0].taskId % 2]);
+                epilogueFAGSabVec(dbParams[0]);
+                AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_V1_C2_FLAG[dbParams[0].taskId % 2]);
+            }
+            AscendC::SyncAll();
+            pipeVec.Destroy();
+            return;
+        }
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace,
                                             params.tiling, unifiedBuffer);
@@ -875,6 +920,7 @@ class FlashAttentionScoreGrad {
         AscendC::TPipe pipePost;
         EpilogueFAGPost epilogueFagPost(resource, &pipePost, params.dq, params.dk, params.dv, params.workspace,
                                         params.tiling);
+        if (params.scaleDsBeforeCast) epilogueFagPost.scaleValue = 1.0f;
         epilogueFagPost();
         pipePost.Destroy();
     }
@@ -1024,7 +1070,8 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
                                GM_ADDR drop_mask, GM_ADDR atten_mask, GM_ADDR softmax_lse, GM_ADDR cu_seq_qlen,
                                GM_ADDR cu_seq_kvlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_, GM_ADDR dk_,
                                GM_ADDR dv_, GM_ADDR alibi_slopes_, GM_ADDR workspace, GM_ADDR tiling,
-                               GM_ADDR ptrDump = nullptr)
+                               GM_ADDR ptrDump = nullptr, GM_ADDR sfmgPartials = nullptr,
+                               uint32_t sfmgPass = 0, bool scaleDsBeforeCast = false)
 {
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
@@ -1146,6 +1193,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
         dout,         q,        k,         v,   out, drop_mask, atten_mask,    softmax_lse, cu_seq_qlen,
         cu_seq_kvlen, seqUsedQ, seqUsedKv, dq_, dk_, dv_,       alibi_slopes_, workspace,   tiling};
 
+    params.sfmgPartials = sfmgPartials;
+    params.sfmgPass = sfmgPass;
+    params.scaleDsBeforeCast = scaleDsBeforeCast;
     // call kernel
     FAGKernel flashAttn;
     flashAttn(params);

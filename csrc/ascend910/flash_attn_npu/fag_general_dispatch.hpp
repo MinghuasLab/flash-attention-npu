@@ -52,6 +52,7 @@ struct FagGeneralLaunchArgs {
     uint8_t *alibiSlopesDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
+    uint8_t *sfmgPartialsDevice = nullptr;
 };
 
 // Per-(dtype, layout) implementation, defined in
