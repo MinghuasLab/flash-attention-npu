@@ -775,12 +775,12 @@ class FAInferKernel {
                 const int64_t leftOrigin = seqDiff - windowSizeLeft;
                 windowSizeLeftStartLen = qBlockBase + leftOrigin;
                 windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
-                const int64_t firstKey = AscendC::Std::min(kvLength,
-                    AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                const int64_t firstKey =
+                    AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
                 kvStart = static_cast<uint32_t>(firstKey) / kvStackLen;
                 if (windowSizeLeftEndLen > kvLength) {
-                    invalidSuffixStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                        AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
+                    invalidSuffixStartRow = static_cast<int32_t>(
+                        AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
                 }
             }
             if (!notNextMask) {
@@ -788,12 +788,12 @@ class FAInferKernel {
                 windowSizeRightStartLen = qBlockBase + rightOrigin;
                 // Exclusive upper bound: the inclusive end of the last row + 1.
                 windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
-                const int64_t endKey = AscendC::Std::min(kvLength,
-                    AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                const int64_t endKey =
+                    AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
                 noSkipKvS = static_cast<uint32_t>(endKey);
                 if (windowSizeRightStartLen < 0) {
-                    invalidPrefixEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                        AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                    invalidPrefixEndRow =
+                        static_cast<int32_t>(AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, -rightOrigin)));
                 }
             }
             kvSLoopNumTotal = CeilDiv(noSkipKvS, kvStackLen);
