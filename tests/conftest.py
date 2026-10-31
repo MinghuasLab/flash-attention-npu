@@ -18,6 +18,7 @@ import random
 import functools
 import time
 import pytest
+from pathlib import Path
 from collections import defaultdict
 from tests.common.timing import add, begin, finish, set_current_state
 
@@ -174,6 +175,10 @@ def _wrap_prepare_functions(module):
 
 
 def pytest_runtest_setup(item):
+    # CATLASS tests exercise Dynamo tracing of the imported entry points.
+    # Keep timing wrappers out of those graphs; their fixtures manage seeds.
+    if item.path.is_relative_to(Path(__file__).parent / "catlass_dsl"):
+        return
     _wrap_kernel_functions(item.module)
     _wrap_reference_functions(item.module)
     _wrap_prepare_functions(item.module)

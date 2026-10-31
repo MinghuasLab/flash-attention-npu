@@ -1,5 +1,11 @@
 global-exclude .*
 prune .github
+prune .cache
+prune tests
+prune build
+global-exclude __pycache__ *.py[cod]
+include flash_attn_npu_4/catlass_dsl/README.md
+recursive-include examples *.py
 
 include csrc/fag_tensor_strides.h
 
