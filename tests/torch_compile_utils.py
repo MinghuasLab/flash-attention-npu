@@ -165,9 +165,11 @@ def run_metadata_compile_test(
                 call_kwargs["cache_seqlens"] = cache
             else:
                 call_kwargs["seqused_k"] = cache
-            return api.get_scheduler_metadata(
-                **call_kwargs,
-            )
+            metadata = api.get_scheduler_metadata(**call_kwargs)
+            # Exercise tensor copies in both eager and compiled metadata paths.
+            copied = torch.empty_like(metadata)
+            copied.copy_(metadata.clone())
+            return copied
 
         eager = fn(cache_seqlens)
 
@@ -180,12 +182,6 @@ def run_metadata_compile_test(
 
         if expected_sizes is not None:
             assert eager.numel() == expected_sizes[case_name]
-
-        eager_fp = getattr(
-            eager,
-            "_fa_scheduler_params",
-            None,
-        )
 
         torch._dynamo.reset()
 
@@ -206,14 +202,6 @@ def run_metadata_compile_test(
         assert compiled.stride() == eager.stride()
         assert compiled.is_contiguous() == eager.is_contiguous()
         assert compiled.requires_grad == eager.requires_grad
-
-        compiled_fp = getattr(
-            compiled,
-            "_fa_scheduler_params",
-            None,
-        )
-
-        assert (compiled_fp is None) == (eager_fp is None)
 
         observed_sizes[case_name] = compiled.numel()
 

@@ -3,7 +3,6 @@
 
 from typing import Optional, Tuple, Union
 
-import math
 import torch
 
 # isort: off
@@ -1763,12 +1762,19 @@ def flash_attn_with_kvcache(
         scheduler_metadata: Optional scheduler metadata precomputed on the AICPU by
             get_scheduler_metadata. When given, the forward consumes the AICPU-computed
             tiling (and optional mask) directly and skips the host-side computation
-            (which would otherwise sync on cache_seqlens). The creation arguments are
-            validated against this call: causal / window_size / softcap / softmax_scale /
-            num_splits must match, and max_seqlen_k must equal the effective KV cache capacity seen
-            by the forward (block_table: page_block_size * block_table.shape[1];
-            otherwise k_cache.shape[1]) — do not overprovision it. Pass the tensor
-            returned by get_scheduler_metadata unchanged (do not clone/copy it).
+            (which would otherwise sync on cache_seqlens). This is a plain byte
+            tensor: clone() and copy_() are supported without Python attributes.
+            The caller must keep the schedule compatible with this call, including
+            mask/window, layout, paging geometry, sequence bounds and num_splits.
+            softmax_scale, softcap and the ALiBi batch stride are baked into this
+            metadata and must also match the forward. max_seqlen_k must equal the
+            KV cache capacity (paged: page_size * block_table.shape[1]; dense:
+            the KV sequence dimension), not an overprovisioned bound.
+            The backend checks dtype, device, contiguity and byte size, but does
+            not validate the metadata contents against the call's arguments.
+            For graph replay, copy updates into the captured buffer on the replay
+            stream (or establish a stream dependency). Keep the buffer address
+            and captured kernel configuration fixed; recapture when it changes.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -1789,19 +1795,6 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    if scheduler_metadata is not None:
-        _validate_scheduler_metadata(
-            scheduler_metadata,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            softmax_scale=softmax_scale,
-            seqlen_q=q.shape[1],
-            num_splits=num_splits,
-            block_table=block_table,
-            k_cache=k_cache,
-            alibi_slopes=alibi_slopes,
-        )
     # _detect_layout picks BNSD only from matching strides; paged KV is never BNSD.
     bsnd_seqlen_k = k_cache.shape[1]
     layout, q, k_cache, v_cache, out_transposed = _detect_layout(
@@ -1843,68 +1836,6 @@ def flash_attn_with_kvcache(
         layout,
     )
     return (out, softmax_lse) if return_softmax_lse else out
-
-
-def _validate_scheduler_metadata(
-    scheduler_metadata,
-    *,
-    causal,
-    window_size,
-    softcap,
-    softmax_scale,
-    seqlen_q,
-    num_splits,
-    block_table,
-    k_cache,
-    alibi_slopes=None,
-):
-    """Reject scheduler_metadata created with arguments that do not match this
-    call; the AICPU-written tiling bakes in the mask layout, paged geometry and
-    softcap-divided softmax scale, including the requested split schedule."""
-    params = getattr(scheduler_metadata, "_fa_scheduler_params", None)
-    if params is None:
-        raise RuntimeError(
-            "scheduler_metadata has no creation-argument fingerprint; it must be "
-            "the unchanged tensor returned by get_scheduler_metadata"
-        )
-    expected = {
-        "causal": bool(causal),
-        "window_size": (int(window_size[0]), int(window_size[1])),
-        "softcap": float(softcap),
-        "softmax_scale": float(softmax_scale),
-        "max_seqlen_q": int(seqlen_q),
-        "num_splits": int(num_splits),
-        # The kernel reads the per-batch ALiBi stride from the baked tiling, so
-        # it must match how this call indexes alibi_slopes.
-        "alibi_slopes_batch_stride": (
-            0
-            if alibi_slopes is None
-            else (int(alibi_slopes.shape[1]) if alibi_slopes.dim() == 2 else 0)
-        ),
-    }
-    if block_table is not None:
-        # The fwd mask derivation and the block-table row stride both use the
-        # paged capacity (page_block_size * max_num_blocks_per_seq) as KV bound.
-        expected["page_size"] = int(k_cache.shape[1])
-        expected["max_seqlen_k"] = int(k_cache.shape[1]) * int(block_table.shape[1])
-    else:
-        expected["page_size"] = None
-        expected["max_seqlen_k"] = int(k_cache.shape[1])
-    mismatches = []
-    for key, call_val in expected.items():
-        meta_val = params.get(key, "<missing>")
-        # softcap/softmax_scale are baked into the tiling as float32; allow
-        # ulp-level differences from the resolution formula (h ** -0.5 vs 1 / h ** 0.5).
-        if key in ("softcap", "softmax_scale") and isinstance(meta_val, float):
-            same = math.isclose(meta_val, call_val, rel_tol=1e-6)
-        else:
-            same = meta_val == call_val
-        if not same:
-            mismatches.append(f"{key}: metadata={meta_val!r} vs call={call_val!r}")
-    if mismatches:
-        raise ValueError(
-            "scheduler_metadata arguments do not match this call: " + "; ".join(mismatches)
-        )
 
 
 # Real metadata contract:
@@ -1962,21 +1893,6 @@ def _get_scheduler_metadata_op(
         alibi_slopes_batch_stride,
         num_splits,
     )
-    # Keep this side effect inside the opaque custom op so Dynamo does not
-    # trace the setattr while still attaching the runtime fingerprint.
-    if softmax_scale is None:
-        softmax_scale = headdim ** (-0.5)
-    scheduler_metadata._fa_scheduler_params = {
-        "causal": bool(causal),
-        "window_size": (int(window_size_left), int(window_size_right)),
-        "softcap": float(softcap),
-        "softmax_scale": float(softmax_scale),
-        "page_size": None if page_size is None else int(page_size),
-        "max_seqlen_q": int(max_seqlen_q),
-        "max_seqlen_k": int(max_seqlen_k),
-        "alibi_slopes_batch_stride": int(alibi_slopes_batch_stride),
-        "num_splits": int(num_splits),
-    }
     return scheduler_metadata
 
 
