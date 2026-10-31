@@ -1327,228 +1327,58 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     assert_fa_close(lse_meta, golden_lse_ref, golden_lse_pt, softcap=softcap, name="meta_lse")
 
 
-@pytest.mark.parametrize(
-    "meta_causal, meta_window, call_causal, call_window",
-    [
-        (False, (-1, -1), True, (-1, -1)),  # call needs a causal mask, metadata has none
-        (False, (-1, -1), False, (128, 128)),  # call needs a band mask, metadata has none
-        (True, (-1, -1), False, (-1, -1)),  # metadata has a causal mask, call needs none
-    ],
-)
+# Metadata contents are a caller-owned schedule contract. Mask, paging and
+# split mismatches are no longer checked through Python Tensor attributes.
+@pytest.mark.parametrize("copy_mode", ["clone", "copy_", "detach"])
+@pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
-    meta_causal, meta_window, call_causal, call_window
-):
-    """Mask-layout mismatches in either direction must be rejected loudly."""
+def test_flash_attn_kvcache_metadata_copied_matches(copy_mode, is_causal):
     data_type = torch.bfloat16
     batch_size, num_heads, kv_heads = 1, 2, 2
-    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
-
+    q_seqlen, kv_seqlen, head_size, block_size = 32, 128, 128, 128
     query = make_random_tensor(
-        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
+        (batch_size, q_seqlen, num_heads, head_size), data_type,
+        low=-1.0, high=1.0, device="npu",
     )
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cu_seqlens_q=None,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        page_size=block_size,
-        is_causal=meta_causal,
-        window_size=meta_window,
+    metadata = _metadata(
+        batch_size=batch_size, q_seqlen=q_seqlen, kv_seqlen=kv_seqlen,
+        num_heads=num_heads, kv_heads=kv_heads, head_size=head_size,
+        cache_seqlens=cache_seqlens, data_type=data_type, page_size=block_size,
+        is_causal=is_causal,
     )
-    with pytest.raises(ValueError, match="do not match this call"):
-        flash_attn_with_kvcache(
-            query,
-            key_cache,
-            value_cache,
-            cache_seqlens=cache_seqlens,
-            page_table=page_table,
-            causal=call_causal,
-            window_size=call_window,
-            rotary_interleaved=False,
-            scheduler_metadata=scheduler_metadata,
-        )
-
-
-@pytest.mark.parametrize(
-    "max_seqlen_k", [128, 2, 192], ids=["max_length", "head_count", "total_tokens"]
-)
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_tnd_max_seqlen_k(monkeypatch, max_seqlen_k):
-    from flash_attn_npu_3 import flash_attn_npu_interface as interface
-
-    scheduler_metadata = torch.empty(0, dtype=torch.uint8)
-    scheduler_metadata._fa_scheduler_params = dict(
-        causal=False,
-        window_size=WINDOW_SIZE,
-        has_softcap=False,
-        varlen_q=True,
-        num_splits=0,
-        max_seqlen_q=16,
-        max_seqlen_k=max_seqlen_k,
-        page_size=None,
-    )
-    query = torch.empty(32, 4, 128)
-    key_cache = torch.empty(192, 2, 128)
-    value_cache = torch.empty_like(key_cache)
-    monkeypatch.setattr(interface, "_flash_attn_forward", lambda *args, **kwargs: (args[0], None))
-    kwargs = dict(
-        cache_seqlens=torch.tensor([64, 128], dtype=torch.int32),
-        cu_seqlens_q=torch.tensor([0, 16, 32], dtype=torch.int32),
-        max_seqlen_q=16,
-        scheduler_metadata=scheduler_metadata,
-    )
-    if max_seqlen_k == 128:
-        assert interface.flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs) is query
+    assert not hasattr(metadata, "_fa_scheduler_params")
+    if copy_mode == "copy_":
+        copied = torch.empty_like(metadata).copy_(metadata)
     else:
-        with pytest.raises(ValueError, match="max_seqlen_k"):
-            interface.flash_attn_with_kvcache(query, key_cache, value_cache, **kwargs)
+        copied = getattr(metadata, copy_mode)()
+    out, lse, *_ = flash_attn_with_kvcache(
+        query, key_cache, value_cache, cache_seqlens=cache_seqlens,
+        page_table=page_table, causal=is_causal, scheduler_metadata=copied,
+        return_softmax_lse=True,
+    )
+    key_cpu, value_cpu = gather_paged_kv_batch(
+        key_cache.cpu(), value_cache.cpu(), page_table.cpu(), kv_seqlen, block_size,
+    )
+    out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+        query.cpu(), key_cpu, value_cpu, head_size ** -0.5,
+        _causal_mask(q_seqlen, kv_seqlen, is_causal), data_type, 0.0,
+    )
+    assert_fa_close(out, out_ref, out_pt, name="copied metadata out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="copied metadata lse")
 
 
+@pytest.mark.parametrize(
+    "invalid, message",
+    [("size", "must exactly match"), ("dtype", "must be a byte tensor"),
+     ("device", "must be an NPU tensor"), ("stride", "must be contiguous")],
+)
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
-    """Paged geometry baked into the tiling must match the call's cache/page table."""
-    data_type = torch.bfloat16
-    batch_size, num_heads, kv_heads = 1, 2, 2
-    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
-
-    query = make_random_tensor(
-        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
-    )
-    key_cache, value_cache, page_table = _make_paged_cache(
-        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
-    )
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-    base = dict(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cu_seqlens_q=None,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-    )
-
-    def call_with(metadata):
-        return flash_attn_with_kvcache(
-            query,
-            key_cache,
-            value_cache,
-            cache_seqlens=cache_seqlens,
-            page_table=page_table,
-            scheduler_metadata=metadata,
-        )
-
-    # Wrong page_size: the page-table page size baked into the tiling differs.
-    bad_page = _metadata(**base, kv_seqlen=kv_seqlen, page_size=2 * block_size)
-    with pytest.raises(ValueError, match="page_size"):
-        call_with(bad_page)
-
-    # Overprovisioned max_seqlen_k: the page-table row stride would not match.
-    overprovisioned = _metadata(**base, kv_seqlen=2 * kv_seqlen, page_size=block_size)
-    with pytest.raises(ValueError, match="max_seqlen_k"):
-        call_with(overprovisioned)
-
-    # Metadata created without paging consumed by a paged call (and vice versa).
-    unpaged = _metadata(**base, kv_seqlen=kv_seqlen, page_size=None)
-    with pytest.raises(ValueError, match="page_size"):
-        call_with(unpaged)
-
-
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
-    """The softcap scheduling flag must match the forward's feature selection."""
-    data_type = torch.bfloat16
-    batch_size, num_heads, kv_heads = 1, 2, 2
-    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
-
-    query = make_random_tensor(
-        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
-    )
-    key_cache, value_cache, page_table = _make_paged_cache(
-        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
-    )
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cu_seqlens_q=None,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        page_size=block_size,
-        softcap=0.0,
-    )
-    with pytest.raises(ValueError, match="softcap"):
-        flash_attn_with_kvcache(
-            query,
-            key_cache,
-            value_cache,
-            cache_seqlens=cache_seqlens,
-            page_table=page_table,
-            softcap=30.0,
-            scheduler_metadata=scheduler_metadata,
-        )
-
-
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
-    """A copied metadata tensor loses its creation-argument fingerprint."""
-    data_type = torch.bfloat16
-    batch_size, num_heads, kv_heads = 1, 2, 2
-    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
-
-    query = make_random_tensor(
-        (batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu"
-    )
-    key_cache, value_cache, page_table = _make_paged_cache(
-        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
-    )
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
-
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cu_seqlens_q=None,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        page_size=block_size,
-    ).clone()
-    with pytest.raises(RuntimeError, match="fingerprint"):
-        flash_attn_with_kvcache(
-            query,
-            key_cache,
-            value_cache,
-            cache_seqlens=cache_seqlens,
-            page_table=page_table,
-            scheduler_metadata=scheduler_metadata,
-        )
-
-
-@pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
-def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
-    """A hand-crafted buffer with a forged fingerprint but the wrong size must be
-    rejected by the C++ exact-size check (defense in depth behind the Python
-    fingerprint validation)."""
+def test_flash_attn_kvcache_metadata_invalid_buffer_rejected(invalid, message):
+    """The C++ buffer checks do not require Python creation attributes."""
     data_type = torch.bfloat16
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
@@ -1573,9 +1403,15 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
         data_type=data_type,
         page_size=block_size,
     )
-    bad = torch.empty(good.numel() - 8, dtype=torch.uint8).npu()
-    bad._fa_scheduler_params = good._fa_scheduler_params
-    with pytest.raises(RuntimeError, match="must exactly match"):
+    if invalid == "size":
+        bad = torch.empty(good.numel() - 8, dtype=torch.uint8, device=good.device)
+    elif invalid == "dtype":
+        bad = good.to(torch.int32)
+    elif invalid == "device":
+        bad = good.cpu()
+    else:
+        bad = torch.empty(good.numel() * 2, dtype=torch.uint8, device=good.device)[::2]
+    with pytest.raises(RuntimeError, match=message):
         flash_attn_with_kvcache(
             query,
             key_cache,

@@ -48,7 +48,8 @@ def _run_flash_attn(
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_flash_attn_kvcache_graph(is_causal):
+@pytest.mark.parametrize("metadata_copy", ["original", "clone", "copy_"])
+def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
     key_cache = make_random_tensor(
         (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
@@ -61,7 +62,7 @@ def test_flash_attn_kvcache_graph(is_causal):
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     metadata_q_lengths = {"cu_seqlens_q": cu_seqlens_q}
 
-    scheduler_metadata = get_scheduler_metadata(
+    metadata_kwargs = dict(
         batch_size=BATCH_SIZE,
         max_seqlen_q=Q_SEQLEN,
         max_seqlen_k=KV_SEQLEN,
@@ -75,6 +76,12 @@ def test_flash_attn_kvcache_graph(is_causal):
         window_size=WINDOW_SIZE,
         **metadata_q_lengths,
     )
+    scheduler_metadata = get_scheduler_metadata(**metadata_kwargs)
+    if metadata_copy == "clone":
+        scheduler_metadata = scheduler_metadata.clone()
+    elif metadata_copy == "copy_":
+        scheduler_metadata = torch.empty_like(scheduler_metadata).copy_(scheduler_metadata)
+    metadata_ptr = scheduler_metadata.data_ptr()
 
     causal_mask = None
     if is_causal:
@@ -123,3 +130,40 @@ def test_flash_attn_kvcache_graph(is_causal):
     torch.npu.synchronize()
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="graph out")
+
+    # Keep the captured address and static kernel configuration unchanged while
+    # replacing the schedule for shorter/longer actual KV lengths. This capacity
+    # is below the FlashDecode threshold, so the kernel branch stays fixed.
+    query_cpu = query.cpu().unsqueeze(0)
+    key_cpu, value_cpu = key_cache.cpu(), value_cache.cpu()
+    previous_out = output_npu.cpu().clone()
+    for kv_length in (64, 96, KV_SEQLEN):
+        cache_seqlens.fill_(kv_length)
+        updated_metadata = get_scheduler_metadata(**metadata_kwargs)
+        scheduler_metadata.copy_(updated_metadata)
+        assert scheduler_metadata.data_ptr() == metadata_ptr
+        graph.replay()
+        torch.npu.synchronize()
+
+        mask = None
+        if is_causal:
+            mask = torch.triu(
+                torch.ones(Q_SEQLEN, kv_length),
+                diagonal=kv_length - Q_SEQLEN + 1,
+            ).bool()
+        expected_ref, _, expected_pt, _ = ref_flash_attention_pair(
+            query_cpu,
+            key_cpu[:, :kv_length],
+            value_cpu[:, :kv_length],
+            SCALE,
+            mask,
+            DATA_TYPE,
+            0.0,
+        )
+        assert_fa_close(
+            output_npu, expected_ref.squeeze(0), expected_pt.squeeze(0),
+            name=f"graph updated KV={kv_length}",
+        )
+        current_out = output_npu.cpu()
+        assert not torch.equal(current_out, previous_out)
+        previous_out = current_out.clone()

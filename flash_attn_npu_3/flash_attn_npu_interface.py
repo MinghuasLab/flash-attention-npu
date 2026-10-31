@@ -1485,14 +1485,19 @@ def flash_attn_with_kvcache(
         scheduler_metadata: Optional scheduler metadata precomputed on the AICPU by
             get_scheduler_metadata. The forward uses the AICPU-computed schedule,
             avoiding host-side computation that would sync on cache_seqlens.
-            Each forward supplies its numerical scale and softcap through tiling. Creation arguments are
-            validated against this call: causal / window_size / has_softcap /
-            num_splits must match, and max_seqlen_k must equal the effective KV cache
-            capacity seen by the forward (page_table: page_block_size * page_table.shape[1];
-            otherwise k_cache.shape[1]) — do not overprovision it. Pass the tensor
-            returned by get_scheduler_metadata unchanged (do not clone/copy it).
-            softmax_scale and the numerical softcap value come from this forward
-            call and may change when reusing metadata with the same has_softcap.
+            This is a plain byte tensor: clone() and copy_() are supported without
+            Python attributes. The caller must keep the metadata's schedule compatible
+            with this call, including mask/window, layout, paging geometry, sequence
+            bounds and num_splits. max_seqlen_k must match the forward's KV bound
+            (paged: page_size * page_table.shape[1]; dense: the KV sequence dimension;
+            packed TND: the maximum actual KV length), not an overprovisioned bound.
+            The backend checks the buffer's dtype, device, contiguity and byte size;
+            it does not validate its contents against the call's arguments.
+            For graph replay, copy updated metadata into the captured buffer on the
+            replay stream (or establish a stream dependency). Keep its address and
+            the captured kernel configuration fixed, including the FlashDecode branch;
+            recapture when that configuration changes. Eager calls supply their own
+            softmax_scale and softcap, but replay retains the captured values.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -1510,19 +1515,6 @@ def flash_attn_with_kvcache(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
-    if scheduler_metadata is not None:
-        _validate_scheduler_metadata(
-            scheduler_metadata,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            seqlen_q=q.shape[1] if cu_seqlens_q is None else max_seqlen_q,
-            varlen_q=cu_seqlens_q is not None,
-            num_splits=num_splits,
-            page_table=page_table,
-            k_cache=k_cache,
-            cache_seqlens=cache_seqlens,
-        )
     # cu_seqlens_q pins the layout to TND; otherwise _detect_layout picks BSND or BNSD.
     if cu_seqlens_q is not None:
         layout, out_transposed = _LAYOUT_TND, False
@@ -1583,61 +1575,6 @@ def flash_attn_with_kvcache(
         layout=layout,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
-
-
-def _validate_scheduler_metadata(
-    scheduler_metadata,
-    *,
-    causal,
-    window_size,
-    softcap,
-    seqlen_q,
-    varlen_q,
-    num_splits,
-    page_table,
-    k_cache,
-    cache_seqlens,
-):
-    """Reject scheduler_metadata created with arguments that do not match this
-    call's mask layout, paged geometry, softcap feature and split schedule.
-    Per-call numerical values are supplied in tiling without changing the shared schedule."""
-    params = getattr(scheduler_metadata, "_fa_scheduler_params", None)
-    if params is None:
-        raise RuntimeError(
-            "scheduler_metadata has no creation-argument fingerprint; it must be "
-            "the unchanged tensor returned by get_scheduler_metadata"
-        )
-    expected = {
-        "causal": bool(causal),
-        "window_size": (int(window_size[0]), int(window_size[1])),
-        "has_softcap": softcap > 0.0,
-        "varlen_q": bool(varlen_q),
-        "num_splits": int(num_splits),
-    }
-    if seqlen_q is not None:
-        expected["max_seqlen_q"] = int(seqlen_q)
-    if page_table is not None:
-        # The fwd mask derivation and the page-table row stride both use the
-        # paged capacity (page_block_size * max_num_blocks_per_seq) as KV bound.
-        expected["page_size"] = int(k_cache.shape[1])
-        expected["max_seqlen_k"] = int(k_cache.shape[1]) * int(page_table.shape[1])
-    else:
-        expected["page_size"] = None
-        if varlen_q and k_cache.dim() == 3:
-            if cache_seqlens is None:
-                raise ValueError("cache_seqlens must be provided for a non-paged TND KV cache")
-            expected["max_seqlen_k"] = int(cache_seqlens.max().item())
-        else:
-            expected["max_seqlen_k"] = int(k_cache.shape[1])
-    mismatches = []
-    for key, call_val in expected.items():
-        meta_val = params.get(key, "<missing>")
-        if meta_val != call_val:
-            mismatches.append(f"{key}: metadata={meta_val!r} vs call={call_val!r}")
-    if mismatches:
-        raise ValueError(
-            "scheduler_metadata arguments do not match this call: " + "; ".join(mismatches)
-        )
 
 
 # Real metadata contract (sizeof(FAInferTilingData)):
@@ -1706,18 +1643,6 @@ def _get_scheduler_metadata_op(
         pack_gqa,
         sm_margin,
     )
-    # Keep this side effect inside the opaque custom op so Dynamo does not
-    # trace the setattr while still attaching the runtime fingerprint.
-    scheduler_metadata._fa_scheduler_params = {
-        "causal": bool(causal),
-        "window_size": (int(window_size_left), int(window_size_right)),
-        "has_softcap": bool(has_softcap),
-        "page_size": None if page_size is None else int(page_size),
-        "max_seqlen_q": int(max_seqlen_q),
-        "max_seqlen_k": int(max_seqlen_k),
-        "varlen_q": seqlens_q is not None,
-        "num_splits": int(num_splits),
-    }
     return scheduler_metadata
 
 
