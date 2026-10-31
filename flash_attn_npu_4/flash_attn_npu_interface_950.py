@@ -5,6 +5,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from .catlass_dsl import utils as _catlass_utils
+
 # isort: off
 import flash_attn_npu_4_950
 # isort: on
@@ -992,6 +994,43 @@ def flash_attn_func(
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
 ):
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        return _catlass_utils.attention(
+            q,
+            k,
+            v,
+            varlen=False,
+            qv=qv,
+            gather_kv_indices=gather_kv_indices,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors,
+            block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+            return_lse=return_lse,
+            scheduler_metadata=scheduler_metadata,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     if q.dtype == torch.float8_e4m3fn:
         if qv is not None:
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
@@ -1225,6 +1264,49 @@ def flash_attn_varlen_func(
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
 ):
+    if _catlass_utils.has_flex(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+    ):
+        return _catlass_utils.attention(
+            q,
+            k,
+            v,
+            varlen=True,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_k=min_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            gather_kv_indices=gather_kv_indices,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            return_lse=return_lse,
+            scheduler_metadata=scheduler_metadata,
+            disable_scheduler_metadata=disable_scheduler_metadata,
+        )
+    # Empty aux containers are equivalent to omitted auxiliary inputs.
+    aux_tensors = aux_scalars = None
     if q.dtype == torch.float8_e4m3fn:
         if qv is not None:
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")

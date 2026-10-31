@@ -32,6 +32,8 @@ FlashAttention significantly improves training and inference efficiency for mode
 python -m pip install "setuptools>=70.1" packaging
 ```
 
+FA4 Flex attention requires ascend-catlass-dsl >=2.1 only when the native DSL backend is used.
+
 - CANN environment variables
 ```bash
 source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
@@ -815,12 +817,12 @@ def flash_attn_varlen_func(
             If num_splits == 0, use a heuristic to automatically determine the number of splits.
         pack_gqa: bool. If True, pack GQA for better performance. (Not supported on NPU)
         deterministic: bool. Whether to use deterministic backward pass.
-        score_mod: Optional callable. Custom score modification. (Not supported on NPU)
-        score_mod_bwd: Optional callable. Custom score modification for backward. (Not supported on NPU)
-        mask_mod: Optional callable. Custom attention mask. (Not supported on NPU)
-        block_sparse_tensors: Optional block sparse tensors. (Not supported on NPU)
-        aux_tensors: Optional list of tensors. Auxiliary tensors for score_mod. (Not supported on NPU)
-        aux_scalars: Optional tuple. Auxiliary scalars for score_mod/mask_mod. (Not supported on NPU)
+        score_mod: Optional callable. Custom score modification.
+        score_mod_bwd: Optional callable. Custom score modification for backward.
+        mask_mod: Optional callable. Custom attention mask.
+        block_sparse_tensors: Optional block sparse tensors.
+        aux_tensors: Optional list of tensors. Auxiliary tensors for score_mod.
+        aux_scalars: Optional tuple. Auxiliary scalars for score_mod/mask_mod.
         return_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Constraints:
@@ -830,7 +832,9 @@ def flash_attn_varlen_func(
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
         - batch_size > 0.
         - softcap >= 0 (0.0 disables; not supported on Ascend 950).
-        - pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices not supported.
+        - On Ascend 950, score_mod / mask_mod are routed to the native Flex backend.
+        - Flex backend: learnable_sink is not supported.
+        - pack_gqa / min_seqlen_k / gather_kv_indices are not supported.
         - cu_seqlens_* / seqused_* / page_table must be int32 when provided.
         - On Ascend 950, paged KV cache page_size must be one of 128, 256, 512, or 1024.
         - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
