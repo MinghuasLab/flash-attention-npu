@@ -52,6 +52,7 @@ def _run_flash_attn(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_varlen_graph(is_causal):
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")

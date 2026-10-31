@@ -13,7 +13,6 @@ import fcntl
 import hashlib
 import json
 import os
-import shutil
 import tarfile
 import tempfile
 import time
@@ -25,7 +24,7 @@ import torch
 from tests.common.timing import add
 
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _DEFAULT_CACHE_DIR = "/var/cache/flash-attention-npu/golden_cache"
 _RETRY_HANDLERS: dict[int, Callable[[], bool]] = {}
 
@@ -45,7 +44,9 @@ def _golden_compute():
         _GOLDEN_COMPUTE_DEPTH -= 1
 
 
-def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]) -> None:
+def register_retry(
+    values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]
+) -> None:
     """Associate cached tensors with a one-shot refresh callback."""
     used = False
 
@@ -99,7 +100,10 @@ def _record_cache_event(event: str, nodeid: str) -> None:
 
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, "1" if default else "0").strip().lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -139,9 +143,7 @@ def input_digest(inputs: Any) -> Any:
 
 
 def _sha256_json(value: Any) -> str:
-    encoded = json.dumps(
-        _json_value(value), sort_keys=True, separators=(",", ":")
-    ).encode()
+    encoded = json.dumps(_json_value(value), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -162,7 +164,10 @@ def _cache_root() -> Path:
 
 def _cache_enabled() -> bool:
     return os.environ.get("GOLDEN_CACHE_MODE", "off").strip().lower() not in {
-        "off", "0", "false", "disabled"
+        "off",
+        "0",
+        "false",
+        "disabled",
     }
 
 
@@ -170,20 +175,17 @@ def _safe_name(value: str) -> str:
     return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
 
 
-def _limits() -> tuple[int, int]:
+def _cache_limits() -> tuple[int, int]:
     def get(name: str, default: int) -> int:
         try:
-            return max(1, int(os.environ.get(name, default)))
+            return max(0, int(os.environ.get(name, default)))
         except ValueError:
             return default
 
-    # A full Ascend910 run currently produces cache artifacts for more than
-    # five test files (v2/v3/v4 plus metadata/graph/smoke).  Keeping only five
-    # test directories causes the suite itself to evict artifacts that the
-    # next CI run would otherwise reuse.  Keep a larger, still bounded number
-    # by default; CI can override this with GOLDEN_CACHE_MAX_TEST_DIRS.
-    max_common = get("GOLDEN_CACHE_MAX_DIRS", 5)
-    return max_common, get("GOLDEN_CACHE_MAX_TEST_DIRS", 32)
+    return (
+        get("GOLDEN_CACHE_MAX_BYTES", 40 * 1024**3),
+        get("GOLDEN_CACHE_MAX_AGE_DAYS", 30),
+    )
 
 
 @contextlib.contextmanager
@@ -195,7 +197,34 @@ def _exclusive_lock(root: Path):
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _case_lock(root: Path, case_hash: str):
+    locks = root / "locks"
+    try:
+        locks.mkdir(parents=True, exist_ok=True)
+        lock_file = (locks / f"{case_hash}.lock").open("a+")
+    except OSError:
+        # The cache is optional.  A read-only or unavailable mount must not
+        # prevent the reference computation from running.
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 def _load_artifact(path: Path, expected: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -261,38 +290,50 @@ def _write_artifact(
         temp_path.unlink(missing_ok=True)
 
 
-def _evict(root: Path) -> None:
-    max_common, max_test = _limits()
-    common_dirs = [path for path in root.glob("common_*") if path.is_dir()]
-    common_dirs.sort(
-        key=lambda path: max(
-            (item.stat().st_mtime for item in path.rglob("*.tar.gz")),
-            default=path.stat().st_mtime,
-        )
-    )
-    for path in common_dirs[:-max_common]:
-        shutil.rmtree(path, ignore_errors=True)
-    for common in common_dirs[-max_common:]:
-        test_dirs = [path for path in common.glob("test_*") if path.is_dir()]
-        test_dirs.sort(
-            key=lambda path: max(
-                (item.stat().st_mtime for item in path.glob("case_*.tar.gz")),
-                default=path.stat().st_mtime,
-            )
-        )
-        for path in test_dirs[:-max_test]:
-            shutil.rmtree(path, ignore_errors=True)
+def _evict(root: Path, newest: Path) -> None:
+    """Bound disk usage by age and size while preserving the just-written case."""
+    interval = int(os.environ.get("GOLDEN_CACHE_EVICT_INTERVAL_SECONDS", "60"))
+    stamp = root / "last_eviction"
+    if interval > 0 and stamp.is_file() and time.time() - stamp.stat().st_mtime < interval:
+        return
+    max_bytes, max_age_days = _cache_limits()
+    cutoff = time.time() - max_age_days * 86400 if max_age_days else None
+    artifacts = []
+    namespaces = [root / "v2", *root.glob("common_*")]
+    for path in (
+        artifact
+        for namespace in namespaces
+        if namespace.is_dir()
+        for artifact in namespace.rglob("case_*.tar.gz")
+    ):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path != newest and cutoff is not None and stat.st_mtime < cutoff:
+            path.unlink(missing_ok=True)
+        else:
+            artifacts.append((stat.st_mtime, stat.st_size, path))
+    total = sum(size for _, size, _ in artifacts)
+    if max_bytes and total > max_bytes:
+        for _, size, path in sorted(artifacts):
+            if total <= max_bytes:
+                break
+            if path != newest:
+                path.unlink(missing_ok=True)
+                total -= size
+    stamp.touch()
 
 
 def get_or_compute_golden(
     *,
     nodeid: str,
+    api_name: str = "reference",
     metadata: Mapping[str, Any],
     inputs: Any,
     compute_fn: Callable[[], Mapping[str, torch.Tensor]],
     expected_keys: tuple[str, ...],
     source_files: list[str] | tuple[str, ...] | None = None,
-    test_source_files: list[str] | tuple[str, ...] | None = None,
     force_refresh: bool = False,
     return_status: bool = False,
 ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], str]:
@@ -315,80 +356,93 @@ def get_or_compute_golden(
     value_names = sorted(set(expected_keys))
     if len(value_names) != len(expected_keys):
         raise ValueError("expected_keys must contain unique names")
+    if not isinstance(api_name, str) or not api_name.strip():
+        raise ValueError("api_name must be a nonempty string")
     case_metadata = {
         "format_version": _FORMAT_VERSION,
         "nodeid": nodeid,
+        "api_name": api_name,
         "metadata": _json_value(dict(metadata)),
         "inputs": input_digest(inputs),
         "source_digest": _source_digest(source_files),
-        "test_source_digest": _source_digest(test_source_files),
         "runtime": {"torch": torch.__version__},
         "value_names": value_names,
     }
     common_hash = _sha256_json(
         {"source": case_metadata["source_digest"], "runtime": case_metadata["runtime"]}
     )[:16]
-    seed = _safe_name(
-        str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case")))
-    )
-    test_hash = _sha256_json(
-        {
-            "test_file": nodeid.split("::", 1)[0],
-            "source": case_metadata["test_source_digest"],
-        }
-    )[:16]
+    seed = _safe_name(str(dict(metadata).get("seed", os.environ.get("CI_TORCH_SEED", "per-case"))))
+    test_hash = _sha256_json(nodeid.split("::", 1)[0])[:16]
+    api_hash = _sha256_json(api_name)[:16]
     case_hash = _sha256_json(case_metadata)[:32]
     root = _cache_root()
     artifact = (
         root
+        / "v2"
         / f"common_{common_hash}_seed_{seed}"
         / f"test_{test_hash}"
+        / f"api_{_safe_name(api_name)[:48]}_{api_hash}"
         / f"case_{case_hash}.tar.gz"
     )
 
     refresh = force_refresh or _env_bool("GOLDEN_CACHE_REFRESH")
-    if not refresh and artifact.is_file():
+
+    def load_cached(report_error: bool) -> dict[str, torch.Tensor] | None:
+        if not artifact.is_file():
+            return None
         try:
             result = _load_artifact(artifact, case_metadata)
+            with contextlib.suppress(OSError):
+                os.utime(artifact, None)
             _record_cache_event("hit", nodeid)
             print(f"[golden-cache] hit {nodeid}")
             if timing_state is not None:
                 add(timing_state, "golden", time.perf_counter() - started, "golden=hit")
-            return (result, "hit") if return_status else result
+            return result
         except Exception as exc:  # cache is an optimization, never a test failure
-            _record_cache_event("read_error", nodeid)
-            if timing_state is not None:
-                timing_state["events"].append("golden=read_error")
+            if report_error:
+                _record_cache_event("read_error", nodeid)
+                if timing_state is not None:
+                    timing_state["events"].append("golden=read_error")
+                warnings.warn(
+                    f"golden cache read failed for {nodeid}: {exc}; recomputing",
+                    RuntimeWarning,
+                )
+            return None
+
+    if not refresh:
+        cached = load_cached(report_error=True)
+        if cached is not None:
+            return (cached, "hit") if return_status else cached
+
+    with _case_lock(root, case_hash):
+        if not refresh:
+            cached = load_cached(report_error=False)
+            if cached is not None:
+                return (cached, "hit") if return_status else cached
+        _record_cache_event("refresh" if refresh else "miss", nodeid)
+        with _golden_compute():
+            values = dict(compute_fn())
+        if set(values) != set(value_names):
+            raise ValueError(
+                f"computed golden tensors {sorted(values)} do not match expected {value_names}"
+            )
+        try:
+            with _exclusive_lock(root):
+                _write_artifact(artifact, case_metadata, values)
+                _evict(root, artifact)
+            _record_cache_event("write_ok", nodeid)
+            print(f"[golden-cache] {'refresh' if refresh else 'miss'} {nodeid}")
+        except Exception as exc:
+            _record_cache_event("write_error", nodeid)
             warnings.warn(
-                f"golden cache read failed for {nodeid}: {exc}; recomputing",
+                f"golden cache write failed for {nodeid}: {exc}; continuing",
                 RuntimeWarning,
             )
-
-    _record_cache_event("refresh" if refresh else "miss", nodeid)
-    with _golden_compute():
-        values = dict(compute_fn())
-    if set(values) != set(value_names):
-        raise ValueError(
-            f"computed golden tensors {sorted(values)} do not match "
-            f"expected {value_names}"
-        )
-    try:
-        with _exclusive_lock(root):
-            _write_artifact(artifact, case_metadata, values)
-            _evict(root)
-        _record_cache_event("write_ok", nodeid)
-        print(f"[golden-cache] {'refresh' if refresh else 'miss'} {nodeid}")
-    except Exception as exc:
-        _record_cache_event("write_error", nodeid)
-        warnings.warn(
-            f"golden cache write failed for {nodeid}: {exc}; continuing",
-            RuntimeWarning,
-        )
     status = "refresh" if refresh else "miss"
     if timing_state is not None:
         recovered = "read_error->" if "golden=read_error" in timing_state["events"] else ""
-        add(timing_state, "golden", time.perf_counter() - started,
-            "golden=" + recovered + status)
+        add(timing_state, "golden", time.perf_counter() - started, "golden=" + recovered + status)
     return (values, status) if return_status else values
 
 
@@ -398,6 +452,9 @@ def golden_compute_in_progress() -> bool:
 
 
 __all__ = [
-    "get_or_compute_golden", "golden_compute_in_progress", "input_digest",
-    "register_retry", "retry_cached_value",
+    "get_or_compute_golden",
+    "golden_compute_in_progress",
+    "input_digest",
+    "register_retry",
+    "retry_cached_value",
 ]

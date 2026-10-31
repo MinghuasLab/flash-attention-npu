@@ -435,6 +435,7 @@ def metadata_spy_950(monkeypatch):
     return calls
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -489,6 +490,7 @@ def test_flash_attn_func_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
@@ -593,6 +595,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
         )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
@@ -667,6 +670,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
@@ -744,6 +748,7 @@ def test_flash_attn_kvcache_metadata_tnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, q_seqlen, num_heads, head_size, num_splits, is_causal, softcap, new_length",
     KV_CACHE_FLASH_DECODE_CASES,
@@ -925,6 +930,7 @@ KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
@@ -981,6 +987,7 @@ def test_flash_attn_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
@@ -1039,6 +1046,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
@@ -1104,6 +1112,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
@@ -1219,6 +1228,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,
@@ -1329,6 +1339,7 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
 
 # Metadata contents are a caller-owned schedule contract. Mask, paging and
 # split mismatches are no longer checked through Python Tensor attributes.
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("copy_mode", ["clone", "copy_", "detach"])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
@@ -1337,17 +1348,26 @@ def test_flash_attn_kvcache_metadata_copied_matches(copy_mode, is_causal):
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 32, 128, 128, 128
     query = make_random_tensor(
-        (batch_size, q_seqlen, num_heads, head_size), data_type,
-        low=-1.0, high=1.0, device="npu",
+        (batch_size, q_seqlen, num_heads, head_size),
+        data_type,
+        low=-1.0,
+        high=1.0,
+        device="npu",
     )
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
     metadata = _metadata(
-        batch_size=batch_size, q_seqlen=q_seqlen, kv_seqlen=kv_seqlen,
-        num_heads=num_heads, kv_heads=kv_heads, head_size=head_size,
-        cache_seqlens=cache_seqlens, data_type=data_type, page_size=block_size,
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
         is_causal=is_causal,
     )
     assert not hasattr(metadata, "_fa_scheduler_params")
@@ -1356,16 +1376,30 @@ def test_flash_attn_kvcache_metadata_copied_matches(copy_mode, is_causal):
     else:
         copied = getattr(metadata, copy_mode)()
     out, lse, *_ = flash_attn_with_kvcache(
-        query, key_cache, value_cache, cache_seqlens=cache_seqlens,
-        page_table=page_table, causal=is_causal, scheduler_metadata=copied,
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=is_causal,
+        scheduler_metadata=copied,
         return_softmax_lse=True,
     )
     key_cpu, value_cpu = gather_paged_kv_batch(
-        key_cache.cpu(), value_cache.cpu(), page_table.cpu(), kv_seqlen, block_size,
+        key_cache.cpu(),
+        value_cache.cpu(),
+        page_table.cpu(),
+        kv_seqlen,
+        block_size,
     )
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-        query.cpu(), key_cpu, value_cpu, head_size ** -0.5,
-        _causal_mask(q_seqlen, kv_seqlen, is_causal), data_type, 0.0,
+        query.cpu(),
+        key_cpu,
+        value_cpu,
+        head_size**-0.5,
+        _causal_mask(q_seqlen, kv_seqlen, is_causal),
+        data_type,
+        0.0,
     )
     assert_fa_close(out, out_ref, out_pt, name="copied metadata out")
     assert_fa_close(lse, lse_ref, lse_pt, name="copied metadata lse")
@@ -1373,8 +1407,12 @@ def test_flash_attn_kvcache_metadata_copied_matches(copy_mode, is_causal):
 
 @pytest.mark.parametrize(
     "invalid, message",
-    [("size", "must exactly match"), ("dtype", "must be a byte tensor"),
-     ("device", "must be an NPU tensor"), ("stride", "must be contiguous")],
+    [
+        ("size", "must exactly match"),
+        ("dtype", "must be a byte tensor"),
+        ("device", "must be an NPU tensor"),
+        ("stride", "must be contiguous"),
+    ],
 )
 @pytest.mark.skipif(not _is_ascend910(), reason="Ascend910 only")
 def test_flash_attn_kvcache_metadata_invalid_buffer_rejected(invalid, message):
@@ -1422,6 +1460,7 @@ def test_flash_attn_kvcache_metadata_invalid_buffer_rejected(invalid, message):
         )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize(
     "data_type, is_causal",
@@ -1477,6 +1516,7 @@ def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
 def test_flash_attn_with_kvcache_metadata_matches(data_type):
@@ -1555,6 +1595,7 @@ def test_flash_attn_with_kvcache_metadata_matches(data_type):
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
 def test_flash_attn_kvcache_metadata_reuse_scale_softcap_950(data_type):
@@ -1646,6 +1687,7 @@ def test_flash_attn_kvcache_metadata_reuse_scale_softcap_950(data_type):
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
     # 3D TND kvcache (total_tokens, kv_heads, head_dim): regression for the

@@ -47,6 +47,7 @@ def _run_flash_attn(
     )
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("metadata_copy", ["original", "clone", "copy_"])
 def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
@@ -161,7 +162,9 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
             0.0,
         )
         assert_fa_close(
-            output_npu, expected_ref.squeeze(0), expected_pt.squeeze(0),
+            output_npu,
+            expected_ref.squeeze(0),
+            expected_pt.squeeze(0),
             name=f"graph updated KV={kv_length}",
         )
         current_out = output_npu.cpu()
