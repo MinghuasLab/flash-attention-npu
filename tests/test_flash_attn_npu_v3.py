@@ -292,6 +292,7 @@ test_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -657,8 +658,13 @@ def test_fa_kvcache_ops(
         value_padded = pad_packed_tensor(value_cache_cpu, kv_sequences, kv_seqlen)
     # Align each sequence using its actual Q/K lengths, not padded bounds.
     q_valid, _, atten_mask = make_padded_varlen_mask(
-        q_sequences, kv_sequences, q_seqlen, kv_seqlen,
-        is_causal, window_size_left, window_size_right,
+        q_sequences,
+        kv_sequences,
+        q_seqlen,
+        kv_seqlen,
+        is_causal,
+        window_size_left,
+        window_size_right,
     )
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap
@@ -773,6 +779,7 @@ func_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap",
     func_cases,
@@ -999,6 +1006,7 @@ varlen_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, add_unused_qkv",
     varlen_cases,
@@ -1286,6 +1294,7 @@ class TestVarlenValidation:
             with pytest.raises(RuntimeError, match=_VARLEN_QUERY_ERRORS[case]):
                 api._flash_attn_forward(**inputs)
 
+    @pytest.mark.golden_api("flash_attn_varlen_func")
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("execution", ["eager", "fake", "compile"])
     def test_valid_swa_varlen(self, api, dtype, execution):
@@ -1442,6 +1451,7 @@ hd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap",
     hd_cases,
@@ -2288,6 +2298,7 @@ flash_attn_func_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
     flash_attn_func_bnsd_cases,
@@ -2318,6 +2329,7 @@ flash_attn_with_kvcache_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, s_alloc, cache_seqlen, q_seqlen",
     flash_attn_with_kvcache_bnsd_cases,

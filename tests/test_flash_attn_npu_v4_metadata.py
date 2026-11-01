@@ -622,9 +622,9 @@ def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
     cu_q = _int32_npu([0, q_seqlen])
     cu_k = _int32_npu([0, kv_seqlen])
     used_k = _int32_npu([kv_seqlen])
-    page_table = torch.arange(
-        kv_seqlen // page_size, dtype=torch.int32, device="npu"
-    ).view(batch_size, -1)
+    page_table = torch.arange(kv_seqlen // page_size, dtype=torch.int32, device="npu").view(
+        batch_size, -1
+    )
     paged_key = key.view(-1, page_size, kv_heads, head_size)
     paged_value = value.view(-1, page_size, kv_heads, head_size)
 
@@ -685,11 +685,17 @@ def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
     reference_out, reference_lse = results["dense_bsnd"]
     for name, (output, lse) in results.items():
         torch.testing.assert_close(
-            output.view_as(reference_out), reference_out, rtol=2e-3, atol=2e-3,
+            output.view_as(reference_out),
+            reference_out,
+            rtol=2e-3,
+            atol=2e-3,
             msg=lambda message, case_name=name: f"{case_name} output: {message}",
         )
         torch.testing.assert_close(
-            lse.view_as(reference_lse), reference_lse, rtol=2e-3, atol=2e-3,
+            lse.view_as(reference_lse),
+            reference_lse,
+            rtol=2e-3,
+            atol=2e-3,
             msg=lambda message, case_name=name: f"{case_name} LSE: {message}",
         )
 
@@ -714,6 +720,7 @@ def metadata_spy(monkeypatch):
     return calls
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
@@ -767,6 +774,7 @@ def test_flash_attn_func_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
@@ -865,6 +873,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
         )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_BSND_CASES,
@@ -933,6 +942,7 @@ def test_flash_attn_kvcache_metadata_bsnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal",
     KV_CACHE_TND_CASES,
@@ -1004,6 +1014,7 @@ def test_flash_attn_kvcache_metadata_tnd(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize("is_causal", [False])
 def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     """FD + metadata path with idle cores (needCoreNum < blockDim)."""
@@ -1105,6 +1116,7 @@ KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_FUNC_SWA_CASES,
@@ -1160,6 +1172,7 @@ def test_flash_attn_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, softmax_scale",
     FLASH_ATTN_FUNC_SOFTCAP_CASES,
@@ -1219,6 +1232,7 @@ def test_flash_attn_func_metadata_softcap_scale(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size",
     FLASH_ATTN_VARLEN_SWA_CASES,
@@ -1283,6 +1297,7 @@ def test_flash_attn_varlen_func_metadata_swa(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_SWA_SOFTCAP_CASES,
@@ -1361,6 +1376,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
     )
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_PAGED_SHORT_KV_WINDOW_CASES,

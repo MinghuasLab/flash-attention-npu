@@ -304,15 +304,19 @@ def ref_flash_attention_pair(case, inputs):
     def compute():
         return dict(zip(names, (*high_reference(case, inputs), *low_reference(case, inputs))))
 
-    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE")
+    api_name = {
+        "dense": "flash_attn_func",
+        "varlen": "flash_attn_varlen_func",
+        "cache": "flash_attn_with_kvcache",
+    }[case.entry]
     cache_args = dict(
         nodeid=os.environ.get("GOLDEN_CACHE_NODEID", "standalone"),
+        api_name=api_name,
         metadata=asdict(case),
         inputs={name: inputs[name] for name in ("q", "k", "v", "descales")},
         compute_fn=compute,
         expected_keys=names,
         source_files=[__file__],
-        test_source_files=[test_file] if test_file else [],
     )
     values, status = get_or_compute_golden(**cache_args, return_status=True)
     if status == "hit":

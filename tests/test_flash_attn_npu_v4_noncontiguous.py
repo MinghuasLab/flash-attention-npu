@@ -60,11 +60,8 @@ def _assert_causal_empty_prefix(out, lse, sink, seqlen_q, seqlen_k):
         return
     empty_out = out[:, :empty]
     empty_lse = lse[:, :, :empty]
-    assert torch.allclose(
-        empty_out.float(), torch.zeros_like(empty_out.float()), atol=2e-3
-    ), (
-        f"empty-prefix O not 0: max={empty_out.float().abs().max().item()} "
-        f"prefix={empty}"
+    assert torch.allclose(empty_out.float(), torch.zeros_like(empty_out.float()), atol=2e-3), (
+        f"empty-prefix O not 0: max={empty_out.float().abs().max().item()} prefix={empty}"
     )
     if sink is None:
         assert torch.isposinf(empty_lse).all(), (
@@ -75,9 +72,7 @@ def _assert_causal_empty_prefix(out, lse, sink, seqlen_q, seqlen_k):
         return
     expected = sink.detach().float().view(1, -1, 1).expand_as(empty_lse)
     max_diff = (empty_lse.float() - expected).abs().max().item()
-    assert max_diff <= 1e-4, (
-        f"empty-prefix LSE must equal sink: max|Δ|={max_diff} prefix={empty}"
-    )
+    assert max_diff <= 1e-4, f"empty-prefix LSE must equal sink: max|Δ|={max_diff} prefix={empty}"
 
 
 def _contiguous_strides(shape):
@@ -165,7 +160,9 @@ def _dim0_view(source, gap_elements, poison):
         dtype=source.dtype,
         device=source.device,
     )
-    view = torch.as_strided(storage, size=tuple(source.shape), stride=(stride0, *source.stride()[1:]))
+    view = torch.as_strided(
+        storage, size=tuple(source.shape), stride=(stride0, *source.stride()[1:])
+    )
     view.copy_(source)
     assert not view.is_contiguous()
     return view, storage, logical_block, stride0, poison
@@ -555,7 +552,9 @@ def test_paged_independent_dim0_stride_profiles(layout, profile):
 
     def maybe_gap(cache, gap, poison):
         physical = _packed_physical(cache, layout)
-        to_logical = (lambda tensor: tensor) if layout == "BBND" else (lambda tensor: tensor.transpose(1, 2))
+        to_logical = (
+            (lambda tensor: tensor) if layout == "BBND" else (lambda tensor: tensor.transpose(1, 2))
+        )
         if gap == 0:
             return to_logical(physical), None
         view, storage, logical_block, stride0, poison_val = _dim0_view(physical, gap, poison)
@@ -658,12 +657,8 @@ def test_dense_outer_noncontiguous_qkv_falls_back(targets):
     """Dense FA4 uses packed strides, so outer-strided QKV must be copied."""
     batch, q_seqlen, kv_seqlen = 2, 16, 32
     nheads, kv_heads, head_size = 4, 2, 64
-    query = torch.randn(
-        batch, q_seqlen, nheads, head_size, dtype=torch.float16, device="npu"
-    )
-    key = torch.randn(
-        batch, kv_seqlen, kv_heads, head_size, dtype=torch.float16, device="npu"
-    )
+    query = torch.randn(batch, q_seqlen, nheads, head_size, dtype=torch.float16, device="npu")
+    key = torch.randn(batch, kv_seqlen, kv_heads, head_size, dtype=torch.float16, device="npu")
     value = torch.randn_like(key)
     query_view = _inner_strided(query) if "query" in targets else query
     key_view = _inner_strided(key) if "key" in targets else key
@@ -672,12 +667,12 @@ def test_dense_outer_noncontiguous_qkv_falls_back(targets):
     out_nc, lse_nc = flash_attn_func(
         query_view, key_view, value_view, num_splits=1, return_lse=True
     )
-    out_ref, lse_ref = flash_attn_func(
-        query, key, value, num_splits=1, return_lse=True
-    )
+    out_ref, lse_ref = flash_attn_func(query, key, value, num_splits=1, return_lse=True)
     torch.testing.assert_close(out_nc, out_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(lse_nc, lse_ref, rtol=0.0, atol=0.0)
 
+
+@pytest.mark.golden_api("flash_attn_func")
 @skip_unless_910
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -707,21 +702,11 @@ def test_flash_attn_sink(
     batch_size = 2
     nheads = 6
     nheads_kv = _nheads_kv(mha_type, nheads)
-    query = make_random_tensor(
-        (batch_size, seqlen_q, nheads, d), dtype, device="npu"
-    )
-    key = make_random_tensor(
-        (batch_size, seqlen_k, nheads_kv, d), dtype, device="npu"
-    )
-    value = make_random_tensor(
-        (batch_size, seqlen_k, nheads_kv, d), dtype, device="npu"
-    )
-    sink = (
-        make_random_tensor((nheads,), dtype, device="npu")
-        if has_learnable_sink
-        else None
-    )
-    scale = d ** -0.5
+    query = make_random_tensor((batch_size, seqlen_q, nheads, d), dtype, device="npu")
+    key = make_random_tensor((batch_size, seqlen_k, nheads_kv, d), dtype, device="npu")
+    value = make_random_tensor((batch_size, seqlen_k, nheads_kv, d), dtype, device="npu")
+    sink = make_random_tensor((nheads,), dtype, device="npu") if has_learnable_sink else None
+    scale = d**-0.5
     atten_mask = None
     if causal:
         atten_mask = torch.triu(
@@ -782,62 +767,612 @@ def test_flash_attn_sink(
 _SINK_PAGE = 128
 _SINK_LAYOUT_CASES = [
     # dense BSND: short
-    {"id": "bsnd-s-mha", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [8, 8], "kv": [8, 8], "causal": False},
-    {"id": "bsnd-s-mqa", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 64, "q": [16, 16], "kv": [16, 16], "causal": False},
-    {"id": "bsnd-s-gqa-causal", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32, 32], "kv": [32, 32], "causal": True},
-    {"id": "bsnd-decode", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [128], "causal": True},
+    {
+        "id": "bsnd-s-mha",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 6,
+        "d": 64,
+        "q": [8, 8],
+        "kv": [8, 8],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-s-mqa",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 64,
+        "q": [16, 16],
+        "kv": [16, 16],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-s-gqa-causal",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [32, 32],
+        "kv": [32, 32],
+        "causal": True,
+    },
+    {
+        "id": "bsnd-decode",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1],
+        "kv": [128],
+        "causal": True,
+    },
     # dense BSND: medium / empty prefix
-    {"id": "bsnd-m-128", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 128, "q": [128, 128], "kv": [128, 128], "causal": False},
-    {"id": "bsnd-m-256-causal", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [256, 256], "kv": [256, 256], "causal": True},
-    {"id": "bsnd-empty-prefix", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [192], "kv": [64], "causal": True},
+    {
+        "id": "bsnd-m-128",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 6,
+        "d": 128,
+        "q": [128, 128],
+        "kv": [128, 128],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-m-256-causal",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [256, 256],
+        "kv": [256, 256],
+        "causal": True,
+    },
+    {
+        "id": "bsnd-empty-prefix",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 6,
+        "d": 64,
+        "q": [192],
+        "kv": [64],
+        "causal": True,
+    },
     # dense BSND: long
-    {"id": "bsnd-l-decode-2k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1], "kv": [2048], "causal": True},
-    {"id": "bsnd-l-decode-4k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [16], "kv": [4096], "causal": False},
-    {"id": "bsnd-l-prefill-1k", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 128, "q": [1024], "kv": [1024], "causal": True},
-    {"id": "bsnd-fp16-mid", "api": "func", "layout": "BSND", "dtype": torch.float16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64, 64], "kv": [128, 128], "causal": False},
-    {"id": "bsnd-fp16-decode", "api": "func", "layout": "BSND", "dtype": torch.float16, "nheads": 8, "kv_heads": 8, "d": 128, "q": [1, 1], "kv": [512, 512], "causal": True},
-    {"id": "bsnd-d192", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 192, "q": [64], "kv": [128], "causal": False},
-    {"id": "bsnd-d256", "api": "func", "layout": "BSND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 256, "q": [32], "kv": [128], "causal": False},
+    {
+        "id": "bsnd-l-decode-2k",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [1],
+        "kv": [2048],
+        "causal": True,
+    },
+    {
+        "id": "bsnd-l-decode-4k",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [16],
+        "kv": [4096],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-l-prefill-1k",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1024],
+        "kv": [1024],
+        "causal": True,
+    },
+    {
+        "id": "bsnd-fp16-mid",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.float16,
+        "nheads": 6,
+        "kv_heads": 3,
+        "d": 64,
+        "q": [64, 64],
+        "kv": [128, 128],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-fp16-decode",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.float16,
+        "nheads": 8,
+        "kv_heads": 8,
+        "d": 128,
+        "q": [1, 1],
+        "kv": [512, 512],
+        "causal": True,
+    },
+    {
+        "id": "bsnd-d192",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 192,
+        "q": [64],
+        "kv": [128],
+        "causal": False,
+    },
+    {
+        "id": "bsnd-d256",
+        "api": "func",
+        "layout": "BSND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 256,
+        "q": [32],
+        "kv": [128],
+        "causal": False,
+    },
     # packed TND: short
-    {"id": "tnd-s", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [4, 7, 1], "kv": [8, 9, 5], "causal": False},
-    {"id": "tnd-s-gqa", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [8, 16], "kv": [16, 32], "causal": False},
-    {"id": "tnd-uneven-causal", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [3, 17, 9], "kv": [20, 40, 16], "causal": True},
-    {"id": "tnd-tiny", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [2, 3, 4], "kv": [8, 8, 8], "causal": False},
-    {"id": "tnd-decode", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 1, 1], "kv": [128, 256, 64], "causal": True},
+    {
+        "id": "tnd-s",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [4, 7, 1],
+        "kv": [8, 9, 5],
+        "causal": False,
+    },
+    {
+        "id": "tnd-s-gqa",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [8, 16],
+        "kv": [16, 32],
+        "causal": False,
+    },
+    {
+        "id": "tnd-uneven-causal",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 3,
+        "d": 64,
+        "q": [3, 17, 9],
+        "kv": [20, 40, 16],
+        "causal": True,
+    },
+    {
+        "id": "tnd-tiny",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [2, 3, 4],
+        "kv": [8, 8, 8],
+        "causal": False,
+    },
+    {
+        "id": "tnd-decode",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1, 1, 1],
+        "kv": [128, 256, 64],
+        "causal": True,
+    },
     # packed TND: medium / long
-    {"id": "tnd-m", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64, 128], "kv": [128, 256], "causal": False},
-    {"id": "tnd-prefill", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [256], "kv": [256], "causal": True},
-    {"id": "tnd-l-kv", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1, 1], "kv": [2048, 1024], "causal": True},
-    {"id": "tnd-l-mix", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [8, 1, 32], "kv": [512, 2048, 128], "causal": False},
-    {"id": "tnd-qgtkv-causal", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 6, "d": 64, "q": [128, 64], "kv": [32, 80], "causal": True},
-    {"id": "tnd-fp16", "api": "varlen", "layout": "TND", "dtype": torch.float16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [16, 24], "kv": [32, 48], "causal": False},
-    {"id": "tnd-mqa", "api": "varlen", "layout": "TND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [5, 7], "kv": [64, 96], "causal": True},
+    {
+        "id": "tnd-m",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 3,
+        "d": 64,
+        "q": [64, 128],
+        "kv": [128, 256],
+        "causal": False,
+    },
+    {
+        "id": "tnd-prefill",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [256],
+        "kv": [256],
+        "causal": True,
+    },
+    {
+        "id": "tnd-l-kv",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [1, 1],
+        "kv": [2048, 1024],
+        "causal": True,
+    },
+    {
+        "id": "tnd-l-mix",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [8, 1, 32],
+        "kv": [512, 2048, 128],
+        "causal": False,
+    },
+    {
+        "id": "tnd-qgtkv-causal",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 6,
+        "d": 64,
+        "q": [128, 64],
+        "kv": [32, 80],
+        "causal": True,
+    },
+    {
+        "id": "tnd-fp16",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.float16,
+        "nheads": 8,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [16, 24],
+        "kv": [32, 48],
+        "causal": False,
+    },
+    {
+        "id": "tnd-mqa",
+        "api": "varlen",
+        "layout": "TND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [5, 7],
+        "kv": [64, 96],
+        "causal": True,
+    },
     # paged BBND
-    {"id": "bbnd-decode-128", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 64, "q": [1], "kv": [128], "causal": True},
-    {"id": "bbnd-decode-gqa", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [1, 1], "kv": [256, 128], "causal": True},
-    {"id": "bbnd-s", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [16, 16], "kv": [128, 128], "causal": False},
-    {"id": "bbnd-m", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [64], "kv": [256], "causal": False},
-    {"id": "bbnd-prefill", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 8, "d": 64, "q": [128], "kv": [128], "causal": True},
-    {"id": "bbnd-causal", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32, 16], "kv": [256, 128], "causal": True},
-    {"id": "bbnd-l-2k", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [2048], "causal": True},
-    {"id": "bbnd-l-4k", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [8], "kv": [4096], "causal": False},
-    {"id": "bbnd-fp16-decode", "api": "paged", "layout": "BBND", "dtype": torch.float16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [1], "kv": [512], "causal": True},
-    {"id": "bbnd-d192", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 192, "q": [4], "kv": [256], "causal": False},
-    {"id": "bbnd-mqa", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 2], "kv": [128, 256], "causal": True},
-    {"id": "bbnd-gqa-mid", "api": "paged", "layout": "BBND", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 64, "q": [48, 80], "kv": [192, 320], "causal": False},
+    {
+        "id": "bbnd-decode-128",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 64,
+        "q": [1],
+        "kv": [128],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-decode-gqa",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [1, 1],
+        "kv": [256, 128],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-s",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [16, 16],
+        "kv": [128, 128],
+        "causal": False,
+    },
+    {
+        "id": "bbnd-m",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [64],
+        "kv": [256],
+        "causal": False,
+    },
+    {
+        "id": "bbnd-prefill",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 8,
+        "d": 64,
+        "q": [128],
+        "kv": [128],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-causal",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [32, 16],
+        "kv": [256, 128],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-l-2k",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1],
+        "kv": [2048],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-l-4k",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [8],
+        "kv": [4096],
+        "causal": False,
+    },
+    {
+        "id": "bbnd-fp16-decode",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.float16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [1],
+        "kv": [512],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-d192",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 1,
+        "d": 192,
+        "q": [4],
+        "kv": [256],
+        "causal": False,
+    },
+    {
+        "id": "bbnd-mqa",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1, 2],
+        "kv": [128, 256],
+        "causal": True,
+    },
+    {
+        "id": "bbnd-gqa-mid",
+        "api": "paged",
+        "layout": "BBND",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [48, 80],
+        "kv": [192, 320],
+        "causal": False,
+    },
     # paged BNBD
-    {"id": "bnbd-decode-128", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [1], "kv": [128], "causal": True},
-    {"id": "bnbd-s", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 128, "q": [8, 12], "kv": [64, 96], "causal": False},
-    {"id": "bnbd-m-causal", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 2, "d": 128, "q": [32], "kv": [256], "causal": True},
-    {"id": "bnbd-prefill", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 6, "kv_heads": 3, "d": 64, "q": [64], "kv": [256], "causal": False},
-    {"id": "bnbd-l-2k", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1], "kv": [2048], "causal": True},
-    {"id": "bnbd-l-4k", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 4, "d": 64, "q": [4], "kv": [4096], "causal": False},
-    {"id": "bnbd-fp16", "api": "paged", "layout": "BNBD", "dtype": torch.float16, "nheads": 8, "kv_heads": 2, "d": 64, "q": [16, 8], "kv": [128, 192], "causal": False},
-    {"id": "bnbd-d256", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 1, "d": 256, "q": [1], "kv": [256], "causal": True},
-    {"id": "bnbd-gqa", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 4, "d": 128, "q": [24, 40], "kv": [160, 288], "causal": True},
-    {"id": "bnbd-uneven", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [1, 16, 8], "kv": [256, 128, 512], "causal": False},
-    {"id": "bnbd-mqa-long", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 8, "kv_heads": 1, "d": 128, "q": [1, 1], "kv": [1024, 2048], "causal": True},
-    {"id": "bnbd-tiny", "api": "paged", "layout": "BNBD", "dtype": torch.bfloat16, "nheads": 4, "kv_heads": 2, "d": 64, "q": [3, 5], "kv": [64, 128], "causal": False},
+    {
+        "id": "bnbd-decode-128",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [1],
+        "kv": [128],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-s",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [8, 12],
+        "kv": [64, 96],
+        "causal": False,
+    },
+    {
+        "id": "bnbd-m-causal",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 128,
+        "q": [32],
+        "kv": [256],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-prefill",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 6,
+        "kv_heads": 3,
+        "d": 64,
+        "q": [64],
+        "kv": [256],
+        "causal": False,
+    },
+    {
+        "id": "bnbd-l-2k",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1],
+        "kv": [2048],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-l-4k",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 4,
+        "d": 64,
+        "q": [4],
+        "kv": [4096],
+        "causal": False,
+    },
+    {
+        "id": "bnbd-fp16",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.float16,
+        "nheads": 8,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [16, 8],
+        "kv": [128, 192],
+        "causal": False,
+    },
+    {
+        "id": "bnbd-d256",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 1,
+        "d": 256,
+        "q": [1],
+        "kv": [256],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-gqa",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 4,
+        "d": 128,
+        "q": [24, 40],
+        "kv": [160, 288],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-uneven",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [1, 16, 8],
+        "kv": [256, 128, 512],
+        "causal": False,
+    },
+    {
+        "id": "bnbd-mqa-long",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 8,
+        "kv_heads": 1,
+        "d": 128,
+        "q": [1, 1],
+        "kv": [1024, 2048],
+        "causal": True,
+    },
+    {
+        "id": "bnbd-tiny",
+        "api": "paged",
+        "layout": "BNBD",
+        "dtype": torch.bfloat16,
+        "nheads": 4,
+        "kv_heads": 2,
+        "d": 64,
+        "q": [3, 5],
+        "kv": [64, 128],
+        "causal": False,
+    },
 ]
 
 
@@ -847,7 +1382,7 @@ def _sink_causal_mask(qlen, kvlen):
     return torch.triu(torch.ones(qlen, kvlen), diagonal=(kvlen - qlen + 1)).bool()
 
 
-def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal):
+def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal, *, api_name=None):
     qlen, kvlen, nheads = query.shape[1], key.shape[1], query.shape[2]
     if qlen == 0:
         empty = query[:, :0]
@@ -855,12 +1390,26 @@ def _sink_reference_bsnd(query, key, value, scale, dtype, sink, causal):
         return empty, empty_lse, empty.clone(), empty_lse.clone()
     if kvlen == 0:
         zeros = torch.zeros_like(query)
-        lse = sink.detach().float().view(1, nheads, 1).expand(query.shape[0], nheads, qlen).contiguous()
+        lse = (
+            sink.detach()
+            .float()
+            .view(1, nheads, 1)
+            .expand(query.shape[0], nheads, qlen)
+            .contiguous()
+        )
         return zeros, lse, zeros.clone(), lse.clone()
     mask = _sink_causal_mask(qlen, kvlen) if causal else None
     sink_matrix = _sink_matrix(sink, query.shape[0], nheads, qlen)
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-        query, key, value, scale, mask, dtype, rescale_threshold=None, sink_matrix=sink_matrix
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        dtype,
+        rescale_threshold=None,
+        sink_matrix=sink_matrix,
+        api_name=api_name,
     )
     if mask is not None:
         fully = mask.all(dim=-1)
@@ -899,7 +1448,9 @@ def _sink_gather(cache, table_row, kvlen):
     return cache[table[positions // _SINK_PAGE], positions % _SINK_PAGE]
 
 
-def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sink, causal, table=None):
+def _sink_packed_reference(
+    query, key, value, q_lens, kv_lens, scale, dtype, sink, causal, table=None, api_name=None
+):
     pieces = []
     q_off = 0
     k_off = 0
@@ -923,6 +1474,7 @@ def _sink_packed_reference(query, key, value, q_lens, kv_lens, scale, dtype, sin
             dtype,
             sink,
             causal,
+            api_name=api_name,
         )
         pieces.append((out_ref[0], lse_ref[0], out_pt[0], lse_pt[0]))
     if not pieces:
@@ -950,7 +1502,7 @@ def test_flash_attn_sink_layouts(cfg):
     torch.manual_seed(0)
     q_lens, kv_lens = cfg["q"], cfg["kv"]
     nheads, kv_heads, head_dim, dtype = cfg["nheads"], cfg["kv_heads"], cfg["d"], cfg["dtype"]
-    scale = head_dim ** -0.5
+    scale = head_dim**-0.5
     sink = make_random_tensor((nheads,), torch.bfloat16, device="npu")
     sink_cpu = sink.detach().cpu()
     kwargs = dict(
@@ -975,6 +1527,7 @@ def test_flash_attn_sink_layouts(cfg):
             dtype,
             sink_cpu,
             cfg["causal"],
+            api_name="flash_attn_func",
         )
         assert_fa_close(out, out_ref, out_pt, name="out")
         assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")
@@ -984,8 +1537,12 @@ def test_flash_attn_sink_layouts(cfg):
 
     query = make_packed_random_tensor(q_lens, max(q_lens), nheads, head_dim, dtype, device="npu")
     if cfg["api"] == "varlen":
-        key = make_packed_random_tensor(kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu")
-        value = make_packed_random_tensor(kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu")
+        key = make_packed_random_tensor(
+            kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu"
+        )
+        value = make_packed_random_tensor(
+            kv_lens, max(kv_lens), kv_heads, head_dim, dtype, device="npu"
+        )
         table = None
         out, lse = flash_attn_varlen_func(
             query,
@@ -1031,10 +1588,10 @@ def test_flash_attn_sink_layouts(cfg):
         sink_cpu,
         cfg["causal"],
         table=table,
+        api_name="flash_attn_varlen_func",
     )
     assert_fa_close(out, out_ref, out_pt, name="out")
     assert_fa_close(lse, lse_ref, lse_pt, name="softmax_lse")
-
 
 
 @skip_unless_910
@@ -1100,7 +1657,6 @@ def test_fa4_paged_tnd_dim0_noncontiguous_with_zero_lengths(
     assert torch.isposinf(lse_view[:, :3]).all()
 
 
-
 @skip_unless_910
 @pytest.mark.parametrize("head_size,kv_length,num_splits", [(256, 129, 1), (64, 2048, 2)])
 def test_fa4_paged_tnd_bnbd_dim0_noncontiguous_split_paths(head_size, kv_length, num_splits):
@@ -1142,7 +1698,6 @@ def test_fa4_paged_tnd_bnbd_dim0_noncontiguous_split_paths(head_size, kv_length,
     torch.testing.assert_close(lse_bnbd, lse_bbnd, rtol=2e-3, atol=2e-3)
 
 
-
 @skip_unless_910
 def test_fa4_paged_tnd_total_q_zero_fast_path():
     batch_size, num_heads, kv_heads, head_size = 2, 4, 2, 64
@@ -1169,7 +1724,6 @@ def test_fa4_paged_tnd_total_q_zero_fast_path():
     assert out.shape == query.shape
     assert lse.shape == (num_heads, 0)
     assert out.numel() == 0 and lse.numel() == 0
-
 
 
 @skip_unless_910
@@ -1242,7 +1796,6 @@ def test_fa4_tnd_total_exceeds_cu_seqlens_q(
     assert lse_pad.shape == (num_heads, used_q + extra_q)
     torch.testing.assert_close(out_pad[:used_q], out_ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(lse_pad[:, :used_q], lse_ref, rtol=2e-3, atol=2e-3, equal_nan=True)
-
 
 
 @skip_unless_910

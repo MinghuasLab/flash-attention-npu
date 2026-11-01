@@ -425,6 +425,7 @@ test_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits, softcap, add_unused_qkv",
     test_cases,
@@ -799,6 +800,7 @@ flash_attn_func_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
     flash_attn_func_cases,
@@ -1043,6 +1045,7 @@ hd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap",
     hd_cases,
@@ -1785,6 +1788,7 @@ flash_attn_func_bnsd_cases = [
 ]
 
 
+@pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.parametrize(
     "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
     flash_attn_func_bnsd_cases,
