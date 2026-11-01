@@ -271,6 +271,9 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -323,6 +326,8 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);

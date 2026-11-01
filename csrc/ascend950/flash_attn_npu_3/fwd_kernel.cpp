@@ -332,6 +332,9 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -356,9 +359,10 @@ class FAIKernel950 {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                // Batch strides are recomputed on every batch advance because the
-                // BSND forms depend on the physical (region) seqlen of the batch
-                // being left.  BNSD planes are maxSeqlen sized so they are constant.
+                // Batch strides are recomputed on every batch advance because packed
+                // TND regions have a per-batch physical seqlen. Dense BSND uses the
+                // allocated S (constant). BNSD planes are maxSeqlen sized so they
+                // are constant.
                 int64_t qBatchStride = 0;
                 if constexpr (qFormat == Format::BNSD) {
                     qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
@@ -396,6 +400,8 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                 // length is resolved in the cachedBatch gate below, not here. If this

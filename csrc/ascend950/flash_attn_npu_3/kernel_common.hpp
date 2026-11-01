@@ -60,8 +60,8 @@ struct FAIKernelParams {
     float softcapValue;
     uint32_t numBlocks;
     uint32_t maxNumBlocksPerBatch;
-    // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
-    // BSND / TND, whose layout is the compile-time Format template parameter.
+    // Allocated KV sequence length: BNSD head-plane width (k.size(2)) or dense
+    // BSND token-plane width (k.size(1)). Unused (0) for TND and paged KV.
     int64_t kvSeqlenAllocated;
     FwdStorageParams storage;
 

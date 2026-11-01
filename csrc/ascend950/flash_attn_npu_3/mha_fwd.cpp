@@ -230,6 +230,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
                     "950 backend (v3) BNSD key and value must share batch, head and sequence dimensions "
                     "(the head dimension may differ)");
+    } else if (layout_enum == FwdLayout::BSND && !paged_KV && k.dim() == 4) {
+        // Dense BSND cache is [B, S_alloc, H, D]. S_alloc is the physical batch
+        // stride; seqused_k / cache_seqlens is only the used prefix.
+        TORCH_CHECK(v.dim() == 4 && k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                    "950 backend (v3) dense BSND key and value must share batch, sequence and head dimensions");
+        kv_seqlen_allocated = static_cast<int64_t>(k.size(1));
     }
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
@@ -404,9 +410,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                 max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_ptr[i]);
             }
         }
-        if (layout_enum == FwdLayout::BNSD) {
+        if (kv_seqlen_allocated > 0) {
             TORCH_CHECK(static_cast<int64_t>(max_kv_seqlen) <= kv_seqlen_allocated,
-                        "950 backend (v3) BNSD KV sequence dimension (", kv_seqlen_allocated,
+                        "950 backend (v3) allocated KV sequence dimension (", kv_seqlen_allocated,
                         ") is too small to cover the actual KV length (", max_kv_seqlen, ")");
         }
         const int64_t declared_k = max_seqlen_k_.value_or(
