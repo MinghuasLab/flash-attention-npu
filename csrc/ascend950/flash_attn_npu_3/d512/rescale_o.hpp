@@ -11,7 +11,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 #include <limits>
-#include "config.hpp"
+#include "../fwd_policy.hpp"
 #include <type_traits>
 #include "../kernel_common.hpp"
 #include "catlass/gemm_coord.hpp"

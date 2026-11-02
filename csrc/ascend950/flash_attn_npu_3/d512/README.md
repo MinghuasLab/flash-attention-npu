@@ -216,3 +216,7 @@ D<=256继续使用原默认地址。回归固定BSND/TND、两种dtype的Q257/KV
 最终修复后验证：v3/950构建安装成功，接口45项通过；原kvcache/BNSD相关集
 227项通过、20项跳过；ATK LSE16项及O-only 100+32项通过。阈值未改变。
 源码仍未提交，正式性能和内存验收尚未完成。
+
+## Shared policy checkpoint (2026-11-03)
+
+The layout and tiling policy now lives in `../fwd_policy.hpp`, shared by host, AICPU and device code. The `flash_attn::d512` namespace and all layout values remain unchanged. The QK/PV/Softmax/Rescale implementations below are still separate components pending convergence. No tiling-data or metadata ABI fields were added.

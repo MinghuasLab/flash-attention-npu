@@ -40,7 +40,7 @@
 #include "pv_matmul.hpp"
 #include "tilingdata.h"
 #include "fd_combine.hpp"
-#include "d512/config.hpp"
+#include "fwd_policy.hpp"
 #include "d512/qk_matmul.hpp"
 #include "d512/pv_matmul.hpp"
 #include "d512/online_softmax.hpp"
@@ -206,7 +206,7 @@ class FAIKernel950 {
             constexpr auto ub = flash_attn::d512::DEFAULT_UB;
             for (uint32_t i = 0; i < UB_S_OTMP_BUF_STAGES; ++i) {
                 ubSTensor[i] =
-                    resource.ubBuf.template GetBufferByByte<ElementS>(ub.sOffset + i * 64 * 128 * sizeof(float));
+                    resource.ubBuf.template GetBufferByByte<ElementS>(ub.sOffset + i * flash_attn::d512::S_STAGE_BYTES);
                 ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
                     ub.loOffset + i * ub.loStageBytes);
             }

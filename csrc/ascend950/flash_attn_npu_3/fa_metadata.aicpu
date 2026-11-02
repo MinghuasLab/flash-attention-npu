@@ -6,7 +6,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "tilingdata.h"
-#include "d512/config.hpp"
+#include "fwd_policy.hpp"
 #include <cstdint>
 #include <cstring>
 

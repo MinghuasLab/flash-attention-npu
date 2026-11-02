@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <vector>
 #include "tilingdata.h"
-#include "d512/config.hpp"
+#include "fwd_policy.hpp"
 
 namespace optiling {
 const uint32_t SIZE_OF_16BIT = 2;

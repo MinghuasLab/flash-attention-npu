@@ -6,7 +6,7 @@
 #include <fstream>
 #include "kernel_common.hpp"
 #include "tilingdata.h"
-#include "d512/config.hpp"
+#include "fwd_policy.hpp"
 void check_d512(void**, void*, int, bool, bool, int, bool, bool);
 #define CHECK(x)                                                                                                       \
     do {                                                                                                               \

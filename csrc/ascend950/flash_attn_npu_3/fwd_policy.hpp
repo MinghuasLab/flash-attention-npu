@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * CANN Open Software License Agreement Version 2.0 (the "License").
  */
-#ifndef FLASH_ATTN_NPU_3_D512_CONFIG_HPP
-#define FLASH_ATTN_NPU_3_D512_CONFIG_HPP
+#ifndef FLASH_ATTN_NPU_3_FWD_POLICY_HPP
+#define FLASH_ATTN_NPU_3_FWD_POLICY_HPP
 
 #include <cstdint>
 
@@ -13,6 +13,13 @@ constexpr uint32_t Q_TILE = 128;
 constexpr uint32_t KV_TILE = 128;
 constexpr uint32_t VECTOR_ROWS = Q_TILE / 2;
 constexpr uint32_t L1_DIM_SLICE = 128;
+constexpr uint32_t Q_STAGES = 1;
+constexpr uint32_t K_STAGES = 2;
+constexpr uint32_t V_STAGES = 1;
+constexpr uint32_t S_STAGES = 2;
+constexpr uint32_t UB_P_STAGES = 2;
+constexpr uint32_t S_STAGE_BYTES = VECTOR_ROWS * KV_TILE * sizeof(float);
+constexpr uint32_t P_STAGE_BYTES = VECTOR_ROWS * KV_TILE * 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t LO_STAGES = 2;
 constexpr uint32_t GO_ROWS = 16;
@@ -22,7 +29,8 @@ constexpr uint32_t UB_BYTES = 248 * 1024;
 constexpr uint32_t LO_TILE_BYTES = Q_TILE * HEAD_DIM * sizeof(float);
 constexpr uint32_t LO_CORE_BYTES = LO_TILE_BYTES * LO_STAGES;
 constexpr uint32_t L1_BYTES =
-    Q_TILE * HEAD_DIM * 2 + KV_TILE * L1_DIM_SLICE * 2 * 2 + Q_TILE * KV_TILE * 2 * P_STAGES + KV_TILE * HEAD_DIM * 2;
+    Q_TILE * HEAD_DIM * 2 * Q_STAGES + KV_TILE * L1_DIM_SLICE * 2 * K_STAGES +
+    Q_TILE * KV_TILE * 2 * P_STAGES + KV_TILE * HEAD_DIM * 2 * V_STAGES;
 static_assert(L1_BYTES == 416 * 1024);
 
 // All offsets are per AIV, in bytes. The shared auxiliary area is budgeted
@@ -48,8 +56,8 @@ constexpr UbLayout MakeUbLayout(uint32_t auxBytes = VECTOR_ROWS * KV_TILE * 2, u
 {
     UbLayout b{};
     b.sOffset = 0;
-    b.pOffset = VECTOR_ROWS * KV_TILE * sizeof(float) * 2;
-    b.goOffset = b.pOffset + VECTOR_ROWS * KV_TILE * 2 * 2;
+    b.pOffset = S_STAGE_BYTES * S_STAGES;
+    b.goOffset = b.pOffset + P_STAGE_BYTES * UB_P_STAGES;
     b.lmOffset = b.goOffset + GO_ROWS * HEAD_DIM * sizeof(float);
     b.gmOffset = b.lmOffset + VECTOR_ROWS * sizeof(float);
     b.dmOffset = b.gmOffset + VECTOR_ROWS * sizeof(float);
@@ -110,10 +118,10 @@ inline void ApplyTiling(Tiling& t)
     t.pvL1TileN = HEAD_DIM;
     t.pvL1TileKLeft = KV_TILE;
     t.pvL1TileKRight = KV_TILE;
-    t.qL1BufNum = 1;
-    t.kL1BufNum = 2;
+    t.qL1BufNum = Q_STAGES;
+    t.kL1BufNum = K_STAGES;
     t.pL1BufNum = P_STAGES;
-    t.vL1BufNum = 1;
+    t.vL1BufNum = V_STAGES;
 }
 } // namespace flash_attn::d512
 #endif

@@ -8,7 +8,7 @@
 #define FLASH_ATTN_D512_SOFTMAX_HPP
 
 #include <limits>
-#include "config.hpp"
+#include "../fwd_policy.hpp"
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"

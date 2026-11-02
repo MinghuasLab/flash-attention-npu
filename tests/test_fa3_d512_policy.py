@@ -9,7 +9,7 @@ def test_d512_layout_and_task_partition(tmp_path):
     root = pathlib.Path(__file__).resolve().parents[1]
     source = tmp_path / "policy.cpp"
     source.write_text(r"""
-#include "csrc/ascend950/flash_attn_npu_3/d512/config.hpp"
+#include "csrc/ascend950/flash_attn_npu_3/fwd_policy.hpp"
 #include "csrc/ascend950/flash_attn_npu_3/tilingdata.h"
 #include <cassert>
 using namespace flash_attn::d512;
