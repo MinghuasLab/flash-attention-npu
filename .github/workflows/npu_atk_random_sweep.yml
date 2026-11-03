@@ -1,0 +1,122 @@
+name: NPU ATK Random Sweep
+
+on:
+  schedule:
+    - cron: '0 18 * * 6'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'ATK flavor (currently 910v3)'
+        required: false
+        default: '910v3'
+        type: string
+      seed:
+        description: 'Master seed (blank = random)'
+        required: false
+        default: ''
+        type: string
+      count:
+        description: 'Total cases'
+        required: false
+        default: '2000'
+        type: string
+      ref:
+        description: 'Operator branch to test'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npu-atk-random-sweep
+  cancel-in-progress: false
+
+jobs:
+  atk-random:
+    name: ATK random sweep (910B)
+    runs-on: ${{ fromJSON('["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]') }}
+    timeout-minutes: 240
+    env:
+      CI_DOCKER_IMAGE: fa-npu-ci:910b-cann9.1-torch2.9
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-atk
+      ATK_WORKSPACE: /tmp/atk-random-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out CI helpers
+        uses: actions/checkout@v4
+
+      - name: Clone ATK harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          source ci/docker_proxy.sh
+          git_proxy_init /home/FA_NPU_CI_DATA
+          mkdir -p "$ATK_WORKSPACE"
+          git clone --depth 1 https://gitcode.com/QieShi09/ATK-FOR-FA910v3.git "$ATK_WORKSPACE/harness"
+          git -C "$ATK_WORKSPACE/harness" rev-parse HEAD
+
+      - name: Run ATK sweep
+        shell: bash
+        env:
+          ATK_FLAVOR: ${{ inputs.flavor || '910v3' }}
+          ATK_SEED: ${{ inputs.seed }}
+          ATK_COUNT: ${{ inputs.count || '2000' }}
+          ATK_REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          source ci/docker_proxy.sh
+          git_proxy_init /home/FA_NPU_CI_DATA
+          test -x /usr/local/bin/npu-smi
+          docker image inspect "$CI_DOCKER_IMAGE" >/dev/null
+          entry_args=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            entry_args=("$ATK_FLAVOR" --count "$ATK_COUNT" --ref "$ATK_REF")
+            if [ -n "$ATK_SEED" ]; then
+              entry_args+=(--seed "$ATK_SEED")
+            fi
+          fi
+          mount_args=()
+          for path in /usr/local/dcmi /etc/ascend_install.info; do
+            if [ -e "$path" ]; then
+              mount_args+=(-v "$path:$path:ro")
+            fi
+          done
+          docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            --privileged \
+            --network host \
+            --ipc host \
+            "${GIT_PROXY_DOCKER_ARGS[@]}" \
+            "${mount_args[@]}" \
+            -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+            -v "$ATK_WORKSPACE/harness:/ws/harness" \
+            -w /ws/harness \
+            "$CI_DOCKER_IMAGE" \
+            bash -lc 'set -euo pipefail;
+              source /usr/local/Ascend/ascend-toolkit/set_env.sh;
+              bash /ws/harness/ci.sh "$@"' \
+            bash "${entry_args[@]}"
+
+      - name: Upload ATK results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atk-random-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.ATK_WORKSPACE }}/harness/**/runs/
+            !${{ env.ATK_WORKSPACE }}/harness/**/runs/**/repo/**
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Clean up this job's CI containers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ci/cleanup_ci_containers.sh
+          if [ -d "$ATK_WORKSPACE" ]; then
+            docker run --rm -v "$ATK_WORKSPACE:/ws" "$CI_DOCKER_IMAGE" rm -rf /ws/harness
+            rmdir "$ATK_WORKSPACE"
+          fi
