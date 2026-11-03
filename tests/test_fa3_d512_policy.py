@@ -11,6 +11,7 @@ def test_d512_layout_and_task_partition(tmp_path):
     source.write_text(r"""
 #include "csrc/ascend950/flash_attn_npu_3/fwd_policy.hpp"
 #include "csrc/ascend950/flash_attn_npu_3/tilingdata.h"
+#include "csrc/ascend950/flash_attn_npu_3/fa_metadata_args.h"
 #include <cassert>
 using namespace flash_attn::d512;
 int main() {
@@ -21,6 +22,12 @@ int main() {
     assert(t.qBaseTile == 128 && t.kvBaseTile == 128);
     assert(t.qkL1TileKRight == 128 && t.qkL1TileKLeft == 512);
     assert(t.pL1BufNum == 3 && t.vL1BufNum == 1 && t.kL1BufNum == 2);
+    // The live GO state sits after QK/P/PV workspace, for every launched Cube block.
+    for (unsigned cores = 1; cores <= 64; ++cores) {
+        const auto goEnd = fa_metadata::Mm1OutSize(cores) + fa_metadata::SmOnlineOutSize(cores) +
+            fa_metadata::Mm2OutSize(cores) + uint64_t(cores) * GO_CORE_BYTES;
+        assert(goEnd <= fa_metadata::WorkSpaceSize(cores));
+    }
     auto b = MakeUbLayout();
     assert(b.loRows == 16 && b.endOffset == 209.75 * 1024);
     assert(MakeUbLayout(8192, 0).loRows == 16);

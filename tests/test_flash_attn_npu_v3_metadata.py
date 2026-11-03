@@ -1901,3 +1901,118 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         rtol=0,
         atol=1e-6,
     )
+
+
+def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths, layout, scale, causal):
+    out, lse, *_ = result
+    offsets = _prefix_sums(q_lengths)
+    for batch, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
+        mask = _causal_mask(nq, nk, causal)
+        ref, lse_ref, baseline, lse_baseline = ref_flash_attention_pair(
+            query[batch:batch + 1, :nq], key[batch:batch + 1, :nk],
+            value[batch:batch + 1, :nk], scale, mask, query.dtype,
+        )
+        if mask is not None:
+            fully_masked = mask.all(dim=-1)
+            ref[:, fully_masked] = 0
+            baseline[:, fully_masked] = 0
+            lse_ref = lse_ref.masked_fill(fully_masked[None, None, :], torch.inf)
+            lse_baseline = lse_baseline.masked_fill(fully_masked[None, None, :], torch.inf)
+        if layout == "BSND":
+            actual = out[batch:batch + 1, :nq]
+            actual_lse = lse[batch:batch + 1, :, :nq] if lse is not None else None
+        else:
+            actual = out[offsets[batch]:offsets[batch + 1]].unsqueeze(0)
+            actual_lse = lse[:, offsets[batch]:offsets[batch + 1]].unsqueeze(0) if lse is not None else None
+        assert_fa_close(actual, ref, baseline, name=f"D512 metadata {layout} batch{batch} O")
+        if actual_lse is not None:
+            assert_fa_close(actual_lse, lse_ref, lse_baseline, name=f"D512 metadata {layout} batch{batch} LSE")
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("sq,sk,heads,kv_heads,causal", [
+    (17, 129, 4, 2, False), (257, 640, 4, 2, True), (1, 1025, 16, 2, False),
+    (1024, 129, 4, 2, False),  # 64 tasks: more than the 28 Cube blocks.
+])
+def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal):
+    gen = torch.Generator().manual_seed(512)
+    q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
+    k = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
+    v = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
+    q_lengths = [sq, max(1, sq - 1)] if layout == "TND" else [sq, sq]
+    k_lengths = [sk, sk - 1]
+    cu_q = _int32_npu(_prefix_sums(q_lengths)) if layout == "TND" else None
+    q_dev = q.npu() if layout == "BSND" else torch.cat([q[i, :n] for i, n in enumerate(q_lengths)]).npu()
+    k_dev = k.npu() if layout == "BSND" else torch.cat([k[i, :n] for i, n in enumerate(k_lengths)]).npu()
+    v_dev = v.npu() if layout == "BSND" else torch.cat([v[i, :n] for i, n in enumerate(k_lengths)]).npu()
+    lengths = _int32_npu(k_lengths)
+    metadata = _metadata(
+        batch_size=2, q_seqlen=sq, kv_seqlen=sk, num_heads=heads, kv_heads=kv_heads,
+        head_size=512, data_type=dtype, cache_seqlens=lengths, cu_seqlens_q=cu_q,
+        is_causal=causal, num_splits=1,
+    )
+    # Metadata depends on geometry, not scale; reuse the same buffer twice.
+    for scale, return_lse in ((512 ** -0.5, True), (0.5 * 512 ** -0.5, False)):
+        for schedule in (None, metadata):
+            result = flash_attn_with_kvcache(
+                q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
+                max_seqlen_q=sq, causal=causal, softmax_scale=scale,
+                scheduler_metadata=schedule, num_splits=1, return_softmax_lse=return_lse,
+            )
+            if not return_lse:
+                result = (result, None)
+            _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, scale, causal)
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("block_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("causal", [False, True])
+def test_d512_metadata_pages(dtype, layout, block_size, causal):
+    sq, sk, heads, kv_heads = (129 if causal else 17), block_size + 1, 4, 2
+    gen = torch.Generator().manual_seed(513)
+    q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
+    k = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
+    v = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
+    q_lengths = [sq, sq - 1] if layout == "TND" else [sq, sq]
+    k_lengths = [sk, sk - 1]
+    cu_q = _int32_npu(_prefix_sums(q_lengths)) if layout == "TND" else None
+    q_dev = q.npu() if layout == "BSND" else torch.cat([q[i, :n] for i, n in enumerate(q_lengths)]).npu()
+    def pages(x):
+        padded = torch.zeros((2, 2 * block_size, kv_heads, 512), dtype=dtype)
+        padded[:, :sk] = x
+        return padded.reshape(4, block_size, kv_heads, 512).flip(0).contiguous().npu()
+    lengths = _int32_npu(k_lengths)
+    table = _int32_npu([[3, 2], [1, 0]])
+    k_dev, v_dev = pages(k), pages(v)
+    metadata = _metadata(
+        batch_size=2, q_seqlen=sq, kv_seqlen=sk, num_heads=heads, kv_heads=kv_heads,
+        head_size=512, data_type=dtype, cache_seqlens=lengths, cu_seqlens_q=cu_q,
+        page_size=block_size, is_causal=causal, num_splits=1,
+    )
+    for schedule in (None, metadata):
+        result = flash_attn_with_kvcache(
+            q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
+            max_seqlen_q=sq, page_table=table, causal=causal,
+            scheduler_metadata=schedule, num_splits=1, return_softmax_lse=True,
+        )
+        _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, 512 ** -0.5, causal)
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("invalid", ["size", "dtype"])
+def test_d512_metadata_validation(invalid):
+    q = torch.zeros((1, 1, 1, 512), dtype=torch.float16, device="npu")
+    kv = torch.zeros((1, 128, 1, 512), dtype=torch.float16, device="npu")
+    lengths = _int32_npu([128])
+    metadata = _metadata(
+        batch_size=1, q_seqlen=1, kv_seqlen=128, num_heads=1, kv_heads=1,
+        head_size=512, data_type=q.dtype, cache_seqlens=lengths, num_splits=1,
+    )
+    invalid_metadata = metadata[:-1] if invalid == "size" else metadata.float()
+    message = "buffer size" if invalid == "size" else "byte tensor"
+    with pytest.raises(RuntimeError, match=message):
+        flash_attn_with_kvcache(q, kv, kv, cache_seqlens=lengths, scheduler_metadata=invalid_metadata)

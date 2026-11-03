@@ -103,6 +103,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->pL1BufNum = 3;
     if (metaArgs->embeddingSize == 512 && metaArgs->embeddingSizeV == 512) {
         flash_attn::d512::ApplyTiling(*tilingData);
+        tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(metaArgs->blockDim);
     }
     tilingData->qSeqlenAligned = 0;
     tilingData->kvSeqlenAligned = 0;
