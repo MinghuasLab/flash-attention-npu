@@ -226,7 +226,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     if (is_d512) {
         TORCH_CHECK(layout_enum != FwdLayout::BNSD, "D512 currently supports TND and BSND");
         TORCH_CHECK(num_splits <= 1, "D512 split-KV is not yet supported");
-        TORCH_CHECK(softcap == 0.0f, "D512 softcap is not yet supported");
     }
     TORCH_CHECK(
         !(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),

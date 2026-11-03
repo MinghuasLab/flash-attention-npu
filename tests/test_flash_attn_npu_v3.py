@@ -327,6 +327,29 @@ test_cases.extend([
 ])
 
 
+# D512 softcap reuses the existing dual-reference rule, including masked tails.
+test_cases.extend([
+    pytest.param(
+        dtype, 2, 4, 2, sq, sk, 512, cache, 128, causal, layout,
+        layout == "TND", -1, -1, cap, 1, False,
+        id=f"d512-softcap-{case}-{dtype}-{layout}-cache{cache}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for layout in ("BSND", "TND")
+    for cache in (0, 1)
+    for case, sq, sk, causal, cap in [
+        ("decode", 1, 1025, False, 2.0),
+        ("short-n", 17, 33, False, 30.0),
+        ("tail-n", 17, 129, True, 2.0),
+        ("resident-boundary", 16, 257, False, 30.0),
+        ("streamed-boundary", 17, 257, True, 2.0),
+        ("full-tile", 64, 256, False, 30.0),
+        ("multi-qkv", 257, 640, True, 2.0),
+        ("masked-rows", 129, 17, True, 30.0),
+    ]
+])
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -868,6 +891,21 @@ func_cases += [
 ]
 
 
+func_cases += [
+    pytest.param(
+        dtype, 2, 4, 2, sq, sk, 512, lse, causal, -1, -1, cap,
+        id=f"d512-softcap-{dtype}-{case}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, sq, sk, causal, cap, lse in [
+        ("short-n", 17, 33, False, 2.0, True),
+        ("multitile", 257, 640, True, 30.0, True),
+        ("o-only", 33, 257, False, 2.0, False),
+        ("masked-rows", 129, 17, True, 30.0, True),
+    ]
+]
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap",
     func_cases,
@@ -1108,6 +1146,21 @@ varlen_cases += [
         ("multitile", 257, 640, True, False),
         ("used-lengths", 129, 257, True, True),
         ("used-q-cap", 257, 129, True, True),
+    ]
+]
+
+
+varlen_cases += [
+    pytest.param(
+        dtype, 2, 4, 2, sq, sk, 512, causal, -1, -1, cap, unused,
+        id=f"d512-softcap-{dtype}-{case}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, sq, sk, causal, cap, unused in [
+        ("short-n", 17, 33, False, 2.0, False),
+        ("multitile", 257, 640, True, 30.0, False),
+        ("used-lengths", 129, 257, True, 2.0, True),
+        ("used-q-cap", 257, 129, True, 30.0, True),
     ]
 ]
 

@@ -1903,14 +1903,14 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
     )
 
 
-def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths, layout, scale, causal):
+def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths, layout, scale, causal, softcap=0.0):
     out, lse, *_ = result
     offsets = _prefix_sums(q_lengths)
     for batch, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
         mask = _causal_mask(nq, nk, causal)
         ref, lse_ref, baseline, lse_baseline = ref_flash_attention_pair(
             query[batch:batch + 1, :nq], key[batch:batch + 1, :nk],
-            value[batch:batch + 1, :nk], scale, mask, query.dtype,
+            value[batch:batch + 1, :nk], scale, mask, query.dtype, softcap,
         )
         if mask is not None:
             fully_masked = mask.all(dim=-1)
@@ -1924,9 +1924,9 @@ def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths
         else:
             actual = out[offsets[batch]:offsets[batch + 1]].unsqueeze(0)
             actual_lse = lse[:, offsets[batch]:offsets[batch + 1]].unsqueeze(0) if lse is not None else None
-        assert_fa_close(actual, ref, baseline, name=f"D512 metadata {layout} batch{batch} O")
+        assert_fa_close(actual, ref, baseline, softcap=softcap, name=f"D512 metadata {layout} batch{batch} O")
         if actual_lse is not None:
-            assert_fa_close(actual_lse, lse_ref, lse_baseline, name=f"D512 metadata {layout} batch{batch} LSE")
+            assert_fa_close(actual_lse, lse_ref, lse_baseline, softcap=softcap, name=f"D512 metadata {layout} batch{batch} LSE")
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
@@ -1936,7 +1936,8 @@ def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths
     (17, 129, 4, 2, False), (257, 640, 4, 2, True), (1, 1025, 16, 2, False),
     (1024, 129, 4, 2, False),  # 64 tasks: more than the 28 Cube blocks.
 ])
-def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal):
+@pytest.mark.parametrize("softcap", [0.0, 2.0], ids=["no-softcap", "softcap"])
+def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal, softcap):
     gen = torch.Generator().manual_seed(512)
     q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
     k = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
@@ -1958,12 +1959,12 @@ def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal):
         for schedule in (None, metadata):
             result = flash_attn_with_kvcache(
                 q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-                max_seqlen_q=sq, causal=causal, softmax_scale=scale,
+                max_seqlen_q=sq, causal=causal, softmax_scale=scale, softcap=softcap,
                 scheduler_metadata=schedule, num_splits=1, return_softmax_lse=return_lse,
             )
             if not return_lse:
                 result = (result, None)
-            _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, scale, causal)
+            _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, scale, causal, softcap)
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
@@ -1971,7 +1972,8 @@ def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal):
 @pytest.mark.parametrize("layout", ["BSND", "TND"])
 @pytest.mark.parametrize("block_size", [128, 256, 512, 1024])
 @pytest.mark.parametrize("causal", [False, True])
-def test_d512_metadata_pages(dtype, layout, block_size, causal):
+@pytest.mark.parametrize("softcap", [0.0, 30.0], ids=["no-softcap", "softcap"])
+def test_d512_metadata_pages(dtype, layout, block_size, causal, softcap):
     sq, sk, heads, kv_heads = (129 if causal else 17), block_size + 1, 4, 2
     gen = torch.Generator().manual_seed(513)
     q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
@@ -1996,10 +1998,10 @@ def test_d512_metadata_pages(dtype, layout, block_size, causal):
     for schedule in (None, metadata):
         result = flash_attn_with_kvcache(
             q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-            max_seqlen_q=sq, page_table=table, causal=causal,
+            max_seqlen_q=sq, page_table=table, causal=causal, softcap=softcap,
             scheduler_metadata=schedule, num_splits=1, return_softmax_lse=True,
         )
-        _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, 512 ** -0.5, causal)
+        _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, 512 ** -0.5, causal, softcap)
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")

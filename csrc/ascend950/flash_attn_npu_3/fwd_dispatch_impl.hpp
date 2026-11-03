@@ -93,8 +93,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                         constexpr bool kUseDnFastPath = (MaskCat == MaskCategory::NO_MASK) && IsDN;
                         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
                             if (a.is_d512) {
-                                if constexpr (kLayout != Format::BNSD && MaskCat != MaskCategory::MASK_SWA &&
-                                              !HasSoftcap) {
+                                if constexpr (kLayout != Format::BNSD && MaskCat != MaskCategory::MASK_SWA) {
                                     FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap, true);
                                 }
                             } else if constexpr (kUseDnFastPath) {
