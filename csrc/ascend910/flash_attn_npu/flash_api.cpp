@@ -491,6 +491,15 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
+        // Fixed layout: every batch sees the same Q length, so the grouped task
+        // geometry is computed once on Host and handed to the kernel.
+        fa_fused::TaskShape fusedShape{};
+        if (fusedTask) {
+            fusedShape = fa_fused::MakeTaskShape(seqlen_q, num_heads, num_heads_k, batch_size, blockDim, true);
+            tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile, fusedShape.normHeadBlocks,
+                                           fusedShape.normTasks, fusedShape.tailRows, fusedShape.tailHeadTile,
+                                           fusedShape.tailHeadBlocks, fusedShape.totalTasks);
+        }
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
@@ -501,8 +510,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (fusedTask) {
-                curTaskNum = fa_fused::MakeTaskShape(
-                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, true).totalTasks;
+                curTaskNum = fusedShape.totalTasks;
             }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
@@ -845,6 +853,12 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         uint32_t firstBatchTaskNum = 0;
+        // Fixed layout: one geometry for every batch, precomputed on Host.
+        const fa_fused::TaskShape fusedShape =
+            fa_fused::MakeTaskShape(seqlen_q, num_heads, num_heads_k, batch_size, blockDim, true);
+        tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile, fusedShape.normHeadBlocks,
+                                       fusedShape.normTasks, fusedShape.tailRows, fusedShape.tailHeadTile,
+                                       fusedShape.tailHeadBlocks, fusedShape.totalTasks);
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             uint64_t kvSeqlen = seqlen_k;
@@ -855,8 +869,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (fusedTask) {
-                curTaskNum = fa_fused::MakeTaskShape(
-                    qSeqlen, num_heads, num_heads_k, batch_size, blockDim, true).totalTasks;
+                curTaskNum = fusedShape.totalTasks;
             }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);

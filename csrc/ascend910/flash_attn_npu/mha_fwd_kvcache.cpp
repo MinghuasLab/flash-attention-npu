@@ -438,7 +438,20 @@ class FAInferKernel {
             uint32_t curQNBlockNumCur = 0;
             fa_fused::TaskShape fusedShape{};
             if (fusedTask && INPUT_LAYOUT != FaiKenel::inputLayout::TND) {
-                fusedShape = fa_fused::MakeTaskShape(maxQSeqlen, qHeads, kvHeads, batch, taskCoreNum, true);
+                // Geometry precomputed by Host/AICPU and carried in the tiling:
+                // the core only loads 8 scalars instead of running HeadTile /
+                // MakeTaskShape (gcd + divides + loops) in every core.
+                fusedShape.normQBlocks = fATilingData->fusedNormQBlocks;
+                fusedShape.normHeadTile = fATilingData->fusedNormHeadTile;
+                fusedShape.normHeadBlocks = fATilingData->fusedNormHeadBlocks;
+                fusedShape.normTasks = fATilingData->fusedNormTasks;
+                fusedShape.tailRows = fATilingData->fusedTailRows;
+                fusedShape.tailHeadTile = fATilingData->fusedTailHeadTile;
+                fusedShape.tailHeadBlocks = fATilingData->fusedTailHeadBlocks;
+                fusedShape.totalTasks = fATilingData->fusedTotalTasks;
+                if (fusedShape.totalTasks == 0U) { // tiling without the precomputed shape
+                    fusedShape = fa_fused::MakeTaskShape(maxQSeqlen, qHeads, kvHeads, batch, taskCoreNum, true);
+                }
             }
             for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
                 while (taskIdx >= curTotalTaskNumTmp) {
@@ -582,6 +595,20 @@ class FAInferKernel {
         }
     }
 
+    // Task -> head slice mapping for fused tasks whose tile is narrower than one
+    // KV group: task `qNBlockIdx` is the subIdx-th slice of KV group kvNIdx, the
+    // same numbering HeadBlocks uses (kvIdx = idx / numSub, subIdx = idx % numSub).
+    __aicore__ __attribute__((noinline)) static void ResolveInGroupHeadSlice(
+        uint32_t qNBlockIdx, uint32_t headTile, uint32_t groupSize, uint32_t& qNStartIdx,
+        uint32_t& qNBlockSize, uint32_t& kvNIdx)
+    {
+        uint32_t numSubPerGroup = CeilDiv(groupSize, headTile);
+        uint32_t subIdx = qNBlockIdx % numSubPerGroup;
+        kvNIdx = qNBlockIdx / numSubPerGroup;
+        qNStartIdx = kvNIdx * groupSize + subIdx * headTile;
+        qNBlockSize = AscendC::Std::min(headTile, groupSize - subIdx * headTile);
+    }
+
     __aicore__ inline bool runMainLoop(uint32_t coreIdx, uint32_t BIdx, uint32_t qNBlockIdx, uint32_t qSBlockIdx,
                                        bool isSplitKV, int32_t stS2IdxNow, int32_t enS2IdxNow, uint64_t gmOffsetLseFD,
                                        uint64_t gmOffsetOFD, GlobalTensorBundle& globalTensors,
@@ -706,9 +733,16 @@ class FAInferKernel {
         uint32_t qNStartIdx;
         uint32_t qNBlockSize;
         if (fusedHeadTile != 0U) {
+            // Whole KV groups per task: the head slice may span several groups.
             qNStartIdx = qNBlockIdx * curQNBlockTile;
             kvNIdx = qNStartIdx / groupSize;
             qNBlockSize = AscendC::Std::min(curQNBlockTile, qHeads - qNStartIdx);
+            if (groupSize != 1U && curQNBlockTile < groupSize) {
+                // Rare in-group slice (GQA with an odd group size). Kept out of
+                // line so the MHA / whole-group path keeps the upstream
+                // instruction stream (growing it cost ~20% on causal MHA).
+                ResolveInGroupHeadSlice(qNBlockIdx, curQNBlockTile, groupSize, qNStartIdx, qNBlockSize, kvNIdx);
+            }
         } else {
             uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
             uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;

@@ -71,6 +71,19 @@ struct FAInferTilingData {
     splitNode splitInfo[25];
     __gm__ uint8_t* pDevice = nullptr;
     __gm__ uint8_t* dropMaskDevice = nullptr;
+    // fuseTask geometry for the fixed-layout (BSND/BNSD) path, computed once on
+    // the Host (or AICPU) so the AICore only reads it instead of re-running
+    // HeadTile/MakeTaskShape (gcd + divides) in every core. All zero means
+    // "not precomputed" and the kernel falls back to computing it locally
+    // (varlen/TND per-batch shapes still need the device-side version).
+    uint32_t fusedNormQBlocks;
+    uint32_t fusedNormHeadTile;
+    uint32_t fusedNormHeadBlocks;
+    uint32_t fusedNormTasks;
+    uint32_t fusedTailRows;
+    uint32_t fusedTailHeadTile;
+    uint32_t fusedTailHeadBlocks;
+    uint32_t fusedTotalTasks;
 
     uint32_t get_numHeads() const { return numHeads; }
     uint32_t get_embeddingSize() const { return embeddingSize; }
@@ -109,6 +122,14 @@ struct FAInferTilingData {
     uint32_t get_numSplits() const { return numSplits; }
     uint32_t get_kvNewSeqlen() const { return kvNewSeqlen; }
     uint32_t get_kvCacheSeqlen() const { return kvCacheSeqlen; }
+    uint32_t get_fusedNormQBlocks() const { return fusedNormQBlocks; }
+    uint32_t get_fusedNormHeadTile() const { return fusedNormHeadTile; }
+    uint32_t get_fusedNormHeadBlocks() const { return fusedNormHeadBlocks; }
+    uint32_t get_fusedNormTasks() const { return fusedNormTasks; }
+    uint32_t get_fusedTailRows() const { return fusedTailRows; }
+    uint32_t get_fusedTailHeadTile() const { return fusedTailHeadTile; }
+    uint32_t get_fusedTailHeadBlocks() const { return fusedTailHeadBlocks; }
+    uint32_t get_fusedTotalTasks() const { return fusedTotalTasks; }
 
     void set_numHeads(uint32_t value) { numHeads = value; }
     void set_embeddingSize(uint32_t value) { embeddingSize = value; }
@@ -147,6 +168,18 @@ struct FAInferTilingData {
     void set_numSplits(uint32_t value) { numSplits = value; }
     void set_kvNewSeqlen(uint32_t value) { kvNewSeqlen = value; }
     void set_kvCacheSeqlen(uint32_t value) { kvCacheSeqlen = value; }
+    void set_fusedShape(uint32_t normQBlocks, uint32_t normHeadTile, uint32_t normHeadBlocks, uint32_t normTasks,
+                        uint32_t tailRows, uint32_t tailHeadTile, uint32_t tailHeadBlocks, uint32_t totalTasks)
+    {
+        fusedNormQBlocks = normQBlocks;
+        fusedNormHeadTile = normHeadTile;
+        fusedNormHeadBlocks = normHeadBlocks;
+        fusedNormTasks = normTasks;
+        fusedTailRows = tailRows;
+        fusedTailHeadTile = tailHeadTile;
+        fusedTailHeadBlocks = tailHeadBlocks;
+        fusedTotalTasks = totalTasks;
+    }
 };
 
 #endif

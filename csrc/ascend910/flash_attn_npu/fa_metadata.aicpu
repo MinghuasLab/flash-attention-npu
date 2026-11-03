@@ -102,6 +102,22 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
     tilingData->fusedTask = fusedTask ? 1U : 0U;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
+    // Fixed layout (non-varlen): every batch shares one Q length, so the grouped
+    // task geometry is computed once here and published in the tiling for the
+    // AICore to read instead of recomputing it in every core.
+    if (fusedTask && metaArgs->isVarlen == 0U) {
+        const fa_fused::TaskShape shape =
+            fa_fused::MakeTaskShape(metaArgs->maxQSeqlen, metaArgs->numHeads, metaArgs->numHeadsK, metaArgs->batch,
+                                    metaArgs->blockDim, true);
+        tilingData->fusedNormQBlocks = shape.normQBlocks;
+        tilingData->fusedNormHeadTile = shape.normHeadTile;
+        tilingData->fusedNormHeadBlocks = shape.normHeadBlocks;
+        tilingData->fusedNormTasks = shape.normTasks;
+        tilingData->fusedTailRows = shape.tailRows;
+        tilingData->fusedTailHeadTile = shape.tailHeadTile;
+        tilingData->fusedTailHeadBlocks = shape.tailHeadBlocks;
+        tilingData->fusedTotalTasks = shape.totalTasks;
+    }
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (metaArgs->isVarlen != 0) {
