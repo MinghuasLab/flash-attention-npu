@@ -852,6 +852,22 @@ func_cases = [
 ]
 
 
+# Ascend950 D512 uses Host tiling; D512 coverage here is forward-only.
+func_cases += [
+    pytest.param(
+        dtype, batch, heads, kv_heads, sq, sk, 512, lse, causal, -1, -1, 0.0,
+        id=f"d512-{dtype}-{case}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, batch, heads, kv_heads, sq, sk, causal, lse in [
+        ("tail", 1, 4, 2, 17, 129, False, True),
+        ("multitile", 2, 4, 2, 257, 640, True, True),
+        ("decode", 1, 16, 2, 1, 1025, False, False),
+        ("masked-rows", 1, 4, 2, 129, 17, True, True),
+    ]
+]
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap",
     func_cases,
@@ -943,16 +959,19 @@ def test_fa_func_ops(
     )
 
     assert_fa_close(out_out, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    if return_attn_probs and "Ascend910" in name:
+    if return_attn_probs and ("Ascend910" in name or head_size == 512):
+        lse_compare = softmax_lse.transpose(-1, -2) if "Ascend950" in name else softmax_lse
         assert_fa_close(
-            softmax_lse,
+            lse_compare,
             golden_lseL_ref,
             golden_lseL_pt,
             softcap=softcap,
             name="softmax_lse",
         )
-    if "Ascend910" in name or (
-        "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+    if head_size <= 256 and (
+        "Ascend910" in name or (
+            "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+        )
     ):
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
         dout_ref = dout.detach().cpu()
@@ -1075,6 +1094,21 @@ varlen_cases = [
     (torch.float16, 3, 10, 2, 127, 129, 35, False, -1, -1, 0.0, True),
     (torch.float16, 7, 40, 8, 511, 513, 101, True, 127, 0, 0.0, True),
     (torch.bfloat16, 4, 10, 1, 65, 8192, 201, True, -1, -1, 0.0, True),
+]
+
+
+varlen_cases += [
+    pytest.param(
+        dtype, 2, 4, 2, sq, sk, 512, causal, -1, -1, 0.0, unused,
+        id=f"d512-{dtype}-{case}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, sq, sk, causal, unused in [
+        ("tail", 17, 129, False, False),
+        ("multitile", 257, 640, True, False),
+        ("used-lengths", 129, 257, True, True),
+        ("used-q-cap", 257, 129, True, True),
+    ]
 ]
 
 
@@ -1217,8 +1251,10 @@ def test_fa_varlen_ops(
         assert_fa_close(
             lse_compare, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse"
         )
-    if "Ascend910" in name or (
-        "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+    if head_size <= 256 and (
+        "Ascend910" in name or (
+            "Ascend950" in name and window_size_left == -1 and window_size_right == -1
+        )
     ):
         dout = make_random_tensor(
             output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu"
@@ -1265,6 +1301,26 @@ def test_fa_varlen_ops(
         assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
         assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+
+
+@pytest.mark.parametrize("entry", ["func", "varlen"])
+@pytest.mark.parametrize("empty", ["q", "kv"])
+def test_fa_d512_empty_sequences(entry, empty):
+    if not torch_npu.npu.is_available() or "Ascend950" not in torch_npu.npu.get_device_name():
+        pytest.skip("requires Ascend950")
+    sq, sk = (0, 17) if empty == "q" else (17, 0)
+    q = torch.zeros((1, sq, 2, 512), dtype=torch.float16, device="npu")
+    k = torch.zeros((1, sk, 1, 512), dtype=torch.float16, device="npu")
+    v = torch.zeros_like(k)
+    with pytest.raises(RuntimeError, match="positive"):
+        if entry == "func":
+            flash_attn_func(q, k, v)
+        else:
+            flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                torch.tensor([0, sq], dtype=torch.int32, device="npu"),
+                torch.tensor([0, sk], dtype=torch.int32, device="npu"), sq, sk,
+            )
 
 
 def _varlen_validation_inputs(dtype):
