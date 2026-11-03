@@ -350,6 +350,29 @@ test_cases.extend([
 ])
 
 
+# D512 SWA uses the same data generation, references and comparator as other dimensions.
+test_cases.extend([
+    pytest.param(
+        dtype, 2, heads, 2, sq, sk, 512, cache, 128, causal, layout,
+        layout == "TND", left, right, cap, 1, False,
+        id=f"d512-swa-{case}-{dtype}-{layout}-cache{cache}",
+    )
+    for dtype in (torch.float16, torch.bfloat16)
+    for layout in ("BSND", "TND")
+    for cache in (0, 1)
+    for case, sq, sk, heads, causal, left, right, cap in [
+        ("both", 129, 257, 4, False, 31, 17, 0.0),
+        ("left", 257, 640, 4, False, 127, -1, 2.0),
+        ("right", 129, 257, 4, False, -1, 127, 0.0),
+        ("self", 129, 129, 4, False, 0, 0, 30.0),
+        ("masked", 257, 17, 4, False, 0, 0, 0.0),
+        ("gqa-split", 17, 129, 8, True, 16, 0, 2.0),
+        ("short-kv", 17, 33, 4, False, 3, 2, 30.0),
+        ("long-q", 1024, 1025, 4, True, 128, 0, 0.0),
+    ]
+])
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -906,6 +929,19 @@ func_cases += [
 ]
 
 
+func_cases += [
+    pytest.param(dtype, 2, 4, 2, sq, sk, 512, True, causal, left, right, cap,
+                 id=f"d512-swa-{dtype}-{case}")
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, sq, sk, causal, left, right, cap in [
+        ("both", 129, 257, False, 31, 17, 0.0),
+        ("causal", 257, 640, True, 127, 0, 2.0),
+        ("masked", 129, 17, False, 0, 0, 0.0),
+        ("short-kv", 17, 33, False, 3, 2, 30.0),
+    ]
+]
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap",
     func_cases,
@@ -1161,6 +1197,19 @@ varlen_cases += [
         ("multitile", 257, 640, True, 30.0, False),
         ("used-lengths", 129, 257, True, 2.0, True),
         ("used-q-cap", 257, 129, True, 30.0, True),
+    ]
+]
+
+
+varlen_cases += [
+    pytest.param(dtype, 2, 4, 2, sq, sk, 512, causal, left, right, cap, unused,
+                 id=f"d512-swa-{dtype}-{case}")
+    for dtype in (torch.float16, torch.bfloat16)
+    for case, sq, sk, causal, left, right, cap, unused in [
+        ("both", 129, 257, False, 31, 17, 0.0, False),
+        ("causal", 257, 640, True, 127, 0, 2.0, False),
+        ("used-lengths", 129, 257, True, 16, 0, 0.0, True),
+        ("short-kv", 17, 33, False, 3, 2, 30.0, False),
     ]
 ]
 

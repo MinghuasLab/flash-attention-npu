@@ -1903,11 +1903,11 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
     )
 
 
-def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths, layout, scale, causal, softcap=0.0):
+def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths, layout, scale, causal, softcap=0.0, window_size=WINDOW_SIZE):
     out, lse, *_ = result
     offsets = _prefix_sums(q_lengths)
     for batch, (nq, nk) in enumerate(zip(q_lengths, k_lengths)):
-        mask = _causal_mask(nq, nk, causal)
+        mask = _attn_mask(nq, nk, causal, window_size)
         ref, lse_ref, baseline, lse_baseline = ref_flash_attention_pair(
             query[batch:batch + 1, :nq], key[batch:batch + 1, :nk],
             value[batch:batch + 1, :nk], scale, mask, query.dtype, softcap,
@@ -1932,12 +1932,16 @@ def _assert_d512_metadata_result(result, query, key, value, q_lengths, k_lengths
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["BSND", "TND"])
-@pytest.mark.parametrize("sq,sk,heads,kv_heads,causal", [
-    (17, 129, 4, 2, False), (257, 640, 4, 2, True), (1, 1025, 16, 2, False),
-    (1024, 129, 4, 2, False),  # 64 tasks: more than the 28 Cube blocks.
+@pytest.mark.parametrize("sq,sk,heads,kv_heads,causal,window_size", [
+    (17, 129, 4, 2, False, WINDOW_SIZE), (257, 640, 4, 2, True, WINDOW_SIZE), (1, 1025, 16, 2, False, WINDOW_SIZE),
+    (1024, 129, 4, 2, False, WINDOW_SIZE),  # 64 tasks: more than the 28 Cube blocks.
+    pytest.param(17, 33, 4, 2, False, (3, 2), id="swa-short"),
+    pytest.param(129, 257, 4, 2, False, (31, 17), id="swa-both"),
+    pytest.param(257, 17, 4, 2, False, (0, 0), id="swa-masked"),
+    pytest.param(1024, 1025, 4, 2, True, (128, 0), id="swa-long"),
 ])
 @pytest.mark.parametrize("softcap", [0.0, 2.0], ids=["no-softcap", "softcap"])
-def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal, softcap):
+def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal, window_size, softcap):
     gen = torch.Generator().manual_seed(512)
     q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
     k = torch.randn((2, sk, kv_heads, 512), dtype=dtype, generator=gen)
@@ -1952,19 +1956,19 @@ def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal, sof
     metadata = _metadata(
         batch_size=2, q_seqlen=sq, kv_seqlen=sk, num_heads=heads, kv_heads=kv_heads,
         head_size=512, data_type=dtype, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-        is_causal=causal, num_splits=1,
+        is_causal=causal, window_size=window_size, num_splits=1,
     )
     # Metadata depends on geometry, not scale; reuse the same buffer twice.
     for scale, return_lse in ((512 ** -0.5, True), (0.5 * 512 ** -0.5, False)):
         for schedule in (None, metadata):
             result = flash_attn_with_kvcache(
                 q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-                max_seqlen_q=sq, causal=causal, softmax_scale=scale, softcap=softcap,
+                max_seqlen_q=sq, causal=causal, softmax_scale=scale, softcap=softcap, window_size=window_size,
                 scheduler_metadata=schedule, num_splits=1, return_softmax_lse=return_lse,
             )
             if not return_lse:
                 result = (result, None)
-            _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, scale, causal, softcap)
+            _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, scale, causal, softcap, window_size)
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
@@ -1973,7 +1977,8 @@ def test_d512_metadata_dense(dtype, layout, sq, sk, heads, kv_heads, causal, sof
 @pytest.mark.parametrize("block_size", [128, 256, 512, 1024])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 30.0], ids=["no-softcap", "softcap"])
-def test_d512_metadata_pages(dtype, layout, block_size, causal, softcap):
+@pytest.mark.parametrize("window_size", [WINDOW_SIZE, (31, 17)], ids=["full", "swa"])
+def test_d512_metadata_pages(dtype, layout, block_size, causal, softcap, window_size):
     sq, sk, heads, kv_heads = (129 if causal else 17), block_size + 1, 4, 2
     gen = torch.Generator().manual_seed(513)
     q = torch.randn((2, sq, heads, 512), dtype=dtype, generator=gen)
@@ -1993,15 +1998,15 @@ def test_d512_metadata_pages(dtype, layout, block_size, causal, softcap):
     metadata = _metadata(
         batch_size=2, q_seqlen=sq, kv_seqlen=sk, num_heads=heads, kv_heads=kv_heads,
         head_size=512, data_type=dtype, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-        page_size=block_size, is_causal=causal, num_splits=1,
+        page_size=block_size, is_causal=causal, window_size=window_size, num_splits=1,
     )
     for schedule in (None, metadata):
         result = flash_attn_with_kvcache(
             q_dev, k_dev, v_dev, cache_seqlens=lengths, cu_seqlens_q=cu_q,
-            max_seqlen_q=sq, page_table=table, causal=causal, softcap=softcap,
+            max_seqlen_q=sq, page_table=table, causal=causal, softcap=softcap, window_size=window_size,
             scheduler_metadata=schedule, num_splits=1, return_softmax_lse=True,
         )
-        _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, 512 ** -0.5, causal, softcap)
+        _assert_d512_metadata_result(result, q, k, v, q_lengths, k_lengths, layout, 512 ** -0.5, causal, softcap, window_size)
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")

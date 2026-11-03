@@ -442,7 +442,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     if (return_softmax_lse) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
-    TORCH_CHECK(!is_d512 || !is_local, "D512 sliding-window attention is not yet supported");
     at::Tensor workspace;
     if (flashDecodeEnabled || is_d512) {
         // D512 metadata stays on device; its workspace budget depends only on core count.
