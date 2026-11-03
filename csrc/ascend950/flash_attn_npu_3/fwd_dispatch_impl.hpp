@@ -45,8 +45,8 @@
         }                                                                                                              \
     } while (0)
 
-#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP)                         \
-    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP>  \
+#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, ...)                                 \
+    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, __VA_ARGS__>  \
         <<<a.block_dim, nullptr, a.stream>>>(a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,  \
                                              a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
                                              a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
@@ -92,7 +92,12 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                         // masked FAInferDn instantiations from this TU.
                         constexpr bool kUseDnFastPath = (MaskCat == MaskCategory::NO_MASK) && IsDN;
                         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
-                            if constexpr (kUseDnFastPath) {
+                            if (a.is_d512) {
+                                if constexpr (kLayout != Format::BNSD && MaskCat != MaskCategory::MASK_SWA &&
+                                              !HasSoftcap) {
+                                    FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap, true);
+                                }
+                            } else if constexpr (kUseDnFastPath) {
                                 FWD_KERNEL_LAUNCH(FAInferDn, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
                             } else {
                                 FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);

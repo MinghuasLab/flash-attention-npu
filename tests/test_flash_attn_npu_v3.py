@@ -293,6 +293,40 @@ test_cases = [
 ]
 
 
+# D512 long-Q scheduling and tail regression: 5 lengths x 2 dtypes x 2 layouts.
+# Keep KV and heads fixed to isolate Q task distribution; compare O and LSE
+# through the existing test_fa_kvcache_ops reference and comparison path.
+test_cases.extend([
+    pytest.param(
+        dtype, 1, 4, 2, q_len, 129, 512, 0, 128, False, layout,
+        False, -1, -1, 0.0, 1, False,
+        id=f"d512-longq-{dtype_name}-{layout}-q{q_len}",
+    )
+    for q_len in (1024, 2048, 4096, 4095, 4097)
+    for dtype, dtype_name in ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))
+    for layout in ("BSND", "TND")
+])
+
+
+# D512 long-Q combinations: 6 scenarios x 2 dtypes, using the same O/LSE checks.
+test_cases.extend([
+    pytest.param(
+        dtype, batch, 4, 2, 1024, kv_len, 512, cache_mode, 128, causal, layout,
+        varied, -1, -1, 0.0, 1, False,
+        id=f"d512-qcombo-{kind}-{dtype_name}-{layout}",
+    )
+    for kind, batch, kv_len, cache_mode, causal, layout, varied in (
+        ("batch2", 2, 129, 0, False, "BSND", False),
+        ("batch2", 2, 129, 0, False, "TND", False),
+        ("paged", 1, 129, 1, False, "TND", False),
+        ("varlen", 2, 1025, 0, False, "TND", True),
+        ("causal", 1, 1025, 0, True, "BSND", False),
+        ("causal", 1, 1025, 0, True, "TND", False),
+    )
+    for dtype, dtype_name in ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))
+])
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -324,8 +358,8 @@ def test_fa_kvcache_ops(
         # as the original <=256 path, but append-KV remains unsupported.
         if head_size != 512:
             pytest.skip("head_size > 256 is only supported for exactly 512")
-        if "Ascend950" in name:
-            pytest.skip("Ascend950 v3 does not support head_size 512")
+        if "Ascend950" in name and num_splits > 1:
+            pytest.skip("Ascend950 D512 split-KV is not yet supported")
     elif head_size < 1:
         pytest.skip("head_size must be >= 1")
     if is_varied and layout != "TND":

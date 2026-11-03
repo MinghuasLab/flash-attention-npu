@@ -30,10 +30,12 @@ class InitOutputs950 {
     static constexpr uint32_t LSE_UB_OFFSET = 7U * 32768U + 2048U;
     static constexpr uint32_t LSE_ELEMS_PER_ROW = 8U;
 
-    __aicore__ inline explicit InitOutputs950(Arch::Resource<ArchTag>& resource)
+    __aicore__ inline explicit InitOutputs950(Arch::Resource<ArchTag>& resource,
+                                             uint32_t outputUbOffset = OUTPUT_UB_OFFSET,
+                                             uint32_t lseUbOffset = LSE_UB_OFFSET)
     {
-        outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(OUTPUT_UB_OFFSET);
-        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
+        outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(outputUbOffset);
+        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(lseUbOffset);
     }
 
     __aicore__ inline InitOutputs950(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)

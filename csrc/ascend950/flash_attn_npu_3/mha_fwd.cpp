@@ -220,8 +220,16 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(seqlen_q > 0 && num_heads > 0, "query sequence length and head count must be positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
-    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
-    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256, "FlashAttention supports value head dimensions in [1, 256]");
+    const bool is_d512 = head_size_q == 512 && head_size_v == 512;
+    TORCH_CHECK(is_d512 || (head_size_q >= 1 && head_size_q <= 256 && head_size_v >= 1 && head_size_v <= 256),
+                "FlashAttention supports Q/K and V dimensions up to 256, or both equal to 512");
+    if (is_d512) {
+        TORCH_CHECK(layout_enum != FwdLayout::BNSD, "D512 currently supports TND and BSND");
+        TORCH_CHECK(!scheduler_metadata_.has_value(), "D512 scheduler metadata is not yet supported");
+        TORCH_CHECK(num_splits <= 1, "D512 split-KV is not yet supported");
+        TORCH_CHECK(softcap == 0.0f, "D512 softcap is not yet supported");
+        TORCH_CHECK(!paged_KV || page_block_size == 128, "D512 paged KV currently requires block size 128");
+    }
     TORCH_CHECK(
         !(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
         "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
@@ -390,7 +398,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
-        const bool flash_decode = num_splits != 1 && fd_shape_supported;
+        const bool flash_decode = !is_d512 && num_splits != 1 && fd_shape_supported;
 
         fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
                                seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu, paged_KV,
@@ -437,8 +445,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     if (return_softmax_lse) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
+    TORCH_CHECK(!is_d512 || !is_local, "D512 sliding-window attention is not yet supported");
     at::Tensor workspace;
-    if (flashDecodeEnabled) {
+    if (flashDecodeEnabled || is_d512) {
         workspace =
             at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
     }
@@ -460,7 +469,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // pointer is used only by specializations that return softmax LSE.
     auto lseDev = return_softmax_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     uint8_t* wsDev = nullptr;
-    if (flashDecodeEnabled) {
+    if (flashDecodeEnabled || is_d512) {
         wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     }
     auto tilDev = tilingDevice;
@@ -497,6 +506,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
     const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;
     const FwdLaunchArgs fwdArgs{is_bf16,
+                                is_d512,
                                 fmt,
                                 mask_category,
                                 paged_KV,

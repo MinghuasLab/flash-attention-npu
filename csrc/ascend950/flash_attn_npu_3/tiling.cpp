@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <vector>
 #include "tilingdata.h"
+#include "d512/config.hpp"
 
 namespace optiling {
 const uint32_t SIZE_OF_16BIT = 2;
@@ -126,6 +127,9 @@ FAInferTiling::FAInferTiling(const FAInferContext& faInfo) : faInfo_(faInfo) {}
 
 uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
+    if (faInfo_.embeddingSize == 512 && faInfo_.embeddingSizeV == 512) {
+        return flash_attn::d512::QHeadTile(qSeqlen, groupSize);
+    }
     uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
     if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
@@ -143,7 +147,7 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 
 uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t qSBlockTile = faInfo_.embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
+    uint32_t qSBlockTile = faInfo_.embeddingSizeV == 512 ? 128 : (faInfo_.embeddingSizeV > 128 ? 64 : Q_TILE_CEIL);
     return qSBlockTile;
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
@@ -220,6 +224,9 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
+    if (faInfo_.embeddingSize == 512 && faInfo_.embeddingSizeV == 512) {
+        flash_attn::d512::ApplyTiling(faTilingData);
+    }
 }
 
 void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData& faTilingData)

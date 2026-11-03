@@ -6,6 +6,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "tilingdata.h"
+#include "d512/config.hpp"
 #include <cstdint>
 #include <cstring>
 
@@ -20,8 +21,8 @@ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 
 inline uint32_t QSBlockTile(uint32_t embeddingSizeV)
 {
-    // Match fai_tiling.cpp GetQSBlockTile: head_dim > 128 uses a 64-wide Q tile.
-    return embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
+    // Match host tiling: D512 uses 128 rows; the existing large-D tier uses 64.
+    return embeddingSizeV == 512 ? 128 : (embeddingSizeV > 128 ? 64 : Q_TILE_CEIL);
 }
 
 inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
@@ -100,6 +101,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
+    if (metaArgs->embeddingSize == 512 && metaArgs->embeddingSizeV == 512) {
+        flash_attn::d512::ApplyTiling(*tilingData);
+    }
     tilingData->qSeqlenAligned = 0;
     tilingData->kvSeqlenAligned = 0;
 
@@ -127,7 +131,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         kvCumSum += kvSeqlen;
         kvCum[batchIdx + 1] = static_cast<int32_t>(kvCumSum);
         const uint32_t curQNBlockTile = QNBlockTile(
-            qSeqlen, groupSize, metaArgs->embeddingSizeV > 128U);
+            qSeqlen, groupSize, (metaArgs->embeddingSizeV > 128U && metaArgs->embeddingSizeV != 512U));
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qBaseTile);

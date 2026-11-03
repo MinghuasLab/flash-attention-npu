@@ -12,6 +12,7 @@
 
 struct FwdLaunchArgs {
     bool is_bf16;
+    bool is_d512;
     Format layout; // TND, BSND or BNSD
     MaskCategory mask_category;
     bool paged_kv;
