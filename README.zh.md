@@ -31,6 +31,9 @@ FlashAttention 通过分块计算和内存感知算法提升训练和推理效�
 ```bash
 python -m pip install "setuptools>=70.1" packaging
 ```
+
+FA4 的原生 Flex 后端要求 ascend-catlass-dsl >=2.1，仅在使用 DSL 时校验，普通 FA4 导入和 attention 调用不依赖 CATLASS DSL。
+
 - 设置 CANN 环境变量
 ```bash
 source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
@@ -762,12 +765,12 @@ def flash_attn_varlen_func(
         num_splits: int。key/value 序列维度分割块数。如果为 0，则根据启发式方法自动确定分割数量。
         pack_gqa: bool。是否打包 GQA 以提高性能。
         deterministic: bool。是否使用反向传播的确定性实现。
-        score_mod [可选]: 自定义 score 修改函数。（NPU 暂不支持）
-        score_mod_bwd [可选]: 反向传播阶段的自定义 score 修改函数。（NPU 暂不支持）
-        mask_mod [可选]: 自定义 attention mask。（NPU 暂不支持）
-        block_sparse_tensors [可选]: block sparse tensor。（NPU 暂不支持）
-        aux_tensors [可选]: 用于 score_mod 的辅助 tensor。（NPU 暂不支持）
-        aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助标量。（NPU 暂不支持）
+        score_mod [可选]: 自定义 score 修改函数。
+        score_mod_bwd [可选]: 反向传播阶段的自定义 score 修改函数。
+        mask_mod [可选]: 自定义 attention mask。
+        block_sparse_tensors [可选]: block sparse tensor。
+        aux_tensors [可选]: 用于 score_mod 的辅助 tensor。
+        aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助标量。
         return_lse: bool。是否返回 attention scores 的 logsumexp。
 
     约束：
@@ -777,7 +780,9 @@ def flash_attn_varlen_func(
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
         - batch_size > 0。
         - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
-        - 不支持 pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices。
+        - score_mod / mask_mod 在 Ascend 950 上路由到原生 Flex 后端。
+        - Flex 后端不支持 learnable_sink。
+        - 不支持 pack_gqa / min_seqlen_k / gather_kv_indices。
         - cu_seqlens_* / seqused_* / page_table 若传入须为 int32。
         - 在 Ascend 950 上，分页 KV Cache 的 page_size 仅支持 128、256、512 或 1024。
         - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。

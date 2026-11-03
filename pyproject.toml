@@ -11,3 +11,15 @@ exclude = ["build", "dist"]
 # Keep the policy intentionally small: these rules catch concrete errors
 # without imposing a repository-wide lint expansion when Ruff defaults change.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+markers = ["npu: requires Ascend 950 and a working CATLASS installation"]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve upstream numerical kernels and reference/test idioms.
+"flash_attn_npu_4/catlass_dsl/kernels/*.py" = ["E741"]
+"tests/catlass_dsl/test_block_sparsity.py" = ["E731"]
+"tests/catlass_dsl/test_flash_attn_varlen.py" = ["E731"]
+"tests/catlass_dsl/test_runtime.py" = ["E731"]
+# A fixture imported from test_graph is intentionally used as a test argument.
+"tests/catlass_dsl/test_fa4_routing.py" = ["F811"]
