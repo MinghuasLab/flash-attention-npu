@@ -50,6 +50,16 @@ struct FwdLaunchArgs {
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a);
 
+extern template void launch_fwd_impl<float8_e4m3_t, Format::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<float8_e4m3_t, Format::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<float8_e4m3_t, Format::BNSD>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<bfloat16_t, Format::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<bfloat16_t, Format::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<bfloat16_t, Format::BNSD>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, Format::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
+
 // Runtime entry: kLayout is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
 // per (dtype, Format) in the autogen TUs.
