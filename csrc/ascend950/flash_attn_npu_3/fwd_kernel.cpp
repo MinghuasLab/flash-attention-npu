@@ -828,7 +828,7 @@ class FAIKernel950 {
                 AscendC::PipeBarrier<PIPE_ALL>();
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                FlashDecodeCombine950<ElementO, LseMode> combine(resource);
+                FlashDecodeCombine950<ElementO, LseMode, 0, IsD512> combine(resource);
                 combine(params);
 #endif
             }

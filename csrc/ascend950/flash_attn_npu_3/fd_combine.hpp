@@ -16,13 +16,13 @@
 #include "tilingdata.h"
 #include "kernel_common.hpp"
 
-template <class ElementO, bool OutputLse, uint32_t quantMode = 0>
+template <class ElementO, bool OutputLse, uint32_t quantMode = 0, bool IsD512 = false>
 class FlashDecodeCombine950 {
   public:
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
-    static constexpr uint32_t MAX_HEAD_DIM = 256U;
+    static constexpr uint32_t MAX_HEAD_DIM = IsD512 ? 512U : 256U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
     static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;
@@ -199,7 +199,7 @@ class FlashDecodeCombine950 {
                 qLen = params.seqUsedQ != nullptr
                            ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
                            : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
-                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
+                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U && headDim != 512U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
                 qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
                 const uint32_t batchTasks = CeilDiv(qLen, tiling->qBaseTile) * qNTaskNum;

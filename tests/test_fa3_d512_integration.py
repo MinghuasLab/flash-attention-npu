@@ -143,29 +143,23 @@ def test_fa3_d512_paged_decode_auto_splits():
     assert_fa_close(out.unsqueeze(0), ref, baseline, name="D512 paged decode num_splits=0")
 
 
-@pytest.mark.parametrize(
-    "kwargs,message",
-    [
-        ({"num_splits": 2}, "split-KV"),
-    ],
-)
-def test_fa3_d512_rejects_unsupported_paths(kwargs, message):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fa3_d512_short_kv_split_fallback(dtype):
     if torch_npu.npu.device_count() == 0 or "Ascend950" not in torch_npu.npu.get_device_name():
         pytest.skip("requires Ascend950")
-    q = torch.zeros((1, 1, 1, 512), dtype=torch.float16).npu()
-    kv = torch.zeros((1, 128, 1, 512), dtype=torch.float16).npu()
-    extra = {}
-    if kwargs["num_splits"] == 2:
-        q = q[0]
-        extra = {
-            "page_table": torch.tensor([[0]], dtype=torch.int32).npu(),
-            "cu_seqlens_q": torch.tensor([0, 1], dtype=torch.int32).npu(),
-            "max_seqlen_q": 1,
-        }
-    with pytest.raises(RuntimeError, match=message):
-        flash_attn_with_kvcache(
-            q, kv, kv, cache_seqlens=torch.tensor([128], dtype=torch.int32).npu(), **extra, **kwargs
-        )
+    q = torch.zeros((1, 1, 512), dtype=dtype).npu()
+    kv = torch.zeros((1, 128, 1, 512), dtype=dtype).npu()
+    out, lse, *_ = flash_attn_with_kvcache(
+        q, kv, kv, cache_seqlens=torch.tensor([128], dtype=torch.int32).npu(),
+        page_table=torch.tensor([[0]], dtype=torch.int32).npu(),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32).npu(),
+        max_seqlen_q=1, num_splits=2, return_softmax_lse=True,
+    )
+    # Short KV falls back to the normal path, as in the existing A5 policy.
+    ref = torch.zeros_like(out.cpu())
+    lse_ref = torch.full_like(lse.cpu(), torch.tensor(128.0).log().item())
+    assert_fa_close(out, ref, ref, name="D512 short KV fallback O")
+    assert_fa_close(lse, lse_ref, lse_ref, name="D512 short KV fallback LSE")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -267,3 +261,25 @@ def test_fa3_d512_uniform_public_path(dtype, layout, kv_len):
     if layout == 'TND':
         result = result.unsqueeze(0)
     assert_fa_close(result, ref, baseline, name=f'D512 uniform {layout} KV{kv_len}')
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sq,heads,kv_heads", [(1, 128, 1), (4, 32, 2)])
+@pytest.mark.parametrize("splits", [0, 2, 4])
+def test_fa3_d512_split_o_only(dtype, sq, heads, kv_heads, splits):
+    if torch_npu.npu.device_count() == 0 or "Ascend950" not in torch_npu.npu.get_device_name():
+        pytest.skip("requires Ascend950")
+    gen = torch.Generator().manual_seed(512)
+    q = torch.randn((1, sq, heads, 512), dtype=dtype, generator=gen)
+    k = torch.randn((1, 2048, kv_heads, 512), dtype=dtype, generator=gen)
+    v = torch.randn((1, 2048, kv_heads, 512), dtype=dtype, generator=gen)
+    out = flash_attn_with_kvcache(
+        q[0].npu(), k.reshape(16, 128, kv_heads, 512).npu(),
+        v.reshape(16, 128, kv_heads, 512).npu(),
+        cache_seqlens=torch.tensor([2048], dtype=torch.int32).npu(),
+        page_table=torch.arange(16, dtype=torch.int32)[None].npu(),
+        cu_seqlens_q=torch.tensor([0, sq], dtype=torch.int32).npu(),
+        max_seqlen_q=sq, num_splits=splits, return_softmax_lse=False,
+    )
+    ref, _, baseline, _ = ref_flash_attention_pair(q, k, v, 512 ** -0.5, None, dtype)
+    assert_fa_close(out.unsqueeze(0), ref, baseline, name="D512 split O-only")

@@ -373,6 +373,26 @@ test_cases.extend([
 ])
 
 
+# D512 FlashDecode: compare forced/auto splitting and the unsplit control.
+test_cases.extend([
+    pytest.param(dtype, batch, heads, kv_heads, sq, sk, 512, 1, 128,
+                 causal, "TND", varied, -1, -1, cap, splits, False,
+                 id=f"d512-fd-{case}-{dtype}-splits{splits}")
+    for dtype in (torch.float16, torch.bfloat16)
+    for splits in (0, 1, 2, 4)
+    for case, batch, heads, kv_heads, sq, sk, causal, varied, cap in [
+        ("decode", 1, 16, 2, 1, 2048, False, False, 0.0),
+        ("tail", 1, 16, 2, 1, 2051, True, False, 0.0),
+        ("full-rows", 1, 128, 1, 1, 4096, False, False, 0.0),
+        ("multi-q", 1, 32, 2, 4, 2051, False, False, 0.0),
+        ("q16", 1, 16, 2, 16, 4096, True, False, 0.0),
+        ("batch", 2, 4, 2, 1, 2048, False, False, 0.0),
+        ("varied", 2, 4, 2, 4, 2051, True, True, 0.0),
+        ("softcap", 1, 16, 2, 4, 2048, False, False, 2.0),
+    ]
+])
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits, new_kv",
     test_cases,
@@ -404,8 +424,6 @@ def test_fa_kvcache_ops(
         # as the original <=256 path, but append-KV remains unsupported.
         if head_size != 512:
             pytest.skip("head_size > 256 is only supported for exactly 512")
-        if "Ascend950" in name and num_splits > 1:
-            pytest.skip("Ascend950 D512 split-KV is not yet supported")
     elif head_size < 1:
         pytest.skip("head_size must be >= 1")
     if is_varied and layout != "TND":
@@ -1943,6 +1961,14 @@ flash_attn_combine_dense_cases = [
 ]
 
 
+flash_attn_combine_dense_cases += [
+    pytest.param(dtype, splits, 512, sq, id=f"d512-combine-{dtype}-splits{splits}-q{sq}")
+    for dtype in (torch.float16, torch.bfloat16)
+    for splits in (1, 2, 4, 17)
+    for sq in (1, 33)
+]
+
+
 @pytest.mark.parametrize(
     "data_type, num_splits, head_dim, seqlen",
     flash_attn_combine_dense_cases,
@@ -1998,6 +2024,13 @@ flash_attn_combine_varlen_cases = [
     (torch.bfloat16, 32, 64),
     (torch.bfloat16, 32, 128),
     (torch.bfloat16, 32, 256),
+]
+
+
+flash_attn_combine_varlen_cases += [
+    pytest.param(dtype, splits, 512, id=f"d512-combine-varlen-{dtype}-splits{splits}")
+    for dtype in (torch.float16, torch.bfloat16)
+    for splits in (2, 4, 32)
 ]
 
 
