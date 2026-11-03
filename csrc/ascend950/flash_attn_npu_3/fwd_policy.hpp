@@ -124,4 +124,10 @@ inline void ApplyTiling(Tiling& t)
     t.vL1BufNum = V_STAGES;
 }
 } // namespace flash_attn::d512
+
+namespace flash_attn {
+template <class Base> struct D512TileCopy : Base {};
+template <class Copy> struct IsD512Copy { static constexpr bool value = false; };
+template <class Base> struct IsD512Copy<D512TileCopy<Base>> { static constexpr bool value = true; };
+} // namespace flash_attn
 #endif

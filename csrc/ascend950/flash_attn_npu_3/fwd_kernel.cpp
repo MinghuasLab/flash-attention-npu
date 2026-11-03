@@ -41,10 +41,6 @@
 #include "tilingdata.h"
 #include "fd_combine.hpp"
 #include "fwd_policy.hpp"
-#include "d512/qk_matmul.hpp"
-#include "d512/pv_matmul.hpp"
-#include "d512/online_softmax.hpp"
-#include "d512/rescale_o.hpp"
 
 using namespace Catlass;
 using namespace tla;
@@ -239,10 +235,8 @@ class FAIKernel950 {
                 ubSRoundTile = 128;
             }
         }
-        using QKTileHelper =
-            std::conditional_t<IsD512, Gemm::Block::BlockMmadQKTileHelperD512, Gemm::Block::BlockMmadQKTileHelper>;
-        using PVTileHelper =
-            std::conditional_t<IsD512, Gemm::Block::BlockMmadPVTileHelperD512, Gemm::Block::BlockMmadPVTileHelper>;
+        using QKTileHelper = Gemm::Block::BlockMmadQKTileHelper;
+        using PVTileHelper = Gemm::Block::BlockMmadPVTileHelper;
         QKTileHelper qkL1TileHelper(qkL1TileM_, qkL1TileN_, qkL1TileKLeft_, qkL1TileKRight_, qL1BufNum_, kL1BufNum_);
         PVTileHelper pvL1TileHelper(pvL1TileM_, pvL1TileN_, pvL1TileKLeft_, pvL1TileKRight_, pL1BufNum_, vL1BufNum_);
 
@@ -1063,45 +1057,33 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
     using DispatchPolicyQK =
         Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
-    using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS,
+    using TileCopyQKBase = Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS,
                                                          LayoutS, void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
-    using BlockMmadQK = std::conditional_t<IsD512,
-                                           Gemm::Block::QkD512<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ,
-                                                               ElementK, ElementS, void, TileCopyQK>,
-                                           Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
-                                                                     ElementQ, ElementK, ElementS, void, TileCopyQK>>;
+    using TileCopyQK = std::conditional_t<IsD512, flash_attn::D512TileCopy<TileCopyQKBase>, TileCopyQKBase>;
+    using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK, ElementS, void, TileCopyQK>;
     // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
     using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap>;
-    using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
+    using TileCopySoftmaxBase = Epilogue::Tile::TileCopySoftmax<ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
+    using TileCopySoftmax = std::conditional_t<IsD512, flash_attn::D512TileCopy<TileCopySoftmaxBase>, TileCopySoftmaxBase>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
     using SType = Gemm::GemmType<ElementS, LayoutS>;
     using MaskType = Gemm::GemmType<ElementMask, LayoutMask>;
-    using EpilogueOnlineSoftmax = std::conditional_t<
-        IsD512, Epilogue::Block::D512Softmax<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>,
-        Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>>;
+    using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>;
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using DispatchPolicyPV =
         Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
-    using TileCopyPV =
+    using TileCopyPVBase =
         Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementP, LayoutPDummy, ElementV, LayoutV, ElementOTmp, LayoutOTmp,
                                           void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
-    using BlockMmadPV =
-        std::conditional_t<IsD512,
-                           Gemm::Block::PvD512<DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV,
-                                               ElementOTmp, void, TileCopyPV>,
-                           Gemm::Block::BlockMmadTla<DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV,
-                                                     ElementOTmp, void, TileCopyPV>>;
+    using TileCopyPV = std::conditional_t<IsD512, flash_attn::D512TileCopy<TileCopyPVBase>, TileCopyPVBase>;
+    using BlockMmadPV = Gemm::Block::BlockMmadTla<DispatchPolicyPV, L1TileShapePV, L0TileShapePV, ElementP, ElementV, ElementOTmp, void, TileCopyPV>;
     // rescale O
     using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
-    using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
-    using EpilogueRescaleO =
-        std::conditional_t<IsD512,
-                           Epilogue::Block::D512Rescale<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                        TileCopyRescaleO, Arch::PositionL0C>,
-                           Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                          ElementV, TileCopyRescaleO, Arch::PositionL0C>>;
+    using TileCopyRescaleOBase = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
+    using TileCopyRescaleO = std::conditional_t<IsD512, flash_attn::D512TileCopy<TileCopyRescaleOBase>, TileCopyRescaleOBase>;
+    using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS, ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode, IsD512>;

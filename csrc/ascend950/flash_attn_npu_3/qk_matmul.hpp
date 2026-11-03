@@ -14,6 +14,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 
+#include "fwd_policy.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -39,6 +40,7 @@ constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
 struct PFAKernelParams {
+  protected:
     // Data members
     GM_ADDR q;
     GM_ADDR k;
@@ -115,37 +117,64 @@ template <class ArchTag_, bool PAGED_CACHE_FLAG_, bool NZ_LAYOUT_FLAG_, bool PA_
 struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_FLAG_, PA_BNNBSD_FLAG_, false>,
                     L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
   public:
+    static constexpr bool IsD512 = flash_attn::IsD512Copy<TileCopy_>::value;
+
     using DispatchPolicy = MmadFlashAttentionQK<ArchTag_>;
+
     using ArchTag = typename DispatchPolicy::ArchTag;
+
     using TileCopy = TileCopy_;
+
     using ElementA = ElementA_;
+
     using ElementB = ElementB_;
+
     using ElementC = ElementC_;
+
 
     using TileMmad = TileMmad_;
 
+
     using CopyL1ToL0A = typename TileCopy::CopyL1ToL0A;
+
     using CopyL1ToL0B = typename TileCopy::CopyL1ToL0B;
+
 
     using ElementAccumulator = typename TileCopy::ElementAccumulator;
 
+
     using LayoutTagL1A = typename TileCopy::LayoutTagL1A;
+
     using LayoutTagL1B = typename TileCopy::LayoutTagL1B;
+
     using LayoutTagL0A = typename TileCopy::LayoutTagL0A;
+
     using LayoutTagL0B = typename TileCopy::LayoutTagL0B;
 
+
     static constexpr uint32_t L0_STAGES = DispatchPolicy::L0_STAGES;
+
     static constexpr uint32_t L0_TILE_M = tla::get<0>(L0TileShape_{});
+
     static constexpr uint32_t L0_TILE_N = tla::get<1>(L0TileShape_{});
+
     static constexpr uint32_t L0_TILE_K = tla::get<2>(L0TileShape_{});
+
     static constexpr uint32_t L0A_PINGPONG_BUF_SIZE = ArchTag::L0A_SIZE / L0_STAGES;
+
     static constexpr uint32_t L0B_PINGPONG_BUF_SIZE = ArchTag::L0B_SIZE / L0_STAGES;
+
     static constexpr uint32_t L0C_PINGPONG_BUF_SIZE = ArchTag::L0C_SIZE / (L0_STAGES * 2);
 
-    static constexpr uint32_t MAX_L1_STAGES = 3; // 编译期常量，为静态L1Tensor数组开辟准备。取一个buffer份数的极大值
-    static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16; // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
+
+    static constexpr uint32_t MAX_L1_STAGES = 3;
+ // 编译期常量，为静态L1Tensor数组开辟准备。取一个buffer份数的极大值
+    static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16;
+ // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
     static constexpr uint32_t STRIDE_LIMIT = 65535;
+
     static constexpr uint32_t C0_ELEMS = 16;
+
 
     __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
     {
@@ -171,8 +200,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
     }
 
+
     // Destructor
     __aicore__ inline ~BlockMmadTla() {}
+
 
     __aicore__ inline auto MakeCustomLayout(uint32_t rowNum, uint32_t embedPhysical, uint32_t qSBlockSize)
     {
@@ -190,6 +221,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto l1AOriginShape = tla::MakeShape(rowNum, embedPhysical);
         return tla::MakeLayout(l1AShape, l1AStride, l1AOriginShape);
     }
+
 
     // qHeadStride is the source-tensor distance (in elements) between adjacent
     // Q heads: embed for BSND, maxQSeqlen * embed for BNSD.  It is the row
@@ -217,6 +249,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
     }
 
+
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline void SetCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
     {
@@ -229,6 +262,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             Arch::CrossCoreSetFlag<MODE, PIPE>(crossCoreFlagV1);
         }
     }
+
 
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline void WaitCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
@@ -243,10 +277,12 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
     }
 
+
     __aicore__ inline uint32_t GetCurLoopCounter(uint32_t outterLoopItr, uint32_t curLoopNum, uint32_t curLoopItr)
     {
         return outterLoopItr * curLoopNum + curLoopItr;
     }
+
 
     template <class TensorB, class L1BTile>
     __aicore__ inline void CopyGmToL1BwithNZ(TensorB& gBTile, L1BTile& l1BTile, uint32_t blockIdx, uint32_t blockOffset,
@@ -267,6 +303,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::DataCopy(l1BTile.data()[dstOffset], gBTile.data()[srcOffset], repeatParams);
     }
 
+
     template <class TensorB, class TensorC>
     __aicore__ inline void operator()(TensorB& gBTensor, TensorC& ubCTensor, AscendC::GlobalTensor<int32_t> gBlockTable,
                                       GemmCoord actualOriShape, uint32_t blockSize, uint32_t kvSTileIdx,
@@ -286,9 +323,6 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t embed = actualOriShape[2];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[1];
-
-        uint32_t l1BBufId = pipelineTileSeq % l1BBufNum;
-        uint32_t l1BEventId = l1BBufId + 1;
 
         // Must match loadQGM: the multi-ND copy stores adjacent Q heads
         // qSBlockSize rows apart in L1.
@@ -314,183 +348,208 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             uint32_t l0CEventId = l0CBufId;
             auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNAct);
             auto l0CTensorTla = tla::MakeTensor(l0CTensor[l0CBufId], l0CLayoutTla, Arch::PositionL0C{});
-            auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, l0TileNAct);
-            auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
-            auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(embed, l0TileNAct));
-            if constexpr (PAGED_CACHE_FLAG_) {
-                if constexpr (!PA_BNNBSD_FLAG_) {
-                    uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
-                    uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
-                    auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(0, blockIdx * blockSize + blockOffset),
-                                                   tla::MakeShape(embed, l0TileNAct));
-                    copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
-                } else {
-                    if (isShrink == 1) {
-                        uint32_t globalRemain = 0;
-                        if (kvSTileIdx == 0) {
-                            globalRemain = globalWindowSize;
+            // D512 streams four D128 slices; smaller dimensions load K once.
+            // Q retains its full L1 layout; only the first slice initializes S.
+            auto loadKSlice = [&](uint32_t dSlice) __aicore__ {
+                const uint32_t l1BBufId = (pipelineTileSeq + dSlice) % l1BBufNum;
+                const uint32_t l1BEventId = l1BBufId + 1;
+                auto slicedK = tla::MakeTensor(gBTensor.data()[dSlice * (IsD512 ? 128U : actualOriShape[2])], gBTensor.layout(), Arch::PositionGM{});
+                auto& gBTensor = slicedK;
+                const uint32_t embed = IsD512 ? 128U : actualOriShape[2];
+                const uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
+                const uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
+                auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, l0TileNAct);
+                auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
+                auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(embed, l0TileNAct));
+                if constexpr (PAGED_CACHE_FLAG_) {
+                    if constexpr (!PA_BNNBSD_FLAG_) {
+                        uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
+                        uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
+                        auto blockIdx = gBlockTable.GetValue(blockTableIdx);
+                        auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(0, blockIdx * blockSize + blockOffset),
+                                                       tla::MakeShape(embed, l0TileNAct));
+                        copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
+                    } else {
+                        if (isShrink == 1) {
+                            uint32_t globalRemain = 0;
+                            if (kvSTileIdx == 0) {
+                                globalRemain = globalWindowSize;
+                                uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
+                                uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
+                                auto blockIdx = gBlockTable.GetValue(blockTableIdx);
+                                auto gBTensorTlaTile =
+                                    GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
+                                            tla::MakeShape(embed, globalRemain));
+                                auto l1BTensorTlaTile0 = GetTile(l1BTensorTlaTile, tla::MakeCoord(0, 0),
+                                                                 tla::MakeShape(embed, globalRemain));
+                                if constexpr (NZ_LAYOUT_FLAG_) {
+                                    CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile0, blockIdx, blockOffset,
+                                                      globalRemain, embed, blockSize, kvHeads, l0TileNAct);
+                                } else {
+                                    copyGmToL1B(l1BTensorTlaTile0, gBTensorTlaTile);
+                                }
+                            }
+                            uint32_t curKvSeqlenStart = kvSeqlenTriDown - rowNum + 1 - localWindowSize +
+                                                        kvSTileIdx * 128 - globalWindowSize * !(kvSTileIdx == 0);
+                            uint32_t blockTableIdx = curKvSeqlenStart / blockSize;
+                            uint32_t blockOffset = curKvSeqlenStart % blockSize;
+                            uint32_t preRemain = (blockSize - blockOffset);
+                            preRemain = min(128 - globalRemain, preRemain);
+                            preRemain = min(l0TileNAct, preRemain);
+                            if (preRemain > 0) {
+                                auto blockIdx = gBlockTable.GetValue(blockTableIdx);
+                                auto gBTensorTlaTile =
+                                    GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
+                                            tla::MakeShape(embed, preRemain));
+                                auto l1BTensorTlaTile1 = GetTile(l1BTensorTlaTile, tla::MakeCoord(0, globalRemain),
+                                                                 tla::MakeShape(embed, preRemain));
+                                if constexpr (NZ_LAYOUT_FLAG_) {
+                                    CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile1, blockIdx, blockOffset,
+                                                      preRemain, embed, blockSize, kvHeads, l0TileNAct);
+                                } else {
+                                    copyGmToL1B(l1BTensorTlaTile1, gBTensorTlaTile);
+                                }
+                            }
+                            if (preRemain + globalRemain < 128 && preRemain + globalRemain < l0TileNAct) {
+                                uint32_t lastRemain = l0TileNAct - preRemain - globalRemain;
+                                blockTableIdx += 1;
+                                blockOffset = 0;
+                                auto blockIdx = gBlockTable.GetValue(blockTableIdx);
+                                auto gBTensorTlaTile =
+                                    GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
+                                            tla::MakeShape(embed, lastRemain));
+                                auto l1BTensorTlaTile2 =
+                                    GetTile(l1BTensorTlaTile, tla::MakeCoord(0, preRemain + globalRemain),
+                                            tla::MakeShape(embed, lastRemain));
+                                if constexpr (NZ_LAYOUT_FLAG_) {
+                                    CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile2, blockIdx, blockOffset,
+                                                      lastRemain, embed, blockSize, kvHeads, l0TileNAct);
+                                } else {
+                                    copyGmToL1B(l1BTensorTlaTile2, gBTensorTlaTile);
+                                }
+                            }
+                        } else {
                             uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                             uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                             auto blockIdx = gBlockTable.GetValue(blockTableIdx);
                             auto gBTensorTlaTile =
                                 GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
-                                        tla::MakeShape(embed, globalRemain));
-                            auto l1BTensorTlaTile0 =
-                                GetTile(l1BTensorTlaTile, tla::MakeCoord(0, 0), tla::MakeShape(embed, globalRemain));
+                                        tla::MakeShape(embed, l0TileNAct));
                             if constexpr (NZ_LAYOUT_FLAG_) {
-                                CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile0, blockIdx, blockOffset,
-                                                  globalRemain, embed, blockSize, kvHeads, l0TileNAct);
-                            } else {
-                                copyGmToL1B(l1BTensorTlaTile0, gBTensorTlaTile);
-                            }
-                        }
-                        uint32_t curKvSeqlenStart = kvSeqlenTriDown - rowNum + 1 - localWindowSize + kvSTileIdx * 128 -
-                                                    globalWindowSize * !(kvSTileIdx == 0);
-                        uint32_t blockTableIdx = curKvSeqlenStart / blockSize;
-                        uint32_t blockOffset = curKvSeqlenStart % blockSize;
-                        uint32_t preRemain = (blockSize - blockOffset);
-                        preRemain = min(128 - globalRemain, preRemain);
-                        preRemain = min(l0TileNAct, preRemain);
-                        if (preRemain > 0) {
-                            auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                            auto gBTensorTlaTile =
-                                GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
-                                        tla::MakeShape(embed, preRemain));
-                            auto l1BTensorTlaTile1 = GetTile(l1BTensorTlaTile, tla::MakeCoord(0, globalRemain),
-                                                             tla::MakeShape(embed, preRemain));
-                            if constexpr (NZ_LAYOUT_FLAG_) {
-                                CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile1, blockIdx, blockOffset, preRemain,
+                                CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile, blockIdx, blockOffset, l0TileNAct,
                                                   embed, blockSize, kvHeads, l0TileNAct);
                             } else {
-                                copyGmToL1B(l1BTensorTlaTile1, gBTensorTlaTile);
+                                copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
                             }
-                        }
-                        if (preRemain + globalRemain < 128 && preRemain + globalRemain < l0TileNAct) {
-                            uint32_t lastRemain = l0TileNAct - preRemain - globalRemain;
-                            blockTableIdx += 1;
-                            blockOffset = 0;
-                            auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                            auto gBTensorTlaTile =
-                                GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
-                                        tla::MakeShape(embed, lastRemain));
-                            auto l1BTensorTlaTile2 =
-                                GetTile(l1BTensorTlaTile, tla::MakeCoord(0, preRemain + globalRemain),
-                                        tla::MakeShape(embed, lastRemain));
-                            if constexpr (NZ_LAYOUT_FLAG_) {
-                                CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile2, blockIdx, blockOffset, lastRemain,
-                                                  embed, blockSize, kvHeads, l0TileNAct);
-                            } else {
-                                copyGmToL1B(l1BTensorTlaTile2, gBTensorTlaTile);
-                            }
-                        }
-                    } else {
-                        uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
-                        uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
-                        auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                        auto gBTensorTlaTile =
-                            GetTile(gBTensor, tla::MakeCoord(0, (blockIdx * blockSize) * kvHeads + blockOffset),
-                                    tla::MakeShape(embed, l0TileNAct));
-                        if constexpr (NZ_LAYOUT_FLAG_) {
-                            CopyGmToL1BwithNZ(gBTensorTlaTile, l1BTensorTlaTile, blockIdx, blockOffset, l0TileNAct,
-                                              embed, blockSize, kvHeads, l0TileNAct);
-                        } else {
-                            copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
-                        }
-                    }
-                }
-            } else {
-                if constexpr (NZ_LAYOUT_FLAG_) {
-                    auto gBTensorTlaTile =
-                        GetTile(gBTensor, tla::MakeCoord(0, kvSTileIdx * 128), tla::MakeShape(embed, l0TileNAct));
-
-                    const uint32_t blockCount = embed / 16; // headdim / 16
-                    const uint32_t blockLen = l0TileNAct;
-                    const uint32_t srcStride = kvNumTokens - blockLen;
-
-                    AscendC::DataCopyParams repeatParams;
-
-                    if (srcStride <= STRIDE_LIMIT) {
-                        repeatParams.blockCount = blockCount;
-                        repeatParams.blockLen = blockLen;
-                        repeatParams.srcStride = srcStride; // num tokens - blockLen
-                        repeatParams.dstStride = RoundUp(blockLen, 16) - curBaseTileSize;
-                        auto dstOffset = 0;
-                        auto srcOffset = kvSTileIdx * 128 * 16;
-
-                        AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
-                                          repeatParams);
-                    } else {
-                        repeatParams.blockCount = 1;
-                        repeatParams.blockLen = blockLen;
-                        repeatParams.srcStride = 0;
-                        repeatParams.dstStride = 0;
-                        for (uint32_t i = 0; i < blockCount; ++i) {
-                            auto dstOffset = i * RoundUp(blockLen, 16) * 16;
-                            auto srcOffset = kvSTileIdx * 128 * 16 + kvNumTokens * i * 16;
-                            AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
-                                              repeatParams);
                         }
                     }
                 } else {
-                    auto gBTensorTlaTile =
-                        GetTile(gBTensor, tla::MakeCoord(0, kvSTileIdx * 128), tla::MakeShape(embed, l0TileNAct));
-                    copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
+                    if constexpr (NZ_LAYOUT_FLAG_) {
+                        auto gBTensorTlaTile =
+                            GetTile(gBTensor, tla::MakeCoord(0, kvSTileIdx * 128), tla::MakeShape(embed, l0TileNAct));
+
+                        const uint32_t blockCount = embed / 16; // headdim / 16
+                        const uint32_t blockLen = l0TileNAct;
+                        const uint32_t srcStride = kvNumTokens - blockLen;
+
+                        AscendC::DataCopyParams repeatParams;
+
+                        if (srcStride <= STRIDE_LIMIT) {
+                            repeatParams.blockCount = blockCount;
+                            repeatParams.blockLen = blockLen;
+                            repeatParams.srcStride = srcStride; // num tokens - blockLen
+                            repeatParams.dstStride = RoundUp(blockLen, 16) - curBaseTileSize;
+                            auto dstOffset = 0;
+                            auto srcOffset = kvSTileIdx * 128 * 16;
+
+                            AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
+                                              repeatParams);
+                        } else {
+                            repeatParams.blockCount = 1;
+                            repeatParams.blockLen = blockLen;
+                            repeatParams.srcStride = 0;
+                            repeatParams.dstStride = 0;
+                            for (uint32_t i = 0; i < blockCount; ++i) {
+                                auto dstOffset = i * RoundUp(blockLen, 16) * 16;
+                                auto srcOffset = kvSTileIdx * 128 * 16 + kvNumTokens * i * 16;
+                                AscendC::DataCopy(l1BTensorTlaTile.data()[dstOffset], gBTensorTlaTile.data()[srcOffset],
+                                                  repeatParams);
+                            }
+                        }
+                    } else {
+                        auto gBTensorTlaTile =
+                            GetTile(gBTensor, tla::MakeCoord(0, kvSTileIdx * 128), tla::MakeShape(embed, l0TileNAct));
+                        copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
+                    }
                 }
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
-            for (uint32_t mL0Itr = 0; mL0Itr < mL0LoopNum; mL0Itr++) {
-                uint32_t l0TileMAct = (mL0Itr == mL0LoopNum - 1) ? (rowNum - mL0Itr * L0_TILE_M) : L0_TILE_M;
-                // different m chunks will be concated in the same piece of l0C buffer
-                auto l0CTensorTlaTile = GetTile(l0CTensorTla, tla::MakeCoord(mL0Itr * L0_TILE_M, 0),
-                                                tla::MakeShape(l0TileMAct, l0TileNAct));
-                for (uint32_t kL0Itr = 0; kL0Itr < kL0LoopNum; kL0Itr++) {
-                    uint32_t l0ALoopCounter = prefixSumL0AStages + GetCurLoopCounter(mL0Itr, kL0LoopNum, kL0Itr);
-                    uint32_t l0BLoopCounter = prefixSumL0BStages + GetCurLoopCounter(nLoopCounter, kL0LoopNum, kL0Itr);
-                    uint32_t l0TileKAct = (kL0Itr == kL0LoopNum - 1) ? (embed - kL0Itr * L0_TILE_K) : L0_TILE_K;
-                    uint32_t l0ABufId = l0ALoopCounter % L0_STAGES;
-                    uint32_t l0BBufId = l0BLoopCounter % L0_STAGES;
-                    uint32_t l0AEventId = l0ABufId;
-                    uint32_t l0BEventId = l0BBufId + 2;
-                    // when L0B buffers wouldn't be reused across the k loop
-                    // redundant L0B load caused by m loop can be avoided
-                    auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(kL0Itr * L0_TILE_K, 0),
-                                                    tla::MakeShape(l0TileKAct, l0TileNAct));
-                    auto l0BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL0B>(l0TileKAct, l0TileNAct);
-                    auto l0BTensorTla = tla::MakeTensor(l0BTensor[l0BBufId], l0BLayoutTla, Arch::PositionL0B{});
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+            };
+            // D512 primes both K slots and refills after the prior slice reaches L0B.
+            loadKSlice(0);
+            if constexpr (IsD512) { loadKSlice(1); }
+            for (uint32_t dSlice = 0; dSlice < (IsD512 ? 4U : 1U); ++dSlice) {
+                const uint32_t l1BBufId = (pipelineTileSeq + dSlice) % l1BBufNum;
+                const uint32_t l1BEventId = l1BBufId + 1;
+                const uint32_t embed = IsD512 ? 128U : actualOriShape[2];
+                const uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
+                auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(RoundUp(embed, C0_ELEMS), l0TileNAct);
+                auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
+                for (uint32_t mL0Itr = 0; mL0Itr < mL0LoopNum; mL0Itr++) {
+                    uint32_t l0TileMAct = (mL0Itr == mL0LoopNum - 1) ? (rowNum - mL0Itr * L0_TILE_M) : L0_TILE_M;
+                    // different m chunks will be concated in the same piece of l0C buffer
+                    auto l0CTensorTlaTile = GetTile(l0CTensorTla, tla::MakeCoord(mL0Itr * L0_TILE_M, 0),
+                                                    tla::MakeShape(l0TileMAct, l0TileNAct));
+                    for (uint32_t kL0Itr = 0; kL0Itr < kL0LoopNum; kL0Itr++) {
+                        uint32_t l0ALoopCounter = prefixSumL0AStages + (IsD512 ? GetCurLoopCounter(mL0Itr, 4U, dSlice) : GetCurLoopCounter(mL0Itr, kL0LoopNum, kL0Itr));
+                        uint32_t l0BLoopCounter = prefixSumL0BStages + (IsD512 ? GetCurLoopCounter(nLoopCounter, 4U, dSlice) : GetCurLoopCounter(nLoopCounter, kL0LoopNum, kL0Itr));
+                        uint32_t l0TileKAct = (kL0Itr == kL0LoopNum - 1) ? (embed - kL0Itr * L0_TILE_K) : L0_TILE_K;
+                        uint32_t l0ABufId = l0ALoopCounter % L0_STAGES;
+                        uint32_t l0BBufId = l0BLoopCounter % L0_STAGES;
+                        uint32_t l0AEventId = l0ABufId;
+                        uint32_t l0BEventId = l0BBufId + 2;
+                        // when L0B buffers wouldn't be reused across the k loop
+                        // redundant L0B load caused by m loop can be avoided
+                        auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(kL0Itr * L0_TILE_K, 0),
+                                                        tla::MakeShape(l0TileKAct, l0TileNAct));
+                        auto l0BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL0B>(l0TileKAct, l0TileNAct);
+                        auto l0BTensorTla = tla::MakeTensor(l0BTensor[l0BBufId], l0BLayoutTla, Arch::PositionL0B{});
 
-                    auto l1ATensorTlaTile =
-                        GetTile(l1ATensorTla, tla::MakeCoord(mL0Itr * L0_TILE_M, kL0Itr * L0_TILE_K),
-                                tla::MakeShape(l0TileMAct, l0TileKAct));
-                    auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileMAct, l0TileKAct);
-                    auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
+                        auto l1ATensorTlaTile =
+                            GetTile(l1ATensorTla, tla::MakeCoord(mL0Itr * L0_TILE_M, dSlice * (IsD512 ? 128U : actualOriShape[2]) + kL0Itr * L0_TILE_K),
+                                    tla::MakeShape(l0TileMAct, l0TileKAct));
+                        auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileMAct, l0TileKAct);
+                        auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
 
-                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
-                    copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                        copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
 
-                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
-                    if ((mL0Itr == 0) && (kL0Itr == 0)) {
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
+                        if ((mL0Itr == 0) && (kL0Itr == 0)) {
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+                        }
+                        copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
+                        if ((mL0Itr == mL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
+                            if (IsD512 && dSlice + 2 < 4) {
+                                loadKSlice(dSlice + 2);
+                            }
+                        }
+
+                        bool initMmad = (dSlice == 0 && kL0Itr == 0);
+                        uint32_t l0TileMAligned = RoundUp(l0TileMAct, 16);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
+                        if (dSlice == 0 && mL0Itr == 0 && kL0Itr == 0) {
+                            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                        }
+                        tileMmad(l0CTensorTlaTile, l0ATensorTla, l0BTensorTla, l0TileMAligned, l0TileNAct, l0TileKAct,
+                                 initMmad);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                     }
-                    copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
-                    if ((mL0Itr == mL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
-                    }
-
-                    bool initMmad = (kL0Itr == 0);
-                    uint32_t l0TileMAligned = RoundUp(l0TileMAct, 16);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
-                    if (mL0Itr == 0 && kL0Itr == 0) {
-                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
-                    }
-                    tileMmad(l0CTensorTlaTile, l0ATensorTla, l0BTensorTla, l0TileMAligned, l0TileNAct, l0TileKAct,
-                             initMmad);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                 }
             }
             // fixpipe
@@ -530,27 +589,42 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         SetCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);
     }
 
-  protected:
     // Data members
     AscendC::LocalTensor<ElementA> l1ATensor[MAX_L1_STAGES];
+
     AscendC::LocalTensor<ElementB> l1BTensor[MAX_L1_STAGES];
+
     AscendC::LocalTensor<ElementA> l0ATensor[L0_STAGES];
+
     AscendC::LocalTensor<ElementB> l0BTensor[L0_STAGES];
+
     AscendC::LocalTensor<ElementAccumulator> l0CTensor[L0_STAGES];
 
+
     TileMmad tileMmad;
+
     CopyL1ToL0A copyL1ToL0A;
+
     CopyL1ToL0B copyL1ToL0B;
 
+
     uint32_t l1ATileM;
+
     uint32_t l1BTileN;
+
     uint32_t l1ATileK;
+
     uint32_t l1BTileK;
+
     uint32_t l1ABufNum;
+
     uint32_t l1BBufNum;
 
+
     uint32_t l1PPingPongFlag = 0;
+
     uint32_t l0CPingPongFlag = 0;
+
     uint32_t l0ABPingPongFlag = 0;
 };
 ////////////////////////////////////////////////////////////////////

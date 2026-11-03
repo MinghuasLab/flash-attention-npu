@@ -14,6 +14,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
+#include "fwd_policy.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -39,6 +40,7 @@ constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
 struct PFAKernelParams {
+  protected:
     // Data members
     GM_ADDR q;
     GM_ADDR k;
@@ -115,38 +117,66 @@ template <class ArchTag_, bool PAGED_CACHE_FLAG_, bool NZ_LAYOUT_FLAG_, bool PA_
 struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_FLAG_, PA_BNNBSD_FLAG_, ENABLE_DN_>,
                     L1TileShape_, L0TileShape_, ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
   public:
+    static constexpr bool IsD512 = flash_attn::IsD512Copy<TileCopy_>::value;
+
     using DispatchPolicy = MmadFlashAttentionPV<ArchTag_>;
+
     using ArchTag = typename DispatchPolicy::ArchTag;
+
     using TileCopy = TileCopy_;
+
     using ElementA = ElementA_;
+
     using ElementB = ElementB_;
+
     using ElementC = ElementC_;
+
 
     using TileMmad = TileMmad_;
 
+
     using CopyL1ToL0A = typename TileCopy::CopyL1ToL0A;
+
     using CopyL1ToL0B = typename TileCopy::CopyL1ToL0B;
+
 
     using ElementAccumulator = typename TileCopy::ElementAccumulator;
 
+
     using LayoutTagL1A = typename TileCopy::LayoutTagL1A;
+
     using LayoutTagL1B = typename TileCopy::LayoutTagL1B;
+
     using LayoutTagL0A = typename TileCopy::LayoutTagL0A;
+
     using LayoutTagL0B = typename TileCopy::LayoutTagL0B;
 
+
     static constexpr uint32_t L0_STAGES = DispatchPolicy::L0_STAGES;
+
     static constexpr uint32_t L0_TILE_M = tla::get<0>(L0TileShape_{});
+
     static constexpr uint32_t L0_TILE_N = tla::get<1>(L0TileShape_{});
+
     static constexpr uint32_t L0_TILE_K = tla::get<2>(L0TileShape_{});
+
     static constexpr uint32_t L0A_PINGPONG_BUF_SIZE = ArchTag::L0A_SIZE / L0_STAGES;
+
     static constexpr uint32_t L0B_PINGPONG_BUF_SIZE = ArchTag::L0B_SIZE / L0_STAGES;
+
     static constexpr uint32_t L0C_PINGPONG_BUF_SIZE = ArchTag::L0C_SIZE / (L0_STAGES * 2);
 
-    static constexpr uint32_t MAX_L1_STAGES = 3; // 编译期常量，为静态L1Tensor数组开辟准备。取一个buffer份数的极大值
-    static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16; // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
+
+    static constexpr uint32_t MAX_L1_STAGES = 3;
+ // 编译期常量，为静态L1Tensor数组开辟准备。取一个buffer份数的极大值
+    static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16;
+ // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
     static constexpr uint32_t STRIDE_LIMIT = 65535;
+
     static constexpr bool FULL_QUANT_FP8 = std::is_same_v<ElementA, float8_e4m3_t>;
-    static constexpr uint32_t C0_ELEMS = 32 / sizeof(ElementA);
+
+    static constexpr uint32_t C0_ELEMS = IsD512 ? ( 16) : ( 32 / sizeof(ElementA));
+
 
     __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart,
                                    BlockMmadPVTileHelper& pvL1TileHelper)
@@ -174,8 +204,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
     }
 
+
     /// Destructor
     __aicore__ inline ~BlockMmadTla() {}
+
 
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline void SetCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
@@ -190,6 +222,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
     }
 
+
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline void WaitCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
     {
@@ -203,10 +236,12 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
     }
 
+
     __aicore__ inline uint32_t GetCurLoopCounter(uint32_t outterLoopItr, uint32_t curLoopNum, uint32_t curLoopItr)
     {
         return outterLoopItr * curLoopNum + curLoopItr;
     }
+
 
     template <class TensorB, class L1BTile>
     __aicore__ inline void CopyGmToL1BwithNZ(TensorB& gBTile, L1BTile& l1BTile, uint32_t blockIdx, uint32_t blockOffset,
@@ -226,6 +261,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto srcOffset = (blockIdx * blockSize) * kvHeads * embed + blockOffset * 16;
         AscendC::DataCopy(l1BTile.data()[dstOffset], gBTile.data()[srcOffset], repeatParams);
     }
+
 
     template <class TensorB, class TensorC>
     __aicore__ inline void operator()(TensorB& gBTensor, TensorC& ubCTensor, AscendC::GlobalTensor<int32_t> gBlockTable,
@@ -499,6 +535,28 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                 }
             }
+            if constexpr (IsD512) {
+            // fixpipe
+            const uint32_t loSlot = nL0Itr % flash_attn::d512::LO_STAGES;
+            Arch::CrossCoreFlag sliceReadyFlag(pvReadyFlag.id + loSlot);
+            WaitCrossCoreSync<4, PIPE_FIX>(sliceReadyFlag);
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+            // 需要kernel传输ubCTensor的时候确保其shape的m，n是满足32B（8个32位元素）对齐的
+            // rounded up by 8 and splited in half to each AIV
+            // valid rows in AIV0: [0, mFixPAligned8 / 2 - 1]
+            // valid rows in AIV1: [mFixPAligned8 / 2, rowNum - 1]
+            const uint32_t mFixAligned = RoundUp(rowNum, ENABLE_DN_ ? 32U : 8U);
+            auto loLayout = tla::MakeLayout<ElementC, layout::RowMajor>(mFixAligned, flash_attn::d512::LO_COLS);
+            auto loSlice = tla::MakeTensor(
+                ubCTensor.data()[loSlot * flash_attn::d512::DEFAULT_UB.loStageBytes / sizeof(ElementC)],
+                loLayout, Arch::PositionUB{});
+            auto l0CSlice = GetTile(l0CTensorTla, tla::MakeCoord(0, 0),
+                                    tla::MakeShape(mFixAligned, l0TileNPhysical));
+            copyL0CToDst(loSlice, l0CSlice);
+            SetCrossCoreSync<4, PIPE_FIX>(sliceReadyFlag);
+
+            } else {
             // fixpipe
             if (nL0Itr == 0) {
                 // reverse crossCoreSync, do fixPipe only after ubCTensor is fully released
@@ -523,29 +581,43 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     GetTile(l0CTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(mFixPAligned32, l0TileNPhysical));
                 copyL0CToDst(ubCTensorTlaTile, l0CTensorTlaTile);
             }
+
+            }
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
         }
         // crossCoreSync after all fixPipe move
-        SetCrossCoreSync<4, PIPE_FIX>(pvReadyFlag);
+        if constexpr (!IsD512) { SetCrossCoreSync<4, PIPE_FIX>(pvReadyFlag); }
     }
 
-  protected:
     /// Data members
     AscendC::LocalTensor<ElementA> l1ATensor[MAX_L1_STAGES];
+
     AscendC::LocalTensor<ElementB> l1BTensor[MAX_L1_STAGES];
+
     AscendC::LocalTensor<ElementA> l0ATensor[L0_STAGES];
+
     AscendC::LocalTensor<ElementB> l0BTensor[L0_STAGES];
+
     AscendC::LocalTensor<ElementAccumulator> l0CTensor[L0_STAGES];
 
+
     TileMmad tileMmad;
+
     CopyL1ToL0A copyL1ToL0A;
+
     CopyL1ToL0B copyL1ToL0B;
 
+
     uint32_t l1ATileM;
+
     uint32_t l1BTileN;
+
     uint32_t l1ATileK;
+
     uint32_t l1BTileK;
+
     uint32_t l1ABufNum;
+
     uint32_t l1BBufNum;
 };
 ////////////////////////////////////////////////////////////////////

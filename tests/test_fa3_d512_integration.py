@@ -240,3 +240,30 @@ def test_fa3_d512_lse(dtype, layout, causal, paged, batch, sq, sk, heads, kv_hea
             actual_o, actual_lse = out[i:i + 1], lse[i:i + 1]
         assert_fa_close(actual_o, ref, baseline, name=f"D512 LSE out batch{i}")
         assert_fa_close(actual_lse, lse_ref, lse_baseline, name=f"D512 LSE batch{i}")
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('layout', ['BSND', 'TND'])
+@pytest.mark.parametrize('kv_len', [129, 640])
+def test_fa3_d512_uniform_public_path(dtype, layout, kv_len):
+    """Preserve the isolated kernel's analytic smoke through the public entry."""
+    if torch_npu.npu.device_count() == 0 or 'Ascend950' not in torch_npu.npu.get_device_name():
+        pytest.skip('requires Ascend950')
+    q = torch.zeros((1, 128, 1, 512), dtype=dtype)
+    k = torch.zeros((1, kv_len, 1, 512), dtype=dtype)
+    v = torch.ones_like(k)
+    ref, _, baseline, _ = ref_flash_attention_pair(
+        q, k, v, 512 ** -0.5, None, dtype, differentiable=True
+    )
+    q, k, v = q.npu(), k.npu(), v.npu()
+    cu_q = None
+    if layout == 'TND':
+        q, k, v = q[0], k[0], v[0]
+        cu_q = torch.tensor([0, 128], dtype=torch.int32, device='npu')
+    result = flash_attn_with_kvcache(
+        q, k, v, cache_seqlens=torch.tensor([kv_len], dtype=torch.int32, device='npu'),
+        cu_seqlens_q=cu_q, max_seqlen_q=128, num_splits=1,
+    )
+    if layout == 'TND':
+        result = result.unsqueeze(0)
+    assert_fa_close(result, ref, baseline, name=f'D512 uniform {layout} KV{kv_len}')
