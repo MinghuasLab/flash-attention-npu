@@ -789,8 +789,11 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             const uint32_t firstRows = Min(splitRows, groupRows);
             const uint32_t rowStart = AscendC::GetSubBlockIdx() == 0U ? 0U : firstRows;
             const uint32_t rowCount = AscendC::GetSubBlockIdx() == 0U ? firstRows : groupRows - firstRows;
-            const bool spillGo = rowCount > flash_attn::d512::GO_ROWS || writePartial;
-            const uint32_t goStride = spillGo ? sliceCols : stride;
+            // Keep all columns for <=32 rows; otherwise retain the first
+            // 128-column slice and reuse the other 32 KiB for spilled slices.
+            const bool slicedGo = rowCount > flash_attn::d512::GO_ROWS;
+            const uint32_t goStride = slicedGo ? sliceCols : stride;
+            constexpr uint32_t spillGoOffset = flash_attn::d512::VECTOR_ROWS * sliceCols;
             const bool finalOutput = isLastKvSTile && !writePartial;
             if (rowCount > 0U) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
@@ -808,12 +811,13 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                     SetCrossCoreSync<4, PIPE_V>(sliceReadyFlag);
                     continue;
                 }
-                const uint32_t goCol = spillGo ? 0U : col;
+                const bool spillGo = slicedGo && col != 0U;
+                const uint32_t goCol = spillGo ? spillGoOffset : col;
                 const uint64_t goOffset = static_cast<uint64_t>(rowStart) * stride + col;
                 if (spillGo && !isFirstKvSTile) {
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-                    AscendC::DataCopy(goUbTensor32, goGm[goOffset],
+                    AscendC::DataCopy(goUbTensor32[goCol], goGm[goOffset],
                         AscendC::DataCopyParams(rowCount, sliceCols / FLOAT_BLOCK_SIZE,
                                                (stride - sliceCols) / FLOAT_BLOCK_SIZE, 0));
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -843,15 +847,16 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 if (!isLastKvSTile && spillGo) {
-                    AscendC::DataCopy(goGm[goOffset], goUbTensor32,
+                    AscendC::DataCopy(goGm[goOffset], goUbTensor32[goCol],
                         AscendC::DataCopyParams(rowCount, sliceCols / FLOAT_BLOCK_SIZE, 0,
                                                (stride - sliceCols) / FLOAT_BLOCK_SIZE));
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID5);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID5);
                 } else if (isLastKvSTile && writePartial) {
                     const uint64_t offset = (static_cast<uint64_t>(partialId) * fdRowCapacity + rowStart) * columns + col;
-                    AscendC::DataCopyPad(gPartialO[offset], goUbTensor32,
-                        AscendC::DataCopyExtParams(rowCount, sliceCols * sizeof(float), 0,
+                    AscendC::DataCopyPad(gPartialO[offset], goUbTensor32[goCol],
+                        AscendC::DataCopyExtParams(rowCount, sliceCols * sizeof(float),
+                                                 (goStride - sliceCols) / FLOAT_BLOCK_SIZE,
                                                  (columns - sliceCols) * sizeof(float), 0));
                 } else if (finalOutput) {
                     // The consumed LO slot becomes cast/output scratch; release it only after the GM store.

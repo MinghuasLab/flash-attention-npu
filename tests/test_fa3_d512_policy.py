@@ -29,11 +29,13 @@ int main() {
         assert(goEnd <= fa_metadata::WorkSpaceSize(cores));
     }
     auto b = MakeUbLayout();
-    assert(b.loRows == 16 && b.endOffset == 209.75 * 1024);
+    assert(b.loRows == 16 && b.endOffset == 241.75 * 1024);
     assert(MakeUbLayout(8192, 0).loRows == 16);
     assert(MakeUbLayout(8192, UB_BYTES).loRows == 0);
     assert(b.pOffset == 65536 && b.goOffset == 98304);
     assert(b.goOffset + GO_ROWS * 512 * 4 == b.lmOffset);
+    assert(b.endOffset + 2 * 1024 <= UB_BYTES);
+    assert(GO_ROWS * HEAD_DIM >= 2 * VECTOR_ROWS * LO_COLS);
     for (unsigned core = 0; core < 56; ++core) {
         for (unsigned seq = 0; seq < 17; ++seq) {
             auto off = LoByteOffset(core, seq);

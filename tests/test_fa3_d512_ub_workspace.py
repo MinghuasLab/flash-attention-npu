@@ -1,4 +1,4 @@
-"""Regression coverage for D512 16-row GO workspace and KV accumulation."""
+"""Regression coverage for D512 GO residency boundaries and KV accumulation."""
 import pytest
 import torch
 import torch_npu
@@ -8,7 +8,7 @@ from tests.common.compare import assert_fa_close
 
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize('q_len', [30, 32, 34, 128])
+@pytest.mark.parametrize('q_len', [30, 32, 34, 63, 64, 65, 128])
 @pytest.mark.parametrize('kv_len', [128, 257])
 def test_d512_go_row_chunks(dtype, q_len, kv_len):
     generator = torch.Generator().manual_seed(512)

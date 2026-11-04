@@ -22,7 +22,7 @@ constexpr uint32_t S_STAGE_BYTES = VECTOR_ROWS * KV_TILE * sizeof(float);
 constexpr uint32_t P_STAGE_BYTES = VECTOR_ROWS * KV_TILE * 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t LO_STAGES = 2;
-constexpr uint32_t GO_ROWS = 16;
+constexpr uint32_t GO_ROWS = 32;
 constexpr uint32_t LO_COLS = 128;
 constexpr uint32_t GO_CORE_BYTES = Q_TILE * HEAD_DIM * sizeof(float);
 constexpr uint32_t UB_BYTES = 248 * 1024;
@@ -70,7 +70,8 @@ constexpr UbLayout MakeUbLayout(uint32_t auxBytes = VECTOR_ROWS * KV_TILE * 2, u
     b.loOffset = b.auxOffset + auxBytes;
     const uint32_t available = b.loOffset + scratchReserve <= UB_BYTES ? UB_BYTES - b.loOffset - scratchReserve : 0;
     b.loRows = available / (HEAD_DIM * sizeof(float) * LO_STAGES);
-    b.loRows = b.loRows < GO_ROWS ? b.loRows : GO_ROWS;
+    constexpr uint32_t loRows = VECTOR_ROWS * LO_COLS / HEAD_DIM;
+    b.loRows = b.loRows < loRows ? b.loRows : loRows;
     b.loStageBytes = b.loRows * HEAD_DIM * sizeof(float);
     b.endOffset = b.loOffset + b.loStageBytes * LO_STAGES;
     return b;
