@@ -42,21 +42,26 @@ jobs:
       CI_DOCKER_IMAGE: fa-npu-ci:910b-cann9.1-torch2.9
       CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-atk
       ATK_WORKSPACE: /tmp/atk-random-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_HELPERS_DIR: ${{ github.workspace }}/atk-ci-helpers
     steps:
       - name: Check out CI helpers
         uses: actions/checkout@v4
+        with:
+          path: atk-ci-helpers
+          persist-credentials: false
 
       - name: Clone ATK harness
         shell: bash
         run: |
           set -euo pipefail
-          source ci/docker_proxy.sh
+          source "$CI_HELPERS_DIR/ci/docker_proxy.sh"
           git_proxy_init /home/FA_NPU_CI_DATA
           mkdir -p "$ATK_WORKSPACE"
           git clone --depth 1 https://gitcode.com/QieShi09/ATK-FOR-FA910v3.git "$ATK_WORKSPACE/harness"
           git -C "$ATK_WORKSPACE/harness" rev-parse HEAD
 
       - name: Run ATK sweep
+        id: sweep
         shell: bash
         env:
           ATK_FLAVOR: ${{ inputs.flavor || '910v3' }}
@@ -65,7 +70,7 @@ jobs:
           ATK_REF: ${{ inputs.ref || 'main' }}
         run: |
           set -euo pipefail
-          source ci/docker_proxy.sh
+          source "$CI_HELPERS_DIR/ci/docker_proxy.sh"
           git_proxy_init /home/FA_NPU_CI_DATA
           test -x /usr/local/bin/npu-smi
           docker image inspect "$CI_DOCKER_IMAGE" >/dev/null
@@ -99,6 +104,20 @@ jobs:
               bash /ws/harness/ci.sh "$@"' \
             bash "${entry_args[@]}"
 
+      - name: Make ATK results readable
+        if: always() && steps.sweep.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$ATK_WORKSPACE/harness" ] && docker image inspect "$CI_DOCKER_IMAGE" >/dev/null 2>&1; then
+            docker run --rm -v "$ATK_WORKSPACE/harness:/ws/harness" "$CI_DOCKER_IMAGE" \
+              bash -c 'for run_dir in /ws/harness/*/runs; do
+                [ -d "$run_dir" ] || continue
+                find "$run_dir" -type d -name repo -prune -o -type d -exec chmod a+rx {} +
+                find "$run_dir" -type d -name repo -prune -o -type f -exec chmod a+r {} +
+              done'
+          fi
+
       - name: Upload ATK results
         if: always()
         uses: actions/upload-artifact@v4
@@ -108,14 +127,16 @@ jobs:
             ${{ env.ATK_WORKSPACE }}/harness/**/runs/
             !${{ env.ATK_WORKSPACE }}/harness/**/runs/**/repo/**
           retention-days: 90
-          if-no-files-found: error
+          if-no-files-found: ${{ steps.sweep.outcome == 'success' && 'error' || 'warn' }}
 
       - name: Clean up this job's CI containers
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          bash ci/cleanup_ci_containers.sh
+          if [ -f "$CI_HELPERS_DIR/ci/cleanup_ci_containers.sh" ]; then
+            bash "$CI_HELPERS_DIR/ci/cleanup_ci_containers.sh"
+          fi
           if [ -d "$ATK_WORKSPACE" ]; then
             docker run --rm -v "$ATK_WORKSPACE:/ws" "$CI_DOCKER_IMAGE" rm -rf /ws/harness
             rmdir "$ATK_WORKSPACE"
