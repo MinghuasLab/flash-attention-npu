@@ -836,6 +836,10 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                     RescaleStrided<ElementOTmp, 128, false>(go, lo, dm, rowCount, sliceCols, goStride, sliceCols, 64);
                 }
                 AscendC::PipeBarrier<PIPE_V>();
+                const bool releaseLoEarly = !isLastKvSTile && spillGo;
+                if (releaseLoEarly) {
+                    SetCrossCoreSync<4, PIPE_V>(sliceReadyFlag);
+                }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 if (!isLastKvSTile && spillGo) {
@@ -868,7 +872,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
-                SetCrossCoreSync<4, PIPE_V>(sliceReadyFlag);
+                if (!releaseLoEarly) {
+                    SetCrossCoreSync<4, PIPE_V>(sliceReadyFlag);
+                }
             }
             if (rowCount > 0U) {
                 if (isLastKvSTile && writePartial) {
