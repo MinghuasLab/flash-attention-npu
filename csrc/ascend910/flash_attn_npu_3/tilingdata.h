@@ -53,6 +53,8 @@ struct FAInferTilingData {
     // P0 (G2)：吸收式 MLA decode gemv 每 batch KV 切分预算，由宿主下沉；2376 字节 ABI 不变。
     // kernel 据此在设备侧重算 (batch, split) task 表，使 task 数不再受 coreInfo[25] 截断。
     uint32_t nsplitPerBatch;
+    // fuseTask 开关；紧随 nsplitPerBatch 填入 int64 对齐前的 4 字节空洞，结构体大小不变。
+    uint32_t fusedTask;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -66,11 +68,11 @@ struct FAInferTilingData {
     uint32_t kvCacheSeqlen;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
-    // fuseTask geometry for the fixed-layout (BSND/BNSD) path, computed once on
-    // the Host (or AICPU) so the AICore only reads it instead of re-running
-    // HeadTile/MakeTaskShape (gcd + divides) in every core. All zero means
-    // "not precomputed" and the kernel falls back to computing it locally
-    // (varlen/TND per-batch shapes still need the device-side version).
+    // fuseTask geometry, computed once on the Host (or AICPU) so the AICore only
+    // reads it instead of re-running HeadTile/MakeTaskShape (gcd + divides) in
+    // every core. Only the fixed-layout (BSND/BNSD) path can publish it; TND
+    // (varlen q / seqused_q) leaves it zero and the kernel derives one shape per
+    // batch from that batch's Q length.
     uint32_t fusedNormQBlocks;
     uint32_t fusedNormHeadTile;
     uint32_t fusedNormHeadBlocks;
@@ -163,6 +165,10 @@ struct FAInferTilingData {
     uint32_t get_nsplitPerBatch() const
     {
         return nsplitPerBatch;
+    }
+    uint32_t get_fusedTask() const
+    {
+        return fusedTask;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -321,6 +327,10 @@ struct FAInferTilingData {
     void set_nsplitPerBatch(uint32_t value)
     {
         nsplitPerBatch = value;
+    }
+    void set_fusedTask(uint32_t value)
+    {
+        fusedTask = value;
     }
     void set_splitLseTotalSize(uint64_t value)
     {

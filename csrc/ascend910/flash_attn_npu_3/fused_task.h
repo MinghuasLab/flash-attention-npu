@@ -22,6 +22,10 @@ FA_TASK_INLINE uint32_t Min(uint32_t a, uint32_t b)
 {
     return a < b ? a : b;
 }
+FA_TASK_INLINE uint32_t Max(uint32_t a, uint32_t b)
+{
+    return a > b ? a : b;
+}
 FA_TASK_INLINE uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
     return (a + b - 1) / b;
@@ -53,9 +57,43 @@ FA_TASK_INLINE uint32_t HeadBlocks(uint32_t headTile, uint32_t groupSize, uint32
     return (qHeads / groupSize) * CeilDiv(groupSize, headTile);
 }
 
+// Head count a task may fuse, limited by the L1 Q budget (Q_ROWS rows per task).
+// Q is copied into L1 as 16-row ND2NZ blocks, and the kernel pays that rounding
+// once per *segment*, not once per head:
+//     segL1Stride = RoundUp<16>(qSBlockSize * segN) * embedRound,  segN = min(tile, groupSize)
+// (mha_fwd_kvcache.cpp, "segL1Stride"; budget = Q_ROWS * embedRound, see maxQL1Size).
+//
+// Decode (qRows small) must stop at ONE KV group: once tile >= groupSize the number
+// of KV scans per batch is qHeads/groupSize = kvHeads regardless of tile, so fusing
+// more groups saves no KV traffic; it only adds wave-quantisation loss (task count
+// collapses, e.g. H64/kv8/B64: 512 tasks -> 64, util 98% -> 80%) and serialises
+// several KV heads inside one core. Measured: v3 +18~26%, v2 +12.8% on that shape.
+// Going from ceil(groupSize/8) in-group slices to one whole group is still a win
+// (JYXH q=1: 8 -> 12 halves the KV scans, -21%/-43%), so the tile must never drop
+// below one group when the group fits in L1.
+FA_TASK_INLINE uint32_t QNCapacity(uint32_t qRows, uint32_t groupSize)
+{
+    if (qRows == 0 || groupSize == 0) {
+        return 1;
+    }
+    if (groupSize == 1) {
+        // MHA: every head owns its own KV head, so the 16-row segment rounding is
+        // paid per head (unchanged from the pre-fuse rule).
+        return Q_ROWS / (CeilDiv(qRows, 16) * 16);
+    }
+    // GQA: one KV group shares one L1 segment, so a whole group costs a single
+    // RoundUp16(qRows*groupSize) once. Stop at one group (see above).
+    if (CeilDiv(qRows * groupSize, 16) * 16 <= Q_ROWS) {
+        return groupSize;
+    }
+    // The group does not fit: fall back to (and never go below) the in-group even
+    // split that the unfused GetQNBlockTile uses.
+    return Min(groupSize, Max(Q_ROWS / (CeilDiv(qRows, 16) * 16), (Q_ROWS / qRows) / 2 * 2));
+}
+
 FA_TASK_INLINE uint32_t HeadTile(uint32_t qRows, uint32_t groupSize, uint32_t nCap, uint32_t qHeads)
 {
-    uint32_t tile = Min(nCap, Q_ROWS / (CeilDiv(qRows, 16) * 16));
+    uint32_t tile = Min(nCap, QNCapacity(qRows, groupSize));
     tile = tile > 0 ? tile : 1;
     if (tile >= groupSize) {
         tile = tile / groupSize * groupSize;
