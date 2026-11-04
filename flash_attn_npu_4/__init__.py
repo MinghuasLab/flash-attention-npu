@@ -1,6 +1,14 @@
-__version__ = "0.5.0"
-
+import importlib.util
+from pathlib import Path
 import torch_npu
+
+_version_path = Path(__file__).parents[1] / "flash_attn_npu" / "_version.py"
+_version_spec = importlib.util.spec_from_file_location("_flash_attn_npu_4_version", _version_path)
+if _version_spec is None or _version_spec.loader is None:
+    raise RuntimeError(f"Cannot load package version from {_version_path}")
+_version_module = importlib.util.module_from_spec(_version_spec)
+_version_spec.loader.exec_module(_version_module)
+__version__ = _version_module.__version__
 
 __all__ = [
     "flash_attn_combine",

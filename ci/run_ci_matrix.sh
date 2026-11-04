@@ -15,7 +15,8 @@
 #     避免 N 个容器并发写 .git/config 损坏。
 #
 # 环境变量:
-#   MATRIX_FILE           (默认 ci/build_matrix.tsv)
+#   MATRIX_FILE           (默认 ci/ci_build_matrix.tsv)
+#   ARCH_FILTER / NPU_FILTER (可选) 只选择对应 CPU 架构和 NPU 后端
 #   IMAGE_PREFIX          (默认 fa-npu-ci)
 #   CI_MATRIX_MAX_JOBS    (默认 0=不限) 并发容器数上限 (内存吃紧时调小, 如 3)
 #   CI_DOCKER_PRIVILEGED  (默认 true)
@@ -30,7 +31,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/build_matrix.tsv}"
+MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/ci_build_matrix.tsv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fa-npu-ci}"
 CI_MATRIX_MAX_JOBS="${CI_MATRIX_MAX_JOBS:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
@@ -38,9 +39,8 @@ CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 LOG_DIR="${REPO_ROOT}/build/matrix-logs"
 # 每个 combo 一个 docker CLI PID 文件; 取消时先终止这些客户端, 再按 scope 清理容器。
 PID_DIR="$LOG_DIR/pids"
-# 架构过滤: 非空时只跑 tsv 第 7 列 (arch) 匹配的 combo。用于多机器分架构跑:
-# 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
 ARCH_FILTER="${ARCH_FILTER:-}"
+NPU_FILTER="${NPU_FILTER:-}"
 
 # shellcheck source=ci/docker_proxy.sh
 # shellcheck disable=SC1091
@@ -74,15 +74,10 @@ privileged_args=()
 [ "$CI_DOCKER_PRIVILEGED" = "true" ] && privileged_args+=(--privileged)
 
 read_combos() {
-  if [ -n "$ARCH_FILTER" ]; then
-    awk -F'|' -v arch="$ARCH_FILTER" '
-      /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
-      NF >= 7 && $7 == arch {print}
-      NF < 7 {print}
-    ' "$MATRIX_FILE"
-  else
-    awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
-  fi
+  awk -F'|' -v arch="$ARCH_FILTER" -v npu="$NPU_FILTER" '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+    (arch == "" || $11 == arch) && (npu == "" || $8 == npu) {print}
+  ' "$MATRIX_FILE"
 }
 
 COMBOS=()
@@ -92,11 +87,11 @@ while IFS= read -r line; do
 done < <(read_combos)
 [ "${#COMBOS[@]}" -gt 0 ] || die "no combo in $MATRIX_FILE"
 
-# 从 combo 行解析镜像名: 若第 8 列 (image) 非空则直接用该镜像 (预构建), 否则用 $IMAGE_PREFIX:$name
+# 从 combo 行解析镜像名: 若第 12 列 (image) 非空则直接用该镜像 (预构建), 否则用 $IMAGE_PREFIX:$name
 combo_image() {
   local line="$1" name img
   name="${line%%|*}"
-  img="$(printf '%s' "$line" | awk -F'|' '{print $8}')"
+  img="$(printf '%s' "$line" | awk -F'|' '{print $12}')"
   if [ -n "$img" ]; then
     printf '%s\n' "$img"
   else
@@ -133,15 +128,13 @@ bash "$SCRIPT_DIR/init_submodules.sh" "$REPO_ROOT"
 
 # ---------- 2. 每个 combo 一个容器, 并发编译 ----------
 build_one() {
-  local line="$1" name logf rc img docker_pid pidfile arch build_npu
+  local line="$1" name logf rc img docker_pid pidfile arch build_npu npu
   name="${line%%|*}"
   img="$(combo_image "$line")"
-  arch="$(printf '%s' "$line" | awk -F'|' '{print $7}')"
-  case "$arch" in
-    aarch64) build_npu=910 ;;
-    x86_64) build_npu=950 ;;
-    *) die "unknown matrix arch: $arch ($name)" ;;
-  esac
+  arch="$(printf '%s' "$line" | awk -F'|' '{print $11}')"
+  npu="$(printf '%s' "$line" | awk -F'|' '{print $8}')"
+  case "$arch" in aarch64|x86_64) ;; *) die "unknown matrix arch: $arch ($name)" ;; esac
+  build_npu="$npu"
   build_npu="${FLASH_ATTN_BUILD_NPU:-$build_npu}"
   logf="$LOG_DIR/${name}.log"
   pidfile="$PID_DIR/${name}.pid"

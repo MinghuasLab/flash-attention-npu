@@ -1,0 +1,247 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: true
+        default: "main"
+        type: string
+      release_tag:
+        description: "Version tag to validate (blank uses v<package version>)"
+        required: false
+        default: ""
+        type: string
+      matrix_filter:
+        description: "Optional substring selecting matrix rows"
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "Create/update the GitHub Release and upload wheels"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.event_name == 'push' && github.ref || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare_release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish_release: ${{ steps.mode.outputs.publish_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          package_version="$(python3 ci/validate_release_version.py)"
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$PUSH_TAG"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$package_version"
+          fi
+          python3 ci/validate_release_version.py --tag "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve publication mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_RELEASE" = "true" ]; then
+            echo "publish_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate publication ref
+        if: steps.mode.outputs.publish_release == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "$TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$head_commit" = "$tag_commit" || {
+            echo "ref HEAD $head_commit does not match $TAG ($tag_commit)" >&2
+            exit 1
+          }
+
+      - name: Build dynamic matrix
+        id: matrix
+        run: python3 ci/release_matrix.py --filter '${{ inputs.matrix_filter }}' --github-output "$GITHUB_OUTPUT"
+
+      - name: Create or reuse GitHub Release
+        if: steps.mode.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git rev-parse "$TAG^{commit}" >/dev/null
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Reusing existing release $TAG"
+          else
+            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          fi
+
+  build_wheels:
+    name: Wheel (${{ matrix.name }})
+    needs: prepare_release
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare_release.outputs.matrix) }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 360
+    env:
+      CI_CONTAINER_SCOPE: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}
+    steps:
+      - name: Prepare self-hosted workspace
+        env:
+          MATRIX_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$MATRIX_IMAGE" >/dev/null
+          docker run --rm --user 0:0 --entrypoint bash -v "$PWD:/workspace" "$MATRIX_IMAGE" \
+            -c 'chmod -R a+rwX /workspace 2>/dev/null || true'
+          git config --global --add safe.directory "$PWD"
+          git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
+          proxy_file="${PROXY_CONFIG_FILE:-/home/FA_NPU_CI_DATA/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            git_proxy="$(sed -n 's/^\(GIT_PROXY\|HTTPS_PROXY\|https_proxy\)=//p' "$proxy_file" | tail -n1)"
+            if [ -n "$git_proxy" ]; then
+              git config --global http.https://github.com.proxy "$git_proxy"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Clear temporary checkout proxy
+        run: git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
+
+      - name: Build and validate wheel
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_PY_TAG: ${{ matrix.py_tag }}
+          MATRIX_TORCH_VERSION: ${{ matrix.torch_version }}
+          MATRIX_TORCH_NPU_VERSION: ${{ matrix.torch_npu_version }}
+          MATRIX_CANN_VERSION: ${{ matrix.cann_version }}
+          MATRIX_CANN_INSTALL_VERSION: ${{ matrix.cann_install_version }}
+          MATRIX_CONDA_ENV: ${{ matrix.conda_env }}
+          MATRIX_NPU: ${{ matrix.npu }}
+          MATRIX_BUILD_VERSION: ${{ matrix.build_version }}
+          MATRIX_ABI: ${{ matrix.abi }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          CI_DOCKER_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$CI_DOCKER_IMAGE" >/dev/null
+          test -d /usr/local/Ascend/driver/lib64
+          test -f /usr/local/Ascend/driver/version.info
+          test -f /etc/ascend_install.info
+          docker run --rm \
+            --user 0:0 \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            --privileged \
+            --ipc host \
+            --network host \
+            -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
+            -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
+            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+            -v "$PWD:/workspace/flash-attention-npu" \
+            -w /workspace/flash-attention-npu \
+            -e MATRIX_NAME -e MATRIX_PY_TAG -e MATRIX_TORCH_VERSION \
+            -e MATRIX_TORCH_NPU_VERSION -e MATRIX_CANN_VERSION \
+            -e MATRIX_CANN_INSTALL_VERSION -e MATRIX_CONDA_ENV -e MATRIX_NPU \
+            -e MATRIX_BUILD_VERSION -e MATRIX_ABI -e MATRIX_ARCH \
+            -e PIP_NO_INDEX=1 \
+            -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
+            "$CI_DOCKER_IMAGE" bash ci/build_release_wheel.sh
+
+      - name: Restore workspace permissions
+        if: always()
+        env:
+          MATRIX_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --user 0:0 -v "$PWD:/workspace" "$MATRIX_IMAGE" \
+            bash -c 'chmod -R a+rwX /workspace'
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/${{ matrix.name }}/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload wheel to GitHub Release
+        if: needs.prepare_release.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          wheel="$(find "dist/${{ matrix.name }}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          bash ci/upload_release_asset.sh "$TAG" "$wheel"
+
+      - name: Clean up release containers
+        if: always()
+        run: bash ci/cleanup_ci_containers.sh
+
+  verify_wheels:
+    name: Verify wheel artifacts
+    needs: [prepare_release, build_wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and count wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      - name: Verify complete wheel set
+        env:
+          MATRIX_JSON: ${{ needs.prepare_release.outputs.matrix }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          expected = len(json.loads(os.environ["MATRIX_JSON"])["include"])
+          wheels = list(Path("dist/wheels").glob("*.whl"))
+          if len(wheels) != expected:
+              raise SystemExit(f"expected {expected} wheels, found {len(wheels)}")
+          PY
