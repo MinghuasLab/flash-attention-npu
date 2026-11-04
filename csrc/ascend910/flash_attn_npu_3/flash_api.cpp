@@ -596,17 +596,21 @@ std::vector<at::Tensor> mha_fwd(
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         // fuseTask: grouped head tiles (a task may span KV groups, and an MHA tail
-        // can pack several heads) need a fixed, per-batch-identical geometry, so it
-        // is limited to non-paged / non-append / fixed-length Q. The geometry is
-        // computed once here and handed to the kernel through the tiling.
-        const bool fusedTask = !paged_KV && !appendKV && !is_varlen_q && !seqused_q_.has_value();
+        // can pack several heads) need one geometry per batch. The fixed-layout
+        // path has a single Q length, so it is computed once here and handed to the
+        // kernel through the tiling. TND (cu_seqlens_q / seqused_q) has per-batch Q
+        // lengths: nothing is published and the kernel derives the shape of each
+        // batch with the varlen variant of MakeTaskShape (same rule V2 uses).
+        const bool fusedTask = !paged_KV && !appendKV;
+        const bool perBatchShape = fusedTask && is_varlen_q;
         fa_fused::TaskShape fusedShape{};
-        if (fusedTask) {
+        if (fusedTask && !perBatchShape) {
             fusedShape = fa_fused::MakeTaskShape(seqlen_q, num_heads, num_heads_k, batch_size, blockDim, true);
             tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile, fusedShape.normHeadBlocks,
                                            fusedShape.normTasks, fusedShape.tailRows, fusedShape.tailHeadTile,
                                            fusedShape.tailHeadBlocks, fusedShape.totalTasks);
         }
+        tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             if (seqlens_q_cpu != nullptr) {
@@ -620,7 +624,10 @@ std::vector<at::Tensor> mha_fwd(
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (fusedTask) {
-                curTaskNum = fusedShape.totalTasks;
+                curTaskNum = perBatchShape
+                                 ? fa_fused::MakeTaskShape(qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false)
+                                       .totalTasks
+                                 : fusedShape.totalTasks;
             }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);

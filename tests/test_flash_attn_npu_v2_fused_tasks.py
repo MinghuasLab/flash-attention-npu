@@ -20,6 +20,22 @@ def test_fused_task_geometry(tmp_path):
 #include <vector>
 
 int main() {
+    // Unfused capacity (kernel_common.hpp::GetQNBlockTile), kept here to prove that
+    // fusing never shrinks the QN slice a task may cover.
+    auto legacyTile = [](unsigned rows, unsigned group) {
+        unsigned t = (rows != 0) ? (fa_fused::Q_ROWS / rows) / 2 * 2 : fa_fused::Q_ROWS;
+        t = t < group ? t : group;
+        return t < 1u ? 1u : t;
+    };
+    // GQA (segments pack groupSize heads) must not be charged 16-row padding per head:
+    // group 16 x 3 rows is 48 L1 rows, so a whole group fits in 128. Decode stops at
+    // ONE group: fusing further groups saves no KV traffic (qHeads/groupSize scans
+    // per batch either way) and only adds wave-quantisation loss.
+    assert(fa_fused::HeadTile(3, 16, 16, 64) >= legacyTile(3, 16));
+    assert(fa_fused::HeadTile(3, 16, 16, 64) == 16);
+    assert(fa_fused::HeadTile(3, 16, 64, 64) == 16);
+    assert(fa_fused::HeadTile(3, 8, 32, 32) == 8);
+    assert(fa_fused::HeadTile(3, 8, 8, 32) == 8);
     // Full two-vector capacity, odd GQA, group balancing, and tail dispatch.
     assert(fa_fused::HeadTile(64, 4, 8, 8) == 2);
     assert(fa_fused::HeadTile(32, 4, 8, 8) == 4);
@@ -51,6 +67,9 @@ int main() {
                             unsigned hb = tail ? t - s.normTasks : t % s.normHeadBlocks;
                             unsigned tile = tail ? s.tailHeadTile : s.normHeadTile;
                             unsigned rows = tail ? s.tailRows : fa_fused::Q_ROWS;
+                            // Criterion 1: fusion may never reduce the QN slice below the
+                            // unfused GetQNBlockTile (nor below a whole head).
+                            assert(tile >= std::min(legacyTile(rows, group), heads));
                             unsigned h0, hn;
                             if (tile >= group) {
                                 // Whole groups per task: the slice starts on a group boundary.
@@ -153,8 +172,8 @@ def test_fused_metadata_reduces_task_count(npu):
     metadata = get_scheduler_metadata(batch, 5, 577, 18, 6, 128, lengths, qkv_dtype=torch.float16)
     tiling = _tiling_from_metadata(metadata)
     assert tiling.fusedTask == 1
-    assert tiling.firstBatchTaskNum == 3  # Two KV groups per task; formerly six tasks.
-    assert tiling.totalTaskNum == batch * 3
+    assert tiling.firstBatchTaskNum == 6  # One KV group per task; q=5 packs 6 groups per batch.
+    assert tiling.totalTaskNum == batch * 6
     paged = get_scheduler_metadata(
         batch, 5, 577, 18, 6, 128, lengths, qkv_dtype=torch.float16, page_size=128
     )

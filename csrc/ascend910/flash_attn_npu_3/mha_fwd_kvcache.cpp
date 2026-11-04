@@ -392,11 +392,11 @@ class FAInferKernel {
         embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
         embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
         groupSize = qHeads / kvHeads;
-        // Grouped ("fused") tasks need one geometry for every batch, so they are
-        // limited to the fixed-layout path. Host/AICPU publish fusedTotalTasks only
-        // when the same conditions held there.
-        fusedTask = (fATilingData->fusedTotalTasks != 0U) && !PAGED_CACHE_FLAG && (kvNewSeqlen == 0U) &&
-                    !FLASH_DECODE_FLAG && (INPUT_LAYOUT != FaiKenel::inputLayout::TND);
+        // Grouped ("fused") tasks pack several heads into one task. The fixed-layout
+        // geometry is published by Host/AICPU; TND (varlen q / seqused_q) publishes
+        // no shape and each batch derives its own from that batch's Q length, so the
+        // flag is what enables fusion, not the published task count.
+        fusedTask = (fATilingData->fusedTask != 0U) && !PAGED_CACHE_FLAG && (kvNewSeqlen == 0U) && !FLASH_DECODE_FLAG;
         taskCoreNum = coreNum;
 
         totalQTokens = 0;
@@ -503,27 +503,34 @@ class FAInferKernel {
             uint32_t curQSBlockNumCur = 0;
             uint32_t qSeqlenCur = 0;
             uint32_t kvSeqlenCur = 0;
-            fa_fused::TaskShape fusedShape{};
-            if (fusedTask) {
-                // Geometry precomputed by Host/AICPU and carried in the tiling:
-                // the core only loads 8 scalars instead of running HeadTile /
-                // MakeTaskShape (gcd + divides + loops) in every core.
-                fusedShape.normQBlocks = fATilingData->fusedNormQBlocks;
-                fusedShape.normHeadTile = fATilingData->fusedNormHeadTile;
-                fusedShape.normHeadBlocks = fATilingData->fusedNormHeadBlocks;
-                fusedShape.normTasks = fATilingData->fusedNormTasks;
-                fusedShape.tailRows = fATilingData->fusedTailRows;
-                fusedShape.tailHeadTile = fATilingData->fusedTailHeadTile;
-                fusedShape.tailHeadBlocks = fATilingData->fusedTailHeadBlocks;
-                fusedShape.totalTasks = fATilingData->fusedTotalTasks;
-                if (fusedShape.totalTasks == 0U) { // tiling without the precomputed shape
-                    fusedShape = fa_fused::MakeTaskShape(maxQSeqlen, qHeads, kvHeads, batch, taskCoreNum, true);
-                }
-            }
             // Resolve batch 0 Q length here since the firstBatchTaskNum seed skips the while advance for batch 0
             qSeqlenCur = fATilingData->maxQSeqlen;
             if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
                 qSeqlenCur = QSeqLenOf(0, gActualQseqlen, gSeqUsedQ);
+            }
+            fa_fused::TaskShape fusedShape{};
+            if (fusedTask) {
+                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                    // TND has one Q length per batch, so no geometry is published in
+                    // the tiling: build batch 0's shape here, the cachedBatch gate
+                    // below rebuilds it whenever the task cursor enters a new batch.
+                    fusedShape = fa_fused::MakeTaskShape(qSeqlenCur, qHeads, kvHeads, batch, taskCoreNum, false);
+                } else {
+                    // Geometry precomputed by Host/AICPU and carried in the tiling:
+                    // the core only loads 8 scalars instead of running HeadTile /
+                    // MakeTaskShape (gcd + divides + loops) in every core.
+                    fusedShape.normQBlocks = fATilingData->fusedNormQBlocks;
+                    fusedShape.normHeadTile = fATilingData->fusedNormHeadTile;
+                    fusedShape.normHeadBlocks = fATilingData->fusedNormHeadBlocks;
+                    fusedShape.normTasks = fATilingData->fusedNormTasks;
+                    fusedShape.tailRows = fATilingData->fusedTailRows;
+                    fusedShape.tailHeadTile = fATilingData->fusedTailHeadTile;
+                    fusedShape.tailHeadBlocks = fATilingData->fusedTailHeadBlocks;
+                    fusedShape.totalTasks = fATilingData->fusedTotalTasks;
+                    if (fusedShape.totalTasks == 0U) { // tiling without the precomputed shape
+                        fusedShape = fa_fused::MakeTaskShape(maxQSeqlen, qHeads, kvHeads, batch, taskCoreNum, true);
+                    }
+                }
             }
             for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
                 while (taskIdx >= curTotalTaskNumTmp) {
@@ -535,7 +542,15 @@ class FAInferKernel {
                     }
 
                     if (fusedTask) {
-                        curTotalTaskNumTmp += fusedShape.totalTasks;
+                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                            // Same rule the Host/AICPU used for firstBatchTaskNum: the
+                            // task count of a batch follows from its own Q length.
+                            curTotalTaskNumTmp +=
+                                fa_fused::MakeTaskShape(qSeqlenCur, qHeads, kvHeads, batch, taskCoreNum, false)
+                                    .totalTasks;
+                        } else {
+                            curTotalTaskNumTmp += fusedShape.totalTasks;
+                        }
                     } else {
                         // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                         // length is resolved in the cachedBatch gate below, not here. If this
@@ -558,7 +573,14 @@ class FAInferKernel {
                     }
                     // Per batch KV length including the appended new KV, reused by every task
                     kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
-                    if (!fusedTask) {
+                    if (fusedTask) {
+                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                            // The published geometry only ever covers a fixed Q length,
+                            // so TND needs this batch's shape before mapping its tasks.
+                            fusedShape =
+                                fa_fused::MakeTaskShape(qSeqlenCur, qHeads, kvHeads, batch, taskCoreNum, false);
+                        }
+                    } else {
                         uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
                         uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                         curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;

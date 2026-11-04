@@ -83,12 +83,15 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
 
     const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
-    // Fixed layout (non-varlen): every batch shares one Q length, so the grouped
-    // task geometry is computed once here and published in the tiling for the
-    // AICore to read instead of recomputing it in every core.
-    const bool fusedTask = (metaArgs->pagedKV == 0u) && (metaArgs->kvNewSeqlen == 0u) && (metaArgs->isVarlen == 0u);
+    // Non-paged grouped-head scheduling. The geometry is per batch: fixed layout
+    // (every batch shares one Q length) publishes it once; TND (varlen q /
+    // seqused_q) publishes no shape and the AICore derives each batch's from its
+    // own Q length with the varlen variant of MakeTaskShape.
+    const bool fusedTask = (metaArgs->pagedKV == 0u) && (metaArgs->kvNewSeqlen == 0u);
+    const bool perBatchShape = fusedTask && (seqlensQ != nullptr);
+    tilingData->fusedTask = fusedTask ? 1U : 0U;
     fa_fused::TaskShape fusedShape{};
-    if (fusedTask) {
+    if (fusedTask && !perBatchShape) {
         fusedShape = fa_fused::MakeTaskShape(metaArgs->maxQSeqlen, metaArgs->numHeads, metaArgs->numHeadsK,
                                              metaArgs->batch, metaArgs->blockDim, true);
         tilingData->fusedNormQBlocks = fusedShape.normQBlocks;
@@ -113,7 +116,14 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, Q_TILE_CEIL);
-        const uint32_t curTaskNum = fusedTask ? fusedShape.totalTasks : (curQNBlockNum * curQSBlockNum);
+        uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        if (fusedTask) {
+            curTaskNum = perBatchShape
+                ? fa_fused::MakeTaskShape(qSeqlen, metaArgs->numHeads, metaArgs->numHeadsK, metaArgs->batch,
+                                          metaArgs->blockDim, false)
+                      .totalTasks
+                : fusedShape.totalTasks;
+        }
 
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;

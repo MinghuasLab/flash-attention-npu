@@ -54,7 +54,7 @@ struct FAInferTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    uint32_t fusedTask;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -68,11 +68,11 @@ struct FAInferTilingData {
     uint32_t kvCacheSeqlen;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
-    // fuseTask geometry for the fixed-layout (BSND/BNSD) path, computed once on
-    // the Host (or AICPU) so the AICore only reads it instead of re-running
-    // HeadTile/MakeTaskShape (gcd + divides) in every core. All zero means
-    // "not precomputed" and the kernel falls back to computing it locally
-    // (varlen/TND per-batch shapes still need the device-side version).
+    // fuseTask geometry, computed once on the Host (or AICPU) so the AICore only
+    // reads it instead of re-running HeadTile/MakeTaskShape (gcd + divides) in
+    // every core. Only the fixed-layout (BSND/BNSD) path can publish it; TND
+    // (varlen q / seqused_q) leaves it zero and the kernel derives one shape per
+    // batch from that batch's Q length.
     uint32_t fusedNormQBlocks;
     uint32_t fusedNormHeadTile;
     uint32_t fusedNormHeadBlocks;
@@ -162,9 +162,9 @@ struct FAInferTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_fusedTask() const
     {
-        return padding3;
+        return fusedTask;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -320,9 +320,9 @@ struct FAInferTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_fusedTask(uint32_t value)
     {
-        padding3 = value;
+        fusedTask = value;
     }
     void set_splitLseTotalSize(uint64_t value)
     {
