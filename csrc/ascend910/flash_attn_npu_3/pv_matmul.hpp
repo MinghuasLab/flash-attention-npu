@@ -161,8 +161,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                        uint32_t& blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                  static_cast<uint64_t>(blockStartOffset) * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride + static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -198,8 +197,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
                                       uint64_t cacheRowBase = 0,
                                       AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
-                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0,
-                                      bool firstSegment = true)
+                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0, bool firstSegment = true)
     {
         (void)doCopyback;
         (void)gBCache;
@@ -361,7 +359,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     AscendC::DataCopyParams ndStoreParams(segLen, embed / BLOCK_SIZE, 0,
                                                           strideKV / BLOCK_SIZE - embed / BLOCK_SIZE);
                     AscendC::DataCopy(appendGBCache[static_cast<uint64_t>(pageId) * pageStride +
-                                                           static_cast<uint64_t>(pageOff) * strideKV],
+                                                    static_cast<uint64_t>(pageOff) * strideKV],
                                       l1BTensor[0][segSrc * embed], ndStoreParams);
                     segSrc += segLen;
                 }
@@ -439,7 +437,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                 AscendC::DataCopyParams ndStoreParams(segLen, nSliceLen / BLOCK_SIZE, 0,
                                                       strideKV / BLOCK_SIZE - nSliceLen / BLOCK_SIZE);
                 AscendC::DataCopy(appendGBCache[static_cast<uint64_t>(pageId) * pageStride +
-                                                       static_cast<uint64_t>(pageOff) * strideKV + srcCol],
+                                                static_cast<uint64_t>(pageOff) * strideKV + srcCol],
                                   ndCopyTensor[segSrc * nSliceLen], ndStoreParams);
                 segSrc += segLen;
             }

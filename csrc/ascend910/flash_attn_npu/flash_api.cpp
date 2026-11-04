@@ -87,8 +87,8 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
                                        int64_t max_seqlen_k_bound)
 {
     FwdMaskDerivation derived;
-    NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k_bound, window_left, window_right,
-                             derived.is_causal, derived.is_local);
+    NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k_bound, window_left, window_right, derived.is_causal,
+                             derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)
@@ -482,8 +482,8 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
         tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
 
-        NormalizeAttentionWindow(is_causal, seqlen_q, max_kv_seqlen, window_size_left, window_size_right,
-                                 is_causal, is_local);
+        NormalizeAttentionWindow(is_causal, seqlen_q, max_kv_seqlen, window_size_left, window_size_right, is_causal,
+                                 is_local);
         TORCH_CHECK(!(appendKV && is_local),
                     "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
 
@@ -710,8 +710,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, seqlen_q, seqlen_k, window_size_left, window_size_right,
-                             is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, seqlen_q, seqlen_k, window_size_left, window_size_right, is_causal, is_local);
 
     // init output tensors
     // BNSD (B,H,S,D) input: the kernel writes contiguous BSND, so allocate (B, S, H, dv).
@@ -1029,8 +1028,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     }
 
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right,
-                             is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal,
+                             is_local);
 
     at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
     auto opts = q.options().device(at::kPrivateUse1);
@@ -1147,11 +1146,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
         // For valid packed inputs, sum(q_lengths) == batch * max_q implies
         // every sequence reaches the declared upper bound. Count this common
         // uniform case directly on Host without copying prefix sums to CPU.
-        const bool uniformQ = fusedTask &&
-            static_cast<int64_t>(T) == static_cast<int64_t>(batch_size) * max_seqlen_q;
+        const bool uniformQ = fusedTask && static_cast<int64_t>(T) == static_cast<int64_t>(batch_size) * max_seqlen_q;
         if (uniformQ) {
-            const uint32_t tasksPerBatch = fa_fused::MakeTaskShape(
-                max_seqlen_q, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+            const uint32_t tasksPerBatch =
+                fa_fused::MakeTaskShape(max_seqlen_q, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
             tiling_cpu_ptr->set_firstBatchTaskNum(tasksPerBatch);
             tiling_cpu_ptr->set_totalTaskNum(tasksPerBatch * batch_size);
         } else {
@@ -1168,16 +1166,16 @@ std::vector<at::Tensor> mha_varlen_fwd(
             uint32_t totalTaskNum = 0;
             const uint32_t groupSize = num_heads / num_heads_k;
             for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-                const uint32_t qSeqlen = static_cast<uint32_t>(
-                    cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
+                const uint32_t qSeqlen =
+                    static_cast<uint32_t>(cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
                 uint32_t curTaskNum;
                 if (fusedTask) {
                     // Grouped task geometry depends only on Q, not on KV lengths.
-                    curTaskNum = fa_fused::MakeTaskShape(
-                        qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false).totalTasks;
+                    curTaskNum = fa_fused::MakeTaskShape(qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false)
+                                     .totalTasks;
                 } else {
-                    const uint32_t kvSeqlen = static_cast<uint32_t>(
-                        cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
+                    const uint32_t kvSeqlen =
+                        static_cast<uint32_t>(cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
                     const uint32_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
                     const uint32_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
                     const uint32_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
@@ -1341,8 +1339,8 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     int local_window_size_right = window_size_right;
     bool local_is_causal = false;
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, local_window_size_left,
-                             local_window_size_right, local_is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, local_window_size_left, local_window_size_right,
+                             local_is_causal, is_local);
 
     AlibiSlopes alibi = set_params_alibi(alibi_slopes_, seqlens_q.numel() - 1, qsizes[1]);
     bool has_alibi = alibi.ptr != nullptr;

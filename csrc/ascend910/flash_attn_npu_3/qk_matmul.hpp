@@ -185,8 +185,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                        uint32_t startOffset, uint32_t strideKV, uint32_t blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                  static_cast<uint64_t>(startOffset) * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride + static_cast<uint64_t>(startOffset) * strideKV;
     }
 
     __aicore__ inline void resetBlockStart(uint32_t kvStart, uint32_t pagedBlockSize)
@@ -212,8 +211,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
                                       uint64_t cacheRowBase = 0,
                                       AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
-                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0,
-                                      uint32_t qL1Offset = 0)
+                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0, uint32_t qL1Offset = 0)
     {
         (void)doCopyback;
         (void)gBCache;
@@ -544,7 +542,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             AscendC::DataCopyParams ndStoreParams(segLen, kActual / BLOCK_SIZE, 0,
                                                   strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
             AscendC::DataCopy(appendGBCache[static_cast<uint64_t>(pageId) * pageStride +
-                                                   static_cast<uint64_t>(pageOff) * strideKV + cacheColumnOffset],
+                                            static_cast<uint64_t>(pageOff) * strideKV + cacheColumnOffset],
                               ndCopyTensor[segSrc * kActual], ndStoreParams);
             segRow += segLen;
             segSrc += segLen;

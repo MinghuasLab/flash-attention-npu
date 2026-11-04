@@ -603,9 +603,9 @@ std::vector<at::Tensor> mha_fwd(
         fa_fused::TaskShape fusedShape{};
         if (fusedTask) {
             fusedShape = fa_fused::MakeTaskShape(seqlen_q, num_heads, num_heads_k, batch_size, blockDim, true);
-            tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile,
-                                           fusedShape.normHeadBlocks, fusedShape.normTasks, fusedShape.tailRows,
-                                           fusedShape.tailHeadTile, fusedShape.tailHeadBlocks, fusedShape.totalTasks);
+            tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile, fusedShape.normHeadBlocks,
+                                           fusedShape.normTasks, fusedShape.tailRows, fusedShape.tailHeadTile,
+                                           fusedShape.tailHeadBlocks, fusedShape.totalTasks);
         }
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
