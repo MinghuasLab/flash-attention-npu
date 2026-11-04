@@ -392,6 +392,12 @@ class FAInferKernel {
         embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
         embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
         groupSize = qHeads / kvHeads;
+        // Grouped ("fused") tasks need one geometry for every batch, so they are
+        // limited to the fixed-layout path. Host/AICPU publish fusedTotalTasks only
+        // when the same conditions held there.
+        fusedTask = (fATilingData->fusedTotalTasks != 0U) && !PAGED_CACHE_FLAG && (kvNewSeqlen == 0U) &&
+                    !FLASH_DECODE_FLAG && (INPUT_LAYOUT != FaiKenel::inputLayout::TND);
+        taskCoreNum = coreNum;
 
         totalQTokens = 0;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
@@ -497,6 +503,23 @@ class FAInferKernel {
             uint32_t curQSBlockNumCur = 0;
             uint32_t qSeqlenCur = 0;
             uint32_t kvSeqlenCur = 0;
+            fa_fused::TaskShape fusedShape{};
+            if (fusedTask) {
+                // Geometry precomputed by Host/AICPU and carried in the tiling:
+                // the core only loads 8 scalars instead of running HeadTile /
+                // MakeTaskShape (gcd + divides + loops) in every core.
+                fusedShape.normQBlocks = fATilingData->fusedNormQBlocks;
+                fusedShape.normHeadTile = fATilingData->fusedNormHeadTile;
+                fusedShape.normHeadBlocks = fATilingData->fusedNormHeadBlocks;
+                fusedShape.normTasks = fATilingData->fusedNormTasks;
+                fusedShape.tailRows = fATilingData->fusedTailRows;
+                fusedShape.tailHeadTile = fATilingData->fusedTailHeadTile;
+                fusedShape.tailHeadBlocks = fATilingData->fusedTailHeadBlocks;
+                fusedShape.totalTasks = fATilingData->fusedTotalTasks;
+                if (fusedShape.totalTasks == 0U) { // tiling without the precomputed shape
+                    fusedShape = fa_fused::MakeTaskShape(maxQSeqlen, qHeads, kvHeads, batch, taskCoreNum, true);
+                }
+            }
             // Resolve batch 0 Q length here since the firstBatchTaskNum seed skips the while advance for batch 0
             qSeqlenCur = fATilingData->maxQSeqlen;
             if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
@@ -511,15 +534,19 @@ class FAInferKernel {
                         qSeqlenCur = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                     }
 
-                    // GetQSBlockTile is a constant independent of kvSeqlen so the kv
-                    // length is resolved in the cachedBatch gate below, not here. If this
-                    // function ever becomes kv dependent move the kv resolution back.
-                    uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
-                    uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
-                    uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
-                    uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
-                    curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
+                    if (fusedTask) {
+                        curTotalTaskNumTmp += fusedShape.totalTasks;
+                    } else {
+                        // GetQSBlockTile is a constant independent of kvSeqlen so the kv
+                        // length is resolved in the cachedBatch gate below, not here. If this
+                        // function ever becomes kv dependent move the kv resolution back.
+                        uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
+                        uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
+                        uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
+                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                        uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
+                        curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
+                    }
                 }
 
                 if (curBatchTmp != cachedBatch) {
@@ -531,17 +558,34 @@ class FAInferKernel {
                     }
                     // Per batch KV length including the appended new KV, reused by every task
                     kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
-                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
-                    uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
-                    curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
-                    curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
+                    if (!fusedTask) {
+                        uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
+                        uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
+                        curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
+                        curQSBlockNumCur = CeilDiv(qSeqlenCur, Q_TILE_CEIL);
+                    }
                     cachedBatch = curBatchTmp;
                 }
 
                 uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
 
-                uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
-                uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+                uint32_t qSBlockIdxCur;
+                uint32_t qNBlockIdxCur;
+                uint32_t fusedHeadTile = 0;
+                if (fusedTask) {
+                    if (taskIdxCurBatch < fusedShape.normTasks) {
+                        qSBlockIdxCur = taskIdxCurBatch / fusedShape.normHeadBlocks;
+                        qNBlockIdxCur = taskIdxCurBatch % fusedShape.normHeadBlocks;
+                        fusedHeadTile = fusedShape.normHeadTile;
+                    } else {
+                        qSBlockIdxCur = fusedShape.normQBlocks;
+                        qNBlockIdxCur = taskIdxCurBatch - fusedShape.normTasks;
+                        fusedHeadTile = fusedShape.tailHeadTile;
+                    }
+                } else {
+                    qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
+                    qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+                }
 
                 uint32_t pipelineDrain = 0;
                 if (taskIdx + uint32_t(coreNum) >= totalTaskNum) {
@@ -552,7 +596,7 @@ class FAInferKernel {
                 const bool hasTaskWork =
                     runMainLoop(coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0,
                                 0, 0, 0, globalTensors, descriptors, taskContexts, currentTaskStateSlot,
-                                issuedStackCount, pipelineDrain, softmaxPingPongFlag);
+                                issuedStackCount, pipelineDrain, softmaxPingPongFlag, fusedHeadTile);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
         }
@@ -615,13 +659,28 @@ class FAInferKernel {
         }
     }
 
+    // Task -> head slice mapping for fused tasks whose tile is narrower than one
+    // KV group: task `qNBlockIdx` is the subIdx-th slice of KV group kvNIdx, the
+    // same numbering HeadBlocks uses (kvIdx = idx / numSub, subIdx = idx % numSub).
+    __aicore__ __attribute__((noinline)) static void ResolveInGroupHeadSlice(
+        uint32_t qNBlockIdx, uint32_t headTile, uint32_t groupSize, uint32_t& qNStartIdx,
+        uint32_t& qNBlockSize, uint32_t& kvNIdx)
+    {
+        uint32_t numSubPerGroup = CeilDiv(groupSize, headTile);
+        uint32_t subIdx = qNBlockIdx % numSubPerGroup;
+        kvNIdx = qNBlockIdx / numSubPerGroup;
+        qNStartIdx = kvNIdx * groupSize + subIdx * headTile;
+        qNBlockSize = AscendC::Std::min(headTile, groupSize - subIdx * headTile);
+    }
+
     __aicore__ inline bool runMainLoop(uint32_t coreIdx, uint32_t BIdx, uint32_t qSeqlen, uint32_t kvSeqlenCur,
                                        uint32_t qNBlockIdx, uint32_t qSBlockIdx, bool isSplitKV, int32_t stS2IdxNow,
                                        int32_t enS2IdxNow, uint64_t gmOffsetLseFD, uint64_t gmOffsetOFD,
                                        GlobalTensorBundle& globalTensors, StackDescriptor (&descriptors)[STACK_SLOTS],
                                        DelayedPVTaskContext (&taskContexts)[STACK_SLOTS],
                                        const uint32_t& currentTaskStateSlot, uint32_t& issuedStackCount,
-                                       uint32_t pipelineDrain, uint32_t& softmaxPingPongFlag)
+                                       uint32_t pipelineDrain, uint32_t& softmaxPingPongFlag,
+                                       uint32_t fusedHeadTile = 0U)
     {
         auto& gQ = globalTensors.gQ;
         auto& gK = globalTensors.gK;
@@ -705,7 +764,7 @@ class FAInferKernel {
             lseHeadStride = maxQSeqlen;
         }
 
-        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
+        uint32_t curQNBlockTile = fusedHeadTile != 0U ? fusedHeadTile : GetQNBlockTile(qSeqlen, groupSize);
         uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
         uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
@@ -714,9 +773,27 @@ class FAInferKernel {
             curKSBlockNum = CeilDiv(kvSeqlenOld, kvStackLen) + CeilDiv(kvNewSeqlen, kvStackLen);
         }
 
-        uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;
-        uint32_t kvNIdx = qNBlockIdx / qNBlockNumPerGroup;
-        uint32_t qNStartIdx = kvNIdx * groupSize + qNBlockIdxCurGroup * curQNBlockTile;
+        uint32_t kvNIdx;
+        uint32_t qNStartIdx;
+        uint32_t qNBlockSize;
+        if (fusedHeadTile != 0U) {
+            // Whole KV groups per task: the head slice may span several groups.
+            qNStartIdx = qNBlockIdx * curQNBlockTile;
+            kvNIdx = qNStartIdx / groupSize;
+            qNBlockSize = AscendC::Std::min(curQNBlockTile, qHeads - qNStartIdx);
+            if (groupSize != 1U && curQNBlockTile < groupSize) {
+                // In-group slice (GQA with an odd group size). Kept out of line so
+                // the MHA / whole-group path keeps the upstream instruction stream.
+                ResolveInGroupHeadSlice(qNBlockIdx, curQNBlockTile, groupSize, qNStartIdx, qNBlockSize, kvNIdx);
+            }
+        } else {
+            uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;
+            kvNIdx = qNBlockIdx / qNBlockNumPerGroup;
+            qNStartIdx = kvNIdx * groupSize + qNBlockIdxCurGroup * curQNBlockTile;
+            qNBlockSize = (qNBlockIdxCurGroup == (qNBlockNumPerGroup - 1U))
+                              ? (groupSize - qNBlockIdxCurGroup * curQNBlockTile)
+                              : curQNBlockTile;
+        }
         uint32_t lseTokenOffset = qSBlockIdx * curQSBlockTile;
 
         uint64_t gmOffsetQ = qBOffset + static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
@@ -738,10 +815,13 @@ class FAInferKernel {
 
         uint32_t qSBlockSize =
             (qSBlockIdx == (curQSBlockNum - 1U)) ? (qSeqlen - qSBlockIdx * curQSBlockTile) : curQSBlockTile;
-        uint32_t qNBlockSize = (qNBlockIdxCurGroup == (qNBlockNumPerGroup - 1U))
-                                   ? (groupSize - qNBlockIdxCurGroup * curQNBlockTile)
-                                   : curQNBlockTile;
         uint32_t rowNum = qSBlockSize * qNBlockSize;
+        // A fused task walks one KV group per segment; each segment is a plain
+        // "heads of one KV head" tile, laid out contiguously in the QK/PV workspace.
+        uint32_t segN = AscendC::Std::min(qNBlockSize, groupSize);
+        uint32_t segNum = CeilDiv(qNBlockSize, segN);
+        uint32_t segRows = qSBlockSize * segN;
+        uint32_t segL1Stride = RoundUp(segRows, FaiKenel::BLOCK_SIZE) * embedRound;
 
         uint32_t noSkipKvS = kvSeqlen;
         uint32_t kvSLoopNumTotal = 0;
@@ -881,8 +961,12 @@ class FAInferKernel {
         LayoutV layoutVTemp(stackSeqTile, strideV);
         if (!isEmptyTask) {
             blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
-            blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, static_cast<uint32_t>(qHeadStride),
-                                static_cast<uint32_t>(strideQ));
+            for (uint32_t seg = 0; seg < segNum; ++seg) {
+                LayoutQ layoutSegmentQ(segRows, embed);
+                blockMmadQK.loadQGM(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride], layoutSegmentQ,
+                                    segRows, segN, static_cast<uint32_t>(qHeadStride),
+                                    static_cast<uint32_t>(strideQ), seg * segL1Stride, seg == 0, seg + 1 == segNum);
+            }
         }
 #endif
 #ifdef __DAV_C220_VEC__
@@ -960,10 +1044,25 @@ class FAInferKernel {
                                 layOutS, actualBlockShapeQK, kvSIdxLocal, kvSLoopNumTotal, pagedBlockSize, strideK,
                                 doCopyback, gK[gmOffsetK], qkCacheOffset, gBlockTable,
                                 isAppendBlock ? pagedBlockSize : 0U, static_cast<uint32_t>(blockBOffset));
-                } else {
+                } else if (segNum == 1U) {
+                    // One head group per task: keep the upstream single-call
+                    // instruction stream (the segment loop costs ~20% here).
                     blockMmadQK(gQ[gmOffsetQ], gQKSrc[qkSrcOffset], gS[gmOffsetS], gBlockTable, layoutQTemp,
                                 layoutKTemp, layOutS, actualBlockShapeQK, kvSIdxLocal, kvSLoopNumTotal, pagedBlockSize,
                                 strideK, doCopyback, gK[gmOffsetK], qkCacheOffset);
+                } else {
+                    LayoutQ layoutSegmentQ(segRows, embed);
+                    LayoutS layoutSegmentS(segRows, desc.stackSeqTile, stackSeqTilePad);
+                    GemmCoord segmentShapeQK{segRows, desc.stackSeqTile, embed};
+                    for (uint32_t seg = 0; seg < segNum; ++seg) {
+                        uint64_t kHeadOffset = static_cast<uint64_t>(seg) * kvHeadStrideK;
+                        blockMmadQK(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride],
+                                    gQKSrc[qkSrcOffset + kHeadOffset],
+                                    gS[gmOffsetS + seg * segRows * stackSeqTilePad], gBlockTable, layoutSegmentQ,
+                                    layoutKTemp, layoutSegmentS, segmentShapeQK, kvSIdxLocal, kvSLoopNumTotal,
+                                    pagedBlockSize, strideK, doCopyback, gK[gmOffsetK + kHeadOffset], qkCacheOffset,
+                                    AscendC::GlobalTensor<int32_t>(), 0, 0, seg * segL1Stride);
+                    }
                 }
                 if (kvSIdx == kvEnd - 1) {
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
@@ -1046,11 +1145,30 @@ class FAInferKernel {
                                 pagedBlockSize, task.noSkipKvS, strideV, blockStackNum, softmaxReady, pvDesc.doCopyback,
                                 gV[task.gmOffsetV], pvDesc.pvCacheOffset, gBlockTable,
                                 pvDesc.isAppendBlock ? pagedBlockSize : 0U, static_cast<uint32_t>(task.blockBOffset));
-                } else {
+                } else if (task.qNBlockSize <= groupSize) {
+                    // One head group per task: single PV call, same stream as before.
                     blockMmadPV(gP[gmOffsetP], gPVSrc[gmOffsetVSrc], gOTmp[gmOffsetOTmp], gBlockTable, layoutPTemp,
                                 layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx, kvSLoopNumTotal,
                                 pagedBlockSize, task.noSkipKvS, strideV, blockStackNum, softmaxReady, pvDesc.doCopyback,
                                 gV[task.gmOffsetV], pvDesc.pvCacheOffset);
+                } else {
+                    // Fused task spanning several KV groups: one PV per group segment.
+                    uint32_t pvSegN = AscendC::Std::min(task.qNBlockSize, groupSize);
+                    uint32_t pvSegNum = CeilDiv(task.qNBlockSize, pvSegN);
+                    uint32_t pvSegRows = task.qSBlockSize * pvSegN;
+                    LayoutP layoutSegmentP(pvSegRows, pvDesc.stackSeqTile, stackSeqTilePad);
+                    LayoutOTmp layoutSegmentO(pvSegRows, embedV, embedRoundV);
+                    GemmCoord segmentShapePV{pvSegRows, embedV, pvDesc.stackSeqTile};
+                    for (uint32_t seg = 0; seg < pvSegNum; ++seg) {
+                        uint64_t vHeadOffset = static_cast<uint64_t>(seg) * kvHeadStrideV;
+                        blockMmadPV(gP[gmOffsetP + seg * pvSegRows * stackSeqTilePad],
+                                    gPVSrc[gmOffsetVSrc + vHeadOffset],
+                                    gOTmp[gmOffsetOTmp + seg * pvSegRows * embedRoundV], gBlockTable,
+                                    layoutSegmentP, layoutVTemp, layoutSegmentO, segmentShapePV, pvDesc.kvSIdx,
+                                    kvSLoopNumTotal, pagedBlockSize, task.noSkipKvS, strideV, blockStackNum,
+                                    softmaxReady, pvDesc.doCopyback, gV[task.gmOffsetV + vHeadOffset],
+                                    pvDesc.pvCacheOffset, AscendC::GlobalTensor<int32_t>(), 0, 0, seg == 0);
+                    }
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
@@ -1141,6 +1259,10 @@ class FAInferKernel {
     uint32_t embedRound;
     uint32_t embedRoundV;
     uint32_t groupSize;
+    // Grouped task geometry: a task may cover several KV groups (MHA tail packing
+    // or whole groups per task) and is then executed as per-group segments.
+    bool fusedTask = false;
+    uint32_t taskCoreNum = 0;
 
     Arch::Resource<ArchTag> resource;
     Arch::CrossCoreFlag qkReady{QK_READY_ID};

@@ -6,6 +6,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "fa_split.h"
+#include "fused_task.h"
 #include "tilingdata.h"
 #include <cstdint>
 #include <cstring>
@@ -82,6 +83,23 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
 
     const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
+    // Fixed layout (non-varlen): every batch shares one Q length, so the grouped
+    // task geometry is computed once here and published in the tiling for the
+    // AICore to read instead of recomputing it in every core.
+    const bool fusedTask = (metaArgs->pagedKV == 0u) && (metaArgs->kvNewSeqlen == 0u) && (metaArgs->isVarlen == 0u);
+    fa_fused::TaskShape fusedShape{};
+    if (fusedTask) {
+        fusedShape = fa_fused::MakeTaskShape(metaArgs->maxQSeqlen, metaArgs->numHeads, metaArgs->numHeadsK,
+                                             metaArgs->batch, metaArgs->blockDim, true);
+        tilingData->fusedNormQBlocks = fusedShape.normQBlocks;
+        tilingData->fusedNormHeadTile = fusedShape.normHeadTile;
+        tilingData->fusedNormHeadBlocks = fusedShape.normHeadBlocks;
+        tilingData->fusedNormTasks = fusedShape.normTasks;
+        tilingData->fusedTailRows = fusedShape.tailRows;
+        tilingData->fusedTailHeadTile = fusedShape.tailHeadTile;
+        tilingData->fusedTailHeadBlocks = fusedShape.tailHeadBlocks;
+        tilingData->fusedTotalTasks = fusedShape.totalTasks;
+    }
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     uint32_t maxQ = 0;
@@ -95,7 +113,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, Q_TILE_CEIL);
-        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const uint32_t curTaskNum = fusedTask ? fusedShape.totalTasks : (curQNBlockNum * curQSBlockNum);
+
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;
         }
