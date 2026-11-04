@@ -23,11 +23,20 @@ int main() {
     // Full two-vector capacity, odd GQA, group balancing, and tail dispatch.
     assert(fa_fused::HeadTile(64, 4, 8, 8) == 2);
     assert(fa_fused::HeadTile(32, 4, 8, 8) == 4);
-    assert(fa_fused::HeadTile(40, 3, 9, 9) == 1);
+    // In-group slicing: a tile below groupSize no longer has to divide it.
+    assert(fa_fused::HeadTile(40, 3, 9, 9) == 2);
+    assert(fa_fused::HeadTile(24, 5, 10, 10) == 4);
+    assert(fa_fused::HeadBlocks(2, 3, 9) == 6);
+    assert(fa_fused::HeadBlocks(4, 5, 10) == 4);
+    assert(fa_fused::HeadBlocks(6, 3, 18) == 3);
     assert(fa_fused::HeadTile(1, 1, 9, 9) == 5);
-    assert(fa_fused::MakeTaskShape(144, 16, 16, 32, 24, true).tailHeadTile == 2);
+    assert(fa_fused::MakeTaskShape(24, 10, 2, 512, 20, true).tailHeadBlocks == 4);
+    // gcd(T, coreNum) decides whether the MHA tail is worth splitting.
+    assert(fa_fused::MakeTaskShape(1, 16, 16, 512, 20, true).tailHeadTile == 8);
+    assert(fa_fused::MakeTaskShape(24, 16, 16, 512, 20, true).tailHeadTile == 4);
+    assert(fa_fused::MakeTaskShape(144, 16, 16, 32, 24, true).tailHeadTile == 8);
     assert(fa_fused::MakeTaskShape(272, 16, 16, 32, 24, true).tailHeadTile == 8);
-    for (unsigned sq : {0, 1, 3, 7, 15, 16, 17, 31, 32, 33, 40, 63, 64, 65,
+    for (unsigned sq : {0, 1, 3, 7, 15, 16, 17, 24, 31, 32, 33, 40, 63, 64, 65,
                        127, 128, 129, 144, 145, 255, 256, 272, 288, 320, 513}) {
         for (unsigned group : {1, 2, 3, 4, 5, 7, 8, 16}) {
             for (unsigned kv : {1, 2, 3, 9, 16}) {
@@ -42,11 +51,25 @@ int main() {
                             unsigned hb = tail ? t - s.normTasks : t % s.normHeadBlocks;
                             unsigned tile = tail ? s.tailHeadTile : s.normHeadTile;
                             unsigned rows = tail ? s.tailRows : fa_fused::Q_ROWS;
-                            unsigned h0 = hb * tile;
-                            assert(h0 < heads && rows > 0);
-                            unsigned hn = std::min(tile, heads - h0);
+                            unsigned h0, hn;
+                            if (tile >= group) {
+                                // Whole groups per task: the slice starts on a group boundary.
+                                h0 = hb * tile;
+                                hn = std::min(tile, heads - h0);
+                                assert(h0 % group == 0);
+                            } else {
+                                // In-group slice, numbered as kvIdx = hb / numSub,
+                                // subIdx = hb % numSub (matches the kernel decode).
+                                unsigned numSub = (group + tile - 1) / tile;
+                                unsigned kvIdx = hb / numSub;
+                                unsigned subIdx = hb % numSub;
+                                h0 = kvIdx * group + subIdx * tile;
+                                hn = std::min(tile, group - subIdx * tile);
+                            }
+                            assert(h0 < heads && rows > 0 && hn > 0);
                             unsigned segN = std::min(hn, group);
                             assert(hn % segN == 0);
+                            assert((h0 % group == 0) || (hn <= segN));
                             unsigned l1Rows = (hn / segN) * ((rows * segN + 15) / 16 * 16);
                             assert(l1Rows <= fa_fused::Q_ROWS);
                             unsigned subRows = hn == 1 ? (rows + 1) / 2 : ((hn + 1) / 2) * rows;
@@ -134,8 +157,8 @@ def test_fused_metadata_reduces_task_count(npu):
     (145, 577, 8, 2, 128),    # normal/tail tasks have different head counts
     (145, 0, 8, 2, 64),       # empty KV initializes each head at its actual LSE stride
     (161, 1, 8, 2, 256),      # invalid causal rows across a tail's vector row loops
-    (144, 577, 16, 16, 128),  # tail dispatch heuristic
-    (272, 257, 16, 16, 256),  # multiwave case keeps a larger fused tail
+    (144, 577, 16, 16, 128),  # tail tile whose split does not improve task rotation
+    (272, 257, 16, 16, 256),  # multiwave case keeps the capacity-derived tail tile
 ])
 def test_fused_fixed_forward(npu, dtype_name, causal, sq, sk, hq, hk, dim):
     torch = npu
