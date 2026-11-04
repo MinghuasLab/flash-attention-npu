@@ -18,8 +18,14 @@ namespace fa_fused {
 constexpr uint32_t Q_ROWS = 128;
 constexpr uint32_t SUB_CORE_ROWS = Q_ROWS / 2;
 
-FA_TASK_INLINE uint32_t Min(uint32_t a, uint32_t b) { return a < b ? a : b; }
-FA_TASK_INLINE uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+FA_TASK_INLINE uint32_t Min(uint32_t a, uint32_t b)
+{
+    return a < b ? a : b;
+}
+FA_TASK_INLINE uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1) / b;
+}
 
 // Task rotation with taskIdx += coreNum: one core revisits the same task class
 // every coreNum / gcd(T, coreNum) tasks, so the number of tasks per batch T
@@ -90,8 +96,8 @@ struct TaskShape {
     uint32_t totalTasks;
 };
 
-FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads,
-                                      uint32_t batch, uint32_t coreNum, bool fixedLayout)
+FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads, uint32_t batch,
+                                       uint32_t coreNum, bool fixedLayout)
 {
     TaskShape shape{};
     uint32_t groupSize = qHeads / kvHeads;
