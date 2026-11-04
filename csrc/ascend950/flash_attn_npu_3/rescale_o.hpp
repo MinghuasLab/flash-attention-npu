@@ -1088,6 +1088,13 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         }
+        // Q1 grouped rows are successive heads; copy one D slice in a batch.
+        if (qSBlockSize == 1U && colStride == embedV) {
+            AscendC::DataCopyPad(gO[rowStart * oHeadStride], output,
+                AscendC::DataCopyExtParams(rowCount, embedV * sizeof(ElementO), 0,
+                    (oHeadStride - embedV) * sizeof(ElementO), 0));
+            return;
+        }
         // scatter O rows to per-head GM addresses.
         uint32_t groupRow = rowStart;
         uint32_t ubRowOffset = 0U;
