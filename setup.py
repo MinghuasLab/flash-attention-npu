@@ -53,7 +53,7 @@ SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
 #          so a single wheel runs on both 910 and 950.
 #   "all"  build v2 + v3 + the v4 backends selected by FLASH_ATTN_BUILD_NPU.
 # FLASH_ATTN_BUILD_NPU selects which NPU hardware backends to build:
-#   "auto" detect the local device using torch_npu (default)
+#   "auto" detect the local device using torch_npu (default); build all backends if unavailable
 #   "910"  only Ascend 910B/C backends (flash_attn_npu.flash_attn_npu,
 #          flash_attn_npu_3.flash_attn_npu_3, flash_attn_npu_4.flash_attn_npu_4)
 #   "950"  only the Ascend 950 backends (flash_attn_npu_3_950,
@@ -79,10 +79,14 @@ def get_build_npu():
     try:
         device_name = torch_npu.npu.get_device_name()
     except Exception as error:
-        raise RuntimeError(
-            "Cannot detect the NPU for this build. Set FLASH_ATTN_BUILD_NPU "
-            "to 910, 950, or all when building without a visible device."
-        ) from error
+        print(
+            f"Warning: cannot detect the NPU for this build ({error}). "
+            "Falling back to all backends (equivalent to FLASH_ATTN_BUILD_NPU=all), "
+            "which builds both 910 and 950 backends. Set FLASH_ATTN_BUILD_NPU=910 "
+            "or 950 to build only the backend you need.",
+            file=sys.stderr,
+        )
+        return "all"
     if "Ascend950" in device_name:
         return "950"
     if "Ascend910" in device_name:
