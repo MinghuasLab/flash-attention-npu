@@ -663,7 +663,7 @@ def _summarize_mask_pair_vf(visibility0, visibility1, summary, has_second):
             maximum,
             tla.params.NormalStoreParams(store_dist=tla.params.StoreDist.DIST_FIRST_ELEMENT_B32),
         )
-    tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
+    tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.SCALAR_LOAD)
 
 
 @tla.jit
