@@ -37,11 +37,12 @@ struct FwdLaunchArgs {
     float softcap_value;
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
-    int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD head plane)
+    int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD S, dense BSND S)
     uint32_t quant_mode = 0;
     uint8_t* q_descale_device = nullptr;
     uint8_t* k_descale_device = nullptr;
     uint8_t* v_descale_device = nullptr;
+    FwdStorageParams storage;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

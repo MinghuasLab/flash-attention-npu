@@ -242,6 +242,8 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx();
         BlockMmadQK blockMmadQK(resource, qkL1TileHelper);
         BlockMmadPV blockMmadPV(resource, pvL1AddrStart_, pvL1TileHelper);
+        blockMmadQK.SetPageStride(params.storage.keyPageStride);
+        blockMmadPV.SetPageStride(params.storage.valuePageStride);
 #endif
 
 #ifdef __DAV_VEC__
@@ -300,6 +302,13 @@ class FAIKernel950 {
             strideV = 16;
         }
 
+        if constexpr (kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd) {
+            strideK = params.storage.keyTokenStride;
+            strideV = params.storage.valueTokenStride;
+            kvHeadStrideK = params.storage.keyHeadStride;
+            kvHeadStrideV = params.storage.valueHeadStride;
+        }
+
         uint32_t embedVRound = RoundUp(embedV_, 16);
         uint32_t groupSize = qHeads_ / kvHeads_;
         int64_t qBOffset = 0;
@@ -323,6 +332,9 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -347,9 +359,10 @@ class FAIKernel950 {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                // Batch strides are recomputed on every batch advance because the
-                // BSND forms depend on the physical (region) seqlen of the batch
-                // being left.  BNSD planes are maxSeqlen sized so they are constant.
+                // Batch strides are recomputed on every batch advance because packed
+                // TND regions have a per-batch physical seqlen. Dense BSND uses the
+                // allocated S (constant). BNSD planes are maxSeqlen sized so they
+                // are constant.
                 int64_t qBatchStride = 0;
                 if constexpr (qFormat == Format::BNSD) {
                     qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
@@ -387,6 +400,8 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                 // length is resolved in the cachedBatch gate below, not here. If this
@@ -431,7 +446,7 @@ class FAIKernel950 {
                 lseOffset = static_cast<uint64_t>(curBatch) * qHeads_ * lseHeadStride +
                             static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             } else if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
                 lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             }
@@ -968,7 +983,7 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated)
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1046,7 +1061,8 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1057,7 +1073,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                              int64_t kvSeqlenAllocated)
+                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1128,7 +1144,8 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }
