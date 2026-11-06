@@ -712,6 +712,13 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     """
 ```
 
+> The public v3 Python wrapper currently accepts only the four arguments above
+> and always returns the combined LSE. The lower-level `fwd_combine` also
+> supports `cu_seqlens`, `seqused`, and `return_lse`, but those arguments are not
+> currently forwarded by the public wrapper and should not be treated as a
+> stable public API. When supplied to the lower layer, `cu_seqlens` / `seqused`
+> are only validated and do not limit the rows that are processed.
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -869,6 +876,51 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
     """
 ```
 
+> The public v4 Python wrapper exposes all arguments above. `cu_seqlens` /
+> `seqused` are still only validated and do not currently limit the processed
+> rows; `return_lse=False` skips allocation and return of the LSE.
+
+#### flash_attn_combine runtime constraints
+
+In the current implementation, v3 combine behaves identically on Ascend 910 and
+Ascend 950, as does v4. The public interfaces also have these constraints:
+
+- `1 <= num_splits <= 256`; the last dimension of `out_partial` must be
+  contiguous.
+- `lse_partial` must be fp32, have one dimension fewer than `out_partial`, and
+  match every non-LSE dimension of `out_partial`.
+- Kernel tiles must fit within 150 KiB of UB. For a given `num_splits` and output
+  dtype, this couples `head_dim` to `num_splits`; exceeding the limit raises
+  `combine tile exceeds 150 KiB UB budget for head_dim=...`. Representative
+  limits are:
+
+  | num_splits | max head_dim for fp16 / bf16 output | max head_dim for fp32 output |
+  | ---------: | ----------------------------------: | ---------------------------: |
+  |          1 |                                 864 |                          792 |
+  |          8 |                                 864 |                          792 |
+  |         16 |                                 848 |                          784 |
+  |         32 |                                 848 |                          776 |
+  |         64 |                                 816 |                          752 |
+  |        128 |                                 768 |                          712 |
+  |        192 |                                 720 |                          672 |
+  |        256 |                                 672 |                          624 |
+
+  The exact check aligns the split count with
+  `ceil(num_splits / 8) * 8`:
+
+  ```text
+  per_row = ns_align * 16 + (16 + out_bytes + 4) * HEAD_DIM_ALIGN
+  ```
+
+  For fp32 output, `out_bytes=4` and `HEAD_DIM_ALIGN` rounds up to a multiple of
+  8; for fp16 / bf16 output, `out_bytes=2` and `HEAD_DIM_ALIGN` rounds up to a
+  multiple of 16. The kernel selects the first of 32, 24, 16, or 8 rows that
+  satisfies `tile_rows * per_row <= 150 * 1024`; it raises if even 8 rows exceed
+  the budget.
+- If any of `seqlen`, `num_heads`, or `head_dim` is zero, the interface performs
+  the preceding shape and argument validation, then returns a shape-correct
+  `out` tensor (and LSE when requested) without launching the combine kernel.
+
 ## Features
 
 #### flash_attn_with_kvcache
@@ -924,9 +976,13 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | FP16 / BF16 / FP32 output | ✅ | ✅ |
 | Batched (BSND) partials | ✅ | ✅ |
 | Variable-length (TND) partials | ✅ | ✅ |
-| cu_seqlens / seqused | - | ✅ accepted, currently ignored |
+| cu_seqlens / seqused | ⚠ lower layer validates; not exposed by Python API | ✅ accepted, currently ignored |
 | virtual_batch_idx | - | ✅ dense |
-| Combined LSE output | ✅ | ✅ (`return_lse`) |
+| Combined LSE output | ✅ (always returned) | ✅ (`return_lse`) |
+| `return_lse` switch | - | ✅ |
+
+⚠ means the lower-level `fwd_combine` implements the validation, but the current
+public v3 Python wrapper does not forward these arguments.
 
 
 ## License

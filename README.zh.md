@@ -697,6 +697,11 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     """
 ```
 
+> v3 的公开 Python 包装目前只接受上述 4 个参数，并且始终返回合并后的 LSE。
+> 底层 `fwd_combine` 还支持 `cu_seqlens`、`seqused` 和 `return_lse`，但这些
+> 参数当前未通过公开包装层透传，不应视为稳定的公开 API。底层收到的
+> `cu_seqlens` / `seqused` 也只做格式校验，不限制实际处理的行。
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -812,6 +817,46 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
     """
 ```
 
+> v4 的公开 Python 包装支持上述全部参数。`cu_seqlens` / `seqused` 仍只做格式
+> 校验，当前不限制实际处理的行；`return_lse=False` 时不会分配或返回 LSE。
+
+#### flash_attn_combine 通用运行时约束
+
+现有实现中，v3 的 combine 行为在 Ascend 910 和 Ascend 950 上一致，v4 的行为
+在这两种设备上也一致。公开接口还受以下约束：
+
+- `1 <= num_splits <= 256`；`out_partial` 的最后一维必须连续。
+- `lse_partial` 必须为 fp32，维度数比 `out_partial` 少 1，除 LSE 外各维必须与
+  `out_partial` 完全一致。
+- kernel 的 tile 必须适配 150 KiB UB。给定 `num_splits` 和输出 dtype 时，
+  `head_dim` 存在与 `num_splits` 耦合的上限，超出后报
+  `combine tile exceeds 150 KiB UB budget for head_dim=...`。代表性边界如下：
+
+  | num_splits | fp16 / bf16 输出时 head_dim 上限 | fp32 输出时 head_dim 上限 |
+  | ---------: | -------------------------------: | ------------------------: |
+  |          1 |                              864 |                       792 |
+  |          8 |                              864 |                       792 |
+  |         16 |                              848 |                       784 |
+  |         32 |                              848 |                       776 |
+  |         64 |                              816 |                       752 |
+  |        128 |                              768 |                       712 |
+  |        192 |                              720 |                       672 |
+  |        256 |                              672 |                       624 |
+
+  精确校验使用 `ceil(num_splits / 8) * 8` 计算 split 对齐宽度：
+
+  ```text
+  per_row = ns_align * 16 + (16 + out_bytes + 4) * HEAD_DIM_ALIGN
+  ```
+
+  其中 fp32 输出时 `out_bytes=4`、`HEAD_DIM_ALIGN` 按 8 对齐，fp16 / bf16
+  输出时 `out_bytes=2`、`HEAD_DIM_ALIGN` 按 16 对齐；从 32、24、16、8 行中
+  选择首个满足 `tile_rows * per_row <= 150 * 1024` 的 tile，最小 8 行仍超限时
+  报错。
+- 当 `seqlen`、`num_heads` 或 `head_dim` 任一为 0 时，接口在完成前面的形状和
+  参数校验后，直接返回形状正确的 `out`（请求 LSE 时还包括 LSE），不启动
+  combine kernel。
+
 ## 特性
 
 #### flash_attn_with_kvcache
@@ -871,9 +916,13 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | FP16 / BF16 / FP32 输出     | ✅ | ✅ |
 | 批量 (BSND) 分片            | ✅ | ✅ |
 | 变长 (TND) 分片             | ✅ | ✅ |
-| cu_seqlens / seqused        | -  | ✅ 接受但当前忽略 |
+| cu_seqlens / seqused        | ⚠ 底层可校验，Python API 未暴露 | ✅ 接受但当前忽略 |
 | virtual_batch_idx           | -  | ✅ dense |
-| 合并后的 LSE 输出           | ✅ | ✅ (`return_lse`) |
+| 合并后的 LSE 输出           | ✅（始终返回） | ✅ (`return_lse`) |
+| `return_lse` 开关           | -  | ✅ |
+
+⚠ 表示底层 `fwd_combine` 已实现相关校验，但 v3 当前公开 Python 包装未透传这些
+参数。
 
 ## 许可证
 
