@@ -20,10 +20,10 @@
 
 #include "mha_fwd_kvcache.cpp"
 
-// 9-parameter FAInfer: Q/KV/accumulator types, paged/FD, mask/layout, LSE mode, softcap.
-#define FWD_LAUNCH(DTYPE, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                        \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE,                               \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(        \
+// 8-parameter FAInfer: Q/KV/accumulator types, paged, mask/layout, LSE mode, softcap.
+#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE, Catlass::Epilogue::LseModeT::OUT_ONLY,      \
+                       SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tiling, kNewDevice, vNewDevice, sequsedQDevice, sequsedKVDevice,                 \
         kvSeqlenAllocated)
@@ -73,7 +73,6 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     const bool paged_KV = a.paged_KV;
     const bool is_causal = a.is_causal;
     const bool is_local = a.is_local;
-    const bool flashDecodeFlag = a.flashDecodeFlag;
     const bool has_softcap = a.has_softcap;
     uint8_t* qDevice = a.qDevice;
     uint8_t* kDevice = a.kDevice;
@@ -92,11 +91,8 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     uint8_t* sequsedKVDevice = a.sequsedKVDevice;
     const int64_t kvSeqlenAllocated = a.kv_seqlen_allocated;
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
-        FWD_BOOL_SWITCH(flashDecodeFlag, IsFlashDecode, {
-            FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
-                FWD_BOOL_SWITCH(has_softcap, HasSoftcap,
-                                { FWD_LAUNCH(DType, IsPaged, IsFlashDecode, MaskType, LAYOUT, HasSoftcap); });
-            });
+        FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
+            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });
         });
     });
 }

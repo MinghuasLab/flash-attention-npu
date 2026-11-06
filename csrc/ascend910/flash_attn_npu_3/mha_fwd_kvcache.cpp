@@ -1157,8 +1157,7 @@ class FAInferKernel {
 
 namespace SplitFuse {
 template <typename InputDtypeQ = half, typename InputDtypeKv = half, typename IntermCalcPrec = float,
-          bool PagedCacheFlag = false, bool FlashDecodeFlag = false,
-          FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
+          bool PagedCacheFlag = false, FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
           FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
           Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE, bool HAS_SOFTCAP = false>
 __global__ __aicore__ void
@@ -1219,11 +1218,20 @@ FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADD
 
     using SplitInfoType = splitNode[25];
     using CombineScale = Epilogue::Block::CombineScale<OType, LseType, SplitInfoType>;
-    using FAInferKernelType = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
-                                            PagedCacheFlag, FlashDecodeFlag, maskCategory, inLayout, CombineScale>;
-
     FAIKernelParams params{q,   k,         v,      mask, blockTables, actualQseqlen, actualKvseqlen, o,
                            lse, workspace, tiling, kNew, vNew,        seqUsedQ,      seqUsedKv,      kvSeqlenAllocated};
+    // Select the specialization from device metadata.
+    if constexpr (PagedCacheFlag) {
+        if (reinterpret_cast<__gm__ FAInferTilingData*>(tiling.tilingDataAddr)->flashDecodeFlag != 0U) {
+            using FAInferKernelType = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
+                                                    PagedCacheFlag, true, maskCategory, inLayout, CombineScale>;
+            FAInferKernelType flashAttnInfer;
+            flashAttnInfer(params);
+            return;
+        }
+    }
+    using FAInferKernelType = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
+                                            PagedCacheFlag, false, maskCategory, inLayout, CombineScale>;
     FAInferKernelType flashAttnInfer;
     flashAttnInfer(params);
 }
