@@ -13,21 +13,46 @@ def test_fused_task_geometry(tmp_path):
         pytest.skip("a C++ compiler is required for the shared scheduler test")
     root = Path(__file__).resolve().parents[1]
     source = tmp_path / "geometry.cpp"
-    source.write_text(r'''
+    source.write_text(r"""
 #include "fused_task.h"
 #include <algorithm>
 #include <cassert>
 #include <vector>
 
 int main() {
+    // Unfused capacity (kernel_common.hpp::GetQNBlockTile), kept here to prove that
+    // fusing never shrinks the QN slice a task may cover.
+    auto legacyTile = [](unsigned rows, unsigned group) {
+        unsigned t = (rows != 0) ? (fa_fused::Q_ROWS / rows) / 2 * 2 : fa_fused::Q_ROWS;
+        t = t < group ? t : group;
+        return t < 1u ? 1u : t;
+    };
+    // GQA (segments pack groupSize heads) must not be charged 16-row padding per head:
+    // group 16 x 3 rows is 48 L1 rows, so a whole group fits in 128. Decode stops at
+    // ONE group: fusing further groups saves no KV traffic (qHeads/groupSize scans
+    // per batch either way) and only adds wave-quantisation loss.
+    assert(fa_fused::HeadTile(3, 16, 16, 64) >= legacyTile(3, 16));
+    assert(fa_fused::HeadTile(3, 16, 16, 64) == 16);
+    assert(fa_fused::HeadTile(3, 16, 64, 64) == 16);
+    assert(fa_fused::HeadTile(3, 8, 32, 32) == 8);
+    assert(fa_fused::HeadTile(3, 8, 8, 32) == 8);
     // Full two-vector capacity, odd GQA, group balancing, and tail dispatch.
     assert(fa_fused::HeadTile(64, 4, 8, 8) == 2);
     assert(fa_fused::HeadTile(32, 4, 8, 8) == 4);
-    assert(fa_fused::HeadTile(40, 3, 9, 9) == 1);
+    // In-group slicing: a tile below groupSize no longer has to divide it.
+    assert(fa_fused::HeadTile(40, 3, 9, 9) == 2);
+    assert(fa_fused::HeadTile(24, 5, 10, 10) == 4);
+    assert(fa_fused::HeadBlocks(2, 3, 9) == 6);
+    assert(fa_fused::HeadBlocks(4, 5, 10) == 4);
+    assert(fa_fused::HeadBlocks(6, 3, 18) == 3);
     assert(fa_fused::HeadTile(1, 1, 9, 9) == 5);
-    assert(fa_fused::MakeTaskShape(144, 16, 16, 32, 24, true).tailHeadTile == 2);
+    assert(fa_fused::MakeTaskShape(24, 10, 2, 512, 20, true).tailHeadBlocks == 4);
+    // gcd(T, coreNum) decides whether the MHA tail is worth splitting.
+    assert(fa_fused::MakeTaskShape(1, 16, 16, 512, 20, true).tailHeadTile == 8);
+    assert(fa_fused::MakeTaskShape(24, 16, 16, 512, 20, true).tailHeadTile == 4);
+    assert(fa_fused::MakeTaskShape(144, 16, 16, 32, 24, true).tailHeadTile == 8);
     assert(fa_fused::MakeTaskShape(272, 16, 16, 32, 24, true).tailHeadTile == 8);
-    for (unsigned sq : {0, 1, 3, 7, 15, 16, 17, 31, 32, 33, 40, 63, 64, 65,
+    for (unsigned sq : {0, 1, 3, 7, 15, 16, 17, 24, 31, 32, 33, 40, 63, 64, 65,
                        127, 128, 129, 144, 145, 255, 256, 272, 288, 320, 513}) {
         for (unsigned group : {1, 2, 3, 4, 5, 7, 8, 16}) {
             for (unsigned kv : {1, 2, 3, 9, 16}) {
@@ -42,11 +67,28 @@ int main() {
                             unsigned hb = tail ? t - s.normTasks : t % s.normHeadBlocks;
                             unsigned tile = tail ? s.tailHeadTile : s.normHeadTile;
                             unsigned rows = tail ? s.tailRows : fa_fused::Q_ROWS;
-                            unsigned h0 = hb * tile;
-                            assert(h0 < heads && rows > 0);
-                            unsigned hn = std::min(tile, heads - h0);
+                            // Criterion 1: fusion may never reduce the QN slice below the
+                            // unfused GetQNBlockTile (nor below a whole head).
+                            assert(tile >= std::min(legacyTile(rows, group), heads));
+                            unsigned h0, hn;
+                            if (tile >= group) {
+                                // Whole groups per task: the slice starts on a group boundary.
+                                h0 = hb * tile;
+                                hn = std::min(tile, heads - h0);
+                                assert(h0 % group == 0);
+                            } else {
+                                // In-group slice, numbered as kvIdx = hb / numSub,
+                                // subIdx = hb % numSub (matches the kernel decode).
+                                unsigned numSub = (group + tile - 1) / tile;
+                                unsigned kvIdx = hb / numSub;
+                                unsigned subIdx = hb % numSub;
+                                h0 = kvIdx * group + subIdx * tile;
+                                hn = std::min(tile, group - subIdx * tile);
+                            }
+                            assert(h0 < heads && rows > 0 && hn > 0);
                             unsigned segN = std::min(hn, group);
                             assert(hn % segN == 0);
+                            assert((h0 % group == 0) || (hn <= segN));
                             unsigned l1Rows = (hn / segN) * ((rows * segN + 15) / 16 * 16);
                             assert(l1Rows <= fa_fused::Q_ROWS);
                             unsigned subRows = hn == 1 ? (rows + 1) / 2 : ((hn + 1) / 2) * rows;
@@ -67,10 +109,21 @@ int main() {
         }
     }
 }
-''')
+""")
     executable = tmp_path / "geometry"
-    subprocess.run([compiler, "-O2", "-std=c++17", "-I",
-                    str(root / "csrc/ascend910/flash_attn_npu"), str(source), "-o", str(executable)], check=True)
+    subprocess.run(
+        [
+            compiler,
+            "-O2",
+            "-std=c++17",
+            "-I",
+            str(root / "csrc/ascend910/flash_attn_npu"),
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
     subprocess.run([str(executable)], check=True)
 
 
@@ -92,7 +145,10 @@ def _reference(torch, q, k, v, causal):
     v = v.float().repeat_interleave(group, dim=-2).transpose(-3, -2)
     scores = (q @ k.transpose(-2, -1)) * q.shape[-1] ** -0.5
     if causal:
-        keep = torch.arange(k.shape[-2])[None, :] <= torch.arange(q.shape[-2])[:, None] + k.shape[-2] - q.shape[-2]
+        keep = (
+            torch.arange(k.shape[-2])[None, :]
+            <= torch.arange(q.shape[-2])[:, None] + k.shape[-2] - q.shape[-2]
+        )
         scores.masked_fill_(~keep, float("-inf"))
     out = (scores.softmax(-1).nan_to_num() @ v).transpose(-3, -2)
     lse = torch.logsumexp(scores, -1)
@@ -116,35 +172,41 @@ def test_fused_metadata_reduces_task_count(npu):
     metadata = get_scheduler_metadata(batch, 5, 577, 18, 6, 128, lengths, qkv_dtype=torch.float16)
     tiling = _tiling_from_metadata(metadata)
     assert tiling.fusedTask == 1
-    assert tiling.firstBatchTaskNum == 3  # Two KV groups per task; formerly six tasks.
-    assert tiling.totalTaskNum == batch * 3
-    paged = get_scheduler_metadata(batch, 5, 577, 18, 6, 128, lengths,
-                                  qkv_dtype=torch.float16, page_size=128)
+    assert tiling.firstBatchTaskNum == 6  # One KV group per task; q=5 packs 6 groups per batch.
+    assert tiling.totalTaskNum == batch * 6
+    paged = get_scheduler_metadata(
+        batch, 5, 577, 18, 6, 128, lengths, qkv_dtype=torch.float16, page_size=128
+    )
     assert _tiling_from_metadata(paged).fusedTask == 0
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("sq,sk,hq,hk,dim", [
-    (3, 577, 9, 9, 64),       # MHA across groups, odd final head, multiple KV stacks
-    (5, 577, 18, 6, 128),     # GQA, 15-row segments with separate padded L1 slices
-    (7, 257, 27, 9, 80),      # odd group count and a non-128 head dimension
-    (17, 257, 9, 3, 64),      # odd head split between vectors
-    (64, 257, 8, 2, 64),      # use both vectors' full state capacity
-    (145, 577, 8, 2, 128),    # normal/tail tasks have different head counts
-    (145, 0, 8, 2, 64),       # empty KV initializes each head at its actual LSE stride
-    (161, 1, 8, 2, 256),      # invalid causal rows across a tail's vector row loops
-    (144, 577, 16, 16, 128),  # tail dispatch heuristic
-    (272, 257, 16, 16, 256),  # multiwave case keeps a larger fused tail
-])
+@pytest.mark.parametrize(
+    "sq,sk,hq,hk,dim",
+    [
+        (3, 577, 9, 9, 64),  # MHA across groups, odd final head, multiple KV stacks
+        (5, 577, 18, 6, 128),  # GQA, 15-row segments with separate padded L1 slices
+        (7, 257, 27, 9, 80),  # odd group count and a non-128 head dimension
+        (17, 257, 9, 3, 64),  # odd head split between vectors
+        (64, 257, 8, 2, 64),  # use both vectors' full state capacity
+        (145, 577, 8, 2, 128),  # normal/tail tasks have different head counts
+        (145, 0, 8, 2, 64),  # empty KV initializes each head at its actual LSE stride
+        (161, 1, 8, 2, 256),  # invalid causal rows across a tail's vector row loops
+        (144, 577, 16, 16, 128),  # tail tile whose split does not improve task rotation
+        (272, 257, 16, 16, 256),  # multiwave case keeps the capacity-derived tail tile
+    ],
+)
 def test_fused_fixed_forward(npu, dtype_name, causal, sq, sk, hq, hk, dim):
     torch = npu
     from flash_attn_npu import flash_attn_func
 
     dtype = getattr(torch, dtype_name)
     generator = torch.Generator().manual_seed(4951)
-    cpu = [torch.randn(32, s, h, dim, generator=generator).to(dtype)
-           for s, h in ((sq, hq), (sk, hk), (sk, hk))]
+    cpu = [
+        torch.randn(32, s, h, dim, generator=generator).to(dtype)
+        for s, h in ((sq, hq), (sk, hk), (sk, hk))
+    ]
     out, lse, _ = flash_attn_func(*(x.npu() for x in cpu), causal=causal, return_attn_probs=True)
     _check(torch, out, lse, _reference(torch, *cpu, causal), dtype)
 
@@ -158,15 +220,19 @@ def test_fused_bnsd_and_host_metadata(npu, dtype_name, causal):
 
     dtype = getattr(torch, dtype_name)
     generator = torch.Generator().manual_seed(1881)
-    cpu = [torch.randn(32, s, h, 128, generator=generator).to(dtype)
-           for s, h in ((145, 18), (257, 6), (257, 6))]
+    cpu = [
+        torch.randn(32, s, h, 128, generator=generator).to(dtype)
+        for s, h in ((145, 18), (257, 6), (257, 6))
+    ]
     physical = [x.transpose(1, 2).contiguous().npu() for x in cpu]
     # The public API detects BNSD storage from BSND-shaped transpose views.
-    out, lse, _ = flash_attn_func(*(x.transpose(1, 2) for x in physical), causal=causal, return_attn_probs=True)
+    out, lse, _ = flash_attn_func(
+        *(x.transpose(1, 2) for x in physical), causal=causal, return_attn_probs=True
+    )
     expected = _reference(torch, *cpu, causal)
     _check(torch, out, lse, expected, dtype)
     # Omit scheduler_metadata to exercise the Host tiler instead of AICPU.
-    host = _flash_attn_forward(*physical, 0.0, 128 ** -0.5, causal, -1, -1, 0.0, None, False, None, 2)
+    host = _flash_attn_forward(*physical, 0.0, 128**-0.5, causal, -1, -1, 0.0, None, False, None, 2)
     _check(torch, host[0], host[1], expected, dtype)
 
 
@@ -180,16 +246,27 @@ def test_fused_varlen_empty_and_changing_tiles(npu, dtype_name, causal):
     qlens = [0, 1, 3, 17, 64, 128, 145, 272] * 4
     klens = [33, 577, 0, 257, 129, 128, 513, 577] * 4
     generator = torch.Generator().manual_seed(967)
-    cpu = [torch.randn(total, heads, 80, generator=generator).to(dtype)
-           for total, heads in ((sum(qlens), 18), (sum(klens), 6), (sum(klens), 6))]
+    cpu = [
+        torch.randn(total, heads, 80, generator=generator).to(dtype)
+        for total, heads in ((sum(qlens), 18), (sum(klens), 6), (sum(klens), 6))
+    ]
     cuq = torch.tensor([0, *torch.tensor(qlens).cumsum(0).tolist()], dtype=torch.int32).npu()
     cuk = torch.tensor([0, *torch.tensor(klens).cumsum(0).tolist()], dtype=torch.int32).npu()
-    out, lse, _ = flash_attn_varlen_func(*(x.npu() for x in cpu), cuq, cuk, max(qlens), max(klens),
-                                        causal=causal, return_attn_probs=True)
+    out, lse, _ = flash_attn_varlen_func(
+        *(x.npu() for x in cpu),
+        cuq,
+        cuk,
+        max(qlens),
+        max(klens),
+        causal=causal,
+        return_attn_probs=True,
+    )
     qi = ki = 0
     outputs, lses = [], []
     for nq, nk in zip(qlens, klens):
-        expected = _reference(torch, cpu[0][qi:qi+nq], cpu[1][ki:ki+nk], cpu[2][ki:ki+nk], causal)
+        expected = _reference(
+            torch, cpu[0][qi : qi + nq], cpu[1][ki : ki + nk], cpu[2][ki : ki + nk], causal
+        )
         outputs.append(expected[0])
         lses.append(expected[1])
         qi += nq

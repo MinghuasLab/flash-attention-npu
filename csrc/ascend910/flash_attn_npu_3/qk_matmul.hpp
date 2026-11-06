@@ -114,24 +114,34 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
     // qHeadStride elements apart, adjacent tokens qTokenStride apart. BSND/TND:
     // (embed, qHeads*embed); BNSD: (maxQSeqlen*embed, embed). qHeadStride is the
     // Nd2Nz source row pitch (the ND-matrix rows are Q heads).
+    // A fused task may pack more heads than one group holds, so its Q block is
+    // staged into L1 as several segments (qL1Offset apart). firstSegment owns
+    // the MTE1->MTE2 handshake that frees the previous task's Q slot; only the
+    // last segment signals MTE2->MTE1 for the QK loop.
     __aicore__ inline void loadQGM(AscendC::GlobalTensor<ElementA> gA, LayoutA layoutA, uint32_t rowNum,
-                                   uint32_t& singleGroupHeads, uint32_t qHeadStride, uint32_t qTokenStride)
+                                   uint32_t& singleGroupHeads, uint32_t qHeadStride, uint32_t qTokenStride,
+                                   uint32_t qL1Offset = 0, bool firstSegment = true, bool lastSegment = true)
     {
         uint32_t embed = layoutA.shape(1);
         uint32_t rowNumRound = RoundUp(rowNum, L1AAlignHelper::M_ALIGNED);
         uint32_t tokenNumPerGroup = rowNum / singleGroupHeads;
         LayoutA layoutSingleANd(singleGroupHeads, embed, qHeadStride);
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+        if (firstSegment) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+        }
+        auto l1Q = l1ATensor[qL1Offset];
         if (singleGroupHeads == 1U) {
             LayoutA denseSrc(rowNum, embed, qTokenStride);
-            copyGmToL1A(l1ATensor, gA, layoutAInL1, denseSrc);
+            copyGmToL1A(l1Q, gA, layoutAInL1, denseSrc);
         } else {
-            copyGmToL1A(l1ATensor, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, qTokenStride, tokenNumPerGroup,
+            copyGmToL1A(l1Q, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, qTokenStride, tokenNumPerGroup,
                         BLOCK_SIZE, rowNumRound);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
+        if (lastSegment) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
+        }
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -175,8 +185,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                        uint32_t startOffset, uint32_t strideKV, uint32_t blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                  static_cast<uint64_t>(startOffset) * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride + static_cast<uint64_t>(startOffset) * strideKV;
     }
 
     __aicore__ inline void resetBlockStart(uint32_t kvStart, uint32_t pagedBlockSize)
@@ -202,7 +211,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
                                       uint64_t cacheRowBase = 0,
                                       AscendC::GlobalTensor<int32_t> gCacheTable = AscendC::GlobalTensor<int32_t>(),
-                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0)
+                                      uint32_t cachePageSize = 0, uint32_t cacheTableBase = 0, uint32_t qL1Offset = 0)
     {
         (void)doCopyback;
         (void)gBCache;
@@ -222,7 +231,8 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         uint32_t embed = actualOriShape[COORD_DIM2];
         if (embed > EMBED_SPLIT_SIZE * 2U) {
             headDimSplitQK(gA, gB, gC, gBlockTable, layoutA, layoutB, layoutC, actualOriShape, nIdx, nLoop, blockSize,
-                           strideKV, doCopyback, gBCache, cacheRowBase, gCacheTable, cachePageSize, cacheTableBase);
+                           strideKV, doCopyback, gBCache, cacheRowBase, gCacheTable, cachePageSize, cacheTableBase,
+                           qL1Offset);
             return;
         }
 
@@ -314,7 +324,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
                     LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0Actual, kL0Actual);
                     MatrixCoord l1ATileCoord{mL0Idx * L0TileShape::M, kL0Idx * L0TileShape::K};
-                    auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ATileCoord)];
+                    auto l1ATile = l1ATensor[qL1Offset + layoutAInL1.GetOffset(l1ATileCoord)];
 
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     copyL1ToL0A(l0ATensor[l0ABPingPongFlag], l1ATile, layoutAInL0, layoutAInL1);
@@ -397,7 +407,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                    LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape, uint32_t nIdx, uint32_t nLoop,
                    uint32_t blockSize, uint32_t strideKV, bool doCopyback, AscendC::GlobalTensor<ElementB> gBCache,
                    uint64_t cacheRowBase, AscendC::GlobalTensor<int32_t> gCacheTable, uint32_t cachePageSize,
-                   uint32_t cacheTableBase)
+                   uint32_t cacheTableBase, uint32_t qL1Offset = 0)
     {
         (void)nLoop;
 
@@ -455,7 +465,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
                         LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0Actual, kL0Actual);
                         MatrixCoord l1ATileCoord{mL0Idx * L0TileShape::M, kGlobalOffset};
-                        auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ATileCoord)];
+                        auto l1ATile = l1ATensor[qL1Offset + layoutAInL1.GetOffset(l1ATileCoord)];
                         // [l0pp experiment] one L0A/L0B slot per L0 step.
                         l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
                         pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
@@ -532,7 +542,7 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             AscendC::DataCopyParams ndStoreParams(segLen, kActual / BLOCK_SIZE, 0,
                                                   strideKV / BLOCK_SIZE - kActual / BLOCK_SIZE);
             AscendC::DataCopy(appendGBCache[static_cast<uint64_t>(pageId) * pageStride +
-                                                   static_cast<uint64_t>(pageOff) * strideKV + cacheColumnOffset],
+                                            static_cast<uint64_t>(pageOff) * strideKV + cacheColumnOffset],
                               ndCopyTensor[segSrc * kActual], ndStoreParams);
             segRow += segLen;
             segSrc += segLen;

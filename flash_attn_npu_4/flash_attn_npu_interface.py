@@ -731,12 +731,11 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors=None,
         block_sparse_tensors_bwd=None,
         return_lse=False,
+        disable_scheduler_metadata=True,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
 
-        # Compute scheduler metadata on the AICPU (no D2H/H2D sync), matching
-        # the v3 dense path. cache_seqlens holds the per-batch KV lengths.
         batch_size, seqlen_q, num_heads, head_size = q.shape
         seqlen_k = k.shape[1]
         num_heads_k = k.shape[2]
@@ -745,21 +744,26 @@ class FlashAttnFunc(torch.autograd.Function):
         # sizes above come from the pre-detection shapes; BNSD only re-views the
         # same storage.
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
-        seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
-        scheduler_metadata = get_scheduler_metadata(
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            nheads=num_heads,
-            nheads_kv=num_heads_k,
-            headdim=head_size,
-            num_splits=num_splits,
-            headdim_v=head_size_v,
-            pack_gqa=pack_gqa,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            seqused_k=seqused_k,
-        )
+        scheduler_metadata = None
+        if not disable_scheduler_metadata:
+            # Opt-in AICPU scheduler metadata (no D2H/H2D sync). Off by default,
+            # matching v2/v3: it costs a ComputeFAMetadataV4 + WriteFARuntime
+            # AICPU round trip on every call.
+            seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
+            scheduler_metadata = get_scheduler_metadata(
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                nheads=num_heads,
+                nheads_kv=num_heads_k,
+                headdim=head_size,
+                num_splits=num_splits,
+                headdim_v=head_size_v,
+                pack_gqa=pack_gqa,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                seqused_k=seqused_k,
+            )
 
         out, softmax_lse = _flash_attn_forward(
             q,
@@ -880,6 +884,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # block_sparse_tensors
             None,  # block_sparse_tensors_bwd
             None,  # return_lse
+            None,  # disable_scheduler_metadata
         )
 
 
@@ -917,7 +922,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         seqlen_k_per_split=None,
-        disable_scheduler_metadata=False,
+        disable_scheduler_metadata=True,
     ):
         if cu_seqlens_q is not None:
             _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
@@ -1145,6 +1150,7 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse=False,
+    disable_scheduler_metadata: bool = True,
 ):
     """Forward pass of FlashAttention for dense (batch-major) inputs.
 
@@ -1154,8 +1160,10 @@ def flash_attn_func(
     heads 0, 1, 2 of Q attend to head 0 of K, V, and heads 3, 4, 5 of Q attend to
     head 1 of K, V.
 
-    The scheduler metadata (tiling + attention mask) is computed on the AICPU so
-    no device->host->device sync breaks the training pipeline.
+    Scheduler metadata (tiling + attention mask) is off by default, matching v2/v3:
+    the fallback path computes the tiling on the host. Pass
+    ``disable_scheduler_metadata=False`` to opt into the AICPU precomputed
+    metadata.
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
@@ -1218,6 +1226,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        disable_scheduler_metadata,
     )
 
 
@@ -1252,7 +1261,7 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata=None,
     seqlen_k_per_split: Optional[int] = None,
-    disable_scheduler_metadata: bool = False,
+    disable_scheduler_metadata: bool = True,
 ):
     """
     FlashAttention for variable-length sequences with optional paged KV cache.

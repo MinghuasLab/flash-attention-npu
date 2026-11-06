@@ -755,7 +755,7 @@ def test_flash_attn_func_metadata_bsnd(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == 0  # default is metadata-free, same as v2/v3
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -827,7 +827,33 @@ def test_flash_attn_varlen_func_metadata_tnd(
         window_size=WINDOW_SIZE,
         num_splits=1,
     )
+    assert len(metadata_spy) == 0  # default is metadata-free, same as v2/v3
+
+    # The AICPU metadata path stays reachable, it just has to be opted in.
+    output_meta = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=kv_seqlen,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=WINDOW_SIZE,
+        num_splits=1,
+        disable_scheduler_metadata=False,
+    )
     assert len(metadata_spy) == 1
+    # Unused Q/KV tails are undefined in both paths; compare only used prefixes.
+    for batch_idx in range(batch_size):
+        q_start = q_offsets[batch_idx]
+        used_q = used_q_lengths[batch_idx]
+        torch.testing.assert_close(
+            output_meta[q_start : q_start + used_q], output_npu[q_start : q_start + used_q]
+        )
 
     if add_unused_qkv:
         output_eager = flash_attn_varlen_func(
@@ -1152,7 +1178,7 @@ def test_flash_attn_func_metadata_swa(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == 0  # default is metadata-free, same as v2/v3
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1212,7 +1238,7 @@ def test_flash_attn_func_metadata_softcap_scale(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == 0  # default is metadata-free, same as v2/v3
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1274,7 +1300,7 @@ def test_flash_attn_varlen_func_metadata_swa(
         window_size=window_size,
         num_splits=1,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == 0  # default is metadata-free, same as v2/v3
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
