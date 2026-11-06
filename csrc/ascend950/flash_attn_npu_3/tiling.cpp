@@ -19,6 +19,8 @@
 #include <stdexcept>
 #include <vector>
 #include "tilingdata.h"
+#include "fwd_resource_plan.h"
+#include "fwd_tiling_policy.h"
 
 namespace optiling {
 const uint32_t SIZE_OF_16BIT = 2;
@@ -120,6 +122,7 @@ class FAInferTiling {
   private:
     FAInferContext faInfo_;
     uint32_t blockNum_;
+    uint32_t qBaseTile_ = Q_TILE_CEIL;
 };
 
 FAInferTiling::FAInferTiling(const FAInferContext& faInfo) : faInfo_(faInfo) {}
@@ -128,7 +131,7 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
     uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-    if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
+    if (GetQSBlockTile(faInfo_.maxKvSeqlen) < Q_TILE_CEIL && qSeqlen != 0) {
         constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
         uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
         qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
@@ -143,8 +146,7 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 
 uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t qSBlockTile = faInfo_.embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
-    return qSBlockTile;
+    return qBaseTile_;
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
 {
@@ -606,6 +608,21 @@ BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)
 
 void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
 {
+    uint64_t fullQ128Tasks = 0;
+    for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
+        const uint32_t qLen = faInfo_.qSeqlenList == nullptr ? faInfo_.maxQSeqlen :
+            (faInfo_.layout == FwdLayout::TND ? faInfo_.qSeqlenList[b + 1] - faInfo_.qSeqlenList[b]
+                                             : faInfo_.qSeqlenList[b]);
+        const uint32_t kvLen = faInfo_.kvSeqlenList == nullptr ? faInfo_.maxKvSeqlen :
+            (faInfo_.layout == FwdLayout::TND && !faInfo_.pagedCacheFlag
+                 ? faInfo_.kvSeqlenList[b + 1] - faInfo_.kvSeqlenList[b] : faInfo_.kvSeqlenList[b]);
+        const uint32_t activeQ = fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK,
+                                                           faInfo_.windowSizeRight);
+        fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
+    }
+    qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV,
+        faInfo_.maxQSeqlen, fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
+        faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
     FillBasicTilingData(tilingdata);
     if (!faInfo_.isTilingSink) {
         FillSplitCoreTilingData(tilingdata);

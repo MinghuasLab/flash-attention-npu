@@ -22,6 +22,7 @@
 
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
+#include "fwd_resource.hpp"
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP
 #include "catlass/epilogue/block/block_epilogue.hpp"
@@ -74,6 +75,7 @@ class FAIKernel950 {
     using LayoutOTmp = layout::RowMajor;
     using LayoutMask = layout::RowMajor;
 
+    uint32_t otmpStages_ = 2U;
     bool hasSeqUsedQ = false;
     bool hasSeqUsedKv = false;
 
@@ -196,32 +198,15 @@ class FAIKernel950 {
             l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementP>(
                 pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * sizeof(ElementP) * i);
         }
-        uint32_t rowNumPerSubCore = EpilogueOnlineSoftmax::SM_ROW_MAX_ELEM_NUM;
-        uint32_t colNumPerSubCore = EpilogueOnlineSoftmax::SM_COL_MAX_ELEM_NUM;
-        uint32_t rescaleCol = EpilogueRescaleO::RESCALE_COL_MAX_ELEM_NUM;
-
-        uint32_t ubSRoundTile = 0;
-        if constexpr (std::is_same_v<ElementS, half>) {
-            for (uint32_t i = 0; i < UB_S_OTMP_BUF_STAGES; i++) {
-                ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(rowNumPerSubCore * colNumPerSubCore *
-                                                                                 sizeof(ElementS) * i);
-                ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
-                    rowNumPerSubCore * colNumPerSubCore * sizeof(ElementS) * UB_S_OTMP_BUF_STAGES +
-                    rowNumPerSubCore * colNumPerSubCore * sizeof(ElementP) * UB_S_OTMP_BUF_STAGES +
-                    rowNumPerSubCore * rescaleCol * sizeof(ElementOTmp) * i);
-            }
-            ubSRoundTile = 16;
-        } else {
-            for (uint32_t i = 0; i < UB_S_OTMP_BUF_STAGES; i++) {
-                ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(32768 * i);
-            }
-
-            for (uint32_t i = 0; i < UB_S_BUF_STAGES; i++) {
-                ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
-                    4 * 32768 + rowNumPerSubCore * rescaleCol * sizeof(ElementOTmp) * i);
-            }
-            ubSRoundTile = 128;
+        const auto ubPlan = fa950_plan::KernelUbPlan(embedV_, qBaseTile_);
+        otmpStages_ = ubPlan.otmpStages;
+        for (uint32_t i = 0; i < UB_S_BUF_STAGES; ++i) {
+            ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(ubPlan.s + ubPlan.sBytes * i);
         }
+        for (uint32_t i = 0; i < otmpStages_; ++i) {
+            ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ubPlan.lo + ubPlan.loBytes * i);
+        }
+        const uint32_t ubSRoundTile = 128;
 
         Gemm::Block::BlockMmadQKTileHelper qkL1TileHelper(qkL1TileM_, qkL1TileN_, qkL1TileKLeft_, qkL1TileKRight_,
                                                           qL1BufNum_, kL1BufNum_);
@@ -248,8 +233,8 @@ class FAIKernel950 {
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, softcapValue_);
-        EpilogueRescaleO epilogueRescaleO(resource);
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_);
+        EpilogueRescaleO epilogueRescaleO(resource, ubPlan);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
 
@@ -406,7 +391,7 @@ class FAIKernel950 {
                 // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                 // length is resolved in the cachedBatch gate below, not here. If this
                 // function ever becomes kv dependent move the kv resolution back.
-                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
+                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
                 uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
                 curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
@@ -420,7 +405,7 @@ class FAIKernel950 {
             uint32_t kvHeadIdx;
             uint32_t qNStartIdx;
             uint32_t qNBlockSize;
-            uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
+            uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
             uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
             uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
             qSTileIdx = taskIdxCurBatch / qNTaskNum;
@@ -726,7 +711,7 @@ class FAIKernel950 {
                         kvSTileSizeAct = kvBaseTile_;
                     }
                     GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
-                    uint32_t ubOTmpBufId = pipelineTileSeqNow % UB_S_OTMP_BUF_STAGES;
+                    uint32_t ubOTmpBufId = pipelineTileSeqNow % otmpStages_;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
@@ -852,7 +837,9 @@ class FAIKernel950 {
         }
         if constexpr (PV_RE_MODE == 4U) {
             AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(5);
-            AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(6);
+            if (otmpStages_ == 2U) {
+                AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(6);
+            }
         }
 #endif
     }
@@ -884,8 +871,10 @@ class FAIKernel950 {
         if constexpr (PV_RE_MODE == 4U) {
             AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(5);
             AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(21);
-            AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(6);
-            AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(22);
+            if (otmpStages_ == 2U) {
+                AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(6);
+                AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(22);
+            }
         }
 #endif
 #ifdef __DAV_VEC__
@@ -930,7 +919,7 @@ class FAIKernel950 {
     }
 
   private:
-    Arch::Resource<ArchTag> resource;
+    Arch::ForwardResource950 resource;
 
     uint32_t batch_;
     uint32_t qHeads_;

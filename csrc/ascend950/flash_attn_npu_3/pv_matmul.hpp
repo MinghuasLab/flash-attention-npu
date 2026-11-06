@@ -148,7 +148,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr bool FULL_QUANT_FP8 = std::is_same_v<ElementA, float8_e4m3_t>;
     static constexpr uint32_t C0_ELEMS = 32 / sizeof(ElementA);
 
-    __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart,
+    template <class Resource>
+    __aicore__ inline BlockMmadTla(Resource& resource, uint32_t l1BufAddrStart,
                                    BlockMmadPVTileHelper& pvL1TileHelper)
     {
         l1ATileM = pvL1TileHelper.pvL1TileM;

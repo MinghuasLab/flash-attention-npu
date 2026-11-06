@@ -4,6 +4,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+from torch.utils import _python_dispatch
 
 # isort: off
 import flash_attn_npu_3_950
@@ -152,10 +153,7 @@ def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
         raise RuntimeError("total_q must be positive (q must contain at least one query token)")
 
 
-@_torch_custom_op_wrapper(
-    "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
-)
-def _flash_attn_forward(
+def _flash_attn_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -257,6 +255,27 @@ def _flash_attn_forward(
         softmax_lse_accum = torch.tensor([], device=out_t.device)
 
     return out_t, softmax_lse, out_accum, softmax_lse_accum
+
+
+_flash_attn_forward = _torch_custom_op_wrapper(
+    "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
+)(_flash_attn_forward_impl)
+
+
+def _can_use_eager_forward(tensors):
+    # The inference API has no backward. Ordinary eager tensors can enter the
+    # same validated implementation directly; tracing/transforms still see the
+    # registered custom op and its fake implementation.
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or torch.jit.is_scripting():
+        return False
+    in_dispatch_mode = getattr(_python_dispatch, 'is_in_torch_dispatch_mode', None)
+    if in_dispatch_mode is None or in_dispatch_mode() or torch.overrides._get_current_function_mode() is not None:
+        return False
+    if torch._C._are_functorch_transforms_active() or torch._C._dispatch_tls_is_dispatch_key_included(
+        torch._C.DispatchKey.Functionalize
+    ):
+        return False
+    return all(t is None or (type(t) is torch.Tensor and not t.requires_grad) for t in tensors)
 
 
 @_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_forward")
@@ -1263,7 +1282,14 @@ def flash_attn_with_kvcache(
             has_softcap=softcap > 0.0,
             num_splits=num_splits,
         )
-    out, softmax_lse, *rest = _flash_attn_forward(
+    forward = _flash_attn_forward
+    if scheduler_metadata is not None and q.dtype in (torch.float16, torch.bfloat16) and _can_use_eager_forward((
+        q, k_cache, v_cache, k, v, qv, cu_seqlens_q, cu_seqlens_k_new, cache_seqlens,
+        page_table, cache_batch_idx, cache_leftpad, rotary_cos, rotary_sin, rotary_seqlens,
+        q_descale, k_descale, v_descale, scheduler_metadata,
+    )):
+        forward = _flash_attn_forward_impl
+    out, softmax_lse, *rest = forward(
         q,
         k_cache,
         v_cache,

@@ -30,7 +30,8 @@ class FlashDecodeCombine950 {
     static constexpr uint32_t MAX_O_INPUT_ELEMS = FD_COMBINE_O_INPUT_ELEMS;
     using Resource = Catlass::Arch::Resource<Catlass::Arch::Ascend950>;
 
-    __aicore__ inline explicit FlashDecodeCombine950(Resource& resource)
+    template <class ResourceType>
+    __aicore__ inline explicit FlashDecodeCombine950(ResourceType& resource)
     {
         constexpr uint32_t LSE_OFFSET = 0U;
         constexpr uint32_t WEIGHT_OFFSET = LSE_OFFSET + MAX_LSE_ELEMS * sizeof(float);

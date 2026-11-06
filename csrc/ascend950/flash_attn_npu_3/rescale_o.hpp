@@ -14,6 +14,7 @@
 #include <type_traits>
 #include "kernel_common.hpp"
 #include "fa_block.h"
+#include "fwd_resource_plan.h"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
@@ -81,6 +82,21 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+    }
+
+    template <class Resource>
+    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub)
+    {
+        otmpStages_ = ub.otmpStages;
+        for (uint32_t i = 0; i < otmpStages_; ++i) {
+            loUbTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.lo + ub.loBytes * i);
+        }
+        goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.go);
+        goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(ub.go);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
+        dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
+        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -737,7 +753,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         // ScatterGroupedOutput after the per-AIV computation finishes.
         auto gOTensorTlaTile = GetTile(gOTensor, tla::MakeCoord(qNBlockSize == 1U ? rowOffsetCurSubCore : 0U, 0),
                                        tla::MakeShape(rowNumCurSubCore, colNumCurSubCore));
-        uint32_t ubOTmpBufId = gatheredKvSTileIdx % UB_OTMP_BUF_STAGES;
+        uint32_t ubOTmpBufId = gatheredKvSTileIdx % otmpStages_;
         uint32_t vlElemNum = AscendC::GetVecLen() / sizeof(ElementOTmp);
         bool headdimAligned64 = (colNumOri % 64 == 0);
         if (rowNumCurSubCore > 0) {
@@ -819,6 +835,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
   private:
+    uint32_t otmpStages_ = UB_OTMP_BUF_STAGES;
     float vDequantScale_ = 1.0f;
     AscendC::LocalTensor<ElementOTmp> loUbTensor[UB_OTMP_BUF_STAGES];
     AscendC::LocalTensor<SMDtype> dmUbTensor16;
