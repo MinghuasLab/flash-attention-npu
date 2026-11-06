@@ -170,3 +170,48 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
         current_out = output_npu.cpu()
         assert not torch.equal(current_out, previous_out)
         previous_out = current_out.clone()
+
+
+@pytest.mark.golden_api("flash_attn_with_kvcache")
+def test_flash_attn_kvcache_graph_long_kv():
+    kv_length = 1024
+    q = torch.zeros((1, NUM_HEADS, HEAD_SIZE), dtype=DATA_TYPE, device="npu")
+    k = torch.zeros(
+        (kv_length // BLOCK_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+        dtype=DATA_TYPE,
+        device="npu",
+    )
+    cache_seqlens = torch.tensor([kv_length], dtype=torch.int32, device="npu")
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    metadata = get_scheduler_metadata(
+        batch_size=1,
+        max_seqlen_q=1,
+        max_seqlen_k=kv_length,
+        num_heads_q=NUM_HEADS,
+        num_heads_kv=NUM_KV_HEADS,
+        headdim=HEAD_SIZE,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=DATA_TYPE,
+        page_size=BLOCK_SIZE,
+        cu_seqlens_q=cu_q,
+    )
+    kwargs = dict(
+        q=q,
+        k_cache=k,
+        v_cache=torch.ones_like(k),
+        cache_seqlens=cache_seqlens,
+        page_table=torch.arange(kv_length // BLOCK_SIZE, dtype=torch.int32, device="npu").reshape(
+            1, -1
+        ),
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=1,
+        scheduler_metadata=metadata,
+    )
+    flash_attn_with_kvcache(**kwargs)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = flash_attn_with_kvcache(**kwargs)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
