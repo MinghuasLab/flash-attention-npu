@@ -4,7 +4,7 @@ name: NPU CI 编译矩阵
 # 在预构建的 fa-npu-ci:<name> 镜像里并发编译, 汇总 per-combo pass/fail。
 #
 # 双架构并行: 950 (x86_64) 和 910B (aarch64) 各跑一个 job, 同时执行。
-# 每个 job 用 ARCH_FILTER 只跑本机架构对应的 combo, 互不干扰。
+# 每个 job 用 ARCH_FILTER 和 NPU_FILTER 选择本机对应的 combo。
 #
 # 前置 (每台 runner 上一次性操作):
 #   1. 确保 clone 镜像存在 (两架构均由 build_matrix_images.sh 构建):
@@ -38,10 +38,12 @@ jobs:
       matrix:
         include:
           - arch_filter: x86_64
+            npu_filter: "950"
             arch_label: x86_64-950
             runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
             clone_image: fa-npu-ci:950-cann9.1-torch2.9
           - arch_filter: aarch64
+            npu_filter: "910"
             arch_label: aarch64-910B
             runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
             clone_image: fa-npu-ci:910b-cann9.1-torch2.9
@@ -51,6 +53,8 @@ jobs:
       CI_DOCKER_IMAGE: ${{ matrix.clone_image }}
       CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
       ARCH_FILTER: ${{ matrix.arch_filter }}
+      NPU_FILTER: ${{ matrix.npu_filter }}
+      MATRIX_FILE: ci/ci_build_matrix.tsv
       CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
     steps:
       - name: Clone repo (docker first 3x as root, then host 3x)

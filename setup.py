@@ -1,13 +1,12 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026
 
-import sys
 import os
-import re
-import ast
 import glob
+import importlib.util
+import re
+import sys
 import sysconfig
-from pathlib import Path
 from packaging.version import parse
 import platform
 
@@ -21,9 +20,6 @@ import urllib.request
 import urllib.error
 from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 
-import torch
-import torch_npu
-
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
@@ -32,14 +28,26 @@ this_dir = os.path.dirname(os.path.realpath(__file__))
 
 PACKAGE_NAME = "flash_attn_npu"
 
-BASE_WHEEL_URL = (
-    "https://github.com/MinghuasLab/flash-attention-npu/releases/download/{tag_name}/{wheel_name}"
-)
-
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
-FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
+FORCE_BUILD = (
+    os.getenv("FLASH_ATTN_FORCE_BUILD", os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE")).upper()
+    == "TRUE"
+)
+SKIP_NPU_BUILD = (
+    os.getenv(
+        "FLASH_ATTN_SKIP_NPU_BUILD", os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE")
+    ).upper()
+    == "TRUE"
+)
+EXTENSION_COMMANDS = {"build", "build_ext", "bdist_wheel", "install", "develop"}
+BUILD_EXTENSIONS = not SKIP_NPU_BUILD and bool(EXTENSION_COMMANDS.intersection(sys.argv[1:]))
+
+torch = None
+torch_npu = None
+if BUILD_EXTENSIONS:
+    import torch
+    import torch_npu
 # FLASH_ATTN_BUILD_VERSION selects which API generations to build:
 #   "v2"   build flash_attn_npu.flash_attn_npu     (910B/C only)
 #   "v3"   build the v3 backends selected by FLASH_ATTN_BUILD_NPU:
@@ -74,7 +82,7 @@ def get_build_npu():
         raise RuntimeError(
             f"Invalid FLASH_ATTN_BUILD_NPU={target!r}; choose auto, 910, 950, or all."
         )
-    if SKIP_NPU_BUILD:
+    if not BUILD_EXTENSIONS:
         return "auto"
     try:
         device_name = torch_npu.npu.get_device_name()
@@ -113,6 +121,20 @@ BUILD_NPU = get_build_npu()
 # 仅用于调试定位，会显著增大二进制并降低性能。建议通过 bdist_wheel 独立产出检测版，
 # 避免覆盖正常版本（editable 安装下正常 .so 位于 flash_attn_npu/ 目录内）。
 ENABLE_MSSANITIZER = os.getenv("FLASH_ATTN_ENABLE_MSSANITIZER", "FALSE") == "TRUE"
+
+
+def load_wheel_metadata_module():
+    module_path = os.path.join(this_dir, "flash_attn_npu", "_wheel_metadata.py")
+    spec = importlib.util.spec_from_file_location("_flash_attn_npu_wheel_metadata", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load wheel metadata module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+wheel_metadata = load_wheel_metadata_module()
 # Static instrumentation is for eager checking. Graph execution needs a build
 # without static stubs; runtime mode retains symbols for optional tool checking.
 MSSANITIZER_MODE = os.getenv("FLASH_ATTN_MSSANITIZER_MODE", "auto").lower()
@@ -285,7 +307,12 @@ class BishengBuildExt(build_ext):
         torch_npu_include = os.path.join(torch_npu_path, "include")
         torch_npu_lib = os.path.join(torch_npu_path, "lib")
 
-        torch_abi = torch._C._GLIBCXX_USE_CXX11_ABI
+        forced_abi = os.getenv("FLASH_ATTN_FORCE_CXX11_ABI")
+        torch_abi = (
+            forced_abi.upper() == "TRUE"
+            if forced_abi and forced_abi.upper() in {"TRUE", "FALSE"}
+            else torch._C._GLIBCXX_USE_CXX11_ABI
+        )
         abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
 
         compile_arch_flags = [
@@ -542,7 +569,18 @@ class BishengBuildExt(build_ext):
         # concurrently regardless of which extension owns them. TUs per extension
         # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
         # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
-        max_workers = min(len(tasks), os.cpu_count() or 1)
+        build_jobs = os.getenv("FLASH_ATTN_BUILD_JOBS")
+        if build_jobs:
+            try:
+                requested_workers = int(build_jobs)
+            except ValueError as error:
+                raise RuntimeError("FLASH_ATTN_BUILD_JOBS must be a positive integer") from error
+            if requested_workers <= 0:
+                raise RuntimeError("FLASH_ATTN_BUILD_JOBS must be a positive integer")
+        else:
+            requested_workers = os.cpu_count() or 1
+        max_workers = min(len(tasks), requested_workers)
+        print(f"[build-config] compile_jobs={max_workers}")
         objs_by_ext = {ext.name: [] for ext in self.extensions}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(compile_one, t): t for t in tasks}
@@ -628,13 +666,19 @@ class BishengBuildExt(build_ext):
 
 ext_modules = []
 
-if os.path.isdir(".git") and os.environ.get("FLASH_ATTN_SKIP_SUBMODULE_INIT") != "1":
+if (
+    BUILD_EXTENSIONS
+    and os.path.isdir(".git")
+    and os.environ.get("FLASH_ATTN_SKIP_SUBMODULE_INIT") != "1"
+):
     subprocess.run(
         ["git", "submodule", "update", "--init", "--depth", "1", "csrc/catlass"],
         check=False,
     )
 
-if not os.path.exists(os.path.join(this_dir, "csrc/catlass", "include/catlass/catlass.hpp")):
+if BUILD_EXTENSIONS and not os.path.exists(
+    os.path.join(this_dir, "csrc/catlass", "include/catlass/catlass.hpp")
+):
     raise RuntimeError(
         "csrc/catlass is missing its catlass headers (include/catlass/catlass.hpp). "
         "The submodule gitlink may be unreachable. Run "
@@ -708,7 +752,7 @@ src_ascend950_v4 += glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "combine_kernel.cpp"), recursive=True
 )
 
-if not SKIP_NPU_BUILD:
+if BUILD_EXTENSIONS:
     if BUILD_VERSION in ("v2", "all") and BUILD_NPU in ("910", "all"):
         # Nested under the Python package so the extension name does not collide
         # with the flash_attn_npu package itself.
@@ -778,29 +822,15 @@ if not SKIP_NPU_BUILD:
 
 
 def get_package_version():
-    with open(Path(this_dir) / "flash_attn_npu" / "__init__.py", "r") as f:
-        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
-    public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
-    if local_version:
-        return f"{public_version}+{local_version}"
-    else:
-        return str(public_version)
+    config = wheel_metadata.get_build_config()
+    if BUILD_EXTENSIONS:
+        return config.wheel_version
+    return config.version
 
 
 def get_wheel_url():
-    torch_version_raw = parse(torch.__version__)
-    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    platform_name = get_platform()
-    flash_version = get_package_version()
-    torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
-    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
-
-    npu_ver_tag = "80"
-    wheel_filename = f"{PACKAGE_NAME}-{flash_version}+npu{npu_ver_tag}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
-
-    return wheel_url, wheel_filename
+    config = wheel_metadata.get_build_config()
+    return wheel_metadata.get_release_url(config), wheel_metadata.get_wheel_filename(config)
 
 
 class CachedWheelsCommand(_bdist_wheel):
@@ -816,6 +846,12 @@ class CachedWheelsCommand(_bdist_wheel):
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
+        config = wheel_metadata.get_build_config()
+        print(
+            "[wheel-config] "
+            f"npu={config.npu} api={config.api} cann={config.cann} "
+            f"torch={config.torch} torch_npu={config.torch_npu} abi={config.abi}"
+        )
         print("Guessing wheel URL: ", wheel_url)
         try:
             urllib.request.urlretrieve(wheel_url, wheel_filename)
@@ -828,8 +864,11 @@ class CachedWheelsCommand(_bdist_wheel):
 
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             os.rename(wheel_filename, wheel_path)
-        except (urllib.error.HTTPError, urllib.error.URLError):
-            print("Precompiled wheel not found. Building from source...")
+        except (OSError, urllib.error.HTTPError, urllib.error.URLError) as error:
+            print(
+                f"Precompiled wheel unavailable ({error}); attempted {wheel_url}. "
+                "Building from source..."
+            )
             super().run()
 
 

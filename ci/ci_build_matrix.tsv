@@ -1,0 +1,4 @@
+# CI compilation images retained from upstream/main. The release matrix is in build_matrix.tsv.
+# name|base_image|py_tag|torch_ver|torch_npu_ver|torch_npu_release|cann_ver|npu|build_version|abi|arch|image
+910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|9.1|910|all|detected|aarch64|
+950-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|9.1|950|all|detected|x86_64|
