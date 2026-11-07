@@ -8,8 +8,13 @@
 
 #ifdef __CCE__
 #define FA_TASK_INLINE __forceinline__[host, aicore]
+// Geometry that only the rare branches need is kept out of line: the AICore
+// inlines this header into its per-batch geometry call, and any growth of that
+// instruction stream costs 7-45% on hot shapes (see MakeMhaTaskShape).
+#define FA_TASK_NOINLINE static __attribute__((noinline))[host, aicore]
 #else
 #define FA_TASK_INLINE inline
+#define FA_TASK_NOINLINE static inline
 #endif
 
 namespace fa_fused {
@@ -82,6 +87,30 @@ FA_TASK_INLINE uint32_t QNCapacity(uint32_t qRows, uint32_t groupSize)
     // GQA: one KV group shares one L1 segment, so a whole group costs a single
     // RoundUp16(qRows*groupSize) once. Stop at one group (see above).
     if (CeilDiv(qRows * groupSize, 16) * 16 <= Q_ROWS) {
+        // Exception, decode (a single Q row per task): the fixed per-task cost
+        // dominates there, and k whole groups keep the per-group L1 segment and the
+        // KV scan count while needing 1/k the tasks. Measured H16/kv4 q1 kv4096 B32:
+        // 2 groups 0.314 ms vs 1 group 0.342 ms. With more Q rows the vector split
+        // and the pipeline favour one group ("one KV group per task" invariant).
+        if (qRows == 1U) {
+            const uint32_t groups = (Q_ROWS / (CeilDiv(qRows, 16) * 16)) / groupSize;
+            return groups > 0U ? groups * groupSize : groupSize;
+        }
+        if (qRows <= 16U) {
+            // Short-q GQA (decode / cross-attention with a few Q rows): one task does
+            // so little work that its prologue/epilogue dominates, so it should keep
+            // swallowing whole KV groups as long as the Q row budget allows even
+            // though that saves no KV traffic. A task of k groups costs
+            // k * RoundUp16(qRows * groupSize) rows in L1 Q. Measured T5 cross
+            // (q3 kv<=276 H16/kv8 B512, TND): 1 group 0.950 ms -> 8 groups 0.62 ms
+            // (-35%, level with minFA); the same tile is used by HeadTile's caller
+            // only when the batch keeps the cores busy (see MakeTaskShape).
+            const uint32_t segRows = CeilDiv(qRows * groupSize, 16) * 16;
+            const uint32_t groups = Q_ROWS / segRows;
+            if (groups > 1U) {
+                return groups * groupSize;
+            }
+        }
         return groupSize;
     }
     // The group does not fit: fall back to (and never go below) the in-group even
@@ -121,6 +150,32 @@ FA_TASK_INLINE uint32_t HeadTile(uint32_t qRows, uint32_t groupSize, uint32_t nC
     return tile;
 }
 
+// groupSize == 1 (MHA) head tile: the pre-fuse upstream rule, kept as its own
+// small function.
+// The generic HeadTile() above is written for GQA (whole KV groups, in-group
+// slices, multi-group packing) and every one of those rules is a no-op when
+// groupSize == 1, but the code is still inlined into every AICore call site.
+FA_TASK_INLINE uint32_t HeadTileMha(uint32_t qRows, uint32_t nCap, uint32_t qHeads)
+{
+    uint32_t tile = Min(nCap, Q_ROWS / (CeilDiv(qRows, 16) * 16));
+    tile = tile > 0 ? tile : 1;
+    // v2 splits whole heads between vectors (except a single head). Each
+    // vector owns 64 state rows; an odd head count must fit the larger half.
+    // groupSize == 1 makes the group divisibility guard a no-op.
+    while (tile > 1 && CeilDiv(tile, 2) * qRows > SUB_CORE_ROWS) {
+        --tile;
+    }
+    // Keep the same number of tasks while balancing the groups per task.
+    if (tile >= 1U) {
+        const uint32_t kvHeads = qHeads;
+        const uint32_t groupsPerTask = tile;
+        if (kvHeads > groupsPerTask) {
+            tile = Min(tile, CeilDiv(kvHeads, CeilDiv(kvHeads, groupsPerTask)));
+        }
+    }
+    return tile;
+}
+
 struct TaskShape {
     uint32_t normQBlocks;
     uint32_t normHeadTile;
@@ -132,12 +187,70 @@ struct TaskShape {
     uint32_t totalTasks;
 };
 
-FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads, uint32_t batch,
-                                       uint32_t coreNum, bool fixedLayout)
+// Fixed-layout MHA tail rotation: rare, gcd based, kept out of line so the
+// inline per-batch geometry of the AICore stays at the upstream size (the call
+// is unexecuted for varlen). Returns 0 to keep the wide tail tile, otherwise
+// newTile | (newHeadBlocks << 16).
+FA_TASK_NOINLINE uint32_t MhaTailShrinkPick(uint32_t qHeads, uint32_t batch, uint32_t coreNum, uint32_t normTasks,
+                                            uint32_t tailHeadTile, uint32_t tailHeadBlocks)
+{
+    const uint32_t curTasks = normTasks + tailHeadBlocks;
+    const uint32_t newTile = Min(tailHeadTile, 2U);
+    if (newTile >= tailHeadTile) {
+        return 0U;
+    }
+    const uint32_t newBlocks = CeilDiv(qHeads, newTile);
+    const uint32_t newTasks = normTasks + newBlocks;
+    const bool starved = batch * curTasks < 8U * coreNum;
+    if (starved || Gcd(newTasks, coreNum) < Gcd(curTasks, coreNum)) {
+        return newTile | (newBlocks << 16);
+    }
+    return 0U;
+}
+
+// groupSize == 1 (MHA) geometry: the pre-fuse upstream rule, in its own small
+// inline function.
+// The generic HeadTile/MakeTaskShape pair above is written for GQA (whole KV
+// groups, in-group slices, multi-group packing). Every one of those rules is a
+// no-op when groupSize == 1, but the AICore still inlines the code into its
+// per-batch geometry call, which it runs once per *batch* inside the TND task
+// loop.
+FA_TASK_INLINE TaskShape MakeMhaTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t batch, uint32_t coreNum,
+                                          bool fixedLayout)
 {
     TaskShape shape{};
-    uint32_t groupSize = qHeads / kvHeads;
-    uint32_t nCap = batch >= coreNum ? qHeads : groupSize;
+    const uint32_t nCap = batch >= coreNum ? qHeads : 1U;
+    shape.normQBlocks = qSeqlen / Q_ROWS;
+    shape.normHeadTile = 1;
+    shape.normHeadBlocks = qHeads;
+    shape.normTasks = shape.normQBlocks * shape.normHeadBlocks;
+    shape.tailRows = qSeqlen % Q_ROWS;
+    shape.tailHeadTile = shape.tailRows ? HeadTileMha(shape.tailRows, nCap, qHeads) : 1;
+    shape.tailHeadBlocks = shape.tailRows ? CeilDiv(qHeads, shape.tailHeadTile) : 0;
+    // Avoid repeatedly assigning the expensive MHA tail to the same cores.
+    // Only shrink the tail tile when the shrink actually breaks the rotation
+    // (gcd(T, coreNum) drops); a fixed "T <= coreNum + 2" window also split
+    // tails whose rotation was already fine, costing 5-20% on short sequences
+    if (fixedLayout && shape.tailHeadBlocks > 0U) {
+        const uint32_t pick =
+            MhaTailShrinkPick(qHeads, batch, coreNum, shape.normTasks, shape.tailHeadTile, shape.tailHeadBlocks);
+        if (pick != 0U) {
+            shape.tailHeadTile = pick & 0xFFFFU;
+            shape.tailHeadBlocks = pick >> 16;
+        }
+    }
+    shape.totalTasks = shape.normTasks + shape.tailHeadBlocks;
+    return shape;
+}
+
+// groupSize > 1 (GQA) geometry: never inlined into the AICore task loop, the
+// per-batch call is negligible there.
+FA_TASK_NOINLINE TaskShape MakeGqaTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads, uint32_t batch,
+                                          uint32_t coreNum, bool fixedLayout)
+{
+    const uint32_t groupSize = qHeads / kvHeads;
+    const uint32_t nCap = batch >= coreNum ? qHeads : groupSize;
+    TaskShape shape{};
     shape.normQBlocks = qSeqlen / Q_ROWS;
     shape.normHeadTile = 1;
     shape.normHeadBlocks = qHeads;
@@ -145,25 +258,31 @@ FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32
     shape.tailRows = qSeqlen % Q_ROWS;
     shape.tailHeadTile = shape.tailRows ? HeadTile(shape.tailRows, groupSize, nCap, qHeads) : 1;
     shape.tailHeadBlocks = shape.tailRows ? HeadBlocks(shape.tailHeadTile, groupSize, qHeads) : 0;
-    // Avoid repeatedly assigning the expensive MHA tail to the same cores.
-    // Only shrink the tail tile when the shrink actually breaks the rotation
-    // (gcd(T, coreNum) drops); a fixed "T <= coreNum + 2" window also split
-    // tails whose rotation was already fine, costing 5-20% on short sequences
-    // (minFA 0e7aa71).
-    if (fixedLayout && groupSize == 1 && shape.tailHeadBlocks > 0) {
-        const uint32_t curTasks = shape.normTasks + shape.tailHeadBlocks;
-        const uint32_t newTile = Min(shape.tailHeadTile, 2);
-        if (newTile < shape.tailHeadTile) {
-            const uint32_t newBlocks = HeadBlocks(newTile, groupSize, qHeads);
-            const uint32_t newTasks = shape.normTasks + newBlocks;
-            if (Gcd(newTasks, coreNum) < Gcd(curTasks, coreNum)) {
-                shape.tailHeadTile = newTile;
-                shape.tailHeadBlocks = newBlocks;
-            }
+    // Short-q GQA may fuse several whole KV groups into one task (QNCapacity) to
+    // amortise the per-task prologue/epilogue. That only pays while the batch
+    // dimension still fills the grid: keep the wide tile only when batch * (tasks
+    // per batch) stays above a few core waves, otherwise fall back to the
+    // "one KV group per task" invariant (a single task holding several KV heads
+    // serialises their scans and the wave quantisation eats the gain).
+    if (shape.tailRows > 1U && shape.tailHeadBlocks > 0U && shape.tailHeadTile > groupSize) {
+        if (batch * shape.tailHeadBlocks < 8U * coreNum) {
+            shape.tailHeadTile = groupSize;
+            shape.tailHeadBlocks = HeadBlocks(groupSize, groupSize, qHeads);
         }
     }
     shape.totalTasks = shape.normTasks + shape.tailHeadBlocks;
     return shape;
+}
+
+FA_TASK_INLINE TaskShape MakeTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads, uint32_t batch,
+                                       uint32_t coreNum, bool fixedLayout)
+{
+    // MHA (groupSize == 1, incl. kvHeads == 0) keeps the upstream rule in its own
+    // small function so the AICore's per-batch call does not inline the GQA code.
+    if (kvHeads == 0U || kvHeads == qHeads) {
+        return MakeMhaTaskShape(qSeqlen, qHeads, batch, coreNum, fixedLayout);
+    }
+    return MakeGqaTaskShape(qSeqlen, qHeads, kvHeads, batch, coreNum, fixedLayout);
 }
 } // namespace fa_fused
 

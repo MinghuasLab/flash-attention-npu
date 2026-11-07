@@ -11,11 +11,15 @@
 #define FA_SPLIT_H
 
 #include <cstdint>
+#include "fused_task.h"
 #include "tilingdata.h"
 
 namespace fa_split {
 
-constexpr uint32_t Q_TILE_CEIL = 128;
+// Single source of truth with the AICore kernel (kernel_common.hpp) and the
+// AICPU metadata scheduler: the Q row tile must match fa_fused::Q_ROWS, or the
+// host workspace sizing / tiling diverges from the kernel and results go NaN.
+constexpr uint32_t Q_TILE_CEIL = fa_fused::Q_ROWS;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MAX_KV_STACK_LEN = 512;
 

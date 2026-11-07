@@ -602,20 +602,6 @@ class FAInferKernel {
         }
     }
 
-    // Task -> head slice mapping for fused tasks whose tile is narrower than one
-    // KV group: task `qNBlockIdx` is the subIdx-th slice of KV group kvNIdx, the
-    // same numbering HeadBlocks uses (kvIdx = idx / numSub, subIdx = idx % numSub).
-    __aicore__ __attribute__((noinline)) static void ResolveInGroupHeadSlice(uint32_t qNBlockIdx, uint32_t headTile,
-                                                                             uint32_t groupSize, uint32_t& qNStartIdx,
-                                                                             uint32_t& qNBlockSize, uint32_t& kvNIdx)
-    {
-        uint32_t numSubPerGroup = CeilDiv(groupSize, headTile);
-        uint32_t subIdx = qNBlockIdx % numSubPerGroup;
-        kvNIdx = qNBlockIdx / numSubPerGroup;
-        qNStartIdx = kvNIdx * groupSize + subIdx * headTile;
-        qNBlockSize = AscendC::Std::min(headTile, groupSize - subIdx * headTile);
-    }
-
     __aicore__ inline bool runMainLoop(uint32_t coreIdx, uint32_t BIdx, uint32_t qNBlockIdx, uint32_t qSBlockIdx,
                                        bool isSplitKV, int32_t stS2IdxNow, int32_t enS2IdxNow, uint64_t gmOffsetLseFD,
                                        uint64_t gmOffsetOFD, GlobalTensorBundle& globalTensors,
@@ -744,11 +730,15 @@ class FAInferKernel {
             qNStartIdx = qNBlockIdx * curQNBlockTile;
             kvNIdx = qNStartIdx / groupSize;
             qNBlockSize = AscendC::Std::min(curQNBlockTile, qHeads - qNStartIdx);
-            if (groupSize != 1U && curQNBlockTile < groupSize) {
-                // Rare in-group slice (GQA with an odd group size). Kept out of
-                // line so the MHA / whole-group path keeps the upstream
-                // instruction stream (growing it cost ~20% on causal MHA).
-                ResolveInGroupHeadSlice(qNBlockIdx, curQNBlockTile, groupSize, qNStartIdx, qNBlockSize, kvNIdx);
+            if (curQNBlockTile < groupSize && groupSize % curQNBlockTile != 0U) {
+                // In-group slice (odd GQA group): task `qNBlockIdx` is a slice of KV
+                // group `kvNIdx`, the same numbering fa_fused::HeadBlocks uses.
+                // Inlined on purpose - a call here cost 25~45% on causal MHA/GQA.
+                uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+                uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;
+                kvNIdx = qNBlockIdx / qNBlockNumPerGroup;
+                qNStartIdx = kvNIdx * groupSize + qNBlockIdxCurGroup * curQNBlockTile;
+                qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxCurGroup * curQNBlockTile);
             }
         } else {
             uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);

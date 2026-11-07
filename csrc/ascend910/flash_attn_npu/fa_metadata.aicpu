@@ -25,7 +25,7 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t Q_TILE_CEIL = fa_split::Q_TILE_CEIL;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MASK_TYPE_NO_MASK = 0;
 constexpr uint32_t MASK_TYPE_CAUSAL = 1;

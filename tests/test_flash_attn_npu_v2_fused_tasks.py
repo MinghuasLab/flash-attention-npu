@@ -35,8 +35,15 @@ int main() {
     // per batch either way) and only adds wave-quantisation loss.
     assert(fa_fused::HeadTile(3, 16, 16, 64) >= legacyTile(3, 16));
     assert(fa_fused::HeadTile(3, 16, 16, 64) == 16);
-    assert(fa_fused::HeadTile(3, 16, 64, 64) == 16);
-    assert(fa_fused::HeadTile(3, 8, 32, 32) == 8);
+    // Short-q GQA (q <= 16 rows, e.g. T5 cross q3 kv<=276 H16/kv8 B512) keeps
+    // swallowing whole KV groups while the Q row budget allows: those tasks are
+    // prologue-bound, so "one group per task" is worth breaking (measured
+    // 0.950 ms -> 0.620 ms, level with minFA). HeadTile still caps at nCap, and
+    // MakeTaskShape reverts to a single group when the grid is starved.
+    assert(fa_fused::HeadTile(3, 16, 64, 64) == 32);
+    assert(fa_fused::HeadTile(3, 16, 16, 64) == 16);
+    // qRows == 1 decode keeps the one-group invariant even when nCap is wide.
+    assert(fa_fused::HeadTile(1, 8, 32, 32) == 8);
     assert(fa_fused::HeadTile(3, 8, 8, 32) == 8);
     // Full two-vector capacity, odd GQA, group balancing, and tail dispatch.
     assert(fa_fused::HeadTile(64, 4, 8, 8) == 2);

@@ -4,6 +4,7 @@
 #define FA_METADATA_ARGS_H
 
 #include <cstdint>
+#include "fa_split.h"
 #include "tilingdata.h"
 
 namespace fa_metadata {
@@ -15,7 +16,11 @@ constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
 inline uint64_t TilingOffset(bool /*has_mask*/) { return 0; }
 inline uint64_t MetadataBytes(bool /*has_mask*/) { return sizeof(FAInferTilingData); }
 
-constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
+// Per-block (Q tile) staging buffer for the split/decode path. Must track the
+// kernel's Q row tile (fa_fused::Q_ROWS); a smaller value silently overlaps
+// neighbouring cores' scratch buffers.
+constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB =
+    static_cast<uint64_t>(fa_split::Q_TILE_CEIL) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;
 inline uint64_t Mm1OutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELAUNCH_NUM; }
 inline uint64_t SmOnlineOutSize(uint64_t blockDim) { return blockDim * WORKSPACE_BLOCK_SIZE_DB * 2 * PRELAUNCH_NUM; }
