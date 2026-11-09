@@ -110,6 +110,9 @@ def has_flex(
     block_sparse_tensors_bwd=None,
     aux_tensors=None,
     aux_scalars=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     # Only Python presence/container length is inspected, never Tensor values.
     tensor_aux = _has_aux(aux_tensors, "aux_tensors")
@@ -125,6 +128,9 @@ def has_flex(
                 mask_mod,
                 block_sparse_tensors,
                 block_sparse_tensors_bwd,
+                q_descale,
+                k_descale,
+                v_descale,
             )
         )
     )

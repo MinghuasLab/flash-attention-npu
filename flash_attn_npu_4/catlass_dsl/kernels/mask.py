@@ -17,6 +17,8 @@ def mask_kernel(
     heads: tla.Int32,
     max_q: tla.Int32,
     max_k: tla.Int32,
+    partial_columns: tla.Int32,
+    full_columns: tla.Int32,
     varlen: tla.Constexpr,
     mask_mod: tla.Constexpr,
     use_fast_sampling: tla.Constexpr,
@@ -85,7 +87,7 @@ def mask_kernel(
                         elif sample_visible > 0:
                             sample_kind = tla.Int32(1)
                     if sample_kb < nk:
-                        pi[row, sample_kb] = sample_kind
+                        pi[row * partial_columns + sample_kb] = sample_kind
             else:
                 if m == 128 and group_base + 128 <= klen // 128:
                     with tla.vec.func(mode="simt", thread_block_dim=2048):
@@ -122,7 +124,7 @@ def mask_kernel(
                                 full_kind = tla.Int32(2)
                             elif full_nnz > 0:
                                 full_kind = tla.Int32(1)
-                            pi[row, full_kb] = full_kind
+                            pi[row * partial_columns + full_kb] = full_kind
                 else:
                     with tla.vec.func(mode="simt", thread_block_dim=2048):
                         tid, _, _ = tla.arch.thread_idx()
@@ -181,7 +183,7 @@ def mask_kernel(
                                 elif nnz > 0:
                                     kind = tla.Int32(1)
                             if kb < nk:
-                                pi[row, kb] = kind
+                                pi[row * partial_columns + kb] = kind
             tla.pipe_barrier(tla.pipes.ALL)
         tla.cross_core_set_flag(classification_done, tla.arch.MTE2)
         tla.cross_core_wait_flag(classification_done, tla.arch.MTE2)
@@ -196,7 +198,7 @@ def mask_kernel(
                 for output_base in tla.range(0, nk, 512):
                     selected = tla.Int32(0)
                     if output_base + lane < nk:
-                        selected = pi[output_row, output_base + lane]
+                        selected = pi[output_row * partial_columns + output_base + lane]
                     kinds[lane] = selected
                     counts[lane] = tla.Int32(selected == 1) | (tla.Int32(selected == 2) << 16)
                     tla.arch.sync_threads()
@@ -212,9 +214,9 @@ def mask_kernel(
                     inclusive = counts[512 + lane]
                     out_kind = kinds[lane]
                     if out_kind == 2:
-                        fi[output_row, full + (inclusive >> 16) - 1] = output_base + lane
+                        fi[output_row * full_columns + full + (inclusive >> 16) - 1] = output_base + lane
                     elif out_kind == 1:
-                        pi[output_row, partial + (inclusive & 65535) - 1] = output_base + lane
+                        pi[output_row * partial_columns + partial + (inclusive & 65535) - 1] = output_base + lane
                     totals = counts[1023]
                     partial = partial + (totals & 65535)
                     full = full + (totals >> 16)

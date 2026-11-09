@@ -1218,9 +1218,7 @@ def _paired_pipeline(
     stage0_last = tla.as_numeric(0)
     stage1_last = tla.as_numeric(0)
     kblocks = (max_k + 127) // 128
-    info = ()
-    if tla.const_expr(ragged):
-        info = (max_q, max_k, tla.Int32(0), tla.Int32(0))
+    info = (max_q, max_k, tla.Int32(0), tla.Int32(0))
     for task in tla.range(tla.arch.block_idx(), batch * q_heads * q_blocks, tla.arch.block_num()):
         if tla.const_expr(dense and not (dense_mask and indexed)):
             qb = task % q_blocks
@@ -2126,7 +2124,7 @@ def _paired_pipeline(
 
 
 @tla.kernel
-def attention_kernel(
+def flash_fwd_kernel(
     q: tla.Tensor,
     k: tla.Tensor,
     v: tla.Tensor,
@@ -2395,7 +2393,9 @@ def attention_kernel(
             klen = max_k
             qs = tla.as_numeric(0)
             ks = tla.as_numeric(0)
-            info = ()
+            qs = b * max_q if tla.const_expr(varlen[0]) else tla.Int32(0)
+            ks = b * max_k if tla.const_expr(varlen[1]) else tla.Int32(0)
+            info = (qlen, klen, qs, ks)
             if tla.const_expr(ragged):
                 if tla.const_expr(varlen[0]):
                     qs = cu_q[b]

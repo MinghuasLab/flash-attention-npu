@@ -65,7 +65,11 @@ SIGNATURES = {
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
-        gather_bwd_token_chunk: Optional[int] = None
+        gather_bwd_token_chunk: Optional[int] = None,
+        *,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None
     """,
     "flash_attn_varlen_func": """
         q: torch.Tensor,
@@ -100,7 +104,11 @@ SIGNATURES = {
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
-        gather_bwd_token_chunk: Optional[int] = None
+        gather_bwd_token_chunk: Optional[int] = None,
+        *,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None
     """,
 }
 
@@ -123,9 +131,11 @@ def test_public_signature(entry):
         assert ast.dump(function.returns, include_attributes=False) == ast.dump(
             expected.returns, include_attributes=False
         )
-    assert all(
-        p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in actual.parameters.values()
-    )
+    scale_names = {"q_descale", "k_descale", "v_descale"}
+    for name, parameter in actual.parameters.items():
+        expected_kind = (inspect.Parameter.KEYWORD_ONLY if name in scale_names
+                         else inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        assert parameter.kind is expected_kind
 
 
 @pytest.mark.parametrize("parameter", ["mask_mod_ref", "mask_mod_simd"])
@@ -170,7 +180,11 @@ def test_positional_and_keyword_binding(entry, monkeypatch):
     signature = inspect.signature(entry)
     arguments = {name: p.default for name, p in signature.parameters.items()}
     arguments.update(q=q, k=q, v=q)
-    assert entry(*arguments.values())[0] is q
+    positional = [arguments[name] for name, p in signature.parameters.items()
+                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+    keywords = {name: arguments[name] for name, p in signature.parameters.items()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert entry(*positional, **keywords)[0] is q
     assert entry(**arguments)[0] is q
     assert captured[0] == captured[1]
 

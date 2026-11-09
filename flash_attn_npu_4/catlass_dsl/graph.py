@@ -106,6 +106,9 @@ _ATTENTION_ARGS = (
     "float? scale, bool causal, int? left, int? right, float cap, Scalar[] scalars, "
     "SymInt? max_q, SymInt? max_k, str layout, bool return_lse, bool training"
 )
+_MXFP8_ATTENTION_ARGS = (
+    f"{_ATTENTION_ARGS}, Tensor q_descale, Tensor k_descale, Tensor v_descale"
+)
 
 
 def _runtime_attention(
@@ -129,6 +132,9 @@ def _runtime_attention(
     layout,
     return_lse,
     training,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     from .interface import _canonical_input, _maximum_length, _prepare_config
 
@@ -158,8 +164,11 @@ def _runtime_attention(
         layout=layout,
         cu_q=cu_q,
         cu_k=cu_k,
-        max_q=_maximum_length(q, max_q),
-        max_k=_maximum_length(k, max_k),
+        max_q=_maximum_length(q, max_q, layout=layout),
+        max_k=_maximum_length(k, max_k, layout=layout),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     return q, k, v, config
 
@@ -208,6 +217,35 @@ def _attention_fwd_fake(
         torch.empty(q.shape, dtype=q.dtype, device=q.device),
         torch.empty(shape, dtype=torch.float32, device=q.device),
     )
+
+
+@torch.library.custom_op(
+    "flash_attn_npu_4_catlass::forward_mxfp8",
+    mutates_args=(),
+    schema=f"({_MXFP8_ATTENTION_ARGS}) -> (Tensor, Tensor)",
+)
+def _attention_fwd_mxfp8(*args):
+    from .interface import _forward
+
+    if args[19] or any(t.requires_grad for t in (*args[:3], *args[6], *args[-3:])):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
+    q, k, v, config = _runtime_attention(*args)
+    return _forward(q, k, v, config)
+
+
+@_attention_fwd_mxfp8.register_fake
+def _attention_fwd_mxfp8_fake(*args):
+    from .interface import _resolve_mxfp8_scales
+
+    if args[19] or any(t.requires_grad for t in (*args[:3], *args[6], *args[-3:])):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
+    _resolve_mxfp8_scales(*args[:3], args[-3:], layout=args[17])
+    out, lse = _attention_fwd_fake(*args[:-3])
+    return torch.empty(out.shape, dtype=torch.bfloat16, device=out.device), lse
 
 
 @torch.library.custom_op(
@@ -281,8 +319,20 @@ def attention(
     score_mod_simd=None,
     score_mod_bwd_simd=None,
     mask_mod_simd=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """Traceable front end; callbacks are static and every buffer is explicit."""
+    from .interface import _resolve_mxfp8_scales
+
+    mxfp8_scales = _resolve_mxfp8_scales(
+        q, k, v, (q_descale, k_descale, v_descale), layout=layout
+    )
+    if mxfp8_scales is not None and any(t.requires_grad for t in aux_tensors or ()):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
     if not isinstance(window_size, (tuple, list)) or len(window_size) != 2:
         raise ValueError("window_size must contain (left, right)")
     if any(
@@ -308,7 +358,7 @@ def attention(
     # Tensor maximum hints have always been ignored without a device readback.
     max_q = None if isinstance(max_q, torch.Tensor) else max_q
     max_k = None if isinstance(max_k, torch.Tensor) else max_k
-    out, lse = _attention_fwd(
+    args = (
         q,
         k,
         v,
@@ -330,6 +380,10 @@ def attention(
         return_lse,
         training,
     )
+    if mxfp8_scales is None:
+        out, lse = _attention_fwd(*args)
+    else:
+        out, lse = _attention_fwd_mxfp8(*args, *mxfp8_scales)
     expose_lse = requires_grad if input_requires_grad is None else input_requires_grad
     return out, lse if return_lse or expose_lse else None
 

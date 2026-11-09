@@ -120,3 +120,82 @@ compiled_attention = torch.compile(
 out, lse = compiled_attention(q, k, v)
 (out.float().square().mean() + lse.mean()).backward()
 ```
+
+## Prequantized MXFP8 inference
+
+Both fixed-length and variable-length FA4 entry points accept three optional,
+keyword-only arguments: `q_descale`, `k_descale`, and
+`v_descale`. Supplying any one selects the CATLASS MXFP8 path and requires
+all three. Q/K/V must already be `torch.float8_e4m3fn`; this API does not quantize
+floating-point inputs. MXFP8 is supported on Ascend 950 with head dimension
+128 and logical sparse blocks of 128x128. Q/K/V and scale tensors must not
+require gradients.
+
+Scales contain E8M0 bytes, exposed as `torch.uint8` or
+`torch.float8_e8m0fnu`. Byte `e` represents `2**(e-127)`, so byte 127 is scale
+1.0; byte 255 is invalid. Q/K group channels by 32; V groups sequence rows by
+32. Two adjacent groups are stored in the final dimension of size 2.
+
+| Input layout | Q scale | K scale | V scale |
+| --- | --- | --- | --- |
+| BSND | `[B,Sq,Hq,2,2]` | `[B,Sk,Hkv,2,2]` | `[B,ceil(Sk/64),Hkv,128,2]` |
+| Packed TND | `[Tq,Hq,2,2]` | `[Tk,Hkv,2,2]` | `[capacity,Hkv,128,2]` |
+
+The public fixed-length API uses BSND. The variable-length API permits Q and
+KV to independently use BSND or TND. Packed cumulative token offsets retain
+the existing int32 `[B+1]` contract, including the leading zero. Packed V-scale
+groups restart at each sequence boundary, and their storage is concatenated
+with each segment padded to 64 rows. The caller must provide capacity of at
+least `sum(ceil(segment_kv_length/64))`; extra trailing capacity is allowed.
+
+```python
+# q_fp8/k_fp8/v_fp8 and their scale tensors are supplied by the caller.
+out, lse = flash_attn_func(
+    q_fp8, k_fp8, v_fp8,
+    q_descale=q_scale,
+    k_descale=k_scale,
+    v_descale=v_scale,
+    mask_mod=local_mask,
+    return_lse=True,
+)
+assert out.dtype == torch.bfloat16
+assert lse.dtype == torch.float32
+```
+
+MXFP8 supports score/mask callbacks, GQA/MQA, causal/window masks, softcap,
+full/partial sparse blocks, and `torch.compile` for forward inference.
+Output is BF16 and LSE is FP32. Fully masked rows produce zero output and
+`-inf` LSE. MXFP8 backward and the separate
+`torch.nn.attention.flex_attention` frontend are not supported.
+
+The direct `catlass_dsl` API returns an `(out, lse_or_none)` pair. The top-level
+FA4 API follows the fixed-length and variable-length return conventions shown
+above.
+
+## Compilation cache
+
+Compiled kernels are cached automatically within the current process.
+Different sequence lengths reuse a cached kernel when the compilation
+specialization remains the same; changes to alignment, layout, callbacks,
+or execution strategy can require another compilation.
+
+To reuse compiled kernels across processes with CATLASS 2.2, set these
+variables before importing FA4:
+
+```bash
+export FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED=1
+export FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=/path/to/attention-cache
+```
+
+Persistent caching is disabled by default. The cache directory is optional
+and defaults to `/tmp/$USER/flash_attention_catlass_dsl_cache` under the
+platform temporary directory.
+
+To clear the cache:
+
+```python
+from flash_attn_npu_4.catlass_dsl.runtime import clear_compile_cache
+
+clear_compile_cache()                 # Clear memory; retain disk artifacts.
+clear_compile_cache(persistent=True)  # Also clear the active disk cache namespace.
+```
