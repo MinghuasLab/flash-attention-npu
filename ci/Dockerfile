@@ -1,7 +1,7 @@
 #
 # 统一 CI 镜像 (参数化): 指定 CANN 基础镜像 + torch + torch_npu 版本。
 # 910B / 950 等所有架构均用本 Dockerfile 构建, 由 ci/build_matrix_images.sh 读取
-# ci/build_matrix.tsv 为每个 combo 构建一次, 镜像名统一为:
+# ci/ci_build_matrix.tsv 为每个 combo 构建一次, 镜像名统一为:
 #   fa-npu-ci:<name>   其中 <name> = <arch>-cann<cann>-torch<torch>
 #   例如 fa-npu-ci:910b-cann9.1-torch2.9 / fa-npu-ci:950-cann9.1-torch2.9
 #
