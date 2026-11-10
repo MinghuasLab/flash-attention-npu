@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Bounded SIMT callback stages for the ordinary DN attention pipelines."""
 
 import catlass.tla as tla

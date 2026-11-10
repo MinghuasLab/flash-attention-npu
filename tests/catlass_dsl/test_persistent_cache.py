@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Persistent-cache recovery and real frontend-free subprocess launches."""
 
 import json

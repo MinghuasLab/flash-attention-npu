@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Minghua Shen.
+
 """Validate release wheel naming, metadata, and selected native extensions."""
 
 from __future__ import annotations

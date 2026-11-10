@@ -1,5 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# Modified by Minghua Shen, 2026.
+# Copyright (c) 2026, Minghua Shen.
 
 import argparse
 from dataclasses import dataclass
@@ -29,10 +28,7 @@ LAYOUTS = [
 ]
 
 PRELUDE = (
-    "/**\n"
-    " * Copyright (c) 2026 Huawei Technologies Co., Ltd.\n"
-    " * Modified by Minghua Shen, 2026.\n"
-    " */\n"
+    "// Copyright (c) 2026, Minghua Shen.\n"
 )
 
 

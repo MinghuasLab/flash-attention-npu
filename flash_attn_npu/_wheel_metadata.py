@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Build and release metadata shared by setup.py and CI tooling.
 
 This module intentionally has no PyTorch or torch_npu dependency.  Importing it

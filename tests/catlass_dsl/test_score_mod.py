@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Fixed-layout score callbacks and their explicit device VJPs."""
 
 import catlass.tla as tla

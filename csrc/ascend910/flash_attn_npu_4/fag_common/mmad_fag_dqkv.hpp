@@ -1,3 +1,15 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
+
 #ifndef FAG_COMMON_GEMM_BLOCK_MMAD_FAG_DQKV_HPP
 #define FAG_COMMON_GEMM_BLOCK_MMAD_FAG_DQKV_HPP
 
@@ -121,7 +133,7 @@ public:
     static_assert((L0A_TILE_SIZE * L0AB_STAGES) <= L0A_SIZE, "L0TileShape exceeding the L0A space!");
     static_assert((L0B_TILE_SIZE * L0AB_STAGES) <= L0B_SIZE, "L0TileShape exceeding the L0B space!");
     static_assert(L0C_TILE_SIZE <= L0C_SIZE, "L0TileShape exceeding the L0C space!");
-    
+
     CATLASS_DEVICE
     BlockMmadFAG(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart_ = 0, uint32_t eventIdStart_ = 0) // eventIdStart给0或4
     {
@@ -146,7 +158,7 @@ public:
             l1BEventList[i] = i + L1A_STAGES + eventIdStart; // 2    or  6
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
         }
-        
+
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             l0ATensorList[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
             l0BTensorList[i] = resource.l0BBuf.template GetBufferByByte<ElementB>(L0B_PINGPONG_BUF_SIZE * i);
@@ -178,7 +190,7 @@ public:
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
         }
-        
+
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[i]);
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
@@ -221,10 +233,10 @@ void operator()(
 
     AscendC::SetAtomicNone();
 
-    uint32_t mL1TileCount = CeilDiv<L1ATileShape::M>(mRound); 
-    uint32_t kL1TileCount = CeilDiv<L1ATileShape::K>(kRound); 
-    
-    for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) { 
+    uint32_t mL1TileCount = CeilDiv<L1ATileShape::M>(mRound);
+    uint32_t kL1TileCount = CeilDiv<L1ATileShape::K>(kRound);
+
+    for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) {
         uint32_t mAL1Actual = (mL1TileIdx < mL1TileCount - 1) ? L1ATileShape::M : (actualM - mL1TileIdx * L1ATileShape::M);
         uint32_t mAL1Round = RoundUp<L1AAlignHelper::M_ALIGNED>(mAL1Actual);
         for (uint32_t kAL1TileIdx = 0; kAL1TileIdx < kL1TileCount; kAL1TileIdx++) {
@@ -236,14 +248,14 @@ void operator()(
             auto gmATile = gmBlockA[layoutA.GetOffset(AGMTileOffset)];
             auto layoutTileAInGM = layoutA.GetTileLayout(MakeCoord(mAL1Actual, kAL1Actual));
 
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]); 
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
             copyGmToL1A(l1ATensor, gmATile, layoutAInL1, layoutTileAInGM);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]); 
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
 
             uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(kAL1Actual);
 
             for (uint32_t kL0TileIdx = 0; kL0TileIdx < kL0TileCount; kL0TileIdx++) {
-                uint32_t kL0Actual = (kL0TileIdx < kL0TileCount - 1) ? L0TileShape::K : (kAL1Actual - kL0TileIdx * L0TileShape::K); 
+                uint32_t kL0Actual = (kL0TileIdx < kL0TileCount - 1) ? L0TileShape::K : (kAL1Actual - kL0TileIdx * L0TileShape::K);
                 uint32_t kL0Round = RoundUp<L1AAlignHelper::K_ALIGNED>(kL0Actual);
                 // ================= L0A MTE1 =================
                 auto l0ATile = l0ATensorList[l0AListId];  // 修正：统一使用 l0AListId
@@ -265,9 +277,9 @@ void operator()(
                 // ================= L0B MTE1 =================
                 auto l0BTile = l0BTensorList[l0BListId]; // 修正：统一使用 l0BListId
                 LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Round, actualN);
-                
+
                 // 【核心修复】L1B 坐标必须包含全局的 kAL1 偏移！
-                MatrixCoord l1BCoord{kAL1TileIdx * L1ATileShape::K + kL0TileIdx * L0TileShape::K, 0}; 
+                MatrixCoord l1BCoord{kAL1TileIdx * L1ATileShape::K + kL0TileIdx * L0TileShape::K, 0};
                 auto l1BTile = l1BTensorList[0][layoutBInL1.GetOffset(l1BCoord)]; // L1B没有pingpong，恒取[0]
 
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
@@ -281,7 +293,7 @@ void operator()(
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(mmadSyncEventId);
 
                 bool initC = (kAL1TileIdx == 0) && (kL0TileIdx == 0);
-                
+
                 // make sure fixp already finished write, GM then issue mmad to write L0C
                 if (initC) {
                     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
@@ -299,7 +311,7 @@ void operator()(
 
                 AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
                 l0BListId = (l0BListId + 1 < L0AB_STAGES) ? (l0BListId + 1) : 0;
-                
+
                 AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
                 l0AListId = (l0AListId + 1 < L0AB_STAGES) ? (l0AListId + 1) : 0;
             } // end of kL0 loop

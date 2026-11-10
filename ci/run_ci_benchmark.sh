@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # CI NPU Benchmark Phase 2. This file must run inside the NPU-selected container.
 set -euo pipefail
 

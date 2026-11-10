@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Versioned, device-independent CATLASS artifact storage.
 
 This is the only module that depends on CATLASS's prepared-executor internals.

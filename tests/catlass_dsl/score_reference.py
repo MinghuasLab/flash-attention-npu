@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Torch-only reference snapshot from the FlashAttention test suite.
 
 BSD-3-Clause; copyright and authors are preserved in

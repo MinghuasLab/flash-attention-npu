@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """MXFP8 Flex attention on Ascend 950 (architecture 3510).
 The fast fixed-exponent path and FP32 repair share scheduling, slots and channels.
 The exact path uses FP32 online statistics and group32 RNE probability packing.

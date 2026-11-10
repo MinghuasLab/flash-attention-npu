@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Representative local/global masks over packed and mixed layouts."""
 
 import pytest

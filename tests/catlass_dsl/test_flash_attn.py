@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Fixed attention, LSE losses, empty inputs and strided views."""
 
 import pytest

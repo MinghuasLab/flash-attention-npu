@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Native score/VJP pairs with independent upstream Torch forward oracles."""
 
 from functools import lru_cache

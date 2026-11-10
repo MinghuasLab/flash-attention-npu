@@ -1,7 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Modified by Minghua Shen, 2026
+ * Copyright (c) 2026, Minghua Shen.
  */
 #ifndef COMMON_ALIBI_BIAS_HPP
 #define COMMON_ALIBI_BIAS_HPP
@@ -9,12 +7,12 @@
 __aicore__ inline void RescaleBiasRow(AscendC::LocalTensor<float> &workUb,
                                       float slope, float preSlope, int32_t count)
 {
-    AscendC::Muls<float>(workUb, workUb, slope / preSlope, count);  
+    AscendC::Muls<float>(workUb, workUb, slope / preSlope, count);
     AscendC::PipeBarrier<PIPE_V>();
 }
 
-__aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb, 
-    int64_t baseColIdx, float slope, int32_t count, 
+__aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
+    int64_t baseColIdx, float slope, int32_t count,
     AscendC::TEventID eventIdSToV, AscendC::TEventID eventIdVToS)
 {
     AscendC::SetFlag<AscendC::HardEvent::V_S>(eventIdVToS);
@@ -25,9 +23,9 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
         workUb.SetValue(i, static_cast<float>(baseColIdx + i));
     }
 
-    AscendC::SetFlag<AscendC::HardEvent::S_V>(eventIdSToV);  
+    AscendC::SetFlag<AscendC::HardEvent::S_V>(eventIdSToV);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(eventIdSToV);
-    
+
     while (n < count) {
         if (2 * n < count) {
             AscendC::Adds(workUb[n], workUb, static_cast<float>(n), n);
@@ -39,7 +37,7 @@ __aicore__ inline void BuildAlibiBiasRow(AscendC::LocalTensor<float> &workUb,
             break;
         }
     }
-    
+
     // Build position differences before scaling. Adding already-scaled blocks
     // cancels rounded multiples of slope and leaves a nonzero bias on the
     // diagonal. Unscaled differences crossing zero are exact, so distance zero
@@ -61,8 +59,8 @@ __aicore__ inline void ApplyAlibi(
     AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
     uint32_t rowStride, uint32_t columnNum,
     int64_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qSBlockBaseIdx, 
-    int64_t qNBlockBaseIdx, int64_t alibiDiffS, 
+    uint32_t qSBlockSize, int64_t qSBlockBaseIdx,
+    int64_t qNBlockBaseIdx, int64_t alibiDiffS,
     AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
     AscendC::LocalTensor<float> &workUb, int64_t kvSStartIdx)
 {

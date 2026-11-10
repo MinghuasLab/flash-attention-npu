@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # 读取 ci/ci_build_matrix.tsv, 为每个 combo (CANN×torch/torch_npu) 构建专用镜像
 # fa-npu-ci:<name> (由 ci/Dockerfile 参数化构建)。

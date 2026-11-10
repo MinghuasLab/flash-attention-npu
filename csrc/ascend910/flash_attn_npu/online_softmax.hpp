@@ -1,8 +1,14 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Modified by Minghua Shen, 2026
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
 
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
@@ -76,8 +82,8 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, 
-        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_, 
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_,
+        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_,
         uint64_t strideDrop_, uint32_t maxKvSeqlen_, AscendC::GlobalTensor<float> alibiSlopesGm_)
     {
         // Allocate UB space
@@ -129,7 +135,7 @@ public:
         alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
         dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
     }
-    
+
     __aicore__ inline
     void set_gmOffsetPret(uint64_t gmOffsetPret_)
     {
@@ -1504,7 +1510,7 @@ public:
                     if constexpr (HAS_ALIBI_) {
                         ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, 
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
@@ -1540,7 +1546,7 @@ public:
                     if constexpr (HAS_ALIBI_) {
                         ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, 
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
@@ -1556,7 +1562,7 @@ public:
                     if constexpr (HAS_ALIBI_) {
                         ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, 
+                        qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff,
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }

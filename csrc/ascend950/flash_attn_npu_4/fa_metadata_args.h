@@ -1,4 +1,5 @@
-/** Copyright (c) 2026 Huawei Technologies Co., Ltd. */
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef CSRC_ASCEND950_FLASH_ATTN_NPU_4_FA_METADATA_ARGS_H
 #define CSRC_ASCEND950_FLASH_ATTN_NPU_4_FA_METADATA_ARGS_H
 

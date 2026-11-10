@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Logical auxiliary tensor views over the backend's flat pointer ABI.
 
 Shapes and nontrivial strides come from the current launch. Rank, broadcast

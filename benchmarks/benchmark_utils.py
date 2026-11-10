@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Shared profiler and reporting utilities for FlashAttention-NPU benchmarks.
 
 Timing protocol:

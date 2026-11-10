@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Ordinary M128 backward with continuous cross-query producer/consumer overlap.
 
 D128 FP16/BF16 with bounded BSND/BNSD/packed GQA and generic SIMD/SIMT callbacks.

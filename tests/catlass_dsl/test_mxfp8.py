@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """MXFP8 forward tests: golden, RNE, layouts, masks, and runtime.
 
 NPU cases carry explicit markers; CPU cases can be selected with ``-m "not npu"``.

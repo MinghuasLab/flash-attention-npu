@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # Stop and remove only containers owned by the current GitHub Actions job.
 
 set -euo pipefail

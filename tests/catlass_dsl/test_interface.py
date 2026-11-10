@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Public signatures and the essential validation/autograd contracts."""
 
 import ast

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Compile-time adapters for native callbacks; no tracing or device fallback."""
 
 from functools import lru_cache

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Native library callbacks with independent Torch references.
 
 Factories are cached so stable callback specializations reuse executors.

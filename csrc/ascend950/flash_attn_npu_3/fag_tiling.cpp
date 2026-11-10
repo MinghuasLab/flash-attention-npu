@@ -1,8 +1,7 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
+
 
 #include "fag_common.h"
 #include "fag_cast_ub_plan.hpp"

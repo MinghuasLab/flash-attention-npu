@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef FAG_KERNEL_COMMON_HPP
 #define FAG_KERNEL_COMMON_HPP
 

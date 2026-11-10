@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Exact/sampled metadata, sparse forward/backward and packed layouts."""
 
 from functools import lru_cache

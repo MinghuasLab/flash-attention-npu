@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 
 //
 // Varlen backward (FAG::FAGVarlenOpt) kernel dispatch for v2, isolated from

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Executor caches with optional, versioned frontend-free disk loading.
 
 Caching executors here skips CATLASS frontend work on repeated launches.

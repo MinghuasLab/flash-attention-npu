@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 // v3 forward FAInfer dispatch, BNSD variant. One explicit instantiation per
 // translation unit so the kernel templates compile in parallel across
 // cores; head_dim is a runtime axis (switch/tiling inside the impl), not a

@@ -1,13 +1,11 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026
- *
- * FA v2 forward split (flash-decode) scheduling helpers, shared between the
- * host path (flash_api.cpp) and the AICPU scheduler-metadata kernel
- * (fa_metadata.aicpu). Everything is inline and free of <algorithm> so the
- * same code compiles for the AICPU toolchain; FaMin/FaMax replace
- * std::min/std::max.
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// FA v2 forward split (flash-decode) scheduling helpers, shared between the
+// host path (flash_api.cpp) and the AICPU scheduler-metadata kernel
+// (fa_metadata.aicpu). Everything is inline and free of <algorithm> so the
+// same code compiles for the AICPU toolchain; FaMin/FaMax replace
+// std::min/std::max.
+
 
 #ifndef FA_SPLIT_H
 #define FA_SPLIT_H

@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef FLASH_ATTN_NPU_FAG_CAST_UB_PLAN_HPP
 #define FLASH_ATTN_NPU_FAG_CAST_UB_PLAN_HPP
 
