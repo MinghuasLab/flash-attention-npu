@@ -538,6 +538,76 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         SetCrossCoreSync<4, PIPE_FIX>(pvReadyFlag);
     }
 
+
+    template<class TensorP, class TensorV, class TensorO>
+    __aicore__ inline void ComputeStack512(TensorP& gP, TensorV& gV, TensorO& gO,
+        AscendC::GlobalTensor<int32_t> pages, uint32_t rows, uint32_t count,
+        uint32_t start, uint32_t pageSize, uint64_t& aSequence, uint64_t& bSequence, uint32_t pageHeadCount=1)
+    {
+        using GmCopy = Gemm::Tile::CopyL0CToGmTla<ArchTag, typename TileCopy::TensorL0C, TensorO>;
+        GmCopy store;
+        for(uint32_t col = 0; col < 512; col += 128) {
+            uint32_t cslot = (col / 128) % 2, cevent = cslot + 2;
+            auto c = tla::MakeTensor(l0CTensor[cslot], tla::MakeLayoutL0C(rows,128U), Arch::PositionL0C{});
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(cevent);
+            for(uint32_t kbase = 0; kbase < count; kbase += 256) {
+                uint32_t countK = AscendC::Std::min(256U,count-kbase);
+                uint32_t physicalK = RoundUp(countK,16U), slot = (kbase/256)%2;
+                uint32_t pevent = slot + 1, vevent = slot + 3;
+                auto p = tla::MakeTensor(l1ATensor[slot], tla::MakeLayout<ElementA,LayoutTagL1A>(RoundUp(rows,16U),256U),Arch::PositionL1{});
+                auto v = tla::MakeTensor(l1BTensor[slot], tla::MakeLayout<ElementB,LayoutTagL1B>(256U,128U),Arch::PositionL1{});
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(pevent);
+                auto ps = GetTile(gP,tla::MakeCoord(0U,kbase),tla::MakeShape(rows,physicalK));
+                auto pd = GetTile(p,tla::MakeCoord(0U,0U),tla::MakeShape(rows,physicalK));
+                Gemm::Tile::TileCopyTla<ArchTag,decltype(ps),decltype(pd)> copyP;
+                copyP(pd,ps);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(pevent);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(vevent);
+                for(uint32_t at = 0; at < countK;) {
+                    uint32_t logical = start+kbase+at, physical=logical, part=countK-at;
+                    if constexpr(PAGED_CACHE_FLAG_) {
+                        part=AscendC::Std::min(part,pageSize-logical%pageSize);
+                        physical=pages.GetValue(logical/pageSize)*pageSize*(PA_BNNBSD_FLAG_ ? pageHeadCount : 1U)+logical%pageSize;
+                    }
+                    auto vs=GetTile(gV,tla::MakeCoord(physical,col),tla::MakeShape(part,128U));
+                    auto vd=GetTile(v,tla::MakeCoord(at,0U),tla::MakeShape(part,128U));
+                    typename TileCopy::template CopyGmToL1B<TensorV> copyV;
+                    copyV(vd,vs);at+=part;
+                }
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(vevent);
+                for(uint32_t kk=0;kk<physicalK;kk+=128) {
+                    uint32_t step=AscendC::Std::min(128U,physicalK-kk);
+                    uint32_t aslot=aSequence++%2,bslot=bSequence++%2;
+                    auto pa=GetTile(p,tla::MakeCoord(0U,kk),tla::MakeShape(rows,step));
+                    auto vb=GetTile(v,tla::MakeCoord(kk,0U),tla::MakeShape(step,128U));
+                    auto a=tla::MakeTensor(l0ATensor[aslot],tla::MakeLayout<ElementA,LayoutTagL0A>(RoundUp(rows,16U),step),Arch::PositionL0A{});
+                    auto b=tla::MakeTensor(l0BTensor[bslot],tla::MakeLayout<ElementB,LayoutTagL0B>(step,128U),Arch::PositionL0B{});
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(aslot);
+                    if(kk==0) AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(pevent);
+                    copyL1ToL0A(a,pa);
+                    if(kk==0) AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(vevent);
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(bslot+2);
+                    copyL1ToL0B(b,vb);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(aslot);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(bslot+2);
+                    if(kk+step==physicalK) {
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(pevent);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(vevent);
+                    }
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(aslot);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(bslot+2);
+                    tileMmad(c,a,b,RoundUp(rows,16U),128U,step,kbase==0 && kk==0);
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(aslot);
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(bslot+2);
+                }
+            }
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(cevent);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(cevent);
+            auto dst=GetTile(gO,tla::MakeCoord(0U,col),tla::MakeShape(RoundUp(rows,16U),128U));
+            store(dst,c);AscendC::SetFlag<AscendC::HardEvent::FIX_M>(cevent);
+        }
+    }
+
   protected:
     /// Data members
     AscendC::LocalTensor<ElementA> l1ATensor[MAX_L1_STAGES];
