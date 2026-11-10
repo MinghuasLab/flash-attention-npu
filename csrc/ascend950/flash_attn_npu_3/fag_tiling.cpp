@@ -2,7 +2,6 @@
 
 // Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
 
-
 #ifndef FAG_TILING_950_CPP_H
 #define FAG_TILING_950_CPP_H
 
@@ -47,14 +46,13 @@ int64_t CheckBn2s2CastUb(FAGTilingData& tiling, const FAGInfo& info)
 
 // The legacy AIV pipeline keeps a 128-element physical UB row stride even
 // when the L1 task width is 64. This preserves the existing VF kernels.
-int64_t CheckLegacyUb(const FAGTilingData& tiling)
+int64_t CheckLegacyUb(const FAGTilingData& tiling, bool singleVec = false)
 {
-    const uint32_t pipelineUb = FagUbLayout::PipelineBytes(tiling.qTile);
+    const uint32_t pipelineUb = FagUbLayout::PipelineBytes(tiling.qTile, singleVec);
     const uint32_t deltaUb = 2 * FagUbLayout::DeltaSlotBytes(tiling.vHeadDim);
     if (pipelineUb > tiling.ubSize || deltaUb > tiling.ubSize) {
         fprintf(stderr, "FAG950 bwd: UB too small: pipeline %llu, delta %llu, capacity %llu\n",
-                (unsigned long long)pipelineUb, (unsigned long long)deltaUb,
-                (unsigned long long)tiling.ubSize);
+                (unsigned long long)pipelineUb, (unsigned long long)deltaUb, (unsigned long long)tiling.ubSize);
         return -1;
     }
     return 0;
@@ -108,14 +106,19 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.scaleValue = info.scaleValue;
     tiling.softcapValue = info.softcapValue;
 
-    // D<=256 keeps the legacy 128x128 full-residency schedule. D>256 uses the
-    // 128x256 partial-resident puncture schedule.
+    // Default kvTile=128. shortQ keeps 128 (larger kvTile was tried and dropped).
+    // VF epilogues use a 128-col chunk loop with row pitch = kvTile.
+    // qTile shrinks for short S1. D>256 uses the 128x256 partial schedule.
     const uint64_t maxHeadDim = std::max(info.qkHeadDim, info.vHeadDim);
     const uint64_t alignedQk = RoundUpU64(info.qkHeadDim, 16);
     const uint64_t alignedV = RoundUpU64(info.vHeadDim, 16);
     tiling.d512Partial = 0;
     tiling.qTile = 128;
     tiling.kvTile = 128;
+    tiling.shortBiDir = 0;
+    tiling.shortBiDirUniform = 0;
+    tiling.shortQ = 0;
+    tiling.shortQUniformS1 = 0;
     if (maxHeadDim > 256) {
         // Precondition for the 128x256 partial schedule: Q/Dy keep a 256-wide
         // half in one 64KB slot and the high halves stream through the 128KB
@@ -128,28 +131,85 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
             fprintf(stderr,
                     "FAG950 bwd: D>256 partial path requires aligned head dim <= %llu, "
                     "got qk=%llu v=%llu\n",
-                    (unsigned long long)MAX_ALIGNED_D, (unsigned long long)alignedQk,
-                    (unsigned long long)alignedV);
+                    (unsigned long long)MAX_ALIGNED_D, (unsigned long long)alignedQk, (unsigned long long)alignedV);
             return -1;
         }
         tiling.d512Partial = 1;
+    }
+
+    // shortQ/shortBiDir only on the non-det full-residency path (not d512Partial).
+    if (!info.deterministic && tiling.d512Partial == 0) {
+        uint64_t maxS1 = info.qSeqlen;
+        uint64_t maxS2 = info.kvSeqlen;
+        bool uniformS1 = true;
+        bool uniformS2 = true;
+        if (info.layout == Layout::TND && info.batch > 0) {
+            if (info.actualSeqQ != nullptr) {
+                maxS1 = 0;
+                for (uint64_t b = 0; b < info.batch; ++b) {
+                    const uint64_t s = static_cast<uint64_t>(info.actualSeqQ[b] > 0 ? info.actualSeqQ[b] : 0);
+                    if (s > maxS1) {
+                        maxS1 = s;
+                    }
+                    if (b > 0 && s != static_cast<uint64_t>(info.actualSeqQ[0] > 0 ? info.actualSeqQ[0] : 0)) {
+                        uniformS1 = false;
+                    }
+                }
+            }
+            if (info.actualSeqKv != nullptr) {
+                maxS2 = 0;
+                for (uint64_t b = 0; b < info.batch; ++b) {
+                    const uint64_t s = static_cast<uint64_t>(info.actualSeqKv[b] > 0 ? info.actualSeqKv[b] : 0);
+                    if (s > maxS2) {
+                        maxS2 = s;
+                    }
+                    if (b > 0 && s != static_cast<uint64_t>(info.actualSeqKv[0] > 0 ? info.actualSeqKv[0] : 0)) {
+                        uniformS2 = false;
+                    }
+                }
+            }
+        }
+        if (maxS1 > 0 && maxS1 <= 16) {
+            tiling.qTile = 16;
+        } else if (maxS1 <= 32) {
+            tiling.qTile = 32;
+        } else if (maxS1 <= 64) {
+            tiling.qTile = 64;
+        }
+        // Short bidirectional: one S1/S2 tile per (b,n2,g). Isolate the
+        // scalar-oriented schedule so longer S1/S2 shapes stay on legacy.
+        if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 0 && maxS2 <= 16) {
+            tiling.shortBiDir = 1;
+            if (uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
+                info.totalQ == info.batch * maxS1 && info.totalKv == info.batch * maxS2) {
+                tiling.shortBiDirUniform = 1;
+            }
+        } else if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 16 && info.batch > 0) {
+            // Short-Q long-KV scene: core-strided (b,n2); S2 inner.
+            // Gate on maxS1/S2 only (from actualSeq or max_seqlen). Runtime
+            // maps gid → (b,n2) as gid/kvHeadNum (kvHeadNum is global).
+            // kvTile stays 128 (256 N-split wiped the win).
+            tiling.shortQ = 1;
+            if (uniformS1 && info.totalQ == info.batch * maxS1) {
+                tiling.shortQUniformS1 = 1;
+            }
+        }
     }
 
     constexpr uint64_t L1_SIZE = 512 * 1024;
     constexpr uint64_t L1_CUBE_SLOT_BYTES = 64 * 1024;
     // Full-residency path budgets the full D column into one cube slot.
     // Partial path only keeps a 256-wide half in Q/Dy; scratch holds the rest.
-    const uint64_t residentCols =
-        tiling.d512Partial ? 256ULL : std::max(alignedQk, alignedV);
-    const uint64_t maxOperandBytes =
-        residentCols * std::max(tiling.qTile, tiling.kvTile) * sizeof(uint16_t);
+    const uint64_t residentCols = tiling.d512Partial ? 256ULL : std::max(alignedQk, alignedV);
+    const uint64_t maxOperandBytes = residentCols * std::max(tiling.qTile, tiling.kvTile) * sizeof(uint16_t);
     const uint64_t pdsBytes = 4ULL * tiling.qTile * tiling.kvTile * sizeof(uint16_t);
     if (maxOperandBytes > L1_CUBE_SLOT_BYTES || 6 * L1_CUBE_SLOT_BYTES + pdsBytes > L1_SIZE) {
-        fprintf(stderr, "FAG950 bwd: invalid L1 tiling: operand %llu, P/dS %llu\n",
-                (unsigned long long)maxOperandBytes, (unsigned long long)pdsBytes);
+        fprintf(stderr, "FAG950 bwd: invalid L1 tiling: operand %llu, P/dS %llu\n", (unsigned long long)maxOperandBytes,
+                (unsigned long long)pdsBytes);
         return -1;
     }
-    if (CheckLegacyUb(tiling) != 0) {
+    const bool singleVec = tiling.shortQ != 0 || tiling.shortBiDir != 0;
+    if (CheckLegacyUb(tiling, singleVec) != 0) {
         return -1;
     }
     if (info.qkHeadDim == 192 && info.vHeadDim == 128 && !info.deterministic) {
@@ -165,15 +225,24 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.dqVecNum = info.deterministic ? info.dqVecNum : 0;
     tiling.dkVecNum = info.deterministic ? info.dkVecNum : 0;
     tiling.dvVecNum = info.deterministic ? info.dvVecNum : 0;
+    tiling.earlyDkvCast = 0;
+    tiling.detCastChunkRows = 0;
 
     const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
     const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
 
     if (!info.deterministic) {
-        // Legacy layout, byte-identical to the non-deterministic path.
+        // Legacy layout. earlyDkvCast: Fixpipe writes bf16/fp16 dk/dv in-loop
+        // and drops the fp32 dk/dv workspaces (FagPost skips those casts).
+        // Enabled only for short-S TND (shortQ/shortBiDir) with D<=128; BSND
+        // and other TND keep the fp32 workspace + FagPost cast.
+        const bool earlyDkv = info.layout == Layout::TND && info.qkHeadDim <= 128 && info.vHeadDim <= 128 &&
+                              (tiling.shortQ != 0 || tiling.shortBiDir != 0);
+        tiling.earlyDkvCast = earlyDkv ? 1 : 0;
+
         uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
+        uint64_t dkWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dvWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
         uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
 
         tiling.dqOffset = 0;
@@ -181,6 +250,8 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         tiling.dvOffset = tiling.dkOffset + dkWsSize;
         tiling.deltaOffset = tiling.dvOffset + dvWsSize;
         tiling.workspaceSize = tiling.deltaOffset + deltaWsSize;
+        tiling.dkPrivOffset = 0;
+        tiling.dvPrivOffset = 0;
         return 0;
     }
 

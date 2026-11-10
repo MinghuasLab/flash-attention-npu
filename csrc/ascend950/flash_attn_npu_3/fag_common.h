@@ -5,7 +5,6 @@
 // to device global memory and will be consumed by the future arch35 FAG
 // kernel.
 
-
 #ifndef FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H
 #define FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H
 
@@ -105,6 +104,24 @@ struct FAGTilingData {
     uint32_t usedCoreNum = 0;
     uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
     uint32_t detCastChunkRows = 0;
+    // Non-deterministic short-S TND (shortQ/shortBiDir) with D<=128: cast each
+    // flushed dk/dv tile to bf16/fp16 in-loop and skip FagPost for dk/dv.
+    // dq still uses the fp32 workspace + FagPost (atomic accumulate over S2).
+    // 0: legacy end-of-kernel cast (BSND and non-short TND).
+    uint32_t earlyDkvCast = 0;
+    // Non-deterministic short bidirectional (maxS1<=16 && maxS2<=16): isolated
+    // schedule that replaces the B×N2 full scan with core-strided task indexing.
+    // Must stay 0 for longer S1/S2 so those shapes keep the legacy pipeline.
+    uint32_t shortBiDir = 0;
+    // 1 when every batch shares the same S1/S2. Enables arithmetic batch
+    // offsets without cu_seqlens GetValue in the hot loop.
+    uint32_t shortBiDirUniform = 0;
+    // Non-deterministic short-Q long-KV (maxS1<=16 && maxS2>16): core-strided
+    // schedule over (b,n2) with S2 inner. Mutually exclusive with shortBiDir.
+    // Indexing is arithmetic (gid → b,n2 via kvHeadNum); no per-batch prefix table.
+    uint32_t shortQ = 0;
+    // 1 when every batch shares the same S1 (enables arithmetic Q offsets).
+    uint32_t shortQUniformS1 = 0;
 
     uint64_t ubSize = 0;
     uint64_t batch = 0;
@@ -193,6 +210,8 @@ struct FAGBlockInfo {
     bool loadKv = true;
     bool flushDkv = true;
     bool initDkv = true;
+    // shortQ: first S2 tile may overwrite zeroed dq workspace (no atomic).
+    bool atomicDq = true;
 
     // BN2S2 only: fold accumulator index of this task and, for every fold
     // buffer of the current column, the real (batch, n2, s2) column that the

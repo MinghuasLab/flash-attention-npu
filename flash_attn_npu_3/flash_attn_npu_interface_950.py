@@ -416,9 +416,9 @@ def _flash_attn_backward(
             torch.nn.functional.pad(x, (0, v_bucket - v_head_dim)) if v_bucket != v_head_dim else x
             for x in (v, out, dout)
         ]
-        dq_kernel = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-        dk_kernel = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-        dv_kernel = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        dq_kernel = torch.zeros(q.shape, dtype=q.dtype, device=q.device)
+        dk_kernel = torch.zeros(k.shape, dtype=k.dtype, device=k.device)
+        dv_kernel = torch.zeros(v.shape, dtype=v.dtype, device=v.device)
     _, _, _, softmax_d = flash_attn_npu_3_950.bwd(
         dout,
         q,
