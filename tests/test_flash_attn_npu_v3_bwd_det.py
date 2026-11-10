@@ -41,6 +41,8 @@ window_size_left / window_size_right 同时传给参考前向、反向算子和�
       -k "not large and not long and not eq and not pack8"                # 跳过大规模
 """
 
+import os
+
 import pytest
 import torch
 import torch_npu
@@ -51,8 +53,12 @@ if "Ascend950" not in (torch_npu.npu.get_device_name() if torch_npu.npu.device_c
     pytest.skip("flash_attn_npu_3 950 backward tests require Ascend950", allow_module_level=True)
 
 from flash_attn_npu_3.flash_attn_npu_interface_950 import _flash_attn_backward
+import tests.fa_small_op_golden as fa_small_op_golden
+from tests.common.golden_cache import get_or_compute_golden, register_retry, retry_cached_value
 from tests.fa_small_op_golden import (
-    golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd, make_window_atten_mask,
+    golden_bsnd_bwd_from_fwd,
+    golden_tnd_bwd_from_fwd,
+    make_window_atten_mask,
 )
 
 INPUT_LIMIT = 2.0
@@ -253,9 +259,7 @@ def torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal, window_size_left, wind
         qi = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0)
         ki = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
         vi = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
-        oi, li = torch_ref_fwd_bsnd(
-            qi, ki, vi, scale, causal, window_size_left, window_size_right
-        )
+        oi, li = torch_ref_fwd_bsnd(qi, ki, vi, scale, causal, window_size_left, window_size_right)
         outs.append(oi.squeeze(0))
         lses.append(li.squeeze(0))
     return torch.cat(outs, dim=0), torch.cat(lses, dim=1)
@@ -291,7 +295,23 @@ def run_bwd_bsnd(q, k, v, dout, out, lse, scale, causal, det, window_size_left, 
     return dq, dk, dv
 
 
-def run_bwd_varlen(q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det, window_size_left, window_size_right):
+def run_bwd_varlen(
+    q,
+    k,
+    v,
+    dout,
+    out,
+    lse,
+    cu_q_t,
+    cu_k_t,
+    max_sq,
+    max_sk,
+    scale,
+    causal,
+    det,
+    window_size_left,
+    window_size_right,
+):
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
         dout,
@@ -325,6 +345,56 @@ def max_diff(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
+def _cached_small_op_bwd(*, kind, inputs, metadata, compute_fn):
+    """Cache fa_small_op_golden dq/dk/dv under CI GOLDEN_CACHE_MODE."""
+    nodeid = os.environ.get("GOLDEN_CACHE_NODEID", f"v3-bwd-det-{kind}")
+    api_name = os.environ.get("GOLDEN_CACHE_API_NAME", "_flash_attn_backward")
+
+    def compute():
+        dq, dk, dv = compute_fn()
+        return {
+            "dq": dq.detach().cpu(),
+            "dk": dk.detach().cpu(),
+            "dv": dv.detach().cpu(),
+        }
+
+    cache_args = dict(
+        nodeid=nodeid,
+        api_name=api_name,
+        metadata={"version": 3, "kind": kind, **metadata},
+        inputs=inputs,
+        compute_fn=compute,
+        expected_keys=("dq", "dk", "dv"),
+        source_files=[fa_small_op_golden.__file__],
+    )
+    values, status = get_or_compute_golden(**cache_args, return_status=True)
+    if status == "hit":
+        register_retry(values, lambda: get_or_compute_golden(**cache_args, force_refresh=True))
+    return values["dq"], values["dk"], values["dv"]
+
+
+def _assert_close_vs_golden(name, tag, gname, got, gold):
+    try:
+        torch.testing.assert_close(
+            got.cpu(),
+            gold.cpu(),
+            rtol=RTOL_GOLDEN,
+            atol=ATOL_GOLDEN,
+            msg=f"{name} [{tag}] {gname} vs golden",
+        )
+    except AssertionError:
+        if not retry_cached_value(gold):
+            raise
+        print(f"[golden-cache] mismatch for {name} [{tag}] {gname}; recomputed golden and retrying")
+        torch.testing.assert_close(
+            got.cpu(),
+            gold.cpu(),
+            rtol=RTOL_GOLDEN,
+            atol=ATOL_GOLDEN,
+            msg=f"{name} [{tag}] {gname} vs golden (after refresh)",
+        )
+
+
 def _check_case(name, run_bwd, golden_fn):
     """golden 对齐 + det 逐位一致 + det/nd 互一致；不满足即断言失败。
 
@@ -335,13 +405,7 @@ def _check_case(name, run_bwd, golden_fn):
 
     for tag, grad in grads.items():
         for gname, got, gold in zip(("dq", "dk", "dv"), grad, golden):
-            torch.testing.assert_close(
-                got.cpu(),
-                gold.cpu(),
-                rtol=RTOL_GOLDEN,
-                atol=ATOL_GOLDEN,
-                msg=f"{name} [{tag}] {gname} vs golden",
-            )
+            _assert_close_vs_golden(name, tag, gname, got, gold)
 
     for it in range(REPEAT):
         cur = run_bwd(True)
@@ -367,44 +431,86 @@ def _check_case(name, run_bwd, golden_fn):
     print(f"[PASS] {name}: golden 一致 + {REPEAT} 次 det 逐位一致 + det/nondet 互相一致")
 
 
+@pytest.mark.golden_api("_flash_attn_backward")
 @pytest.mark.parametrize(
     "name, bsz, sq, sk, hq, hkv, hd, causal, large, window_size_left, window_size_right",
     BSND_CASES,
     ids=[c[0] for c in BSND_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large, window_size_left, window_size_right):
+def test_fa_bwd_det_bsnd(
+    name, bsz, sq, sk, hq, hkv, hd, causal, large, window_size_left, window_size_right
+):
     scale = hd ** (-0.5)
     q = rand_inputs((bsz, sq, hq, hd), 42)
     k = rand_inputs((bsz, sk, hkv, hd), 43)
     v = rand_inputs((bsz, sk, hkv, hd), 44)
     dout = rand_inputs((bsz, sq, hq, hd), 45)
-    out, lse = torch_ref_fwd_bsnd(
-        q, k, v, scale, causal, window_size_left, window_size_right
-    )
+    out, lse = torch_ref_fwd_bsnd(q, k, v, scale, causal, window_size_left, window_size_right)
 
     def run_bwd(det):
         return run_bwd_bsnd(
-            q, k, v, dout, out, lse, scale, causal, det,
-            window_size_left, window_size_right,
+            q,
+            k,
+            v,
+            dout,
+            out,
+            lse,
+            scale,
+            causal,
+            det,
+            window_size_left,
+            window_size_right,
         )
 
     def golden_fn():
-        return golden_bsnd_bwd_from_fwd(
-            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P, causal,
-            window_size_left, window_size_right, gtype=GTYPE
+        return _cached_small_op_bwd(
+            kind="bsnd-bwd-det",
+            inputs={"q": q, "k": k, "v": v, "dout": dout, "lse": lse},
+            metadata={
+                "hq": hq,
+                "hkv": hkv,
+                "hd": hd,
+                "causal": causal,
+                "scale": scale,
+                "softcap": SOFTCAP,
+                "dropout_p": DROPOUT_P,
+                "window_size_left": window_size_left,
+                "window_size_right": window_size_right,
+                "gtype": str(GTYPE),
+            },
+            compute_fn=lambda: golden_bsnd_bwd_from_fwd(
+                q,
+                k,
+                v,
+                dout,
+                out,
+                lse,
+                hq,
+                hkv,
+                scale,
+                SOFTCAP,
+                DROPOUT_P,
+                causal,
+                window_size_left,
+                window_size_right,
+                gtype=GTYPE,
+            ),
         )
 
     _check_case(name, run_bwd, golden_fn)
 
 
+@pytest.mark.golden_api("_flash_attn_backward")
 @pytest.mark.parametrize(
     "name, cu_q, cu_k, hq, hkv, hd, causal, large, window_size_left, window_size_right",
     VARLEN_CASES,
     ids=[c[0] for c in VARLEN_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large, window_size_left, window_size_right):
+def test_fa_bwd_det_varlen(
+    name, cu_q, cu_k, hq, hkv, hd, causal, large, window_size_left, window_size_right
+):
     scale = hd ** (-0.5)
     total_q, total_k = cu_q[-1], cu_k[-1]
     q = rand_inputs((total_q, hq, hd), 42)
@@ -421,31 +527,68 @@ def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large, window_
 
     def run_bwd(det):
         return run_bwd_varlen(
-            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det,
-            window_size_left, window_size_right,
-        )
-
-    def golden_fn():
-        seqlens_q = [cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)]
-        seqlens_k = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
-        return golden_tnd_bwd_from_fwd(
             q,
             k,
             v,
             dout,
             out,
             lse,
-            hq,
-            hkv,
-            seqlens_q,
-            seqlens_k,
+            cu_q_t,
+            cu_k_t,
+            max_sq,
+            max_sk,
             scale,
-            SOFTCAP,
-            DROPOUT_P,
             causal,
+            det,
             window_size_left,
             window_size_right,
-            gtype=GTYPE,
+        )
+
+    def golden_fn():
+        seqlens_q = [cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)]
+        seqlens_k = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
+        return _cached_small_op_bwd(
+            kind="tnd-bwd-det",
+            inputs={
+                "q": q,
+                "k": k,
+                "v": v,
+                "dout": dout,
+                "lse": lse,
+                "seqlens_q": seqlens_q,
+                "seqlens_k": seqlens_k,
+            },
+            metadata={
+                "hq": hq,
+                "hkv": hkv,
+                "hd": hd,
+                "causal": causal,
+                "scale": scale,
+                "softcap": SOFTCAP,
+                "dropout_p": DROPOUT_P,
+                "window_size_left": window_size_left,
+                "window_size_right": window_size_right,
+                "gtype": str(GTYPE),
+            },
+            compute_fn=lambda: golden_tnd_bwd_from_fwd(
+                q,
+                k,
+                v,
+                dout,
+                out,
+                lse,
+                hq,
+                hkv,
+                seqlens_q,
+                seqlens_k,
+                scale,
+                SOFTCAP,
+                DROPOUT_P,
+                causal,
+                window_size_left,
+                window_size_right,
+                gtype=GTYPE,
+            ),
         )
 
     _check_case(name, run_bwd, golden_fn)
