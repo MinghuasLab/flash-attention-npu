@@ -95,8 +95,8 @@ inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
                                        int64_t max_seqlen_q_bound, int64_t max_seqlen_k_bound)
 {
     FwdMaskDerivation derived;
-    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q_bound, max_seqlen_k_bound,
-                                        window_left, window_right, derived.is_causal, derived.is_local);
+    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q_bound, max_seqlen_k_bound, window_left, window_right,
+                                        derived.is_causal, derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? 4u : (derived.is_causal ? 1u : 0u);

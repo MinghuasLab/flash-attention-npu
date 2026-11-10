@@ -610,19 +610,23 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
 {
     uint64_t fullQ128Tasks = 0;
     for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
-        const uint32_t qLen = faInfo_.qSeqlenList == nullptr ? faInfo_.maxQSeqlen :
-            (faInfo_.layout == FwdLayout::TND ? faInfo_.qSeqlenList[b + 1] - faInfo_.qSeqlenList[b]
-                                             : faInfo_.qSeqlenList[b]);
-        const uint32_t kvLen = faInfo_.kvSeqlenList == nullptr ? faInfo_.maxKvSeqlen :
-            (faInfo_.layout == FwdLayout::TND && !faInfo_.pagedCacheFlag
-                 ? faInfo_.kvSeqlenList[b + 1] - faInfo_.kvSeqlenList[b] : faInfo_.kvSeqlenList[b]);
-        const uint32_t activeQ = fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK,
-                                                           faInfo_.windowSizeRight);
+        const uint32_t qLen =
+            faInfo_.qSeqlenList == nullptr
+                ? faInfo_.maxQSeqlen
+                : (faInfo_.layout == FwdLayout::TND ? faInfo_.qSeqlenList[b + 1] - faInfo_.qSeqlenList[b]
+                                                    : faInfo_.qSeqlenList[b]);
+        const uint32_t kvLen = faInfo_.kvSeqlenList == nullptr
+                                   ? faInfo_.maxKvSeqlen
+                                   : (faInfo_.layout == FwdLayout::TND && !faInfo_.pagedCacheFlag
+                                          ? faInfo_.kvSeqlenList[b + 1] - faInfo_.kvSeqlenList[b]
+                                          : faInfo_.kvSeqlenList[b]);
+        const uint32_t activeQ =
+            fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
-    qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV,
-        faInfo_.maxQSeqlen, fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
-        faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
+    qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
+                                             fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
+                                             faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
     FillBasicTilingData(tilingdata);
     if (!faInfo_.isTilingSink) {
         FillSplitCoreTilingData(tilingdata);

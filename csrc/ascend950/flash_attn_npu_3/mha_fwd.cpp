@@ -234,8 +234,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     const bool empty_query = is_varlen_q && q.size(0) == 0 && seqlen_q == 0;
     TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
                 "query sequence length and head count must be positive unless TND total_q=max_seqlen_q=0");
-    TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query,
-                "total_q must be positive when max_seqlen_q is positive");
+    TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query, "total_q must be positive when max_seqlen_q is positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
     TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
@@ -310,8 +309,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     }
 
     if (empty_query) {
-        auto lse = at::empty(return_softmax_lse ? std::vector<int64_t>{num_heads, 0}
-                                               : std::vector<int64_t>{0},
+        auto lse = at::empty(return_softmax_lse ? std::vector<int64_t>{num_heads, 0} : std::vector<int64_t>{0},
                              q.options().dtype(at::kFloat));
         auto empty_accum = at::empty({0}, q.options().dtype(at::kFloat));
         auto empty_lse_accum = at::empty({0}, q.options().dtype(at::kFloat));
@@ -538,44 +536,42 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
     const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;
-    const FwdLaunchArgs fwdArgs{is_bf16,
-                                fmt,
-                                mask_category,
-                                paged_KV,
-                                enableDN,
-                                return_softmax_lse,
-                                is_softcap,
-                                launchBlockDim,
-                                aclStream,
-                                qDev,
-                                kDev,
-                                vDev,
-                                maskDevice,
-                                blockTableDev,
-                                oDev,
-                                lseDev,
-                                qSeqDev,
-                                kvSeqDev,
-                                seqUsedQDev,
-                                seqUsedKvDev,
-                                wsDev,
-                                tilDev,
-                                scale_value,
-                                softcap,
-                                static_cast<uint32_t>(num_blocks),
-                                static_cast<uint32_t>(max_num_blocks_per_seq),
-                                kv_seqlen_allocated,
-                                quantMode,
-                                qDescale,
-                                kDescale,
-                                vDescale,
-                                {paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U,
-                                 paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
-                                 paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U,
-                                 paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
-                                 paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U,
-                                 paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
-                                 is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
+    const FwdLaunchArgs fwdArgs{
+        is_bf16,
+        fmt,
+        mask_category,
+        paged_KV,
+        enableDN,
+        return_softmax_lse,
+        is_softcap,
+        launchBlockDim,
+        aclStream,
+        qDev,
+        kDev,
+        vDev,
+        maskDevice,
+        blockTableDev,
+        oDev,
+        lseDev,
+        qSeqDev,
+        kvSeqDev,
+        seqUsedQDev,
+        seqUsedKvDev,
+        wsDev,
+        tilDev,
+        scale_value,
+        softcap,
+        static_cast<uint32_t>(num_blocks),
+        static_cast<uint32_t>(max_num_blocks_per_seq),
+        kv_seqlen_allocated,
+        quantMode,
+        qDescale,
+        kDescale,
+        vDescale,
+        {paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
+         paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
+         paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
+         is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
     auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
         launch_fwd(fwdArgs);
         return 0;

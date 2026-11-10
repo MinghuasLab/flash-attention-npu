@@ -331,11 +331,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                     uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                     auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gPageTensor = tla::MakeTensor(
-                        gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
-                        gBTensor.layout(), Arch::PositionGM{});
-                    auto gBTensorTlaTile = GetTile(gPageTensor, tla::MakeCoord(0, blockOffset),
-                                                   tla::MakeShape(embed, l0TileNAct));
+                    auto gPageTensor = tla::MakeTensor(gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                                                       gBTensor.layout(), Arch::PositionGM{});
+                    auto gBTensorTlaTile =
+                        GetTile(gPageTensor, tla::MakeCoord(0, blockOffset), tla::MakeShape(embed, l0TileNAct));
                     copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
                 } else {
                     if (isShrink == 1) {

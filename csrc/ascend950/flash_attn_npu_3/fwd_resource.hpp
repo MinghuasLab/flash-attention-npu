@@ -29,7 +29,10 @@ struct ForwardResource950 {
     LocalTensorBuffer<Ascend950, AscendC::TPosition::VECCALC> ubBuf;
     ForwardCubeBuffer950<AscendC::TPosition::C2PIPE2GM, Ascend950::FIXBUF_SIZE> fpBuf;
 
-    __aicore__ inline ForwardResource950() { pipe.Destroy(); }
+    __aicore__ inline ForwardResource950()
+    {
+        pipe.Destroy();
+    }
 };
 } // namespace Catlass::Arch
 #endif

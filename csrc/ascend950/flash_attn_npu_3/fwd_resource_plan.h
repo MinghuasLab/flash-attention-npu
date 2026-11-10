@@ -71,25 +71,26 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
 
 FA950_PLAN_INLINE constexpr uint32_t L1Bytes(uint32_t d, uint32_t dv)
 {
-    return 128U * ((d + 15U) / 16U * 16U) * 2U + 192U * 256U * 2U * 2U +
-           128U * 128U * 2U * P_STAGES + 128U * ((dv + 15U) / 16U * 16U) * 2U * 2U;
+    return 128U * ((d + 15U) / 16U * 16U) * 2U + 192U * 256U * 2U * 2U + 128U * 128U * 2U * P_STAGES +
+           128U * ((dv + 15U) / 16U * 16U) * 2U * 2U;
 }
 
 FA950_PLAN_INLINE constexpr uint32_t QueryTile(uint32_t d, uint32_t dv, uint32_t maxQ)
 {
     // Preserve small-query task parallelism and existing decode grouping.
-    return dv > 128U && (maxQ <= 64U || L1Bytes(d, dv) > L1_CAPACITY ||
-                         MakeUbPlan(dv, OTmpStages(dv)).total > UB_CAPACITY) ? 64U : 128U;
+    return dv > 128U &&
+                   (maxQ <= 64U || L1Bytes(d, dv) > L1_CAPACITY || MakeUbPlan(dv, OTmpStages(dv)).total > UB_CAPACITY)
+               ? 64U
+               : 128U;
 }
 
-FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, uint32_t maxQ,
-                                                     uint64_t fullQ128Tasks, uint32_t cores)
+FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, uint32_t maxQ, uint64_t fullQ128Tasks,
+                                                       uint32_t cores)
 {
     // Larger tiles reduce independent Q work. Keep several complete waves so
     // tail tasks and the single-PV-buffer latency do not dominate small inputs.
     // Count only full Q tiles; ragged/empty sequences must not inflate occupancy.
-    return dv > 128U && fullQ128Tasks < uint64_t(cores) * 4U
-               ? 64U : QueryTile(d, dv, maxQ);
+    return dv > 128U && fullQ128Tasks < uint64_t(cores) * 4U ? 64U : QueryTile(d, dv, maxQ);
 }
 
 static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");

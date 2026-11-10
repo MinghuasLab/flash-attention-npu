@@ -9,21 +9,23 @@ namespace fa950_plan {
 // empty. Unlimited-right windows and unmasked attention keep every query row.
 inline uint32_t ActiveQueryRows(uint32_t q, uint32_t kv, bool hasMask, int64_t right)
 {
-    if (kv == 0U) return 0U;
-    if (!hasMask || right < 0) return q;
+    if (kv == 0U)
+        return 0U;
+    if (!hasMask || right < 0)
+        return q;
     const uint64_t rows = uint64_t(kv) + uint64_t(right);
     return rows < q ? static_cast<uint32_t>(rows) : q;
 }
 
-inline uint32_t SelectQueryTile(uint32_t d, uint32_t dv, uint32_t maxQ, uint64_t fullTasks,
-                                uint32_t cores, bool isLocal, int64_t left, int64_t right)
+inline uint32_t SelectQueryTile(uint32_t d, uint32_t dv, uint32_t maxQ, uint64_t fullTasks, uint32_t cores,
+                                bool isLocal, int64_t left, int64_t right)
 {
     // A narrow finite window adds masked KV work when Q doubles. Single PV
     // storage also serializes Fixpipe/rescale: use a conservative four-KV-tile
     // window floor there, versus two tiles when both PV stages fit in UB.
     const uint32_t minWindowTiles = OTmpStages(dv) == 1U ? 4U : 2U;
-    if (dv > 128U && isLocal && left >= 0 && right >= 0 &&
-        uint64_t(left) + right + 1U < minWindowTiles * 128U) return 64U;
+    if (dv > 128U && isLocal && left >= 0 && right >= 0 && uint64_t(left) + right + 1U < minWindowTiles * 128U)
+        return 64U;
     return QueryTileForTasks(d, dv, maxQ, fullTasks, cores);
 }
 } // namespace fa950_plan

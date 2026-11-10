@@ -426,8 +426,14 @@ class BishengBuildExt(build_ext):
         # switch or stash re-apply.
         aicpu_stamp = aicpu_obj + ".inputs"
         aicpu_inputs = [aicpu_src]
-        for name in ("tilingdata.h", "fa_metadata_args.h", "fa_split.h", "fused_task.h",
-                     "fwd_resource_plan.h", "fwd_tiling_policy.h"):
+        for name in (
+            "tilingdata.h",
+            "fa_metadata_args.h",
+            "fa_split.h",
+            "fused_task.h",
+            "fwd_resource_plan.h",
+            "fwd_tiling_policy.h",
+        ):
             header = os.path.join(src_dir, name)
             if os.path.exists(header):
                 aicpu_inputs.append(header)

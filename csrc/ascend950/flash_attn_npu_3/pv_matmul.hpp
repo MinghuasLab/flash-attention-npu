@@ -149,8 +149,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr uint32_t C0_ELEMS = 32 / sizeof(ElementA);
 
     template <class Resource>
-    __aicore__ inline BlockMmadTla(Resource& resource, uint32_t l1BufAddrStart,
-                                   BlockMmadPVTileHelper& pvL1TileHelper)
+    __aicore__ inline BlockMmadTla(Resource& resource, uint32_t l1BufAddrStart, BlockMmadPVTileHelper& pvL1TileHelper)
     {
         l1ATileM = pvL1TileHelper.pvL1TileM;
         l1BTileN = pvL1TileHelper.pvL1TileN;
@@ -293,11 +292,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 uint32_t blockTableIdx = kvTileStart / blockSize;
                 uint32_t blockOffset = kvTileStart % blockSize;
                 auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                auto gPageTensor = tla::MakeTensor(
-                    gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
-                    gBTensor.layout(), Arch::PositionGM{});
-                auto gBTensorTlaTile = GetTile(gPageTensor,
-                    tla::MakeCoord(blockOffset, 0), tla::MakeShape(curBaseTileSize, embed));
+                auto gPageTensor = tla::MakeTensor(gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                                                   gBTensor.layout(), Arch::PositionGM{});
+                auto gBTensorTlaTile =
+                    GetTile(gPageTensor, tla::MakeCoord(blockOffset, 0), tla::MakeShape(curBaseTileSize, embed));
                 copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
             } else {
                 if (isShrink == 1) {

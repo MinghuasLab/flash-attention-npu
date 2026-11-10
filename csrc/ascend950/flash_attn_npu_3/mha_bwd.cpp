@@ -143,8 +143,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.layout =
         is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
     bool is_local = false;
-    fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right,
-                                        is_causal, is_local);
+    fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right, is_causal,
+                                        is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fag_info.maskType = FAGTiling950::MaskType::CAUSAL;
@@ -186,7 +186,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // K and V may have different unused packed tails. The common workspace
     // extent must fit both gradient outputs; longer tails are zeroed below.
     fag_info.totalKv = is_varlen ? static_cast<uint64_t>(std::min(k_sizes[0], v_sizes[0]))
-                                : static_cast<uint64_t>(batch_size * kv_seqlen);
+                                 : static_cast<uint64_t>(batch_size * kv_seqlen);
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
@@ -248,10 +248,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         if (kvGradEnd < v_sizes[0]) {
             dv.slice(0, kvGradEnd).zero_();
         }
-        at::Tensor used_q_cpu = seqused_q_.has_value()
-            ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
-        at::Tensor used_k_cpu = seqused_k_.has_value()
-            ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        at::Tensor used_q_cpu =
+            seqused_q_.has_value() ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
+        at::Tensor used_k_cpu =
+            seqused_k_.has_value() ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
         const int32_t* used_q = used_q_cpu.defined() ? used_q_cpu.data_ptr<int32_t>() : nullptr;
         const int32_t* used_kv = used_k_cpu.defined() ? used_k_cpu.data_ptr<int32_t>() : nullptr;
         for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
@@ -423,15 +423,15 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>         \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>     \
         <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
                                             cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
                                             ptr(tiling_device))
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
     do {                                                                                                               \
-        if (has_attn_mask) {                                                                                               \
+        if (has_attn_mask) {                                                                                           \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
                     LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \

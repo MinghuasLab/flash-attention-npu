@@ -94,17 +94,9 @@ def _paged_kv_inner_layout(x):
     if x is None or x.dim() != 4:
         return None
     page_size, num_heads, head_dim = x.shape[1:]
-    if (
-        x.stride(1) == num_heads * head_dim
-        and x.stride(2) == head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
         return "BBND"
-    if (
-        x.stride(1) == head_dim
-        and x.stride(2) == page_size * head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
         return "BNBD"
     return None
 
@@ -268,11 +260,16 @@ def _can_use_eager_forward(tensors):
     # registered custom op and its fake implementation.
     if torch.compiler.is_compiling() or torch.jit.is_tracing() or torch.jit.is_scripting():
         return False
-    in_dispatch_mode = getattr(_python_dispatch, 'is_in_torch_dispatch_mode', None)
-    if in_dispatch_mode is None or in_dispatch_mode() or torch.overrides._get_current_function_mode() is not None:
+    in_dispatch_mode = getattr(_python_dispatch, "is_in_torch_dispatch_mode", None)
+    if (
+        in_dispatch_mode is None
+        or in_dispatch_mode()
+        or torch.overrides._get_current_function_mode() is not None
+    ):
         return False
-    if torch._C._are_functorch_transforms_active() or torch._C._dispatch_tls_is_dispatch_key_included(
-        torch._C.DispatchKey.Functionalize
+    if (
+        torch._C._are_functorch_transforms_active()
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
     ):
         return False
     return all(t is None or (type(t) is torch.Tensor and not t.requires_grad) for t in tensors)
@@ -1283,11 +1280,33 @@ def flash_attn_with_kvcache(
             num_splits=num_splits,
         )
     forward = _flash_attn_forward
-    if scheduler_metadata is not None and q.dtype in (torch.float16, torch.bfloat16) and _can_use_eager_forward((
-        q, k_cache, v_cache, k, v, qv, cu_seqlens_q, cu_seqlens_k_new, cache_seqlens,
-        page_table, cache_batch_idx, cache_leftpad, rotary_cos, rotary_sin, rotary_seqlens,
-        q_descale, k_descale, v_descale, scheduler_metadata,
-    )):
+    if (
+        scheduler_metadata is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and _can_use_eager_forward(
+            (
+                q,
+                k_cache,
+                v_cache,
+                k,
+                v,
+                qv,
+                cu_seqlens_q,
+                cu_seqlens_k_new,
+                cache_seqlens,
+                page_table,
+                cache_batch_idx,
+                cache_leftpad,
+                rotary_cos,
+                rotary_sin,
+                rotary_seqlens,
+                q_descale,
+                k_descale,
+                v_descale,
+                scheduler_metadata,
+            )
+        )
+    ):
         forward = _flash_attn_forward_impl
     out, softmax_lse, *rest = forward(
         q,

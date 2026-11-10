@@ -102,8 +102,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     __aicore__ inline ~BlockEpilogue() {}
 
     template <class Resource>
-    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub,
-                                    float scale, float softcap)
+    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, float scale, float softcap)
     {
         subBlockIdx_ = AscendC::GetSubBlockIdx();
         scaleValue = scale;
