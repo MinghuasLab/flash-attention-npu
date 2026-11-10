@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Callback mode decorators, native dispatch and independent device VJPs."""
 
 import inspect

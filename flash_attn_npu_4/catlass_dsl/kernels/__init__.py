@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Device kernels are imported lazily; compiler and CPU oracle need no NPU."""
 
 from ..utils import get_tla

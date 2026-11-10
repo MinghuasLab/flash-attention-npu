@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Fixed-layout mask output and gradient checks."""
 
 import pytest

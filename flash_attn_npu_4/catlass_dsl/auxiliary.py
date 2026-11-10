@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Logical auxiliary tensor views over the backend's flat pointer ABI.
 
 This is compile-time layout binding, not callback tracing or code generation.

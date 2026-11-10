@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Minghua Shen.
 # Lightweight, hardware-independent quality environment.
 # The repository is mounted at runtime; hooks and their pinned tool versions
 # are materialized by pre-commit inside this image.

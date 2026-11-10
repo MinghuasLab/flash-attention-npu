@@ -1,11 +1,18 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
  *
  * Deterministic BN2S2 (batch/head x kv-block column-private) task schedules
  * ported from ops-transformer arch35 FlashAttentionScoreGrad:
  *   attention/flash_attention_score_grad/op_kernel/arch35/deter.h
  *   op_host/arch35/flash_attention_score_grad_tiling_{common,normal}_regbase.cpp
- *
  * The schedule assigns every (core, round) pair a task coordinate
  * (batch, n2, g, s1Block, s2Block) so that
  *   - one core owns a fixed (batch, n2, g, s2Block) column for a whole
@@ -13,7 +20,6 @@
  *     accumulated by a single core in program order;
  *   - within one round the active cores never write the same dq tile, so the
  *     only cross-core ordering requirement is across rounds.
- *
  * The functions here are pure scalar integer math and are shared by the
  * host tiler (round counting / validation) and the device kernel (decode).
  * Coordinates follow opst's 1-based convention internally and are converted

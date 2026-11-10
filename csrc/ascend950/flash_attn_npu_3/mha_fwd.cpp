@@ -1,19 +1,16 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- *
- *
- *   ✅ FP16 / BF16
- *   ✅ Causal mask
- *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch; kernel Phase 2/3)
- *   ✅ Paged KV (page_table)
- *   ✅ MQA / GQA
- *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ✅ return_softmax_lse
- *   ✅ num_splits (FlashDecode for paged KV + TND)
- *   ✅ scheduler_metadata for non-FD execution
- *   ❌ pack_gqa, leftpad_k
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// ✅ FP16 / BF16
+// ✅ Causal mask
+// ✅ SWA / window_size (host normalize + MASK_SWA dispatch; kernel Phase 2/3)
+// ✅ Paged KV (page_table)
+// ✅ MQA / GQA
+// ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
+// ✅ return_softmax_lse
+// ✅ num_splits (FlashDecode for paged KV + TND)
+// ✅ scheduler_metadata for non-FD execution
+// ❌ pack_gqa, leftpad_k
+
 
 #include <algorithm>
 #include <cmath>

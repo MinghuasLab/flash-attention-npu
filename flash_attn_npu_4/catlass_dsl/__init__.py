@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Native Ascend attention and sparse-mask metadata APIs.
 
 Use ``flash_attn_func`` for fixed BSND inputs and

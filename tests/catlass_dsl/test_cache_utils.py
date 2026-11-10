@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Compile-cache lifecycle, concurrent misses and lazy runtime binding."""
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError

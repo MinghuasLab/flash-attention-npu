@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #include "fag_tiling.h"
 #include "../flash_attn_npu/softmax_tiling.cpp"
 #include "../flash_attn_npu/fag_kernel_common.hpp"

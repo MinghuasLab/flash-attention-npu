@@ -1,8 +1,6 @@
-#include "../attention_window.h"
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- */
+// Copyright (c) 2026, Minghua Shen.
 
+#include "../attention_window.h"
 #include <cmath>
 #include <cstring>
 #include <limits>

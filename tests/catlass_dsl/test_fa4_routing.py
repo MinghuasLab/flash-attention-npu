@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """FA4 dispatch/ABI tests. CPU kernel substitution is explicit in cpu_runtime."""
 
 import ast

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Public BSND/TND inputs and independent Torch output/LSE/gradient checks."""
 
 from types import SimpleNamespace

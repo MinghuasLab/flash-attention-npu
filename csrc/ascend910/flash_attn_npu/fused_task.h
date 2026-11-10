@@ -1,9 +1,7 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0.
- *
- * Shared Host/AICPU/AICore task geometry, adapted from minFA's grouped tasks.
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// Shared Host/AICPU/AICore task geometry, adapted from minFA's grouped tasks.
+
 #pragma once
 
 #include <cstdint>

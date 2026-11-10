@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef FLASH_ATTN_FAG_TENSOR_STRIDES_H
 #define FLASH_ATTN_FAG_TENSOR_STRIDES_H
 #include <cstdint>

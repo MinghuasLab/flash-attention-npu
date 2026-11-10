@@ -1,13 +1,19 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
  *
  * Ascend950 FlashAttention v3 backward deterministic reduction epilogue
  * (VecDTM).  At each round end, the vector cores reduce every cube core's
  * private det staging slots into the shared fp32 workspaces in a FIXED
  * blockId order, so repeated backward runs accumulate bit-exactly.
- *
  * Deterministic axis order: b -> n2 -> s1 -> g -> s2 (s2 innermost).
- *
  * Vec core assignment (tiling: dqVecNum/dkVecNum/dvVecNum, v1 = 16/16/16):
  *   [0, dqVecNum)                  -> dQ group
  *   [dqVecNum, dqVecNum+dkVecNum)  -> dK group
@@ -735,7 +741,7 @@ private:
                 if (!streamDecoder_.Decode(currentBlockId, nextBlockInfo)) {
                     continue;
                 }
-                if (nextBlockInfo.groupIdx != headBlockInfo.groupIdx || nextBlockInfo.totalS1Start != headBlockInfo.totalS1Start 
+                if (nextBlockInfo.groupIdx != headBlockInfo.groupIdx || nextBlockInfo.totalS1Start != headBlockInfo.totalS1Start
                      || nextBlockInfo.n2Idx != headBlockInfo.n2Idx) {
                     pendingBlockInfo = nextBlockInfo;
                     hasPendingBlock = true;
@@ -766,14 +772,14 @@ private:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
                 AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
-                
+
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Muls(accUb_, accUb_, scaleValue_, rowNum * qkHeadDim);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                
+
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(DataType)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(DataType)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
@@ -788,7 +794,7 @@ private:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                
+
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(DataType)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(DataType)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);

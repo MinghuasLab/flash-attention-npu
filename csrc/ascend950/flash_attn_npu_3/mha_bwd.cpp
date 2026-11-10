@@ -1,13 +1,11 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #include "../attention_window.h"
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * Ascend950 FlashAttention v3 backward scaffold.
- *
- * The host ABI matches the Python v3 backward entry. The device kernel is a
- * no-op placeholder; replace the implementation in fag_kernel.cpp when the
- * real backward algorithm lands.
- */
+// Ascend950 FlashAttention v3 backward scaffold.
+// The host ABI matches the Python v3 backward entry. The device kernel is a
+// no-op placeholder; replace the implementation in fag_kernel.cpp when the
+// real backward algorithm lands.
+
 
 #include <cmath>
 #include <cstring>

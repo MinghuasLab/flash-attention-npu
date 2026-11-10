@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # 多 docker 并发编译矩阵: 每个 combo (CANN×torch/torch_npu) 用预构建镜像
 # fa-npu-ci:<name>, 并发跑 `python setup.py build`, 汇总 per-combo pass/fail。

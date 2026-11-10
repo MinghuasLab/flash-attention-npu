@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Real Ascend 950 accuracy through the FA4 public dispatch boundary."""
 
 import pytest

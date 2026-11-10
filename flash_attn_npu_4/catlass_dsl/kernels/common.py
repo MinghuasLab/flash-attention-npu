@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Explicitly synchronized on-chip tile operations for Ascend 950.
 
 All matrix tiles are physically 128x128. AIV0/1 each stage 64 rows,

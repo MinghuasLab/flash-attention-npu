@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # Upload a release asset idempotently: identical assets are reused, conflicts fail.
 
 set -euo pipefail

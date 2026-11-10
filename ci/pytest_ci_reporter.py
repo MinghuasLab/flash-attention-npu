@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Structured pytest events consumed by the CI progress watcher."""
 
 import base64

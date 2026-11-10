@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Process-local caching for compiled functions.
 
 Caching executors here skips CATLASS frontend work on repeated launches.

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Analytic block intervals for registered causal and local-window masks."""
 
 from catlass import tla

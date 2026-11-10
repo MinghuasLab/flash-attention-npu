@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #include "fag_general_host.hpp"
 #include "../attention_window.h"
 

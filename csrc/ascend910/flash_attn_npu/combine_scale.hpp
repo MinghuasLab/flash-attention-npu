@@ -1,12 +1,14 @@
 /**
-* This program is free software, you can redistribute it and/or modify.
-* Copyright (c) 2025 Huawei Technologies Co., Ltd.
-* This file is a part of the CANN Open Software.
-* Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
-* Please refer to the License for details. You may not use this file except in compliance with the License.
-* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-* See LICENSE in the root of the software repository for the full text of the License.
-*/
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
 
 #ifndef CATLASS_EPILOGUE_BLOCK_COMBINE_SCALE_HPP
 #define CATLASS_EPILOGUE_BLOCK_COMBINE_SCALE_HPP
@@ -35,13 +37,13 @@ public:
     static constexpr uint32_t UB_UINT8_LINE_SIZE = 32768; // 1 * 64 * 128 * 4
     static constexpr uint32_t FLOAT_PER_BLOCK = 8;
 
-    __aicore__ inline 
+    __aicore__ inline
     CombineScale() {}
 
-    __aicore__ inline 
+    __aicore__ inline
     ~CombineScale() {}
 
-    __aicore__ inline 
+    __aicore__ inline
     void init(Arch::Resource<ArchTag> &resource) {
         constexpr uint32_t LL_UB_OFFSET = 0;
         constexpr uint32_t LM_UB_OFFSET = 1 * STAGE2_UB_UINT8_BLOCK_SIZE;
@@ -122,11 +124,11 @@ public:
             uint32_t baseGmOffset = prevQSeqlenSum * qHeads * headSizeV + qStartIndx * qHeads * headSizeV + headStartIndx * headSizeV;
             uint32_t gmOScalar = 0;
             if (q_len == 1) {
-                gmOScalar = vectorsubBlockID == 0 ? baseGmOffset 
+                gmOScalar = vectorsubBlockID == 0 ? baseGmOffset
                                                 : baseGmOffset + sum_former * headSizeV;
             } else {
                 uint32_t q_half = q_len / 2;
-                gmOScalar = vectorsubBlockID == 0 ? baseGmOffset 
+                gmOScalar = vectorsubBlockID == 0 ? baseGmOffset
                                                 : baseGmOffset + q_half * qHeads * headSizeV;
             }
 
@@ -152,10 +154,10 @@ public:
 
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
-            
+
             // Copy LSE from GM to UB
             uint32_t srcStride = vectorsubBlockID == 0 ? sum - sum_former : sum_former;
-            AscendC::DataCopyPad(llUbTensor, lGmTensor[addrLOffset], 
+            AscendC::DataCopyPad(llUbTensor, lGmTensor[addrLOffset],
                                 AscendC::DataCopyExtParams(splitNum, lseBlock * sizeof(float), srcStride * sizeof(float), 0, 0),
                                 AscendC::DataCopyPadExtParams<float>(false, 0, lseBlockAlign - lseBlock, 0));
 
@@ -380,4 +382,3 @@ private:
 } // namespace Catlass
 
 #endif // CATLASS_EPILOGUE_BLOCK_COMBINE_SCALE_HPP
-
