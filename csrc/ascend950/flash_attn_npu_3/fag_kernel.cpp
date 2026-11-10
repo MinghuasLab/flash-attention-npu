@@ -80,7 +80,8 @@ static constexpr uint16_t SYNC_V6_TO_C5_FLAG = 14;  // dv buffer free
  */
 
 template <typename DataType, class BlockMmadSdP_, class BlockMmaddQKV_, class EpilogueScaledMaskSoftmax_,
-          class EpilogueSubMul_, FAGTiling950::Layout INPUT_LAYOUT, bool IS_ATTEN_MASK, bool IS_DTM, bool IS_SOFTCAP>
+          class EpilogueSubMul_, FAGTiling950::Layout INPUT_LAYOUT, bool IS_ATTEN_MASK, bool IS_DTM, bool IS_SOFTCAP,
+          bool SINGLE_VEC = false>
 class FlashAttentionScoreGrad950 {
   public:
     using BlockMmadSdP = BlockMmadSdP_;
@@ -129,6 +130,11 @@ class FlashAttentionScoreGrad950 {
         dkWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkOffset));
         dvWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dvOffset));
 
+        earlyDkvCast_ = tiling_->earlyDkvCast != 0;
+        shortBiDir_ = tiling_->shortBiDir != 0;
+        shortBiDirUniform_ = tiling_->shortBiDirUniform != 0;
+        shortQ_ = tiling_->shortQ != 0;
+        shortQUniformS1_ = tiling_->shortQUniformS1 != 0;
         if constexpr (IS_DTM) {
             dqDetWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dqDetOffset));
             dkDetWorkspaceGm_.SetGlobalBuffer((__gm__ float*)(params.workspace + tiling_->dkDetOffset));
@@ -143,6 +149,11 @@ class FlashAttentionScoreGrad950 {
             dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(params.dv));
             cuSeqQPtr_ = reinterpret_cast<__gm__ int32_t*>(params.cuSeqQlen);
             cuSeqKvPtr_ = reinterpret_cast<__gm__ int32_t*>(params.cuSeqKvlen);
+        } else if (earlyDkvCast_) {
+            // Non-det early dk/dv: cube Fixpipe casts fp32 L0C → bf16 outputs
+            // directly (skips FagPost dk/dv and the AIV cast path).
+            dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(params.dk));
+            dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(params.dv));
         }
 
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
@@ -241,9 +252,9 @@ class FlashAttentionScoreGrad950 {
         // Per-AIV UB layout.  Ping and pong each own one complete half of UB:
         //   ping: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
         //   pong: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
-        // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
+        // SPLIT_M: half M per AIV. SINGLE_VEC+NO_SPLIT: full M on AIV0 only.
         const uint32_t mAligned = RoundUp(qBlockSize_, 16);
-        const uint32_t rowsPerSubBlock = mAligned / 2;
+        const uint32_t rowsPerSubBlock = SINGLE_VEC ? mAligned : (mAligned / 2);
         const uint32_t mmResTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(float);
         const uint32_t attenMaskTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
         const uint32_t lseTileBytes = RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
@@ -339,6 +350,10 @@ class FlashAttentionScoreGrad950 {
             castMte3ToMte2_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
             castMte2ToV_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
             castVToMte3_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        } else if (earlyDkvCast_) {
+            castMte3ToMte2_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
+            castMte2ToV_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+            castVToMte3_ = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
         }
     }
 
@@ -365,8 +380,8 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx,
-                              uint32_t& firstValidS1, uint32_t& validS1Num)
+    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx, uint32_t& firstValidS1,
+                              uint32_t& validS1Num)
     {
         validS1Num = 0;
         // No mask: every S1 block is valid.
@@ -390,11 +405,12 @@ class FlashAttentionScoreGrad950 {
         }
 
         // BAND: both S1 boundaries depend on the window and actual KV tile size.
-        const int64_t s1IdxUp = tiling_->s2Token == INT32_MAX ? 0 :
-            Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
+        const int64_t s1IdxUp =
+            tiling_->s2Token == INT32_MAX ? 0 : Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
         const int64_t s2RealSize = Min(static_cast<int64_t>(kvBlockSize_), static_cast<int64_t>(s2Length) - s2Start);
-        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length :
-            Min(static_cast<int64_t>(s1Length), s2Start + s2RealSize - delta + tiling_->s1Token);
+        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length
+                                                                : Min(static_cast<int64_t>(s1Length),
+                                                                      s2Start + s2RealSize - delta + tiling_->s1Token);
         if (s1IdxUp >= s1IdxDown) {
             return;
         }
@@ -525,7 +541,7 @@ class FlashAttentionScoreGrad950 {
         block.vOffset = (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
         block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
         // TODO: M方向划分和MM1输出一致
-        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
+        block.firstHalfRealS1 = SINGLE_VEC ? block.s1Extend : CeilDiv(block.s1Extend, 2U);
     }
 
     // Fill one task from the opst BN2S2 schedule coordinate.  BSND uses the
@@ -571,7 +587,7 @@ class FlashAttentionScoreGrad950 {
         block.kOffset = (totalS2Start * kvHeadNum_ + c.n2) * qkHeadDim_;
         block.vOffset = (totalS2Start * kvHeadNum_ + c.n2) * vHeadDim_;
         block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
-        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
+        block.firstHalfRealS1 = SINGLE_VEC ? block.s1Extend : CeilDiv(block.s1Extend, 2U);
         // BN2S2 treats every task as its own residency/accumulate group: the
         // shared C1/C2 stages reload K^T/V^T each task and dk/dv flush per
         // task (the private/shared workspaces handle cross-task accumulation).
@@ -659,10 +675,13 @@ class FlashAttentionScoreGrad950 {
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
                     const int64_t delta = static_cast<int64_t>(block.curBatchS2) - block.curBatchS1;
-                    const int64_t firstCol = tiling_->s1Token == INT32_MAX ? 0 :
-                        static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
-                    const int64_t endCol = tiling_->s2Token == INT32_MAX ? block.curBatchS2 :
-                        static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
+                    const int64_t firstCol = tiling_->s1Token == INT32_MAX
+                                                 ? 0
+                                                 : static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
+                    const int64_t endCol =
+                        tiling_->s2Token == INT32_MAX
+                            ? block.curBatchS2
+                            : static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
                     if (static_cast<int64_t>(block.s2Start) + block.s2Extend <= firstCol ||
                         static_cast<int64_t>(block.s2Start) >= endCol) {
                         return false;
@@ -719,13 +738,13 @@ class FlashAttentionScoreGrad950 {
             int64_t firstCol = 0;
             if constexpr (IS_ATTEN_MASK) {
                 if (tiling_->s1Token != INT32_MAX) {
-                    firstCol = Max(static_cast<int64_t>(0),
-                        static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
-                        static_cast<int64_t>(decoderS2Length_) - decoderS1Length_ - tiling_->s1Token);
+                    firstCol = Max(static_cast<int64_t>(0), static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
+                                                                static_cast<int64_t>(decoderS2Length_) -
+                                                                decoderS1Length_ - tiling_->s1Token);
                 }
             }
-            const uint32_t s2BlockIdx = static_cast<uint32_t>(firstCol / kvBlockSize_) +
-                static_cast<uint32_t>(blockInS1 % validS2Num);
+            const uint32_t s2BlockIdx =
+                static_cast<uint32_t>(firstCol / kvBlockSize_) + static_cast<uint32_t>(blockInS1 % validS2Num);
             FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
             return true;
         }
@@ -919,6 +938,17 @@ class FlashAttentionScoreGrad950 {
                 return;
             }
         }
+        // Isolated short-biDir schedule: do not share the B×N2 scan / dual-AIV
+        // handshake with longer S1/S2 shapes.
+        if (shortBiDir_) {
+            RunTasksShortBiDir(coreIdx, subBlockIdx);
+            return;
+        }
+        // Isolated short-Q long-KV schedule: core-strided (b,n2), S2 inner.
+        if (shortQ_) {
+            RunTasksShortQ(coreIdx, subBlockIdx);
+            return;
+        }
 #ifdef __DAV_CUBE__
         BlockMmadSdP mm12(resource, Mm12L1Offset());
         BlockMmaddQKV mm345(resource, Mm12L1Offset());
@@ -929,7 +959,9 @@ class FlashAttentionScoreGrad950 {
 #endif
         // Assign each (batch, n2, s2Block) group to exactly one AIC so that
         // contiguous s1 ranges stay on the same core (KV L1 residency + local
-        // dk/dv accumulate). Round-robin over kvGroupId.
+        // dk/dv accumulate). Round-robin over kvGroupId. GQA groups stay serial
+        // on that core (earlyDkv has no atomic). Legacy long-S keeps returnL1
+        // dual-AIV pipeline; short paths use RunTasksShortQ/ShortBiDir above.
         uint64_t taskId = 0;
         uint64_t kvGroupId = 0;
         bool hasPrev = false;
@@ -1010,12 +1042,6 @@ class FlashAttentionScoreGrad950 {
 #ifdef __DAV_CUBE__
             ProcessC5Stage(previousBlock_, false, mm345);
             ProcessC34Stage(previousBlock_, false, mm345);
-            if (ktResident) {
-                mm12.ReleaseResidentKT();
-            }
-            if (vtResident) {
-                mm12.ReleaseResidentVT();
-            }
 #endif
 #ifdef __DAV_VEC__
             ProcessV1Stage(previousBlock_, subBlockIdx);
@@ -1023,6 +1049,280 @@ class FlashAttentionScoreGrad950 {
 #endif
         }
 #ifdef __DAV_CUBE__
+        if (ktResident) {
+            mm12.ReleaseResidentKT();
+        }
+        if (vtResident) {
+            mm12.ReleaseResidentVT();
+        }
+        WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        WaitVecEvents();
+#endif
+    }
+
+    // Short-Q long-KV (maxS1<=16, maxS2>16): core-strided (b,n2) with S2
+    // inner so per-head setup is amortized across the few kvTiles. In-order
+    // CV (no returnL1). Short bidirectional stays on shortBiDir; longer S
+    // stays on legacy RunTasks. SINGLE_VEC: AIV0 owns full M via NO_SPLIT
+    // Fixpipe. gid → (b,n2) is arithmetic: kvHeadNum is a global tiling field.
+    CATLASS_DEVICE
+    void RunTasksShortQ(uint32_t coreIdx, uint32_t subBlockIdx)
+    {
+#ifdef __DAV_CUBE__
+        BlockMmadSdP mm12(resource, Mm12L1Offset());
+        BlockMmaddQKV mm345(resource, Mm12L1Offset());
+        SetCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        SetVecEvents();
+        if constexpr (SINGLE_VEC) {
+            if (subBlockIdx != 0U) {
+                WaitVecEvents();
+                return;
+            }
+        }
+#endif
+        const uint64_t totalHeadGroups = static_cast<uint64_t>(batchNum_) * static_cast<uint64_t>(kvHeadNum_);
+        if (totalHeadGroups == 0 || kvHeadNum_ == 0) {
+#ifdef __DAV_CUBE__
+            WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+            WaitVecEvents();
+#endif
+            return;
+        }
+
+        const uint32_t uniformS1 = shortQUniformS1_ ? static_cast<uint32_t>(tiling_->totalQ / batchNum_) : 0U;
+        bool ktResident = false;
+        bool vtResident = false;
+        uint64_t taskId = 0;
+        uint32_t prevBatchIdx = 0xffffffffu;
+        uint64_t qBatchStart = 0;
+        uint64_t kvBatchStart = 0;
+        uint32_t s1Length = 0;
+        uint32_t s2Length = 0;
+        uint32_t s2BlockNum = 0;
+
+        for (uint64_t localG = 0;; ++localG) {
+            const uint64_t gid = localG * static_cast<uint64_t>(coreNum_) + coreIdx;
+            if (gid >= totalHeadGroups) {
+                break;
+            }
+            const uint32_t batchIdx = static_cast<uint32_t>(gid / static_cast<uint64_t>(kvHeadNum_));
+            const uint32_t n2Idx = static_cast<uint32_t>(gid % static_cast<uint64_t>(kvHeadNum_));
+            if (batchIdx != prevBatchIdx) {
+                if (shortQUniformS1_) {
+                    s1Length = uniformS1;
+                    qBatchStart = static_cast<uint64_t>(batchIdx) * s1Length;
+                    uint64_t kvEnd = 0;
+                    uint64_t kvStart = 0;
+                    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+                        kvEnd = static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx));
+                        kvStart = batchIdx == 0 ? 0 : static_cast<uint64_t>(cuSeqKvGm_.GetValue(batchIdx - 1));
+                    } else {
+                        kvStart = static_cast<uint64_t>(batchIdx) * kvSeqlen_;
+                        kvEnd = kvStart + kvSeqlen_;
+                    }
+                    kvBatchStart = kvStart;
+                    s2Length = hasSeqUsedKv_ ? static_cast<uint32_t>(seqUsedKvGm_.GetValue(batchIdx))
+                                             : static_cast<uint32_t>(kvEnd - kvStart);
+                } else {
+                    GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
+                }
+                s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+                prevBatchIdx = batchIdx;
+            }
+
+            if (s1Length == 0 || s2Length == 0 || s2BlockNum == 0) {
+                continue;
+            }
+
+            // Inner S2: same (b,n2) keeps batch/head addressing hot; each S2
+            // tile still reloads its K/V slice and owns its dk/dv column.
+            for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx) {
+                uint32_t firstValidS1 = 0;
+                uint32_t validS1Num = 0;
+                GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
+                const uint32_t tasksInGroup = groupNum_ * validS1Num;
+                if (tasksInGroup == 0) {
+                    continue;
+                }
+
+                uint32_t taskInGroup = 0;
+                for (uint32_t groupIdx = 0; groupIdx < groupNum_; ++groupIdx) {
+                    for (uint32_t s1Ord = 0; s1Ord < validS1Num; ++s1Ord, ++taskInGroup) {
+                        FAGBlockInfo block{};
+                        const uint32_t s1BlockIdx = firstValidS1 + s1Ord;
+                        FillBlockInfoFrom(batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx, qBatchStart, kvBatchStart,
+                                          s1Length, s2Length, block);
+                        block.taskId = taskId;
+                        block.loadKv = (taskInGroup == 0);
+                        block.initDkv = (taskInGroup == 0);
+                        block.flushDkv = (taskInGroup + 1 == tasksInGroup);
+                        // FagPre zeros dq; first S2 tile overwrites, later tiles atomic-add.
+                        // Core-strided (b,n2) keeps all S2 of a head on one AIC in order.
+                        block.atomicDq = (s2BlockIdx > 0);
+
+#ifdef __DAV_CUBE__
+                        if (block.loadKv && ktResident) {
+                            mm12.ReleaseResidentKT();
+                            ktResident = false;
+                        }
+                        if (block.loadKv && vtResident) {
+                            mm12.ReleaseResidentVT();
+                            vtResident = false;
+                        }
+                        ProcessC1Stage(block, mm12);
+                        ProcessC2Stage(block, mm12);
+                        if (block.loadKv) {
+                            ktResident = true;
+                            vtResident = true;
+                        }
+#endif
+#ifdef __DAV_VEC__
+                        ProcessV1Stage(block, subBlockIdx);
+                        ProcessV2Stage(block, subBlockIdx);
+#endif
+#ifdef __DAV_CUBE__
+                        ProcessC5Stage(block, /*returnL1=*/false, mm345);
+                        ProcessC34Stage(block, /*returnL1=*/false, mm345);
+#endif
+                        ++taskId;
+                    }
+                }
+            }
+        }
+
+#ifdef __DAV_CUBE__
+        if (ktResident) {
+            mm12.ReleaseResidentKT();
+        }
+        if (vtResident) {
+            mm12.ReleaseResidentVT();
+        }
+        WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        WaitVecEvents();
+#endif
+    }
+
+    // Short bidirectional (maxS1/S2 <= 16): one S1×S2 tile per (b,n2), with
+    // GQA groups accumulated on the same AIC (init first / flush last). Core-
+    // strided (b,n2) + in-order CV (no returnL1). Scattering (b,n2,g) as
+    // independent tasks used to overwrite shared dk/dv under earlyDkvCast
+    // (no atomic). Legacy RunTasks stays for longer S. SINGLE_VEC: AIV0 owns
+    // full M; cube handshakes only AIV0.
+    CATLASS_DEVICE
+    void RunTasksShortBiDir(uint32_t coreIdx, uint32_t subBlockIdx)
+    {
+#ifdef __DAV_CUBE__
+        BlockMmadSdP mm12(resource, Mm12L1Offset());
+        BlockMmaddQKV mm345(resource, Mm12L1Offset());
+        SetCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+        SetVecEvents();
+        if constexpr (SINGLE_VEC) {
+            if (subBlockIdx != 0U) {
+                WaitVecEvents();
+                return;
+            }
+        }
+#endif
+        // One schedule unit per (b,n2); group heads share that unit's dk/dv.
+        const uint64_t tasksPerBatch = static_cast<uint64_t>(kvHeadNum_);
+        if (tasksPerBatch == 0 || batchNum_ == 0 || groupNum_ == 0) {
+#ifdef __DAV_CUBE__
+            WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+            WaitVecEvents();
+#endif
+            return;
+        }
+        const uint64_t totalTasks = static_cast<uint64_t>(batchNum_) * tasksPerBatch;
+        const uint32_t uniformS1 = shortBiDirUniform_ ? static_cast<uint32_t>(tiling_->totalQ / batchNum_) : 0U;
+        const uint32_t uniformS2 = shortBiDirUniform_ ? static_cast<uint32_t>(tiling_->totalKv / batchNum_) : 0U;
+        bool ktResident = false;
+        bool vtResident = false;
+        uint64_t taskId = 0;
+
+        for (uint64_t localTask = 0;; ++localTask) {
+            const uint64_t taskGlobal = localTask * static_cast<uint64_t>(coreNum_) + coreIdx;
+            if (taskGlobal >= totalTasks) {
+                break;
+            }
+            const uint32_t batchIdx = static_cast<uint32_t>(taskGlobal / tasksPerBatch);
+            const uint32_t n2Idx = static_cast<uint32_t>(taskGlobal % tasksPerBatch);
+
+            uint64_t qBatchStart = 0;
+            uint64_t kvBatchStart = 0;
+            uint32_t s1Length = 0;
+            uint32_t s2Length = 0;
+            if (shortBiDirUniform_) {
+                s1Length = uniformS1;
+                s2Length = uniformS2;
+                qBatchStart = static_cast<uint64_t>(batchIdx) * s1Length;
+                kvBatchStart = static_cast<uint64_t>(batchIdx) * s2Length;
+            } else {
+                GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
+            }
+            if (s1Length == 0 || s2Length == 0) {
+                continue;
+            }
+
+            for (uint32_t groupIdx = 0; groupIdx < groupNum_; ++groupIdx) {
+                FAGBlockInfo block{};
+                FillBlockInfoFrom(batchIdx, n2Idx, groupIdx, /*s1BlockIdx=*/0, /*s2BlockIdx=*/0, qBatchStart,
+                                  kvBatchStart, s1Length, s2Length, block);
+                block.taskId = taskId;
+                block.loadKv = (groupIdx == 0U);
+                block.initDkv = (groupIdx == 0U);
+                block.flushDkv = (groupIdx + 1U == groupNum_);
+                // FagPre zeros dq; each group writes a distinct q head.
+                block.atomicDq = false;
+
+#ifdef __DAV_CUBE__
+                if (block.loadKv && ktResident) {
+                    mm12.ReleaseResidentKT();
+                    ktResident = false;
+                }
+                if (block.loadKv && vtResident) {
+                    mm12.ReleaseResidentVT();
+                    vtResident = false;
+                }
+                ProcessC1Stage(block, mm12);
+                ProcessC2Stage(block, mm12);
+                if (block.loadKv) {
+                    ktResident = true;
+                    vtResident = true;
+                }
+#endif
+#ifdef __DAV_VEC__
+                ProcessV1Stage(block, subBlockIdx);
+                ProcessV2Stage(block, subBlockIdx);
+#endif
+#ifdef __DAV_CUBE__
+                // returnL1=false: L0C dk/dv slots survive across GQA groups
+                // (SDP uses slots 0/1; dk/dv use 2/3) until flushDkv.
+                ProcessC5Stage(block, /*returnL1=*/false, mm345);
+                ProcessC34Stage(block, /*returnL1=*/false, mm345);
+#endif
+                ++taskId;
+            }
+        }
+
+#ifdef __DAV_CUBE__
+        if (ktResident) {
+            mm12.ReleaseResidentKT();
+        }
+        if (vtResident) {
+            mm12.ReleaseResidentVT();
+        }
         WaitCubeEvents();
 #endif
 #ifdef __DAV_VEC__
@@ -1058,7 +1358,7 @@ class FlashAttentionScoreGrad950 {
         block.kOffset = (totalS2Start * kvHeadNum_ + n2Idx) * qkHeadDim_;
         block.vOffset = (totalS2Start * kvHeadNum_ + n2Idx) * vHeadDim_;
         block.doutOffset = (totalS1Start * qHeadNum_ + qHeadIdx) * vHeadDim_;
-        block.firstHalfRealS1 = CeilDiv(block.s1Extend, 2U);
+        block.firstHalfRealS1 = SINGLE_VEC ? block.s1Extend : CeilDiv(block.s1Extend, 2U);
     }
 
 #ifdef __DAV_CUBE__
@@ -1112,7 +1412,9 @@ class FlashAttentionScoreGrad950 {
         mm12.ComputeS(q, k, s, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv, slot,
                       block.loadKv, v, block.s2Extend, vHeadDim_);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
+        if constexpr (!SINGLE_VEC) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 
     CATLASS_DEVICE
@@ -1131,18 +1433,20 @@ class FlashAttentionScoreGrad950 {
         mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(block.s1Extend, block.s2Extend, vHeadDim_),
                        /*loadV=*/false, /*waitV=*/block.loadKv, slot);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
-        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
+        if constexpr (!SINGLE_VEC) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 
     CATLASS_DEVICE
     void ProcessC5Stage(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345)
     {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+        if constexpr (!SINGLE_VEC) {
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
+        }
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-
         // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
         // with dv cube; subsequent C34 tasks in the group reuse it.
         if (block.initDkv && qkHeadDim_ <= 128U) {
@@ -1153,11 +1457,24 @@ class FlashAttentionScoreGrad950 {
 
         // Reuse L1 dY from C2. Small D accumulates in L0C until flush;
         // large D flushes each slice/task into the zero-initialized full workspace.
-        mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
-                        block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE);
+        // earlyDkvCast (TND D<=128): Fixpipe fp32→bf16/fp16 into user dk/dv
+        // via InputOffset + sequence stride so FagPost / AIV cast are skipped.
+        if (earlyDkvCast_) {
+            auto dv = MakeGmTensor(dvGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
+                                   inputStrides_.v.sequence);
+            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
+                            block.initDkv, block.flushDkv, /*enAtomicDv=*/false, /*fixpipeScaleDv=*/1.0f);
+        } else {
+            auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
+                            block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE,
+                            /*fixpipeScaleDv=*/1.0f);
+        }
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+            if constexpr (!SINGLE_VEC) {
+                AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
+            }
         }
     }
 
@@ -1165,25 +1482,38 @@ class FlashAttentionScoreGrad950 {
     void ProcessC34Stage(FAGBlockInfo const& block, bool returnL1, BlockMmaddQKV& mm345)
     {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG);
-        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+        if constexpr (!SINGLE_VEC) {
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
+        }
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
                               inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
         // D<=128: waitResidentK on first task (C5 prefetched); later tasks hit
         // resident K. D>128 streams K via DY scratch and accumulates each
         // flushed slice/task into the zero-initialized full workspace.
-        mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk, Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-                          slot,
-                          /*waitResidentK=*/block.initDkv,
-                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv,
-                          /*enAtomicDk=*/qkHeadDim_ > BlockMmaddQKV::BASE);
+        if (earlyDkvCast_) {
+            auto dk = MakeGmTensor(dkGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                                   inputStrides_.k.sequence);
+            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+                              /*waitResidentK=*/block.initDkv, /*enAtomicDq=*/block.atomicDq, block.initDkv,
+                              block.flushDkv, /*enAtomicDk=*/false, /*fixpipeScaleDk=*/scaleValue_);
+        } else {
+            auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+                              /*waitResidentK=*/block.initDkv, /*enAtomicDq=*/block.atomicDq, block.initDkv,
+                              block.flushDkv, /*enAtomicDk=*/qkHeadDim_ > BlockMmaddQKV::BASE,
+                              /*fixpipeScaleDk=*/1.0f);
+        }
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG);
-            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
+            if constexpr (!SINGLE_VEC) {
+                AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
+            }
         }
     }
 
@@ -1347,6 +1677,8 @@ class FlashAttentionScoreGrad950 {
                 // across cast chunks and flush points.
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
             }
+        } else if (earlyDkvCast_) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
         }
     }
 
@@ -1410,6 +1742,26 @@ class FlashAttentionScoreGrad950 {
         }
     }
 
+    // Non-det early dk/dv cast: after a column flush into the per-core private
+    // tile, convert to bf16 outputs and release the private buffer.  FagPost
+    // then skips the full-tensor trailing cast (critical for short-Q / large-KV).
+    CATLASS_DEVICE
+    void ProcessEarlyDkvCast(FAGBlockInfo const& block, uint32_t subBlockIdx)
+    {
+        if (!earlyDkvCast_ || !block.flushDkv || castChunkRows_ == 0U) {
+            return;
+        }
+        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(SYNC_C34_TO_V5_FLAG);
+        CastRegionRows(block.totalS2Start, block.n2Idx, block.s2Extend, subBlockIdx, dkPrivGm_,
+                       static_cast<uint64_t>(coreIdx) * dkPrivSlotElems_, qkHeadDimAlign_, qkHeadDim_, dkGm_, true);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V5_TO_C34_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE2>(SYNC_C5_TO_V6_FLAG);
+        CastRegionRows(block.totalS2Start, block.n2Idx, block.s2Extend, subBlockIdx, dvPrivGm_,
+                       static_cast<uint64_t>(coreIdx) * dvPrivSlotElems_, vHeadDimAlign_, vHeadDim_, dvGm_, false);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V6_TO_C5_FLAG);
+    }
+
     // BN2S2 dk/dv column conversion.  Called after V1/V2 of the pending task
     // on both AIVs: track the fold buffers seen for this column and, at the
     // column end, wait for the cube-side publish, convert each used private
@@ -1465,8 +1817,9 @@ class FlashAttentionScoreGrad950 {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C1_TO_V1_FLAG[flagSlot]);
 
         // Before task 1 and later overwrite P in L1, C5 must return ownership
-        // of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        // of the buffer used by the preceding task. shortBiDir/shortQ run
+        // in-order with returnL1=false, so this handshake is unused there.
+        if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C5_TO_V1_FLAG);
         }
 
@@ -1521,8 +1874,9 @@ class FlashAttentionScoreGrad950 {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C2_TO_V2_FLAG[flagSlot]);
 
         // Before task 1 and later overwrite dS in L1, C3/C4 must return
-        // ownership of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        // ownership of the buffer used by the preceding task. shortBiDir /
+        // shortQ in-order paths skip this (returnL1=false).
+        if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C34_TO_V2_FLAG);
         }
         const uint32_t bufferId = flagSlot;
@@ -1607,6 +1961,11 @@ class FlashAttentionScoreGrad950 {
     uint32_t detColumnRounds_ = 0;
     uint32_t detBufNum_ = 1;
     bool detPrivDkv_ = false;
+    bool earlyDkvCast_ = false;
+    bool shortBiDir_ = false;
+    bool shortBiDirUniform_ = false;
+    bool shortQ_ = false;
+    bool shortQUniformS1_ = false;
     uint64_t dkPrivSlotElems_ = 0;
     uint64_t dvPrivSlotElems_ = 0;
     uint32_t coreIdxBn2s2_ = 0;
@@ -1695,7 +2054,8 @@ class FlashAttentionScoreGrad950 {
     FAGBlockInfo previousBlock_{};
 };
 
-template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP>
+template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP,
+          bool SINGLE_VEC = false>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
                                            GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
                                            GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
@@ -1706,10 +2066,12 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
     using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<128>, tla::Int<128>>;
 
     using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagSdP<2, 2, false>;
-    using TileCopySdP =
-        Catlass::Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
-                                                   Catlass::layout::ColumnMajor, float, Catlass::layout::RowMajor, void,
-                                                   Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
+    // shortQ/shortBiDir SINGLE_VEC: NO_SPLIT → AIV0; else SPLIT_M dual-AIV.
+    constexpr auto kCopyMode =
+        SINGLE_VEC ? Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT : Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M;
+    using TileCopySdP = Catlass::Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, DataType, Catlass::layout::RowMajor,
+                                                                   DataType, Catlass::layout::ColumnMajor, float,
+                                                                   Catlass::layout::RowMajor, void, kCopyMode>;
     using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicySdP, L1TileShape, L0TileShape, DataType,
                                                             DataType, float, void, TileCopySdP>;
 
@@ -1729,7 +2091,7 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
                                                                    FAGTiling950::FAGTilingData>;
     using FAGKernel950 =
         FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
-                                   INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>;
+                                   INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC>;
     FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
                            cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     FAGKernel950 fag;

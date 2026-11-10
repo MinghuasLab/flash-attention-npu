@@ -13,6 +13,7 @@
 #include "catlass/gemm/helper.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
+#include "catlass/gemm/tile/ascend950/copy_l0c_to_dst.hpp"
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
@@ -158,14 +159,15 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     template <class TensorK, class TensorDq, class TensorDk>
     CATLASS_DEVICE void ComputeDqDk(AscendC::LocalTensor<ElementA> dsNz, TensorK& k, TensorDq& dq, TensorDk& dk,
                                     GemmCoord const& actualShape, uint32_t taskPing, bool waitResidentK,
-                                    bool enAtomicDq, bool initDk, bool flushDk, bool enAtomicDk)
+                                    bool enAtomicDq, bool initDk, bool flushDk, bool enAtomicDk,
+                                    float fixpipeScaleDk = 1.0f)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dActual <= BASE) {
             ComputeDqDkSmallHeadDim(dsNz, dq, dk, sqActual, skvActual, dActual, taskPing, waitResidentK, enAtomicDq,
-                                    initDk, flushDk, enAtomicDk);
+                                    initDk, flushDk, enAtomicDk, fixpipeScaleDk);
         } else {
             ComputeDqDkLargeHeadDim(dsNz, k, dq, dk, sqActual, skvActual, dActual, taskPing, enAtomicDq, enAtomicDk);
         }
@@ -177,13 +179,15 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
      */
     template <class TensorDv>
     CATLASS_DEVICE void ComputeDv(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, GemmCoord const& actualShape,
-                                  uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv)
+                                  uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv,
+                                  float fixpipeScaleDv = 1.0f)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dvActual = actualShape.n();
         const uint32_t skvActual = actualShape.k();
         if (dvActual <= BASE) {
-            ComputeDvSmallHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, initDv, flushDv, enAtomicDv);
+            ComputeDvSmallHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, initDv, flushDv, enAtomicDv,
+                                  fixpipeScaleDv);
         } else {
             ComputeDvLargeHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, enAtomicDv);
         }
@@ -194,7 +198,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     CATLASS_DEVICE void ComputeDqDkSmallHeadDim(AscendC::LocalTensor<ElementA> dsNz, TensorDq& dq, TensorDk& dk,
                                                 uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
                                                 uint32_t taskPing, bool waitResidentK, bool enAtomicDq, bool initDk,
-                                                bool flushDk, bool enAtomicDk)
+                                                bool flushDk, bool enAtomicDk, float fixpipeScaleDk)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
@@ -208,7 +212,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK], skvRound, dRound, sqRound, skvActual, dActual, sqActual,
                  initDk, 0b11, SLOT_DK, qEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDk) {
-            FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK);
+            FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK, fixpipeScaleDk);
             ReleaseResidentK();
         }
     }
@@ -216,7 +220,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     template <class TensorDv>
     CATLASS_DEVICE void ComputeDvSmallHeadDim(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, uint32_t sqActual,
                                               uint32_t skvActual, uint32_t dvActual, uint32_t taskPing, bool initDv,
-                                              bool flushDv, bool enAtomicDv)
+                                              bool flushDv, bool enAtomicDv, float fixpipeScaleDv)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
@@ -225,7 +229,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV], skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
                  initDv, 0b11, SLOT_DV, dyEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDv) {
-            FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV);
+            FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV, fixpipeScaleDv);
         }
     }
 
@@ -408,28 +412,39 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
 
     template <class TensorGm>
     CATLASS_DEVICE void FixpipeTla(TensorGm& gmC, AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mActual,
-                                   uint32_t nActual, uint32_t mRound, bool enAtomic, uint32_t l0cSlot)
+                                   uint32_t nActual, uint32_t mRound, bool enAtomic, uint32_t l0cSlot,
+                                   float scale = 1.0f)
     {
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nActual);
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
         auto tensorGmTile = GetTile(gmC, tla::MakeCoord(0u, 0u), tla::MakeShape(mActual, nActual));
 
-        using CopyL0CToDst = typename TileCopy::template CopyL0CToDst<decltype(tensorGmTile)>;
-        CopyL0CToDst copyL0CToDst;
-
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
 
-        if (enAtomic) {
-            AscendC::SetAtomicType<float>();
+        // scale!=1: Fixpipe PER_TENSOR cast (fp32 L0C → bf16/fp16 GM with deqScalar).
+        // Used by earlyDkvCast to write dk directly and skip the AIV cast path.
+        if (scale != 1.0f) {
+            using CopyScaled = Gemm::Tile::CopyL0CToGmTla<ArchTag, decltype(tensorL0C), decltype(tensorGmTile),
+                                                          Gemm::Tile::ScaleGranularity::PER_TENSOR, false>;
+            CopyScaled copyL0CToDst({scale});
             if constexpr (ENABLE_UNIT_FLAG) {
                 copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
             } else {
                 copyL0CToDst(tensorGmTile, tensorL0C);
             }
-            AscendC::SetAtomicNone();
         } else {
-            if constexpr (ENABLE_UNIT_FLAG) {
+            using CopyL0CToDst = typename TileCopy::template CopyL0CToDst<decltype(tensorGmTile)>;
+            CopyL0CToDst copyL0CToDst;
+            if (enAtomic) {
+                AscendC::SetAtomicType<float>();
+                if constexpr (ENABLE_UNIT_FLAG) {
+                    copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
+                } else {
+                    copyL0CToDst(tensorGmTile, tensorL0C);
+                }
+                AscendC::SetAtomicNone();
+            } else if constexpr (ENABLE_UNIT_FLAG) {
                 copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
             } else {
                 copyL0CToDst(tensorGmTile, tensorL0C);
