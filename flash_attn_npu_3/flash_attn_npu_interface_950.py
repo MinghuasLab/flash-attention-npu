@@ -783,7 +783,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
+        return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
@@ -930,7 +930,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
+        return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):

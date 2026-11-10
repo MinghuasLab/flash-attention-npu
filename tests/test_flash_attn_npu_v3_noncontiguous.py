@@ -116,7 +116,9 @@ def _dim0_view(source, gap_elements, poison):
         dtype=source.dtype,
         device=source.device,
     )
-    view = torch.as_strided(storage, size=tuple(source.shape), stride=(stride0, *source.stride()[1:]))
+    view = torch.as_strided(
+        storage, size=tuple(source.shape), stride=(stride0, *source.stride()[1:])
+    )
     view.copy_(source)
     assert not view.is_contiguous()
     return view, storage, logical_block, stride0, poison
@@ -272,7 +274,7 @@ PA_CASES = [
         "ql": "TND",
         "layout": "BBND",
         "nc": 0,
-        "bs": 384,
+        "bs": 512,
         "act_q": [2, 4, 3],
     },
     # FIA NEW-d192-dim0
@@ -288,7 +290,7 @@ PA_CASES = [
         "ql": "TND",
         "layout": "BNBD",
         "nc": 0,
-        "bs": 384,
+        "bs": 512,
     },
     # FIA OLD-d256-dim0
     {
@@ -432,7 +434,6 @@ def _prepare(cfg):
     return query, key, value, key_view, value_view, page_table.npu(), q_lens, kv_lens
 
 
-@skip_unless_910
 @pytest.mark.parametrize("cfg", PA_CASES, ids=[c["id"] for c in PA_CASES])
 def test_paged_noncontiguous_matches_contiguous(cfg):
     query, key, value, key_view, value_view, page_table, q_lens, kv_lens = _prepare(cfg)
@@ -452,7 +453,6 @@ def test_paged_noncontiguous_matches_contiguous(cfg):
     torch.testing.assert_close(lse_nc, lse_ref, rtol=0.0, atol=0.0)
 
 
-@skip_unless_910
 @pytest.mark.parametrize("cfg", FALLBACK_CASES, ids=[c["id"] for c in FALLBACK_CASES])
 def test_paged_inner_noncontiguous_falls_back_to_contiguous(cfg):
     query, key, value, key_view, value_view, page_table, q_lens, kv_lens = _prepare(cfg)
@@ -478,7 +478,6 @@ STRIDE_PROFILES = (
 )
 
 
-@skip_unless_910
 @pytest.mark.parametrize("layout", ["BBND", "BNBD"])
 @pytest.mark.parametrize("profile", STRIDE_PROFILES, ids=[p[0] for p in STRIDE_PROFILES])
 def test_paged_independent_dim0_stride_profiles(layout, profile):
@@ -494,7 +493,9 @@ def test_paged_independent_dim0_stride_profiles(layout, profile):
 
     def maybe_gap(cache, gap, poison):
         physical = _packed_physical(cache, layout)
-        to_logical = (lambda tensor: tensor) if layout == "BBND" else (lambda tensor: tensor.transpose(1, 2))
+        to_logical = (
+            (lambda tensor: tensor) if layout == "BBND" else (lambda tensor: tensor.transpose(1, 2))
+        )
         if gap == 0:
             return to_logical(physical), None
         view, storage, logical_block, stride0, poison_val = _dim0_view(physical, gap, poison)
@@ -520,7 +521,6 @@ def test_paged_independent_dim0_stride_profiles(layout, profile):
             _assert_poison_untouched(*meta)
 
 
-@skip_unless_910
 def test_paged_d512_dim0_noncontiguous():
     """FIA D512 MLA dim0 case, rewritten without split-RoPE."""
     name = torch_npu.npu.get_device_name()
@@ -548,7 +548,6 @@ def test_paged_d512_dim0_noncontiguous():
     _assert_poison_untouched(*value_meta)
 
 
-@skip_unless_910
 @pytest.mark.parametrize(
     "targets",
     (("key",), ("value",), ("key", "value")),
@@ -587,7 +586,6 @@ def test_inner_axis_noncontiguous_cache_falls_back(targets):
     torch.testing.assert_close(lse_nc, lse_ref, rtol=0.0, atol=0.0)
 
 
-@skip_unless_910
 @pytest.mark.parametrize(
     "q_lengths,kv_lengths,extra_q,extra_kv,causal,paged",
     [
@@ -695,7 +693,9 @@ def test_tnd_total_shorter_than_cu_seqlens_q_errors(paged):
                 key,
                 value,
                 cache_seqlens=torch.tensor(kv_lengths, dtype=torch.int32, device="npu"),
-                page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(num_pages, 1),
+                page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(
+                    num_pages, 1
+                ),
                 cu_seqlens_q=cu_q,
                 max_seqlen_q=max(q_lengths),
                 causal=True,
@@ -718,7 +718,6 @@ def test_tnd_total_shorter_than_cu_seqlens_q_errors(paged):
             )
 
 
-@skip_unless_910
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("physical_layout", ["BBND", "BNBD"])
@@ -774,8 +773,7 @@ def test_paged_tnd_dim0_noncontiguous_with_zero_lengths(physical_layout, causal,
     assert torch.isposinf(lse_view[:, :3]).all()
 
 
-@skip_unless_910
-@pytest.mark.parametrize("head_size,kv_length,num_splits", [(512, 129, 1), (64, 2048, 2)])
+@pytest.mark.parametrize("head_size,kv_length,num_splits", [(256, 129, 1), (64, 2048, 2)])
 def test_paged_tnd_bnbd_dim0_noncontiguous_split_paths(head_size, kv_length, num_splits):
     num_heads, kv_heads, page_size = 8, 2, 128
     num_pages = (kv_length + page_size - 1) // page_size
@@ -815,7 +813,6 @@ def test_paged_tnd_bnbd_dim0_noncontiguous_split_paths(head_size, kv_length, num
     torch.testing.assert_close(lse_bnbd, lse_bbnd, rtol=2e-3, atol=2e-3)
 
 
-@skip_unless_910
 def test_paged_tnd_total_q_zero_fast_path():
     batch_size, num_heads, kv_heads, head_size = 2, 4, 2, 64
     query = torch.empty((0, num_heads, head_size), dtype=torch.float16, device="npu")
@@ -843,7 +840,6 @@ def test_paged_tnd_total_q_zero_fast_path():
     assert out.numel() == 0 and lse.numel() == 0
 
 
-@skip_unless_910
 @pytest.mark.parametrize(
     "targets",
     (("key",), ("value",), ("key", "value")),
@@ -876,7 +872,6 @@ def test_fa3_paged_inner_noncontiguous_falls_back_to_contiguous(targets):
     torch.testing.assert_close(lse_view, lse_ref, rtol=0.0, atol=0.0)
 
 
-@skip_unless_910
 @pytest.mark.parametrize(
     "targets",
     (("query",), ("key",), ("value",), ("query", "key", "value")),
@@ -886,12 +881,8 @@ def test_fa3_dense_outer_noncontiguous_qkv_falls_back_to_contiguous(targets):
     """Match FA4/FIA: dense outer-strided QKV are materialized."""
     batch, q_seqlen, kv_seqlen = 2, 16, 32
     num_heads, kv_heads, head_size = 4, 2, 64
-    query = torch.randn(
-        (batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu"
-    )
-    key = torch.randn(
-        (batch, kv_seqlen, kv_heads, head_size), dtype=torch.float16, device="npu"
-    )
+    query = torch.randn((batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu")
+    key = torch.randn((batch, kv_seqlen, kv_heads, head_size), dtype=torch.float16, device="npu")
     value = torch.randn_like(key)
     query_view = _inner_strided(query) if "query" in targets else query
     key_view = _inner_strided(key) if "key" in targets else key
@@ -900,28 +891,21 @@ def test_fa3_dense_outer_noncontiguous_qkv_falls_back_to_contiguous(targets):
     out_view, lse_view = flash_attn_func(
         query_view, key_view, value_view, num_splits=1, return_attn_probs=True
     )
-    out_ref, lse_ref = flash_attn_func(
-        query, key, value, num_splits=1, return_attn_probs=True
-    )
+    out_ref, lse_ref = flash_attn_func(query, key, value, num_splits=1, return_attn_probs=True)
     torch.testing.assert_close(out_view, out_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(lse_view, lse_ref, rtol=0.0, atol=0.0)
 
 
-@skip_unless_910
 def test_fa3_append_kv_rejects_noncontiguous_dense_cache():
     """A cache fallback must not hide append-KV's in-place update target."""
     batch, q_seqlen, cache_len, new_len = 1, 1, 16, 1
     num_heads, kv_heads, head_size = 4, 2, 64
-    query = torch.randn(
-        (batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu"
-    )
+    query = torch.randn((batch, q_seqlen, num_heads, head_size), dtype=torch.float16, device="npu")
     key_cache = _inner_strided(
         torch.randn((batch, cache_len, kv_heads, head_size), dtype=torch.float16, device="npu")
     )
     value_cache = _inner_strided(torch.randn_like(key_cache.contiguous()))
-    key_new = torch.randn(
-        (batch, new_len, kv_heads, head_size), dtype=torch.float16, device="npu"
-    )
+    key_new = torch.randn((batch, new_len, kv_heads, head_size), dtype=torch.float16, device="npu")
     value_new = torch.randn_like(key_new)
     cache_seqlens = torch.tensor([cache_len - new_len], dtype=torch.int32, device="npu")
 

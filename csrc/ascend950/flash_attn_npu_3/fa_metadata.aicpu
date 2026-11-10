@@ -77,7 +77,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     // max_seqlen_q is a loose bound. The task grouping and UB policy must agree.
     uint32_t actualMaxQ = metaArgs->maxQSeqlen;
     uint64_t fullQ128Tasks = 0;
-    if (seqlensQ != nullptr) actualMaxQ = 0;
+    if (seqlensQ != nullptr)
+        actualMaxQ = 0;
     for (uint32_t b = 0; b < metaArgs->batch; ++b) {
         const uint32_t len = seqlensQ ? static_cast<uint32_t>(seqlensQ[b]) : metaArgs->maxQSeqlen;
         actualMaxQ = len > actualMaxQ ? len : actualMaxQ;

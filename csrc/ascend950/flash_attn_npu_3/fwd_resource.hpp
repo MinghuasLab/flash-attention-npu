@@ -4,17 +4,14 @@
 #include "catlass/arch/resource.hpp"
 
 namespace Catlass::Arch {
-// CO1 and C2PIPE2GM belong to the Cube. On AIV, InitBuffer does not
-// initialize these TBuf descriptors, so calling Get() there reads private
-// storage that has never been written. AIV never consumes either buffer.
-template <AscendC::TPosition Position, uint32_t Bytes>
+// Only initialize Cube-only buffers on AIC; AIV never consumes them.
+template <AscendC::TPosition Position>
 struct ForwardCubeBuffer950 : LocalTensorBufferBase {
     __aicore__ inline ForwardCubeBuffer950()
     {
 #ifdef __DAV_CUBE__
-        AscendC::TBuf<Position> buffer;
-        GetTPipePtr()->InitBuffer(buffer, Bytes);
-        tensor = buffer.template Get<uint8_t>();
+        LocalTensorBuffer<Ascend950, Position> buffer;
+        tensor = buffer.template GetBufferByByte<uint8_t>(0);
 #endif
     }
 };
@@ -25,9 +22,9 @@ struct ForwardResource950 {
     LocalTensorBuffer<Ascend950, AscendC::TPosition::A2> l0ABuf;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::B2> l0BBuf;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::C2> btBuf;
-    ForwardCubeBuffer950<AscendC::TPosition::CO1, Ascend950::L0C_SIZE> l0CBuf;
+    ForwardCubeBuffer950<AscendC::TPosition::CO1> l0CBuf;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::VECCALC> ubBuf;
-    ForwardCubeBuffer950<AscendC::TPosition::C2PIPE2GM, Ascend950::FIXBUF_SIZE> fpBuf;
+    ForwardCubeBuffer950<AscendC::TPosition::C2PIPE2GM> fpBuf;
 
     __aicore__ inline ForwardResource950()
     {
