@@ -120,3 +120,85 @@ compiled_attention = torch.compile(
 out, lse = compiled_attention(q, k, v)
 (out.float().square().mean() + lse.mean()).backward()
 ```
+
+
+## MXFP8 inference
+
+Fixed-length and variable-length FA4 accept keyword-only `q_descale`,
+`k_descale`, `v_descale`; all three are required together. Q/K/V must already be
+`torch.float8_e4m3fn` (no in-API quantization), have no gradients, and use
+Ascend 950, head dimension 128 and 128x128 sparse blocks.
+
+Scales are E8M0 bytes (`torch.uint8` or `torch.float8_e8m0fnu`): byte `e` means
+`2**(e-127)`, so 127 is 1.0 and 255 is invalid. Q/K group channels by 32, V
+groups rows by 32; adjacent groups occupy a final dimension of 2.
+
+| Layout | Q scale | K scale | V scale |
+| --- | --- | --- | --- |
+| BSND | `[B,Sq,Hq,2,2]` | `[B,Sk,Hkv,2,2]` | `[B,ceil(Sk/64),Hkv,128,2]` |
+| Packed TND | `[Tq,Hq,2,2]` | `[Tk,Hkv,2,2]` | `[capacity,Hkv,128,2]` |
+
+Packed TND uses int32 `cu_seqlens` with a leading zero. V-scale storage is
+concatenated per sequence, each padded to 64 rows; capacity must be at least
+`sum(ceil(segment_kv_length/64))`. Q and KV may independently use BSND or TND.
+
+```python
+out, lse = flash_attn_func(
+    q_fp8, k_fp8, v_fp8,
+    q_descale=q_scale, k_descale=k_scale, v_descale=v_scale,
+    mask_mod=local_mask, return_lse=True,
+)
+# out: BF16, lse: FP32
+```
+
+Supported: score/mask callbacks, GQA/MQA, causal/window, softcap, sparse blocks
+and `torch.compile` forward. Fully masked rows give zero output and `-inf` LSE.
+MXFP8 backward and the `flex_attention` frontend are not supported.
+
+## Compile reuse
+
+Default is baseline. Broad forward reuse is opt-in:
+
+```python
+with forward_compile_mode("broad"):
+    ...  # preparation and execution
+```
+
+`get_forward_compile_mode()` returns the effective mode. Without a context,
+`FLASH_ATTENTION_CATLASS_DSL_DYNAMIC_SHAPES=1` enables broad; unset/0 keeps
+baseline. Modes use separate caches. Broad accepts varying B, Hq/Hkv, Sq/Sk,
+alignment, packed lengths, auxiliary strides and sparse capacities; D stays 128.
+Callback identity, dtype, layout, sparse mode and auxiliary types still form
+separate variants.
+
+Backward has an independent switch, set before the forward call:
+
+```python
+with forward_compile_mode("broad"), backward_compile_mode("broad"):
+    precompile_attention(sample_q, sample_k, sample_v, mask_mod=local_mask)
+    precompile_backward_attention(
+        sample_q, sample_k, sample_v, mask_mod=local_mask, lse_gradient=True,
+    )
+    out, lse = flash_attn_func(q, k, v, mask_mod=local_mask, return_lse=True)
+    (out.float().square().mean() + lse.mean()).backward()
+```
+
+`FLASH_ATTENTION_CATLASS_DSL_BACKWARD_DYNAMIC_SHAPES=1` is the environment
+equivalent. The selected backward policy is saved by forward, so it survives
+Autograd worker dispatch. Precompile helpers do not execute attention or
+backward; `lse_gradient=True` selects the dLSE variant. MXFP8 is forward-only.
+For TND, pass `varlen=True`; prototypes must be nonempty.
+
+`compile_cache_info()` reports hits, misses, compilations, failures, size and
+disk hits. Persistent reuse is opt-in:
+
+```bash
+export FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED=1
+export FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=/path/to/cache
+```
+
+`clear_compile_cache()` clears memory; `clear_compile_cache(persistent=True)`
+also clears the active disk cache. `backward_compile_diagnostics()` records
+opt-in backward capture/execution events. Training additionally requires the
+supported schema-v4 mixed executor and cooperative batch launch; see
+`BACKWARD_BATCH_SYNC_FIX.md` for the baseline launch fix.

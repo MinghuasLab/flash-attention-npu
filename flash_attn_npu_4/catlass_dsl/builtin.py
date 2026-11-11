@@ -155,61 +155,25 @@ def softcap_bwd(slot=0):
 
 
 @lru_cache(maxsize=256)
-def pipeline_adapter(mod, kind, sq, sk, specs=(), mode="simd", varlen=(False, False)):
-    """Bind local lengths and global offsets for fixed or uniform packed inputs."""
+def pipeline_adapter(mod, kind, specs=(), mode="simd", varlen=(False, False)):
+    """Adapt callbacks without capturing any invocation's sequence lengths."""
     from .auxiliary import bind_aux
 
     fn = bind_aux(getattr(mod, mode), kind, specs)
     if kind == "mask":
-
         @tla.jit
-        def adapted(
-            unused, b, h, q, k, aux, scalars, info=(), bounds_checked: tla.Constexpr = False
-        ):
-            if tla.const_expr(mode == "simt" and len(info) > 0 and not bounds_checked):
+        def adapted(unused, b, h, q, k, aux, scalars, info, bounds_checked: tla.Constexpr = False):
+            if tla.const_expr(mode == "simt" and not bounds_checked):
                 visible = tla.Bool(False)
                 if q < info[0] and k < info[1]:
                     visible = fn(b, h, q, k, info, aux, scalars)
                 return visible
             else:
-                return fn(
-                    b,
-                    h,
-                    q,
-                    k,
-                    info
-                    if tla.const_expr(len(info) > 0)
-                    else (
-                        tla.Int32(sq),
-                        tla.Int32(sk),
-                        b * sq if tla.const_expr(varlen[0]) else tla.Int32(0),
-                        b * sk if tla.const_expr(varlen[1]) else tla.Int32(0),
-                    ),
-                    aux,
-                    scalars,
-                )
+                return fn(b, h, q, k, info, aux, scalars)
     else:
-
         @tla.jit
-        def adapted(s, b, h, q, k, aux, scalars, info=()):
-            return fn(
-                s,
-                b,
-                h,
-                q,
-                k,
-                info
-                if tla.const_expr(len(info) > 0)
-                else (
-                    tla.Int32(sq),
-                    tla.Int32(sk),
-                    b * sq if tla.const_expr(varlen[0]) else tla.Int32(0),
-                    b * sk if tla.const_expr(varlen[1]) else tla.Int32(0),
-                ),
-                aux,
-                scalars,
-            )
-
+        def adapted(s, b, h, q, k, aux, scalars, info):
+            return fn(s, b, h, q, k, info, aux, scalars)
     return adapted
 
 
