@@ -316,7 +316,7 @@ def _pds_pass(
 
 
 @tla.kernel
-def attention_kernel(
+def flash_bwd_kernel(
     q: tla.Tensor,
     k: tla.Tensor,
     v: tla.Tensor,
@@ -538,7 +538,7 @@ def attention_kernel(
         klen = max_k
         qs = tla.as_numeric(0)
         ks = tla.as_numeric(0)
-        info = ()
+        info = (max_q, max_k, batch_idx * max_q if tla.const_expr(varlen[0]) else tla.Int32(0), batch_idx * max_k if tla.const_expr(varlen[1]) else tla.Int32(0))
         if tla.const_expr(ragged):
             if tla.const_expr(varlen[0]):
                 qs = cu_q[batch_idx]

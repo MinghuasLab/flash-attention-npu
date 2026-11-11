@@ -11,6 +11,7 @@ import torch
 
 from .block_sparsity import BlockSparseTensorsTorch
 from .decorators import _Callback
+from .diagnostics import record_backward_capture
 from .mods import MaskMod, Mod
 
 _CALLBACKS = {}
@@ -106,6 +107,7 @@ _ATTENTION_ARGS = (
     "float? scale, bool causal, int? left, int? right, float cap, Scalar[] scalars, "
     "SymInt? max_q, SymInt? max_k, str layout, bool return_lse, bool training"
 )
+_MXFP8_ATTENTION_ARGS = f"{_ATTENTION_ARGS}, Tensor q_descale, Tensor k_descale, Tensor v_descale"
 
 
 def _runtime_attention(
@@ -129,6 +131,9 @@ def _runtime_attention(
     layout,
     return_lse,
     training,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     from .interface import _canonical_input, _maximum_length, _prepare_config
 
@@ -158,8 +163,11 @@ def _runtime_attention(
         layout=layout,
         cu_q=cu_q,
         cu_k=cu_k,
-        max_q=_maximum_length(q, max_q),
-        max_k=_maximum_length(k, max_k),
+        max_q=_maximum_length(q, max_q, layout=layout),
+        max_k=_maximum_length(k, max_k, layout=layout),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     return q, k, v, config
 
@@ -211,40 +219,188 @@ def _attention_fwd_fake(
 
 
 @torch.library.custom_op(
+    "flash_attn_npu_4_catlass::forward_training",
+    mutates_args=(),
+    schema=f"({_ATTENTION_ARGS}) -> (Tensor, Tensor, Tensor)",
+)
+def _attention_fwd_training(*args):
+    from .interface import _forward
+    from .runtime import get_backward_compile_mode
+
+    # A tensor output survives AOTAutograd and its worker-thread handoff. It
+    # is created on every real execution, rather than frozen during tracing.
+    mode = get_backward_compile_mode()
+    q, k, v, config = _runtime_attention(*args)
+    out, lse = _forward(q, k, v, config)
+    record_backward_capture(mode, source="graph")
+    policy = torch.tensor(mode == "broad", dtype=torch.uint8, device="cpu")
+    return out, lse, policy
+
+
+@_attention_fwd_training.register_fake
+def _attention_fwd_training_fake(*args):
+    out, lse = _attention_fwd_fake(*args)
+    return out, lse, torch.empty((), dtype=torch.uint8, device="cpu")
+
+
+@torch.library.custom_op(
+    "flash_attn_npu_4_catlass::forward_mxfp8",
+    mutates_args=(),
+    schema=f"({_MXFP8_ATTENTION_ARGS}) -> (Tensor, Tensor)",
+)
+def _attention_fwd_mxfp8(*args):
+    from .interface import _forward
+
+    if args[19] or any(t.requires_grad for t in (*args[:3], *args[6], *args[-3:])):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
+    q, k, v, config = _runtime_attention(*args)
+    return _forward(q, k, v, config)
+
+
+@_attention_fwd_mxfp8.register_fake
+def _attention_fwd_mxfp8_fake(*args):
+    from .interface import _resolve_mxfp8_scales
+
+    if args[19] or any(t.requires_grad for t in (*args[:3], *args[6], *args[-3:])):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
+    _resolve_mxfp8_scales(*args[:3], args[-3:], layout=args[17])
+    out, lse = _attention_fwd_fake(*args[:-3])
+    return torch.empty(out.shape, dtype=torch.bfloat16, device=out.device), lse
+
+
+@torch.library.custom_op(
     "flash_attn_npu_4_catlass::backward",
     mutates_args=(),
-    schema=f"({_ATTENTION_ARGS}, Tensor out, Tensor lse, Tensor? dout, Tensor? dlse) -> (Tensor, Tensor, Tensor)",
+    schema=f"({_ATTENTION_ARGS}, Tensor out, Tensor lse, Tensor? dout, Tensor? dlse, "
+    "Tensor? backward_policy=None) -> (Tensor, Tensor, Tensor)",
 )
-def _attention_bwd(*args):
+def _attention_bwd(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    sparse,
+    aux,
+    sparse_spec,
+    callbacks,
+    scale,
+    causal,
+    left,
+    right,
+    cap,
+    scalars,
+    max_q,
+    max_k,
+    layout,
+    return_lse,
+    training,
+    out,
+    lse,
+    dout,
+    dlse,
+    backward_policy=None,
+):
     from .interface import _backward
 
-    q, k, v, config = _runtime_attention(*args[:-4])
-    out, lse, dout, dlse = args[-4:]
+    mode = _decode_backward_policy(backward_policy)
+    q, k, v, config = _runtime_attention(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sparse,
+        aux,
+        sparse_spec,
+        callbacks,
+        scale,
+        causal,
+        left,
+        right,
+        cap,
+        scalars,
+        max_q,
+        max_k,
+        layout,
+        return_lse,
+        training,
+    )
+    config["backward_compile_mode"] = mode
+    config["backward_diagnostic_source"] = "graph"
     return _backward(q, k, v, out, lse, config, dout, dlse)
 
 
+def _decode_backward_policy(policy):
+    # None preserves legacy direct calls to the internal backward op. Public
+    # training always supplies the saved token from forward_training.
+    if policy is None:
+        return "baseline"
+    if policy.device.type != "cpu" or policy.dtype != torch.uint8 or policy.ndim != 0:
+        raise ValueError("backward policy must be a scalar CPU uint8 tensor")
+    value = policy.item()
+    if value not in (0, 1):
+        raise ValueError("backward policy must encode baseline (0) or broad (1)")
+    return "broad" if value else "baseline"
+
+
 @_attention_bwd.register_fake
-def _attention_bwd_fake(*args):
-    return tuple(torch.empty(t.shape, dtype=t.dtype, device=t.device) for t in args[:3])
+def _attention_bwd_fake(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    sparse,
+    aux,
+    sparse_spec,
+    callbacks,
+    scale,
+    causal,
+    left,
+    right,
+    cap,
+    scalars,
+    max_q,
+    max_k,
+    layout,
+    return_lse,
+    training,
+    out,
+    lse,
+    dout,
+    dlse,
+    backward_policy=None,
+):
+    return tuple(torch.empty(t.shape, dtype=t.dtype, device=t.device) for t in (q, k, v))
 
 
 def _setup_context(ctx, inputs, output):
     q, k, v, cu_q, cu_k, sparse, aux, *options = inputs
     ctx.sparse_count, ctx.aux_count = len(sparse), len(aux)
     ctx.options = options
+    ctx.has_backward_policy = len(output) == 3
     # Save original inputs as well as results. Version counters protect aux,
     # sparse metadata and cumulative lengths against changes before backward.
     ctx.save_for_backward(q, k, v, cu_q, cu_k, *sparse, *aux, *output)
     ctx.set_materialize_grads(False)
 
 
-def _autograd_backward(ctx, dout, dlse):
+def _autograd_backward(ctx, dout, dlse, dpolicy=None):
     saved = ctx.saved_tensors
     q, k, v, cu_q, cu_k = saved[:5]
     split = 5 + ctx.sparse_count
-    sparse, aux = list(saved[5:split]), list(saved[split:-2])
+    sparse, aux = list(saved[5:split]), list(saved[split : split + ctx.aux_count])
+    if ctx.has_backward_policy:
+        out, lse, policy = saved[-3:]
+    else:
+        out, lse, policy = *saved[-2:], None
     dq, dk, dv = _attention_bwd(
-        q, k, v, cu_q, cu_k, sparse, aux, *ctx.options, *saved[-2:], dout, dlse
+        q, k, v, cu_q, cu_k, sparse, aux, *ctx.options, out, lse, dout, dlse, policy
     )
     # PyTorch's Tensor-list autograd treats an empty list as an empty tree,
     # including an empty Scalar[] argument. Preserve that structure exactly.
@@ -253,6 +409,7 @@ def _autograd_backward(ctx, dout, dlse):
 
 
 _attention_fwd.register_autograd(_autograd_backward, setup_context=_setup_context)
+_attention_fwd_training.register_autograd(_autograd_backward, setup_context=_setup_context)
 
 
 def attention(
@@ -281,8 +438,18 @@ def attention(
     score_mod_simd=None,
     score_mod_bwd_simd=None,
     mask_mod_simd=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """Traceable front end; callbacks are static and every buffer is explicit."""
+    from .interface import _resolve_mxfp8_scales
+
+    mxfp8_scales = _resolve_mxfp8_scales(q, k, v, (q_descale, k_descale, v_descale), layout=layout)
+    if mxfp8_scales is not None and any(t.requires_grad for t in aux_tensors or ()):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
     if not isinstance(window_size, (tuple, list)) or len(window_size) != 2:
         raise ValueError("window_size must contain (left, right)")
     if any(
@@ -308,7 +475,7 @@ def attention(
     # Tensor maximum hints have always been ignored without a device readback.
     max_q = None if isinstance(max_q, torch.Tensor) else max_q
     max_k = None if isinstance(max_k, torch.Tensor) else max_k
-    out, lse = _attention_fwd(
+    args = (
         q,
         k,
         v,
@@ -330,6 +497,13 @@ def attention(
         return_lse,
         training,
     )
+    if mxfp8_scales is None:
+        if training:
+            out, lse, policy = _attention_fwd_training(*args)
+        else:
+            out, lse = _attention_fwd(*args)
+    else:
+        out, lse = _attention_fwd_mxfp8(*args, *mxfp8_scales)
     expose_lse = requires_grad if input_requires_grad is None else input_requires_grad
     return out, lse if return_lse or expose_lse else None
 

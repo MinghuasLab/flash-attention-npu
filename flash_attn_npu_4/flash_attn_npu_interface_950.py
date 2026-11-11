@@ -7,9 +7,28 @@ import torch
 
 from .catlass_dsl import utils as _catlass_utils
 
-# isort: off
-import flash_attn_npu_4_950
-# isort: on
+
+class _LazyNativeBackend:
+    """Keep the independent CATLASS Flex backend usable without a C++ build."""
+
+    def __getattr__(self, name):
+        from importlib import import_module
+
+        try:
+            module = import_module("flash_attn_npu_4_950")
+        except ModuleNotFoundError as error:
+            if error.name != "flash_attn_npu_4_950":
+                raise
+            raise ModuleNotFoundError(
+                "The Ascend950 C++ backend is not installed. Build the v4/950 "
+                "extension for native attention; CATLASS Flex calls with "
+                "mask/score callbacks or MXFP8 descales do not need it."
+            ) from error
+        globals()["flash_attn_npu_4_950"] = module
+        return getattr(module, name)
+
+
+flash_attn_npu_4_950 = _LazyNativeBackend()
 
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
@@ -993,6 +1012,10 @@ def flash_attn_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     if _catlass_utils.has_flex(
         score_mod=score_mod,
@@ -1002,6 +1025,9 @@ def flash_attn_func(
         block_sparse_tensors_bwd=block_sparse_tensors_bwd,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     ):
         return _catlass_utils.attention(
             q,
@@ -1028,6 +1054,9 @@ def flash_attn_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
@@ -1263,6 +1292,10 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     if _catlass_utils.has_flex(
         score_mod=score_mod,
@@ -1271,6 +1304,9 @@ def flash_attn_varlen_func(
         block_sparse_tensors=block_sparse_tensors,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     ):
         return _catlass_utils.attention(
             q,
@@ -1304,6 +1340,9 @@ def flash_attn_varlen_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None

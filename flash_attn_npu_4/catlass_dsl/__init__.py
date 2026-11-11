@@ -16,6 +16,18 @@ _EXPORTS = {
     "compute_block_sparsity": "block_sparsity",
     "simd": "decorators",
     "simt": "decorators",
+    "precompile_attention": "precompile",
+    "precompile_backward_attention": "precompile",
+    "compile_cache_info": "precompile",
+    "forward_compile_mode": "runtime",
+    "get_forward_compile_mode": "runtime",
+    "backward_compile_mode": "runtime",
+    "get_backward_compile_mode": "runtime",
+    "clear_compile_cache": "runtime",
+    "CompileCacheInfo": "cache_utils",
+    "backward_compile_diagnostics": "diagnostics",
+    "BackwardCompileDiagnostics": "diagnostics",
+    "BackwardCompileEvent": "diagnostics",
 }
 
 __all__ = [
@@ -24,15 +36,33 @@ __all__ = [
     "compute_block_sparsity",
     "simd",
     "simt",
+    "precompile_attention",
+    "precompile_backward_attention",
+    "compile_cache_info",
+    "forward_compile_mode",
+    "get_forward_compile_mode",
+    "backward_compile_mode",
+    "get_backward_compile_mode",
+    "clear_compile_cache",
+    "CompileCacheInfo",
+    "backward_compile_diagnostics",
+    "BackwardCompileDiagnostics",
+    "BackwardCompileEvent",
 ]
 
 
 def __getattr__(name):
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from .utils import ensure_backend
+    if _EXPORTS[name] not in ("cache_utils", "diagnostics") and name not in (
+        "forward_compile_mode",
+        "get_forward_compile_mode",
+        "backward_compile_mode",
+        "get_backward_compile_mode",
+    ):
+        from .utils import ensure_backend
 
-    ensure_backend()
+        ensure_backend()
     value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
     globals()[name] = value
     return value

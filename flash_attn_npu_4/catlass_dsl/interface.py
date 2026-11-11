@@ -10,6 +10,8 @@ from typing import Callable, NamedTuple, Optional, Tuple
 import torch
 from torch.autograd.function import once_differentiable
 
+from .diagnostics import record_backward_capture, record_backward_execution
+
 from .block_sparsity import (
     BlockSparseTensorsTorch,
     normalize_block_sparse_tensors,
@@ -36,7 +38,86 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     blocks_to_batch_idx: Optional[torch.Tensor] = None
 
 
-def _validate(q, k, v, aux_tensors, aux_scalars, scale, cu_q, cu_k, max_q, max_k, *, layout="BNSD"):
+def _resolve_mxfp8_scales(q, k, v, scales, *, layout="BSND", canonical=False):
+    """Validate MX metadata without reading scale bytes or packed boundaries."""
+    if not any(t is not None for t in scales):
+        return None
+    if any(t is None for t in scales):
+        raise ValueError("MXFP8 requires q_descale, k_descale and v_descale together")
+    if any(not isinstance(t, torch.Tensor) for t in (*scales, q, k, v)):
+        raise TypeError("MXFP8 q/k/v and dequant scales must be tensors")
+    if any(t.requires_grad for t in (q, k, v, *scales)):
+        raise NotImplementedError(
+            "MXFP8 supports inference forward only; inputs must not require gradients"
+        )
+    if any(t.dtype != torch.float8_e4m3fn for t in (q, k, v)):
+        raise ValueError("MXFP8 q/k/v must all have dtype torch.float8_e4m3fn")
+    if k.device != q.device or v.device != q.device:
+        raise ValueError("MXFP8 q/k/v must be on the same device")
+    if layout not in ("BSND", "BNSD") or any(t.ndim not in (3, 4) for t in (q, k, v)):
+        raise ValueError("MXFP8 inputs require BSND, BNSD or packed TND layout")
+    if k.shape != v.shape or any(t.shape[-1] != 128 for t in (q, k, v)):
+        raise ValueError("MXFP8 k/v shapes must match and head dimension must be 128")
+    for t in scales:
+        if t.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError("MXFP8 dequant scales must be uint8 or float8_e8m0fnu")
+        if t.device != q.device or any(s < 0 for s in t.stride()):
+            raise ValueError("MXFP8 dequant scales must be on q.device with nonnegative strides")
+        if t.numel() >= 2**31:
+            raise ValueError("MXFP8 scale tensors exceed the int32 device offset range")
+    qs, ks, vs = scales
+    if qs.shape != q.shape[:-1] + (2, 2) or ks.shape != k.shape[:-1] + (2, 2):
+        raise ValueError("MXFP8 Q/K scale shapes must replace the last input dimension with (2, 2)")
+    if k.ndim == 3:
+        # Each sequence starts a new group. Extra capacity is permitted; the
+        # caller guarantees enough entries for sum(ceil(segment_length / 64)).
+        if (
+            vs.ndim != 4
+            or vs.shape[1:] != (k.shape[1], 128, 2)
+            or vs.shape[0] < (k.shape[0] + 63) // 64
+        ):
+            raise ValueError(
+                "packed MXFP8 V scales require [capacity, Hkv, 128, 2] with sufficient capacity"
+            )
+    else:
+        heads, length = (k.shape[2], k.shape[1]) if layout == "BSND" else (k.shape[1], k.shape[2])
+        shape = (
+            (k.shape[0], (length + 63) // 64, heads, 128, 2)
+            if layout == "BSND"
+            else (k.shape[0], heads, (length + 63) // 64, 128, 2)
+        )
+        if vs.shape != shape:
+            raise ValueError(
+                "MXFP8 V scale shape must group the KV sequence dimension into pairs of 32"
+            )
+    if not canonical:
+        return tuple(scales)
+    result = []
+    for scale in scales:
+        # Byte views avoid requiring E8M0 copy kernels, while preserving the
+        # caller's encoded values rather than numerically converting them.
+        scale = scale.view(torch.uint8).contiguous()
+        if scale.numel() and scale.data_ptr() % 16:
+            scale = scale.clone(memory_format=torch.contiguous_format)
+        result.append(scale)
+    return tuple(result)
+
+
+def _validate(
+    q,
+    k,
+    v,
+    aux_tensors,
+    aux_scalars,
+    scale,
+    cu_q,
+    cu_k,
+    max_q,
+    max_k,
+    *,
+    layout="BNSD",
+    mxfp8_scales=None,
+):
     # Internal callers (including torch_npu_flex) use BNSD; public inputs are BSND.
     if not isinstance(layout, str) or layout not in ("BSND", "BNSD"):
         raise ValueError('layout must be "BSND" or "BNSD"')
@@ -44,7 +125,9 @@ def _validate(q, k, v, aux_tensors, aux_scalars, scale, cu_q, cu_k, max_q, max_k
         raise TypeError("q/k/v must be tensors")
     if q.device.type != "npu":
         raise ValueError("attention requires an NPU")
-    if q.dtype not in (torch.float16, torch.bfloat16):
+    if mxfp8_scales is not None:
+        _resolve_mxfp8_scales(q, k, v, mxfp8_scales, layout=layout)
+    elif q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("q/k/v must be float16 or bfloat16")
     if any(
         t.ndim not in (3, 4) or t.device != q.device or t.dtype != q.dtype or not t.is_contiguous()
@@ -116,6 +199,7 @@ def _validate(q, k, v, aux_tensors, aux_scalars, scale, cu_q, cu_k, max_q, max_k
         block_sparse_tensors_bwd=None,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
+        mxfp8_scales=mxfp8_scales,
     )
 
 
@@ -123,7 +207,8 @@ def _forward(q, k, v, config):
     """Allocate and launch once, shared by eager autograd and graph operators."""
     from .runtime import launch_attention
 
-    output = torch.empty_like(q)
+    output_dtype = torch.bfloat16 if config.get("mxfp8_scales") is not None else q.dtype
+    output = torch.empty_like(q, dtype=output_dtype)
     if q.ndim == 4:
         lse_shape = (
             (q.shape[0], q.shape[2], q.shape[1]) if config.get("layout") == "BSND" else q.shape[:-1]
@@ -141,7 +226,13 @@ def _forward(q, k, v, config):
 
 
 def _attention_forward(ctx, q, k, v, config, *aux):
+    from .runtime import get_backward_compile_mode
+
+    # NPU Autograd can execute backward on a worker that does not inherit the
+    # Python ContextVar. Bind the policy when this forward actually executes.
+    config = dict(config, backward_compile_mode=get_backward_compile_mode())
     output, lse = _forward(q, k, v, config)
+    record_backward_capture(config["backward_compile_mode"], source="eager")
     ctx.config = config
     ctx.aux_count = len(aux)
     boundaries = tuple(t for t in (config["cu_q"], config["cu_k"]) if t is not None)
@@ -153,9 +244,12 @@ def _attention_forward(ctx, q, k, v, config, *aux):
 def _backward(q, k, v, out, lse, config, dout, dlse):
     from .runtime import launch_attention
 
+    if config.get("mxfp8_scales") is not None:
+        raise NotImplementedError("MXFP8 supports inference forward only")
     if not config.get("return_lse", False):
         dlse = None
     if q.numel() == 0 or k.numel() == 0 or (dout is None and dlse is None):
+        record_backward_execution(config, kernel_submitted=False)
         return tuple(torch.zeros_like(t) for t in (q, k, v))
     if dout is None:
         dout = torch.zeros_like(out)
@@ -183,6 +277,7 @@ def _backward(q, k, v, out, lse, config, dout, dlse):
         dk=dk,
         dv=dv,
     )
+    record_backward_execution(config, kernel_submitted=True)
     return dq, dk, dv
 
 
@@ -236,11 +331,11 @@ def _canonical_input(t):
     return t
 
 
-def _maximum_length(t, hint):
+def _maximum_length(t, hint, *, layout="BSND"):
     # Ignore tensor hints without synchronizing the device.
     if isinstance(hint, torch.Tensor):
         hint = None
-    length = t.shape[0] if t.ndim == 3 else t.shape[1]
+    length = t.shape[0] if t.ndim == 3 else t.shape[1 if layout == "BSND" else 2]
     if hint is not None:
         if type(hint) is not int or hint < 0:
             raise ValueError("max_seqlen must be a nonnegative integer, tensor hint or None")
@@ -296,11 +391,17 @@ def _prepare_config(
     mask_mod_simd=None,
     layout="BSND",
     training=False,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     from . import builtin
     from .callbacks import prepare_mod
     from .mods import callback_mode
 
+    mxfp8_scales = _resolve_mxfp8_scales(
+        q, k, v, (q_descale, k_descale, v_descale), layout=layout, canonical=True
+    )
     aux, scalars = tuple(aux_tensors or ()), tuple(aux_scalars or ())
     if not isinstance(window_size, (tuple, list)) or len(window_size) != 2:
         raise ValueError("window_size must contain (left, right)")
@@ -336,8 +437,23 @@ def _prepare_config(
             mask = builtin.local_window(left, right)
     callback_mode(score, mask, grad if training else None)
     config = _validate(
-        q, k, v, aux, scalars, softmax_scale, cu_q, cu_k, max_q, max_k, layout=layout
+        q,
+        k,
+        v,
+        aux,
+        scalars,
+        softmax_scale,
+        cu_q,
+        cu_k,
+        max_q,
+        max_k,
+        layout=layout,
+        mxfp8_scales=mxfp8_scales,
     )
+    if training and q.numel() and k.numel():
+        from .utils import check_backward_backend
+
+        check_backward_backend()
     if q.numel() == 0 or k.numel() == 0:
         blocks = [None, None]
     else:
@@ -386,7 +502,10 @@ def _flash(q, k, v, *, input_requires_grad=None, autograd_func=None, **options):
         autograd_func = (
             FlashAttnVarlenFunc if cu_q is not None or cu_k is not None else FlashAttnFunc
         )
-    out, lse = autograd_func.apply(q, k, v, config, *aux)
+    if config["mxfp8_scales"] is not None:
+        out, lse = _forward(q, k, v, config)
+    else:
+        out, lse = autograd_func.apply(q, k, v, config, *aux)
     if input_requires_grad is None:
         input_requires_grad = any(t.requires_grad for t in (q, k, v))
     return out, lse if (options["return_lse"] or input_requires_grad) else None
@@ -416,11 +535,15 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """Compute fixed-length BSND attention with optional score and mask callbacks.
 
-    Inputs must be FP16 or BF16 tensors on the same Ascend 950 NPU, with
-    head dimension 128. Grouped-query and multi-query attention require
+    Inputs must be FP16/BF16, or prequantized E4M3FN with all three MXFP8
+    dequant scales, on the same Ascend 950 NPU with head dimension 128. Grouped-query and multi-query attention require
     ``Hq % Hkv == 0``. Unsupported options accept only the defaults
     documented below.
 
@@ -502,6 +625,17 @@ def flash_attn_func(
         returned for gradient-requiring inputs, but its gradient is ignored.
     gather_bwd_recompute_p : bool, optional
         Reserved gather-backward argument; only ``False`` is supported.
+    q_descale, k_descale, v_descale : Tensor or None, keyword-only
+        Supply all three to enable inference-only MXFP8. Q/K/V must be
+        E4M3FN; scales contain E8M0 codes as uint8 or float8_e8m0fnu.
+        Q/K scales replace D=128 with (2, 2), grouping channels by 32.
+        V scales group sequence rows by 32: fixed BSND uses
+        (B, ceil(Sk/64), Hkv, 128, 2); packed TND uses
+        (capacity, Hkv, 128, 2), with capacity at least the sum of
+        ceil(segment_length/64). Packed groups restart per sequence.
+        No input may require gradients. Input quantization is external.
+        Scale byte 255 and out-of-capacity packed metadata are invalid
+        caller inputs; device values are not scanned on the host.
     gather_bwd_token_chunk : int or None, optional
         Reserved gather-backward chunk size; only ``None`` is supported.
         Invalid gather combinations are validated before capability checks.
@@ -509,7 +643,8 @@ def flash_attn_func(
     Returns
     -------
     out : torch.Tensor
-        Attention output with the same shape, dtype, and device as ``q``.
+        Attention output with the same shape and device as ``q``. MXFP8
+        inputs produce BF16; other inputs preserve their dtype.
     lse : torch.Tensor or None
         Contiguous FP32 natural-log log-sum-exp of shape ``(B, Hq, Sq)``.
         Returned when ``return_lse`` is true or any original Q/K/V input
@@ -587,6 +722,7 @@ def flash_attn_func(
     )
     if any((not isinstance(t, torch.Tensor) or t.ndim != 4 for t in (q, k, v))):
         raise ValueError("flash_attn_func requires BSND; use flash_attn_varlen_func for TND")
+    _resolve_mxfp8_scales(q, k, v, (q_descale, k_descale, v_descale))
     input_requires_grad = any(t.requires_grad for t in (q, k, v))
     if not torch.compiler.is_compiling():
         q, k, v = (_canonical_input(t) for t in (q, k, v))
@@ -609,6 +745,9 @@ def flash_attn_func(
         layout="BSND",
         input_requires_grad=input_requires_grad,
         autograd_func=FlashAttnFunc,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
 
 
@@ -646,12 +785,17 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """Compute attention with independently fixed BSND or packed TND Q/KV.
 
     Q and KV may independently use either layout and must describe the same
-    batch. Inputs must be FP16 or BF16 tensors on the same Ascend 950 NPU,
-    with head dimension 128 and ``Hq % Hkv == 0``. Unsupported options
+    batch. Inputs must be FP16/BF16, or prequantized E4M3FN with all three
+    MXFP8 dequant scales, on the same Ascend 950 NPU, with head dimension
+    128 and ``Hq % Hkv == 0``. Unsupported options
     accept only the defaults documented below.
 
     Parameters
@@ -759,6 +903,17 @@ def flash_attn_varlen_func(
         Reserved scheduling argument; only ``False`` is supported.
     gather_bwd_recompute_p : bool, optional
         Reserved gather-backward argument; only ``False`` is supported.
+    q_descale, k_descale, v_descale : Tensor or None, keyword-only
+        Supply all three to enable inference-only MXFP8. Q/K/V must be
+        E4M3FN; scales contain E8M0 codes as uint8 or float8_e8m0fnu.
+        Q/K scales replace D=128 with (2, 2), grouping channels by 32.
+        V scales group sequence rows by 32: fixed BSND uses
+        (B, ceil(Sk/64), Hkv, 128, 2); packed TND uses
+        (capacity, Hkv, 128, 2), with capacity at least the sum of
+        ceil(segment_length/64). Packed groups restart per sequence.
+        No input may require gradients. Input quantization is external.
+        Scale byte 255 and out-of-capacity packed metadata are invalid
+        caller inputs; device values are not scanned on the host.
     gather_bwd_token_chunk : int or None, optional
         Reserved gather-backward chunk size; only ``None`` is supported.
         Invalid gather combinations are validated before capability checks.
@@ -859,6 +1014,7 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p=(gather_bwd_recompute_p, False),
         gather_bwd_token_chunk=(gather_bwd_token_chunk, None),
     )
+    _resolve_mxfp8_scales(q, k, v, (q_descale, k_descale, v_descale))
     input_requires_grad = any(isinstance(t, torch.Tensor) and t.requires_grad for t in (q, k, v))
     if not torch.compiler.is_compiling():
         q, k, v = (_canonical_input(t) for t in (q, k, v))
@@ -887,4 +1043,7 @@ def flash_attn_varlen_func(
         cu_k=cu_seqlens_k,
         max_q=max_seqlen_q,
         max_k=max_seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )

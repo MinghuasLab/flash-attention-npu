@@ -1145,6 +1145,10 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse=False,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """Forward pass of FlashAttention for dense (batch-major) inputs.
 
@@ -1190,6 +1194,9 @@ def flash_attn_func(
         block_sparse_tensors_bwd=block_sparse_tensors_bwd,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     ):
         raise NotImplementedError(
             "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
@@ -1253,6 +1260,10 @@ def flash_attn_varlen_func(
     scheduler_metadata=None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention for variable-length sequences with optional paged KV cache.
@@ -1345,6 +1356,9 @@ def flash_attn_varlen_func(
         block_sparse_tensors=block_sparse_tensors,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     ):
         raise NotImplementedError(
             "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
