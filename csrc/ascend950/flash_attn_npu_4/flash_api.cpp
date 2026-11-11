@@ -239,7 +239,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
         }
     }
 
-    if (seqlen == 0 || num_heads == 0 || head_dim == 0) {
+    if (seqlen == 0 || num_heads == 0) {
         return {out, lse_out};
     }
 
