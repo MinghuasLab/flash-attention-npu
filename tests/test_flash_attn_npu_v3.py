@@ -35,6 +35,7 @@ from flash_attn_npu_3 import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
 if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_3.flash_attn_npu_interface_950 import _flash_attn_backward
 else:
@@ -935,18 +936,44 @@ bwd_headdim_cases = [
 ]
 
 
-def _bwd_headdim(dout, query, key, value, out, softmax_lse, *, is_causal, softcap,
-                 deterministic=False, cu_q=None, cu_k=None, max_seqlen_q=None, max_seqlen_k=None):
+def _bwd_headdim(
+    dout,
+    query,
+    key,
+    value,
+    out,
+    softmax_lse,
+    *,
+    is_causal,
+    softcap,
+    deterministic=False,
+    cu_q=None,
+    cu_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
     """Run the shared bwd entry; dq/dk/dv are written in place by the wrapper."""
     dq, dk, dv = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
     _flash_attn_backward(
-        dout, query, key, value, out, softmax_lse,
-        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-        dq=dq, dk=dk, dv=dv,
+        dout,
+        query,
+        key,
+        value,
+        out,
+        softmax_lse,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dq=dq,
+        dk=dk,
+        dv=dv,
         softmax_scale=1.0 / (query.shape[-1] ** 0.5),
-        is_causal=is_causal, window_size_left=-1, window_size_right=-1,
-        softcap=softcap, deterministic=deterministic,
+        is_causal=is_causal,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=softcap,
+        deterministic=deterministic,
     )
     return dq, dk, dv
 
@@ -986,7 +1013,13 @@ def test_bwd_headdim_bsnd(
     def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
         """Same post-processing as test_fa_func_ops; lets cached_autograd_grads rebuild the graph."""
         out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-            query_ref, key_ref, value_ref, scale, atten_mask, data_type, softcap,
+            query_ref,
+            key_ref,
+            value_ref,
+            scale,
+            atten_mask,
+            data_type,
+            softcap,
             differentiable=differentiable,
         )
         if atten_mask is not None:
@@ -1001,9 +1034,14 @@ def test_bwd_headdim_bsnd(
     # The reference out comes from permute(0, 2, 1, 3) and keeps last-dim stride 1,
     # which the wrapper's maybe_contiguous does not fix; make it contiguous BSND explicitly.
     dq, dk, dv = _bwd_headdim(
-        dout, query, key, value,
-        golden_out_ref.npu().contiguous(), golden_lse_ref.npu().contiguous(),
-        is_causal=is_causal, softcap=softcap,
+        dout,
+        query,
+        key,
+        value,
+        golden_out_ref.npu().contiguous(),
+        golden_lse_ref.npu().contiguous(),
+        is_causal=is_causal,
+        softcap=softcap,
     )
     dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
         os.environ.get("GOLDEN_CACHE_NODEID", "v3"),
@@ -1394,8 +1432,16 @@ def test_varlen_bwd_headdim_tnd(
         key_padded = pad_packed_tensor(key_ref, seqlens_k, max_seqlen_k)
         value_padded = pad_packed_tensor(value_ref, seqlens_k, max_seqlen_k)
         out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
-            query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap,
-            q_seqlens=seqlens_q, kv_seqlens=seqlens_k, differentiable=differentiable,
+            query_padded,
+            key_padded,
+            value_padded,
+            scale,
+            atten_mask,
+            data_type,
+            softcap,
+            q_seqlens=seqlens_q,
+            kv_seqlens=seqlens_k,
+            differentiable=differentiable,
         )
         fully_masked = atten_mask.all(dim=-1)
         out_ref[fully_masked] = 0
@@ -1412,10 +1458,18 @@ def test_varlen_bwd_headdim_tnd(
     golden_out_ref, golden_out_pt, golden_lse_ref, _ = reference_pair(query_ref, key_ref, value_ref)
     dout = make_random_tensor(golden_out_ref.shape, data_type, low=-0.5, high=0.5, device="npu")
     dq, dk, dv = _bwd_headdim(
-        dout, query, key, value,
-        golden_out_ref.npu().contiguous(), golden_lse_ref.npu().contiguous(),
-        is_causal=is_causal, softcap=softcap,
-        cu_q=cu_q, cu_k=cu_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        dout,
+        query,
+        key,
+        value,
+        golden_out_ref.npu().contiguous(),
+        golden_lse_ref.npu().contiguous(),
+        is_causal=is_causal,
+        softcap=softcap,
+        cu_q=cu_q,
+        cu_k=cu_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
     dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
         os.environ.get("GOLDEN_CACHE_NODEID", "v3-varlen"),
@@ -2254,6 +2308,86 @@ def test_combine_all_masked_rows_produce_zero():
     assert out[:, :2].abs().max().item() == 0.0
     assert torch.isinf(lse[:, :2]).all()
     assert (lse[:, :2] < 0).all()
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_combine_nonfinite_out_partial_preserves_ieee_special(sign):
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    out_partial[0, 0, 0, 0, 0] = sign * float("inf")
+    lse_partial = _make_combine_lse_partial(num_splits, batch, seqlen, heads)
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        out.float(),
+        out_ref.to(torch.bfloat16).float(),
+        atol=1e-3,
+        rtol=1e-3,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize("special_lse", [float("inf"), float("nan")])
+def test_combine_nonfinite_lse_masks_weights_and_preserves_lse(special_lse):
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = _make_combine_lse_partial(num_splits, batch, seqlen, heads)
+    lse_partial[0, 0, 0, 0] = special_lse
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4, equal_nan=True)
+    torch.testing.assert_close(
+        out.float(),
+        out_ref.to(torch.bfloat16).float(),
+        atol=1e-3,
+        rtol=1e-3,
+        equal_nan=True,
+    )
+
+
+def test_combine_head_dim_zero_still_writes_lse():
+    num_splits, batch, seqlen, heads = 2, 1, 8, 3
+    out_partial = torch.empty(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        0,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    assert out.shape == (batch, seqlen, heads, 0)
+    assert out.numel() == 0
+    torch.testing.assert_close(lse, torch.logsumexp(lse_partial, dim=0), atol=1e-4, rtol=1e-4)
 
 
 def test_combine_error_contract():
