@@ -28,8 +28,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 import flash_attn_npu_4 as fa4
 from flash_attn_npu_4.catlass_dsl import (
     compute_block_sparsity,
-    flash_attn_func,
-    flash_attn_varlen_func,
+    flash_attn_func_with_quant as flash_attn_func,
+    flash_attn_varlen_func_with_quant as flash_attn_varlen_func,
     graph,
     interface,
     runtime,
@@ -420,8 +420,14 @@ def cpu_mxfp8_runtime(monkeypatch):
     "public,packed", [(False, False), (False, True), (True, False), (True, True)]
 )
 def test_mxfp8_fullgraph_dynamic_scale_rebinding(cpu_mxfp8_runtime, public, packed):
-    api = fa4 if public else interface
-    entry = api.flash_attn_varlen_func if packed else api.flash_attn_func
+    if public:
+        entry = fa4.flash_attn_varlen_func if packed else fa4.flash_attn_func
+    else:
+        entry = (
+            interface.flash_attn_varlen_func_with_quant
+            if packed
+            else interface.flash_attn_func_with_quant
+        )
 
     def call(q, k, v, qs, ks, vs, cq, ck):
         options = dict(q_descale=qs, k_descale=ks, v_descale=vs, return_lse=True)
@@ -712,7 +718,10 @@ def test_guard_storage_is_fresh_for_each_fused_launch(mocked_launch, monkeypatch
 
 @pytest.mark.npu
 def test_bf16_and_mxfp8_share_cache_without_aliasing(device, monkeypatch):
-    from flash_attn_npu_4.catlass_dsl import flash_attn_varlen_func
+    from flash_attn_npu_4.catlass_dsl import (
+        flash_attn_varlen_func,
+        flash_attn_varlen_func_with_quant,
+    )
 
     from .mxfp8_reference import SCALE_NAMES, decoded_inputs, make_case, to_device
     from .test_utils import check
@@ -737,7 +746,7 @@ def test_bf16_and_mxfp8_share_cache_without_aliasing(device, monkeypatch):
             **baseline_kwargs,
             return_lse=True,
         )
-        out, lse = flash_attn_varlen_func(*inputs, **kwargs, return_lse=True)
+        out, lse = flash_attn_varlen_func_with_quant(*inputs, **kwargs, return_lse=True)
         check(out, expected)
         check(lse.to(torch.float16), expected_lse)
         assert ordinary.call_count == quantized.call_count == expected_compiles
@@ -1884,7 +1893,10 @@ def test_sparse_label_quantization_matches_generic_bytes(device, case, tail):
 
 @pytest.mark.npu
 def test_sparse_label_dispatch_handles_rebound_sorted_unsorted_and_wide_labels(device, monkeypatch):
-    from flash_attn_npu_4.catlass_dsl import flash_attn_varlen_func, runtime
+    from flash_attn_npu_4.catlass_dsl import (
+        flash_attn_varlen_func_with_quant as flash_attn_varlen_func,
+        runtime,
+    )
     from tests.catlass_dsl.mxfp8_reference import (
         check_quantized_lse,
         make_case,
@@ -3051,7 +3063,10 @@ def test_short_probability_guard_boundaries(device, sparse_case, score):
 @pytest.mark.npu
 @pytest.mark.parametrize("capacity", [None, 6])
 def test_sparse_compile_rebinds_scales(device, capacity):
-    from flash_attn_npu_4.catlass_dsl import flash_attn_func, runtime
+    from flash_attn_npu_4.catlass_dsl import (
+        flash_attn_func_with_quant as flash_attn_func,
+        runtime,
+    )
 
     from .mxfp8_reference import SCALE_NAMES
 

@@ -474,7 +474,7 @@ def _flash(q, k, v, *, input_requires_grad=None, autograd_func=None, **options):
     return out, lse if (options["return_lse"] or input_requires_grad) else None
 
 
-def flash_attn_func(
+def flash_attn_func_with_quant(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -503,12 +503,13 @@ def flash_attn_func(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
 ):
-    """Compute fixed-length BSND attention with optional score and mask callbacks.
+    """Quantized fixed-length BSND attention (MXFP8) with score/mask callbacks.
 
-    Inputs must be FP16/BF16, or prequantized E4M3FN with all three MXFP8
-    dequant scales, on the same Ascend 950 NPU with head dimension 128. Grouped-query and multi-query attention require
-    ``Hq % Hkv == 0``. Unsupported options accept only the defaults
-    documented below.
+    Q/K/V must be prequantized E4M3FN and all three MXFP8 dequant scales
+    (``q_descale``, ``k_descale``, ``v_descale``) are required, on the same
+    Ascend 950 NPU with head dimension 128. Grouped-query and multi-query
+    attention require ``Hq % Hkv == 0``. Unsupported options accept only the
+    defaults documented below. For FP16/BF16 inputs use :func:`flash_attn_func`.
 
     Parameters
     ----------
@@ -714,7 +715,74 @@ def flash_attn_func(
     )
 
 
-def flash_attn_varlen_func(
+def flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+    return_lse: bool = False,
+    gather_bwd_recompute_p: bool = False,
+    gather_bwd_token_chunk: Optional[int] = None,
+):
+    """Compute fixed-length BSND attention on FP16/BF16 inputs.
+
+    This is the non-quantized entry point: Q/K/V must be ``float16`` or
+    ``bfloat16``. For prequantized E4M3FN inputs supply ``q_descale``,
+    ``k_descale`` and ``v_descale`` through :func:`flash_attn_func_with_quant`.
+    All remaining options match the quantized variant.
+    """
+    if isinstance(q, torch.Tensor) and q.dtype == torch.float8_e4m3fn:
+        raise ValueError(
+            "quantized E4M3FN inputs require flash_attn_func_with_quant("
+            "q, k, v, q_descale=..., k_descale=..., v_descale=...)"
+        )
+    return flash_attn_func_with_quant(
+        q,
+        k,
+        v,
+        qv=qv,
+        gather_kv_indices=gather_kv_indices,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        return_lse=return_lse,
+        gather_bwd_recompute_p=gather_bwd_recompute_p,
+        gather_bwd_token_chunk=gather_bwd_token_chunk,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+
+
+def flash_attn_varlen_func_with_quant(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -753,13 +821,14 @@ def flash_attn_varlen_func(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
 ):
-    """Compute attention with independently fixed BSND or packed TND Q/KV.
+    """Quantized attention with independently fixed BSND or packed TND Q/KV.
 
     Q and KV may independently use either layout and must describe the same
-    batch. Inputs must be FP16/BF16, or prequantized E4M3FN with all three
-    MXFP8 dequant scales, on the same Ascend 950 NPU, with head dimension
-    128 and ``Hq % Hkv == 0``. Unsupported options
-    accept only the defaults documented below.
+    batch. Q/K/V must be prequantized E4M3FN and all three MXFP8 dequant
+    scales (``q_descale``, ``k_descale``, ``v_descale``) are required, on the
+    same Ascend 950 NPU, with head dimension 128 and ``Hq % Hkv == 0``.
+    For FP16/BF16 inputs use :func:`flash_attn_varlen_func`. Unsupported
+    options accept only the defaults documented below.
 
     Parameters
     ----------
@@ -1009,4 +1078,92 @@ def flash_attn_varlen_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+    )
+
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
+    gather_bwd_recompute_p: bool = False,
+    gather_bwd_token_chunk: Optional[int] = None,
+):
+    """Compute attention with independently fixed BSND or packed TND Q/KV.
+
+    This is the non-quantized entry point: Q/K/V must be ``float16`` or
+    ``bfloat16``. For prequantized E4M3FN inputs supply ``q_descale``,
+    ``k_descale`` and ``v_descale`` through
+    :func:`flash_attn_varlen_func_with_quant`. All remaining options match the
+    quantized variant.
+    """
+    if isinstance(q, torch.Tensor) and q.dtype == torch.float8_e4m3fn:
+        raise ValueError(
+            "quantized E4M3FN inputs require flash_attn_varlen_func_with_quant("
+            "q, k, v, q_descale=..., k_descale=..., v_descale=...)"
+        )
+    return flash_attn_varlen_func_with_quant(
+        q,
+        k,
+        v,
+        qv=qv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_k=min_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        gather_kv_indices=gather_kv_indices,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+        seqlen_k_per_split=seqlen_k_per_split,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+        gather_bwd_recompute_p=gather_bwd_recompute_p,
+        gather_bwd_token_chunk=gather_bwd_token_chunk,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     )

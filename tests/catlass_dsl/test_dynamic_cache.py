@@ -6,7 +6,14 @@ import catlass.tla as tla
 import pytest
 import torch
 
-from flash_attn_npu_4.catlass_dsl import compute_block_sparsity, flash_attn_func, flash_attn_varlen_func, runtime
+from flash_attn_npu_4.catlass_dsl import (
+    compute_block_sparsity,
+    flash_attn_func,
+    flash_attn_func_with_quant,
+    flash_attn_varlen_func,
+    flash_attn_varlen_func_with_quant,
+    runtime,
+)
 from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache
 from .test_utils import DTYPES, check_attention, copy_aux_to_device, make_inputs
 from .test_runtime import score, score_bwd
@@ -160,7 +167,7 @@ def test_mxfp8_reuses_dynamic_lengths_and_scales(device, compiler, monkeypatch, 
                          v_scale_capacity=20 + step if packed else None, seed=1176 + step)
         expected, logs = reference(case)
         inputs, options = to_device(case, device)
-        out, lse = flash_attn_varlen_func(*inputs, **options, return_lse=True)
+        out, lse = flash_attn_varlen_func_with_quant(*inputs, **options, return_lse=True)
         check(out, expected)
         check_quantized_lse(lse.cpu(), logs)
         owners = tuple(runtime.compile_cache.values())
@@ -222,7 +229,7 @@ def test_mxfp8_aux_cache_rebinds_geometry(device, compiler, monkeypatch, tail):
         inputs, options = to_device(case, device)
         rows = [0, 63, 127, 191, 255, length - 1]
         expected, logs = reference(case, mask_mod=mask_ref, aux=auxiliary, query_rows=[rows])
-        out, lse = flash_attn_varlen_func(*inputs, **options, return_lse=True,
+        out, lse = flash_attn_varlen_func_with_quant(*inputs, **options, return_lse=True,
                                          mask_mod=batch_labels, aux_tensors=tuple(copy_aux_to_device(t, device) for t in auxiliary),
                                          block_sparse_tensors=_device_sparse(sparse, device))
         check(out[:, rows], expected[:, rows])

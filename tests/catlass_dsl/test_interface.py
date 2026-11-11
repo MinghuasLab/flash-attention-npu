@@ -13,12 +13,15 @@ from .test_utils import check, metadata_tensor, oracle
 from flash_attn_npu_4.catlass_dsl import (
     compute_block_sparsity,
     flash_attn_func,
+    flash_attn_func_with_quant,
     flash_attn_varlen_func,
+    flash_attn_varlen_func_with_quant,
     interface,
     runtime,
 )
 
 ENTRIES = (flash_attn_func, flash_attn_varlen_func)
+QUANT_ENTRIES = (flash_attn_func_with_quant, flash_attn_varlen_func_with_quant)
 
 # Expected public signatures, stored locally for independent contract checks.
 SIGNATURES = {
@@ -43,6 +46,31 @@ SIGNATURES = {
         use_fast_sampling: bool = False
     """,
     "flash_attn_func": """
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qv: Optional[torch.Tensor] = None,
+        gather_kv_indices: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        learnable_sink: Optional[torch.Tensor] = None,
+        softcap: float = 0.0,
+        num_splits: int = 1,
+        pack_gqa: Optional[bool] = None,
+        deterministic: bool = False,
+        score_mod: Optional[Callable] = None,
+        score_mod_bwd: Optional[Callable] = None,
+        mask_mod: Optional[Callable] = None,
+        aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
+        block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+        block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+        return_lse: bool = False,
+        gather_bwd_recompute_p: bool = False,
+        gather_bwd_token_chunk: Optional[int] = None
+    """,
+    "flash_attn_func_with_quant": """
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -104,6 +132,41 @@ SIGNATURES = {
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
+        gather_bwd_token_chunk: Optional[int] = None
+    """,
+    "flash_attn_varlen_func_with_quant": """
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qv: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
+        min_seqlen_k: Optional[int] = None,
+        seqused_q: Optional[torch.Tensor] = None,
+        seqused_k: Optional[torch.Tensor] = None,
+        gather_kv_indices: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        learnable_sink: Optional[torch.Tensor] = None,
+        softcap: float = 0.0,
+        num_splits: int = 1,
+        pack_gqa: Optional[bool] = None,
+        deterministic: bool = False,
+        score_mod: Optional[Callable] = None,
+        score_mod_bwd: Optional[Callable] = None,
+        mask_mod: Optional[Callable] = None,
+        block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+        aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
+        return_lse: bool = False,
+        scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+        seqlen_k_per_split: Optional[int] = None,
+        disable_scheduler_metadata: bool = False,
+        gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
         *,
         q_descale: Optional[torch.Tensor] = None,
@@ -113,7 +176,7 @@ SIGNATURES = {
 }
 
 
-@pytest.mark.parametrize("entry", (*ENTRIES, compute_block_sparsity))
+@pytest.mark.parametrize("entry", (*ENTRIES, *QUANT_ENTRIES, compute_block_sparsity))
 def test_public_signature(entry):
     actual = inspect.signature(entry)
     source = ast.parse(Path(inspect.getfile(entry)).read_text())

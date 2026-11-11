@@ -123,11 +123,16 @@ out, lse = compiled_attention(q, k, v)
 
 ## Prequantized MXFP8 inference
 
-Both fixed-length and variable-length FA4 entry points accept three optional,
-keyword-only arguments: `q_descale`, `k_descale`, and
-`v_descale`. Supplying any one selects the CATLASS MXFP8 path and requires
-all three. Q/K/V must already be `torch.float8_e4m3fn`; this API does not quantize
-floating-point inputs. MXFP8 is supported on Ascend 950 with head dimension
+MXFP8 has dedicated entry points that add three keyword-only arguments,
+`q_descale`, `k_descale`, and `v_descale`, on top of the regular signatures:
+
+- `flash_attn_func_with_quant(...)` — fixed-length BSND
+- `flash_attn_varlen_func_with_quant(...)` — variable-length / mixed BSND/TND
+
+The non-quantized `flash_attn_func` / `flash_attn_varlen_func` remain FP16/BF16
+only. All three scales are required and Q/K/V must already be
+`torch.float8_e4m3fn`; this API does not quantize floating-point inputs. MXFP8
+is supported on Ascend 950 with head dimension
 128 and logical sparse blocks of 128x128. Q/K/V and scale tensors must not
 require gradients.
 
@@ -150,7 +155,9 @@ least `sum(ceil(segment_kv_length/64))`; extra trailing capacity is allowed.
 
 ```python
 # q_fp8/k_fp8/v_fp8 and their scale tensors are supplied by the caller.
-out, lse = flash_attn_func(
+from flash_attn_npu_4.catlass_dsl import flash_attn_func_with_quant
+
+out, lse = flash_attn_func_with_quant(
     q_fp8, k_fp8, v_fp8,
     q_descale=q_scale,
     k_descale=k_scale,

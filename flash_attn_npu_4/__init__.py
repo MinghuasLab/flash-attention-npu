@@ -13,7 +13,9 @@ __version__ = _version_module.__version__
 __all__ = [
     "flash_attn_combine",
     "flash_attn_func",
+    "flash_attn_func_with_quant",
     "flash_attn_varlen_func",
+    "flash_attn_varlen_func_with_quant",
     "get_scheduler_metadata",
 ]
 
@@ -34,14 +36,18 @@ if is_ascend910():
     from .flash_attn_npu_interface import (
         flash_attn_combine as flash_attn_combine,
         flash_attn_func as flash_attn_func,
+        flash_attn_func_with_quant as flash_attn_func_with_quant,
         flash_attn_varlen_func as flash_attn_varlen_func,
+        flash_attn_varlen_func_with_quant as flash_attn_varlen_func_with_quant,
         get_scheduler_metadata as get_scheduler_metadata,
     )
 elif is_ascend950():
     from .flash_attn_npu_interface_950 import (
         flash_attn_combine as flash_attn_combine,
         flash_attn_func as flash_attn_func,
+        flash_attn_func_with_quant as flash_attn_func_with_quant,
         flash_attn_varlen_func as flash_attn_varlen_func,
+        flash_attn_varlen_func_with_quant as flash_attn_varlen_func_with_quant,
         get_scheduler_metadata as get_scheduler_metadata,
     )
 else:

@@ -13,6 +13,8 @@ from importlib import import_module
 _EXPORTS = {
     "flash_attn_func": "interface",
     "flash_attn_varlen_func": "interface",
+    "flash_attn_func_with_quant": "interface",
+    "flash_attn_varlen_func_with_quant": "interface",
     "compute_block_sparsity": "block_sparsity",
     "simd": "decorators",
     "simt": "decorators",
@@ -21,6 +23,8 @@ _EXPORTS = {
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "flash_attn_func_with_quant",
+    "flash_attn_varlen_func_with_quant",
     "compute_block_sparsity",
     "simd",
     "simt",
