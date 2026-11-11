@@ -22,7 +22,7 @@ class FlashDecodeCombine950 {
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
-    static constexpr uint32_t MAX_HEAD_DIM = 256U;
+    static constexpr uint32_t MAX_HEAD_DIM = 512U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
     static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;

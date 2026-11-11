@@ -335,7 +335,7 @@ void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
         tiling.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE | FD_COMBINE_UNIFORM_WITH_LSE;
     } else {
         const uint32_t rowTile =
-            std::min(tiling.embeddingSizeV == 512 ? 4U : FD_COMBINE_ROW_TILE, std::max(1U, (tiling.fdCombineRowNum + aivNum - 1U) / aivNum));
+            std::min(FD_COMBINE_ROW_TILE, std::max(1U, (tiling.fdCombineRowNum + aivNum - 1U) / aivNum));
         std::vector<uint64_t> uniformLoads(aivNum, 0U);
         std::vector<uint32_t> uniformRounds(aivNum, 0U);
         uint32_t tile = 0U;
@@ -354,8 +354,8 @@ void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
             uint32_t balancedRounds = 0U;
             for (uint32_t core = 0U; core < tiling.fdCombineAivNum; ++core) {
                 balancedRounds =
-                    std::max(balancedRounds, (tiling.fdCombineCoreSchedules[core].rowCount + (tiling.embeddingSizeV == 512 ? 4U : FD_COMBINE_ROW_TILE) - 1U) /
-                                                 (tiling.embeddingSizeV == 512 ? 4U : FD_COMBINE_ROW_TILE));
+                    std::max(balancedRounds, (tiling.fdCombineCoreSchedules[core].rowCount + FD_COMBINE_ROW_TILE - 1U) /
+                                                 FD_COMBINE_ROW_TILE);
             }
             // With no multi-buffer input to remove, adding a whole extra
             // row round can also outweigh balancing the LSE stores.
