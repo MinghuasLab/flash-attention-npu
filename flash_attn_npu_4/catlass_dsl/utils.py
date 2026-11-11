@@ -190,10 +190,7 @@ def attention(
     window = tuple(None if bound is None or bound < 0 else bound for bound in window_size)
     from . import interface
 
-    scales = {
-        name: options.pop(name, None)
-        for name in ("q_descale", "k_descale", "v_descale")
-    }
+    scales = {name: options.pop(name, None) for name in ("q_descale", "k_descale", "v_descale")}
     quantized = any(value is not None for value in scales.values())
     if quantized:
         entry = (

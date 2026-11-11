@@ -60,8 +60,21 @@ class _TensorBinding:
     def build_memref_launch_fields(self):
         # CATLASS schema-v4 canonical fields: allocated/aligned ptr, offset,
         # four physical sizes, four strides, and two logical origin sizes.
-        return (self.address, self.address, 0, self.rows, self.columns, 1, 1,
-                self.row_stride, 1, 1, 1, self.rows, self.columns)
+        return (
+            self.address,
+            self.address,
+            0,
+            self.rows,
+            self.columns,
+            1,
+            1,
+            self.row_stride,
+            1,
+            1,
+            1,
+            self.rows,
+            self.columns,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -108,10 +121,15 @@ def _sample(value, shape=None, *, logical=False):
 
         tla = _tla()
         dtype = {
-            torch.bool: tla.Bool, torch.int32: tla.Int32, torch.int64: tla.Int64,
-            torch.uint32: tla.Int32, torch.uint8: tla.UInt8,
-            torch.float16: tla.Float16, torch.bfloat16: tla.BFloat16,
-            torch.float32: tla.Float32, torch.float8_e4m3fn: tla.Float8E4M3FN,
+            torch.bool: tla.Bool,
+            torch.int32: tla.Int32,
+            torch.int64: tla.Int64,
+            torch.uint32: tla.Int32,
+            torch.uint8: tla.UInt8,
+            torch.float16: tla.Float16,
+            torch.bfloat16: tla.BFloat16,
+            torch.float32: tla.Float32,
+            torch.float8_e4m3fn: tla.Float8E4M3FN,
         }[value.dtype]
         # SIMT captures one pointer, not a dynamic memref descriptor. Aux
         # handles are linear pointer ABIs; logical bounds and strides are
@@ -120,8 +138,12 @@ def _sample(value, shape=None, *, logical=False):
         shape = (1,) if pointer else shape or (max(1, value.numel()),)
         stride = (shape[1], 1) if len(shape) == 2 else (1,)
         sample = make_fake_tensor(
-            dtype, shape, stride, origin_shape=shape,
-            coord=(0,) * len(shape), layout_tag=tla.arch.RowMajor,
+            dtype,
+            shape,
+            stride,
+            origin_shape=shape,
+            coord=(0,) * len(shape),
+            layout_tag=tla.arch.RowMajor,
         )
         return sample if pointer else sample.mark_layout_dynamic()
     if isinstance(value, tuple):
@@ -133,12 +155,15 @@ def _sample(value, shape=None, *, logical=False):
 def _aux_specs(tensors):
     # Shapes and nonzero strides are runtime values. The descriptor retains
     # rank, unsigned interpretation and the offset arithmetic width.
-    return tuple((
-        (None,) * t.ndim,
-        tuple(0 if s == 0 else 1 if s == 1 else None for s in t.stride()),
-        t.dtype == torch.uint32,
-        _extent(t) < 2**31 and all(0 <= n < 2**31 for n in (*t.shape, *t.stride())),
-    ) for t in tensors)
+    return tuple(
+        (
+            (None,) * t.ndim,
+            tuple(0 if s == 0 else 1 if s == 1 else None for s in t.stride()),
+            t.dtype == torch.uint32,
+            _extent(t) < 2**31 and all(0 <= n < 2**31 for n in (*t.shape, *t.stride())),
+        )
+        for t in tensors
+    )
 
 
 def _aux_key(tensors):
@@ -216,8 +241,15 @@ def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=Fal
             return tuple(bind(item, logical=logical) for item in value)
         return value
 
-    bound = tuple(bind(arg, shapes.get(i), logical=i in (6, 15) and isinstance(arg, tuple),
-                       quantized=fp8 and i < 3) for i, arg in enumerate(runtime))
+    bound = tuple(
+        bind(
+            arg,
+            shapes.get(i),
+            logical=i in (6, 15) and isinstance(arg, tuple),
+            quantized=fp8 and i < 3,
+        )
+        for i, arg in enumerate(runtime)
+    )
     executor(*bound, block_num=block_num, stream=stream)
 
 
@@ -373,8 +405,13 @@ class _AttentionPlan:
         args = self.arguments(
             q, k, v, out, lse, config, sparse, dout, dq, dk_acc, dv_acc, dk, dv, dlse
         )
-        _launch(self.executor, args, block_num=self.block_num, device=q.device,
-                tensor_shapes=_index_shapes(sparse))
+        _launch(
+            self.executor,
+            args,
+            block_num=self.block_num,
+            device=q.device,
+            tensor_shapes=_index_shapes(sparse),
+        )
 
 
 @_on_tensor_device
@@ -405,8 +442,19 @@ def launch_attention(
         "block_sparse_tensors"
     ]
     plan = _make_attention_plan(
-        q, k, v, out, lse, config, dout=dout, dq=dq, dk_acc=dk_acc,
-        dv_acc=dv_acc, dk=dk, dv=dv, dlse=dlse,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        config,
+        dout=dout,
+        dq=dq,
+        dk_acc=dk_acc,
+        dv_acc=dv_acc,
+        dk=dk,
+        dv=dv,
+        dlse=dlse,
     )
     plan(q, k, v, out, lse, config, sparse, dout, dq, dk_acc, dv_acc, dk, dv, dlse)
 
@@ -553,9 +601,7 @@ def _make_attention_plan(
         # Pass both adapters explicitly; the forward kernel owns their scheduling.
         vector_score = None
         if dense and generic and indexed and program.simd is not None:
-            vector_score = pipeline_adapter(
-                program, "score", specs, mode="simd", varlen=varlen
-            )
+            vector_score = pipeline_adapter(program, "score", specs, mode="simd", varlen=varlen)
         # Preserve unsigned storage metadata across the signed auxiliary ABI.
         temporal_aux = bool(specs) and all(spec[2] for spec in specs)
         static += (vector_score, temporal_aux)
@@ -578,10 +624,17 @@ def _make_attention_plan(
     # the kernel signature. Empty tuples must keep their ABI positions too.
     compile_args = (*args[:-2], *static, *args[-2:]) if backward else (*args, *static)
     key = (
-        "bwd" if backward else "fwd", q.device, str(q.dtype), "3510",
-        H, KH, static, _aux_key(config["aux_tensors"]),
+        "bwd" if backward else "fwd",
+        q.device,
+        str(q.dtype),
+        "3510",
+        H,
+        KH,
+        static,
+        _aux_key(config["aux_tensors"]),
         tuple(type(x).__name__ for x in config["aux_scalars"]),
-        plan.workspace_size is not None, dlse is not None,
+        plan.workspace_size is not None,
+        dlse is not None,
     )
     executor = _compile(key, kernel, compile_args, _index_shapes(sparse))
     return replace(plan, executor=executor)
@@ -594,8 +647,7 @@ def _compile_mxfp8(args, index_shape):
     from .kernels.flash_fwd_mxfp8_arch35 import flash_fwd_mxfp8_kernel
 
     tla = _tla()
-    samples = tuple(_sample(arg, index_shape.get(i), logical=i == 15)
-                    for i, arg in enumerate(args))
+    samples = tuple(_sample(arg, index_shape.get(i), logical=i == 15) for i, arg in enumerate(args))
     return tla.compile(flash_fwd_mxfp8_kernel, *samples, options="--npu-arch 3510")
 
 
@@ -627,22 +679,38 @@ class _MXFP8Plan:
     def arguments(self, q, k, v, out, lse, config, offsets):
         sparse = config["block_sparse_tensors"]
         pc, pi, fc, fi = (
-            (self.dummy,) * 4 if sparse is None else (
-                sparse.mask_block_cnt, sparse.mask_block_idx,
-                sparse.full_block_cnt, sparse.full_block_idx,
+            (self.dummy,) * 4
+            if sparse is None
+            else (
+                sparse.mask_block_cnt,
+                sparse.mask_block_idx,
+                sparse.full_block_cnt,
+                sparse.full_block_idx,
             )
         )
         tensors = (
-            q, k, v, *config["mxfp8_scales"],
+            q,
+            k,
+            v,
+            *config["mxfp8_scales"],
             self.dummy if offsets is None else offsets,
-            out, lse, pc, pi, fc, fi,
+            out,
+            lse,
+            pc,
+            pi,
+            fc,
+            fi,
             self.dummy if config["cu_q"] is None else config["cu_q"],
             self.dummy if config["cu_k"] is None else config["cu_k"],
         )
         aux, scalars = _aux(config["aux_tensors"], config["aux_scalars"])
         return (
-            *(_buffer(t) for t in tensors), aux, scalars,
-            *self.integers, self.scale_type(config["scale"]), self.total_tokens,
+            *(_buffer(t) for t in tensors),
+            aux,
+            scalars,
+            *self.integers,
+            self.scale_type(config["scale"]),
+            self.total_tokens,
             _tla().Int32(k.shape[0] if config["cu_k"] is not None else config["B"] * config["Sk"]),
             _tla().Int32(config["mxfp8_scales"][2].shape[0] if config["cu_k"] is not None else 0),
         )
@@ -672,11 +740,17 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     program = config["score_mod"] or identity
     mask_program = config["mask_mod"] or all_visible
     mode = callback_mode(program, mask_program)
-    if (config["block_sparse_tensors"] is not None
-        and (config["cu_q"] is not None or config["cu_k"] is not None
-             or (config["Sq"] >= 1024 and config["Sk"] >= 1024))
-            and program is identity and mask_program is not all_visible
-            and mask_program.simt is not None):
+    if (
+        config["block_sparse_tensors"] is not None
+        and (
+            config["cu_q"] is not None
+            or config["cu_k"] is not None
+            or (config["Sq"] >= 1024 and config["Sk"] >= 1024)
+        )
+        and program is identity
+        and mask_program is not all_visible
+        and mask_program.simt is not None
+    ):
         mode = "simt"
     indexed = mode == "simt"
     varlen = (config["cu_q"] is not None, config["cu_k"] is not None)
@@ -687,7 +761,8 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     mask = pipeline_adapter(mask_program, "mask", specs, mode=mode, varlen=varlen)
     vector_score = (
         pipeline_adapter(program, "score", specs, mode="simd", varlen=varlen)
-        if indexed and program.simd is not None else None
+        if indexed and program.simd is not None
+        else None
     )
     sparse = config["block_sparse_tensors"]
     dense = sparse is None
@@ -707,13 +782,20 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     )
     args = plan.arguments(q, k, v, out, lse, config, offsets)
     static = (
-        varlen, dense, indexed, score, mask, sequence_major,
-        dense and mask_program is not all_visible, vector_score,
+        varlen,
+        dense,
+        indexed,
+        score,
+        mask,
+        sequence_major,
+        dense and mask_program is not all_visible,
+        vector_score,
         any(varlen) or Sq % 128 != 0 or Sk % 128 != 0,
         program is identity,
     )
     continuous = (
-        program is identity and mask_program.simt is not None
+        program is identity
+        and mask_program.simt is not None
         and ((Sq >= 1024 and Sk >= 1024) or any(varlen))
         and (not dense or mask_program is all_visible)
     )
@@ -723,47 +805,87 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
         # Auxiliary masks use up to four lookahead tiles; masks without
         # auxiliary storage can use six. Neither traverses unused capacity.
         # Keep two extra P slots while consuming every actual KV block.
-        group_size = 4 if dense else max(1, min(4, max(
-            sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]
-        )))
+        group_size = (
+            4
+            if dense
+            else max(
+                1, min(4, max(sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]))
+            )
+        )
         if not config["aux_tensors"]:
-            group_size = 6 if dense else max(1, min(6, max(
-                sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]
-            )))
+            group_size = (
+                6
+                if dense
+                else max(
+                    1, min(6, max(sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]))
+                )
+            )
         guard_elements = (B * H * ((Sq + 127) // 128) + plan.block_num) * 16
-    mask_kind = (0 if mask_program is all_visible else
-                 2 if any(t.dtype == torch.uint32 for t in config["aux_tensors"]) else 1)
-    aux_cache_meta=[]
-    cache_bytes=0
-    if continuous and mask_kind==1:
-        valid_aux=all(1<=t.ndim<=3 and t.is_contiguous()
-                      and t.dtype in (torch.int32,torch.int64)
-                      and t.shape[-1]>=max(Sq,Sk)
-                      and (not any(varlen) or t.ndim>=2 or t.shape[0]>=max(q.shape[0] if varlen[0] else Sq,k.shape[0] if varlen[1] else Sk)) for t in config["aux_tensors"])
+    mask_kind = (
+        0
+        if mask_program is all_visible
+        else 2
+        if any(t.dtype == torch.uint32 for t in config["aux_tensors"])
+        else 1
+    )
+    aux_cache_meta = []
+    cache_bytes = 0
+    if continuous and mask_kind == 1:
+        valid_aux = all(
+            1 <= t.ndim <= 3
+            and t.is_contiguous()
+            and t.dtype in (torch.int32, torch.int64)
+            and t.shape[-1] >= max(Sq, Sk)
+            and (
+                not any(varlen)
+                or t.ndim >= 2
+                or t.shape[0]
+                >= max(q.shape[0] if varlen[0] else Sq, k.shape[0] if varlen[1] else Sk)
+            )
+            for t in config["aux_tensors"]
+        )
         if valid_aux:
-            sizes=[(t.numel()*t.element_size()+511)//512*512 for t in config["aux_tensors"]]
-            tile_cache=bool(any(varlen) or Sq%128 or Sk%128 or sum(sizes)>131072)
-            for tensor,size in zip(config["aux_tensors"],sizes):
-                storage=3*128*tensor.element_size() if tile_cache else size
-                if cache_bytes+storage>131072:
-                    aux_cache_meta=[]
+            sizes = [
+                (t.numel() * t.element_size() + 511) // 512 * 512 for t in config["aux_tensors"]
+            ]
+            tile_cache = bool(any(varlen) or Sq % 128 or Sk % 128 or sum(sizes) > 131072)
+            for tensor, size in zip(config["aux_tensors"], sizes):
+                storage = 3 * 128 * tensor.element_size() if tile_cache else size
+                if cache_bytes + storage > 131072:
+                    aux_cache_meta = []
                     break
                 # Negative offsets select query + two KV tile caches.
-                offset=-1-cache_bytes if tile_cache else cache_bytes
-                aux_cache_meta.append((offset if tile_cache else 0, (None,) * tensor.ndim, (None,) * tensor.ndim, tensor.element_size()==8))
-                cache_bytes+=storage
-    post_quant = continuous and not any(varlen) and mask_kind==2 and max(sparse.mask_block_idx.shape[-1],sparse.full_block_idx.shape[-1])>=8
-    inline_quantize=None
+                offset = -1 - cache_bytes if tile_cache else cache_bytes
+                aux_cache_meta.append(
+                    (
+                        offset if tile_cache else 0,
+                        (None,) * tensor.ndim,
+                        (None,) * tensor.ndim,
+                        tensor.element_size() == 8,
+                    )
+                )
+                cache_bytes += storage
+    post_quant = (
+        continuous
+        and not any(varlen)
+        and mask_kind == 2
+        and max(sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]) >= 8
+    )
+    inline_quantize = None
     bounded_inline, periodic_mask = False, False
-    mask_span=None
-    if continuous and mask_kind==1 and not config["aux_tensors"]:
+    mask_span = None
+    if continuous and mask_kind == 1 and not config["aux_tensors"]:
         from .kernels.flash_fwd_mxfp8_arch35 import _mx_trace_affine_mask
-        traced=_mx_trace_affine_mask(mask_program.simt,Sq,Sk,len(config["aux_scalars"]),post_quant,any(varlen))
+
+        traced = _mx_trace_affine_mask(
+            mask_program.simt, Sq, Sk, len(config["aux_scalars"]), post_quant, any(varlen)
+        )
         if traced is not None:
-            inline_quantize,bounded_inline,mask_span,periodic_mask=traced
+            inline_quantize, bounded_inline, mask_span, periodic_mask = traced
     wide_mask = inline_quantize is not None and mask_span is None
     if continuous and aux_cache_meta and mask_kind == 1:
         from .kernels.flash_fwd_mxfp8_arch35 import _mx_mask_depends_on_query
+
         # A KV-only mask permits the same head-major reuse as a wide affine
         # mask. Apply the existing working-set/reuse threshold to its layout
         # copies too; neither auxiliary values nor boundary values are read.
@@ -775,47 +897,87 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     if continuous:
         tensors = (*args[:6], *args[7:13], *config["aux_tensors"])
         properties = torch.npu.get_device_properties(q.device)
-        stream_output = _mxfp8_stream_output(
-            tensors, int(getattr(properties, "L2_cache_size", 0))
+        stream_output = _mxfp8_stream_output(tensors, int(getattr(properties, "L2_cache_size", 0)))
+        l2_bytes = int(getattr(properties, "L2_cache_size", 0))
+        selected = (
+            (Sk + 127) // 128
+            if dense
+            else max(sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1])
         )
-        l2_bytes=int(getattr(properties,"L2_cache_size",0))
-        selected=(Sk+127)//128 if dense else max(sparse.mask_block_idx.shape[-1],sparse.full_block_idx.shape[-1])
-        reuse=H*((Sq+127)//128)*selected/max(1,KH*((Sk+127)//128))
-        kv_bytes=sum(t.numel()*t.element_size() for t in (k,v,*config["mxfp8_scales"][1:]))
-        pack_kv=sequence_major[1] and (dense or wide_mask) and _mxfp8_should_pack_kv(kv_bytes,reuse,l2_bytes)
+        reuse = H * ((Sq + 127) // 128) * selected / max(1, KH * ((Sk + 127) // 128))
+        kv_bytes = sum(t.numel() * t.element_size() for t in (k, v, *config["mxfp8_scales"][1:]))
+        pack_kv = (
+            sequence_major[1]
+            and (dense or wide_mask)
+            and _mxfp8_should_pack_kv(kv_bytes, reuse, l2_bytes)
+        )
         if pack_kv:
-            sequence_major=(sequence_major[0],False)
-            static=(*static[:5],sequence_major,*static[6:])
+            sequence_major = (sequence_major[0], False)
+            static = (*static[:5], sequence_major, *static[6:])
     # Narrow sparse neighborhoods stream adjacent heads together. Wider
     # neighborhoods reuse a head's K/V across consecutive query blocks.
     query_major = not dense and not wide_mask
-    paired_heads=continuous and not config["aux_tensors"] and sequence_major[0] and sequence_major[1] and H==KH and KH%2==0 and mask_span is not None and mask_span<=257
+    paired_heads = (
+        continuous
+        and not config["aux_tensors"]
+        and sequence_major[0]
+        and sequence_major[1]
+        and H == KH
+        and KH % 2 == 0
+        and mask_span is not None
+        and mask_span <= 257
+    )
     # The exact online auxiliary pipeline has no speculative phase or repair.
     # Trace the same fake auxiliary dtypes/scalars passed to the compiler.
     legacy_guard_elements = guard_elements
-    if (continuous and 0 < len(aux_cache_meta) <= 4
-            and (any(varlen) or all(t.ndim == 1 for t in config["aux_tensors"]))):
+    if (
+        continuous
+        and 0 < len(aux_cache_meta) <= 4
+        and (any(varlen) or all(t.ndim == 1 for t in config["aux_tensors"]))
+    ):
         from .kernels.flash_fwd_mxfp8_arch35 import _mx_mask_depends_on_query, _mx_repair_aux
+
         if _mx_mask_depends_on_query(mask, _sample(args[15], logical=True), args[16]):
             pipeline, guard_elements = "exact_aux", 0
             aux_cache_meta = _mx_repair_aux(tuple(aux_cache_meta))
     # Few-block periodic neighborhoods often have only a handful of visible
     # keys in some rows. Avoid speculating on those rows and repairing them.
-    if (continuous and periodic_mask and mask_span is None
-            and max(Sq, Sk) <= 2048):
+    if continuous and periodic_mask and mask_span is None and max(Sq, Sk) <= 2048:
         pipeline, guard_elements = "exact_aux", 0
     features = _MXFP8Features(
-        single_sequence=B == 1 and any(varlen), q_heads=H, kv_heads=KH,
+        single_sequence=B == 1 and any(varlen),
+        q_heads=H,
+        kv_heads=KH,
         short_delay=pipeline == "continuous" and max(Sq, Sk) <= 2048,
-        stream_output=stream_output, query_major=query_major,
-        bounded_inline=bounded_inline, paired_heads=paired_heads,
+        stream_output=stream_output,
+        query_major=query_major,
+        bounded_inline=bounded_inline,
+        paired_heads=paired_heads,
     )
-    static = (*static, False, pipeline, group_size, mask_kind,
-              features, tuple(aux_cache_meta), inline_quantize, post_quant)
-    key = ("mxfp8", q.device, str(q.dtype), str(out.dtype), "3510", H, KH,
-           static, _aux_key(config["aux_tensors"]),
-           tuple(str(t.dtype) for t in config["mxfp8_scales"]),
-           tuple(type(x).__name__ for x in config["aux_scalars"]))
+    static = (
+        *static,
+        False,
+        pipeline,
+        group_size,
+        mask_kind,
+        features,
+        tuple(aux_cache_meta),
+        inline_quantize,
+        post_quant,
+    )
+    key = (
+        "mxfp8",
+        q.device,
+        str(q.dtype),
+        str(out.dtype),
+        "3510",
+        H,
+        KH,
+        static,
+        _aux_key(config["aux_tensors"]),
+        tuple(str(t.dtype) for t in config["mxfp8_scales"]),
+        tuple(type(x).__name__ for x in config["aux_scalars"]),
+    )
 
     def compile_selected():
         try:
@@ -865,17 +1027,29 @@ def launch_mxfp8(q, k, v, out, lse, config):
     if plan.pack_kv:
         # Preserve the public TND/BSND metadata while packing internal storage
         # by head. The complete cu_seqlens contract remains device-side.
-        axes=(0,1) if config["cu_k"] is not None else (1,2)
-        stream=torch.npu.current_stream(q.device)
-        packed=[]
-        for tensor in (k,v,*scales[1:]):
+        axes = (0, 1) if config["cu_k"] is not None else (1, 2)
+        stream = torch.npu.current_stream(q.device)
+        packed = []
+        for tensor in (k, v, *scales[1:]):
             tensor.record_stream(stream)
-            packed.append(tensor.view(torch.uint8).transpose(*axes).contiguous().reshape(tensor.shape).view(tensor.dtype))
-        k,v,ks,vs=packed
-        config=dict(config,mxfp8_scales=(scales[0],ks,vs))
+            packed.append(
+                tensor.view(torch.uint8)
+                .transpose(*axes)
+                .contiguous()
+                .reshape(tensor.shape)
+                .view(tensor.dtype)
+            )
+        k, v, ks, vs = packed
+        config = dict(config, mxfp8_scales=(scales[0], ks, vs))
     args = plan.arguments(q, k, v, out, lse, config, offsets)
-    _launch(plan.executor, args, block_num=plan.block_num, device=q.device,
-            tensor_shapes=_index_shapes(sparse), fp8=True)
+    _launch(
+        plan.executor,
+        args,
+        block_num=plan.block_num,
+        device=q.device,
+        tensor_shapes=_index_shapes(sparse),
+        fp8=True,
+    )
 
 
 def clear_compile_cache(*, persistent=False):

@@ -85,7 +85,9 @@ def _resolve_mxfp8_scales(q, k, v, scales, *, layout="BSND", canonical=False):
             else (k.shape[0], heads, (length + 63) // 64, 128, 2)
         )
         if vs.shape != shape:
-            raise ValueError("MXFP8 V scale shape must group the KV sequence dimension into pairs of 32")
+            raise ValueError(
+                "MXFP8 V scale shape must group the KV sequence dimension into pairs of 32"
+            )
     if not canonical:
         return tuple(scales)
     result = []
@@ -100,8 +102,19 @@ def _resolve_mxfp8_scales(q, k, v, scales, *, layout="BSND", canonical=False):
 
 
 def _validate(
-    q, k, v, aux_tensors, aux_scalars, scale, cu_q, cu_k, max_q, max_k,
-    *, layout="BNSD", mxfp8_scales=None,
+    q,
+    k,
+    v,
+    aux_tensors,
+    aux_scalars,
+    scale,
+    cu_q,
+    cu_k,
+    max_q,
+    max_k,
+    *,
+    layout="BNSD",
+    mxfp8_scales=None,
 ):
     # Internal callers (including torch_npu_flex) use BNSD; public inputs are BSND.
     if not isinstance(layout, str) or layout not in ("BSND", "BNSD"):
@@ -414,8 +427,18 @@ def _prepare_config(
             mask = builtin.local_window(left, right)
     callback_mode(score, mask, grad if training else None)
     config = _validate(
-        q, k, v, aux, scalars, softmax_scale, cu_q, cu_k, max_q, max_k,
-        layout=layout, mxfp8_scales=mxfp8_scales,
+        q,
+        k,
+        v,
+        aux,
+        scalars,
+        softmax_scale,
+        cu_q,
+        cu_k,
+        max_q,
+        max_k,
+        layout=layout,
+        mxfp8_scales=mxfp8_scales,
     )
     if q.numel() == 0 or k.numel() == 0:
         blocks = [None, None]

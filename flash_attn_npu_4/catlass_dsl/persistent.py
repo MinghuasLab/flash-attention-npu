@@ -29,7 +29,9 @@ def file_digest(path):
 
 
 def _json_digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _constant(value, active):
@@ -59,17 +61,30 @@ def _constant(value, active):
         from .mods import Mod
 
         if isinstance(value, Mod):
-            return ["mod", _constant(value.simt, active), _constant(value.simd, active),
-                    getattr(value, "broadcast_batch", False), getattr(value, "broadcast_head", False)]
+            return [
+                "mod",
+                _constant(value.simt, active),
+                _constant(value.simd, active),
+                getattr(value, "broadcast_batch", False),
+                getattr(value, "broadcast_head", False),
+            ]
     if type(value).__module__ == "catlass.tla.ffi" and type(value).__name__ == "ExternFunction":
         # The declaration's Python stub does not contain the generated C++.
         # Extra include roots need dependency discovery; conservatively leave
         # those declarations to the backend cache instead of guessing a key.
         if value.include_dirs:
             raise TypeError("extern has additional include dependencies")
-        return ["extern", value.symbol, hashlib.sha256(value.source.encode()).hexdigest(),
-                tuple(str(arg) for arg in value.arg_types)]
-    if isinstance(value, type) and value.__module__.split(".")[0] in ("builtins", "catlass", "flash_attn_npu_4"):
+        return [
+            "extern",
+            value.symbol,
+            hashlib.sha256(value.source.encode()).hexdigest(),
+            tuple(str(arg) for arg in value.arg_types),
+        ]
+    if isinstance(value, type) and value.__module__.split(".")[0] in (
+        "builtins",
+        "catlass",
+        "flash_attn_npu_4",
+    ):
         return ["type", value.__module__, value.__qualname__]
     if callable(value):
         return _callable(value, active)
@@ -85,6 +100,7 @@ def _callable(value, active):
     active = active | {fn}
     source = inspect.getsource(fn)
     dependencies = []
+
     def names(code):
         result = set(code.co_names)
         for constant in code.co_consts:
@@ -95,9 +111,17 @@ def _callable(value, active):
     for name in sorted(names(fn.__code__)):
         if name in fn.__globals__:
             dependencies.append((name, _constant(fn.__globals__[name], active)))
-    return ["function", source, _constant(fn.__defaults__, active),
-            [(name, _constant(default, active)) for name, default in sorted((fn.__kwdefaults__ or {}).items())],
-            [_constant(c.cell_contents, active) for c in (fn.__closure__ or ())], dependencies]
+    return [
+        "function",
+        source,
+        _constant(fn.__defaults__, active),
+        [
+            (name, _constant(default, active))
+            for name, default in sorted((fn.__kwdefaults__ or {}).items())
+        ],
+        [_constant(c.cell_contents, active) for c in (fn.__closure__ or ())],
+        dependencies,
+    ]
 
 
 @lru_cache(maxsize=2048)
@@ -119,9 +143,12 @@ def source_fingerprint():
     versions = {}
     for name in ("ascend-catlass-dsl", "torch", "torch_npu"):
         versions[name] = importlib.metadata.version(name)
-    if (versions["ascend-catlass-dsl"].split(".")[:2] != ["2", "2"]
-            or not hasattr(execution, "_new_jit_compiled_function")):
-        raise RuntimeError("persistent attention cache requires the CATLASS 2.2 prepared-executor API")
+    if versions["ascend-catlass-dsl"].split(".")[:2] != ["2", "2"] or not hasattr(
+        execution, "_new_jit_compiled_function"
+    ):
+        raise RuntimeError(
+            "persistent attention cache requires the CATLASS 2.2 prepared-executor API"
+        )
     sources = []
     for root in (Path(__file__).parent, Path(catlass.__file__).parent):
         for path in sorted(root.rglob("*.py")):
@@ -131,10 +158,17 @@ def source_fingerprint():
     tools.extend(Path(catlass.__file__).parent.rglob("*.so"))
     for variant in ("normal", "print"):
         tools.extend(Path(p) for p in get_bc_paths("mix", variant=variant).split(","))
-    return _json_digest((ABI_VERSION, sys.version_info[:3], versions, sources,
-                         [(str(p), file_digest(p)) for p in sorted(set(p for p in tools if p is not None))],
-                         tuple(str(root) for root in include_roots),
-                         "--npu-arch 3510"))
+    return _json_digest(
+        (
+            ABI_VERSION,
+            sys.version_info[:3],
+            versions,
+            sources,
+            [(str(p), file_digest(p)) for p in sorted(set(p for p in tools if p is not None))],
+            tuple(str(root) for root in include_roots),
+            "--npu-arch 3510",
+        )
+    )
 
 
 def _tree_json(tree):
@@ -156,7 +190,9 @@ def _read_tree(data):
     if "leaf" in data:
         return Leaf(kind=data["leaf"], binding_index=data["index"])
     children = tuple(_read_tree(child) for child in data["children"])
-    return PyTreeDef(_NODE_TYPES["tuple"], TreeMetadata(tuple, tuple(range(len(children)))), children)
+    return PyTreeDef(
+        _NODE_TYPES["tuple"], TreeMetadata(tuple, tuple(range(len(children)))), children
+    )
 
 
 def export_function(fn, directory):
@@ -170,31 +206,55 @@ def export_function(fn, directory):
     # Include transitive C++/system headers discovered by the real compiler.
     # Hash contents even where CATLASS itself records only size/mtime.
     backend = json.loads((artifacts.cache_dir / "manifest.json").read_text())
-    dependencies = sorted({entry["path"] for group in backend.get("extern_dependency_groups", ())
-                            for entry in group["dependency_snapshots"]})
+    dependencies = sorted(
+        {
+            entry["path"]
+            for group in backend.get("extern_dependency_groups", ())
+            for entry in group["dependency_snapshots"]
+        }
+    )
     trees = []
     for tree in module.execution_args.argument_trees:
-        trees.append(None if tree is None else {
-            "tree": _tree_json(tree.treedef),
-            "bindings": [{"path": list(b.path), "type": str(b.mlir_type), "kind": b.kind}
-                         for b in tree.bindings],
-        })
-    metadata = {field.name: getattr(module, field.name) for field in fields(module)
-                if field.name not in ("kernel_binary_path", "execution_args", "print_metadata")}
-    metadata.update(version=ABI_VERSION, backend_key=artifacts.cache_key,
-                    guarded_fallback=getattr(fn, "_attention_guarded_fallback", False),
-                    dependencies={path: file_digest(path) for path in dependencies},
-                    abi=kernel_abi_to_dict(module.execution_args.kernel_abi), trees=trees)
+        trees.append(
+            None
+            if tree is None
+            else {
+                "tree": _tree_json(tree.treedef),
+                "bindings": [
+                    {"path": list(b.path), "type": str(b.mlir_type), "kind": b.kind}
+                    for b in tree.bindings
+                ],
+            }
+        )
+    metadata = {
+        field.name: getattr(module, field.name)
+        for field in fields(module)
+        if field.name not in ("kernel_binary_path", "execution_args", "print_metadata")
+    }
+    metadata.update(
+        version=ABI_VERSION,
+        backend_key=artifacts.cache_key,
+        guarded_fallback=getattr(fn, "_attention_guarded_fallback", False),
+        dependencies={path: file_digest(path) for path in dependencies},
+        abi=kernel_abi_to_dict(module.execution_args.kernel_abi),
+        trees=trees,
+    )
     shutil.copyfile(module.kernel_binary_path, directory / "kernel.o")
     (directory / "tla.mlir").write_text(artifacts.MLIR)
     (directory / "lowered.mlir").write_text(artifacts.LLVM)
-    metadata["checksums"] = {name: file_digest(directory / name)
-                             for name in ("kernel.o", "tla.mlir", "lowered.mlir")}
+    metadata["checksums"] = {
+        name: file_digest(directory / name) for name in ("kernel.o", "tla.mlir", "lowered.mlir")
+    }
     (directory / "manifest.json").write_text(json.dumps(metadata, sort_keys=True))
 
 
 def load_function(directory):
-    from catlass.base_dsl.jit_executor import ExecutionArgs, JitCompiledFunction, JitFunctionArtifacts, JitModule
+    from catlass.base_dsl.jit_executor import (
+        ExecutionArgs,
+        JitCompiledFunction,
+        JitFunctionArtifacts,
+        JitModule,
+    )
     from catlass.base_dsl.runtime.argument_binding import RuntimeArgumentTree, RuntimeLeafBinding
     from catlass.compiler_bridge import kernel_abi_from_dict
     from catlass.execution import _prepare_abi_packer
@@ -209,20 +269,39 @@ def load_function(directory):
     for name in ("kernel.o", "tla.mlir", "lowered.mlir"):
         if file_digest(directory / name) != checksums[name]:
             raise ValueError(f"corrupt artifact: {name}")
-    trees = tuple(None if entry is None else RuntimeArgumentTree(
-        _read_tree(entry["tree"]),
-        tuple(RuntimeLeafBinding(tuple(b["path"]), b["type"], b["kind"]) for b in entry["bindings"]),
-    ) for entry in metadata.pop("trees"))
+    trees = tuple(
+        None
+        if entry is None
+        else RuntimeArgumentTree(
+            _read_tree(entry["tree"]),
+            tuple(
+                RuntimeLeafBinding(tuple(b["path"]), b["type"], b["kind"])
+                for b in entry["bindings"]
+            ),
+        )
+        for entry in metadata.pop("trees")
+    )
     abi = kernel_abi_from_dict(metadata.pop("abi"))
     backend_key = metadata.pop("backend_key")
     guarded_fallback = metadata.pop("guarded_fallback", False)
-    execution_args = ExecutionArgs(kernel_abi=abi, argument_trees=trees,
-                                   abi_packer=_prepare_abi_packer(abi, expected_entrypoint=metadata["entrypoint"]))
-    module = JitModule(kernel_binary_path=directory / "kernel.o", execution_args=execution_args,
-                       print_metadata=None, **metadata)
+    execution_args = ExecutionArgs(
+        kernel_abi=abi,
+        argument_trees=trees,
+        abi_packer=_prepare_abi_packer(abi, expected_entrypoint=metadata["entrypoint"]),
+    )
+    module = JitModule(
+        kernel_binary_path=directory / "kernel.o",
+        execution_args=execution_args,
+        print_metadata=None,
+        **metadata,
+    )
     artifacts = JitFunctionArtifacts(
-        MLIR=(directory / "tla.mlir").read_text(), LLVM=(directory / "lowered.mlir").read_text(),
-        BINARY=directory / "kernel.o", cache_key=backend_key, cache_dir=directory, hivmc_path=None,
+        MLIR=(directory / "tla.mlir").read_text(),
+        LLVM=(directory / "lowered.mlir").read_text(),
+        BINARY=directory / "kernel.o",
+        cache_key=backend_key,
+        cache_dir=directory,
+        hivmc_path=None,
     )
     fn = JitCompiledFunction(jit_module=module, artifacts=artifacts)
     fn._attention_guarded_fallback = guarded_fallback

@@ -20,9 +20,13 @@ class AuxTensor:
         self.dtype = getattr(tensor, "dtype", None)
         if self.dtype is None:
             self.dtype = tensor.ptr.dtype
-        self.int32_offsets = int32_offsets if int32_offsets is not None else (
-            all(0 <= step < 2**31 for step in stride)
-            and sum(max(0, size - 1) * step for size, step in zip(shape, stride)) < 2**31
+        self.int32_offsets = (
+            int32_offsets
+            if int32_offsets is not None
+            else (
+                all(0 <= step < 2**31 for step in stride)
+                and sum(max(0, size - 1) * step for size, step in zip(shape, stride)) < 2**31
+            )
         )
 
     @property
@@ -57,10 +61,11 @@ def _views(tensors, specs, scalars=()):
         shape, stride, unsigned32 = spec[:3]
         if len(spec) == 4:
             rank = len(shape)
-            shape = scalars[offset:offset + rank]
-            runtime_stride = scalars[offset + rank:offset + 2 * rank]
-            stride = tuple(step if step is not None else actual
-                           for step, actual in zip(stride, runtime_stride))
+            shape = scalars[offset : offset + rank]
+            runtime_stride = scalars[offset + rank : offset + 2 * rank]
+            stride = tuple(
+                step if step is not None else actual for step, actual in zip(stride, runtime_stride)
+            )
             offset += 2 * rank
             views.append(AuxTensor(tensor, shape, stride, unsigned32, spec[3]))
         else:
@@ -77,16 +82,43 @@ def bind_aux(fn, kind, specs):
 
         @tla.jit
         def bound(b, h, q, k, info, aux, scalars):
-            return fn(b, h, q, k, info, _views(aux, specs, scalars), scalars[:-metadata_size] if metadata_size else scalars)
+            return fn(
+                b,
+                h,
+                q,
+                k,
+                info,
+                _views(aux, specs, scalars),
+                scalars[:-metadata_size] if metadata_size else scalars,
+            )
     elif kind == "score":
 
         @tla.jit
         def bound(s, b, h, q, k, info, aux, scalars):
-            return fn(s, b, h, q, k, info, _views(aux, specs, scalars), scalars[:-metadata_size] if metadata_size else scalars)
+            return fn(
+                s,
+                b,
+                h,
+                q,
+                k,
+                info,
+                _views(aux, specs, scalars),
+                scalars[:-metadata_size] if metadata_size else scalars,
+            )
     else:
 
         @tla.jit
         def bound(g, s, b, h, q, k, info, aux, scalars):
-            return fn(g, s, b, h, q, k, info, _views(aux, specs, scalars), scalars[:-metadata_size] if metadata_size else scalars)
+            return fn(
+                g,
+                s,
+                b,
+                h,
+                q,
+                k,
+                info,
+                _views(aux, specs, scalars),
+                scalars[:-metadata_size] if metadata_size else scalars,
+            )
 
     return bound

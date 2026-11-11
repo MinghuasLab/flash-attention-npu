@@ -2,7 +2,6 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 from unittest.mock import Mock
@@ -16,6 +15,7 @@ from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache, JITPersistentCach
 def factory(value):
     def callback(x, scale=3):
         return x * value * scale
+
     return callback
 
 
@@ -43,10 +43,16 @@ def disk_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("CATLASS_DSL_FORCE_RECOMPILE", raising=False)
     monkeypatch.setattr(persistent, "source_fingerprint", lambda: "source-abi-v1")
-    monkeypatch.setattr(persistent, "export_function",
-                        lambda fn, directory: (directory / "value.json").write_text(json.dumps(fn)))
-    monkeypatch.setattr(persistent, "load_function",
-                        lambda directory: json.loads((directory / "value.json").read_text()))
+    monkeypatch.setattr(
+        persistent,
+        "export_function",
+        lambda fn, directory: (directory / "value.json").write_text(json.dumps(fn)),
+    )
+    monkeypatch.setattr(
+        persistent,
+        "load_function",
+        lambda directory: json.loads((directory / "value.json").read_text()),
+    )
     return JITPersistentCache("test")
 
 
@@ -98,7 +104,9 @@ def test_failed_compile_never_publishes(disk_cache):
 
 
 def test_unavailable_namespace_falls_back_once(disk_cache, monkeypatch):
-    monkeypatch.setattr(persistent, "source_fingerprint", Mock(side_effect=RuntimeError("requires CATLASS 2.2")))
+    monkeypatch.setattr(
+        persistent, "source_fingerprint", Mock(side_effect=RuntimeError("requires CATLASS 2.2"))
+    )
     with pytest.warns(RuntimeWarning, match="requires CATLASS 2.2"):
         assert disk_cache.get_or_compile(("fwd",), lambda: 11) == 11
     assert disk_cache.get_or_compile(("bwd",), lambda: 12) == 12
@@ -114,7 +122,7 @@ def test_new_source_or_abi_namespace_does_not_reuse(disk_cache, monkeypatch):
 
 
 def test_competing_processes_compile_once(tmp_path):
-    worker = r'''
+    worker = r"""
 import json, sys, time
 from pathlib import Path
 from flash_attn_npu_4.catlass_dsl import persistent
@@ -128,13 +136,23 @@ def compile_fn():
     time.sleep(0.2)
     return 17
 assert JITPersistentCache("race").get_or_compile(("mask",), compile_fn) == 17
-'''
-    env = dict(os.environ, FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=str(tmp_path),
-               CATLASS_DSL_FORCE_RECOMPILE="0")
+"""
+    env = dict(
+        os.environ,
+        FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=str(tmp_path),
+        CATLASS_DSL_FORCE_RECOMPILE="0",
+    )
     log = tmp_path / "compile.log"
-    processes = [subprocess.Popen([sys.executable, "-c", worker, str(log)], env=env,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for _ in range(2)]
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(log)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
     try:
         for process in processes:
             stdout, stderr = process.communicate(timeout=60)
@@ -147,7 +165,7 @@ assert JITPersistentCache("race").get_or_compile(("mask",), compile_fn) == 17
     assert log.read_text().count("compiled") == 1
 
 
-_WORKER = r'''
+_WORKER = r"""
 import sys
 import torch, torch_npu
 import catlass.tla as tla
@@ -200,17 +218,26 @@ else:
             check(lse, logs)
 assert len(calls) == (0 if forbid else 2 if kind == "aux" else 1), calls
 print("CACHE_WORKER_OK")
-'''
+"""
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize("kind", ["dense", "aux", "mxfp8", "mask"])
 def test_subprocess_load_bypasses_frontend_for_new_length(tmp_path, kind):
-    env = dict(os.environ, FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED="1",
-               FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=str(tmp_path), CATLASS_DSL_FORCE_RECOMPILE="0")
+    env = dict(
+        os.environ,
+        FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED="1",
+        FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=str(tmp_path),
+        CATLASS_DSL_FORCE_RECOMPILE="0",
+    )
     for length, forbid in ((17, 0), (33, 1)):
-        process = subprocess.run([sys.executable, "-c", _WORKER, str(length), str(forbid), kind],
-                                 env=env, capture_output=True, text=True, timeout=180)
+        process = subprocess.run(
+            [sys.executable, "-c", _WORKER, str(length), str(forbid), kind],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
         assert process.returncode == 0, process.stdout + process.stderr
         assert "CACHE_WORKER_OK" in process.stdout
     assert list(tmp_path.rglob("manifest.json"))
@@ -218,6 +245,11 @@ def test_subprocess_load_bypasses_frontend_for_new_length(tmp_path, kind):
         # Corruption is a miss, including for a previously successful binary.
         next(tmp_path.rglob("kernel.o")).write_bytes(b"truncated")
         for length, forbid in ((49, 0), (65, 1)):
-            process = subprocess.run([sys.executable, "-c", _WORKER, str(length), str(forbid), kind],
-                                     env=env, capture_output=True, text=True, timeout=180)
+            process = subprocess.run(
+                [sys.executable, "-c", _WORKER, str(length), str(forbid), kind],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
             assert process.returncode == 0, process.stdout + process.stderr

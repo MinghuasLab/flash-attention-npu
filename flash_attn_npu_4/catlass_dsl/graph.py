@@ -106,9 +106,7 @@ _ATTENTION_ARGS = (
     "float? scale, bool causal, int? left, int? right, float cap, Scalar[] scalars, "
     "SymInt? max_q, SymInt? max_k, str layout, bool return_lse, bool training"
 )
-_MXFP8_ATTENTION_ARGS = (
-    f"{_ATTENTION_ARGS}, Tensor q_descale, Tensor k_descale, Tensor v_descale"
-)
+_MXFP8_ATTENTION_ARGS = f"{_ATTENTION_ARGS}, Tensor q_descale, Tensor k_descale, Tensor v_descale"
 
 
 def _runtime_attention(
@@ -326,9 +324,7 @@ def attention(
     """Traceable front end; callbacks are static and every buffer is explicit."""
     from .interface import _resolve_mxfp8_scales
 
-    mxfp8_scales = _resolve_mxfp8_scales(
-        q, k, v, (q_descale, k_descale, v_descale), layout=layout
-    )
+    mxfp8_scales = _resolve_mxfp8_scales(q, k, v, (q_descale, k_descale, v_descale), layout=layout)
     if mxfp8_scales is not None and any(t.requires_grad for t in aux_tensors or ()):
         raise NotImplementedError(
             "MXFP8 supports inference forward only; inputs must not require gradients"

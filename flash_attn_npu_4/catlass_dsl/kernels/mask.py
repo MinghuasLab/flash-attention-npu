@@ -214,9 +214,13 @@ def mask_kernel(
                     inclusive = counts[512 + lane]
                     out_kind = kinds[lane]
                     if out_kind == 2:
-                        fi[output_row * full_columns + full + (inclusive >> 16) - 1] = output_base + lane
+                        fi[output_row * full_columns + full + (inclusive >> 16) - 1] = (
+                            output_base + lane
+                        )
                     elif out_kind == 1:
-                        pi[output_row * partial_columns + partial + (inclusive & 65535) - 1] = output_base + lane
+                        pi[output_row * partial_columns + partial + (inclusive & 65535) - 1] = (
+                            output_base + lane
+                        )
                     totals = counts[1023]
                     partial = partial + (totals & 65535)
                     full = full + (totals >> 16)

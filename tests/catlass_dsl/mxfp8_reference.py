@@ -58,9 +58,19 @@ def quantize_v(sequence):
     return encoded[:length].contiguous(), scales
 
 
-def make_case(*, q_lengths=(17, 17), k_lengths=(23, 23), q_heads=4, kv_heads=2,
-              q_packed=False, k_packed=False, layout="BSND", seed=42,
-              v_scale_capacity=None, native_scales=False):
+def make_case(
+    *,
+    q_lengths=(17, 17),
+    k_lengths=(23, 23),
+    q_heads=4,
+    kv_heads=2,
+    q_packed=False,
+    k_packed=False,
+    layout="BSND",
+    seed=42,
+    v_scale_capacity=None,
+    native_scales=False,
+):
     """Build CPU inputs; fixed sides require equal lengths across the batch."""
     if len(q_lengths) != len(k_lengths):
         raise ValueError("Q/K lengths describe different batches")
@@ -81,8 +91,9 @@ def make_case(*, q_lengths=(17, 17), k_lengths=(23, 23), q_heads=4, kv_heads=2,
         q, qs = quantize_qk(random_values(qn, q_heads))
         k, ks = quantize_qk(random_values(kn, kv_heads))
         v, vs = quantize_v(random_values(kn, kv_heads))
-        for parts, value in zip((q_parts, k_parts, v_parts, qs_parts, ks_parts, vs_parts),
-                                (q, k, v, qs, ks, vs)):
+        for parts, value in zip(
+            (q_parts, k_parts, v_parts, qs_parts, ks_parts, vs_parts), (q, k, v, qs, ks, vs)
+        ):
             parts.append(value)
 
     def combine(parts, packed, trailing, dtype):
@@ -107,18 +118,27 @@ def make_case(*, q_lengths=(17, 17), k_lengths=(23, 23), q_heads=4, kv_heads=2,
         if v_scale_capacity < vs.shape[0]:
             raise ValueError("requested V scale capacity is too small")
         capacity = torch.full((v_scale_capacity, kv_heads, 128, 2), 255, dtype=torch.uint8)
-        capacity[:vs.shape[0]] = vs
+        capacity[: vs.shape[0]] = vs
         vs = capacity  # Poison unused capacity; it must never be read.
     kwargs = dict(zip(SCALE_NAMES, (qs, ks, vs)))
     if native_scales:
         kwargs = {name: value.view(torch.float8_e8m0fnu) for name, value in kwargs.items()}
-    for name, lengths, packed in (("cu_seqlens_q", q_lengths, q_packed),
-                                  ("cu_seqlens_k", k_lengths, k_packed)):
+    for name, lengths, packed in (
+        ("cu_seqlens_q", q_lengths, q_packed),
+        ("cu_seqlens_k", k_lengths, k_packed),
+    ):
         if packed:
-            kwargs[name] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+            kwargs[name] = torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32
+            )
     kwargs.update(max_seqlen_q=max(q_lengths, default=0), max_seqlen_k=max(k_lengths, default=0))
-    return dict(qkv=(q, k, v), kwargs=kwargs, q_lengths=tuple(q_lengths),
-                k_lengths=tuple(k_lengths), layout=layout)
+    return dict(
+        qkv=(q, k, v),
+        kwargs=kwargs,
+        q_lengths=tuple(q_lengths),
+        k_lengths=tuple(k_lengths),
+        layout=layout,
+    )
 
 
 def to_device(case, device):
@@ -135,12 +155,12 @@ def decode_sequences(case):
     decoded = []
     for b, (qn, kn) in enumerate(zip(case["q_lengths"], case["k_lengths"])):
         # Scale and input ranks differ, so use the corresponding Q/K layout.
-        qpart = q[qoff:qoff + qn] if q.ndim == 3 else q[b]
-        kpart = k[koff:koff + kn] if k.ndim == 3 else k[b]
-        vpart = v[koff:koff + kn] if v.ndim == 3 else v[b]
-        qsp = qs[qoff:qoff + qn] if q.ndim == 3 else qs[b]
-        ksp = ks[koff:koff + kn] if k.ndim == 3 else ks[b]
-        vsp = vs[soff:soff + (kn + 63) // 64] if k.ndim == 3 else vs[b]
+        qpart = q[qoff : qoff + qn] if q.ndim == 3 else q[b]
+        kpart = k[koff : koff + kn] if k.ndim == 3 else k[b]
+        vpart = v[koff : koff + kn] if v.ndim == 3 else v[b]
+        qsp = qs[qoff : qoff + qn] if q.ndim == 3 else qs[b]
+        ksp = ks[koff : koff + kn] if k.ndim == 3 else ks[b]
+        vsp = vs[soff : soff + (kn + 63) // 64] if k.ndim == 3 else vs[b]
         if case["layout"] == "BNSD":
             if q.ndim == 4:
                 qpart, qsp = qpart.transpose(0, 1), qsp.transpose(0, 1)
@@ -171,9 +191,22 @@ def decoded_inputs(case, dtype=torch.bfloat16):
     return tuple(values)
 
 
-def reference(case, *, scale=None, score_mod=None, mask_mod=None, causal=False,
-              window_size=(None, None), softcap=0.0, sparse=None, aux=(), scalars=(),
-              quantize_p=True, query_rows=None, normalize_quantized=False):
+def reference(
+    case,
+    *,
+    scale=None,
+    score_mod=None,
+    mask_mod=None,
+    causal=False,
+    window_size=(None, None),
+    softcap=0.0,
+    sparse=None,
+    aux=(),
+    scalars=(),
+    quantize_p=True,
+    query_rows=None,
+    normalize_quantized=False,
+):
     """CPU online golden; sparse lists use the existing partial-then-full order.
 
     Optional query_rows is a list of local row-index lists, one per sequence.
@@ -183,16 +216,27 @@ def reference(case, *, scale=None, score_mod=None, mask_mod=None, causal=False,
     """
     original_q = case["qkv"][0]
     result = torch.full(original_q.shape, float("nan"), dtype=torch.float32)
-    hq = original_q.shape[-2] if original_q.ndim == 3 or case["layout"] == "BSND" else original_q.shape[1]
-    lshape = ((hq, original_q.shape[0]) if original_q.ndim == 3 else
-              (original_q.shape[0], hq, original_q.shape[1 if case["layout"] == "BSND" else 2]))
+    hq = (
+        original_q.shape[-2]
+        if original_q.ndim == 3 or case["layout"] == "BSND"
+        else original_q.shape[1]
+    )
+    lshape = (
+        (hq, original_q.shape[0])
+        if original_q.ndim == 3
+        else (original_q.shape[0], hq, original_q.shape[1 if case["layout"] == "BSND" else 2])
+    )
     lse = torch.full(lshape, float("nan"), dtype=torch.float32)
     scale = 128**-0.5 if scale is None else scale
     qoff = koff = 0
     for b, (q, k, v) in enumerate(decode_sequences(case)):
         qn, kn, kh = q.shape[0], k.shape[0], k.shape[1]
-        info = (qn, kn, qoff if original_q.ndim == 3 else 0,
-                koff if case["qkv"][1].ndim == 3 else 0)
+        info = (
+            qn,
+            kn,
+            qoff if original_q.ndim == 3 else 0,
+            koff if case["qkv"][1].ndim == 3 else 0,
+        )
         selected = list(range(qn)) if query_rows is None else list(query_rows[b])
         for qb in sorted({row // 128 for row in selected}):
             rows = torch.tensor([row for row in selected if row // 128 == qb], dtype=torch.long)
@@ -202,16 +246,22 @@ def reference(case, *, scale=None, score_mod=None, mask_mod=None, causal=False,
                 denominator = torch.zeros(len(rows))
                 quantized_denominator = torch.zeros(len(rows))
                 accum = torch.zeros((len(rows), 128))
-                blocks = [(kb, mask_mod is None and not causal and window_size == (None, None))
-                          for kb in range((kn + 127) // 128)]
+                blocks = [
+                    (kb, mask_mod is None and not causal and window_size == (None, None))
+                    for kb in range((kn + 127) // 128)
+                ]
                 if sparse is not None:
                     blocks = []
-                    for full, counts, indices in ((False, sparse.mask_block_cnt, sparse.mask_block_idx),
-                                                  (True, sparse.full_block_cnt, sparse.full_block_idx)):
+                    for full, counts, indices in (
+                        (False, sparse.mask_block_cnt, sparse.mask_block_idx),
+                        (True, sparse.full_block_cnt, sparse.full_block_idx),
+                    ):
                         if counts is None:
                             continue
                         bi, hi = b % counts.shape[0], h % counts.shape[1]
-                        blocks += [(int(kb), full) for kb in indices[bi, hi, qb, :int(counts[bi, hi, qb])]]
+                        blocks += [
+                            (int(kb), full) for kb in indices[bi, hi, qb, : int(counts[bi, hi, qb])]
+                        ]
                 for kb, full in blocks:
                     start, end = kb * 128, min(kn, (kb + 1) * 128)
                     keys = torch.arange(start, end)
@@ -219,11 +269,15 @@ def reference(case, *, scale=None, score_mod=None, mask_mod=None, causal=False,
                     if softcap:
                         scores = softcap * torch.tanh(scores / softcap)
                     if score_mod is not None:
-                        scores = score_mod(scores, b, h, rows[:, None], keys[None, :], info, aux, scalars)
+                        scores = score_mod(
+                            scores, b, h, rows[:, None], keys[None, :], info, aux, scalars
+                        )
                     if not full:
                         center = rows[:, None] + kn - qn
                         if mask_mod is not None:
-                            visible = mask_mod(b, h, rows[:, None], keys[None, :], info, aux, scalars)
+                            visible = mask_mod(
+                                b, h, rows[:, None], keys[None, :], info, aux, scalars
+                            )
                         else:
                             left, right = window_size
                             if left is not None and right is not None and left < 0 and right < 0:
@@ -239,13 +293,18 @@ def reference(case, *, scale=None, score_mod=None, mask_mod=None, causal=False,
                     updated_m = torch.maximum(m, scores.amax(-1))
                     empty = torch.isneginf(updated_m)
                     alpha = torch.exp(torch.where(empty, 0.0, m - updated_m))
-                    p = torch.exp(torch.where(empty[:, None], -torch.inf, scores - updated_m[:, None]))
+                    p = torch.exp(
+                        torch.where(empty[:, None], -torch.inf, scores - updated_m[:, None])
+                    )
                     denominator = alpha * denominator + p.sum(-1)
                     pv = p
                     if quantize_p:
                         invalid_row = ~torch.isfinite(p).all(-1, keepdim=True)
                         encoded, pscale = quantize_group32(torch.where(torch.isfinite(p), p, 0.0))
-                        pv = encoded.float() * decode_scale(pscale).repeat_interleave(32, -1)[..., :p.shape[-1]]
+                        pv = (
+                            encoded.float()
+                            * decode_scale(pscale).repeat_interleave(32, -1)[..., : p.shape[-1]]
+                        )
                         pv = torch.where(invalid_row, torch.nan, pv)
                     accum = alpha[:, None] * accum + pv @ v[start:end, kvh]
                     quantized_denominator = alpha * quantized_denominator + pv.sum(-1)
@@ -277,15 +336,19 @@ def check_quantized_lse(actual, expected):
     it. The relative term covers FP16 score rounding. NaN and infinity classes
     must match exactly. This is for the approximate MX forward path only.
     """
-    torch.testing.assert_close(actual.float(), expected.float(), atol=0.07,
-                               rtol=2**-11, equal_nan=False)
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=0.07, rtol=2**-11, equal_nan=False
+    )
 
 
 def error_metrics(actual, expected):
     actual, expected = actual.detach().cpu().float(), expected.detach().cpu().float()
     finite = torch.isfinite(expected)
     error = (actual[finite] - expected[finite]).abs()
-    return dict(elements=int(error.numel()), rms=float(error.square().mean().sqrt()) if error.numel() else 0.0,
-                max_abs=float(error.max()) if error.numel() else 0.0,
-                p50_abs=float(error.quantile(.5)) if error.numel() else 0.0,
-                p99_abs=float(error.quantile(.99)) if error.numel() else 0.0)
+    return dict(
+        elements=int(error.numel()),
+        rms=float(error.square().mean().sqrt()) if error.numel() else 0.0,
+        max_abs=float(error.max()) if error.numel() else 0.0,
+        p50_abs=float(error.quantile(0.5)) if error.numel() else 0.0,
+        p99_abs=float(error.quantile(0.99)) if error.numel() else 0.0,
+    )

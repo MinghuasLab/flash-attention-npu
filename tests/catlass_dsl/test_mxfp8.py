@@ -601,7 +601,9 @@ def mocked_launch(monkeypatch):
     monkeypatch.setattr(runtime, "compile_cache", cache)
     monkeypatch.setattr(runtime, "_compile_mxfp8", compiler)
     monkeypatch.setattr(runtime, "_cores", lambda device: 28)
-    monkeypatch.setattr(torch.npu, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=128 << 20))
+    monkeypatch.setattr(
+        torch.npu, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=128 << 20)
+    )
     monkeypatch.setattr(runtime, "_launch", launcher)
     return cache, compiler, launcher
 
@@ -617,7 +619,7 @@ def test_warm_plan_rebinds_data_scales_outputs_and_aux(mocked_launch):
         assert all(a is e for a, e in zip(actual[:6], expected))
         assert actual[7] is out and actual[8] is lse
         assert actual[15][0] is config["aux_tensors"][0]
-        assert actual[16][:len(config["aux_scalars"])] == config["aux_scalars"]
+        assert actual[16][: len(config["aux_scalars"])] == config["aux_scalars"]
     assert compiler.call_count == 1 and len(cache) == 1
     old_args, new_args = (call.args[1] for call in launcher.call_args_list)
     assert all(a.data_ptr() != b.data_ptr() for a, b in zip(old_args[:6], new_args[:6]))
@@ -704,7 +706,9 @@ def test_guard_storage_is_fresh_for_each_fused_launch(mocked_launch, monkeypatch
 
     _, compiler, launcher = mocked_launch
     make_plan = runtime._make_mxfp8_plan
-    monkeypatch.setattr(runtime, "_make_mxfp8_plan", lambda *args: replace(make_plan(*args), guard_elements=64))
+    monkeypatch.setattr(
+        runtime, "_make_mxfp8_plan", lambda *args: replace(make_plan(*args), guard_elements=64)
+    )
     for _ in range(2):
         runtime.launch_mxfp8(*make_launch())
     calls = launcher.call_args_list
@@ -5240,6 +5244,7 @@ def test_single_segment_compiled_dynamic_lengths_and_scale_rebinding(device, mon
         )
 
     from torch._dynamo.backends.registry import lookup_backend
+
     graphs = []
 
     def backend(gm, inputs):

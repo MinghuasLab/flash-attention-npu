@@ -103,15 +103,26 @@ class JITPersistentCache(JITCache):
     def _warn(self, operation, error):
         if operation not in self._warnings:
             self._warnings.add(operation)
-            warnings.warn(f"CATLASS attention cache {operation}: {error}; using normal compilation",
-                          RuntimeWarning, stacklevel=3)
+            warnings.warn(
+                f"CATLASS attention cache {operation}: {error}; using normal compilation",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def _directory(self):
         if self._path is None:
             from .persistent import source_fingerprint
 
-            root = Path(os.environ.get("FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR",
-                                       str(Path(tempfile.gettempdir()) / getuser() / "flash_attention_catlass_dsl_cache")))
+            root = Path(
+                os.environ.get(
+                    "FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR",
+                    str(
+                        Path(tempfile.gettempdir())
+                        / getuser()
+                        / "flash_attention_catlass_dsl_cache"
+                    ),
+                )
+            )
             self._path = root.expanduser() / source_fingerprint() / self.name
         self._path.mkdir(parents=True, exist_ok=True)
         return self._path
@@ -131,7 +142,11 @@ class JITPersistentCache(JITCache):
                 directory = self._directory()
                 locks.enter_context(_file_lock(directory / ".namespace.lock", shared=True))
                 # The first key field partitions fwd/bwd/mxfp8/mask artifacts.
-                family = str(key[0]) if key and str(key[0]) in ("fwd", "bwd", "mask", "mxfp8") else "other"
+                family = (
+                    str(key[0])
+                    if key and str(key[0]) in ("fwd", "bwd", "mask", "mxfp8")
+                    else "other"
+                )
                 directory = directory / family
                 directory.mkdir(exist_ok=True)
                 locks.enter_context(_file_lock(directory / f"{digest}.lock"))
@@ -159,7 +174,14 @@ class JITPersistentCache(JITCache):
                     if entry.exists():
                         shutil.rmtree(entry)
                     os.replace(temporary, entry)
-                except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError) as error:
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    AttributeError,
+                    RuntimeError,
+                ) as error:
                     self._warn("export failed", error)
                 finally:
                     if temporary is not None and temporary.exists():
@@ -184,4 +206,8 @@ def get_jit_cache(name: str | None = None) -> JITCache:
     """Create an independent cache, optionally backed by a named disk partition."""
     if name is not None and (not name or Path(name).name != name or name in (".", "..")):
         raise ValueError("cache name must be a single directory component")
-    return JITPersistentCache(name) if os.getenv("FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED", "0") == "1" else JITCache()
+    return (
+        JITPersistentCache(name)
+        if os.getenv("FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED", "0") == "1"
+        else JITCache()
+    )

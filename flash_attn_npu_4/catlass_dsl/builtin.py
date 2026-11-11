@@ -161,6 +161,7 @@ def pipeline_adapter(mod, kind, specs=(), mode="simd", varlen=(False, False)):
 
     fn = bind_aux(getattr(mod, mode), kind, specs)
     if kind == "mask":
+
         @tla.jit
         def adapted(unused, b, h, q, k, aux, scalars, info, bounds_checked: tla.Constexpr = False):
             if tla.const_expr(mode == "simt" and not bounds_checked):
@@ -171,9 +172,11 @@ def pipeline_adapter(mod, kind, specs=(), mode="simd", varlen=(False, False)):
             else:
                 return fn(b, h, q, k, info, aux, scalars)
     else:
+
         @tla.jit
         def adapted(s, b, h, q, k, aux, scalars, info):
             return fn(s, b, h, q, k, info, aux, scalars)
+
     return adapted
 
 

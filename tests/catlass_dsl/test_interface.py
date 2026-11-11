@@ -196,8 +196,11 @@ def test_public_signature(entry):
         )
     scale_names = {"q_descale", "k_descale", "v_descale"}
     for name, parameter in actual.parameters.items():
-        expected_kind = (inspect.Parameter.KEYWORD_ONLY if name in scale_names
-                         else inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        expected_kind = (
+            inspect.Parameter.KEYWORD_ONLY
+            if name in scale_names
+            else inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
         assert parameter.kind is expected_kind
 
 
@@ -243,10 +246,16 @@ def test_positional_and_keyword_binding(entry, monkeypatch):
     signature = inspect.signature(entry)
     arguments = {name: p.default for name, p in signature.parameters.items()}
     arguments.update(q=q, k=q, v=q)
-    positional = [arguments[name] for name, p in signature.parameters.items()
-                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
-    keywords = {name: arguments[name] for name, p in signature.parameters.items()
-                if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    positional = [
+        arguments[name]
+        for name, p in signature.parameters.items()
+        if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ]
+    keywords = {
+        name: arguments[name]
+        for name, p in signature.parameters.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY
+    }
     assert entry(*positional, **keywords)[0] is q
     assert entry(**arguments)[0] is q
     assert captured[0] == captured[1]
