@@ -28,6 +28,18 @@ constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
+// Per-call storage geometry, independent of reusable scheduler metadata.
+// Strides are in elements of logical [page, token, head, dim] K/V tensors.
+struct FwdStorageParams {
+    uint64_t keyPageStride;
+    uint64_t valuePageStride;
+    uint64_t keyTokenStride;
+    uint64_t valueTokenStride;
+    uint64_t keyHeadStride;
+    uint64_t valueHeadStride;
+    uint64_t totalQTokens;
+};
+
 struct FAIKernelParams {
     // Data members
     GM_ADDR q;
@@ -48,9 +60,10 @@ struct FAIKernelParams {
     float softcapValue;
     uint32_t numBlocks;
     uint32_t maxNumBlocksPerBatch;
-    // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
-    // BSND / TND, whose layout is the compile-time Format template parameter.
+    // Allocated KV sequence length: BNSD head-plane width (k.size(2)) or dense
+    // BSND token-plane width (k.size(1)). Unused (0) for TND and paged KV.
     int64_t kvSeqlenAllocated;
+    FwdStorageParams storage;
 
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
@@ -63,11 +76,13 @@ struct FAIKernelParams {
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR seqUsedQ_,
                                       GM_ADDR seqUsedKv_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_,
                                       float scaleValue_, float softcapValue_, uint32_t numBlocks_,
-                                      uint32_t maxNumBlocksPerBatch_, int64_t kvSeqlenAllocated_)
+                                      uint32_t maxNumBlocksPerBatch_, int64_t kvSeqlenAllocated_,
+                                      FwdStorageParams storage_)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), o(o_), lse(lse_),
           workSpace(workSpace_), tiling(tiling_), scaleValue(scaleValue_), softcapValue(softcapValue_),
-          numBlocks(numBlocks_), maxNumBlocksPerBatch(maxNumBlocksPerBatch_), kvSeqlenAllocated(kvSeqlenAllocated_)
+          numBlocks(numBlocks_), maxNumBlocksPerBatch(maxNumBlocksPerBatch_), kvSeqlenAllocated(kvSeqlenAllocated_),
+          storage(storage_)
     {}
 };
 

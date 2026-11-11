@@ -86,16 +86,16 @@ struct FwdMaskDerivation {
     uint32_t maskType;
 };
 
-// Window normalization + mask-type derivation, mirroring the host tiling
-// branch in mha_fwd, but bounding the KV side with a host-known upper bound
-// (max_seqlen_k / cache capacity) instead of the device-side actual max KV
-// seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
-// allowed. Both metadata creation and fwd consumption use the same derivation.
-inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right, int64_t max_seqlen_q,
-                                       int64_t max_seqlen_k_bound)
+// Select the kernel from the requested window, independently of length bounds.
+// Metadata creation can know a tight per-sequence bound while its consumer
+// only knows total packed KV or padded page capacity. Folding finite windows
+// using those different bounds can select different mask categories. Keep
+// unlimited sides negative so an undersized bound cannot truncate them.
+inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
+                                       int64_t max_seqlen_q_bound, int64_t max_seqlen_k_bound)
 {
     FwdMaskDerivation derived;
-    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q, max_seqlen_k_bound, window_left, window_right,
+    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q_bound, max_seqlen_k_bound, window_left, window_right,
                                         derived.is_causal, derived.is_local);
     derived.window_left = window_left;
     derived.window_right = window_right;
