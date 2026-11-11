@@ -809,7 +809,10 @@ class FAIKernel950 {
         probabilities.SetGlobalBuffer((__gm__ ElementP*)(params.workSpace+t->qkOutSize));
         partial.SetGlobalBuffer((__gm__ float*)(params.workSpace+t->qkOutSize+t->smOnlineOutSize));
         update.SetGlobalBuffer((__gm__ float*)(params.workSpace+t->qkOutSize+t->smOnlineOutSize+t->pvOutSize));
-        struct Task { uint64_t qbase,kbase,vbase,obase,lsebase,pagebase; uint32_t rows,qrows,qn,qstart,qlen,klen,slot; } tasks[3];
+        AscendC::GlobalTensor<float> fdO,fdLse;
+        fdO.SetGlobalBuffer((__gm__ float*)(params.workSpace+t->fdPartialOOffset));
+        fdLse.SetGlobalBuffer((__gm__ float*)(params.workSpace+t->fdPartialLseOffset));
+        struct Task { uint64_t qbase,kbase,vbase,obase,lsebase,pagebase; uint32_t rows,qrows,qn,qstart,qlen,klen,slot,partialId; bool writePartial; } tasks[3];
         struct Stack { uint32_t task,slot,start,count; bool first,last; } stacks[3];
         uint32_t sequence=0,taskSequence=0,globalTask=0; uint64_t aSequence=0,bSequence=0;
         Gemm::Block::BlockMmadQKTileHelper qh(128,128,512,256,1,2);
@@ -868,23 +871,38 @@ class FAIKernel950 {
                     AscendC::DataCopy(ubGo, ubLo, nr * 512);
                     AscendC::PipeBarrier<PIPE_V>();
                 } else {
+                    if (task.writePartial) {
+                    EpilogueRescaleO::template ComputeStack512<true>((__ubuf__ float*)ubLo.GetPhyAddr(),(__ubuf__ float*)ubGo.GetPhyAddr(),
+                        (__ubuf__ ElementO*)ubOut.GetPhyAddr(),(__ubuf__ float*)ubAlpha[d.slot*256+r].GetPhyAddr(),
+                        (__ubuf__ float*)ubSum[d.task*64+r].GetPhyAddr(),nr,d.first,d.last);
+                    } else {
                     EpilogueRescaleO::ComputeStack512((__ubuf__ float*)ubLo.GetPhyAddr(),(__ubuf__ float*)ubGo.GetPhyAddr(),
                         (__ubuf__ ElementO*)ubOut.GetPhyAddr(),(__ubuf__ float*)ubAlpha[d.slot*256+r].GetPhyAddr(),
                         (__ubuf__ float*)ubSum[d.task*64+r].GetPhyAddr(),nr,d.first,d.last);
+                    }
                 }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(2); AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(2);
                 if(!d.last) AscendC::DataCopy(update[static_cast<uint64_t>(core)*65536+io],ubGo,nr*512);
+                else if(task.writePartial) AscendC::DataCopy(fdO[(static_cast<uint64_t>(task.partialId)*t->fdRowCapacity+rowStart+r)*512],ubGo,nr*512);
                 else EpilogueRescaleO::CopyGroupedOutputToGm(out[task.obase], ubOut,
                     task.qrows, rowStart+r, nr, 512U, t->numHeads*512U, 512U, 512U);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(2); AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(2);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(2);
             }
-            if constexpr(LseMode) if(d.last && rowCount) {
+            if(d.last && rowCount && (LseMode || task.writePartial)) {
+                if(task.writePartial) {
+                EpilogueRescaleO::template ComputeStackLse<true>((__ubuf__ float*)ubLse.GetPhyAddr(),(__ubuf__ float*)ubMax[d.task*64].GetPhyAddr(),
+                    (__ubuf__ float*)ubSum[d.task*64].GetPhyAddr(),rowCount);
+                } else {
                 EpilogueRescaleO::ComputeStackLse((__ubuf__ float*)ubLse.GetPhyAddr(),(__ubuf__ float*)ubMax[d.task*64].GetPhyAddr(),
                     (__ubuf__ float*)ubSum[d.task*64].GetPhyAddr(),rowCount);
+                }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(3); AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(3);
                 uint32_t totalQ=t->maxQSeqlen; if constexpr(qFormat==Format::TND) totalQ=cuq.GetValue(t->batch);
-                EpilogueRescaleO::CopyGroupedLseToGm(lse[task.lsebase], ubLse,
+                if(task.writePartial) EpilogueRescaleO::CopyGroupedLseToGm(
+                    fdLse[(static_cast<uint64_t>(task.partialId)*2+sub)*t->fdLseSubStride],ubLse,
+                    rowCount,1U,rowCount,0U,rowCount);
+                else EpilogueRescaleO::CopyGroupedLseToGm(lse[task.lsebase], ubLse,
                     task.qrows, task.qn, totalQ, rowStart, rowCount);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(3); AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(3);
             }
@@ -900,7 +918,10 @@ class FAIKernel950 {
             if(params.seqUsedKv) klen=usedk.GetValue(batch);
             uint32_t group=t->numHeads/t->kvHeads,qnTile=GetQNBlockTile(qlen,group,false),nblocks=CeilDiv(group,qnTile);
             for(uint32_t qt=0;qt<CeilDiv(qlen,128U);qt++) for(uint32_t ht=0;ht<nblocks*t->kvHeads;ht++,globalTask++) {
-                if(globalTask%cores!=core) continue;
+                if(t->flashDecodeFlag) {
+                    if(static_cast<int32_t>(globalTask)<t->fdDecodeSchedules[core].baseTaskStart ||
+                       static_cast<int32_t>(globalTask)>=t->fdDecodeSchedules[core].baseTaskEnd) continue;
+                } else if(globalTask%cores!=core) continue;
                 uint32_t kh=ht/nblocks,hstart=kh*group+(ht%nblocks)*qnTile;
                 uint32_t qn=AscendC::Std::min(qnTile,group-(ht%nblocks)*qnTile),qr=AscendC::Std::min(128U,qlen-qt*128),rows=qr*qn;
                 Task task{}; task.rows=rows;task.qrows=qr;task.qn=qn;task.qstart=qt*128;task.qlen=qlen;task.klen=klen;
@@ -930,6 +951,16 @@ class FAIKernel950 {
 #endif
                     continue;
                 }
+                if(t->flashDecodeFlag) {
+                    for(uint32_t ci=0;ci<t->fdCombineTaskNum;ci++) {
+                        auto* schedule=&t->fdCombineSchedules[ci];
+                        if(schedule->baseTask==static_cast<int32_t>(globalTask)) {
+                            task.writePartial=true;
+                            task.partialId=schedule->partialStart+core-schedule->firstCore;
+                            break;
+                        }
+                    }
+                }
                 task.slot=taskSequence++%3;tasks[task.slot]=task;
 #ifdef __DAV_CUBE__
                 auto gq=tla::MakeTensor(q[task.qbase],tla::MakeLayout(tla::MakeShape(qr,512U),tla::MakeStride(t->numHeads*512,tla::Int<1>{})),Arch::PositionGM{});
@@ -947,6 +978,11 @@ class FAIKernel950 {
                         kvBegin=static_cast<uint32_t>(left)/512*512;
                         kvEnd=AscendC::Std::min(klen,RoundUp(static_cast<uint32_t>(right),512U));
                     }
+                }
+                if(t->flashDecodeFlag) {
+                    auto* schedule=&t->fdDecodeSchedules[core];
+                    if(static_cast<int32_t>(globalTask)==schedule->baseTaskStart) kvBegin=schedule->firstKvTileStart*512U;
+                    if(static_cast<int32_t>(globalTask+1)==schedule->baseTaskEnd) kvEnd=AscendC::Std::min(klen,static_cast<uint32_t>(schedule->lastKvTileEnd)*512U);
                 }
                 for(uint32_t start=kvBegin;start<kvEnd;start+=512) {
                     uint32_t slot=sequence%3,count=AscendC::Std::min(512U,kvEnd-start);
@@ -1036,6 +1072,16 @@ class FAIKernel950 {
         for(uint16_t e=0;e<4;e++) { AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(e);AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(e); }
 #endif
         AscendC::PipeBarrier<PIPE_ALL>();
+        if constexpr (!IsDN && qFormat == Format::TND && kvcacheType == CacheMode::pagedCache &&
+                      maskCategory != MaskCategory::MASK_SWA) {
+            if(t->flashDecodeFlag) {
+                AscendC::SyncAll<false>();
+#ifdef __DAV_VEC__
+                FlashDecodeCombine950<ElementO,LseMode> combine(resource);
+                combine(params);
+#endif
+            }
+        }
     }
 
     template <uint32_t QK_SM_MODE, uint32_t PV_RE_MODE, uint32_t SM_PV_MODE>

@@ -331,7 +331,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor mask_npu_tensor;
     bool is_local = false;
     if(head_size_q == 512) {
-        TORCH_CHECK(num_splits == 1, "D512 currently requires num_splits=1");
+        TORCH_CHECK((num_splits == 1 || num_splits == 2), "D512 currently requires num_splits=1 or 2");
         TORCH_CHECK(!scheduler_metadata_.has_value(), "D512 metadata is not enabled yet");
         TORCH_CHECK(layout_enum != FwdLayout::BNSD, "D512 BNSD is not supported");
     }

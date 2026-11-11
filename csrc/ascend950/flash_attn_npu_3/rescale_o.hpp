@@ -100,6 +100,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
 
+    template <bool Partial = false>
     __simd_vf__ static inline void ComputeStackLse(__ubuf__ float* output,
         __ubuf__ float* max, __ubuf__ float* sum, uint32_t rows)
     {
@@ -112,7 +113,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             LoadAlign<float,LoadDist::DIST_BRC_B32>(l,sum+row);
             MaskReg empty;Compares(empty,l,0.0F,full);
             Ln(l,l,full);Add(l,l,m,full);
-            RegTensor<float> infinity;Duplicate(infinity,std::numeric_limits<float>::infinity());
+            RegTensor<float> infinity;Duplicate(infinity,Partial ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity());
             Select(l,infinity,l,empty);
             StoreAlign<float,StoreDist::DIST_NORM_B32>(output+row*8,l,block);
         }
@@ -120,6 +121,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
     // Fused row-major update for one 16x512 GM batch. Alpha belongs to the
     // consumed stack; rowSum is used only for the final stack of its task.
+    template <bool Partial = false>
     __simd_vf__ static inline void ComputeStack512(
         __ubuf__ float* lo, __ubuf__ float* go, __ubuf__ ElementO* output,
         __ubuf__ float* alpha, __ubuf__ float* rowSum,
@@ -155,11 +157,17 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 } else {
                     Div(even, even, sum, full);
                     Div(odd, odd, sum, full);
+                    if constexpr (Partial) {
+                        Interleave(contiguous0, contiguous1, even, odd);
+                        StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col, contiguous0, full);
+                        StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col + 64, contiguous1, full);
+                    } else {
                     Cast<ElementO, float, evenCast>(pEven, even, full);
                     Cast<ElementO, float, oddCast>(pOdd, odd, full);
                     Or((RegTensor<uint16_t>&)packed, (RegTensor<uint16_t>&)pEven,
                        (RegTensor<uint16_t>&)pOdd, halfFull);
                     StoreAlign<ElementO>(output + row * 512 + col, packed, halfFull);
+                    }
                 }
             }
         }
