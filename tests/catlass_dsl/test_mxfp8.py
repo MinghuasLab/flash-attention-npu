@@ -5855,13 +5855,27 @@ def test_prepacked_boundaries_and_scales_rebind_in_graph(device, monkeypatch, co
 
 # Benchmark timing and report integrity.
 
-path = Path(__file__).resolve().parents[2] / "benchmarks/benchmark_catlass_mxfp8.py"
-spec = importlib.util.spec_from_file_location("mxfp8_benchmark", path)
-benchmark = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(benchmark)
+
+@pytest.fixture(scope="module")
+def benchmark_scripts():
+    directory = Path(__file__).resolve().parents[2] / "benchmarks"
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.syspath_prepend(str(directory))
+        yield directory
 
 
-def test_statistics_keep_outliers_and_report_dispersion():
+@pytest.fixture(scope="module")
+def benchmark(benchmark_scripts):
+    path = benchmark_scripts / "benchmark_catlass_mxfp8.py"
+    if not path.is_file():
+        pytest.skip(f"benchmark script unavailable: {path.name}")
+    spec = importlib.util.spec_from_file_location("mxfp8_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_statistics_keep_outliers_and_report_dispersion(benchmark):
     values = [1.0, 2.0, 1000.0]
     measured = benchmark.statistics_us(values)
     assert measured["samples_us"] == values
@@ -5872,12 +5886,12 @@ def test_statistics_keep_outliers_and_report_dispersion():
 
 
 @pytest.mark.parametrize("values", [[], [float("nan")], [float("inf")], [-1.0]])
-def test_invalid_timing_samples(values):
+def test_invalid_timing_samples(benchmark, values):
     with pytest.raises(ValueError, match="nonempty, finite and nonnegative"):
         benchmark.statistics_us(values)
 
 
-def test_visible_device_maps_logical_to_physical(monkeypatch):
+def test_visible_device_maps_logical_to_physical(benchmark, monkeypatch):
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "6,3")
     assert benchmark.physical_device("npu:0") == 6
     assert benchmark.physical_device("npu:1") == 3
@@ -5885,7 +5899,7 @@ def test_visible_device_maps_logical_to_physical(monkeypatch):
     assert benchmark.physical_device("npu:7") == 7
 
 
-def test_process_detection_ignores_other_devices_and_headers():
+def test_process_detection_ignores_other_devices_and_headers(benchmark):
     status = """
 | NPU ID | Process id | Process name | Process memory(MB) |
 | 6 | 123 | python | 100 |
@@ -5897,7 +5911,7 @@ def test_process_detection_ignores_other_devices_and_headers():
     assert benchmark.device_processes(status, 0) == []
 
 
-def test_default_case_matrix():
+def test_default_case_matrix(benchmark):
     args = SimpleNamespace(
         lengths=[1024, 8192, 16384, 65536, 65531], sparsities=[0.5, 0.9], no_extra=False
     )
@@ -5956,7 +5970,7 @@ def write_trace(directory, rows):
             )
 
 
-def test_profiler_sums_auxiliary_kernels_per_call(tmp_path, monkeypatch):
+def test_profiler_sums_auxiliary_kernels_per_call(benchmark, tmp_path, monkeypatch):
     fake_profiler(monkeypatch)
     path = tmp_path / "trace"
     write_trace(
@@ -5988,7 +6002,9 @@ def test_profiler_sums_auxiliary_kernels_per_call(tmp_path, monkeypatch):
         ([("a", 0, 1, 6), ("a", 1, 1, 7)], "multiple devices"),
     ],
 )
-def test_profiler_rejects_incomplete_or_inconsistent_data(tmp_path, monkeypatch, rows, match):
+def test_profiler_rejects_incomplete_or_inconsistent_data(
+    benchmark, tmp_path, monkeypatch, rows, match
+):
     fake_profiler(monkeypatch)
     path = tmp_path / "trace"
     write_trace(path, rows)
@@ -5996,7 +6012,7 @@ def test_profiler_rejects_incomplete_or_inconsistent_data(tmp_path, monkeypatch,
         benchmark.profile_call(lambda: None, path, 2, SimpleNamespace(check=lambda: None))
 
 
-def test_summary_includes_dispersion_and_partial_run_error(tmp_path):
+def test_summary_includes_dispersion_and_partial_run_error(benchmark, tmp_path):
     measured = benchmark.statistics_us([1.0, 2.0, 6.0])
     report = dict(
         status="failed",
@@ -6030,7 +6046,7 @@ def test_summary_includes_dispersion_and_partial_run_error(tmp_path):
     ]["samples_us"] == [1, 2, 6]
 
 
-def test_environment_metadata_reads_installed_versions(tmp_path, monkeypatch):
+def test_environment_metadata_reads_installed_versions(benchmark, tmp_path, monkeypatch):
     root = tmp_path / "cann"
     version = root / "share/info/runtime/version.info"
     version.parent.mkdir(parents=True)
@@ -6048,7 +6064,7 @@ def test_environment_metadata_reads_installed_versions(tmp_path, monkeypatch):
     assert result["compile_environment"]["CATLASS_DSL_CACHE"] == "1"
 
 
-def test_compiler_records_actual_options_and_preserves_manifest(tmp_path, monkeypatch):
+def test_compiler_records_actual_options_and_preserves_manifest(benchmark, tmp_path, monkeypatch):
     @dataclass
     class Options:
         arch_scope: str
@@ -6086,7 +6102,7 @@ def thermal_text(temperature=75, frequency=1650, nominal=1650):
     )
 
 
-def test_parse_temperature_and_frequency_from_common():
+def test_parse_temperature_and_frequency_from_common(benchmark):
     assert benchmark.parse_thermal(thermal_text(99, 400)) == dict(
         temperature_c=99.0, frequency_mhz=400.0, nominal_frequency_mhz=1650.0
     )
@@ -6095,12 +6111,14 @@ def test_parse_temperature_and_frequency_from_common():
 @pytest.mark.parametrize(
     "common", ["Temperature(C) : 75", thermal_text("nan"), thermal_text(75, 0)]
 )
-def test_thermal_parser_rejects_missing_or_invalid_fields(common):
+def test_thermal_parser_rejects_missing_or_invalid_fields(benchmark, common):
     with pytest.raises(RuntimeError, match="temperature/frequency"):
         benchmark.parse_thermal(common)
 
 
-def test_thermal_pacing_hysteresis_batching_and_frequency_recording(tmp_path, monkeypatch):
+def test_thermal_pacing_hysteresis_batching_and_frequency_recording(
+    benchmark, tmp_path, monkeypatch
+):
     states = iter([thermal_text(85), thermal_text(86), thermal_text(84), thermal_text(75, 100)])
     reads, waits, checks = [], [], []
 
@@ -6133,7 +6151,7 @@ def test_thermal_pacing_hysteresis_batching_and_frequency_recording(tmp_path, mo
     assert pacer.metadata()["cooldown_seconds"] == 6
 
 
-def test_low_idle_frequency_does_not_block_sampling(tmp_path, monkeypatch):
+def test_low_idle_frequency_does_not_block_sampling(benchmark, tmp_path, monkeypatch):
     monkeypatch.setattr(benchmark, "npu_common", lambda physical: thermal_text(67, 100))
     monkeypatch.setattr(
         benchmark.time, "sleep", lambda seconds: pytest.fail("idle DVFS must not cause cooling")
@@ -6143,7 +6161,7 @@ def test_low_idle_frequency_does_not_block_sampling(tmp_path, monkeypatch):
     assert pacer.metadata()["cooldown_count"] == 0
 
 
-def test_thermal_pacing_disabled_does_not_query_device(tmp_path, monkeypatch):
+def test_thermal_pacing_disabled_does_not_query_device(benchmark, tmp_path, monkeypatch):
     monkeypatch.setattr(
         benchmark, "npu_common", lambda physical: pytest.fail("unexpected device query")
     )
@@ -6152,7 +6170,9 @@ def test_thermal_pacing_disabled_does_not_query_device(tmp_path, monkeypatch):
     assert not (tmp_path / "thermal_pacing.jsonl").exists()
 
 
-def test_thermal_interruption_is_logged_and_run_marked_interrupted(tmp_path, monkeypatch):
+def test_thermal_interruption_is_logged_and_run_marked_interrupted(
+    benchmark, tmp_path, monkeypatch
+):
     monkeypatch.setattr(benchmark, "npu_common", lambda physical: thermal_text(90))
 
     def interrupted(seconds):
@@ -6176,7 +6196,7 @@ def test_thermal_interruption_is_logged_and_run_marked_interrupted(tmp_path, mon
     assert "KeyboardInterrupt" in saved["error"]
 
 
-def test_pacing_wait_is_outside_end_to_end_sample_window(monkeypatch):
+def test_pacing_wait_is_outside_end_to_end_sample_window(benchmark, monkeypatch):
     clock = [0]
     monkeypatch.setitem(
         sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None))
@@ -6202,7 +6222,7 @@ def test_pacing_wait_is_outside_end_to_end_sample_window(monkeypatch):
     assert stages == [("trial", i) for i in range(3)]
 
 
-def test_warmup_is_also_synchronized_and_paced(monkeypatch):
+def test_warmup_is_also_synchronized_and_paced(benchmark, monkeypatch):
     events = []
     monkeypatch.setitem(
         sys.modules,
@@ -6218,11 +6238,19 @@ def test_warmup_is_also_synchronized_and_paced(monkeypatch):
     assert events[-3:] == [("warmup", 19), "kernel", "sync"]
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
-suite = importlib.import_module("benchmark_catlass_mxfp8_suite")
+@pytest.fixture(scope="module")
+def suite(benchmark_scripts):
+    for name in (
+        "benchmark_catlass_mxfp8_suite.py",
+        "benchmark_catlass_mxfp8.py",
+        "mxfp8_revision.py",
+    ):
+        if not (benchmark_scripts / name).is_file():
+            pytest.skip(f"benchmark script unavailable: {name}")
+    return importlib.import_module("benchmark_catlass_mxfp8_suite")
 
 
-def test_reference_report_matrix_and_ragged_local_boundaries():
+def test_reference_report_matrix_and_ragged_local_boundaries(suite):
     settings = suite.report_settings()
     cases = suite.make_specs(settings, ["BSND", "TND", "TND-ragged"])
     assert len(cases) == 204 and len({c["id"] for c in cases}) == 204
@@ -6235,7 +6263,7 @@ def test_reference_report_matrix_and_ragged_local_boundaries():
             assert c["q_lengths"][1:] == (65, 129)
 
 
-def test_packed_metadata_decode_keeps_sequence_and_head_axes():
+def test_packed_metadata_decode_keeps_sequence_and_head_axes(suite):
     # Rows per sequence 1,2; columns 2,1. Index-slot offsets 0,2,4.
     sparse = BlockSparseTensorsTorch(
         torch.tensor([[1, 1, 0], [0, 0, 1]], dtype=torch.int32),
@@ -6253,7 +6281,7 @@ def test_packed_metadata_decode_keeps_sequence_and_head_axes():
 
 
 @pytest.mark.parametrize("error", [0.0, 0.005, 0.2, float("nan")])
-def test_streaming_mixed_tolerance_agrees_with_existing_check(error):
+def test_streaming_mixed_tolerance_agrees_with_existing_check(suite, error):
     expected = torch.zeros(4097, dtype=torch.bfloat16)
     actual = expected.clone()
     actual[0] = error
@@ -6265,7 +6293,7 @@ def test_streaming_mixed_tolerance_agrees_with_existing_check(error):
     assert suite.compare_full(actual, expected)["passed"] == passed
 
 
-def test_report_retains_invalid_attempts_without_counting_them_as_passed(tmp_path):
+def test_report_retains_invalid_attempts_without_counting_them_as_passed(suite, tmp_path):
     settings = dict(suite.report_settings(), warmup=20, trials=100, rounds=3)
     spec = suite.make_specs(settings, ["TND"])[0]
     folder = tmp_path / "cases" / spec["id"] / "attempt-01"
@@ -6281,7 +6309,7 @@ def test_report_retains_invalid_attempts_without_counting_them_as_passed(tmp_pat
     assert saved["results"][0]["record"].endswith("attempt-01/result.json")
 
 
-def test_golden_contract_reports_bf16_error_without_changing_raw_record(tmp_path):
+def test_golden_contract_reports_bf16_error_without_changing_raw_record(suite, tmp_path):
     settings = dict(
         suite.report_settings(),
         warmup=20,
@@ -6313,7 +6341,7 @@ def test_golden_contract_reports_bf16_error_without_changing_raw_record(tmp_path
     assert not suite.golden_accuracy_passed(accuracy)
 
 
-def test_revision_report_requires_complete_paired_coverage(tmp_path):
+def test_revision_report_requires_complete_paired_coverage(suite, tmp_path):
     settings = dict(suite.report_settings(), warmup=3, trials=10, rounds=1)
     specs = suite.make_specs(settings, ["BSND"])[:2]
     for spec, previous in zip(specs, (20.0, 5.0)):
@@ -6345,9 +6373,13 @@ def test_revision_report_requires_complete_paired_coverage(tmp_path):
     assert report["by_scene"]["BSND"]["measured"] == 2
 
 
-def test_previous_revision_binds_planning_helpers_and_restores_on_error(monkeypatch):
+def test_previous_revision_binds_planning_helpers_and_restores_on_error(
+    benchmark_scripts, monkeypatch
+):
     from types import ModuleType, SimpleNamespace
 
+    if not (benchmark_scripts / "mxfp8_revision.py").is_file():
+        pytest.skip("benchmark script unavailable: mxfp8_revision.py")
     from mxfp8_revision import PreviousRevision
 
     name = "flash_attn_npu_4.catlass_dsl.kernels.flash_fwd_mxfp8_arch35"
@@ -6374,7 +6406,7 @@ def test_previous_revision_binds_planning_helpers_and_restores_on_error(monkeypa
     assert package.flash_fwd_mxfp8_arch35 is current
 
 
-def test_report_keeps_reused_measurements_distinct_from_new_runs(tmp_path):
+def test_report_keeps_reused_measurements_distinct_from_new_runs(suite, tmp_path):
     settings = dict(suite.report_settings(), warmup=3, trials=10, rounds=1)
     spec = suite.make_specs(settings, ["BSND"])[0]
     folder = tmp_path / "cases" / spec["id"] / "attempt-01"
