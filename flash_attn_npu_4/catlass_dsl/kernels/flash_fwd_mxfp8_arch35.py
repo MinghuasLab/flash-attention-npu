@@ -18,11 +18,6 @@ using namespace AscendC;using namespace AscendC::Reg;
 """
 
 
-def _mx_cpp_lanes(count, template):
-    """Expand named-register operations without changing their instruction order."""
-    return "".join(template.format(i=i, lo=2 * i, hi=2 * i + 1) for i in range(count))
-
-
 @tla.jit
 def q_scale_gm(ptr, rows, pitch, groups: tla.Constexpr = 4):
     # MX descriptors have a structural singleton axis with stride zero.
@@ -230,9 +225,11 @@ def prepare_group_scales(mstate, lstate, astate, safemstate, ph0, ph1, inverses,
     tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
 
 
-_EXP_PACK_SOURCE = (
-    _MX_CPP_HEADER
-    + r"""constexpr CastTrait rne0 = {RegLayout::ZERO, SatMode::NO_SAT,
+# RNE packing stays explicitly unrolled to preserve register scheduling.
+_PACK_SOURCE = r"""#include <cstdint>
+#include "kernel_operator.h"
+using namespace AscendC;using namespace AscendC::Reg;
+constexpr CastTrait rne0 = {RegLayout::ZERO, SatMode::NO_SAT,
   MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
 constexpr CastTrait rne1 = {RegLayout::ONE, SatMode::NO_SAT,
   MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
@@ -257,77 +254,57 @@ __simd_vf__ inline void flex_exp_pack_update(__ubuf__ float* src, __ubuf__ uint8
   ShiftLefts(upper, upper, int16_t(7), mb);
   Or(loidx, loidx, upper, mb);
   RegTensor<float> sm, inv, sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
-  LoadAlign(sm, safemstate);
   Duplicate(sum0, 0.0f, mf); Duplicate(sum1, 0.0f, mf);
   Duplicate(sum2, 0.0f, mf); Duplicate(sum3, 0.0f, mf);
   Duplicate(sum4, 0.0f, mf); Duplicate(sum5, 0.0f, mf);
   Duplicate(sum6, 0.0f, mf); Duplicate(sum7, 0.0f, mf);
   for (uint16_t row = 0; row < 128; row += 8) {
     LoadAlign(inv, inverses + (row / 32) * 64);
-@PACK_BLOCKS@
-  }
-  Add(sum0, sum0, sum1, mf); Add(sum2, sum2, sum3, mf);
-  Add(sum4, sum4, sum5, mf); Add(sum6, sum6, sum7, mf);
-  Add(sum0, sum0, sum2, mf); Add(sum4, sum4, sum6, mf);
-  Add(sum0, sum0, sum4, mf);
-  RegTensor<float> oldl, alpha, bad, one;
-  LoadAlign(oldl, lstate); LoadAlign(alpha, astate); LoadAlign(bad, badstate);
-  Mul(oldl, oldl, alpha, mf); Add(oldl, oldl, sum0, mf);
-  StoreAlign(lstate, oldl, mf);
-  Duplicate(one, 1.0f, mf);
-  MaskReg finite;
-  Compares<float, CMPMODE::LT>(finite, sum0, __builtin_inff(), mf);
-  Select(bad, bad, one, finite); StoreAlign(badstate, bad, mf);
-  LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
-}
-extern "C" [aicore] __attribute__((always_inline))
-void flex_mx_exp_pack_update(uint64_t src, uint64_t dst, uint64_t inverses,
-                      uint64_t safemstate, uint64_t lstate, uint64_t astate, uint64_t badstate, float scale) {
-  flex_exp_pack_update(reinterpret_cast<__ubuf__ float*>(src),
-                reinterpret_cast<__ubuf__ uint8_t*>(dst),
-                reinterpret_cast<__ubuf__ float*>(inverses),
-                reinterpret_cast<__ubuf__ float*>(safemstate),
-                reinterpret_cast<__ubuf__ float*>(lstate), reinterpret_cast<__ubuf__ float*>(astate),
-                reinterpret_cast<__ubuf__ float*>(badstate), scale);
-}
-"""
-)
-_MX_PACK_BLOCK = r"""    {{
+    {
       RegTensor<float> x0, x1, x2, x3;
       RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
       RegTensor<uint8_t> packed, lo;
-@LANES@      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      LoadAlign(x0, src + (row + 0) * 64);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 1) * 64);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 2) * 64);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 3) * 64);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
       Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
       Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
       Gather(lo, packed, loidx);
-      StoreAlign(dst + (row + {offset}) * 64, lo, mb);
-    }}
-"""
-_MX_PACK_LANE = r"""      LoadAlign(x{i}, src + (row + {row}) * 64);
-      Muls(x{i}, x{i}, scale, mf);
-      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x{i},x{i},sm,mf);
-      Add(sum{row}, sum{row}, x{i}, mf);
-      Mul(x{i}, x{i}, inv, mf);
-      Cast<fp8_e4m3fn_t, float, rne{i}>(p{i}, x{i}, mf);
-"""
-_EXP_PACK_SOURCE = _EXP_PACK_SOURCE.replace(
-    "@PACK_BLOCKS@\n",
-    "".join(
-        _MX_PACK_BLOCK.format(offset=offset).replace(
-            "@LANES@", "".join(_MX_PACK_LANE.format(i=i, row=offset + i) for i in range(4))
-        )
-        for offset in (0, 4)
-    ),
-)
-
-# The fallback already holds P in FP32; reuse the same RNE packing body.
-_PACK_SOURCE = _EXP_PACK_SOURCE.split("  Add(sum0, sum0, sum1, mf);")[0]
-_PACK_SOURCE = "\n".join(
-    line
-    for line in _PACK_SOURCE.splitlines()
-    if not any(token in line for token in ("FusedExpSub<", "Add(sum", "Muls(x", "LoadAlign(sm,"))
-)
-_PACK_SOURCE += r"""
+      StoreAlign(dst + (row + 0) * 64, lo, mb);
+    }
+    {
+      RegTensor<float> x0, x1, x2, x3;
+      RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
+      RegTensor<uint8_t> packed, lo;
+      LoadAlign(x0, src + (row + 4) * 64);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 5) * 64);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 6) * 64);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 7) * 64);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
+      Gather(lo, packed, loidx);
+      StoreAlign(dst + (row + 4) * 64, lo, mb);
+    }
+  }
 }
 extern "C" [aicore] __attribute__((always_inline))
 void flex_mx_pack_scaled_rne(uint64_t src,uint64_t dst,uint64_t inverses) {
@@ -452,7 +429,7 @@ def _mx_vector_tile(ptr, lanes: tla.Constexpr[int]):
 # Device saturation, score-range and denominator guards request FP32 repair.
 # Periodic masks additionally reject tiny total mass; interval/auxiliary masks
 # check mass per selected block. Empty rows remain zero with LSE=-inf.
-_CPP_SHORT_QUANTIZE = (
+_CPP_SHORT_BODY = (
     _MX_CPP_HEADER
     + r"""constexpr CastTrait mx_short_cast0={RegLayout::ZERO,SatMode::SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
 constexpr CastTrait mx_short_cast1={RegLayout::ONE,SatMode::SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
@@ -470,10 +447,19 @@ __simd_callee__ inline void mx_short_pack(RegTensor<float>& x0,RegTensor<float>&
  Or(packed,packed,reinterpret_cast<RegTensor<uint8_t>&>(p2),mb);
  Or(packed,packed,reinterpret_cast<RegTensor<uint8_t>&>(p3),mb);
 }
-constexpr bool mx_short_sum_denominator=true;
-template<bool FULL,bool MASKED=false,bool ADAPTIVE=false,bool RANGE=false>
-__simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* p,__ubuf__ float* maximum,__ubuf__ float* denominator,int32_t tile,int32_t cols,__ubuf__ uint32_t* visibility=nullptr,__ubuf__ float* offset=nullptr,int32_t first=0,int32_t last=128) {
+// Both stored masks and fused callbacks provide the same vector policy.
+struct MxStoredMask {
+ __simd_callee__ static inline void init(RegTensor<int32_t>& query,int32_t qbase,MaskReg& all) {}
+ __simd_callee__ static inline MaskReg load(RegTensor<int32_t>& query,__ubuf__ uint32_t* visibility,
+     int32_t row,int32_t key,int32_t qlen,int32_t klen,MaskReg& all) {
+  MaskReg result;DataCopy<uint32_t>(result,visibility+row*8);return result;
+ }
+};
+template<bool FULL,bool MASKED=false,bool ADAPTIVE=false,bool RANGE=false,
+ bool SUM_DENOMINATOR=true,bool CHECK_MINIMUM=true,class Mask=MxStoredMask>
+__simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* p,__ubuf__ float* maximum,__ubuf__ float* denominator,int32_t tile,int32_t cols,__ubuf__ uint32_t* visibility=nullptr,__ubuf__ float* offset=nullptr,int32_t first=0,int32_t last=128,int32_t qbase=0,int32_t kbase=0,int32_t qlen=0,int32_t klen=0) {
  MaskReg mf=CreateMask<float,MaskPattern::ALL>(),mh=CreateMask<half,MaskPattern::ALL>(),mb=CreateMask<uint8_t,MaskPattern::ALL>();
+ RegTensor<int32_t> query;Mask::init(query,qbase,mf);
  RegTensor<int8_t> seq;RegTensor<uint8_t> ix,upper;Arange(seq,int8_t(0));
  ShiftLefts(ix,reinterpret_cast<RegTensor<uint8_t>&>(seq),int16_t(3),mb);ShiftRights(ix,ix,int16_t(1),mb);
  ShiftLefts(upper,reinterpret_cast<RegTensor<uint8_t>&>(seq),int16_t(1),mb);ShiftRights(upper,upper,int16_t(6),mb);Add(ix,ix,upper,mb);
@@ -484,7 +470,7 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
   RegTensor<half> m0,m1,m2,m3,negative;RegTensor<float> maximum,zero;
   Duplicate(negative,half(-__builtin_inff()));Duplicate(zero,0.f);
   m0=negative;m1=negative;m2=negative;m3=negative;
-  for(uint16_t row=0;row<128;row+=4) {
+  for(uint16_t row=RANGE?first:0;row<(RANGE?last:128);row+=4) {
    RegTensor<half> x0,x1,x2,x3;
    LoadAlign<half,LoadDist::DIST_UNPACK_B16>(x0,s+(row+0)*64);
    LoadAlign<half,LoadDist::DIST_UNPACK_B16>(x1,s+(row+1)*64);
@@ -492,8 +478,8 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
    LoadAlign<half,LoadDist::DIST_UNPACK_B16>(x3,s+(row+3)*64);
    if constexpr(MASKED) {
     MaskReg v0,v1,v2,v3;
-    DataCopy<uint32_t>(v0,visibility+(row+0)*8);DataCopy<uint32_t>(v1,visibility+(row+1)*8);
-    DataCopy<uint32_t>(v2,visibility+(row+2)*8);DataCopy<uint32_t>(v3,visibility+(row+3)*8);
+    v0=Mask::load(query,visibility,row+0,kbase+row+0,qlen,klen,mf);v1=Mask::load(query,visibility,row+1,kbase+row+1,qlen,klen,mf);
+    v2=Mask::load(query,visibility,row+2,kbase+row+2,qlen,klen,mf);v3=Mask::load(query,visibility,row+3,kbase+row+3,qlen,klen,mf);
     Select(x0,x0,negative,v0);Select(x1,x1,negative,v1);Select(x2,x2,negative,v2);Select(x3,x3,negative,v3);
    }
    if constexpr(!FULL) {
@@ -521,14 +507,14 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
   RegTensor<float> x0,x1,x2,x3;
   MaskReg v0=mh,v1=mh,v2=mh,v3=mh;
   if constexpr (MASKED) {
-    DataCopy<uint32_t>(v0,visibility+(row+0)*8);DataCopy<uint32_t>(v1,visibility+(row+1)*8);
-    DataCopy<uint32_t>(v2,visibility+(row+2)*8);DataCopy<uint32_t>(v3,visibility+(row+3)*8);
+    v0=Mask::load(query,visibility,row+0,kbase+row+0,qlen,klen,mf);v1=Mask::load(query,visibility,row+1,kbase+row+1,qlen,klen,mf);
+    v2=Mask::load(query,visibility,row+2,kbase+row+2,qlen,klen,mf);v3=Mask::load(query,visibility,row+3,kbase+row+3,qlen,klen,mf);
   }
   FusedExpSub<float,half,RegLayout::ZERO,MaskMergeMode::ZEROING>(x0,s0,shift,v0);
   FusedExpSub<float,half,RegLayout::ZERO,MaskMergeMode::ZEROING>(x1,s1,shift,v1);
   FusedExpSub<float,half,RegLayout::ZERO,MaskMergeMode::ZEROING>(x2,s2,shift,v2);
   FusedExpSub<float,half,RegLayout::ZERO,MaskMergeMode::ZEROING>(x3,s3,shift,v3);
-  if constexpr(!ADAPTIVE && (MASKED || !mx_short_sum_denominator)) {
+  if constexpr(!ADAPTIVE && CHECK_MINIMUM && (MASKED || !SUM_DENOMINATOR)) {
    Min(low01,s0,s1,mh);Min(low23,s2,s3,mh);
    Min(low01,low01,low23,mh);Min(lowest,lowest,low01,mh);
   }
@@ -536,7 +522,7 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
     if(row>=cols) Duplicate(x0,0.f); if(row+1>=cols) Duplicate(x1,0.f);
     if(row+2>=cols) Duplicate(x2,0.f); if(row+3>=cols) Duplicate(x3,0.f);
   }
-  if constexpr(mx_short_sum_denominator) {Add(den,den,x0,mf);Add(den1,den1,x1,mf);Add(den2,den2,x2,mf);Add(den3,den3,x3,mf);}
+  if constexpr(SUM_DENOMINATOR) {Add(den,den,x0,mf);Add(den1,den1,x1,mf);Add(den2,den2,x2,mf);Add(den3,den3,x3,mf);}
   RegTensor<uint8_t> packed;
   if constexpr(ADAPTIVE) {
    Muls(x0,x0,256.f,mf);Muls(x1,x1,256.f,mf);Muls(x2,x2,256.f,mf);Muls(x3,x3,256.f,mf);
@@ -546,7 +532,7 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
   Gather(packed,packed,ix);StoreAlign(p+row*64,packed,mb);
  }
  RegTensor<uint32_t> unsafe;Duplicate(unsafe,uint32_t(0x7f7f7f7f));
- if constexpr(mx_short_sum_denominator) {
+ if constexpr(SUM_DENOMINATOR) {
   Add(den,den,den1,mf);Add(den2,den2,den3,mf);Add(den,den,den2,mf);
   if constexpr(ADAPTIVE) Muls(den,den,32.f,mf);else Muls(den,den,0.125f,mf);
   if constexpr(!MASKED && !ADAPTIVE) {
@@ -558,7 +544,7 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
   if(tile!=0) {LoadAlign(tmp,denominator);Add(den,den,tmp,mf);}
   StoreAlign(denominator,den,mf);
  }
- if constexpr(!ADAPTIVE && (MASKED || !mx_short_sum_denominator)) {
+ if constexpr(!ADAPTIVE && CHECK_MINIMUM && (MASKED || !SUM_DENOMINATOR)) {
   // Arbitrary masks need no visible-lane count: certify that their possible
   // FP8 probabilities are normal. Testing masked scores is conservative.
   RegTensor<half> threshold;Adds(threshold,shift,half(-4.f),mh);
@@ -573,26 +559,38 @@ __simd_vf__ inline void mx_short_quantize_vf(__ubuf__ half* s,__ubuf__ uint8_t* 
   if(offset!=nullptr) {RegTensor<float> c;Duplicate(c,0.13315247917983575f);StoreAlign(offset,c,mf);}
  }
 }
-template<bool ADAPTIVE>
+"""
+)
+
+
+_CPP_SHORT_QUANTIZE = (
+    _CPP_SHORT_BODY
+    + r"""
+template<bool ADAPTIVE,bool SUM_DENOMINATOR>
 [aicore] __attribute__((always_inline)) void mx_short_dispatch(
  uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t cols,uint64_t visibility,__ubuf__ float* offset,int32_t masked) {
-#define CALL(F,M) mx_short_quantize_vf<F,M,ADAPTIVE>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,tile,cols,(__ubuf__ uint32_t*)visibility,(__ubuf__ float*)offset)
+#define CALL(F,M) mx_short_quantize_vf<F,M,ADAPTIVE,false,SUM_DENOMINATOR>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,tile,cols,(__ubuf__ uint32_t*)visibility,offset)
  if(masked) {if(cols==128) CALL(true,true);else CALL(false,true);}
  else {if(cols==128) CALL(true,false);else CALL(false,false);}
 #undef CALL
 }
-extern "C" [aicore] __attribute__((always_inline)) void mx_short_quantize_dispatch(
+template<bool SUM_DENOMINATOR>
+[aicore] __attribute__((always_inline)) void mx_short_run(
  uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t cols,uint64_t visibility,uint64_t offset,int32_t masked,int32_t adaptive,int32_t first,int32_t last) {
  __ubuf__ float* offsetp=adaptive<0?nullptr:(__ubuf__ float*)offset;
- if(first>=0) mx_short_quantize_vf<true,false,false,true>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,0,128,nullptr,offsetp,first,last);
- else if(adaptive>0) mx_short_dispatch<true>(s,p,m,d,tile,cols,visibility,offsetp,masked);
- else mx_short_dispatch<false>(s,p,m,d,tile,cols,visibility,offsetp,masked);
+ if(first>=0) mx_short_quantize_vf<true,false,false,true,SUM_DENOMINATOR>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,0,128,nullptr,offsetp,first,last);
+ else if(adaptive>0) mx_short_dispatch<true,SUM_DENOMINATOR>(s,p,m,d,tile,cols,visibility,offsetp,masked);
+ else mx_short_dispatch<false,SUM_DENOMINATOR>(s,p,m,d,tile,cols,visibility,offsetp,masked);
+}
+extern "C" [aicore] __attribute__((always_inline)) void mx_short_quantize_dispatch(
+ uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t cols,uint64_t visibility,uint64_t offset,int32_t masked,int32_t adaptive,int32_t first,int32_t last) {
+ mx_short_run<true>(s,p,m,d,tile,cols,visibility,offset,masked,adaptive,first,last);
+}
+extern "C" [aicore] __attribute__((always_inline)) void mx_short_quantize_post_dispatch(
+ uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t cols,uint64_t visibility,uint64_t offset,int32_t masked,int32_t adaptive,int32_t first,int32_t last) {
+ mx_short_run<false>(s,p,m,d,tile,cols,visibility,offset,masked,adaptive,first,last);
 }
 """
-)
-
-_CPP_SHORT_QUANTIZE_PVSUM = _CPP_SHORT_QUANTIZE.replace(
-    "mx_short_sum_denominator=true", "mx_short_sum_denominator=false"
 )
 
 _MX_SHORT_QUANTIZERS = {}
@@ -601,9 +599,9 @@ _MX_SHORT_QUANTIZERS = {}
 def _mx_short_quantizer(post_quant):
     if post_quant in _MX_SHORT_QUANTIZERS:
         return _MX_SHORT_QUANTIZERS[post_quant]
-    source = _CPP_SHORT_QUANTIZE_PVSUM if post_quant else _CPP_SHORT_QUANTIZE
+    name = "mx_short_quantize_post_dispatch" if post_quant else "mx_short_quantize_dispatch"
 
-    @tla.extern(name="mx_short_quantize_dispatch", source=source)
+    @tla.extern(name=name, source=_CPP_SHORT_QUANTIZE)
     def pack(
         s: tla.Pointer[tla.Float16, tla.AddressSpace.ub],
         p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
@@ -641,6 +639,46 @@ def _mx_short_quantize(
 ):
     pack = _mx_short_quantizer(post_quant)
     pack(s, p, m, d, tile, cols, visibility, offset, masked, adaptive, first, last)
+
+
+@tla.extern(
+    name="mx_key_aux_quantize",
+    source=_CPP_SHORT_BODY
+    + r"""
+struct MxKeyAuxMask {
+ __simd_callee__ static inline void init(RegTensor<int32_t>& q,int32_t base,MaskReg& all) {}
+ __simd_callee__ static inline MaskReg load(RegTensor<int32_t>& q,__ubuf__ uint32_t* aux,
+     int32_t row,int32_t key,int32_t qlen,int32_t klen,MaskReg& all) {
+  RegTensor<int32_t> position,threshold;Duplicate(position,key);
+  LoadAlign<int32_t,LoadDist::DIST_BRC_B32>(threshold,(__ubuf__ int32_t*)aux+row);
+  MaskReg visible,tail;Compare<int32_t,CMPMODE::GE>(visible,position,threshold,all);
+  Compares<int32_t,CMPMODE::LT>(tail,position,klen,all);And(visible,visible,tail,all);
+  return visible;
+ }
+};
+extern "C" [aicore] __attribute__((always_inline)) void mx_key_aux_quantize(
+ uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t cols,uint64_t aux,
+ uint64_t offset,int32_t single,int32_t kbase,int32_t klen) {
+#define CALL(F,A) mx_short_quantize_vf<F,true,A,false,true,true,MxKeyAuxMask>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,tile,cols,(__ubuf__ uint32_t*)aux,single?(__ubuf__ float*)offset:nullptr,0,128,0,kbase,0,klen)
+ if(single) {if(cols==128) CALL(true,true);else CALL(false,true);}
+ else {if(cols==128) CALL(true,false);else CALL(false,false);}
+#undef CALL
+}
+""",
+)
+def _mx_quantize_key_aux(
+    s: tla.Pointer[tla.Float16, tla.AddressSpace.ub],
+    p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
+    m: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    d: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    tile: tla.Int32,
+    cols: tla.Int32,
+    aux: tla.Pointer[tla.Int32, tla.AddressSpace.ub],
+    offset: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    single: tla.Int32,
+    kbase: tla.Int32,
+    klen: tla.Int32,
+) -> None: ...
 
 
 @tla.extern(
@@ -717,6 +755,8 @@ def short_statistics(
     rows: tla.Int32,
     bounded: tla.Int32,
 ) -> None: ...
+
+
 @tla.jit
 def initialize_short_pipeline(aggregate, scales):
     target = tla.make_tensor(aggregate, tla.make_layout(tla.make_shape(64), tla.make_stride(1)))
@@ -1542,6 +1582,63 @@ class _MxUnknownIndex:
     __getattr__ = unsupported
 
 
+class _MxKeyOffset:
+    pass
+
+
+class _MxKeyPosition(_MxUnknownIndex):
+    def __init__(self, global_key=False):
+        self.global_key = global_key
+
+    def __add__(self, offset):
+        if not isinstance(offset, _MxKeyOffset):
+            raise NotImplementedError
+        return _MxKeyPosition(True)
+
+    __radd__ = __add__
+
+    def __ge__(self, other):
+        if self.global_key or not isinstance(other, _MxKeyAuxValue):
+            raise NotImplementedError
+        return ("key_aux_ge", other.global_key)
+
+
+class _MxKeyAuxValue(_MxUnknownIndex):
+    def __init__(self, global_key):
+        self.global_key = global_key
+
+    def __le__(self, other):
+        return other.__ge__(self)
+
+
+class _MxKeyAuxProbe:
+    def __getitem__(self, index):
+        if isinstance(index, tuple) and len(index) == 1:
+            index = index[0]
+        if not isinstance(index, _MxKeyPosition):
+            raise NotImplementedError
+        return _MxKeyAuxValue(index.global_key)
+
+
+def _mx_trace_key_aux(mask_mod):
+    import inspect
+
+    unknown = _MxUnknownIndex()
+    try:
+        value = inspect.unwrap(mask_mod)(
+            unknown,
+            unknown,
+            unknown,
+            _MxKeyPosition(),
+            (unknown, unknown, unknown, _MxKeyOffset()),
+            (_MxKeyAuxProbe(),),
+            (),
+        )
+    except Exception:
+        return ()
+    return (value[1],) if type(value) is tuple and value[0] == "key_aux_ge" else ()
+
+
 class _MxAffineMask(_MxComparable):
     def __init__(self, tree):
         self.tree = tree
@@ -1660,7 +1757,7 @@ def _mx_mask_span(tree):
     )
 
 
-def _mx_trace_affine_mask(mask_mod, nq, nk, scalar_count, post_quant=False, packed=False):
+def _mx_trace_affine_tree(mask_mod, scalar_count, packed=False):
     import inspect
 
     try:
@@ -1681,92 +1778,202 @@ def _mx_trace_affine_mask(mask_mod, nq, nk, scalar_count, post_quant=False, pack
         )
     except Exception:
         return None
-    return (
-        _mx_affine_quantizer(result.tree, post_quant, -1, (0, 0))
-        if isinstance(result, _MxAffineMask)
-        else None
-    )
+    return result.tree if isinstance(result, _MxAffineMask) else None
+
+
+def _mx_trace_affine_mask(mask_mod, nq, nk, scalar_count, post_quant=False, packed=False):
+    tree = _mx_trace_affine_tree(mask_mod, scalar_count, packed)
+    return _mx_affine_quantizer(tree, post_quant) if tree is not None else None
 
 
 @lru_cache(maxsize=128)
-def _mx_affine_quantizer(tree, post_quant=False, tail_end=0, limits=(0, 0)):
-    import hashlib
+def _mx_is_periodic_prefix(mask_mod, scalar_count, packed=False):
+    """Prove a block-local causal predicate with the attention tile period."""
+    tree = _mx_trace_affine_tree(mask_mod, scalar_count, packed)
+    query = ("mod", (1, 0, 0, 0, 0), 128)
+    key = ("mod", (0, 1, 0, 0, 0), 128)
+    return tree in (("periodic", "GE", query, key), ("periodic", "LE", key, query))
 
-    name = (
-        "mx_affine_"
-        + hashlib.sha256(repr((tree, post_quant, tail_end, limits)).encode()).hexdigest()[:16]
-    )
-    lines, expressions, predicates = [], {}, {}
 
-    def no_overflow(coefficients):
-        a, b, c, ql, kl = coefficients
-        nq, nk = limits
-        return (
-            nq > 0 and nk > 0 and (abs(a) + abs(ql)) * nq + (abs(b) + abs(kl)) * nk + abs(c) < 2**31
+def _mx_dense_mask_bounds(mask_mod, scalar_count, packed=False):
+    """Reuse proven affine constraints; never inspect auxiliary tensor values."""
+    tree = _mx_trace_affine_tree(mask_mod, scalar_count, packed)
+    if tree is None:
+        return ()
+    lower, upper = _mx_mask_bounds(tree)
+    return (tuple(lower), tuple(upper)) if lower or upper else ()
+
+
+def _mx_mask_is_all_visible(mask_mod):
+    """Canonicalize only a predicate proven constant with unknown indices."""
+    import inspect
+
+    unknown = _MxUnknownIndex()
+    try:
+        result = inspect.unwrap(mask_mod)(
+            unknown, unknown, unknown, unknown, (unknown,) * 4, (), ()
         )
+    except Exception:
+        return False
+    return result is True or getattr(result, "value", None) is True
 
-    def expression(coefficients):
+
+class _MxMaskLowering:
+    """Lower the symbolic callback to vector instructions, independently of quantization.
+
+    Registers and calls form a small instruction list. Only this callback-dependent
+    list is emitted as C++; the quantizer and dispatch are ordinary static functions.
+    No kernel source is searched, patched or used as a substitution template.
+    """
+
+    def __init__(self):
+        self.instructions = []
+        self.expressions = {}
+        self.operands = {}
+        self.predicates = {}
+        self.register_count = 0
+
+    def register(self, dtype):
+        name = "mask_r" + str(self.register_count)
+        self.register_count += 1
+        self.instructions.append(("declare", dtype, name))
+        return name
+
+    def call(self, operation, *arguments, types=()):
+        self.instructions.append(("call", operation, types, arguments))
+
+    @staticmethod
+    def scalar(coefficients):
+        # Parenthesize signed coefficients and every operation, preserving the
+        # original int32 expression and its overflow behavior.
+        c, ql, kl = coefficients
+        return "(" + str(c) + "+(" + str(ql) + ")*qlen+(" + str(kl) + ")*klen)"
+
+    def expression(self, coefficients):
         a, b, c, ql, kl = coefficients
-        rhs = f"-({c}+({ql})*qlen+({kl})*klen)"
-        if a == 1 and no_overflow(coefficients):
-            return "query", f"-({c}+({ql})*qlen+({kl})*klen+({b})*key)"
-        if (a, b) in expressions:
-            return expressions[a, b], rhs
-        var = "x" + str(len(expressions))
-        lines.append(f"RegTensor<int32_t> {var};")
-        if a == 0:
-            lines.append(f"Duplicate({var},int32_t({b}*key));")
-        else:
-            if a != 1:
-                lines.append(f"Muls({var},query,int32_t({a}),all);")
-            lines.append(f"Adds({var},{'query' if a == 1 else var},int32_t({b}*key),all);")
-        expressions[a, b] = var
-        return var, rhs
+        if (a, b) not in self.expressions:
+            value = self.register("RegTensor<int32_t>")
+            key = "int32_t(" + str(b) + "*key)"
+            if a == 0:
+                self.call("Duplicate", value, key)
+            else:
+                if a != 1:
+                    self.call("Muls", value, "query", "int32_t(" + str(a) + ")", "all")
+                self.call("Adds", value, "query" if a == 1 else value, key, "all")
+            self.expressions[a, b] = value
+        return self.expressions[a, b], self.scalar((c, ql, kl))
 
-    operands = {}
+    def operand(self, node):
+        if node not in self.operands:
+            kind, coefficients, divisor = node
+            base, shift = self.expression(coefficients)
+            value = self.register("RegTensor<int32_t>")
+            self.call("Adds", value, base, "int32_t(-(-" + shift + "))", "all")
+            if kind == "mod":
+                mask = self.register("RegTensor<int32_t>")
+                self.call("Duplicate", mask, "int32_t(" + str(divisor - 1) + ")")
+                self.call("And", value, value, mask, "all")
+            elif kind == "div":
+                self.call(
+                    "ShiftRights",
+                    value,
+                    value,
+                    "int16_t(" + str(divisor.bit_length() - 1) + ")",
+                    "all",
+                )
+            self.operands[node] = value
+        return self.operands[node]
 
-    def operand(node):
-        if node in operands:
-            return operands[node]
-        kind, coefficients, divisor = node
-        base, rhs = expression(coefficients)
-        var = "operand" + str(len(operands))
-        lines.append(f"RegTensor<int32_t> {var};Adds({var},{base},int32_t(-({rhs})),all);")
-        if kind == "mod":
-            mask = var + "_mask"
-            lines.append(
-                f"RegTensor<int32_t> {mask};Duplicate({mask},int32_t({divisor - 1}));And({var},{var},{mask},all);"
-            )
-        elif kind == "div":
-            lines.append(f"ShiftRights({var},{var},int16_t({divisor.bit_length() - 1}),all);")
-        operands[node] = var
-        return var
+    def predicate(self, node):
+        if node not in self.predicates:
+            mode, *args = node
+            if mode in ("and", "or"):
+                left, right = (self.predicate(child) for child in args)
+                operation, types = mode.title(), ()
+            elif mode == "periodic":
+                comparison, lhs, rhs = args
+                left, right = self.operand(lhs), self.operand(rhs)
+                operation, types = "Compare", ("int32_t", "CMPMODE::" + comparison)
+            else:
+                left, shift = self.expression(args[0])
+                right = "int32_t(-" + shift + ")"
+                operation, types = "Compares", ("int32_t", "CMPMODE::" + mode)
+            value = self.register("MaskReg")
+            self.call(operation, value, left, right, "all", types=types)
+            self.predicates[node] = value
+        return self.predicates[node]
 
-    def predicate(node):
-        if node in predicates:
-            return predicates[node]
-        mode, *args = node
-        if mode in ("and", "or"):
-            a, b = (predicate(t) for t in args)
-            body = f"{mode.title()}({{var}},{a},{b},all);"
-        elif mode == "periodic":
-            comparison, lhs, rhs = args
-            a, b = operand(lhs), operand(rhs)
-            body = f"Compare<int32_t,CMPMODE::{comparison}>({{var}},{a},{b},all);"
-        else:
-            coefficients = args[0]
-            if coefficients[0] == -1 and no_overflow(coefficients):
-                coefficients = tuple(-x for x in coefficients)
-                mode = {"LT": "GT", "LE": "GE", "GT": "LT", "GE": "LE", "EQ": "EQ", "NE": "NE"}[
-                    mode
-                ]
-            value, rhs = expression(coefficients)
-            body = f"Compares<int32_t,CMPMODE::{mode}>({{var}},{value},int32_t({rhs}),all);"
-        var = "m" + str(len(predicates))
-        predicates[node] = var
-        lines.append("MaskReg " + var + ";" + body.format(var=var))
-        return var
+    def source(self, result, *, lower, upper, sum_denominator, skip_minimum, continuous):
+        # Serialize complete policy declarations and instructions. The shared
+        # quantizer calls this policy through its C++ type parameter.
+        tokens = ["struct MxAffineMask {\n"]
+        for name, value in (
+            ("lower", lower),
+            ("upper", upper),
+            ("sum_denominator", int(sum_denominator)),
+            ("skip_minimum", int(skip_minimum)),
+            ("continuous", int(continuous)),
+        ):
+            tokens.extend((" static constexpr auto ", name, "=", str(value), ";\n"))
+        tokens.append(r"""
+ __simd_callee__ static inline void init(RegTensor<int32_t>& query,int32_t qbase,MaskReg& all) {
+  Arange(query,int32_t(0));Adds(query,query,qbase,all);
+ }
+ __simd_callee__ static inline MaskReg load(RegTensor<int32_t>& query,__ubuf__ uint32_t* visibility,
+     int32_t row,int32_t key,int32_t qlen,int32_t klen,MaskReg& all) {
+  // The caller forms (kbase + row) + lane, retaining the aligned-key strength reduction.
+""")
+        for instruction in self.instructions:
+            if instruction[0] == "declare":
+                _, dtype, name = instruction
+                tokens.extend(("  ", dtype, " ", name, ";\n"))
+            else:
+                _, operation, types, arguments = instruction
+                tokens.extend(("  ", operation))
+                if types:
+                    tokens.extend(("<", ",".join(types), ">"))
+                tokens.extend(("(", ",".join(arguments), ");\n"))
+        tokens.extend(("  return ", result, ";\n }\n};\n"))
+        return "".join(tokens)
 
+
+_CPP_AFFINE_DISPATCH = r"""
+[aicore] __attribute__((always_inline)) int32_t mx_affine_visible(int32_t q,int32_t k,int32_t lower,int32_t upper) {
+ int32_t a=q-upper,b=q-lower+1,c=q+63-upper,d=q+64-lower;
+ a=a<k?k:a;b=b>k+128?k+128:b;c=c<k?k:c;d=d>k+128?k+128:d;
+ return b-a<d-c?b-a:d-c;
+}
+template<bool FULL>
+[aicore] __attribute__((always_inline)) void mx_affine_dispatch(
+ uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t qbase,int32_t kbase,
+ uint64_t offset,int32_t single,int32_t qlen,int32_t klen,int32_t first,int32_t last,int32_t cols) {
+ using Mask=MxAffineMask;
+#define CALL(ADAPTIVE,TILE,OFFSET) mx_short_quantize_vf<FULL,true,ADAPTIVE,true,Mask::sum_denominator,!Mask::skip_minimum,Mask>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,TILE,cols,nullptr,OFFSET,first,last,qbase,kbase,qlen,klen)
+ if(single) {
+  int32_t minimum=0;
+  if constexpr(Mask::continuous) minimum=mx_affine_visible(qbase,kbase,Mask::lower,Mask::upper);
+  if(minimum>=32) CALL(false,0,(__ubuf__ float*)offset);
+  else CALL(true,0,(__ubuf__ float*)offset);
+ } else CALL(false,tile,nullptr);
+#undef CALL
+}
+extern "C" [aicore] __attribute__((always_inline)) void mx_affine_quantize_dispatch(
+ uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t qbase,int32_t kbase,
+ uint64_t offset,int32_t single,int32_t qlen,int32_t klen) {
+ using Mask=MxAffineMask;
+ int32_t first=0,last=128;
+ if constexpr(Mask::upper!=(1<<30)) first=qbase-kbase-Mask::upper;
+ if constexpr(Mask::lower!=-(1<<30)) last=qbase-kbase+64-Mask::lower;
+ first=first<0?0:(first>128?128:first);last=last<0?0:(last>128?128:last);
+ first=(first/4)*4;last=((last+3)/4)*4;
+ if(kbase+128<=klen) mx_affine_dispatch<true>(s,p,m,d,tile,qbase,kbase,offset,single,qlen,klen,first,last,128);
+ else mx_affine_dispatch<false>(s,p,m,d,tile,qbase,kbase,offset,single,qlen,klen,first,last,klen-kbase);
+}
+"""
+
+
+@lru_cache(maxsize=128)
+def _mx_affine_quantizer(tree, post_quant=False):
     def continuous_interval(node):
         mode, *args = node
         if mode == "and":
@@ -1777,88 +1984,25 @@ def _mx_affine_quantizer(tree, post_quant=False, tail_end=0, limits=(0, 0)):
             and args[0][3:] == (0, 0)
         )
 
+    continuous = continuous_interval(tree)
+    bounded = (1 if continuous else 2) if not post_quant else 0
     lows, highs = _mx_mask_bounds(tree)
     lower = max((x[0] for x in lows if x[1:] == (0, 0)), default=-(2**30))
     upper = min((x[0] for x in highs if x[1:] == (0, 0)), default=2**30)
-    minimum = "0"
-    if continuous_interval(tree):
-        minimum = f"mx_visible(qbase,kbase,{lower},{upper})"
-    first = "0" if upper == 2**30 else f"qbase-kbase-({upper})"
-    last = "128" if lower == -(2**30) else f"qbase-kbase+64-({lower})"
-    result = predicate(tree)
-    helper = "\n".join(lines) + f"\nreturn {result};"
-    source = (_CPP_SHORT_QUANTIZE_PVSUM if post_quant else _CPP_SHORT_QUANTIZE).split('extern "C"')[
-        0
-    ]
-    declaration = f"__simd_callee__ inline MaskReg {name}_mask(RegTensor<int32_t>& query,int32_t key,MaskReg& all,int32_t qlen,int32_t klen) {{\n{helper}\n}}\n"
-    source = source.replace("template<bool FULL", declaration + "template<bool FULL", 1)
-    source = source.replace(
-        "int32_t first=0,int32_t last=128)",
-        "int32_t first=0,int32_t last=128,int32_t qbase=0,int32_t kbase=0,int32_t qlen=0,int32_t klen=0)",
-        1,
+    lowering = _MxMaskLowering()
+    result = lowering.predicate(tree)
+    policy = lowering.source(
+        result,
+        lower=lower,
+        upper=upper,
+        sum_denominator=not post_quant,
+        skip_minimum=bounded == 1,
+        continuous=continuous,
     )
-    source = source.replace(
-        " RegTensor<int8_t> seq;",
-        " RegTensor<int32_t> query;Arange(query,int32_t(0));Adds(query,query,qbase,mf);\n RegTensor<int8_t> seq;",
-        1,
+
+    @tla.extern(
+        name="mx_affine_quantize_dispatch", source=_CPP_SHORT_BODY + policy + _CPP_AFFINE_DISPATCH
     )
-    for spaces in ("    ", "   "):
-        source = source.replace(
-            spaces
-            + "DataCopy<uint32_t>(v0,visibility+(row+0)*8);DataCopy<uint32_t>(v1,visibility+(row+1)*8);",
-            spaces
-            + f"v0={name}_mask(query,kbase+row,mf,qlen,klen);v1={name}_mask(query,kbase+row+1,mf,qlen,klen);",
-        )
-        source = source.replace(
-            spaces
-            + "DataCopy<uint32_t>(v2,visibility+(row+2)*8);DataCopy<uint32_t>(v3,visibility+(row+3)*8);",
-            spaces
-            + f"v2={name}_mask(query,kbase+row+2,mf,qlen,klen);v3={name}_mask(query,kbase+row+3,mf,qlen,klen);",
-        )
-    source = source.replace(
-        "for(uint16_t row=0;row<128;row+=4)",
-        "for(uint16_t row=RANGE?first:0;row<(RANGE?last:128);row+=4)",
-        1,
-    )
-    bounded = (1 if continuous_interval(tree) else 2) if not post_quant else 0
-    if bounded == 1:
-        source = source.replace("!ADAPTIVE && (MASKED || !mx_short_sum_denominator)", "false")
-    source = source.replace("mx_short", name)
-    source += f"""[aicore] __attribute__((always_inline)) int32_t {name}_visible(int32_t q,int32_t k,int32_t lower,int32_t upper) {{
- int32_t a=q-upper,b=q-lower+1,c=q+63-upper,d=q+64-lower;
- a=a<k?k:a;b=b>k+128?k+128:b;c=c<k?k:c;d=d>k+128?k+128:d;
- return b-a<d-c?b-a:d-c;
-}}
-"""
-    minimum = minimum.replace("mx_visible", name + "_visible")
-
-    def dispatch(full, cols):
-        return f"""
- if(single) {{
-  if(({minimum})>=32) {name}_quantize_vf<{full},true,false,true>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,0,{cols},nullptr,(__ubuf__ float*)offset,first,last,qbase,kbase,qlen,klen);
-  else {name}_quantize_vf<{full},true,true,true>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,0,{cols},nullptr,(__ubuf__ float*)offset,first,last,qbase,kbase,qlen,klen);
- }} else {name}_quantize_vf<{full},true,false,true>((__ubuf__ half*)s,(__ubuf__ uint8_t*)p,(__ubuf__ float*)m,(__ubuf__ float*)d,tile,{cols},nullptr,nullptr,first,last,qbase,kbase,qlen,klen);
-"""
-
-    # Tail bounds affect only the last KV tile. Full tiles retain the same
-    # fused callback regardless of whether the sequence has a remainder.
-    body = dispatch("true", "128")
-    if tail_end:
-        limit = "klen" if tail_end < 0 else str(tail_end)
-        body = (
-            f"if(kbase+128<={limit}) {{"
-            + body
-            + f"}} else {{ int32_t cols={limit}-kbase;"
-            + dispatch("false", "cols")
-            + "}"
-        )
-    source += f"""extern "C" [aicore] __attribute__((always_inline)) void {name}(uint64_t s,uint64_t p,uint64_t m,uint64_t d,int32_t tile,int32_t qbase,int32_t kbase,uint64_t offset,int32_t single,int32_t qlen,int32_t klen) {{
- int32_t first={first},last={last};first=first<0?0:(first>128?128:first);last=last<0?0:(last>128?128:last);first=(first/4)*4;last=((last+3)/4)*4;
- {body}
-}}
-"""
-
-    @tla.extern(name=name, source=source)
     def quantize(
         s: tla.Pointer[tla.Float16, tla.AddressSpace.ub],
         p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
@@ -1874,7 +2018,7 @@ def _mx_affine_quantizer(tree, post_quant=False, tail_end=0, limits=(0, 0)):
     ) -> None: ...
     def periodic(node):
         return node[0] == "periodic" or (
-            node[0] in ("and", "or") and any(periodic(t) for t in node[1:])
+            node[0] in ("and", "or") and any(periodic(child) for child in node[1:])
         )
 
     return quantize, bounded, _mx_mask_span(tree), periodic(tree)
@@ -2100,6 +2244,18 @@ def _mx_l1_cache(address, valid, tags, next_slot):
 
 
 @tla.jit
+def _mx_scalar_min(a, b):
+    a, b = tla.Int32(a), tla.Int32(b)
+    return a + (b - a) * tla.Int32(b < a)
+
+
+@tla.jit
+def _mx_scalar_max(a, b):
+    a, b = tla.Int32(a), tla.Int32(b)
+    return a + (b - a) * tla.Int32(b > a)
+
+
+@tla.jit
 def _mx_task_geometry(
     task,
     cu_q,
@@ -2117,6 +2273,8 @@ def _mx_task_geometry(
     varlen: tla.Constexpr,
     sequence_major: tla.Constexpr,
     dense: tla.Constexpr,
+    dense_mask: tla.Constexpr,
+    dense_bounds: tla.Constexpr,
     single: tla.Constexpr,
     packed_k: tla.Constexpr,
 ):
@@ -2144,10 +2302,47 @@ def _mx_task_geometry(
     maskrow = (b % mb * mh + h % mh) * blocks + qb
     partial = tla.Int32(0)
     count = (klen + 127) // 128
+    first_key_block = tla.Int32(0)
+    if tla.const_expr(dense and dense_mask):
+        # Dense masks evaluate callbacks on implicit tiles, without index lists.
+        if tla.const_expr(len(dense_bounds) > 0):
+            # q-k bounds cover the entire query tile. Round outward so every
+            # potentially visible key remains in the callback's traversal.
+            first_key = tla.Int32(0)
+            last_key = tla.Int32(klen)
+            query_end = _mx_scalar_min(qstart + 128, qlen)
+            for i in tla.range_constexpr(len(dense_bounds[0])):
+                c, ql, kl = dense_bounds[0][i]
+                lower = c + ql * qlen + kl * klen
+                last_key = _mx_scalar_min(last_key, query_end - lower)
+            for i in tla.range_constexpr(len(dense_bounds[1])):
+                c, ql, kl = dense_bounds[1][i]
+                upper = c + ql * qlen + kl * klen
+                first_key = _mx_scalar_max(first_key, qstart - upper)
+            first_key = _mx_scalar_min(first_key, klen)
+            last_key = _mx_scalar_max(last_key, 0)
+            first_key_block = first_key // 128
+            count = _mx_scalar_max(0, (last_key + 127) // 128 - first_key_block)
+        partial = count
     if tla.const_expr(not dense):
         partial = partial_count[maskrow]
         count = partial + full_count[maskrow]
-    return b, h, kh, qstart, qbase, kbase, qlen, klen, qoff, koff, maskrow, partial, count
+    return (
+        b,
+        h,
+        kh,
+        qstart,
+        qbase,
+        kbase,
+        qlen,
+        klen,
+        qoff,
+        koff,
+        maskrow,
+        partial,
+        count,
+        first_key_block,
+    )
 
 
 @tla.jit
@@ -2359,6 +2554,8 @@ def _attention_mxfp8_pipeline(
     tiled_aux = compact_aux and aux_cache_meta[0][0] < 0
     aux_layouts = _mx_aux_layouts(aux_cache_meta, aux_scalars)
     global_aux = any(varlen) or _mx_mask_depends_on_query(mask_mod, aux_tensors, aux_scalars)
+    if tla.const_expr(len(features.key_aux_scope) > 0):
+        global_aux = features.key_aux_scope[0]
     score_stride = 8192 if tla.const_expr(exact) else 8192 if compact_aux else 16384
     inverse_ub_offset = 57344 if compact_aux else 153600
     mask_ub_offset = (
@@ -2761,6 +2958,12 @@ def _attention_mxfp8_pipeline(
                         )
         else:
             initialize_short_state(agg)
+        if tla.const_expr(exact and features.periodic_prefix):
+            # Every query tile starts at a multiple of 128. The first vector
+            # half never exposes keys 64..127; keep both P slots zero there.
+            if tla.arch.sub_block_idx() == 0:
+                mx_zero_ub(pp + 4096, 4096)
+                mx_zero_ub(pp + pp_stride + 4096, 4096)
         _mx_slot(None, (ppfree0, ppfree1, yfree0, yfree1), None, False)
         if tla.const_expr(post_quant):
             tla.cross_core_set_flag(padready, tla.arch.MTE3)
@@ -2823,7 +3026,6 @@ def _attention_mxfp8_pipeline(
     vs_stride = hk * 256 if tla.const_expr(sequence_major[1]) else 256
     q_major = (
         sequence_major[0]
-        and (not dense)
         and features.query_major
         and _mx_mask_depends_on_query(mask_mod, aux_tensors, aux_scalars)
     )
@@ -2850,6 +3052,7 @@ def _attention_mxfp8_pipeline(
     qbase, kbase, maskrow = (tla.Int32(0), tla.Int32(0), tla.Int32(0))
     pqbase, pkbase, vb, pmaskrow = (tla.Int32(0), tla.Int32(0), tla.Int32(0), tla.Int32(0))
     qpc, ppc, qcount, pcount = (tla.Int32(0), tla.Int32(0), tla.Int32(1), tla.Int32(1))
+    qfirst, pfirst = tla.Int32(0), tla.Int32(0)
     plsebase, ptask = tla.Int32(0), tla.Int32(0)
     rows, valid = (tla.Int32(128), tla.Int32(64))
     b, h, qstart = (tla.Int32(0), tla.Int32(0), tla.Int32(0))
@@ -2908,7 +3111,7 @@ def _attention_mxfp8_pipeline(
                     q_major,
                     total_q if tla.const_expr(single_sequence) else None,
                 )
-            b, h, kh, qstart, qbase, kbase, qlen, klen, qoff, koff, maskrow, qpc, qcount = (
+            b, h, kh, qstart, qbase, kbase, qlen, klen, qoff, koff, maskrow, qpc, qcount, qfirst = (
                 _mx_task_geometry(
                     task,
                     cu_q,
@@ -2926,6 +3129,8 @@ def _attention_mxfp8_pipeline(
                     varlen,
                     sequence_major,
                     dense,
+                    dense_mask,
+                    features.dense_bounds,
                     single_sequence,
                     total_k,
                 )
@@ -2981,6 +3186,7 @@ def _attention_mxfp8_pipeline(
                 pmaskrow,
                 ppc,
                 pcount,
+                pfirst,
             ) = _mx_task_geometry(
                 ptask,
                 cu_q,
@@ -2998,6 +3204,8 @@ def _attention_mxfp8_pipeline(
                 varlen,
                 sequence_major,
                 dense,
+                dense_mask,
+                features.dense_bounds,
                 single_sequence,
                 total_k,
             )
@@ -3074,7 +3282,7 @@ def _attention_mxfp8_pipeline(
         qcols, vcols = (tla.Int32(0), tla.Int32(0))
         qstart_k, vstart_k = (tla.Int32(0), tla.Int32(0))
         if qordinal < task_count and qtile < qcount:
-            qblock = qtile
+            qblock = qfirst + qtile
             if tla.const_expr(not dense):
                 qblock = (
                     partial_index[maskrow, qtile]
@@ -3084,7 +3292,7 @@ def _attention_mxfp8_pipeline(
             qstart_k = qblock * bn
             qcols = min(128, max(0, klen - qstart_k)) if tla.const_expr(ragged) else 128
         if pi >= 0 and ptile < pcount:
-            pblock = ptile
+            pblock = pfirst + ptile
             if tla.const_expr(not dense):
                 pblock = (
                     partial_index[pmaskrow, ptile]
@@ -3459,6 +3667,32 @@ def _attention_mxfp8_pipeline(
                         )
                     tla.set_flag(aux_ready)
                     tla.wait_flag(aux_ready)
+                elif tla.const_expr(len(features.key_aux) > 0):
+                    if qcols > 0:
+                        _mx_stage_aux(
+                            aux_tensors[0],
+                            full_cached_aux[0],
+                            aux_layouts[0],
+                            b,
+                            h,
+                            qstart,
+                            qstart_k,
+                            qstart_k,
+                            rows,
+                            qcols,
+                            qcols,
+                            qoff,
+                            koff,
+                            any(varlen),
+                            False,
+                            True,
+                            False,
+                            tiled_aux,
+                            global_aux,
+                        )
+                        if tla.const_expr(tiled_aux):
+                            tla.set_flag(aux_ready)
+                            tla.wait_flag(aux_ready)
                 elif tla.const_expr(mask_kind > 0 and inline_quantize is None):
                     if qcols > 0 and qtile < qpc and (qtile % 2 == 0):
                         mask0 = tla.make_tensor(
@@ -3471,7 +3705,10 @@ def _attention_mxfp8_pipeline(
                         )
                         cache_next_k = qstart_k
                         if qtile + 1 < qpc:
-                            cache_next_k = partial_index[maskrow, qtile + 1] * 128
+                            if tla.const_expr(dense):
+                                cache_next_k = qstart_k + 128
+                            else:
+                                cache_next_k = partial_index[maskrow, qtile + 1] * 128
                         cached_aux = ()
                         for aux_i in tla.range_constexpr(len(aux_tensors)):
                             if tla.const_expr(compact_aux):
@@ -3540,7 +3777,7 @@ def _attention_mxfp8_pipeline(
                                     )
                                 single_mask_visible = uniform_code >> 1 & 255
                         elif qtile + 1 < qpc:
-                            next_k = partial_index[maskrow, qtile + 1] * 128
+                            next_k = cache_next_k
                             if tla.const_expr(mask_kind == 2):
                                 if rows == 128 and qcols == 128 and (next_k + 128 <= klen):
                                     _mx_cache_packed_pair(
@@ -3674,7 +3911,50 @@ def _attention_mxfp8_pipeline(
                 _mx_slot(step % 2, (sr, sr_second), tla.arch.VECTOR, True)
                 _mx_slot(step % 2, (ppfree0, ppfree1), None, True)
                 if tla.const_expr(exact):
-                    if tla.const_expr(generic):
+                    if tla.const_expr(features.periodic_prefix):
+                        if qtile < qpc and qcols > 0:
+                            _mx_exact_periodic_prefix(
+                                sp + step % 2 * score_stride,
+                                pp + step % 2 * pp_stride,
+                                psp + step % 2 * 256,
+                                qmp,
+                                qlp,
+                                np + step % ring * half,
+                                badp + qordinal % ring * half,
+                                scale,
+                                max(0, min(64, qlen - qstart - sub * 64)),
+                                qcols,
+                                tla.Int32(qtile == 0),
+                                (qstart + sub * 64) % 128,
+                            )
+                        else:
+                            _mx_exact_probabilities_generic(
+                                sp + step % 2 * score_stride,
+                                pp + step % 2 * pp_stride,
+                                psp + step % 2 * 256,
+                                qmp,
+                                qlp,
+                                np + step % ring * half,
+                                badp + qordinal % ring * half,
+                                exact_inv,
+                                exact_safe,
+                                exact_gmax,
+                                scale,
+                                qcols,
+                                False,
+                                qtile == 0,
+                                mask_mod,
+                                b,
+                                h,
+                                qstart,
+                                sub,
+                                qstart_k,
+                                cached_aux,
+                                aux_scalars,
+                                (qlen, klen, qoff, koff),
+                                False,
+                            )
+                    elif tla.const_expr(generic):
                         _mx_callback_probabilities(
                             sp + step % 2 * score_stride,
                             pp + step % 2 * pp_stride,
@@ -3772,7 +4052,26 @@ def _attention_mxfp8_pipeline(
                                 qlp, tla.make_layout(tla.make_shape(64), tla.make_stride(1))
                             ).store(tla.full(0.0, tla.Float32))
                     if qcols > 0:
-                        if qcount == 1:
+                        if tla.const_expr(len(features.key_aux) > 0):
+                            key_ptr = (
+                                full_cached_aux[0][1].ptr
+                                if tla.const_expr(tiled_aux)
+                                else full_cached_aux[0].ptr + qstart_k
+                            )
+                            _mx_quantize_key_aux(
+                                sp + step % 2 * score_stride,
+                                pp + step % 2 * pp_stride,
+                                qmp,
+                                qlp,
+                                qtile,
+                                qcols,
+                                tla.recast_ptr(key_ptr, dtype=tla.Int32),
+                                np + qordinal % ring * half,
+                                tla.Int32(qcount == 1),
+                                qstart_k,
+                                klen,
+                            )
+                        elif qcount == 1:
                             if tla.const_expr(inline_quantize is not None):
                                 if qtile < qpc:
                                     _mx_quantize_masked_inline(
@@ -4341,14 +4640,80 @@ void flex_exact_label_quant(uint64_t s,uint64_t p,uint64_t ps,uint64_t m,uint64_
 )
 
 
-def _mx_label_source(interval=False):
-    if not interval:
-        return _MX_LABEL_SOURCE
-    source = (
-        _MX_LABEL_SOURCE[: _MX_LABEL_SOURCE.index("template<bool WIDE,bool FULL>")]
-        + r"""template<bool FULL>
+# Interval tiles skip inactive groups and retain the fixed half-tile specializations.
+_MX_LABEL_INTERVAL_SOURCE = r"""#include <cstdint>
+#include "kernel_operator.h"
+using namespace AscendC;using namespace AscendC::Reg;
+#ifndef FLEX_MX_SCALE_DEFINED
+#define FLEX_MX_SCALE_DEFINED
+constexpr CastTrait mx_scale_cast={RegLayout::ZERO,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+__simd_callee__ inline void mx_group_scale(RegTensor<float>& maximum,RegTensor<float>& sm,RegTensor<float>& inv,RegTensor<int32_t>& encoded) {
+ MaskReg mf=CreateMask<float,MaskPattern::ALL>(),condition;
+ RegTensor<float> p,zero;Duplicate(zero,0.f);
+ FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(p,maximum,sm,mf);
+ Compares<float,CMPMODE::LT>(condition,p,__builtin_inff(),mf);Select(p,p,zero,condition);
+ RegTensor<int32_t> power,mantissa,one,none,increment,mask,invbits;
+ Duplicate(one,int32_t(1));Duplicate(none,int32_t(0));Duplicate(mask,int32_t(0x7fffff));
+ ShiftRights(power,reinterpret_cast<RegTensor<int32_t>&>(p),int16_t(23),mf);Adds(power,power,int32_t(-135),mf);
+ And(mantissa,reinterpret_cast<RegTensor<int32_t>&>(p),mask,mf);
+ Compares<int32_t,CMPMODE::GT>(condition,mantissa,int32_t(0x600000),mf);Select(increment,one,none,condition);Add(power,power,increment,mf);
+ Maxs(power,power,int32_t(-127),mf);Mins(power,power,int32_t(127),mf);
+ Compares<float,CMPMODE::EQ>(condition,p,0.f,mf);Select(power,none,power,condition);
+ Duplicate(invbits,int32_t(127));Sub(invbits,invbits,power,mf);ShiftLefts(invbits,invbits,int16_t(23),mf);inv=reinterpret_cast<RegTensor<float>&>(invbits);
+ Adds(encoded,power,int32_t(127),mf);
+}
+__simd_callee__ inline void mx_scale_pair(__ubuf__ uint8_t* dst,RegTensor<int32_t>& lo,RegTensor<int32_t>& hi) {
+ MaskReg mf=CreateMask<float,MaskPattern::ALL>();uint32_t count=64;MaskReg mh=UpdateMask<int16_t>(count);
+ RegTensor<int32_t> joined;RegTensor<int16_t> words,packed,unused;
+ ShiftLefts(joined,hi,int16_t(8),mf);Or(joined,joined,lo,mf);
+ Cast<int16_t,int32_t,mx_scale_cast>(words,joined,mf);DeInterleave(packed,unused,words,words);
+ StoreAlign<int16_t,DataCopyMode::DATA_BLOCK_COPY>((__ubuf__ int16_t*)dst,packed,2,mh);
+}
+#endif
+constexpr CastTrait ri_r0={RegLayout::ZERO,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+constexpr CastTrait ri_r1={RegLayout::ONE,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+constexpr CastTrait ri_r2={RegLayout::TWO,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+constexpr CastTrait ri_r3={RegLayout::THREE,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+template<bool FULL,bool MASKED=true>
+__simd_callee__ inline void prefix_range_max8(RegTensor<float>& result,__ubuf__ float* src,
+ MaskReg& valid,int32_t start,int32_t first_key,int32_t last_key,float scale,int32_t prefix_base) {
+ MaskReg mf=CreateMask<float,MaskPattern::ALL>(),visible;
+ RegTensor<int32_t> query;
+ if constexpr(MASKED) {Arange(query,int32_t(0));Adds(query,query,prefix_base,mf);}
+ RegTensor<float> m0,m1,m2,m3,m4,m5,m6,m7,negative;
+ Duplicate(negative,-__builtin_inff());m0=negative;m1=negative;m2=negative;m3=negative;m4=negative;m5=negative;m6=negative;m7=negative;
+ uint16_t begin=first_key<=start?0:first_key>=start+32?32:((first_key-start)/8)*8;
+ uint16_t end=last_key<=start?0:last_key>=start+32?32:((last_key-start+7)/8)*8;
+ for(uint16_t j=begin;j<end;j+=8) {
+  RegTensor<float> x0,x1,x2,x3,x4,x5,x6,x7;
+#define LOAD_X(I) LoadAlign(x##I,src+(start+j+I)*64);
+  LOAD_X(0) LOAD_X(1) LOAD_X(2) LOAD_X(3) LOAD_X(4) LOAD_X(5) LOAD_X(6) LOAD_X(7)
+#undef LOAD_X
+#define SCALE_X(I) Muls(x##I,x##I,scale,mf);
+  SCALE_X(0) SCALE_X(1) SCALE_X(2) SCALE_X(3) SCALE_X(4) SCALE_X(5) SCALE_X(6) SCALE_X(7)
+#undef SCALE_X
+#define SELECT_X(I) \
+  if constexpr(MASKED) {Compares<int32_t,CMPMODE::GE>(visible,query,int32_t(start+j+I),mf); \
+   if constexpr(!FULL) And(visible,visible,valid,mf); \
+   Select(x##I,x##I,negative,visible);} \
+  else if constexpr(!FULL) Select(x##I,x##I,negative,valid); \
+  if constexpr(!FULL) {if(start+j+I<first_key || start+j+I>=last_key) x##I=negative;}
+  SELECT_X(0) SELECT_X(1) SELECT_X(2) SELECT_X(3) SELECT_X(4) SELECT_X(5) SELECT_X(6) SELECT_X(7)
+#undef SELECT_X
+#define STORE_X(I) StoreAlign(src+(start+j+I)*64,x##I,mf);
+  STORE_X(0) STORE_X(1) STORE_X(2) STORE_X(3) STORE_X(4) STORE_X(5) STORE_X(6) STORE_X(7)
+#undef STORE_X
+#define MAX_X(I) Max(m##I,m##I,x##I,mf);
+  MAX_X(0) MAX_X(1) MAX_X(2) MAX_X(3) MAX_X(4) MAX_X(5) MAX_X(6) MAX_X(7)
+#undef MAX_X
+ }
+ Max(m0,m0,m1,mf);Max(m2,m2,m3,mf);Max(m4,m4,m5,mf);Max(m6,m6,m7,mf);
+ Max(m0,m0,m2,mf);Max(m4,m4,m6,mf);Max(result,m0,m4,mf);
+}
+template<bool FULL,bool PREFIX=false,bool ALL_VISIBLE=false>
 __simd_callee__ inline void range_max(RegTensor<float>& result,__ubuf__ float* src,
- MaskReg& valid,int32_t start,int32_t first_key,int32_t last_key,float scale) {
+ MaskReg& valid,int32_t start,int32_t first_key,int32_t last_key,float scale,int32_t prefix_base=0) {
+ if constexpr(PREFIX) {prefix_range_max8<FULL,!ALL_VISIBLE>(result,src,valid,start,first_key,last_key,scale,prefix_base);return;}
  MaskReg mf=CreateMask<float,MaskPattern::ALL>();
  RegTensor<float> m0,m1,m2,m3,negative,x;
  Duplicate(negative,-__builtin_inff());m0=negative;m1=negative;m2=negative;m3=negative;
@@ -4365,54 +4730,73 @@ __simd_callee__ inline void range_max(RegTensor<float>& result,__ubuf__ float* s
  }
  Max(m0,m0,m1,mf);Max(m2,m2,m3,mf);Max(result,m0,m2,mf);
 }
-"""
-        + _MX_LABEL_SOURCE[_MX_LABEL_SOURCE.index("__simd_callee__ inline void group_pack") :]
-    )
-    source = source.replace("group_pack", "range_pack")
-    source = (
-        source.replace("r0", "ri_r0")
-        .replace("r1", "ri_r1")
-        .replace("r2", "ri_r2")
-        .replace("r3", "ri_r3")
-    )
-    source = source.replace(
-        "sum3,int32_t start)", "sum3,int32_t start,int32_t first_key,int32_t last_key)"
-    )
-    source = source.replace(
-        " #pragma unroll 4\n for(uint16_t j=0;j<32;j+=4)",
-        r""" uint16_t begin=first_key<=start?0:first_key>=start+32?32:((first_key-start)/4)*4;
+__simd_callee__ inline void range_pack(__ubuf__ float* src,__ubuf__ uint8_t* dst,
+ RegTensor<float>& maximum,RegTensor<float>& sm,RegTensor<uint8_t>& index,
+ RegTensor<int32_t>& encoded,RegTensor<float>& sum0,RegTensor<float>& sum1,
+ RegTensor<float>& sum2,RegTensor<float>& sum3,int32_t start,int32_t first_key,int32_t last_key) {
+ MaskReg mf=CreateMask<float,MaskPattern::ALL>(),mb=CreateMask<uint8_t,MaskPattern::ALL>(),condition;
+ RegTensor<float> inv;
+ mx_group_scale(maximum,sm,inv,encoded);
+ uint16_t begin=first_key<=start?0:first_key>=start+32?32:((first_key-start)/4)*4;
  uint16_t end=last_key<=start?0:last_key>=start+32?32:((last_key-start+3)/4)*4;
- for(uint16_t j=begin;j<end;j+=4)""",
-    )
-    source = source.replace(
-        "template<bool WIDE,bool FULL>\n__simd_vf__ inline void label_quant",
-        "template<bool WIDE,bool FULL,int BEGIN=-1,int END=-1>\n__simd_vf__ inline void range_quant",
-    )
-    source = source.replace(
-        "int32_t first) {",
-        "int32_t first,int32_t first_key,int32_t last_key) {\n if constexpr(BEGIN>=0) { first_key=BEGIN;last_key=END; }",
-    )
-    source = (
-        source[: source.index(" RegTensor<uint32_t> qlo,qhi;")]
-        + source[source.index(" RegTensor<int32_t> qi;") :]
-    )
-    for group in range(4):
-        source = source.replace(
-            f"label_max<WIDE,FULL>(g{group},src,k,qlo,qhi,valid,{group * 32},cols,scale)",
-            f"range_max<FULL>(g{group},src,valid,{group * 32},first_key,last_key,scale)",
-        )
-        source = source.replace(f"sum3,{group * 32});", f"sum3,{group * 32},first_key,last_key);")
-    source = source.replace(
-        " RegTensor<int32_t> e0,e1,e2,e3;\n",
-        r""" RegTensor<int32_t> e0,e1,e2,e3;
+ for(uint16_t j=begin;j<end;j+=4) {
+  RegTensor<float> x0,x1,x2,x3;
+  RegTensor<fp8_e4m3fn_t> p0,p1,p2,p3;
+  RegTensor<uint8_t> packed;
+#define EXACT_P(LANE, SUM, PACK, TRAIT) \
+  LoadAlign(x##LANE,src+(start+j+LANE)*64); \
+  FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x##LANE,x##LANE,sm,mf); \
+  Add(SUM,SUM,x##LANE,mf);Mul(x##LANE,x##LANE,inv,mf); \
+  Cast<fp8_e4m3fn_t,float,TRAIT>(PACK,x##LANE,mf);
+  EXACT_P(0,sum0,p0,ri_r0) EXACT_P(1,sum1,p1,ri_r1) EXACT_P(2,sum2,p2,ri_r2) EXACT_P(3,sum3,p3,ri_r3)
+#undef EXACT_P
+  Or(packed,reinterpret_cast<RegTensor<uint8_t>&>(p0),reinterpret_cast<RegTensor<uint8_t>&>(p1),mb);
+  Or(packed,packed,reinterpret_cast<RegTensor<uint8_t>&>(p2),mb);Or(packed,packed,reinterpret_cast<RegTensor<uint8_t>&>(p3),mb);
+  Gather(packed,packed,index);StoreAlign(dst+(start+j)*64,packed,mb);
+ }
+}
+template<bool WIDE,bool FULL,int BEGIN=-1,int END=-1,bool PREFIX=false,int QUERY_BASE=-1>
+__simd_vf__ inline void range_quant(__ubuf__ float* src,__ubuf__ uint8_t* dst,__ubuf__ uint8_t* scales,
+ __ubuf__ float* mp,__ubuf__ float* lp,__ubuf__ float* ap,__ubuf__ float* bp,
+ __ubuf__ uint32_t* q,__ubuf__ uint32_t* k,float scale,int32_t rows,int32_t cols,int32_t first,int32_t first_key,int32_t last_key,int32_t prefix_base=0) {
+ if constexpr(BEGIN>=0) { first_key=BEGIN;last_key=END; }
+ if constexpr(PREFIX && QUERY_BASE>=0) prefix_base=QUERY_BASE;
+ MaskReg mf=CreateMask<float,MaskPattern::ALL>(),mb=CreateMask<uint8_t,MaskPattern::ALL>(),valid,condition;
+ RegTensor<int32_t> qi;Arange(qi,int32_t(0));Compares<int32_t,CMPMODE::LT>(valid,qi,rows,mf);
+ RegTensor<float> g0,g1,g2,g3;
+ range_max<FULL,PREFIX,(PREFIX && QUERY_BASE>=32)>(g0,src,valid,0,first_key,last_key,scale,prefix_base);
+ range_max<FULL,PREFIX,(PREFIX && QUERY_BASE>=64)>(g1,src,valid,32,first_key,last_key,scale,prefix_base);
+ range_max<FULL,PREFIX,(PREFIX && QUERY_BASE>=96)>(g2,src,valid,64,first_key,last_key,scale,prefix_base);
+ range_max<FULL,PREFIX,(PREFIX && QUERY_BASE>=128)>(g3,src,valid,96,first_key,last_key,scale,prefix_base);
+ RegTensor<float> m,sm,alpha,oldm,oldl,bad,zero,one,tmp;
+ Duplicate(zero,0.f);Duplicate(one,1.f);
+ Max(m,g0,g1,mf);Max(tmp,g2,g3,mf);Max(m,m,tmp,mf);
+ if(first) {Duplicate(oldm,-__builtin_inff());oldl=zero;bad=zero;}else {LoadAlign(oldm,mp);LoadAlign(oldl,lp);LoadAlign(bad,bp);}
+ Max(m,m,oldm,mf);Compares<float,CMPMODE::EQ>(condition,m,-__builtin_inff(),mf);Select(sm,zero,m,condition);
+ FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(alpha,oldm,sm,mf);Compares<float,CMPMODE::GT>(condition,oldl,0.f,mf);Select(alpha,alpha,zero,condition);
+ StoreAlign(mp,m,mf);StoreAlign(ap,alpha,mf);
+ RegTensor<int8_t> seq;RegTensor<uint8_t> index,upper;Arange(seq,int8_t(0));
+ ShiftLefts(index,reinterpret_cast<RegTensor<uint8_t>&>(seq),int16_t(3),mb);ShiftRights(index,index,int16_t(1),mb);
+ ShiftLefts(upper,reinterpret_cast<RegTensor<uint8_t>&>(seq),int16_t(1),mb);ShiftRights(upper,upper,int16_t(6),mb);Add(index,index,upper,mb);
+ ShiftRights(upper,reinterpret_cast<RegTensor<uint8_t>&>(seq),int16_t(7),mb);ShiftLefts(upper,upper,int16_t(7),mb);Or(index,index,upper,mb);
+ RegTensor<float> sum0,sum1,sum2,sum3;sum0=zero;sum1=zero;sum2=zero;sum3=zero;
+ RegTensor<int32_t> e0,e1,e2,e3;
  RegTensor<uint8_t> zeros;Duplicate(zeros,uint8_t(0));
+ if constexpr(!(PREFIX && BEGIN==0 && END==64)) {
  for(uint16_t i=0;i<first_key/4;i++) StoreAlign(dst+i*256,zeros,mb);
  for(uint16_t i=(last_key+3)/4;i<32;i++) StoreAlign(dst+i*256,zeros,mb);
-""",
-    )
-    return (
-        source.split('extern "C"')[0]
-        + r"""extern "C" [aicore] __attribute__((always_inline))
+ }
+ LocalMemBar<MemType::VEC_STORE,MemType::VEC_LOAD>();
+ range_pack(src,dst,g0,sm,index,e0,sum0,sum1,sum2,sum3,0,first_key,last_key);
+ range_pack(src,dst,g1,sm,index,e1,sum0,sum1,sum2,sum3,32,first_key,last_key);mx_scale_pair(scales,e0,e1);
+ range_pack(src,dst,g2,sm,index,e2,sum0,sum1,sum2,sum3,64,first_key,last_key);
+ range_pack(src,dst,g3,sm,index,e3,sum0,sum1,sum2,sum3,96,first_key,last_key);mx_scale_pair(scales+32,e2,e3);
+ Add(sum0,sum0,sum1,mf);Add(sum2,sum2,sum3,mf);Add(sum0,sum0,sum2,mf);
+ Mul(oldl,oldl,alpha,mf);Add(oldl,oldl,sum0,mf);StoreAlign(lp,oldl,mf);
+ Compares<float,CMPMODE::LT>(condition,sum0,__builtin_inff(),mf);Select(bad,bad,one,condition);StoreAlign(bp,bad,mf);
+ LocalMemBar<MemType::VEC_STORE,MemType::VEC_LOAD>();
+}
+extern "C" [aicore] __attribute__((always_inline))
 void flex_exact_label_interval_quant(uint64_t s,uint64_t p,uint64_t ps,uint64_t m,uint64_t l,uint64_t a,uint64_t b,uint64_t q,uint64_t k,float scale,int32_t rows,int32_t cols,int32_t first,int32_t wide,int32_t full,int32_t first_key,int32_t last_key) {
 #define CALL(W,F) range_quant<W,F>((__ubuf__ float*)s,(__ubuf__ uint8_t*)p,(__ubuf__ uint8_t*)ps,(__ubuf__ float*)m,(__ubuf__ float*)l,(__ubuf__ float*)a,(__ubuf__ float*)b,(__ubuf__ uint32_t*)q,(__ubuf__ uint32_t*)k,scale,rows,cols,first,first_key,last_key)
 #define FIXED(L,R) range_quant<false,true,L,R>((__ubuf__ float*)s,(__ubuf__ uint8_t*)p,(__ubuf__ uint8_t*)ps,(__ubuf__ float*)m,(__ubuf__ float*)l,(__ubuf__ float*)a,(__ubuf__ float*)b,(__ubuf__ uint32_t*)q,(__ubuf__ uint32_t*)k,scale,rows,cols,first,first_key,last_key)
@@ -4423,11 +4807,36 @@ void flex_exact_label_interval_quant(uint64_t s,uint64_t p,uint64_t ps,uint64_t 
 #undef FIXED
 #undef CALL
 }
+extern "C" [aicore] __attribute__((always_inline))
+void mx_exact_periodic_prefix(uint64_t s,uint64_t p,uint64_t ps,uint64_t m,uint64_t l,uint64_t a,uint64_t b,float scale,int32_t rows,int32_t cols,int32_t first,int32_t prefix_base) {
+ int32_t last=prefix_base+rows;last=last<cols?last:cols;
+#define PREFIX(F,L,R,Q) range_quant<false,F,L,R,true,Q>((__ubuf__ float*)s,(__ubuf__ uint8_t*)p,(__ubuf__ uint8_t*)ps,(__ubuf__ float*)m,(__ubuf__ float*)l,(__ubuf__ float*)a,(__ubuf__ float*)b,nullptr,nullptr,scale,rows,cols,first,0,last,prefix_base)
+ if(rows==64 && prefix_base==0 && cols>=64) PREFIX(true,0,64,0);
+ else if(rows==64 && prefix_base==64 && cols==128) PREFIX(true,0,128,64);
+ else PREFIX(false,-1,-1,-1);
+#undef PREFIX
+}
 """
-    )
 
 
-@tla.extern(name="flex_exact_label_quant", source=_mx_label_source())
+@tla.extern(name="mx_exact_periodic_prefix", source=_MX_LABEL_INTERVAL_SOURCE)
+def _mx_exact_periodic_prefix(
+    s: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
+    ps: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
+    m: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    l: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    a: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    bad: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
+    scale: tla.Float32,
+    rows: tla.Int32,
+    cols: tla.Int32,
+    first: tla.Int32,
+    prefix_base: tla.Int32,
+) -> None: ...
+
+
+@tla.extern(name="flex_exact_label_quant", source=_MX_LABEL_SOURCE)
 def _mx_exact_label_quant(
     s: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
     p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
@@ -4447,9 +4856,135 @@ def _mx_exact_label_quant(
 ) -> None: ...
 
 
-_MX_EXACT_EXP_PACK_SOURCE = _EXP_PACK_SOURCE.replace(
-    "flex_mx_exp_pack_update", "flex_mx_exact_exp_pack_update"
-).replace("flex_exp_pack_update", "flex_exact_exp_pack_update")
+_MX_EXACT_EXP_PACK_SOURCE = r"""#include <cstdint>
+#include "kernel_operator.h"
+using namespace AscendC;using namespace AscendC::Reg;
+constexpr CastTrait rne0 = {RegLayout::ZERO, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne1 = {RegLayout::ONE, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne2 = {RegLayout::TWO, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne3 = {RegLayout::THREE, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+__simd_vf__ inline void flex_exact_exp_pack_update(__ubuf__ float* src, __ubuf__ uint8_t* dst,
+                                __ubuf__ float* inverses, __ubuf__ float* safemstate,
+                                __ubuf__ float* lstate, __ubuf__ float* astate, __ubuf__ float* badstate, float scale) {
+  MaskReg mf = CreateMask<float, MaskPattern::ALL>();
+  MaskReg mb = CreateMask<uint8_t, MaskPattern::ALL>();
+  RegTensor<int8_t> seq;
+  RegTensor<uint8_t> loidx, hiidx, upper;
+  Arange(seq, int8_t(0));
+  ShiftLefts(loidx, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(3), mb);
+  ShiftRights(loidx, loidx, int16_t(1), mb);
+  ShiftLefts(upper, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(1), mb);
+  ShiftRights(upper, upper, int16_t(6), mb);
+  Add(loidx, loidx, upper, mb);
+  ShiftRights(upper, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(7), mb);
+  ShiftLefts(upper, upper, int16_t(7), mb);
+  Or(loidx, loidx, upper, mb);
+  RegTensor<float> sm, inv, sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
+  LoadAlign(sm, safemstate);
+  Duplicate(sum0, 0.0f, mf); Duplicate(sum1, 0.0f, mf);
+  Duplicate(sum2, 0.0f, mf); Duplicate(sum3, 0.0f, mf);
+  Duplicate(sum4, 0.0f, mf); Duplicate(sum5, 0.0f, mf);
+  Duplicate(sum6, 0.0f, mf); Duplicate(sum7, 0.0f, mf);
+  for (uint16_t row = 0; row < 128; row += 8) {
+    LoadAlign(inv, inverses + (row / 32) * 64);
+    {
+      RegTensor<float> x0, x1, x2, x3;
+      RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
+      RegTensor<uint8_t> packed, lo;
+      LoadAlign(x0, src + (row + 0) * 64);
+      Muls(x0, x0, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x0,x0,sm,mf);
+      Add(sum0, sum0, x0, mf);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 1) * 64);
+      Muls(x1, x1, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x1,x1,sm,mf);
+      Add(sum1, sum1, x1, mf);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 2) * 64);
+      Muls(x2, x2, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x2,x2,sm,mf);
+      Add(sum2, sum2, x2, mf);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 3) * 64);
+      Muls(x3, x3, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x3,x3,sm,mf);
+      Add(sum3, sum3, x3, mf);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
+      Gather(lo, packed, loidx);
+      StoreAlign(dst + (row + 0) * 64, lo, mb);
+    }
+    {
+      RegTensor<float> x0, x1, x2, x3;
+      RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
+      RegTensor<uint8_t> packed, lo;
+      LoadAlign(x0, src + (row + 4) * 64);
+      Muls(x0, x0, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x0,x0,sm,mf);
+      Add(sum4, sum4, x0, mf);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 5) * 64);
+      Muls(x1, x1, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x1,x1,sm,mf);
+      Add(sum5, sum5, x1, mf);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 6) * 64);
+      Muls(x2, x2, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x2,x2,sm,mf);
+      Add(sum6, sum6, x2, mf);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 7) * 64);
+      Muls(x3, x3, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x3,x3,sm,mf);
+      Add(sum7, sum7, x3, mf);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
+      Gather(lo, packed, loidx);
+      StoreAlign(dst + (row + 4) * 64, lo, mb);
+    }
+  }
+  Add(sum0, sum0, sum1, mf); Add(sum2, sum2, sum3, mf);
+  Add(sum4, sum4, sum5, mf); Add(sum6, sum6, sum7, mf);
+  Add(sum0, sum0, sum2, mf); Add(sum4, sum4, sum6, mf);
+  Add(sum0, sum0, sum4, mf);
+  RegTensor<float> oldl, alpha, bad, one;
+  LoadAlign(oldl, lstate); LoadAlign(alpha, astate); LoadAlign(bad, badstate);
+  Mul(oldl, oldl, alpha, mf); Add(oldl, oldl, sum0, mf);
+  StoreAlign(lstate, oldl, mf);
+  Duplicate(one, 1.0f, mf);
+  MaskReg finite;
+  Compares<float, CMPMODE::LT>(finite, sum0, __builtin_inff(), mf);
+  Select(bad, bad, one, finite); StoreAlign(badstate, bad, mf);
+  LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+}
+extern "C" [aicore] __attribute__((always_inline))
+void flex_mx_exact_exp_pack_update(uint64_t src, uint64_t dst, uint64_t inverses,
+                      uint64_t safemstate, uint64_t lstate, uint64_t astate, uint64_t badstate, float scale) {
+  flex_exact_exp_pack_update(reinterpret_cast<__ubuf__ float*>(src),
+                reinterpret_cast<__ubuf__ uint8_t*>(dst),
+                reinterpret_cast<__ubuf__ float*>(inverses),
+                reinterpret_cast<__ubuf__ float*>(safemstate),
+                reinterpret_cast<__ubuf__ float*>(lstate), reinterpret_cast<__ubuf__ float*>(astate),
+                reinterpret_cast<__ubuf__ float*>(badstate), scale);
+}
+"""
 
 
 @tla.extern(name="flex_mx_exact_exp_pack_update", source=_MX_EXACT_EXP_PACK_SOURCE)
@@ -4611,18 +5146,135 @@ def _mx_query_window_bounds(radius, scratch, qstart, kstart, rows, cols, checked
     return ((lower // tla.Int64(8)) * tla.Int64(8)).to(tla.Int32), ((upper + 7) // 8) * 8, maximum
 
 
-_MX_EXACT_RANGE_SOURCE = _MX_EXACT_EXP_PACK_SOURCE.replace(
-    "flex_mx_exact_exp_pack_update", "flex_mx_exact_exp_pack_range"
-).replace("flex_exact_exp_pack_update", "flex_exact_exp_pack_range")
-_MX_EXACT_RANGE_SOURCE = _MX_EXACT_RANGE_SOURCE.replace(
-    "float scale) {", "float scale,int32_t first_key,int32_t last_key) {"
-)
-_MX_EXACT_RANGE_SOURCE = _MX_EXACT_RANGE_SOURCE.replace(
-    "row = 0; row < 128; row += 8", "row = first_key; row < last_key; row += 8"
-)
-_MX_EXACT_RANGE_SOURCE = _MX_EXACT_RANGE_SOURCE.replace(
-    "badstate), scale);", "badstate), scale, first_key, last_key);"
-)
+_MX_EXACT_RANGE_SOURCE = r"""#include <cstdint>
+#include "kernel_operator.h"
+using namespace AscendC;using namespace AscendC::Reg;
+constexpr CastTrait rne0 = {RegLayout::ZERO, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne1 = {RegLayout::ONE, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne2 = {RegLayout::TWO, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+constexpr CastTrait rne3 = {RegLayout::THREE, SatMode::NO_SAT,
+  MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+__simd_vf__ inline void flex_exact_exp_pack_range(__ubuf__ float* src, __ubuf__ uint8_t* dst,
+                                __ubuf__ float* inverses, __ubuf__ float* safemstate,
+                                __ubuf__ float* lstate, __ubuf__ float* astate, __ubuf__ float* badstate, float scale,int32_t first_key,int32_t last_key) {
+  MaskReg mf = CreateMask<float, MaskPattern::ALL>();
+  MaskReg mb = CreateMask<uint8_t, MaskPattern::ALL>();
+  RegTensor<int8_t> seq;
+  RegTensor<uint8_t> loidx, hiidx, upper;
+  Arange(seq, int8_t(0));
+  ShiftLefts(loidx, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(3), mb);
+  ShiftRights(loidx, loidx, int16_t(1), mb);
+  ShiftLefts(upper, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(1), mb);
+  ShiftRights(upper, upper, int16_t(6), mb);
+  Add(loidx, loidx, upper, mb);
+  ShiftRights(upper, reinterpret_cast<RegTensor<uint8_t>&>(seq), int16_t(7), mb);
+  ShiftLefts(upper, upper, int16_t(7), mb);
+  Or(loidx, loidx, upper, mb);
+  RegTensor<float> sm, inv, sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
+  LoadAlign(sm, safemstate);
+  Duplicate(sum0, 0.0f, mf); Duplicate(sum1, 0.0f, mf);
+  Duplicate(sum2, 0.0f, mf); Duplicate(sum3, 0.0f, mf);
+  Duplicate(sum4, 0.0f, mf); Duplicate(sum5, 0.0f, mf);
+  Duplicate(sum6, 0.0f, mf); Duplicate(sum7, 0.0f, mf);
+  for (uint16_t row = first_key; row < last_key; row += 8) {
+    LoadAlign(inv, inverses + (row / 32) * 64);
+    {
+      RegTensor<float> x0, x1, x2, x3;
+      RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
+      RegTensor<uint8_t> packed, lo;
+      LoadAlign(x0, src + (row + 0) * 64);
+      Muls(x0, x0, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x0,x0,sm,mf);
+      Add(sum0, sum0, x0, mf);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 1) * 64);
+      Muls(x1, x1, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x1,x1,sm,mf);
+      Add(sum1, sum1, x1, mf);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 2) * 64);
+      Muls(x2, x2, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x2,x2,sm,mf);
+      Add(sum2, sum2, x2, mf);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 3) * 64);
+      Muls(x3, x3, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x3,x3,sm,mf);
+      Add(sum3, sum3, x3, mf);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
+      Gather(lo, packed, loidx);
+      StoreAlign(dst + (row + 0) * 64, lo, mb);
+    }
+    {
+      RegTensor<float> x0, x1, x2, x3;
+      RegTensor<fp8_e4m3fn_t> p0, p1, p2, p3;
+      RegTensor<uint8_t> packed, lo;
+      LoadAlign(x0, src + (row + 4) * 64);
+      Muls(x0, x0, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x0,x0,sm,mf);
+      Add(sum4, sum4, x0, mf);
+      Mul(x0, x0, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne0>(p0, x0, mf);
+      LoadAlign(x1, src + (row + 5) * 64);
+      Muls(x1, x1, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x1,x1,sm,mf);
+      Add(sum5, sum5, x1, mf);
+      Mul(x1, x1, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne1>(p1, x1, mf);
+      LoadAlign(x2, src + (row + 6) * 64);
+      Muls(x2, x2, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x2,x2,sm,mf);
+      Add(sum6, sum6, x2, mf);
+      Mul(x2, x2, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne2>(p2, x2, mf);
+      LoadAlign(x3, src + (row + 7) * 64);
+      Muls(x3, x3, scale, mf);
+      FusedExpSub<float,float,RegLayout::ZERO,MaskMergeMode::ZEROING>(x3,x3,sm,mf);
+      Add(sum7, sum7, x3, mf);
+      Mul(x3, x3, inv, mf);
+      Cast<fp8_e4m3fn_t, float, rne3>(p3, x3, mf);
+      Or(packed, reinterpret_cast<RegTensor<uint8_t>&>(p0), reinterpret_cast<RegTensor<uint8_t>&>(p1), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p2), mb);
+      Or(packed, packed, reinterpret_cast<RegTensor<uint8_t>&>(p3), mb);
+      Gather(lo, packed, loidx);
+      StoreAlign(dst + (row + 4) * 64, lo, mb);
+    }
+  }
+  Add(sum0, sum0, sum1, mf); Add(sum2, sum2, sum3, mf);
+  Add(sum4, sum4, sum5, mf); Add(sum6, sum6, sum7, mf);
+  Add(sum0, sum0, sum2, mf); Add(sum4, sum4, sum6, mf);
+  Add(sum0, sum0, sum4, mf);
+  RegTensor<float> oldl, alpha, bad, one;
+  LoadAlign(oldl, lstate); LoadAlign(alpha, astate); LoadAlign(bad, badstate);
+  Mul(oldl, oldl, alpha, mf); Add(oldl, oldl, sum0, mf);
+  StoreAlign(lstate, oldl, mf);
+  Duplicate(one, 1.0f, mf);
+  MaskReg finite;
+  Compares<float, CMPMODE::LT>(finite, sum0, __builtin_inff(), mf);
+  Select(bad, bad, one, finite); StoreAlign(badstate, bad, mf);
+  LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+}
+extern "C" [aicore] __attribute__((always_inline))
+void flex_mx_exact_exp_pack_range(uint64_t src, uint64_t dst, uint64_t inverses,
+                      uint64_t safemstate, uint64_t lstate, uint64_t astate, uint64_t badstate, float scale,int32_t first_key,int32_t last_key) {
+  flex_exact_exp_pack_range(reinterpret_cast<__ubuf__ float*>(src),
+                reinterpret_cast<__ubuf__ uint8_t*>(dst),
+                reinterpret_cast<__ubuf__ float*>(inverses),
+                reinterpret_cast<__ubuf__ float*>(safemstate),
+                reinterpret_cast<__ubuf__ float*>(lstate), reinterpret_cast<__ubuf__ float*>(astate),
+                reinterpret_cast<__ubuf__ float*>(badstate), scale, first_key, last_key);
+}
+"""
 
 
 @tla.extern(name="flex_mx_exact_exp_pack_range", source=_MX_EXACT_RANGE_SOURCE)
@@ -4843,7 +5495,7 @@ def _mx_common_label_bounds(inv, safe, rows, checked: tla.Constexpr):
     return scalar[0]
 
 
-@tla.extern(name="flex_exact_label_interval_quant", source=_mx_label_source(True))
+@tla.extern(name="flex_exact_label_interval_quant", source=_MX_LABEL_INTERVAL_SOURCE)
 def _mx_exact_label_interval_quant(
     s: tla.Pointer[tla.Float32, tla.AddressSpace.ub],
     p: tla.Pointer[tla.UInt8, tla.AddressSpace.ub],
@@ -5331,9 +5983,11 @@ def _mx_exact_accumulate(acc, pv, alpha, first):
             tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
 
 
-_MX_FINISH_SOURCE = (
-    _MX_CPP_HEADER
-    + r"""constexpr CastTrait mx_short_out0={RegLayout::ZERO,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
+# Keep loads, normalization, casts and stores in separate register batches.
+_MX_FINISH_SOURCE = r"""#include <cstdint>
+#include "kernel_operator.h"
+using namespace AscendC;using namespace AscendC::Reg;
+constexpr CastTrait mx_short_out0={RegLayout::ZERO,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
 constexpr CastTrait mx_short_out1={RegLayout::ONE,SatMode::NO_SAT,MaskMergeMode::ZEROING,RoundMode::CAST_RINT};
 template<bool FIRST>
 __simd_vf__ inline void mx_exact_finish_vf(__ubuf__ float* acc,__ubuf__ float* pv,
@@ -5358,9 +6012,86 @@ __simd_vf__ inline void mx_exact_finish_vf(__ubuf__ float* acc,__ubuf__ float* p
   for(uint16_t d=0;d<dim;d+=16) {
     RegTensor<float> r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15;
     RegTensor<OUT> low,high;
-@LOAD@
-@NORMALIZE@
-@CAST@
+    LoadAlign(r0,pv+(d+0)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+0)*64);Mul(previous,previous,alpha,af);Add(r0,previous,r0,af); }
+    LoadAlign(r1,pv+(d+1)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+1)*64);Mul(previous,previous,alpha,af);Add(r1,previous,r1,af); }
+    LoadAlign(r2,pv+(d+2)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+2)*64);Mul(previous,previous,alpha,af);Add(r2,previous,r2,af); }
+    LoadAlign(r3,pv+(d+3)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+3)*64);Mul(previous,previous,alpha,af);Add(r3,previous,r3,af); }
+    LoadAlign(r4,pv+(d+4)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+4)*64);Mul(previous,previous,alpha,af);Add(r4,previous,r4,af); }
+    LoadAlign(r5,pv+(d+5)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+5)*64);Mul(previous,previous,alpha,af);Add(r5,previous,r5,af); }
+    LoadAlign(r6,pv+(d+6)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+6)*64);Mul(previous,previous,alpha,af);Add(r6,previous,r6,af); }
+    LoadAlign(r7,pv+(d+7)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+7)*64);Mul(previous,previous,alpha,af);Add(r7,previous,r7,af); }
+    LoadAlign(r8,pv+(d+8)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+8)*64);Mul(previous,previous,alpha,af);Add(r8,previous,r8,af); }
+    LoadAlign(r9,pv+(d+9)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+9)*64);Mul(previous,previous,alpha,af);Add(r9,previous,r9,af); }
+    LoadAlign(r10,pv+(d+10)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+10)*64);Mul(previous,previous,alpha,af);Add(r10,previous,r10,af); }
+    LoadAlign(r11,pv+(d+11)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+11)*64);Mul(previous,previous,alpha,af);Add(r11,previous,r11,af); }
+    LoadAlign(r12,pv+(d+12)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+12)*64);Mul(previous,previous,alpha,af);Add(r12,previous,r12,af); }
+    LoadAlign(r13,pv+(d+13)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+13)*64);Mul(previous,previous,alpha,af);Add(r13,previous,r13,af); }
+    LoadAlign(r14,pv+(d+14)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+14)*64);Mul(previous,previous,alpha,af);Add(r14,previous,r14,af); }
+    LoadAlign(r15,pv+(d+15)*64);
+    if constexpr(!FIRST) { LoadAlign(previous,acc+(d+15)*64);Mul(previous,previous,alpha,af);Add(r15,previous,r15,af); }
+    Mul(r0,r0,inv,af);
+    Select(r0,r0,zero,active);
+    Mul(r1,r1,inv,af);
+    Select(r1,r1,zero,active);
+    Mul(r2,r2,inv,af);
+    Select(r2,r2,zero,active);
+    Mul(r3,r3,inv,af);
+    Select(r3,r3,zero,active);
+    Mul(r4,r4,inv,af);
+    Select(r4,r4,zero,active);
+    Mul(r5,r5,inv,af);
+    Select(r5,r5,zero,active);
+    Mul(r6,r6,inv,af);
+    Select(r6,r6,zero,active);
+    Mul(r7,r7,inv,af);
+    Select(r7,r7,zero,active);
+    Mul(r8,r8,inv,af);
+    Select(r8,r8,zero,active);
+    Mul(r9,r9,inv,af);
+    Select(r9,r9,zero,active);
+    Mul(r10,r10,inv,af);
+    Select(r10,r10,zero,active);
+    Mul(r11,r11,inv,af);
+    Select(r11,r11,zero,active);
+    Mul(r12,r12,inv,af);
+    Select(r12,r12,zero,active);
+    Mul(r13,r13,inv,af);
+    Select(r13,r13,zero,active);
+    Mul(r14,r14,inv,af);
+    Select(r14,r14,zero,active);
+    Mul(r15,r15,inv,af);
+    Select(r15,r15,zero,active);
+    Cast<OUT,float,mx_short_out0>(low,r0,af);Cast<OUT,float,mx_short_out1>(high,r1,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r0),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r2,af);Cast<OUT,float,mx_short_out1>(high,r3,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r1),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r4,af);Cast<OUT,float,mx_short_out1>(high,r5,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r2),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r6,af);Cast<OUT,float,mx_short_out1>(high,r7,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r3),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r8,af);Cast<OUT,float,mx_short_out1>(high,r9,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r4),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r10,af);Cast<OUT,float,mx_short_out1>(high,r11,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r5),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r12,af);Cast<OUT,float,mx_short_out1>(high,r13,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r6),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
+    Cast<OUT,float,mx_short_out0>(low,r14,af);Cast<OUT,float,mx_short_out1>(high,r15,af);
+    Or(reinterpret_cast<RegTensor<uint16_t>&>(r7),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
     Interleave(r0,r4,r0,r4);
     Interleave(r1,r5,r1,r5);
     Interleave(r2,r6,r2,r6);
@@ -5373,7 +6104,14 @@ __simd_vf__ inline void mx_exact_finish_vf(__ubuf__ float* acc,__ubuf__ float* p
     Interleave(r2,r3,r2,r3);
     Interleave(r4,r5,r4,r5);
     Interleave(r6,r7,r6,r7);
-@STORE@
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+0*8*(dim+16)/2,r0,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+1*8*(dim+16)/2,r1,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+2*8*(dim+16)/2,r2,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+3*8*(dim+16)/2,r3,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+4*8*(dim+16)/2,r4,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+5*8*(dim+16)/2,r5,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+6*8*(dim+16)/2,r6,(dim+16)/16,af);
+    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+7*8*(dim+16)/2,r7,(dim+16)/16,af);
   }
 }
 extern "C" [aicore] __attribute__((always_inline))
@@ -5382,42 +6120,6 @@ void flex_mx_exact_finish(uint64_t a,uint64_t pv,uint64_t alpha,uint64_t m,uint6
  else mx_exact_finish_vf<false>((__ubuf__ float*)a,(__ubuf__ float*)pv,(__ubuf__ float*)alpha,(__ubuf__ float*)m,(__ubuf__ float*)l,(__ubuf__ float*)b,(__ubuf__ bfloat16_t*)y,(__ubuf__ float*)e);
 }
 """
-)
-_MX_FINISH_SOURCE = _MX_FINISH_SOURCE.replace(
-    "@LOAD@\n",
-    _mx_cpp_lanes(
-        16,
-        r"""    LoadAlign(r{i},pv+(d+{i})*64);
-    if constexpr(!FIRST) {{ LoadAlign(previous,acc+(d+{i})*64);Mul(previous,previous,alpha,af);Add(r{i},previous,r{i},af); }}
-""",
-    ),
-)
-_MX_FINISH_SOURCE = _MX_FINISH_SOURCE.replace(
-    "@NORMALIZE@\n",
-    _mx_cpp_lanes(
-        16,
-        r"""    Mul(r{i},r{i},inv,af);
-    Select(r{i},r{i},zero,active);
-""",
-    ),
-)
-_MX_FINISH_SOURCE = _MX_FINISH_SOURCE.replace(
-    "@CAST@\n",
-    _mx_cpp_lanes(
-        8,
-        r"""    Cast<OUT,float,mx_short_out0>(low,r{lo},af);Cast<OUT,float,mx_short_out1>(high,r{hi},af);
-    Or(reinterpret_cast<RegTensor<uint16_t>&>(r{i}),reinterpret_cast<RegTensor<uint16_t>&>(low),reinterpret_cast<RegTensor<uint16_t>&>(high),ah);
-""",
-    ),
-)
-_MX_FINISH_SOURCE = _MX_FINISH_SOURCE.replace(
-    "@STORE@\n",
-    _mx_cpp_lanes(
-        8,
-        r"""    StoreAlign<float,DataCopyMode::DATA_BLOCK_COPY>(reinterpret_cast<__ubuf__ float*>(out)+d/2+{i}*8*(dim+16)/2,r{i},(dim+16)/16,af);
-""",
-    ),
-)
 
 
 @tla.extern(name="flex_mx_exact_finish", source=_MX_FINISH_SOURCE)

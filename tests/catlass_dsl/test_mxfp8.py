@@ -532,6 +532,7 @@ def make_launch(*, packed=False, code=127, boundaries=(0, 65, 128), length=128):
         (1024, None, False, ("continuous", 4)),
         (2048, None, False, ("continuous", 4)),
         (2049, None, False, ("continuous", 4)),
+        (1024, None, True, ("continuous", 4)),
         (1024, 1, False, ("continuous", 1)),
         (1025, 2, False, ("continuous", 2)),
         (2048, 16, False, ("continuous", 4)),
@@ -2298,6 +2299,8 @@ def mask_reference(b, h, q, k, info, aux, scalars):
 
 
 def _device_sparse(sparse, device):
+    if sparse is None:
+        return None
     return sparse._replace(
         **{
             name: value.to(device)
@@ -3250,6 +3253,8 @@ def partial_visibility(b, h, q, k, info, aux, scalars):
 
 
 def _cpu_sparse(sparse):
+    if sparse is None:
+        return None
     return sparse._replace(
         **{
             name: value.cpu()
@@ -3370,6 +3375,7 @@ def test_masked_pipeline_authoritative_lists(device, scale, key_length):
 
 
 @pytest.mark.npu
+@pytest.mark.parametrize("explicit_metadata", [False, True])
 @pytest.mark.parametrize(
     "kind,length",
     [
@@ -3380,7 +3386,7 @@ def test_masked_pipeline_authoritative_lists(device, scale, key_length):
         ("scalar", 1024),
     ],
 )
-def test_masked_pipeline_affine_and_generic_callbacks(device, kind, length):
+def test_masked_pipeline_affine_and_generic_callbacks(device, kind, length, explicit_metadata):
     """Fused bounds and unsupported expressions preserve the callback semantics."""
 
     @simt
@@ -3411,8 +3417,12 @@ def test_masked_pipeline_affine_and_generic_callbacks(device, kind, length):
 
     scalars = (193,) if kind == "scalar" else ()
     case = make_case(q_lengths=(length,), k_lengths=(length,), q_heads=2, kv_heads=1, seed=91)
-    sparse = compute_block_sparsity(
-        128, 128, 1, 2, length, length, mask, (), device, aux_scalars=scalars
+    sparse = (
+        compute_block_sparsity(
+            128, 128, 1, 2, length, length, mask, (), device, aux_scalars=scalars
+        )
+        if explicit_metadata
+        else None
     )
     _verify(case, device, mask, mask_ref, sparse, scalars=scalars)
 
@@ -3782,10 +3792,11 @@ def test_packed_sparse_order_and_remainder(device):
 
 
 @pytest.mark.npu
+@pytest.mark.parametrize("explicit_metadata", [False, True])
 @pytest.mark.parametrize(
     "kind", ["mini_causal", "block_diagonal", "dilated", "negative_floor", "negative_mod"]
 )
-def test_packed_periodic_masks(device, kind):
+def test_packed_periodic_masks(device, kind, explicit_metadata):
     @simt
     @tla.jit
     def mask(b, h, q, k, info, aux, scalars):
@@ -3824,7 +3835,7 @@ def test_packed_periodic_masks(device, kind):
         kv_heads=2,
         seed=282,
     )
-    sparse = _blocks(case, expected_mask, ())
+    sparse = _blocks(case, expected_mask, ()) if explicit_metadata else None
     expected, logs = reference(case, mask_mod=expected_mask, sparse=sparse)
     inputs, kwargs = to_device(case, device)
     output, lse = flash_attn_varlen_func(
@@ -3836,6 +3847,143 @@ def test_packed_periodic_masks(device, kind):
     )
     check(output, expected)
     check_quantized_lse(lse.cpu(), logs)
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        ("direct", True),
+        ("reversed", True),
+        ("strict", False),
+        ("shifted", False),
+        ("period64", False),
+        ("extra", False),
+        ("global", False),
+    ],
+)
+def test_periodic_prefix_proof_requires_exact_local_predicate(kind, expected):
+    from flash_attn_npu_4.catlass_dsl.kernels.flash_fwd_mxfp8_arch35 import _mx_is_periodic_prefix
+
+    @simt
+    @tla.jit
+    def mask(b, h, q, k, info, aux, scalars):
+        if tla.const_expr(kind == "direct"):
+            return q % 128 >= k % 128
+        elif tla.const_expr(kind == "reversed"):
+            return k % 128 <= q % 128
+        elif tla.const_expr(kind == "strict"):
+            return q % 128 > k % 128
+        elif tla.const_expr(kind == "shifted"):
+            return (q + 1) % 128 >= k % 128
+        elif tla.const_expr(kind == "period64"):
+            return q % 64 >= k % 64
+        elif tla.const_expr(kind == "extra"):
+            return (q % 128 >= k % 128) & (k < 128)
+        else:
+            return (q + info[2]) % 128 >= (k + info[3]) % 128
+
+    assert _mx_is_periodic_prefix(mask.simt, 0, packed=True) is expected
+
+
+@pytest.mark.npu
+@pytest.mark.usefixtures("poisoned_mxfp8_l1")
+@pytest.mark.parametrize("scene", ["BSND", "TND", "TND-ragged"])
+@pytest.mark.parametrize("scale", [None, 0.0, -0.125])
+def test_dense_periodic_prefix_exact_tails_and_scale(device, scene, scale):
+    @simt
+    @tla.jit
+    def mask(b, h, q, k, info, aux, scalars):
+        return q % 128 >= k % 128
+
+    def mask_ref(b, h, q, k, info, aux, scalars):
+        return q % 128 >= k % 128
+
+    packed = scene != "BSND"
+    q_lengths, k_lengths = (
+        ((129, 0, 65), (257, 0, 33)) if scene == "TND-ragged" else ((1025,), (1153,))
+    )
+    case = make_case(
+        q_lengths=q_lengths,
+        k_lengths=k_lengths,
+        q_packed=packed,
+        k_packed=packed,
+        q_heads=4,
+        kv_heads=2,
+        seed=701,
+    )
+    expected, logs = reference(case, mask_mod=mask_ref, scale=scale)
+    inputs, kwargs = to_device(case, device)
+    scales = {name: kwargs[name] for name in SCALE_NAMES}
+    options = (
+        {
+            name: kwargs[name]
+            for name in ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+        }
+        if packed
+        else {}
+    )
+    call = flash_attn_varlen_func if packed else flash_attn_func
+    previous = None
+    for _ in range(3):
+        output, lse = call(
+            *inputs,
+            **scales,
+            **options,
+            mask_mod=mask,
+            softmax_scale=scale,
+            block_sparse_tensors=None,
+            return_lse=True,
+        )
+        output = output.cpu()
+        check(output, expected)
+        check_quantized_lse(lse.cpu(), logs)
+        if previous is not None:
+            assert torch.equal(output, previous)
+        previous = output
+
+
+@pytest.mark.npu
+@pytest.mark.usefixtures("poisoned_mxfp8_l1")
+@pytest.mark.parametrize("nan_key", [0, 127])
+def test_dense_periodic_prefix_masks_nonfinite_score(device, nan_key):
+    @simt
+    @tla.jit
+    def mask(b, h, q, k, info, aux, scalars):
+        return q % 128 >= k % 128
+
+    def mask_ref(b, h, q, k, info, aux, scalars):
+        return q % 128 >= k % 128
+
+    case = make_case(
+        q_lengths=(1024,),
+        k_lengths=(1024,),
+        q_packed=True,
+        k_packed=True,
+        q_heads=4,
+        kv_heads=2,
+        seed=702,
+    )
+    case["qkv"][1].view(torch.uint8)[nan_key, 0].fill_(0x7F)
+    rows = [[0, 31, 63, 64, 95, 126, 127, 128, 255, 511, 1023]]
+    expected, logs = reference(case, mask_mod=mask_ref, query_rows=rows)
+    inputs, kwargs = to_device(case, device)
+    for _ in range(3):
+        output, lse = flash_attn_varlen_func(
+            *inputs,
+            **kwargs,
+            mask_mod=mask,
+            block_sparse_tensors=None,
+            return_lse=True,
+        )
+        actual_output, expected_output = output.cpu()[rows[0]], expected[rows[0]]
+        actual_lse, expected_lse = lse.cpu()[:, rows[0]], logs[:, rows[0]]
+        for actual, golden in ((actual_output, expected_output), (actual_lse, expected_lse)):
+            for classify in (torch.isnan, torch.isposinf, torch.isneginf):
+                assert torch.equal(classify(actual), classify(golden))
+        finite = torch.isfinite(expected_output)
+        check(actual_output[finite], expected_output[finite])
+        finite = torch.isfinite(expected_lse)
+        check_quantized_lse(actual_lse[finite], expected_lse[finite])
 
 
 @simt
@@ -3967,6 +4115,77 @@ def head_labels(b, h, q, k, info, aux, scalars):
 @tla.jit
 def global_key_filter(b, h, q, k, info, aux, scalars):
     return k >= aux[0][k + info[3]]
+
+
+@simt
+@tla.jit
+def local_key_filter(b, h, q, k, info, aux, scalars):
+    return k >= aux[0][k]
+
+
+def test_key_aux_trace_distinguishes_local_and_global_indices():
+    from flash_attn_npu_4.catlass_dsl.kernels.flash_fwd_mxfp8_arch35 import _mx_trace_key_aux
+
+    assert _mx_trace_key_aux(local_key_filter.simt) == (False,)
+    assert _mx_trace_key_aux(global_key_filter.simt) == (True,)
+    assert _mx_trace_key_aux(global_labels.simt) == ()
+    assert _mx_trace_key_aux(global_window.simt) == ()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("global_indices", [False, True])
+def test_dense_key_aux_cache_rebinds_local_global_and_empty(device, packed, global_indices):
+    qlens = (1025, 65) if packed else (1025,)
+    klens = (1153, 129) if packed else (1153,)
+    case = make_case(
+        q_lengths=qlens,
+        k_lengths=klens,
+        q_heads=4,
+        kv_heads=2,
+        q_packed=packed,
+        k_packed=packed,
+        seed=1201,
+    )
+    inputs, kwargs = to_device(case, device)
+    positions = torch.arange(sum(klens), dtype=torch.int32)
+    aux = (positions.to(device),)
+    native = global_key_filter if global_indices else local_key_filter
+
+    def mask_ref(b, h, q, k, info, aux, scalars):
+        return k >= aux[0][k + (info[3] if global_indices else 0)]
+
+    rows = [sorted({0, 31, 63, 64, 127, 128, n - 1} & set(range(n))) for n in qlens]
+    for mode in ("normal", "sparse", "empty"):
+        values = positions % 13
+        if mode == "sparse":
+            values = torch.where(positions % 17 == 0, -1, 2**30).int()
+        if mode == "empty":
+            values.fill_(2**30)
+        aux[0].copy_(values.to(device))
+        expected, logs = reference(case, mask_mod=mask_ref, aux=(values,), query_rows=rows)
+        actual, lse = flash_attn_varlen_func(
+            *inputs,
+            **kwargs,
+            mask_mod=native,
+            aux_tensors=aux,
+            block_sparse_tensors=None,
+            return_lse=True,
+        )
+        actual, lse = actual.cpu(), lse.cpu()
+        offset = 0
+        for b, selected in enumerate(rows):
+            if packed:
+                indices = torch.tensor(selected) + offset
+                try:
+                    check(actual[indices], expected[indices])
+                except AssertionError as error:
+                    raise AssertionError((mode, b, global_indices)) from error
+                check_quantized_lse(lse[:, indices], logs[:, indices])
+            else:
+                check(actual[b, selected], expected[b, selected])
+                check_quantized_lse(lse[b, :, selected], logs[b, :, selected])
+            offset += qlens[b]
 
 
 @pytest.mark.npu

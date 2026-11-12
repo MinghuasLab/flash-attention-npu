@@ -662,6 +662,10 @@ class _MXFP8Features(NamedTuple):
     query_major: bool
     bounded_inline: bool
     paired_heads: bool
+    dense_bounds: tuple = ()
+    key_aux: tuple = ()
+    key_aux_scope: tuple = ()
+    periodic_prefix: bool = False
 
 
 @dataclass(frozen=True)
@@ -739,10 +743,20 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     tla = _tla()
     program = config["score_mod"] or identity
     mask_program = config["mask_mod"] or all_visible
+    if (
+        config["block_sparse_tensors"] is None
+        and mask_program is not all_visible
+        and mask_program.simt is not None
+        and not config["aux_tensors"]
+        and not config["aux_scalars"]
+    ):
+        from .kernels.flash_fwd_mxfp8_arch35 import _mx_mask_is_all_visible
+
+        if _mx_mask_is_all_visible(mask_program.simt):
+            mask_program = all_visible
     mode = callback_mode(program, mask_program)
     if (
-        config["block_sparse_tensors"] is not None
-        and (
+        (
             config["cu_q"] is not None
             or config["cu_k"] is not None
             or (config["Sq"] >= 1024 and config["Sk"] >= 1024)
@@ -797,7 +811,6 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
         program is identity
         and mask_program.simt is not None
         and ((Sq >= 1024 and Sk >= 1024) or any(varlen))
-        and (not dense or mask_program is all_visible)
     )
     pipeline, group_size, guard_elements = "general", 16, 0
     if continuous:
@@ -867,6 +880,7 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
                 cache_bytes += storage
     post_quant = (
         continuous
+        and sparse is not None
         and not any(varlen)
         and mask_kind == 2
         and max(sparse.mask_block_idx.shape[-1], sparse.full_block_idx.shape[-1]) >= 8
@@ -882,6 +896,15 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
         )
         if traced is not None:
             inline_quantize, bounded_inline, mask_span, periodic_mask = traced
+    if (
+        dense
+        and continuous
+        and config["aux_scalars"]
+        and not config["aux_tensors"]
+        and inline_quantize is None
+    ):
+        # Opaque scalar-dependent callbacks retain the exact general path.
+        continuous, pipeline, group_size, guard_elements = False, "general", 16, 0
     wide_mask = inline_quantize is not None and mask_span is None
     if continuous and aux_cache_meta and mask_kind == 1:
         from .kernels.flash_fwd_mxfp8_arch35 import _mx_mask_depends_on_query
@@ -908,7 +931,7 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
         kv_bytes = sum(t.numel() * t.element_size() for t in (k, v, *config["mxfp8_scales"][1:]))
         pack_kv = (
             sequence_major[1]
-            and (dense or wide_mask)
+            and (wide_mask or (dense and mask_span is None))
             and _mxfp8_should_pack_kv(kv_bytes, reuse, l2_bytes)
         )
         if pack_kv:
@@ -933,7 +956,7 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     if (
         continuous
         and 0 < len(aux_cache_meta) <= 4
-        and (any(varlen) or all(t.ndim == 1 for t in config["aux_tensors"]))
+        and (dense or any(varlen) or all(t.ndim == 1 for t in config["aux_tensors"]))
     ):
         from .kernels.flash_fwd_mxfp8_arch35 import _mx_mask_depends_on_query, _mx_repair_aux
 
@@ -944,6 +967,10 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
     # keys in some rows. Avoid speculating on those rows and repairing them.
     if continuous and periodic_mask and mask_span is None and max(Sq, Sk) <= 2048:
         pipeline, guard_elements = "exact_aux", 0
+    if continuous and dense and pipeline == "exact_aux" and kv_bytes <= l2_bytes // 2:
+        query_major = True
+    from .kernels.flash_fwd_mxfp8_arch35 import _mx_is_periodic_prefix
+
     features = _MXFP8Features(
         single_sequence=B == 1 and any(varlen),
         q_heads=H,
@@ -953,7 +980,38 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
         query_major=query_major,
         bounded_inline=bounded_inline,
         paired_heads=paired_heads,
+        dense_bounds=(),
+        periodic_prefix=dense
+        and pipeline == "exact_aux"
+        and periodic_mask
+        and not config["aux_tensors"]
+        and not config["aux_scalars"]
+        and _mx_is_periodic_prefix(mask_program.simt, len(config["aux_scalars"]), any(varlen)),
     )
+    if (
+        continuous
+        and dense
+        and len(aux_cache_meta) == 1
+        and len(config["aux_tensors"]) == 1
+        and config["aux_tensors"][0].ndim == 1
+        and config["aux_tensors"][0].dtype == torch.int32
+        and not config["aux_scalars"]
+    ):
+        from .kernels.flash_fwd_mxfp8_arch35 import _mx_trace_key_aux
+
+        key_aux_scope = _mx_trace_key_aux(mask_program.simt)
+        # Multi-sequence launches retain the established mask-cache quantizer.
+        features = features._replace(
+            key_aux_scope=key_aux_scope, key_aux=key_aux_scope if B == 1 else ()
+        )
+    if continuous and dense and mask_program is not all_visible and not config["aux_tensors"]:
+        from .kernels.flash_fwd_mxfp8_arch35 import _mx_dense_mask_bounds
+
+        features = features._replace(
+            dense_bounds=_mx_dense_mask_bounds(
+                mask_program.simt, len(config["aux_scalars"]), any(varlen)
+            )
+        )
     static = (
         *static,
         False,
@@ -991,6 +1049,7 @@ def _make_mxfp8_plan(q, k, v, out, lse, config, offsets):
             if pipeline == "exact_aux":
                 fallback[-7] = "continuous"
             fallback[-3] = ()
+            fallback[-4] = features._replace(key_aux=())
             compiled = _compile_mxfp8((*args, *fallback), _index_shapes(sparse))
             compiled._attention_guarded_fallback = pipeline == "exact_aux"
             return compiled
