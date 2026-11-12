@@ -90,6 +90,14 @@ CI_BENCHMARK_FA_VERSION="${CI_BENCHMARK_FA_VERSION:-all}"
 CI_BENCHMARK_LAYOUT="${CI_BENCHMARK_LAYOUT:-all}"
 CI_BENCHMARK_MODE="${CI_BENCHMARK_MODE:-all}"
 CI_BENCHMARK_CAUSAL="${CI_BENCHMARK_CAUSAL:-both}"
+# 用于检测 Benchmark 参数与任务类型是否匹配。
+# 正常 correctness Test 不传 CI_BENCHMARK_FA_VERSION。
+if [ "${CI_BENCHMARK_FA_VERSION_EXPLICIT:-false}" = "true" ] &&
+   [ "$CI_TASK" != "benchmark" ]; then
+  printf '[CI][ERROR] Benchmark requested but CI_TASK=%s\n' \
+    "$CI_TASK" >&2
+  exit 1
+fi
 CI_BENCHMARK_COMMIT_SHA="${CI_BENCHMARK_COMMIT_SHA:-unknown}"
 
 CI_RUN_EXAMPLE_ST="${CI_RUN_EXAMPLE_ST:-true}"
@@ -386,6 +394,7 @@ run_docker_task() {
       ;;
 
   esac
+  log "task routing: CI_TASK=$CI_TASK -> $entry_script"
 
 
   # 提前检查脚本是否存在
