@@ -1059,13 +1059,13 @@ def _paired_pipeline(
     # Sparse block indices may be nonconsecutive; carry both through the pipeline.
     # PV ping-pong buffers retain the running accumulator, freeing space for
     # four QK buffers (two groups in flight). Aligned SIMT borrows the
-    # consumed second score for the first probability tile; ragged sparse
-    # SIMT retains its shared score and independent tail staging buffer.
+    # consumed second score for the first probability tile. Tail staging borrows
+    # the probability buffer only while its MTE3 ownership token is available.
     # Final output compacts the consumed PV buffer's prefix.
     # Tail staging borrows the output slot after its DMA completes.
     # Mask predicates reuse on-chip buffers without a global workspace.
     dtype = q.ptr.dtype
-    reuse_score_buffers = (dense_mask and indexed) or (indexed and not ragged)
+    reuse_score_buffers = indexed
     head_group = tla.as_numeric(1)
     if tla.const_expr(dense_mask and indexed):
         # Remove common power-of-two factors from the per-core query stride.
@@ -1280,7 +1280,7 @@ def _paired_pipeline(
                 tail_free,
                 tail_ready,
                 True,
-                (outfree,),
+                (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
             )
         steps = count
         if count == 0:
@@ -1391,7 +1391,7 @@ def _paired_pipeline(
                             tail_free,
                             tail_ready,
                             True,
-                            (outfree,),
+                            (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
                         )
                         with tla.cube():
                             product = _mm(
@@ -1912,7 +1912,7 @@ def _paired_pipeline(
                                 tail_free,
                                 tail_ready,
                                 True,
-                                (outfree,),
+                                (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
                             )
                             with tla.cube():
                                 _mm(

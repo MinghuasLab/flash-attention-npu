@@ -240,6 +240,41 @@ def test_sparse_forward_backward(device, dtype, qp, kp, compute_full):
     check_attention(cpu, inputs, out, lse, cq=cq, ck=ck, mask_mod=reference, loss="both")
 
 
+@tla.jit
+def _ragged_aux_mask(b, h, q, k, info, aux, scalars):
+    q_id, k_id = aux[0][q], aux[0][k]
+    return ((q >= k) | ((q_id >= 0) & (q_id == k_id))) & (q >= 13) & (q // 128 != 1)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("sq,sk", [(384, 384), (513, 519), (519, 513)])
+def test_sparse_mha_probability_tail_reuse(device, dtype, sq, sk):
+    """Exercise shared probability/tail storage across persistent MHA tasks.
+
+    Empty query tiles, partially masked rows, odd/even KV counts and both
+    rectangular tail directions must preserve output, LSE and all gradients.
+    """
+    cpu, inputs, _, _, _ = make_inputs(device, dtype, sq=sq, sk=sk, heads=4, kh=4)
+    ids = torch.full((max(sq, sk),), -1, dtype=torch.int32)
+    ids[8:173], ids[259:511] = 0, 1
+    aux = (ids.to(device),)
+    blocks = compute_block_sparsity(128, 128, 1, 1, sq, sk, _ragged_aux_mask, aux, device)
+    out, lse = flash_attn_func(
+        *inputs,
+        mask_mod=_ragged_aux_mask,
+        aux_tensors=aux,
+        block_sparse_tensors=blocks,
+        return_lse=True,
+    )
+
+    def reference(b, h, q, k, info, tensors, scalars):
+        q_id, k_id = tensors[0][q], tensors[0][k]
+        return ((q >= k) | ((q_id >= 0) & (q_id == k_id))) & (q >= 13) & (q // 128 != 1)
+
+    check_attention(cpu, inputs, out, lse, mask_mod=reference, aux_tensors=(ids,), loss="both")
+
+
 @pytest.mark.npu
 @pytest.mark.parametrize("mutate_backward", [False, True])
 def test_sparse_mutation_between_forward_and_backward(device, mutate_backward):
