@@ -191,11 +191,11 @@ if kind == "mask":
     expected = reference_block_sparsity(1, 1, length, length+6, lambda b,h,q,k,i,a,c: q>=k)
     assert active_lists(result) == active_lists(expected)
 elif kind == "mxfp8":
-    from flash_attn_npu_4.catlass_dsl import flash_attn_varlen_func
+    from flash_attn_npu_4.catlass_dsl import flash_attn_varlen_func_with_quant
     from tests.catlass_dsl.mxfp8_reference import make_case, reference, to_device, check_quantized_lse
     case = make_case(q_lengths=(length,), k_lengths=(length+6,), q_packed=True, k_packed=True)
     inputs, options = to_device(case, 'npu:0')
-    out, lse = flash_attn_varlen_func(*inputs, **options, return_lse=True)
+    out, lse = flash_attn_varlen_func_with_quant(*inputs, **options, return_lse=True)
     expected, logs = reference(case)
     check(out, expected)
     check_quantized_lse(lse.cpu(), logs)
