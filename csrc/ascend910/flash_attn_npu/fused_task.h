@@ -246,7 +246,7 @@ FA_TASK_INLINE TaskShape MakeMhaTaskShape(uint32_t qSeqlen, uint32_t qHeads, uin
 // groupSize > 1 (GQA) geometry: never inlined into the AICore task loop, the
 // per-batch call is negligible there.
 FA_TASK_NOINLINE TaskShape MakeGqaTaskShape(uint32_t qSeqlen, uint32_t qHeads, uint32_t kvHeads, uint32_t batch,
-                                          uint32_t coreNum, bool fixedLayout)
+                                            uint32_t coreNum, bool fixedLayout)
 {
     const uint32_t groupSize = qHeads / kvHeads;
     const uint32_t nCap = batch >= coreNum ? qHeads : groupSize;

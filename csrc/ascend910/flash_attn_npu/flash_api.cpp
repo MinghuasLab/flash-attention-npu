@@ -1107,7 +1107,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         tiling_cpu_ptr->set_dropMaskDevice(
             has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
-        uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(fa_split::Q_TILE_CEIL) * 512; // 工作空间块大小 ，每次计算128 * 512
+        uint64_t WORKSPACE_BLOCK_SIZE_DB =
+            static_cast<uint64_t>(fa_split::Q_TILE_CEIL) * 512; // 工作空间块大小 ，每次计算128 * 512
         uint64_t PRELANCH_NUM = 3;
 
         uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
