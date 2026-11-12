@@ -20,6 +20,7 @@
 #   IMAGE_PREFIX          (默认 fa-npu-ci)
 #   CI_MATRIX_MAX_JOBS    (默认 0=不限) 并发容器数上限 (内存吃紧时调小, 如 3)
 #   CI_DOCKER_PRIVILEGED  (默认 true)
+#   CI_DOCKER_CPUS        可选, 限制每个容器的 CPU 数
 #   CI_CONTAINER_SCOPE   （默认 -local-$(id -u)-$$）当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_VERSION (默认 all) 编译哪些 API 代 (all/v2/v3/v4)
 #   FLASH_ATTN_BUILD_NPU     (默认按 combo 架构) 可设 all 编译双架构
@@ -35,6 +36,10 @@ MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/ci_build_matrix.tsv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fa-npu-ci}"
 CI_MATRIX_MAX_JOBS="${CI_MATRIX_MAX_JOBS:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
+docker_cpu_args=()
+if [ -n "${CI_DOCKER_CPUS:-}" ]; then
+  docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+fi
 CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 LOG_DIR="${REPO_ROOT}/build/matrix-logs"
 # 每个 combo 一个 docker CLI PID 文件; 取消时先终止这些客户端, 再按 scope 清理容器。
@@ -143,6 +148,7 @@ build_one() {
   echo "[matrix-build] >>> $name ($img) -> $logf"
   set +e
   docker run --rm \
+    "${docker_cpu_args[@]}" \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     "${GIT_PROXY_DOCKER_ARGS[@]}" \

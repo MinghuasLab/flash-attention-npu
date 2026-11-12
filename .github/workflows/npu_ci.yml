@@ -253,6 +253,7 @@ jobs:
       CI_TEST_WORKERS: ${{ needs.prepare.outputs.workers }}
       FLASH_ATTN_BUILD_NPU: ${{ needs.prepare.outputs.build_npu }}
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
@@ -349,7 +350,12 @@ jobs:
           # docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突
           # clone 后: fetch base 分支最新, checkout base, merge PR head
           docker_ok=false
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
           if docker run --rm \
+            "${docker_cpu_args[@]}" \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             "${proxy_args[@]}" \
             --network host \

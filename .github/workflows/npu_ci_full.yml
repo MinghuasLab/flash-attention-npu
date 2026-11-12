@@ -76,6 +76,7 @@ jobs:
     timeout-minutes: 600
     env:
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       CI_TEST_DIRECT_FILE: >-
@@ -166,7 +167,12 @@ jobs:
               -e GIT_CONFIG_VALUE_0=/tmp/ci-git-proxy.conf
             )
           fi
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
           docker run --rm \
+            "${docker_cpu_args[@]}" \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             "${proxy_args[@]}" \
             --network host \
