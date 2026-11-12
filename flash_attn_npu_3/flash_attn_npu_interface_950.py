@@ -737,7 +737,7 @@ class FlashAttnFunc(torch.autograd.Function):
         headdim_v = v.shape[3]
 
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
-        if scheduler_metadata is None and q.shape[-1] != 512:
+        if scheduler_metadata is None:
             meta_cache_seqlens = torch.full(
                 (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
             )
@@ -866,7 +866,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         _validate_varlen_query(q, cu_seqlens_q)
         # The packed varlen query (cu_seqlens_q present) is always TND, never BNSD.
         layout = _LAYOUT_TND
-        if scheduler_metadata is None and q.shape[-1] != 512:
+        if scheduler_metadata is None:
             meta_seqused_k = (
                 seqused_k
                 if seqused_k is not None

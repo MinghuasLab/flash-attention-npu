@@ -332,7 +332,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     bool is_local = false;
     if(head_size_q == 512) {
         TORCH_CHECK((num_splits == 0 || num_splits == 1 || num_splits == 2 || num_splits == 4), "D512 currently requires num_splits=0 (auto), 1, 2 or 4");
-        TORCH_CHECK(!scheduler_metadata_.has_value(), "D512 metadata is not enabled yet");
         TORCH_CHECK(layout_enum != FwdLayout::BNSD, "D512 BNSD is not supported");
     }
     bool flashDecodeEnabled = false;
@@ -484,8 +483,10 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     }
     at::Tensor workspace;
     if (flashDecodeEnabled || head_size_q == 512) {
-        workspace =
-            at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        const uint64_t workspaceBytes = scheduler_metadata_.has_value()
+            ? fa_metadata::WorkSpaceSize(blockDim)
+            : tilingData.workSpaceSize;
+        workspace = at::empty({static_cast<int64_t>(workspaceBytes)}, at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================

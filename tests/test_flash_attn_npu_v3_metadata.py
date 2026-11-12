@@ -1779,3 +1779,29 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         rtol=0,
         atol=1e-6,
     )
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+def test_d512_dense_metadata_uses_physical_kv_stride(data_type):
+    # A used-length batch stride would read the first batch's V padding.
+    q = torch.zeros((2, 3, 2, 512), dtype=data_type).npu()
+    k = torch.zeros((2, 513, 1, 512), dtype=data_type).npu()
+    v = torch.ones((2, 513, 1, 512), dtype=data_type)
+    v[1].fill_(2)
+    v = v.npu()
+    cache_seqlens = _int32_npu([256, 321])
+    metadata = _metadata(
+        batch_size=2, q_seqlen=3, kv_seqlen=513, num_heads=2, kv_heads=1,
+        head_size=512, cu_seqlens_q=None, cache_seqlens=cache_seqlens,
+        data_type=data_type, page_size=None, is_causal=False, num_splits=1,
+    )
+    kwargs = dict(cache_seqlens=cache_seqlens, num_splits=1, return_softmax_lse=True)
+    direct, direct_lse, *_ = flash_attn_with_kvcache(q, k, v, **kwargs)
+    scheduled, scheduled_lse, *_ = flash_attn_with_kvcache(
+        q, k, v, scheduler_metadata=metadata, **kwargs
+    )
+    expected = torch.ones_like(q)
+    expected[1].fill_(2)
+    torch.testing.assert_close(direct, expected, rtol=0, atol=0)
+    torch.testing.assert_close(scheduled, expected, rtol=0, atol=0)
+    torch.testing.assert_close(scheduled_lse, direct_lse, rtol=0, atol=0)

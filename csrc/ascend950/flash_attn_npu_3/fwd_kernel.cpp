@@ -915,6 +915,9 @@ class FAIKernel950 {
             if(params.seqUsedQ) qlen=usedq.GetValue(batch);
             uint32_t klen=cuk.GetValue(batch); uint64_t ktoken=static_cast<uint64_t>(batch)*t->maxKvSeqlen;
             if constexpr(kvFormat==Format::TND && kvcacheType==CacheMode::normalCache) { ktoken=cuk.GetValue(batch); klen=cuk.GetValue(batch+1)-ktoken; }
+            if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                ktoken = static_cast<uint64_t>(batch) * params.kvSeqlenAllocated;
+            }
             if(params.seqUsedKv) klen=usedk.GetValue(batch);
             uint32_t group=t->numHeads/t->kvHeads,qnTile=GetQNBlockTile(qlen,group,false),nblocks=CeilDiv(group,qnTile);
             for(uint32_t qt=0;qt<CeilDiv(qlen,128U);qt++) for(uint32_t ht=0;ht<nblocks*t->kvHeads;ht++,globalTask++) {

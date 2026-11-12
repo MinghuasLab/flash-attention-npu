@@ -111,6 +111,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
+    fa950_plan::ApplyStack512Tiles(*tilingData);
     tilingData->qSeqlenAligned = 0;
     tilingData->kvSeqlenAligned = 0;
 
@@ -158,6 +159,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);
     tilingData->pvOutSize = fa_metadata::Mm2OutSize(blockDim);
     tilingData->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
+    if (tilingData->embeddingSizeV == 512U) {
+        tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+    }
 
     AscendC::DataStoreBarrier();
     return 0;

@@ -185,7 +185,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
 
     auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
     const uint32_t quantMode = faInfo_.dataType == DataType::FP8 ? 1U : 0U;
-    auto kvBaseTile_ = faInfo_.embeddingSizeV == 512 ? 512U : (quantMode == 1 ? 256U : BASE_KV_SIZE);
+    auto kvBaseTile_ = quantMode == 1 ? 256U : BASE_KV_SIZE;
     faTilingData.quantMode = quantMode;
     auto embeddingSizeAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
@@ -193,18 +193,18 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     auto qkL1TileKLeft_ = embeddingSizeAligned16_;
     auto qL1BufNum_ = 1;
     // K矩阵开启2buf，D按128分割，S2按256分割
-    auto qkL1TileN_ = faInfo_.embeddingSizeV == 512 ? 128 : 256;
-    auto qkL1TileKRight_ = faInfo_.embeddingSizeV == 512 ? 256 : (quantMode == 1 ? 128 : 192);
+    auto qkL1TileN_ = 256;
+    auto qkL1TileKRight_ = quantMode == 1 ? 128 : 192;
     auto kL1BufNum_ = 2;
     // V矩阵开启db，D按128分割，kvBaseTile_不分割，指令同样提前于核间同步下发
     // 如果kvBaseTile_进一步增大，考虑关闭db，使得kvBaseTile_不分割
-    auto pvL1TileN_ = faInfo_.embeddingSizeV == 512 ? 128U : embeddingSizeVAligned16_;
-    auto pvL1TileKLeft_ = faInfo_.embeddingSizeV == 512 ? 256U : kvBaseTile_;
+    auto pvL1TileN_ = embeddingSizeVAligned16_;
+    auto pvL1TileKLeft_ = kvBaseTile_;
     auto vL1BufNum_ = 2;
     // P矩阵在950上会常驻L1，由于基块的prelaunch为2，因此最好有3 buf，以免基块间流水阻塞
     auto pvL1TileM_ = Q_TILE_CEIL;
-    auto pvL1TileKRight_ = faInfo_.embeddingSizeV == 512 ? 256U : kvBaseTile_;
-    auto pL1BufNum_ = faInfo_.embeddingSizeV == 512 ? 2 : 3;
+    auto pvL1TileKRight_ = kvBaseTile_;
+    auto pL1BufNum_ = 3;
 
     faTilingData.set_innerPrec(0);
     faTilingData.set_actSeqAval(0);
@@ -222,6 +222,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
+    fa950_plan::ApplyStack512Tiles(faTilingData);
 }
 
 void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData& faTilingData)
@@ -626,7 +627,7 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
             fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
-    qBaseTile_ = faInfo_.embeddingSizeV == 512 ? Q_TILE_CEIL : fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
+    qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
                                              fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
     FillBasicTilingData(tilingdata);
