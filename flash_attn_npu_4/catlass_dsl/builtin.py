@@ -187,11 +187,15 @@ def local_window(left=None, right=None):
     @tla.jit
     def simt(b, h, q, k, info, aux, scalars):
         center = q + info[1] - info[0]
-        keep = tla.Bool(True)
-        if tla.const_expr(left is not None):
-            keep = keep & (center - k <= left)
-        if tla.const_expr(right is not None):
-            keep = keep & (k - center <= right)
+        # Keep bounded predicates symbolic for MXFP8 range tracing and repair.
+        if tla.const_expr(left is not None and right is not None):
+            keep = (center - k <= left) & (k - center <= right)
+        elif tla.const_expr(left is not None):
+            keep = center - k <= left
+        elif tla.const_expr(right is not None):
+            keep = k - center <= right
+        else:
+            keep = tla.Bool(True)
         return keep
 
     @tla.jit

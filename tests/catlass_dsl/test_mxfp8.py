@@ -2292,6 +2292,40 @@ def mask_reference(b, h, q, k, info, aux, scalars):
     return (k <= q + info[1] - info[0]) & (q != 0)
 
 
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "q_lengths,k_lengths,heads,packed,seed,mask",
+    [
+        ((2048,), (2048,), (4, 2), False, 20261132, {"causal": True}),
+        ((2175, 2175), (2144, 2144), (2, 2), False, 20261139, {"window_size": (127, 33)}),
+        ((2081,), (2082,), (4, 1), True, 20261146, {"causal": True}),
+    ],
+    ids=["bsnd-causal", "bsnd-window", "tnd-causal"],
+)
+def test_builtin_mxfp8_mask_preserves_short_visible_rows(
+    device, q_lengths, k_lengths, heads, packed, seed, mask
+):
+    case = make_case(
+        q_lengths=q_lengths,
+        k_lengths=k_lengths,
+        q_heads=heads[0],
+        kv_heads=heads[1],
+        q_packed=packed,
+        k_packed=packed,
+        seed=seed,
+    )
+    rows = [0, 1, 31, 127, 128, q_lengths[0] - 1]
+    expected, expected_lse = reference(case, query_rows=[rows] * len(q_lengths), **mask)
+    inputs, options = to_device(case, device)
+    out, lse = flash_attn_varlen_func(*inputs, **options, **mask, return_lse=True)
+    if packed:
+        check(out[rows], expected[rows])
+        check_quantized_lse(lse[:, rows].cpu(), expected_lse[:, rows])
+    else:
+        check(out[:, rows], expected[:, rows])
+        check_quantized_lse(lse[:, :, rows].cpu(), expected_lse[:, :, rows])
+
+
 def _device_sparse(sparse, device):
     if sparse is None:
         return None
