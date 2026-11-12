@@ -130,9 +130,7 @@ def _runtime_attention(
     layout,
     return_lse,
     training,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
+    *mxfp8_scales,
 ):
     from .interface import _canonical_input, _maximum_length, _prepare_config
 
@@ -164,9 +162,7 @@ def _runtime_attention(
         cu_k=cu_k,
         max_q=_maximum_length(q, max_q, layout=layout),
         max_k=_maximum_length(k, max_k, layout=layout),
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        **({"scales": mxfp8_scales} if mxfp8_scales else {}),
     )
     return q, k, v, config
 
@@ -317,14 +313,12 @@ def attention(
     score_mod_simd=None,
     score_mod_bwd_simd=None,
     mask_mod_simd=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
+    scales=None,
 ):
     """Traceable front end; callbacks are static and every buffer is explicit."""
     from .interface import _resolve_mxfp8_scales
 
-    mxfp8_scales = _resolve_mxfp8_scales(q, k, v, (q_descale, k_descale, v_descale), layout=layout)
+    mxfp8_scales = _resolve_mxfp8_scales(q, k, v, scales, layout=layout)
     if mxfp8_scales is not None and any(t.requires_grad for t in aux_tensors or ()):
         raise NotImplementedError(
             "MXFP8 supports inference forward only; inputs must not require gradients"

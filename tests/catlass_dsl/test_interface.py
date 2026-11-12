@@ -11,6 +11,7 @@ import torch
 from .test_utils import check, metadata_tensor, oracle
 
 from flash_attn_npu_4.catlass_dsl import (
+    TensorwiseScales,
     compute_block_sparsity,
     flash_attn_func,
     flash_attn_func_with_quant,
@@ -74,6 +75,7 @@ SIGNATURES = {
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        scales: TensorwiseScales,
         qv: Optional[torch.Tensor] = None,
         gather_kv_indices: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
@@ -93,11 +95,7 @@ SIGNATURES = {
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
-        gather_bwd_token_chunk: Optional[int] = None,
-        *,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None
+        gather_bwd_token_chunk: Optional[int] = None
     """,
     "flash_attn_varlen_func": """
         q: torch.Tensor,
@@ -138,6 +136,7 @@ SIGNATURES = {
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        scales: TensorwiseScales,
         qv: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_k: Optional[torch.Tensor] = None,
@@ -167,11 +166,7 @@ SIGNATURES = {
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
-        gather_bwd_token_chunk: Optional[int] = None,
-        *,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None
+        gather_bwd_token_chunk: Optional[int] = None
     """,
 }
 
@@ -194,14 +189,43 @@ def test_public_signature(entry):
         assert ast.dump(function.returns, include_attributes=False) == ast.dump(
             expected.returns, include_attributes=False
         )
-    scale_names = {"q_descale", "k_descale", "v_descale"}
-    for name, parameter in actual.parameters.items():
-        expected_kind = (
-            inspect.Parameter.KEYWORD_ONLY
-            if name in scale_names
-            else inspect.Parameter.POSITIONAL_OR_KEYWORD
-        )
-        assert parameter.kind is expected_kind
+    for parameter in actual.parameters.values():
+        assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("public", [False, True])
+def test_float_and_quantized_entries_are_disjoint(cpu_launch, packed, public):
+    import flash_attn_npu_4 as fa4
+
+    fixed, varlen = ("flash_attn_func", "flash_attn_varlen_func")
+    module = fa4 if public else interface
+    name = varlen if packed else fixed
+    float_entry = getattr(module, name)
+    quant_entry = getattr(module, name + "_with_quant")
+    assert fa4.TensorwiseScales is TensorwiseScales
+    assert "scales" not in inspect.signature(float_entry).parameters
+    assert (
+        inspect.signature(quant_entry).parameters["scales"].kind
+        is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
+    fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    with pytest.raises(TypeError, match="scales"):
+        float_entry(q, q, q, scales=TensorwiseScales())
+    if not public:
+        with pytest.raises(ValueError, match="matching dtype/device"):
+            float_entry(q, fp8, q)
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        quant_entry(q, q, q, scales=TensorwiseScales(q, q, q))
+    with pytest.raises(TypeError, match="TensorwiseScales"):
+        quant_entry(fp8, fp8, fp8, scales=(q, q, q))
+    with pytest.raises(ValueError, match="all three"):
+        quant_entry(fp8, fp8, fp8, scales=TensorwiseScales(q=q))
+    with pytest.raises(TypeError, match="scales"):
+        quant_entry(fp8, fp8, fp8)
+    with pytest.raises(ValueError, match="requires scales"):
+        quant_entry(fp8, fp8, fp8, None)
 
 
 @pytest.mark.parametrize("parameter", ["mask_mod_ref", "mask_mod_simd"])
@@ -223,18 +247,18 @@ def test_sparse_builder_requires_explicit_aux_and_device(missing):
     "parameter", ["layout", "score_mod_simd", "score_mod_bwd_simd", "mask_mod_simd"]
 )
 def test_removed_extensions(entry, parameter):
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(TypeError, match=parameter):
         entry(q, q, q, **{parameter: None})
 
 
 def test_varlen_rejects_explicit_backward_lists():
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(TypeError, match="block_sparse_tensors_bwd"):
         flash_attn_varlen_func(q, q, q, block_sparse_tensors_bwd=None)
 
 
-@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("entry", (*ENTRIES, *QUANT_ENTRIES))
 def test_positional_and_keyword_binding(entry, monkeypatch):
     captured = []
     monkeypatch.setattr(
@@ -242,21 +266,16 @@ def test_positional_and_keyword_binding(entry, monkeypatch):
         "_flash",
         lambda *args, **kwargs: captured.append((args, kwargs)) or (args[0], None),
     )
-    q = torch.empty(1, 7, 2, 128)
+    dtype = torch.float8_e4m3fn if entry in QUANT_ENTRIES else torch.float16
+    q = torch.empty(1, 7, 2, 128, dtype=dtype)
     signature = inspect.signature(entry)
     arguments = {name: p.default for name, p in signature.parameters.items()}
     arguments.update(q=q, k=q, v=q)
-    positional = [
-        arguments[name]
-        for name, p in signature.parameters.items()
-        if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ]
-    keywords = {
-        name: arguments[name]
-        for name, p in signature.parameters.items()
-        if p.kind is inspect.Parameter.KEYWORD_ONLY
-    }
-    assert entry(*positional, **keywords)[0] is q
+    if entry in QUANT_ENTRIES:
+        qk_scale = torch.full((1, 7, 2, 2, 2), 127, dtype=torch.uint8)
+        v_scale = torch.full((1, 1, 2, 128, 2), 127, dtype=torch.uint8)
+        arguments["scales"] = TensorwiseScales(q=qk_scale, k=qk_scale, v=v_scale)
+    assert entry(*arguments.values())[0] is q
     assert entry(**arguments)[0] is q
     assert captured[0] == captured[1]
 
@@ -266,7 +285,7 @@ def test_positional_and_keyword_binding(entry, monkeypatch):
     "options", [{"gather_bwd_recompute_p": True}, {"gather_bwd_token_chunk": 2}]
 )
 def test_gather_options_require_indices(entry, options):
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(ValueError, match="require gather_kv_indices"):
         entry(q, q, q, **options)
 
@@ -274,7 +293,7 @@ def test_gather_options_require_indices(entry, options):
 @pytest.mark.parametrize("entry", ENTRIES)
 @pytest.mark.parametrize("chunk", [True, 0, 1.5])
 def test_invalid_gather_chunk_precedes_capability_check(entry, chunk):
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(ValueError, match="positive int"):
         entry(q, q, q, gather_kv_indices=torch.empty(1), gather_bwd_token_chunk=chunk)
 
@@ -377,7 +396,7 @@ def test_cpu_lse_backward_plumbing(cpu_launch, return_lse, mode, entry):
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("hint", [None, 12, "tensor"])
 def test_maximum_hints_without_device_readback(monkeypatch, packed, hint):
-    q = torch.empty((9, 2, 128) if packed else (2, 7, 2, 128))
+    q = torch.empty((9, 2, 128) if packed else (2, 7, 2, 128), dtype=torch.float16)
     cu = torch.tensor([0, 4, 9], dtype=torch.int32) if packed else None
     hint = torch.empty((), device="meta") if hint == "tensor" else hint
     captured = []
@@ -408,13 +427,13 @@ def test_maximum_hints_without_device_readback(monkeypatch, packed, hint):
     ],
 )
 def test_unsupported_options(entry, options):
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(NotImplementedError):
         entry(q, q, q, **options)
 
 
 def test_cpu_attention_requires_npu():
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(ValueError, match="requires an NPU"):
         flash_attn_func(q, q, q)
 
@@ -447,7 +466,7 @@ def test_invalid_inputs(cpu_launch, kind, message):
     ],
 )
 def test_invalid_softcap(options, message):
-    q = torch.empty(1, 7, 2, 128)
+    q = torch.empty(1, 7, 2, 128, dtype=torch.float16)
     with pytest.raises(ValueError, match=message):
         flash_attn_func(q, q, q, **options)
 

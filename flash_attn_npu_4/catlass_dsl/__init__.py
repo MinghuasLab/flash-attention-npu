@@ -21,6 +21,7 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "TensorwiseScales",
     "flash_attn_func",
     "flash_attn_varlen_func",
     "flash_attn_func_with_quant",
@@ -32,6 +33,8 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name == "TensorwiseScales":
+        return getattr(import_module("..", __name__), name)
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from .utils import ensure_backend

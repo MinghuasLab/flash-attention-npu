@@ -1,4 +1,4 @@
-"""Versioned, device-independent CATLASS 2.2 artifact storage.
+"""Versioned, device-independent CATLASS artifact storage.
 
 This is the only module that depends on CATLASS's prepared-executor internals.
 JSON contains compiler ABI/argument metadata, never executable Python objects,

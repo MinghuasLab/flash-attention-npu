@@ -1,4 +1,4 @@
-"""FA4 runtime checks, Flex routing and native CATLASS API adaptation.
+"""FA4 input checks, backend initialization and attention routing.
 
 Routing is available without CATLASS. Native dependencies and graph operators
 are initialized only when a DSL API is requested or a Flex call is dispatched.
@@ -19,6 +19,24 @@ _INSTALL = (
     "for Python 3.10–3.13, then source the CANN environment. "
     "See flash_attn_npu_4/catlass_dsl/README.md for installation commands."
 )
+
+
+def require_fp8_inputs(q, k, v):
+    if any(not isinstance(t, torch.Tensor) for t in (q, k, v)):
+        raise TypeError("quantized q/k/v must be tensors")
+    if any(t.dtype != torch.float8_e4m3fn for t in (q, k, v)):
+        raise ValueError("quantized q/k/v must all have dtype torch.float8_e4m3fn")
+
+
+def require_mxfp8_scales(scales):
+    from .. import TensorwiseScales
+
+    if scales is None:
+        raise ValueError("MXFP8 requires scales=TensorwiseScales(q=..., k=..., v=...)")
+    if not isinstance(scales, TensorwiseScales):
+        raise TypeError("scales must be a TensorwiseScales instance")
+    if any(t is None for t in scales):
+        raise ValueError("MXFP8 requires all three tensors in scales.q, scales.k and scales.v")
 
 
 def _release(distribution):
@@ -110,9 +128,6 @@ def has_flex(
     block_sparse_tensors_bwd=None,
     aux_tensors=None,
     aux_scalars=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
 ):
     # Only Python presence/container length is inspected, never Tensor values.
     tensor_aux = _has_aux(aux_tensors, "aux_tensors")
@@ -128,9 +143,6 @@ def has_flex(
                 mask_mod,
                 block_sparse_tensors,
                 block_sparse_tensors_bwd,
-                q_descale,
-                k_descale,
-                v_descale,
             )
         )
     )
@@ -172,6 +184,7 @@ def attention(
     return_lse,
     scheduler_metadata=None,
     disable_scheduler_metadata=False,
+    scales=None,
     **options,
 ):
     ensure_backend()
@@ -190,15 +203,13 @@ def attention(
     window = tuple(None if bound is None or bound < 0 else bound for bound in window_size)
     from . import interface
 
-    scales = {name: options.pop(name, None) for name in ("q_descale", "k_descale", "v_descale")}
-    quantized = any(value is not None for value in scales.values())
-    if quantized:
+    if scales is not None:
         entry = (
             interface.flash_attn_varlen_func_with_quant
             if varlen
             else interface.flash_attn_func_with_quant
         )
-        options.update(scales)
+        options["scales"] = scales
     else:
         entry = interface.flash_attn_varlen_func if varlen else interface.flash_attn_func
     out, lse = entry(

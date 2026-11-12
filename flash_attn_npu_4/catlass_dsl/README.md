@@ -123,8 +123,8 @@ out, lse = compiled_attention(q, k, v)
 
 ## Prequantized MXFP8 inference
 
-MXFP8 has dedicated entry points that add three keyword-only arguments,
-`q_descale`, `k_descale`, and `v_descale`, on top of the regular signatures:
+MXFP8 entry points take a required `TensorwiseScales` argument immediately
+after Q/K/V. Pass it positionally or as `scales=...`.
 
 - `flash_attn_func_with_quant(...)` — fixed-length BSND
 - `flash_attn_varlen_func_with_quant(...)` — variable-length / mixed BSND/TND
@@ -155,13 +155,11 @@ least `sum(ceil(segment_kv_length/64))`; extra trailing capacity is allowed.
 
 ```python
 # q_fp8/k_fp8/v_fp8 and their scale tensors are supplied by the caller.
-from flash_attn_npu_4.catlass_dsl import flash_attn_func_with_quant
+from flash_attn_npu_4.catlass_dsl import TensorwiseScales, flash_attn_func_with_quant
 
 out, lse = flash_attn_func_with_quant(
     q_fp8, k_fp8, v_fp8,
-    q_descale=q_scale,
-    k_descale=k_scale,
-    v_descale=v_scale,
+    scales=TensorwiseScales(q=q_scale, k=k_scale, v=v_scale),
     mask_mod=local_mask,
     return_lse=True,
 )

@@ -1145,10 +1145,6 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse=False,
-    *,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     """Forward pass of FlashAttention for dense (batch-major) inputs.
 
@@ -1194,9 +1190,6 @@ def flash_attn_func(
         block_sparse_tensors_bwd=block_sparse_tensors_bwd,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
     ):
         raise NotImplementedError(
             "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
@@ -1260,10 +1253,6 @@ def flash_attn_varlen_func(
     scheduler_metadata=None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
-    *,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention for variable-length sequences with optional paged KV cache.
@@ -1356,9 +1345,6 @@ def flash_attn_varlen_func(
         block_sparse_tensors=block_sparse_tensors,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
     ):
         raise NotImplementedError(
             "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
@@ -1504,69 +1490,3 @@ def flash_attn_combine(
         return_lse,
     )
     return out, lse if return_lse else None
-
-
-def flash_attn_func_with_quant(
-    q,
-    k,
-    v,
-    *args,
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    **kwargs,
-):
-    """Quantized fixed-length attention via the native CATLASS backend.
-
-    Adds the three dequantization scales to :func:`flash_attn_func`. Q/K/V must
-    be prequantized ``torch.float8_e4m3fn``; the remaining arguments are
-    forwarded unchanged.
-    """
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "flash_attn_func_with_quant requires prequantized float8_e4m3fn q/k/v; "
-            "use flash_attn_func for float16/bfloat16 inputs"
-        )
-    return flash_attn_func(
-        q,
-        k,
-        v,
-        *args,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        **kwargs,
-    )
-
-
-def flash_attn_varlen_func_with_quant(
-    q,
-    k,
-    v,
-    *args,
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    **kwargs,
-):
-    """Quantized variable-length attention via the native CATLASS backend.
-
-    Adds the three dequantization scales to :func:`flash_attn_varlen_func`.
-    Q/K/V must be prequantized ``torch.float8_e4m3fn``; the remaining arguments
-    are forwarded unchanged.
-    """
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "flash_attn_varlen_func_with_quant requires prequantized float8_e4m3fn "
-            "q/k/v; use flash_attn_varlen_func for float16/bfloat16 inputs"
-        )
-    return flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        *args,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        **kwargs,
-    )

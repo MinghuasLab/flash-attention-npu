@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -10,6 +10,7 @@ from .catlass_dsl import utils as _catlass_utils
 # isort: off
 import flash_attn_npu_4_950
 # isort: on
+
 
 if torch.__version__ >= "2.4.0":
     _torch_custom_op_wrapper = torch.library.custom_op
@@ -993,10 +994,6 @@ def flash_attn_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
-    *,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     if _catlass_utils.has_flex(
         score_mod=score_mod,
@@ -1006,9 +1003,6 @@ def flash_attn_func(
         block_sparse_tensors_bwd=block_sparse_tensors_bwd,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
     ):
         return _catlass_utils.attention(
             q,
@@ -1035,9 +1029,6 @@ def flash_attn_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
         )
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
@@ -1273,10 +1264,6 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
-    *,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     if _catlass_utils.has_flex(
         score_mod=score_mod,
@@ -1285,9 +1272,6 @@ def flash_attn_varlen_func(
         block_sparse_tensors=block_sparse_tensors,
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
     ):
         return _catlass_utils.attention(
             q,
@@ -1321,9 +1305,6 @@ def flash_attn_varlen_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
         )
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
@@ -1366,36 +1347,76 @@ def flash_attn_varlen_func(
     )
 
 
+class TensorwiseScales(NamedTuple):
+    """Dequantization tensors for Q, K and V.
+
+    The MXFP8 attention backend expects all three operands' E8M0 group
+    scales, encoded as uint8 or float8_e8m0fnu.
+    """
+
+    q: Optional[torch.Tensor] = None
+    k: Optional[torch.Tensor] = None
+    v: Optional[torch.Tensor] = None
+
+
 def flash_attn_func_with_quant(
     q,
     k,
     v,
-    *args,
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    **kwargs,
+    scales: TensorwiseScales,
+    qv=None,
+    gather_kv_indices=None,
+    softmax_scale=None,
+    causal: bool = False,
+    window_size=(-1, -1),
+    learnable_sink=None,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic: bool = False,
+    score_mod=None,
+    score_mod_bwd=None,
+    mask_mod=None,
+    aux_tensors=None,
+    aux_scalars=None,
+    block_sparse_tensors=None,
+    block_sparse_tensors_bwd=None,
+    return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    disable_scheduler_metadata: bool = False,
 ):
-    """Quantized fixed-length attention (MXFP8), Ascend 950.
+    """Quantized fixed-length attention for prequantized E4M3FN inputs.
 
-    Adds the three dequantization scales to :func:`flash_attn_func`. Q/K/V must
-    be prequantized ``torch.float8_e4m3fn``; the remaining arguments are
-    forwarded unchanged.
+    Supply all three E8M0 dequantization tensors in scales for MXFP8.
     """
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "flash_attn_func_with_quant requires prequantized float8_e4m3fn q/k/v; "
-            "use flash_attn_func for float16/bfloat16 inputs"
-        )
-    return flash_attn_func(
+    _catlass_utils.require_fp8_inputs(q, k, v)
+    _catlass_utils.require_mxfp8_scales(scales)
+    return _catlass_utils.attention(
         q,
         k,
         v,
-        *args,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        **kwargs,
+        varlen=False,
+        qv=qv,
+        gather_kv_indices=gather_kv_indices,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+        scales=scales,
     )
 
 
@@ -1403,30 +1424,72 @@ def flash_attn_varlen_func_with_quant(
     q,
     k,
     v,
-    *args,
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    **kwargs,
+    scales: TensorwiseScales,
+    qv=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q=None,
+    seqused_k=None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal: bool = False,
+    window_size=(-1, -1),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap=0.0,
+    num_splits=0,
+    pack_gqa=None,
+    deterministic: bool = False,
+    score_mod=None,
+    score_mod_bwd=None,
+    mask_mod=None,
+    block_sparse_tensors=None,
+    aux_tensors=None,
+    aux_scalars=None,
+    return_lse: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
+    disable_scheduler_metadata: bool = False,
 ):
-    """Quantized variable-length attention (MXFP8), Ascend 950.
+    """Quantized variable-length attention for prequantized E4M3FN inputs.
 
-    Adds the three dequantization scales to :func:`flash_attn_varlen_func`.
-    Q/K/V must be prequantized ``torch.float8_e4m3fn``; the remaining arguments
-    are forwarded unchanged.
+    Supply all three E8M0 dequantization tensors in scales for MXFP8.
     """
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "flash_attn_varlen_func_with_quant requires prequantized float8_e4m3fn "
-            "q/k/v; use flash_attn_varlen_func for float16/bfloat16 inputs"
-        )
-    return flash_attn_varlen_func(
+    _catlass_utils.require_fp8_inputs(q, k, v)
+    _catlass_utils.require_mxfp8_scales(scales)
+    return _catlass_utils.attention(
         q,
         k,
         v,
-        *args,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        **kwargs,
+        varlen=True,
+        qv=qv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_k=min_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        gather_kv_indices=gather_kv_indices,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+        scales=scales,
     )

@@ -8,6 +8,8 @@ FP8 conversion, independently of the device bit-manipulation implementation.
 import torch
 
 
+from flash_attn_npu_4.catlass_dsl import TensorwiseScales
+
 SCALE_NAMES = ("q_descale", "k_descale", "v_descale")
 
 
@@ -142,10 +144,13 @@ def make_case(
 
 
 def to_device(case, device):
-    return tuple(t.to(device) for t in case["qkv"]), {
+    options = {
         name: value.to(device) if isinstance(value, torch.Tensor) else value
         for name, value in case["kwargs"].items()
+        if name not in SCALE_NAMES
     }
+    options["scales"] = TensorwiseScales(*(case["kwargs"][name].to(device) for name in SCALE_NAMES))
+    return tuple(t.to(device) for t in case["qkv"]), options
 
 
 def decode_sequences(case):

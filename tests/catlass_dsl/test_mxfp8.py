@@ -21,6 +21,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import flash_attn_npu_4 as fa4
 from flash_attn_npu_4.catlass_dsl import (
+    TensorwiseScales,
     compute_block_sparsity,
     flash_attn_func_with_quant as flash_attn_func,
     flash_attn_varlen_func_with_quant as flash_attn_varlen_func,
@@ -269,14 +270,14 @@ def test_scale_metadata_layouts(packed, layout):
     q, k, v, *scales = inputs(packed=packed, layout=layout)
     result = interface._resolve_mxfp8_scales(q, k, v, scales, layout=layout)
     assert all(actual is expected for actual, expected in zip(result, scales))
-    assert interface._resolve_mxfp8_scales(q, k, v, (None, None, None)) is None
+    assert interface._resolve_mxfp8_scales(q, k, v, None) is None
 
 
 @pytest.mark.parametrize("missing", [0, 1, 2])
 def test_all_three_scales_are_required(missing):
     q, k, v, *scales = inputs()
     scales[missing] = None
-    with pytest.raises(ValueError, match="together"):
+    with pytest.raises(ValueError, match="all three"):
         interface._resolve_mxfp8_scales(q, k, v, scales)
 
 
@@ -388,7 +389,7 @@ def test_graph_runtime_resolves_sequence_axis(monkeypatch, packed, layout, hint)
     _, _, _, config = graph._runtime_attention(*args)
     assert config["max_q"] == (hint if packed and hint is not None else 17)
     assert config["max_k"] == (hint if packed and hint is not None else 20)
-    assert config["q_descale"] is data[3]
+    assert config["scales"][0] is data[3]
 
 
 @pytest.fixture
@@ -415,7 +416,7 @@ def cpu_mxfp8_runtime(monkeypatch):
 )
 def test_mxfp8_fullgraph_dynamic_scale_rebinding(cpu_mxfp8_runtime, public, packed):
     if public:
-        entry = fa4.flash_attn_varlen_func if packed else fa4.flash_attn_func
+        entry = fa4.flash_attn_varlen_func_with_quant if packed else fa4.flash_attn_func_with_quant
     else:
         entry = (
             interface.flash_attn_varlen_func_with_quant
@@ -424,7 +425,7 @@ def test_mxfp8_fullgraph_dynamic_scale_rebinding(cpu_mxfp8_runtime, public, pack
         )
 
     def call(q, k, v, qs, ks, vs, cq, ck):
-        options = dict(q_descale=qs, k_descale=ks, v_descale=vs, return_lse=True)
+        options = dict(scales=TensorwiseScales(qs, ks, vs), return_lse=True)
         if packed:
             options.update(
                 cu_seqlens_q=cq, cu_seqlens_k=ck, max_seqlen_q=q.shape[0], max_seqlen_k=k.shape[0]
@@ -722,7 +723,7 @@ def test_bf16_and_mxfp8_share_cache_without_aliasing(device, monkeypatch):
         flash_attn_varlen_func_with_quant,
     )
 
-    from .mxfp8_reference import SCALE_NAMES, decoded_inputs, make_case, to_device
+    from .mxfp8_reference import decoded_inputs, make_case, to_device
     from .test_utils import check
 
     cache = get_jit_cache()
@@ -739,7 +740,7 @@ def test_bf16_and_mxfp8_share_cache_without_aliasing(device, monkeypatch):
         case = make_case(q_lengths=(128,), k_lengths=(128,), q_heads=4, kv_heads=2, seed=80 + step)
         inputs, kwargs = to_device(case, device)
         baseline = tuple(t.to(device) for t in decoded_inputs(case))
-        baseline_kwargs = {name: value for name, value in kwargs.items() if name not in SCALE_NAMES}
+        baseline_kwargs = {name: value for name, value in kwargs.items() if name != "scales"}
         expected, expected_lse = flash_attn_varlen_func(
             *baseline,
             **baseline_kwargs,
@@ -2496,7 +2497,7 @@ def test_mxfp8_internal_bnsd(device):
         block_sparse_tensors=None,
         block_sparse_tensors_bwd=None,
         return_lse=True,
-        **{name: kwargs[name] for name in SCALE_NAMES},
+        scales=kwargs["scales"],
     )
     expected, el = reference(case)
     check(output, expected)
@@ -2536,11 +2537,11 @@ def test_mxfp8_cached_plan_rebinds_scale_aux_and_stream(device):
         if keys is not None:
             assert set(runtime.compile_cache) == keys
             assert all(
-                old.data_ptr() != kwargs[name].data_ptr()
-                for old, name in zip(previous, SCALE_NAMES)
+                old.data_ptr() != current.data_ptr()
+                for old, current in zip(previous, kwargs["scales"])
             )
         keys = set(runtime.compile_cache)
-        previous = tuple(kwargs[name] for name in SCALE_NAMES)
+        previous = kwargs["scales"]
 
 
 @pytest.mark.npu
@@ -2551,9 +2552,7 @@ def test_mxfp8_rebinds_packed_boundaries_with_capacity(device, compiled):
             q,
             k,
             v,
-            q_descale=qs,
-            k_descale=ks,
-            v_descale=vs,
+            scales=TensorwiseScales(qs, ks, vs),
             cu_seqlens_q=cq,
             cu_seqlens_k=ck,
             max_seqlen_q=64,
@@ -2580,7 +2579,7 @@ def test_mxfp8_rebinds_packed_boundaries_with_capacity(device, compiled):
         inputs, kwargs = to_device(case, device)
         out, lse = invoke(
             *inputs,
-            *(kwargs[name] for name in SCALE_NAMES),
+            *kwargs["scales"],
             kwargs["cu_seqlens_q"],
             kwargs["cu_seqlens_k"],
         )
@@ -2722,7 +2721,7 @@ def test_mxfp8_noncontiguous_data_and_scales(device, packed, native_scales):
         return result.view(value.dtype)
 
     inputs = tuple(strided(value) for value in inputs)
-    kwargs.update({name: strided(kwargs[name]) for name in SCALE_NAMES})
+    kwargs["scales"] = TensorwiseScales(*(strided(scale) for scale in kwargs["scales"]))
     out, lse = flash_attn_varlen_func(*inputs, **kwargs, return_lse=True)
     expected, el = reference(case)
     check(out, expected)
@@ -2733,7 +2732,7 @@ def test_mxfp8_noncontiguous_data_and_scales(device, packed, native_scales):
 def test_mxfp8_fixed_return_shape(device):
     case = make_case(q_lengths=(17,), k_lengths=(23,))
     inputs, kwargs = to_device(case, device)
-    scales = {name: kwargs[name] for name in SCALE_NAMES}
+    scales = {"scales": kwargs["scales"]}
     out, lse = flash_attn_func(*inputs, **scales, return_lse=False)
     assert out.shape == inputs[0].shape and out.dtype == torch.bfloat16 and lse is None
 
@@ -3103,8 +3102,6 @@ def test_sparse_compile_rebinds_scales(device, capacity):
         runtime,
     )
 
-    from .mxfp8_reference import SCALE_NAMES
-
     sparse = None
     device_sparse = None
     if capacity is not None:
@@ -3130,9 +3127,7 @@ def test_sparse_compile_rebinds_scales(device, capacity):
             q,
             k,
             v,
-            q_descale=qs,
-            k_descale=ks,
-            v_descale=vs,
+            scales=TensorwiseScales(qs, ks, vs),
             block_sparse_tensors=device_sparse,
             return_lse=True,
         )
@@ -3145,7 +3140,7 @@ def test_sparse_compile_rebinds_scales(device, capacity):
         current = copy.deepcopy(case)
         current["kwargs"]["q_descale"] += power
         inputs, kwargs = to_device(current, device)
-        out, lse = invoke(*inputs, *(kwargs[n] for n in SCALE_NAMES))
+        out, lse = invoke(*inputs, *kwargs["scales"])
         wanted, el = reference(current, sparse=sparse, query_rows=[rows])
         check(out[:, rows], wanted[:, rows])
         check(lse[:, :, rows].to(torch.float16), el[:, :, rows])
@@ -3304,7 +3299,7 @@ def _verify(
     normalize_quantized=False,
 ):
     inputs, scales = to_device(case, device)
-    scales = {name: scales[name] for name in SCALE_NAMES}
+    scales = {"scales": scales["scales"]}
     length = case["q_lengths"][0]
     rows = sorted({0, 31, 63, 64, 127, 128, 601, length - 1} | {i for i in range(0, length, 67)})
     cpu_aux = tuple(t.long() if t.dtype == torch.uint32 else t for t in auxiliary)
@@ -3499,7 +3494,7 @@ def test_masked_pipeline_label_aux_updates(device, rank):
     length, heads = 2048, 2
     case = make_case(q_lengths=(length,), k_lengths=(length,), q_heads=heads, kv_heads=1, seed=71)
     inputs, scales = to_device(case, device)
-    scales = {name: scales[name] for name in SCALE_NAMES}
+    scales = {"scales": scales["scales"]}
     # The low 32 bits deliberately collide; signed high bits distinguish IDs.
     labels = ((torch.arange(length) // 64) - 16) * (1 << 35) + 7
     if rank == 2:
@@ -3587,7 +3582,7 @@ def test_masked_pipeline_tiled_aux_cache(
         q_lengths=(qn,) * batch, k_lengths=(kn,) * batch, q_heads=heads, kv_heads=kv_heads, seed=89
     )
     inputs, scales = to_device(case, device)
-    scales = {name: scales[name] for name in SCALE_NAMES}
+    scales = {"scales": scales["scales"]}
     labels = torch.arange(max(qn, kn)) // 64
     if dtype == torch.int64:
         labels = (labels - 64) * (1 << 35) + 7
@@ -3941,7 +3936,7 @@ def test_dense_periodic_prefix_exact_tails_and_scale(device, scene, scale):
     )
     expected, logs = reference(case, mask_mod=mask_ref, scale=scale)
     inputs, kwargs = to_device(case, device)
-    scales = {name: kwargs[name] for name in SCALE_NAMES}
+    scales = {"scales": kwargs["scales"]}
     options = (
         {
             name: kwargs[name]
@@ -4082,7 +4077,7 @@ def test_repair_gaps_cross_ring_boundary_and_rebind_scales(device):
         changed["kwargs"]["q_descale"][:, heads] = 140
         expected, expected_lse = reference(changed, query_rows=[rows])
         # Reuse the same device scale storage: task selection must be rebuilt.
-        options["q_descale"].copy_(changed["kwargs"]["q_descale"])
+        options["scales"].q.copy_(changed["kwargs"]["q_descale"])
         output, lse = flash_attn_varlen_func(*inputs, **options, return_lse=True)
         output, lse = output.cpu(), lse.cpu()
         check(output[rows][:, heads], expected[rows][:, heads])
@@ -4409,16 +4404,12 @@ def test_global_labels_valid_and_masked_nan_rows(device):
     "compiled,output_cache_policy", [(False, True), (True, False)], indirect=["output_cache_policy"]
 )
 def test_global_labels_rebind_boundaries_scales_and_stream(device, compiled, output_cache_policy):
-    from .mxfp8_reference import SCALE_NAMES
-
     def call(q, k, v, qs, ks, vs, cq, ck, aq, ak, blocks):
         return flash_attn_varlen_func(
             q,
             k,
             v,
-            q_descale=qs,
-            k_descale=ks,
-            v_descale=vs,
+            scales=TensorwiseScales(qs, ks, vs),
             cu_seqlens_q=cq,
             cu_seqlens_k=ck,
             max_seqlen_q=65,
@@ -4461,7 +4452,7 @@ def test_global_labels_rebind_boundaries_scales_and_stream(device, compiled, out
             consumer.wait_stream(producer)
             actual, lse = invoke(
                 *inputs,
-                *(kwargs[name] for name in SCALE_NAMES),
+                *kwargs["scales"],
                 kwargs["cu_seqlens_q"],
                 kwargs["cu_seqlens_k"],
                 aq,
@@ -4909,7 +4900,7 @@ def test_fixed_aux_indices_rebind_without_fallback(
                 block_sparse_tensors=_device_sparse(sparse, device),
                 block_sparse_tensors_bwd=None,
                 return_lse=True,
-                **{name: kwargs[name] for name in SCALE_NAMES},
+                scales=kwargs["scales"],
             )
             check(actual, expected)
             check_quantized_lse(lse.cpu(), logs)
@@ -5473,16 +5464,12 @@ def test_single_segment_empty_inputs_with_capacity_hints(device, lengths):
 def test_single_segment_compiled_dynamic_lengths_and_scale_rebinding(device, monkeypatch):
     from flash_attn_npu_4.catlass_dsl import runtime
 
-    from .mxfp8_reference import SCALE_NAMES
-
     def call(q, k, v, qs, ks, vs, cq, ck):
         return flash_attn_varlen_func(
             q,
             k,
             v,
-            q_descale=qs,
-            k_descale=ks,
-            v_descale=vs,
+            scales=TensorwiseScales(qs, ks, vs),
             cu_seqlens_q=cq,
             cu_seqlens_k=ck,
             max_seqlen_q=513,
@@ -5525,7 +5512,7 @@ def test_single_segment_compiled_dynamic_lengths_and_scale_rebinding(device, mon
             inputs, kwargs = to_device(case, device)
             actual, lse = invoke(
                 *inputs,
-                *(kwargs[n] for n in SCALE_NAMES),
+                *kwargs["scales"],
                 kwargs["cu_seqlens_q"],
                 kwargs["cu_seqlens_k"],
             )

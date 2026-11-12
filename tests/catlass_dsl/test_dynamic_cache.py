@@ -344,7 +344,7 @@ def test_layout_isolation_and_bnsd_length_reuse(device, compiler, monkeypatch, k
                 *inputs,
                 **options,
                 layout=layout,
-                **{name: extra[name] for name in ("q_descale", "k_descale", "v_descale")},
+                scales=extra["scales"],
             )
             expected, logs = reference(case)
             check(out, expected)
