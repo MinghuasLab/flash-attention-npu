@@ -13,6 +13,7 @@
 #include "tla/layout.hpp"
 
 #include "fag_common.h"
+#include "fag_ub_layout.hpp"
 #include "fag_det_schedule.hpp"
 #include "fag_epilogue_post.hpp"
 #include "fag_epilogue_pre.hpp"
@@ -26,6 +27,9 @@
 #include "kernel_operator.h"
 
 static constexpr uint32_t TASK_PINGPONG = 2;
+// Keep the AIV physical UB row stride unchanged for 64-wide tasks. Only the
+// valid columns copied to L1 follow tiling kvTile.
+static constexpr uint32_t UB_S2_ROW_STRIDE = FagUbLayout::ROW_STRIDE;
 static constexpr uint8_t CROSS_CORE_SYNC_MODE = 4;
 static constexpr uint16_t V0_V1_FLAG_ID_OFFSET = 16;
 static constexpr uint16_t SYNC_C1_TO_V1_FLAG[TASK_PINGPONG] = {0, 1};
@@ -242,23 +246,19 @@ class FlashAttentionScoreGrad950 {
         //   ping: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
         //   pong: [mm1Res][mm2Res][attenMask][LSE][P(NZ, M+1 padding)][dS(NZ, M+1 padding)][delta]
         // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
-        const uint32_t mAligned = RoundUp(qBlockSize_, 16);
-        const uint32_t rowsPerSubBlock = mAligned / 2;
-        const uint32_t mmResTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(float);
-        const uint32_t attenMaskTileBytes = rowsPerSubBlock * kvBlockSize_ * sizeof(uint8_t);
-        const uint32_t lseTileBytes = RoundUp(rowsPerSubBlock, 8) * 8U * sizeof(float);
-        const uint32_t pTileBytes = (rowsPerSubBlock + 1) * kvBlockSize_ * sizeof(DataType);
-        const uint32_t dSTileBytes = pTileBytes;
-        const uint32_t deltaTileBytes = rowsPerSubBlock * 8U * sizeof(float);
-
-        const uint32_t mm1SlotOffset = 0;
-        const uint32_t mm2SlotOffset = mm1SlotOffset + mmResTileBytes;
-        const uint32_t attenMaskSlotOffset = mm2SlotOffset + mmResTileBytes;
-        const uint32_t lseSlotOffset = RoundUp(attenMaskSlotOffset + attenMaskTileBytes, 32);
-        const uint32_t pSlotOffset = RoundUp(lseSlotOffset + lseTileBytes, 32);
-        const uint32_t dSSlotOffset = RoundUp(pSlotOffset + pTileBytes, 32);
-        const uint32_t deltaSlotOffset = RoundUp(dSSlotOffset + dSTileBytes, 32);
-        const uint32_t pingPongHalfBytes = RoundUp(deltaSlotOffset + deltaTileBytes, 32);
+        // Offsets come from fag_ub_layout.hpp, which is also used by the host
+        // budget check in fag_tiling.cpp.
+        static_assert(sizeof(DataType) == FagUbLayout::P_ELEMENT_BYTES,
+                      "FagUbLayout assumes 2-byte P/dS elements");
+        const FagUbLayout::PipelineSlots ubSlots = FagUbLayout::MakePipelineSlots(qBlockSize_);
+        const uint32_t mm1SlotOffset = ubSlots.mm1;
+        const uint32_t mm2SlotOffset = ubSlots.mm2;
+        const uint32_t attenMaskSlotOffset = ubSlots.attenMask;
+        const uint32_t lseSlotOffset = ubSlots.lse;
+        const uint32_t pSlotOffset = ubSlots.p;
+        const uint32_t dSSlotOffset = ubSlots.dS;
+        const uint32_t deltaSlotOffset = ubSlots.delta;
+        const uint32_t pingPongHalfBytes = ubSlots.halfBytes;
 
         for (uint32_t i = 0; i < TASK_PINGPONG; ++i) {
             const uint32_t halfBaseOffset = i * pingPongHalfBytes;
@@ -1106,7 +1106,7 @@ class FlashAttentionScoreGrad950 {
         auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
                               inputStrides_.v.sequence);
         auto sLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
-                                       tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+                                       tla::MakeStride(UB_S2_ROW_STRIDE, tla::Int<1>{}));
         auto s = tla::MakeTensor(ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
         // Prefetch V^T on the group’s first task so MTE2 overlaps S cube.
         mm12.ComputeS(q, k, s, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv, slot,
@@ -1125,7 +1125,7 @@ class FlashAttentionScoreGrad950 {
         auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
                               inputStrides_.v.sequence);
         auto dpLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
-                                        tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
+                                        tla::MakeStride(UB_S2_ROW_STRIDE, tla::Int<1>{}));
         auto dp = tla::MakeTensor(ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
         // VT already prefetched in C1 when loadKv; only wait on first use.
         mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(block.s1Extend, block.s2Extend, vHeadDim_),

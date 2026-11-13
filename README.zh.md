@@ -308,7 +308,8 @@ def flash_attn_func(
         - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
         - 0.0 <= dropout_p < 1.0；0.0 表示关闭 dropout。
         - 不支持 alibi_slopes。
-        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同。
+          确定性反向不支持 headdim > 256。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -395,7 +396,8 @@ def flash_attn_varlen_func(
         - 0.0 <= dropout_p < 1.0；0.0 表示关闭 dropout。
         - 不支持 alibi_slopes。
         - cu_seqlens_q / cu_seqlens_k / block_table 若传入须为 int32。
-        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同。
+          确定性反向不支持 headdim > 256。
 
     返回：
         out: (total_q, nheads, headdim)。
@@ -579,7 +581,8 @@ def flash_attn_func(
         - batch_size > 0。
         - softcap >= 0（0.0 表示关闭）。
         - 不支持 alibi_slopes / attention_chunk / pack_gqa。
-        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+          确定性反向不支持 headdim > 256。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -660,7 +663,8 @@ def flash_attn_varlen_func(
         - softcap >= 0（0.0 表示关闭）。
         - 不支持 alibi_slopes / attention_chunk / pack_gqa。
         - cu_seqlens_q / cu_seqlens_k 若传入须为 int32。
-        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+          确定性反向不支持 headdim > 256。
 
     返回：
         out: (total_q, nheads, headdim)。
@@ -794,7 +798,8 @@ def flash_attn_varlen_func(
         - 不支持 pack_gqa / min_seqlen_k / gather_kv_indices。
         - cu_seqlens_* / seqused_* / page_table 若传入须为 int32。
         - 在 Ascend 950 上，分页 KV Cache 的 page_size 仅支持 128、256、512 或 1024。
-        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+          确定性反向不支持 headdim > 256。
 
     返回：
         out: (total_q, nheads, headdim_v) 或稠密 (batch_size, seqlen, nheads, headdim_v)。

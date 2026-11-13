@@ -938,7 +938,7 @@ std::vector<at::Tensor> mha_bwd(
     // NPU FAG bwd currently requires q/k/v/dout headdim to be equal.
     TORCH_CHECK(q_headdim == k_headdim && q_headdim == v_headdim && q_headdim == dout_headdim,
                 "mha_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
-    TORCH_CHECK(q_headdim > 0 && q_headdim <= 256, "mha_bwd: headdim must be in (0, 256].");
+    TORCH_CHECK(q_headdim > 0 && q_headdim <= 512, "mha_bwd: headdim must be in (0, 512].");
     TORCH_CHECK(qsizes == dout_sizes, "mha_bwd: q and dout must have the same shape");
     TORCH_CHECK(ksizes == vsizes, "mha_bwd: k and v must have the same shape");
     if (is_varlen_q) {
@@ -949,9 +949,10 @@ std::vector<at::Tensor> mha_bwd(
         TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
     }
-    // Kernel template only has 64/128/192/256 specializations.
+    // Kernel template only has 64/128/192/256/512 specializations.
     // For non-exact dims (e.g. 1, 80), choose the nearest supported bucket.
-    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
+    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 :
+                                 (q_headdim <= 256 ? 256 : 512)));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q.size(0) - 1) : qsizes[0];
     TORCH_CHECK(batch_size > 0, "mha_bwd: batch size must be positive");
     if (seqused_q_.has_value()) {
@@ -970,6 +971,9 @@ std::vector<at::Tensor> mha_bwd(
     }
     TORCH_CHECK(!deterministic || (!seqused_q_.has_value() && !seqused_k_.has_value()),
                 "mha_bwd: seqused_q/seqused_k with deterministic is not supported yet");
+    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
+    TORCH_CHECK(!(deterministic && q_headdim > 256),
+                "mha_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(!is_varlen_q || max_seqlen_q_.has_value(), "max_seqlen_q must be provided in varlen bwd.");
     TORCH_CHECK(!is_varlen_q || max_seqlen_k_.has_value(), "max_seqlen_k must be provided in varlen bwd.");
     int64_t max_seqlen_q = is_varlen_q ? max_seqlen_q_.value() : qsizes[1];

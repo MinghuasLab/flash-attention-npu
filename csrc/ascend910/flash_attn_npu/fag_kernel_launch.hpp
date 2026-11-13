@@ -9,11 +9,11 @@
 // Heavy half of the v2 FAGGeneral backward dispatch: the kernel definition
 // (via ../flash_attn_npu_3/fag_kernel.cpp), the OpCommand wrapper include and
 // the launch / switch macros. Included ONLY by the generated
-// autogen/fag_<dtype>_<layout>_headdim<64|128|192|256>[_softcap].cpp
+// autogen/fag_<dtype>_<layout>_headdim<64|128|192|256|512>[_softcap].cpp
 // FAG variant TUs,
 // each of which fixes one (headdim, softcap) pair and instantiates the 8
-// causal x deterministic x dropout FAGGeneral variants, so the 64
-// instantiations of a (dtype, layout) family compile in 8 parallel TUs
+// causal x deterministic x dropout FAGGeneral variants, so the 80
+// instantiations of a (dtype, layout) family compile in 10 parallel TUs
 // instead of one. The light half (combo selection) lives in
 // fag_general_dispatch_impl.hpp.
 //

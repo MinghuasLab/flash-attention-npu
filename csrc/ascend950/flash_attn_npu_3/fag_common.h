@@ -127,6 +127,9 @@ struct FAGTilingData {
 
     uint32_t qTile = 0;
     uint32_t kvTile = 0;
+    // 1: D>256 128x256 partial-resident puncture path (required for D>256).
+    // 0: legacy 128x128 full-residency schedule for D<=256.
+    uint32_t d512Partial = 0;
 
     // BN2S2 deterministic schedule (detSchedule == BN2S2).
     uint32_t detKind = 0;         // fag_det::Kind

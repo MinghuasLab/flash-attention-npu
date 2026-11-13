@@ -732,6 +732,10 @@ src_ascend950_v3 += glob.glob(
 src_ascend950_v3 += glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "combine_kernel.cpp"), recursive=True
 )
+# Isolated D>256 128x256 partial-resident bwd kernel (compile-isolated from fag_kernel.cpp).
+src_ascend950_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"), recursive=True
+)
 src_ascend910_v4 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True
 )
@@ -758,6 +762,10 @@ src_ascend950_v4 += glob.glob(
 src_ascend950_v4 += glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "combine_kernel.cpp"), recursive=True
 )
+# Isolated D>256 128x256 partial-resident bwd kernel (shared with v3 sources).
+src_ascend950_v4 += [
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"),
+]
 
 if BUILD_EXTENSIONS:
     if BUILD_VERSION in ("v2", "all") and BUILD_NPU in ("910", "all"):

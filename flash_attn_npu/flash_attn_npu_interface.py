@@ -70,11 +70,13 @@ def _validate_varlen_query(q, cu_seqlens_q):
 
 
 _HEADDIM_BWD_ALIGN = 64
-
+_HEADDIM_BWD_ALIGN_LARGE = 16
 
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
-    Pad headdim to a multiple of 64 for the bwd kernel.
+    Pad headdim for the bwd kernel: a multiple of 64 up to 256 (which matches the
+    kernel buckets exactly), and a multiple of 16 above 256 (16 elements is the
+    hardware granularity; wider D is segmented along K/N inside the kernel).
     """
     if dout.size(-1) != head_size_og:
         raise ValueError(
@@ -87,9 +89,10 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
             "(unequal headdim is not supported)"
         )
     ctx_headdim = qkv_out_headdims[0]
-    if ctx_headdim <= 0 or ctx_headdim > 256:
-        raise ValueError(f"headdim must be in (0, 256], got {ctx_headdim} ")
-    target = round_multiple(ctx_headdim, _HEADDIM_BWD_ALIGN)
+    if ctx_headdim <= 0 or ctx_headdim > 512:
+        raise ValueError(f"headdim must be in (0, 512], got {ctx_headdim} ")
+    align = _HEADDIM_BWD_ALIGN if ctx_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    target = round_multiple(ctx_headdim, align)
 
     def _pad(t):
         cur = t.size(-1)

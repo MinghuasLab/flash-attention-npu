@@ -64,9 +64,10 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
                                    event_t vToMte3Event, event_t mte3ToVEvent, uint32_t subBlockIdx)
     {
         using namespace AscendC::MicroAPI;
-        constexpr uint32_t rowStride = 128;
+        constexpr uint32_t rowStride = 128;  // Physical UB stride; see fag_kernel.cpp.
         constexpr uint32_t lanes = 64;
         constexpr uint32_t c0 = 32U / sizeof(ElementDS);
+        const uint32_t l1RowWidth = tiling_->kvTile;
 
         const uint32_t m = subBlockIdx == 0 ? block.firstHalfRealS1 : block.s1Extend - block.firstHalfRealS1;
         const uint32_t rowOffset = subBlockIdx * block.firstHalfRealS1;
@@ -102,7 +103,7 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
         const uint32_t l1M = RoundUp(block.s1Extend, c0);
         const uint32_t l1Offset = subBlockIdx == 0 ? 0 : block.firstHalfRealS1 * c0;
-        AscendC::DataCopyParams copyParams{static_cast<uint16_t>(rowStride / c0), static_cast<uint16_t>(m), 1,
+        AscendC::DataCopyParams copyParams{static_cast<uint16_t>(l1RowWidth / c0), static_cast<uint16_t>(m), 1,
                                            static_cast<uint16_t>(l1M - m)};
         AscendC::DataCopy(l1DSTensor[l1Offset], ubDSTensor, copyParams);
 

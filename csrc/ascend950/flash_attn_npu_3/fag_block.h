@@ -103,6 +103,35 @@ struct MmadAscend950FagSdP {
     static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 };
 
+// D>256 puncture: Q/Dy keep a 256-wide half; K^T/V^T and high-half stream
+// through the shared 128KB scratch (RES_KT+RES_VT). Used only by the
+// fag_bwd_d512_partial translation unit.
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = false>
+struct MmadAscend950FagSdPPartial {
+    using ArchTag = Arch::Ascend950;
+    static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
+    static constexpr uint32_t L1B_STAGES = L1B_STAGES_;
+    static constexpr uint32_t L0AB_STAGES = 2;
+    static constexpr uint32_t L0C_STAGES = Ascend950FagL0CLayout::L0C_SDP_SLOT_NUM;
+    static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagL0CLayout::L0C_BUF_SIZE;
+    static constexpr uint32_t BASE = 128;
+    static constexpr uint32_t HALF_D = 256;
+    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+};
+
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = false>
+struct MmadAscend950FagdQKVPartial {
+    using ArchTag = Arch::Ascend950;
+    static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
+    static constexpr uint32_t L1B_STAGES = L1B_STAGES_;
+    static constexpr uint32_t L0AB_STAGES = 2;
+    static constexpr uint32_t L0C_STAGES = Ascend950FagL0CLayout::L0C_SLOT_NUM;
+    static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagL0CLayout::L0C_BUF_SIZE;
+    static constexpr uint32_t BASE = 128;
+    static constexpr uint32_t HALF_D = 256;
+    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+};
+
 }
 // namespace Catlass::Gemm
 

@@ -131,7 +131,8 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
         const uint32_t l1M = RoundUp(block.s1Extend, NZ_C0_SIZE);
         const uint32_t l1Offset = subBlockIdx == 0 ? 0 : block.firstHalfRealS1 * NZ_C0_SIZE;
         AscendC::DataCopyParams pCopyParams;
-        pCopyParams.blockCount = S2_ROW_STRIDE / NZ_C0_SIZE;
+        // UB keeps the original 128-wide layout; L1 receives only kvTile columns.
+        pCopyParams.blockCount = tiling_->kvTile / NZ_C0_SIZE;
         pCopyParams.blockLen = static_cast<uint16_t>(s1RealSize);
         pCopyParams.srcStride = 1;
         pCopyParams.dstStride = static_cast<uint16_t>(l1M - s1RealSize);

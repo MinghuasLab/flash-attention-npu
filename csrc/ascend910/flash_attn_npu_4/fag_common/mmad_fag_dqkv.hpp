@@ -99,7 +99,8 @@ public:
     static_assert((BlockTileShape::N == 64) || \
                   (BlockTileShape::N == 128) || \
                   (BlockTileShape::N == 192) || \
-                  (BlockTileShape::N == 256), "BlockN must be in (64, 128, 192, 256)!");
+                  (BlockTileShape::N == 256) || \
+                  (BlockTileShape::N == 512), "BlockN must be in (64, 128, 192, 256, 512)!");
 
     // Check Layout
     static_assert(std::is_same_v<LayoutA, layout::RowMajor> || std::is_same_v<LayoutA, layout::ColumnMajor>, "LayoutA can only be in RowMajor, or ColumnMajor yet!");
@@ -188,7 +189,7 @@ public:
         }
     }
 
-// tile AL1; full-load B
+// tile AL1; B按N(D维)分L1BTileShape::N列段载入，D<=256时只有一段，与满载等价
 CATLASS_DEVICE
 void operator()(
     AscendC::GlobalTensor<ElementA> gmBlockA,  // Q^T: (D, M)
@@ -198,26 +199,52 @@ void operator()(
     GemmCoord actualShape, const bool enAtomic)
 {
     SetFlag();
-    uint32_t actualM = actualShape.m();
     uint32_t actualN = actualShape.n();
+
+    uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
+
+    // N(D)方向按L1B列容量切段，D<=256时nTileCount为1，循环体与原满载一致
+    uint32_t nTileCount = CeilDiv<L1BTileShape::N>(nRound);
+
+    for (uint32_t nTileIdx = 0; nTileIdx < nTileCount; nTileIdx++) {
+        uint32_t nBegin = nTileIdx * L1BTileShape::N;
+        uint32_t nAct = (nTileIdx < nTileCount - 1) ? L1BTileShape::N : (actualN - nTileIdx * L1BTileShape::N);
+        GemmNTile(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, nBegin, nAct, enAtomic);
+    }
+
+    WaitFlag();
+}
+
+// 处理一个 N 段（nBegin 起的 nAct 列）：段内流程与原"满载"一致
+CATLASS_DEVICE
+void GemmNTile(
+    AscendC::GlobalTensor<ElementA> gmBlockA,  // Q^T: (D, M)
+    AscendC::GlobalTensor<ElementB> gmBlockB,  // dO: (M, N)
+    AscendC::GlobalTensor<ElementC> gmBlockC,  // dk: (D, N)
+    LayoutA layoutA, LayoutB layoutB, LayoutC layoutC,
+    GemmCoord actualShape, uint32_t nBegin, uint32_t nAct, const bool enAtomic)
+{
+    uint32_t actualM = actualShape.m();
     uint32_t actualK = actualShape.k();
 
     uint32_t mRound = RoundUp<L1AAlignHelper::M_ALIGNED>(actualM);
-    uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
     uint32_t kRound = RoundUp<L1BAlignHelper::K_ALIGNED>(actualK);
+    uint32_t nActRound = RoundUp<L1BAlignHelper::N_ALIGNED>(nAct);
 
     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1ATileShape::M, L1ATileShape::K);
-    // B在L1中是满载的，所以其布局是实际K x actualN
-    LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kRound, nRound);
+    // B在L1中只驻留当前N段，所以其布局是实际K x 当前段N
+    LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kRound, nActRound);
 
-    // load matrix B tile from GM to L1 (Full load)
-    auto layoutTileB = layoutB.GetTileLayout(MakeCoord(actualK, actualN));
-    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+    // load matrix B tile from GM to L1 (当前N段 x 整段K，覆盖同一块L1B)
+    MatrixCoord BGMTileOffset{0, nBegin};
+    auto gmBTile = gmBlockB[layoutB.GetOffset(BGMTileOffset)];
+    auto layoutTileB = layoutB.GetTileLayout(MakeCoord(actualK, nAct));
+    // 覆盖写前等待上一N段的全部L1->L0B(MTE1)消费完成（首段消耗SetFlag预置标志）
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
-    copyGmToL1B(l1BTensorList[0], gmBlockB, layoutBInL1, layoutTileB);
+    copyGmToL1B(l1BTensorList[0], gmBTile, layoutBInL1, layoutTileB);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
-    // 【关键】由于B是满载，这里Wait完成后，L1B数据将一直安全可用，循环内不要再有L1B的事件操作。
+    // 【关键】这里Wait完成后，本段L1B数据在本nTile内一直安全可用，循环内不要再有L1B的MTE2_MTE1事件操作。
 
     AscendC::SetAtomicNone();
 
@@ -264,7 +291,7 @@ void operator()(
 
                 // ================= L0B MTE1 =================
                 auto l0BTile = l0BTensorList[l0BListId]; // 修正：统一使用 l0BListId
-                LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Round, actualN);
+                LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Round, nAct);
                 
                 // 【核心修复】L1B 坐标必须包含全局的 kAL1 偏移！
                 MatrixCoord l1BCoord{kAL1TileIdx * L1ATileShape::K + kL0TileIdx * L0TileShape::K, 0}; 
@@ -281,7 +308,7 @@ void operator()(
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(mmadSyncEventId);
 
                 bool initC = (kAL1TileIdx == 0) && (kL0TileIdx == 0);
-                
+                    
                 // make sure fixp already finished write, GM then issue mmad to write L0C
                 if (initC) {
                     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
@@ -295,7 +322,7 @@ void operator()(
                         unitFlag = 0b10;
                     }
                 }
-                tileMmad(l0CTile, l0ATile, l0BTile, mAL1Round, actualN, kL0Actual, initC, unitFlag);
+                tileMmad(l0CTile, l0ATile, l0BTile, mAL1Round, nAct, kL0Actual, initC, unitFlag);
 
                 AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
                 l0BListId = (l0BListId + 1 < L0AB_STAGES) ? (l0BListId + 1) : 0;
@@ -309,16 +336,17 @@ void operator()(
         } // end of kL1 loop
 
         // ================= COPY OUT =================
-        // Layout 修改：只 Copy 当前的实际 m 大小，而不是全 Block 大小
-        LayoutC layoutBlock = layoutC.GetTileLayout(MakeCoord(mAL1Actual, actualN));
-        auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mAL1Round, actualN));
-        MatrixCoord gmCoordC{mL1TileIdx * L1ATileShape::M, 0};
+        // Layout 修改：只 Copy 当前的实际 m 大小，而不是全 Block 大小；列偏移为当前N段起点
+        LayoutC layoutBlock = layoutC.GetTileLayout(MakeCoord(mAL1Actual, nAct));
+        auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mAL1Round, nAct));
+        MatrixCoord gmCoordC{mL1TileIdx * L1ATileShape::M, nBegin};
         auto gmTileC = gmBlockC[layoutC.GetOffset(gmCoordC)];
 
         // 【核心修复】增加 L0C 到 GM 的安全同步
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
 
+        // enAtomic原样透传：两段N写不同列，不因nTileIdx额外开关atomic
         if (enAtomic) {
             AscendC::SetAtomicType<float>();
             copyL0CToGm(gmTileC, l0CTensorList[0], layoutBlock, layoutInL0C, 0b11);
@@ -330,7 +358,8 @@ void operator()(
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
     } // end of mL1 loop
 
-    WaitFlag();
+    // 本N段的全部L1->L0B(MTE1)消费已完成（MTE1队列保序），允许下一N段覆盖写L1B
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
 }
 
 protected:
