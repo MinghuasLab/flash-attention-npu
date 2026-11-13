@@ -250,7 +250,10 @@ def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=Fal
         )
         for i, arg in enumerate(runtime)
     )
-    executor(*bound, block_num=block_num, stream=stream)
+    try:
+        executor(*bound, block_num=block_num, stream=stream)
+    finally:
+        bindings.clear()
 
 
 @lru_cache(maxsize=32)
