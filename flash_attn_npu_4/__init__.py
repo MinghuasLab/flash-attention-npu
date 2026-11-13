@@ -39,10 +39,19 @@ if is_ascend910():
     )
 elif is_ascend950():
     from .flash_attn_npu_interface_950 import (
+        TensorwiseScales as TensorwiseScales,
         flash_attn_combine as flash_attn_combine,
         flash_attn_func as flash_attn_func,
+        flash_attn_func_with_quant as flash_attn_func_with_quant,
         flash_attn_varlen_func as flash_attn_varlen_func,
+        flash_attn_varlen_func_with_quant as flash_attn_varlen_func_with_quant,
         get_scheduler_metadata as get_scheduler_metadata,
     )
+
+    __all__ += [
+        "TensorwiseScales",
+        "flash_attn_func_with_quant",
+        "flash_attn_varlen_func_with_quant",
+    ]
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")

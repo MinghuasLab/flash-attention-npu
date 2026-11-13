@@ -1,7 +1,9 @@
 """FA4 dispatch/ABI tests. CPU kernel substitution is explicit in cpu_runtime."""
 
 import ast
+import importlib.util
 import inspect
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional, Tuple
@@ -9,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import torch_npu
 
 import flash_attn_npu_4 as fa4
 from flash_attn_npu_4 import catlass_dsl, flash_attn_func, flash_attn_varlen_func
@@ -82,31 +85,83 @@ def test_default_backend_and_empty_aux(monkeypatch, entry, options):
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-@pytest.mark.parametrize("invalid", [None, "qv", "q", "k", "v"])
-def test_ordinary_fp8_preserves_upstream_guards(monkeypatch, entry, invalid):
+def test_quantized_entry_signature_and_forwarding(monkeypatch, entry):
+    quant_entry = getattr(fa4, f"{entry.__name__}_with_quant")
+    quant_parameters = dict(inspect.signature(quant_entry).parameters)
+    assert list(quant_parameters)[:4] == ["q", "k", "v", "scales"]
+    scales_parameter = quant_parameters.pop("scales")
+    assert scales_parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert scales_parameter.default is inspect.Parameter.empty
+    assert list(quant_parameters.values()) == list(inspect.signature(entry).parameters.values())
+
     backend = Mock(return_value=object())
-    cls = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
-    monkeypatch.setattr(cls, "apply", backend)
-    monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("DSL")))
+    monkeypatch.setattr(dsl_utils, "attention", backend)
+    native = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
+    monkeypatch.setattr(native, "apply", Mock(side_effect=AssertionError("native backend")))
+    arguments = {name: object() for name in quant_parameters}
+    arguments.update({name: torch.empty(0, dtype=torch.float8_e4m3fn) for name in ("q", "k", "v")})
+    scale = torch.empty(0, dtype=torch.uint8)
+    scales = fa4.TensorwiseScales(q=scale, k=scale, v=scale)
+
+    qkv = tuple(arguments.pop(name) for name in ("q", "k", "v"))
+    assert quant_entry(*qkv, scales, *arguments.values()) is backend.return_value
+    assert quant_entry(*qkv, **arguments, scales=scales) is backend.return_value
+    for call in backend.call_args_list:
+        assert call.args == qkv
+        assert call.kwargs == dict(arguments, scales=scales, varlen=entry is flash_attn_varlen_func)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("invalid", [None, "qv", "q", "k", "v"])
+def test_native_fp8_preserves_upstream_guards(monkeypatch, entry, invalid):
+    backend = Mock(return_value=object())
+    native = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
+    monkeypatch.setattr(native, "apply", backend)
+    monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("CATLASS backend")))
     inputs = {
         name: torch.empty(0, dtype=torch.float8_e4m3fn, requires_grad=name == invalid)
         for name in ("q", "k", "v")
     }
-    options = {"aux_tensors": [], "aux_scalars": ()}
-    if invalid == "qv":
-        options["qv"] = torch.empty(0)
     if invalid is None:
-        assert entry(**inputs, **options) is backend.return_value
-    else:
-        message = "q/k/v inputs only" if invalid == "qv" else "inference forward only"
-        with pytest.raises(NotImplementedError, match=message):
-            entry(**inputs, **options)
-        backend.assert_not_called()
+        assert entry(**inputs) is backend.return_value
+        return
+    if invalid == "qv":
+        inputs["qv"] = torch.empty(0)
+    message = "q/k/v inputs only" if invalid == "qv" else "inference forward only"
+    with pytest.raises(NotImplementedError, match=message):
+        entry(**inputs)
+    backend.assert_not_called()
 
 
 def test_combine_remains_public():
     assert "flash_attn_combine" in fa4.__all__
     assert fa4.flash_attn_combine is legacy.flash_attn_combine
+
+
+def test_910_package_does_not_export_quantized_attention(monkeypatch):
+    names = (
+        "flash_attn_func",
+        "flash_attn_varlen_func",
+        "flash_attn_combine",
+        "get_scheduler_metadata",
+    )
+    backend = SimpleNamespace(**{name: getattr(fa4, name) for name in names})
+    monkeypatch.setitem(sys.modules, "flash_attn_npu_4.flash_attn_npu_interface", backend)
+    monkeypatch.setattr(torch_npu.npu, "get_device_name", lambda: "Ascend910B")
+
+    spec = importlib.util.spec_from_file_location(fa4.__name__, fa4.__file__)
+    package = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(package)
+
+    assert package.flash_attn_func is backend.flash_attn_func
+    assert package.flash_attn_varlen_func is backend.flash_attn_varlen_func
+    for name in (
+        "TensorwiseScales",
+        "flash_attn_func_with_quant",
+        "flash_attn_varlen_func_with_quant",
+    ):
+        assert not hasattr(package, name)
+        assert name not in package.__all__
 
 
 def test_aux_container_validation():

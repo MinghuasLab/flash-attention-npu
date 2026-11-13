@@ -1059,13 +1059,13 @@ def _paired_pipeline(
     # Sparse block indices may be nonconsecutive; carry both through the pipeline.
     # PV ping-pong buffers retain the running accumulator, freeing space for
     # four QK buffers (two groups in flight). Aligned SIMT borrows the
-    # consumed second score for the first probability tile; ragged sparse
-    # SIMT retains its shared score and independent tail staging buffer.
+    # consumed second score for the first probability tile. Tail staging borrows
+    # the probability buffer only while its MTE3 ownership token is available.
     # Final output compacts the consumed PV buffer's prefix.
     # Tail staging borrows the output slot after its DMA completes.
     # Mask predicates reuse on-chip buffers without a global workspace.
     dtype = q.ptr.dtype
-    reuse_score_buffers = (dense_mask and indexed) or (indexed and not ragged)
+    reuse_score_buffers = indexed
     head_group = tla.as_numeric(1)
     if tla.const_expr(dense_mask and indexed):
         # Remove common power-of-two factors from the per-core query stride.
@@ -1218,9 +1218,7 @@ def _paired_pipeline(
     stage0_last = tla.as_numeric(0)
     stage1_last = tla.as_numeric(0)
     kblocks = (max_k + 127) // 128
-    info = ()
-    if tla.const_expr(ragged):
-        info = (max_q, max_k, tla.Int32(0), tla.Int32(0))
+    info = (max_q, max_k, tla.Int32(0), tla.Int32(0))
     for task in tla.range(tla.arch.block_idx(), batch * q_heads * q_blocks, tla.arch.block_num()):
         if tla.const_expr(dense and not (dense_mask and indexed)):
             qb = task % q_blocks
@@ -1282,7 +1280,7 @@ def _paired_pipeline(
                 tail_free,
                 tail_ready,
                 True,
-                (outfree,),
+                (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
             )
         steps = count
         if count == 0:
@@ -1393,7 +1391,7 @@ def _paired_pipeline(
                             tail_free,
                             tail_ready,
                             True,
-                            (outfree,),
+                            (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
                         )
                         with tla.cube():
                             product = _mm(
@@ -1914,7 +1912,7 @@ def _paired_pipeline(
                                 tail_free,
                                 tail_ready,
                                 True,
-                                (outfree,),
+                                (pfree0,) if tla.const_expr(reuse_score_buffers) else (outfree,),
                             )
                             with tla.cube():
                                 _mm(
@@ -2126,7 +2124,7 @@ def _paired_pipeline(
 
 
 @tla.kernel
-def attention_kernel(
+def flash_fwd_kernel(
     q: tla.Tensor,
     k: tla.Tensor,
     v: tla.Tensor,
@@ -2395,7 +2393,9 @@ def attention_kernel(
             klen = max_k
             qs = tla.as_numeric(0)
             ks = tla.as_numeric(0)
-            info = ()
+            qs = b * max_q if tla.const_expr(varlen[0]) else tla.Int32(0)
+            ks = b * max_k if tla.const_expr(varlen[1]) else tla.Int32(0)
+            info = (qlen, klen, qs, ks)
             if tla.const_expr(ragged):
                 if tla.const_expr(varlen[0]):
                     qs = cu_q[b]
