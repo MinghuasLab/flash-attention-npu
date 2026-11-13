@@ -493,12 +493,13 @@ def flash_attn_with_kvcache(
 
     约束：
         - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128。
         - nheads % nheads_k == 0。
-        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
         - batch_size > 0。
-        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
-        - 不支持 alibi_slopes / rotary / FP8 descales / attention_chunk / pack_gqa。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / rotary / attention_chunk / pack_gqa。
         - cache_seqlens / page_table / cu_seqlens_* 若传入须为 int32。
         - 不支持反向传播。
 
@@ -571,12 +572,13 @@ def flash_attn_func(
 
     约束：
         - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
         - nheads % nheads_k == 0。
-        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
         - batch_size > 0。
-        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
-        - 不支持 alibi_slopes / FP8 descales / attention_chunk / pack_gqa。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / attention_chunk / pack_gqa。
         - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
 
     返回：
@@ -649,13 +651,14 @@ def flash_attn_varlen_func(
 
     约束：
         - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
         - nheads % nheads_k == 0。
-        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
         - batch_size > 0。
         - total_q > 0；Q 必须至少包含一个 query token。
-        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
-        - 不支持 alibi_slopes / FP8 descales / attention_chunk / pack_gqa。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / attention_chunk / pack_gqa。
         - cu_seqlens_q / cu_seqlens_k 若传入须为 int32。
         - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
 
@@ -780,11 +783,12 @@ def flash_attn_varlen_func(
 
     约束：
         - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
         - nheads % nheads_k == 0。
-        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
         - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
         - batch_size > 0。
-        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - softcap >= 0（0.0 表示关闭）。
         - score_mod / mask_mod 在 Ascend 950 上路由到原生 Flex 后端。
         - Flex 后端不支持 learnable_sink。
         - 不支持 pack_gqa / min_seqlen_k / gather_kv_indices。
@@ -872,7 +876,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | 旋转位置编码 (RoPE) | -  | -  |
 | ALiBi               | ✅  | -  |
 | Softcapping         | ✅ | ✅ |
-| FP8 量化            | -  | -  |
+| FP8 量化            | -  | ✅ |
 | 变长序列            | ✅ | ✅ |
 
 #### flash_attn_func
@@ -887,7 +891,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | 反向传播            | ✅ | ✅ |
 | ALiBi               | ✅  | -  |
 | Softcapping         | ✅ | ✅ |
-| FP8 量化            | -  | -  |
+| FP8 量化            | -  | ✅ |
 | Dropout             | ✅ | -  |
 
 #### flash_attn_varlen_func
@@ -904,7 +908,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | 分页 KV 缓存        | ✅ | ✅  | ✅ |
 | ALiBi               | ✅  | -  | -  |
 | Softcapping         | ✅ | ✅ | ✅ |
-| FP8 量化            | -  | -  | -  |
+| FP8 量化            | -  | ✅ | ✅ |
 | Dropout             | ✅ | -  | -  |
 
 #### flash_attn_combine
