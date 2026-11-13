@@ -73,6 +73,19 @@ if BUILD_EXTENSIONS:
 #          both 910 and 950.
 BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
 
+BUILD_VERSION_ALIASES = {
+    "fa2": "v2",
+    "fa3": "v3",
+    "fa4": "v4",
+}
+
+BUILD_VERSION = BUILD_VERSION_ALIASES.get(BUILD_VERSION, BUILD_VERSION)
+
+if BUILD_VERSION not in ("v2", "v3", "v4", "all"):
+    raise RuntimeError(
+        f"Invalid FLASH_ATTN_BUILD_VERSION={BUILD_VERSION!r}; choose fa2, fa3, fa4, or all."
+    )
+
 
 def get_build_npu():
     target = os.getenv("FLASH_ATTN_BUILD_NPU", "auto").lower()
@@ -883,6 +896,12 @@ cmdclass = {"bdist_wheel": CachedWheelsCommand}
 if ext_modules:
     cmdclass["build_ext"] = BishengBuildExt
 
+print("[BUILD-CONFIG] version =", BUILD_VERSION)
+print("[BUILD-CONFIG] npu =", BUILD_NPU)
+print(
+    "[BUILD-CONFIG] extensions =",
+    [ext.name for ext in ext_modules],
+)
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
