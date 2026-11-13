@@ -843,7 +843,7 @@ if BUILD_EXTENSIONS:
 
 def get_package_version():
     config = wheel_metadata.get_build_config()
-    if BUILD_EXTENSIONS:
+    if os.getenv("FLASH_ATTN_WHEEL_VARIANT"):
         return config.wheel_version
     return config.version
 
@@ -862,7 +862,7 @@ class CachedWheelsCommand(_bdist_wheel):
     """
 
     def run(self):
-        if FORCE_BUILD:
+        if FORCE_BUILD or not os.getenv("FLASH_ATTN_WHEEL_VARIANT"):
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
