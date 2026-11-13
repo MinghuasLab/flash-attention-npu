@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 import importlib.util
 from pathlib import Path
 import torch_npu

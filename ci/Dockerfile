@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Minghua Shen.
 #
 # 统一 CI 镜像 (参数化): 指定 CANN 基础镜像 + torch + torch_npu 版本。
 # 910B / 950 等所有架构均用本 Dockerfile 构建, 由 ci/build_matrix_images.sh 读取

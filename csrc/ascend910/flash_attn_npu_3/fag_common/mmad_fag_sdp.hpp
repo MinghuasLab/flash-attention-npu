@@ -1,3 +1,15 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
+
 #ifndef FAG_COMMON_GEMM_BLOCK_MMAD_FAG_SDP_HPP
 #define FAG_COMMON_GEMM_BLOCK_MMAD_FAG_SDP_HPP
 
@@ -12,7 +24,7 @@
 
 namespace Catlass::Gemm::Block {
 
-template <    
+template <
     uint32_t L1A_STAGES_,
     uint32_t L1B_STAGES_,
     bool ENABLE_UNIT_FLAG_,
@@ -127,7 +139,7 @@ public:
     static_assert((L0A_TILE_SIZE * L0_STAGES) <= L0A_SIZE, "L0TileShape exceeding the L0A space!");
     static_assert((L0B_TILE_SIZE * L0_STAGES) <= L0B_SIZE, "L0TileShape exceeding the L0B space!");
     static_assert(L0C_TILE_SIZE <= L0C_SIZE, "L0TileShape exceeding the L0C space!");
-    
+
     /// Construct
     CATLASS_DEVICE
     BlockMmadFagSdp(Arch::Resource<ArchTag> &ArchResource, uint32_t l1BufAddrStart = 0)
@@ -146,7 +158,7 @@ public:
            1          2         [0]      [1, 2]
            2          1         [0, 1]   [2]
            2          2         [0, 1]   [2, 3]
-        */        
+        */
         for (uint32_t i = 0; i < L1A_STAGES; i++) {
             l1ATensorList[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1AAddrStart + L1A_SIZE * i);
             l1AEventList[i] = i;

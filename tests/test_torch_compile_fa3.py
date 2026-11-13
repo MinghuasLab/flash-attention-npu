@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 import pytest
 
 from torch_compile_utils import (

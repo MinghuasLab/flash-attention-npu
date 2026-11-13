@@ -1,11 +1,8 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- *
- * Pybind entrypoint for `flash_attn_npu_4_950` — the Ascend 950 backend
- * for FlashAttention v4.
- *
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// Pybind entrypoint for `flash_attn_npu_4_950` — the Ascend 950 backend
+// for FlashAttention v4.
+
 
 #include <torch/extension.h>
 #include <cmath>

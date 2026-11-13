@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Minghua Shen.
+
 """Measure golden-cache reuse with pytest on a local NPU machine.
 
 Run each revision from the same checkout path and reuse --cache-dir.  The

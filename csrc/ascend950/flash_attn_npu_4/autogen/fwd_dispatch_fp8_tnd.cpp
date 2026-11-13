@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 // v4 (950) forward FAInfer dispatch, fp8 x TND variant.
 // One explicit instantiation per translation unit so the FAInfer / FAInferDn
 // kernel templates compile in parallel across cores; head_dim is a runtime

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # 阶段1: 编译 (容器内执行, 不需要 NPU, 不加锁)
 #   1. bash ci/init_submodules.sh  (浅拉 + runner 磁盘缓存)

@@ -1,8 +1,15 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
  *
  * Host-side mirror of the fag_det:: schedule selectors and round counters.
- *
  * The device header fag_det_schedule.hpp is compiled only inside __aicore__
  * kernels, so the host tiler cannot call it.  This header carries the same
  * selection rules and round formulas with plain inline functions.  Keep the

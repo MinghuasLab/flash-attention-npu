@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Torch sparse metadata and native NPU construction, without CUDA dependencies.
 
 Only block metadata is transformed here, never an elementwise attention mask.

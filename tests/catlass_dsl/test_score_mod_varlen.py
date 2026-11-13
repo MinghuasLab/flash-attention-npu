@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Global score offsets, multiple auxiliary tensors and explicit VJPs."""
 
 import pytest

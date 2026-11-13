@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 
 #ifndef CSRC_ASCENDC950_FLASH_ATTN_NPU_V3_TILING_FROM_TENSORS_HPP
 #define CSRC_ASCENDC950_FLASH_ATTN_NPU_V3_TILING_FROM_TENSORS_HPP

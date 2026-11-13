@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Compile-time TLA binding with direct Tensor launches on a warm cache.
 
 All layouts here are static pointer ABIs. Compiled launch packing reads the

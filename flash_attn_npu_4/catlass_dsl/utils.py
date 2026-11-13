@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """FA4 runtime checks, Flex routing and native CATLASS API adaptation.
 
 Routing is available without CATLASS. Native dependencies and graph operators

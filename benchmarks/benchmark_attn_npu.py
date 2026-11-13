@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Minghua Shen.
+
 """FA2/FA3/FA4 vs CANN FusionAttention on Ascend NPU.
 
 BSND/TND, causal/noncausal, training FWD and FWD+BWD.

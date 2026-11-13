@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Declare the execution mode of native attention callbacks."""
 
 from dataclasses import dataclass

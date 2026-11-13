@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Test-only Torch attention and sparse-metadata oracles."""
 
 import inspect

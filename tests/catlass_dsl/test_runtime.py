@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Executor rebinding and producer/consumer streams through the public API."""
 
 import catlass.tla as tla

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Opaque CATLASS launches for Dynamo, FakeTensor and AOTAutograd.
 
 Only immutable callback identities live in the process-local registry. Tensor

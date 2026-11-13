@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 from ._version import __version__ as __version__
 
 import torch_npu

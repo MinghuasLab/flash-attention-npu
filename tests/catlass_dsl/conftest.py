@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Shared fixtures for CATLASS DSL tests."""
 
 import pytest

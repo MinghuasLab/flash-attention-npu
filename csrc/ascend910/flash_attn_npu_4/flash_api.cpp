@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #include <torch/extension.h>
 #include "../attention_window.h"
 

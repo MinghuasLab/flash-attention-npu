@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # 扫描宿主机 Ascend NPU，选一张可用于 CI 的卡。
 #

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Ragged and uniform attention across independently packed Q/KV layouts."""
 
 import pytest

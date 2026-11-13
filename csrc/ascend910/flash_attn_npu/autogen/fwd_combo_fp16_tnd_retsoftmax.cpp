@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 // v2 forward FAInfer combo, TND variant, softcap=false return_softmax=true dropout=false.
 // Fixes the (softcap, return_softmax, dropout) triple at compile time and
 // switches over paged x mask (6 FAInfer instantiations) so the 48 variants

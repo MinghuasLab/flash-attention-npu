@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # Build and validate one release-matrix combination inside its CANN image.
 
 set -euo pipefail
