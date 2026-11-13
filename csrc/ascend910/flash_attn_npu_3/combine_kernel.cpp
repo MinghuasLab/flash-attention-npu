@@ -32,6 +32,18 @@ __aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t align)
     return (value + align - 1U) / align * align;
 }
 
+// 0: finite LSE row, 1: +inf present, 2: NaN present.
+__aicore__ inline float ClassifyLseRow(float value)
+{
+    if (value != value) {
+        return 2.0f;
+    }
+    if (value == std::numeric_limits<float>::infinity()) {
+        return 1.0f;
+    }
+    return 0.0f;
+}
+
 template <class OutDType>
 __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR outGm,
                                      GM_ADDR lseOutGm, uint32_t isDense, uint32_t writeLse, uint32_t numSplits,
@@ -69,6 +81,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
     // Denominator of the normalised weights: sum_s exp(lse_s - max).
     auto denUb = resource.ubBuf.template GetBufferByByte<float>(off);
     off += rA * sizeof(float);
+    auto specialUb = resource.ubBuf.template GetBufferByByte<float>(off);
+    off += rA * sizeof(float);
     auto accUb = resource.ubBuf.template GetBufferByByte<float>(off);
     off += rA * dA * sizeof(float);
     // Kahan compensation keeps fp32 accumulation within ~1 ULP across splits.
@@ -79,8 +93,9 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
     auto wTileUb = resource.ubBuf.template GetBufferByByte<float>(off);
     off += rA * dA * sizeof(float);
     // Reduce / BroadCast take a uint8_t shared temporary workspace.
+    const uint32_t sharedTmpFloats = (dA == 0U) ? rA : rA * dA;
     auto sharedTmpUb = resource.ubBuf.template GetBufferByByte<uint8_t>(off);
-    off += rA * dA * sizeof(float);
+    off += sharedTmpFloats * sizeof(float);
     auto outUb = resource.ubBuf.template GetBufferByByte<OutDType>(off);
     off += rA * dA * kOutBytes;
 
@@ -134,6 +149,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
                     AscendC::DataCopyPadExtParams<float>(false, 0U, static_cast<uint8_t>(loadElems - nrows),
                                                          std::numeric_limits<float>::lowest()));
             }
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
         } else {
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 const int64_t base = lseBase + static_cast<int64_t>(split) * lSplit;
@@ -144,6 +161,24 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
         }
+
+        // Preserve logsumexp semantics separately from the finite weight mask:
+        // any NaN -> NaN, otherwise any +inf -> +inf, all -inf -> -inf.
+        for (uint32_t row = 0U; row < rA; ++row) {
+            float mode = 0.0f;
+            for (uint32_t split = 0U; split < numSplits; ++split) {
+                const float splitMode = ClassifyLseRow(lseUb.GetValue(split * rA + row));
+                if (splitMode > mode) {
+                    mode = splitMode;
+                }
+                if (mode == 2.0f) {
+                    break;
+                }
+            }
+            specialUb.SetValue(row, mode);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
 
@@ -161,6 +196,19 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Exp(redTmpUb, redTmpUb, static_cast<int32_t>(totalCount));
         AscendC::PipeBarrier<PIPE_V>();
+        // CPU/NV golden filters every non-finite weight to zero. A +inf or
+        // NaN LSE makes all weights in that row non-finite, so clear the row.
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        for (uint32_t row = 0U; row < rA; ++row) {
+            if (specialUb.GetValue(row) != 0.0f) {
+                for (uint32_t split = 0U; split < nsA; ++split) {
+                    redTmpUb.SetValue(split * rA + row, 0.0f);
+                }
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
         AscendC::ReduceSum<float, AscendC::Pattern::Reduce::RA, false>(sumUb, redTmpUb, sharedTmpUb, shapeSplit, true);
         AscendC::PipeBarrier<PIPE_V>();
         // Keep sum_s exp(lse_s - max) as the weight denominator; ln() below
@@ -188,6 +236,37 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         // Clamp den to 1 so an all-masked row yields zero instead of NaN.
         AscendC::Maxs(denUb, denUb, 1.0f, static_cast<int32_t>(rA));
         AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        for (uint32_t row = 0U; row < rA; ++row) {
+            const float mode = specialUb.GetValue(row);
+            if (mode == 1.0f) {
+                if (writeLse != 0U) {
+                    lseOutUb.SetValue(row, std::numeric_limits<float>::infinity());
+                }
+                denUb.SetValue(row, 1.0f);
+            } else if (mode == 2.0f) {
+                if (writeLse != 0U) {
+                    lseOutUb.SetValue(row, std::numeric_limits<float>::quiet_NaN());
+                }
+                denUb.SetValue(row, 1.0f);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+
+        if (headDim == 0U) {
+            if (writeLse != 0U) {
+                const int64_t lseOutBase = static_cast<int64_t>(bIdx) * lseOutBatch +
+                                           static_cast<int64_t>(hIdx) * lseOutHead + static_cast<int64_t>(s0);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopyPad(
+                    gLseOut[lseOutBase], lseOutUb,
+                    AscendC::DataCopyExtParams(1U, static_cast<uint32_t>(nrows * sizeof(float)), 0U, 0U, 0U));
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            continue;
+        }
 
         AscendC::Duplicate(accUb, 0.0f, static_cast<int32_t>(rA * dA));
         AscendC::PipeBarrier<PIPE_V>();
@@ -218,21 +297,42 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
 
-            AscendC::BroadCast<float, 2, 1>(wTileUb, redTmpUb[split * rA], dstShapeO, srcShapeO, sharedTmpUb);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(oUb, oUb, wTileUb, static_cast<int32_t>(rA * dA));
-            AscendC::PipeBarrier<PIPE_V>();
-            // Kahan: y = t - c; s = acc + y; c = (s - acc) - y; acc = s.
-            // oUb holds t and is recycled for s, wTileUb holds y.
-            AscendC::Sub(wTileUb, oUb, compUb, static_cast<int32_t>(rA * dA));
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(oUb, accUb, wTileUb, static_cast<int32_t>(rA * dA));
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(compUb, oUb, accUb, static_cast<int32_t>(rA * dA));
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(compUb, compUb, wTileUb, static_cast<int32_t>(rA * dA));
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds(accUb, oUb, 0.0f, static_cast<int32_t>(rA * dA));
+            for (uint32_t row = 0U; row < nrows; ++row) {
+                AscendC::Muls(oUb[row * dA], oUb[row * dA], redTmpUb.GetValue(split * rA + row),
+                              static_cast<int32_t>(dA));
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
+                bool nonFinite = false;
+                for (uint32_t col = 0U; col < headDim; ++col) {
+                    const float term = oUb.GetValue(row * dA + col);
+                    const float total = accUb.GetValue(row * dA + col);
+                    if (term != term || total != total || term == std::numeric_limits<float>::infinity() ||
+                        term == -std::numeric_limits<float>::infinity() ||
+                        total == std::numeric_limits<float>::infinity() ||
+                        total == -std::numeric_limits<float>::infinity()) {
+                        nonFinite = true;
+                        break;
+                    }
+                }
+                if (nonFinite) {
+                    // Kahan's (s - acc) - y step is inf - inf for a non-finite
+                    // addend. Fall back to IEEE addition for this row.
+                    AscendC::Add(accUb[row * dA], accUb[row * dA], oUb[row * dA], static_cast<int32_t>(dA));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate(compUb[row * dA], 0.0f, static_cast<int32_t>(dA));
+                } else {
+                    AscendC::Sub(wTileUb[row * dA], oUb[row * dA], compUb[row * dA], static_cast<int32_t>(dA));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Add(oUb[row * dA], accUb[row * dA], wTileUb[row * dA], static_cast<int32_t>(dA));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Sub(compUb[row * dA], oUb[row * dA], accUb[row * dA], static_cast<int32_t>(dA));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Sub(compUb[row * dA], compUb[row * dA], wTileUb[row * dA], static_cast<int32_t>(dA));
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Adds(accUb[row * dA], oUb[row * dA], 0.0f, static_cast<int32_t>(dA));
+                }
+            }
             AscendC::PipeBarrier<PIPE_V>();
         }
         // comp stores the negated low-order error, so subtract it before normalising.
