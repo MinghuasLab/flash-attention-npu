@@ -37,6 +37,7 @@ struct FwdLaunchArgs {
     bool is_causal;
     bool is_local; // sliding-window attention (MASK_SWA)
     bool has_softcap;
+    bool mlaDecodeGemv = false;
     KernelCommon::FaiKenel::inputLayout layout; // BSND, TND or BNSD
     // BNSD only: the allocated KV sequence length (S_alloc = k.size(2)), i.e. the
     // KV head-plane stride in tokens. 0 for BSND / TND.
@@ -56,6 +57,7 @@ struct FwdLaunchArgs {
     FAInferTilingParams tiling;
     uint8_t* sequsedQDevice;  // per-batch used Q lengths; nullptr when absent
     uint8_t* sequsedKVDevice; // per-batch used KV lengths; nullptr when absent
+    uint8_t* qvDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp

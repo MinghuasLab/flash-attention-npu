@@ -39,6 +39,7 @@ struct FwdLaunchArgs {
     bool is_local; // sliding-window attention (MASK_SWA)
     bool flashDecodeFlag;
     bool has_softcap;
+    bool mlaDecodeGemv;
     uint8_t* qDevice;
     uint8_t* kDevice;
     uint8_t* vDevice;
@@ -55,6 +56,7 @@ struct FwdLaunchArgs {
     uint8_t* sequsedQDevice;
     uint8_t* sequsedKVDevice;
     uint8_t* sinkDevice; // nullptr disables learnable_sink
+    uint8_t* qvDevice;
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp
