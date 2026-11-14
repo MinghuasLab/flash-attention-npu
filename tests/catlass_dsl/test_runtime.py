@@ -1,5 +1,7 @@
 """Executor rebinding and producer/consumer streams through the public API."""
 
+import gc
+import weakref
 from unittest.mock import Mock
 
 import catlass.tla as tla
@@ -12,6 +14,42 @@ from flash_attn_npu_4.catlass_dsl import builtin, flash_attn_func, flash_attn_va
 from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
 
 pytestmark = pytest.mark.npu
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["success", "launch-error"])
+def test_launch_releases_tensor_owners_without_gc(monkeypatch, raises):
+    """Launch providers must not retain tensors until cyclic GC runs."""
+    monkeypatch.setattr(torch.npu, "current_stream", lambda device: object())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+
+        def invoke():
+            tensor = torch.empty(32)
+            reference = weakref.ref(tensor)
+
+            def executor(*args, **kwargs):
+                if raises:
+                    raise RuntimeError("launch failed")
+
+            if raises:
+                try:
+                    runtime._launch(executor, (tensor,), block_num=1, device=tensor.device)
+                except RuntimeError as error:
+                    assert str(error) == "launch failed"
+                else:
+                    pytest.fail("executor did not raise")
+            else:
+                runtime._launch(executor, (tensor,), block_num=1, device=tensor.device)
+            return reference
+
+        reference = invoke()
+        assert reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 @tla.jit
