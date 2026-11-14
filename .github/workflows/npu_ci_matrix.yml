@@ -51,6 +51,7 @@ jobs:
     timeout-minutes: 360
     env:
       CI_DOCKER_IMAGE: ${{ matrix.clone_image }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_filter == 'x86_64' && '16' || '' }}
       CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
       ARCH_FILTER: ${{ matrix.arch_filter }}
       NPU_FILTER: ${{ matrix.npu_filter }}
@@ -120,7 +121,12 @@ jobs:
           # 用 docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突。
           # 容器内用 git init + fetch (不要求空目录), checkout 前用 git clean 删 untracked。
           docker_ok=false
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
           if docker run --rm \
+            "${docker_cpu_args[@]}" \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             "${proxy_args[@]}" \
             --network host \

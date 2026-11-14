@@ -61,6 +61,7 @@ jobs:
       # Runner / Docker
       # ----------------------------------------------------------------------
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
       FLASH_ATTN_BUILD_NPU: ${{ matrix.arch_label == 'aarch64-910B' && '910' || '950' }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
@@ -358,7 +359,12 @@ jobs:
           # 直接把 ref / commit 作为环境变量传进 container，
           # 避免 shell 字符串拼接
           # ------------------------------------------------------------------
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
           docker run --rm \
+            "${docker_cpu_args[@]}" \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             "${proxy_args[@]}" \
             --network host \

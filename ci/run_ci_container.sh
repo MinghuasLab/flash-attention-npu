@@ -32,6 +32,7 @@
 #   CI_CONTAINER_DEVICE      (默认 0)       容器内逻辑设备号
 #   CI_DOCKER_PRIVILEGED     (默认 true)    是否带 --privileged
 #   CI_DOCKER_IMAGE          (默认 fa-npu-ci:910b-cann9.1-torch2.9)
+#   CI_DOCKER_CPUS           可选, 限制每个容器的 CPU 数
 #   CI_SKIP_BUILD            (默认 false)   true=跳过阶段1 (已有 build/ 产物)
 #   CI_CONTAINER_SCOPE       当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_NPU     (默认 auto) 按 torch_npu 设备名选择 910/950; all=双架构
@@ -111,6 +112,10 @@ fi
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
+docker_cpu_args=()
+if [ -n "${CI_DOCKER_CPUS:-}" ]; then
+  docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+fi
 
 CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 CI_LOG_SCOPE="${CI_CONTAINER_SCOPE//[^A-Za-z0-9_.-]/_}"
@@ -313,6 +318,7 @@ run_build_phase() {
 
 
   docker run --rm \
+    "${docker_cpu_args[@]}" \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     "${GIT_PROXY_DOCKER_ARGS[@]}" \
@@ -459,6 +465,7 @@ container=$GOLDEN_CACHE_DIR"
 
   fi
   docker run --rm \
+    "${docker_cpu_args[@]}" \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     "${GIT_PROXY_DOCKER_ARGS[@]}" \

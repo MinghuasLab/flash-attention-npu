@@ -122,6 +122,7 @@ jobs:
     timeout-minutes: 360
     env:
       CI_CONTAINER_SCOPE: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}
+      CI_DOCKER_CPUS: ${{ matrix.arch == 'x86_64' && '16' || '' }}
     steps:
       - name: Prepare self-hosted workspace
         env:
@@ -129,7 +130,11 @@ jobs:
         run: |
           set -euo pipefail
           docker image inspect "$MATRIX_IMAGE" >/dev/null
-          docker run --rm --user 0:0 --entrypoint bash -v "$PWD:/workspace" "$MATRIX_IMAGE" \
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
+          docker run --rm "${docker_cpu_args[@]}" --user 0:0 --entrypoint bash -v "$PWD:/workspace" "$MATRIX_IMAGE" \
             -c 'chmod -R a+rwX /workspace 2>/dev/null || true'
           git config --global --add safe.directory "$PWD"
           git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
@@ -171,7 +176,12 @@ jobs:
           test -d /usr/local/Ascend/driver/lib64
           test -f /usr/local/Ascend/driver/version.info
           test -f /etc/ascend_install.info
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
           docker run --rm \
+            "${docker_cpu_args[@]}" \
             --user 0:0 \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             --privileged \
@@ -195,7 +205,11 @@ jobs:
         env:
           MATRIX_IMAGE: ${{ matrix.image }}
         run: |
-          docker run --rm --user 0:0 -v "$PWD:/workspace" "$MATRIX_IMAGE" \
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
+          docker run --rm "${docker_cpu_args[@]}" --user 0:0 -v "$PWD:/workspace" "$MATRIX_IMAGE" \
             bash -c 'chmod -R a+rwX /workspace'
 
       - name: Upload wheel artifact
