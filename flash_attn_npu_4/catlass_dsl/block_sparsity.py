@@ -324,7 +324,7 @@ def _canonical(s, B, H, Sq, Sk, cq, ck, backward=False):
     width = max(1, pi.shape[-1], fi.shape[-1])
     if pc.numel() * width >= 2**31:
         raise ValueError("sparse metadata exceeds the int32 device index range")
-    return pc, _pad_indices(pi, width), fc, _pad_indices(fi, width)
+    return pc, _pad_indices(pi, max(1, pi.shape[-1])), fc, _pad_indices(fi, max(1, fi.shape[-1]))
 
 
 def normalize_block_sparse_tensors(
@@ -343,7 +343,7 @@ def normalize_block_sparse_tensors(
 
     Packed lists are unpacked to fixed batch/head/block axes. Backward input
     lists are converted from KV-major to the query-major kernel ABI. Full
-    lists are always present and both index lists share a contiguous capacity.
+    lists are always present; each index list retains its own contiguous capacity.
     Cache hits wait for the producing NPU stream without synchronizing the host.
     Callback and attention context stay in the caller's config.
     """

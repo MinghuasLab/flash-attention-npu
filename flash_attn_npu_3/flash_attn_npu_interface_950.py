@@ -4,6 +4,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+from torch.utils import _python_dispatch
 
 # isort: off
 import flash_attn_npu_3_950
@@ -88,10 +89,63 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
-@_torch_custom_op_wrapper(
-    "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
-)
-def _flash_attn_forward(
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
+        return "BBND"
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
+    """Apply the same forward stride policy as FA4 and FIA.
+
+    Dense operands use fixed packed kernel strides and are materialized. Paged
+    K/V remain zero-copy when both caches have the same packed BBND or BNBD
+    inner layout; dimension 0 may still be strided. Other paged views fall
+    back to packed BBND storage. FP8 caches always use packed BBND storage.
+
+    Append-KV is the exception: replacing a cache with a temporary contiguous
+    copy would lose the API's in-place cache update, so an unsupported cache
+    view is rejected instead of copied.
+    """
+    q = q.contiguous()
+    # The FP8 kernel still uses packed page addressing.
+    if page_table is None or q.dtype == torch.float8_e4m3fn:
+        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
+            raise RuntimeError(
+                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
+            )
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    if append_kv:
+        raise RuntimeError(
+            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
+        )
+    return q, k.contiguous(), v.contiguous()
+
+
+def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
+    if q.dim() != 3:
+        raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
+    if cu_seqlens_q.numel() <= 1:
+        raise RuntimeError("batch size must be positive")
+    # max_seqlen_q == 0 is the paged TND fast path, where every sequence has
+    # qlen 0. The training varlen API omits this argument and rejects any
+    # empty packed query, including one whose prefix still claims tokens.
+    if q.shape[0] == 0 and max_seqlen_q != 0:
+        raise RuntimeError("total_q must be positive (q must contain at least one query token)")
+
+
+def _flash_attn_forward_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -129,8 +183,12 @@ def _flash_attn_forward(
     return_softmax_lse: bool,
     layout: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, k_new, v_new = (_maybe_contiguous(x) for x in (q, k, k_new, v_new))
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    if cu_seqlens_q is not None:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
+    q, k, v = _prepare_forward_qkv(
+        q, k, v, page_table, append_kv=k_new is not None or v_new is not None
+    )
+    k_new, v_new = (_maybe_contiguous(x) for x in (k_new, v_new))
     q_descale, k_descale, v_descale = (
         _maybe_contiguous(x) for x in (q_descale, k_descale, v_descale)
     )
@@ -191,6 +249,32 @@ def _flash_attn_forward(
     return out_t, softmax_lse, out_accum, softmax_lse_accum
 
 
+_flash_attn_forward = _torch_custom_op_wrapper(
+    "flash_attn_npu_3_950_C::_flash_attn_forward", mutates_args=(), device_types="npu"
+)(_flash_attn_forward_impl)
+
+
+def _can_use_eager_forward(tensors):
+    # The inference API has no backward. Ordinary eager tensors can enter the
+    # same validated implementation directly; tracing/transforms still see the
+    # registered custom op and its fake implementation.
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or torch.jit.is_scripting():
+        return False
+    in_dispatch_mode = getattr(_python_dispatch, "is_in_torch_dispatch_mode", None)
+    if (
+        in_dispatch_mode is None
+        or in_dispatch_mode()
+        or torch.overrides._get_current_function_mode() is not None
+    ):
+        return False
+    if (
+        torch._C._are_functorch_transforms_active()
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
+    ):
+        return False
+    return all(t is None or (type(t) is torch.Tensor and not t.requires_grad) for t in tensors)
+
+
 @_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q,
@@ -231,6 +315,8 @@ def _flash_attn_forward_fake(
     layout,
 ):
     is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
     out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
     head_size_v = v.size(-1)
 
@@ -697,7 +783,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
+        return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
@@ -777,6 +863,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
+        _validate_varlen_query(q, cu_seqlens_q)
         # The packed varlen query (cu_seqlens_q present) is always TND, never BNSD.
         layout = _LAYOUT_TND
         if scheduler_metadata is None:
@@ -843,7 +930,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = tuple(window_size)
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse.transpose(-1, -2)) if return_softmax else out
+        return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
@@ -1057,6 +1144,9 @@ def flash_attn_with_kvcache(
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
             When cu_seqlens_q is provided (TND), non-paged cache must be 3D:
             (total_tokens, nheads_k, headdim_v).
+        Paged K/V may have different non-overlapping page strides. Physical BNBD
+        storage (pages, heads, page_size, dim) is accepted through transpose(1, 2).
+        Other read-only views are materialized as contiguous BBND caches.
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
@@ -1130,7 +1220,8 @@ def flash_attn_with_kvcache(
         and max_seqlen_q is not None
         and max_seqlen_q <= 16
     )
-    use_host_tiling = num_splits > 1 or auto_fd_candidate
+    empty_query = cu_seqlens_q is not None and q.shape[0] == 0 and max_seqlen_q == 0
+    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query
     if scheduler_metadata is None and not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:
@@ -1188,7 +1279,36 @@ def flash_attn_with_kvcache(
             has_softcap=softcap > 0.0,
             num_splits=num_splits,
         )
-    out, softmax_lse, *rest = _flash_attn_forward(
+    forward = _flash_attn_forward
+    if (
+        scheduler_metadata is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and _can_use_eager_forward(
+            (
+                q,
+                k_cache,
+                v_cache,
+                k,
+                v,
+                qv,
+                cu_seqlens_q,
+                cu_seqlens_k_new,
+                cache_seqlens,
+                page_table,
+                cache_batch_idx,
+                cache_leftpad,
+                rotary_cos,
+                rotary_sin,
+                rotary_seqlens,
+                q_descale,
+                k_descale,
+                v_descale,
+                scheduler_metadata,
+            )
+        )
+    ):
+        forward = _flash_attn_forward_impl
+    out, softmax_lse, *rest = forward(
         q,
         k_cache,
         v_cache,

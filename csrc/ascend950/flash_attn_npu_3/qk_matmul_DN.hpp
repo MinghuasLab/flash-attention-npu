@@ -133,7 +133,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr bool FULL_QUANT_FP8 = std::is_same_v<ElementA, float8_e4m3_t>;
     static constexpr uint32_t C0_ELEMS = 32 / sizeof(ElementA);
 
-    __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
+    template <class Resource>
+    __aicore__ inline BlockMmadTla(Resource& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
     {
         l1ATileM = BlockMmadQKTileHelper.qkL1TileM;
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
@@ -212,6 +213,13 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     __aicore__ inline uint32_t GetCurLoopCounter(uint32_t outterLoopItr, uint32_t curLoopNum, uint32_t curLoopItr)
     {
         return outterLoopItr * curLoopNum + curLoopItr;
+    }
+
+    uint64_t pageStride = 0;
+
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
     }
 
     template <class TensorB, class L1BTile>
@@ -325,8 +333,11 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                         uint32_t blockTableIdx = kvL0Start / blockSize;
                         uint32_t blockOffset = kvL0Start % blockSize;
                         auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                        auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(blockIdx * blockSize + blockOffset, 0),
-                                                       tla::MakeShape(l0TileNAct, embed));
+                        auto gPageTensor =
+                            tla::MakeTensor(gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                                            gBTensor.layout(), Arch::PositionGM{});
+                        auto gBTensorTlaTile =
+                            GetTile(gPageTensor, tla::MakeCoord(blockOffset, 0), tla::MakeShape(l0TileNAct, embed));
                         copyGmToL1A(l1BTensorTlaTile, gBTensorTlaTile);
                     }
                 } else {

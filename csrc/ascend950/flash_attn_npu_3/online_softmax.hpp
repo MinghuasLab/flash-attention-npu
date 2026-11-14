@@ -13,6 +13,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 #include "fa_block.h"
+#include "fwd_resource_plan.h"
 #include "kernel_common.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
@@ -99,6 +100,22 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     }
 
     __aicore__ inline ~BlockEpilogue() {}
+
+    template <class Resource>
+    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, float scale, float softcap)
+    {
+        subBlockIdx_ = AscendC::GetSubBlockIdx();
+        scaleValue = scale;
+        softcapValue = softcap;
+        lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(ub.s);
+        lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(ub.p);
+        lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
+        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
+        dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
+        llUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.ll);
+        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(ub.mask);
+    }
 
     template <class TensorDst, class TensorSrc>
     __aicore__ inline void CopyPUbToPL1(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t m)
@@ -437,7 +454,6 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
-        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         if (isFirstKvSTile) {
@@ -630,7 +646,6 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ ElementMask* maskNextUbAddr = (__ubuf__ ElementMask*)maskUbTensor[MASK_NEXT_ELEM_OFFSET].GetPhyAddr();
 
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
-        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         if (doTriUPreMask && doTriUNextMask) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(5);

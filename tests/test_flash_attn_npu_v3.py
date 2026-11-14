@@ -1134,7 +1134,7 @@ def test_fa_varlen_ops(
         )
     assert_fa_close(output_compare, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
     if "Ascend910" in name or "Ascend950" in name:
-        lse_compare = softmax_lse.transpose(-1, -2) if "Ascend950" in name else softmax_lse
+        lse_compare = softmax_lse
         if add_unused_qkv:
             lse_compare = torch.cat(
                 [

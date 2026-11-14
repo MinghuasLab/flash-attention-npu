@@ -229,8 +229,6 @@ def run_forward(case, inputs, device):
     result = function(**{name: value for name, value in kwargs.items() if name in parameters})
     output = (result[0] if case.return_lse else result).cpu()
     lse = result[1].cpu() if case.return_lse else None
-    if lse is not None and case.entry in ("dense", "varlen"):
-        lse = lse.transpose(-1, -2)
     if case.tnd:
         return output, lse
     output = torch.cat([output[b, :n] for b, n in enumerate(case.q_lengths)])

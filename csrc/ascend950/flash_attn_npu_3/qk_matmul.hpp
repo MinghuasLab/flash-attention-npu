@@ -147,7 +147,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr uint32_t STRIDE_LIMIT = 65535;
     static constexpr uint32_t C0_ELEMS = 16;
 
-    __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
+    template <class Resource>
+    __aicore__ inline BlockMmadTla(Resource& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
     {
         l1ATileM = BlockMmadQKTileHelper.qkL1TileM;
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
@@ -248,6 +249,13 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         return outterLoopItr * curLoopNum + curLoopItr;
     }
 
+    uint64_t pageStride = 0;
+
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
+    }
+
     template <class TensorB, class L1BTile>
     __aicore__ inline void CopyGmToL1BwithNZ(TensorB& gBTile, L1BTile& l1BTile, uint32_t blockIdx, uint32_t blockOffset,
                                              uint32_t len, uint32_t embed, uint32_t blockSize, uint32_t kvHeads,
@@ -323,8 +331,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                     uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                     auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(0, blockIdx * blockSize + blockOffset),
-                                                   tla::MakeShape(embed, l0TileNAct));
+                    auto gPageTensor = tla::MakeTensor(gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                                                       gBTensor.layout(), Arch::PositionGM{});
+                    auto gBTensorTlaTile =
+                        GetTile(gPageTensor, tla::MakeCoord(0, blockOffset), tla::MakeShape(embed, l0TileNAct));
                     copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
                 } else {
                     if (isShrink == 1) {

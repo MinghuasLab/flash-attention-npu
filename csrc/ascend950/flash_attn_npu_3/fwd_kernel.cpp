@@ -22,6 +22,7 @@
 
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
+#include "fwd_resource.hpp"
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP
 #include "catlass/epilogue/block/block_epilogue.hpp"
@@ -74,6 +75,7 @@ class FAIKernel950 {
     using LayoutOTmp = layout::RowMajor;
     using LayoutMask = layout::RowMajor;
 
+    uint32_t otmpStages_ = 2U;
     bool hasSeqUsedQ = false;
     bool hasSeqUsedKv = false;
 
@@ -196,32 +198,15 @@ class FAIKernel950 {
             l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementP>(
                 pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * sizeof(ElementP) * i);
         }
-        uint32_t rowNumPerSubCore = EpilogueOnlineSoftmax::SM_ROW_MAX_ELEM_NUM;
-        uint32_t colNumPerSubCore = EpilogueOnlineSoftmax::SM_COL_MAX_ELEM_NUM;
-        uint32_t rescaleCol = EpilogueRescaleO::RESCALE_COL_MAX_ELEM_NUM;
-
-        uint32_t ubSRoundTile = 0;
-        if constexpr (std::is_same_v<ElementS, half>) {
-            for (uint32_t i = 0; i < UB_S_OTMP_BUF_STAGES; i++) {
-                ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(rowNumPerSubCore * colNumPerSubCore *
-                                                                                 sizeof(ElementS) * i);
-                ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
-                    rowNumPerSubCore * colNumPerSubCore * sizeof(ElementS) * UB_S_OTMP_BUF_STAGES +
-                    rowNumPerSubCore * colNumPerSubCore * sizeof(ElementP) * UB_S_OTMP_BUF_STAGES +
-                    rowNumPerSubCore * rescaleCol * sizeof(ElementOTmp) * i);
-            }
-            ubSRoundTile = 16;
-        } else {
-            for (uint32_t i = 0; i < UB_S_OTMP_BUF_STAGES; i++) {
-                ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(32768 * i);
-            }
-
-            for (uint32_t i = 0; i < UB_S_BUF_STAGES; i++) {
-                ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(
-                    4 * 32768 + rowNumPerSubCore * rescaleCol * sizeof(ElementOTmp) * i);
-            }
-            ubSRoundTile = 128;
+        const auto ubPlan = fa950_plan::KernelUbPlan(embedV_, qBaseTile_);
+        otmpStages_ = ubPlan.otmpStages;
+        for (uint32_t i = 0; i < UB_S_BUF_STAGES; ++i) {
+            ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(ubPlan.s + ubPlan.sBytes * i);
         }
+        for (uint32_t i = 0; i < otmpStages_; ++i) {
+            ubOTmpTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ubPlan.lo + ubPlan.loBytes * i);
+        }
+        const uint32_t ubSRoundTile = 128;
 
         Gemm::Block::BlockMmadQKTileHelper qkL1TileHelper(qkL1TileM_, qkL1TileN_, qkL1TileKLeft_, qkL1TileKRight_,
                                                           qL1BufNum_, kL1BufNum_);
@@ -242,12 +227,14 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx();
         BlockMmadQK blockMmadQK(resource, qkL1TileHelper);
         BlockMmadPV blockMmadPV(resource, pvL1AddrStart_, pvL1TileHelper);
+        blockMmadQK.SetPageStride(params.storage.keyPageStride);
+        blockMmadPV.SetPageStride(params.storage.valuePageStride);
 #endif
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_, softcapValue_);
-        EpilogueRescaleO epilogueRescaleO(resource);
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_);
+        EpilogueRescaleO epilogueRescaleO(resource, ubPlan);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
 
@@ -300,6 +287,13 @@ class FAIKernel950 {
             strideV = 16;
         }
 
+        if constexpr (kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd) {
+            strideK = params.storage.keyTokenStride;
+            strideV = params.storage.valueTokenStride;
+            kvHeadStrideK = params.storage.keyHeadStride;
+            kvHeadStrideV = params.storage.valueHeadStride;
+        }
+
         uint32_t embedVRound = RoundUp(embedV_, 16);
         uint32_t groupSize = qHeads_ / kvHeads_;
         int64_t qBOffset = 0;
@@ -323,6 +317,9 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -347,9 +344,10 @@ class FAIKernel950 {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                // Batch strides are recomputed on every batch advance because the
-                // BSND forms depend on the physical (region) seqlen of the batch
-                // being left.  BNSD planes are maxSeqlen sized so they are constant.
+                // Batch strides are recomputed on every batch advance because packed
+                // TND regions have a per-batch physical seqlen. Dense BSND uses the
+                // allocated S (constant). BNSD planes are maxSeqlen sized so they
+                // are constant.
                 int64_t qBatchStride = 0;
                 if constexpr (qFormat == Format::BNSD) {
                     qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
@@ -387,11 +385,14 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                 // length is resolved in the cachedBatch gate below, not here. If this
                 // function ever becomes kv dependent move the kv resolution back.
-                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
+                uint32_t curQNBlockTile =
+                    GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
                 uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
                 curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
@@ -405,7 +406,8 @@ class FAIKernel950 {
             uint32_t kvHeadIdx;
             uint32_t qNStartIdx;
             uint32_t qNBlockSize;
-            uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
+            uint32_t curQNBlockTile =
+                GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
             uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
             uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
             qSTileIdx = taskIdxCurBatch / qNTaskNum;
@@ -431,7 +433,7 @@ class FAIKernel950 {
                 lseOffset = static_cast<uint64_t>(curBatch) * qHeads_ * lseHeadStride +
                             static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             } else if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
                 lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             }
@@ -492,12 +494,12 @@ class FAIKernel950 {
                     const int64_t leftOrigin = seqDiff - windowSizeLeft_;
                     windowSizeLeftStartLen = qBlockBase + leftOrigin;
                     windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
-                    const int64_t firstKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                    const int64_t firstKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
                     kvStart = static_cast<uint32_t>(firstKey) / kvBaseTile_;
                     if (windowSizeLeftEndLen > kvLength) {
-                        delStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
+                        delStartRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
                     }
                 }
                 if (!notNextMask) {
@@ -505,12 +507,12 @@ class FAIKernel950 {
                     windowSizeRightStartLen = qBlockBase + rightOrigin;
                     // Exclusive upper bound for the last Q row in this tile.
                     windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
-                    const int64_t endKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                    const int64_t endKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
                     noSkipKvS = static_cast<uint32_t>(endKey);
                     if (windowSizeRightStartLen < 0) {
-                        delEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                        delEndRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, -rightOrigin)));
                     }
                 }
                 kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
@@ -711,7 +713,7 @@ class FAIKernel950 {
                         kvSTileSizeAct = kvBaseTile_;
                     }
                     GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
-                    uint32_t ubOTmpBufId = pipelineTileSeqNow % UB_S_OTMP_BUF_STAGES;
+                    uint32_t ubOTmpBufId = pipelineTileSeqNow % otmpStages_;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
@@ -837,7 +839,9 @@ class FAIKernel950 {
         }
         if constexpr (PV_RE_MODE == 4U) {
             AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(5);
-            AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(6);
+            if (otmpStages_ == 2U) {
+                AscendC::CrossCoreSetFlag<PV_RE_MODE, PIPE_V>(6);
+            }
         }
 #endif
     }
@@ -869,8 +873,10 @@ class FAIKernel950 {
         if constexpr (PV_RE_MODE == 4U) {
             AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(5);
             AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(21);
-            AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(6);
-            AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(22);
+            if (otmpStages_ == 2U) {
+                AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(6);
+                AscendC::CrossCoreWaitFlag<PV_RE_MODE, PIPE_FIX>(22);
+            }
         }
 #endif
 #ifdef __DAV_VEC__
@@ -915,7 +921,7 @@ class FAIKernel950 {
     }
 
   private:
-    Arch::Resource<ArchTag> resource;
+    Arch::ForwardResource950 resource;
 
     uint32_t batch_;
     uint32_t qHeads_;
@@ -968,7 +974,7 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated)
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1046,7 +1052,8 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1057,7 +1064,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                              int64_t kvSeqlenAllocated)
+                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1128,7 +1135,8 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated};
+                           kvSeqlenAllocated,
+                           storage};
     Kernel faInfer;
     faInfer(params);
 }

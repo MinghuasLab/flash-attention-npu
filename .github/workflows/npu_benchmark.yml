@@ -14,8 +14,6 @@ name: NPU Benchmark
 #   commit_id=<sha>   (优先级高于 ref)
 
 on:
-
-
   issue_comment:
     types: [created]
 
@@ -26,9 +24,10 @@ permissions:
 jobs:
   benchmark:
     if: >-
-       github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, 'run-npu-benchmark')
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request != null
+        && contains(github.event.comment.body, 'run-npu-benchmark')
+
     name: Benchmark (${{ matrix.arch_label }})
 
     strategy:
@@ -63,9 +62,9 @@ jobs:
       # ----------------------------------------------------------------------
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
       CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
+      FLASH_ATTN_BUILD_NPU: ${{ matrix.arch_label == 'aarch64-910B' && '910' || '950' }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
-
       # ----------------------------------------------------------------------
       # Benchmark task
       # ----------------------------------------------------------------------
@@ -93,29 +92,34 @@ jobs:
         shell: bash
         env:
           COMMENT_BODY: ${{ github.event.comment.body || '' }}
-          EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || '' }}
         run: |
           set -euo pipefail
 
+          # ============================================================
+          #  评论触发：保留原来的动态参数解析
+          # ============================================================
             body="$COMMENT_BODY"
-            arch="$(printf '%s\n' "$body" | grep -oE 'arch=(910|950|both)' | head -n1 | cut -d= -f2- || true)"
-            fa_version="$(
-              printf '%s\n' "$body" |
-                grep -oE 'fa_version=(all|fa2|fa3|fa4)' |
-                head -n1 |
-                cut -d= -f2- || true
-            )"
-            layout="$(printf '%s\n' "$body" | grep -oE 'layout=(all|bsnd|tnd)' | head -n1 | cut -d= -f2- || true)"
-            mode="$(printf '%s\n' "$body" | grep -oE 'mode=(all|fwd|fwd_bwd)' | head -n1 | cut -d= -f2- || true)"
-            causal="$(printf '%s\n' "$body" | grep -oE 'causal=(both|true|false)' | head -n1 | cut -d= -f2- || true)"
-            ref="$(printf '%s\n' "$body" | grep -oE 'ref=[A-Za-z0-9._/-]+' | head -n1 | cut -d= -f2- || true)"
-            commit_id="$(
-              printf '%s\n' "$body" |
-                grep -oE 'commit_id=[A-Fa-f0-9]{7,40}' |
-                head -n1 |
-                cut -d= -f2- || true
-            )"
+            arch="$(printf '%s\n' "$body" |
+            grep -oE 'arch=(910|950|both)' | head -n1 | cut -d= -f2- || true)"
+
+            fa_version="$(printf '%s\n' "$body" |
+            grep -oE 'fa_version=(all|fa2|fa3|fa4)' | head -n1 | cut -d= -f2- || true)"
+
+            layout="$(printf '%s\n' "$body" |
+            grep -oE 'layout=(all|bsnd|tnd)' | head -n1 | cut -d= -f2- || true)"
+
+            mode="$(printf '%s\n' "$body" |
+            grep -oE 'mode=(all|fwd|fwd_bwd)' | head -n1 | cut -d= -f2- || true)"
+
+            causal="$(printf '%s\n' "$body" |
+            grep -oE 'causal=(both|true|false)' | head -n1 | cut -d= -f2- || true)"
+
+            ref="$(printf '%s\n' "$body" |
+            grep -oE 'ref=[A-Za-z0-9._/-]+' | head -n1 | cut -d= -f2- || true)"
+
+            commit_id="$(printf '%s\n' "$body" |
+            grep -oE 'commit_id=[A-Fa-f0-9]{7,40}' | head -n1 | cut -d= -f2- || true)"
 
             [ -n "$arch" ] || arch="both"
             [ -n "$fa_version" ] || fa_version="all"
@@ -124,6 +128,14 @@ jobs:
             [ -n "$causal" ] || causal="both"
             [ -n "$ref" ] || ref="refs/pull/${PR_NUMBER}/head"
 
+          else
+            echo "[ERROR] Unsupported event: $EVENT_NAME" >&2
+            exit 1
+          fi
+
+          # ============================================================
+          # 输出统一参数，供后续 Steps 使用
+          # ============================================================
 
           echo "arch=$arch" >> "$GITHUB_OUTPUT"
           echo "fa_version=$fa_version" >> "$GITHUB_OUTPUT"
@@ -134,9 +146,7 @@ jobs:
           echo "commit_id=${commit_id:-}" >> "$GITHUB_OUTPUT"
 
           printf '[benchmark] arch=%s fa_version=%s layout=%s mode=%s causal=%s ref=%s commit_id=%s\n' \
-            "$arch" "$fa_version" "$layout" "$mode" "$causal" \
-            "${ref:-<none>}" "${commit_id:-<none>}"
-
+          "$arch" "$fa_version" "$layout" "$mode" "$causal" "${ref:-<none>}" "${commit_id:-<none>}"
       # ======================================================================
       # 1. 根据输入判断当前 matrix job 是否需要执行
       # ======================================================================
@@ -150,9 +160,8 @@ jobs:
           arch="$CI_ARCH"
           label="${{ matrix.arch_label }}"
 
-          if [ "$arch" = "both" ] ||
-             { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
-             { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
+          if [ "$arch" = "both" ] || { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
+          { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
 
             echo "match=true" >> "$GITHUB_OUTPUT"
             echo "[CI] arch matches ($arch / $label), proceeding"
@@ -280,11 +289,9 @@ jobs:
           # ------------------------------------------------------------------
           # workflow / runner 显式环境变量优先级最高
           # ------------------------------------------------------------------
-          [ "${CI_GIT_PROXY+x}" = x ] &&
-            git_proxy="$CI_GIT_PROXY"
+          [ "${CI_GIT_PROXY+x}" = x ] && git_proxy="$CI_GIT_PROXY"
 
-          [ "${CI_GIT_PROXY_WHITELIST+x}" = x ] &&
-            git_proxy_hosts="$CI_GIT_PROXY_WHITELIST"
+          [ "${CI_GIT_PROXY_WHITELIST+x}" = x ] && git_proxy_hosts="$CI_GIT_PROXY_WHITELIST"
 
 
           # ------------------------------------------------------------------
@@ -310,37 +317,17 @@ jobs:
 
               if [[ "$git_proxy_host" == *"://"* ]]; then
 
-                printf \
-                  '[http "%s"]\n\tproxy = %s\n' \
-                  "$git_proxy_host" \
-                  "$git_proxy" \
-                  >> "$git_proxy_conf"
+                printf '[http "%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
 
               else
 
-                printf \
-                  '[http "https://%s"]\n\tproxy = %s\n' \
-                  "$git_proxy_host" \
-                  "$git_proxy" \
-                  >> "$git_proxy_conf"
+                printf '[http "https://%s"]\n\tproxy = %s\n' "$git_proxy_host"  "$git_proxy" >> "$git_proxy_conf"
 
-                printf \
-                  '[http "https://%s/"]\n\tproxy = %s\n' \
-                  "$git_proxy_host" \
-                  "$git_proxy" \
-                  >> "$git_proxy_conf"
+                printf '[http "https://%s/"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
 
-                printf \
-                  '[http "http://%s"]\n\tproxy = %s\n' \
-                  "$git_proxy_host" \
-                  "$git_proxy" \
-                  >> "$git_proxy_conf"
+                printf  '[http "http://%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
 
-                printf \
-                  '[http "http://%s/"]\n\tproxy = %s\n' \
-                  "$git_proxy_host" \
-                  "$git_proxy" \
-                  >> "$git_proxy_conf"
+                printf '[http "http://%s/"]\n\tproxy = %s\n' "$git_proxy_host"  "$git_proxy" >> "$git_proxy_conf"
 
               fi
 
@@ -560,10 +547,13 @@ jobs:
       - name: Build + Benchmark
         if: steps.arch.outputs.match == 'true'
         env:
+          CI_TASK: benchmark
+          FLASH_ATTN_BUILD_VERSION: ${{ steps.benchmark_inputs.outputs.fa_version }}
           CI_BENCHMARK_FA_VERSION: ${{ steps.benchmark_inputs.outputs.fa_version }}
           CI_BENCHMARK_LAYOUT: ${{ steps.benchmark_inputs.outputs.layout }}
           CI_BENCHMARK_MODE: ${{ steps.benchmark_inputs.outputs.mode }}
           CI_BENCHMARK_CAUSAL: ${{ steps.benchmark_inputs.outputs.causal }}
+          CI_BENCHMARK_FA_VERSION_EXPLICIT: "true"
         run: |
           set -euo pipefail
 
@@ -571,9 +561,24 @@ jobs:
 
           echo "[CI] benchmark configuration:"
           echo "[CI]   arch=${{ matrix.arch_label }}"
+          echo "[CI]   task=${CI_TASK}"
           echo "[CI]   fa_version=${CI_BENCHMARK_FA_VERSION}"
+          echo "[CI]   build_version=${FLASH_ATTN_BUILD_VERSION}"
           echo "[CI]   layout=${CI_BENCHMARK_LAYOUT}"
+          echo "[CI]   mode=${CI_BENCHMARK_MODE}"
+          echo "[CI]   causal=${CI_BENCHMARK_CAUSAL}"
           echo "[CI]   commit=${CI_BENCHMARK_COMMIT_SHA:-unknown}"
+
+          # 在启动 Docker 之前验证任务配置
+          if [ "$CI_TASK" != "benchmark" ]; then
+            echo "[CI][ERROR] Expected benchmark task, got: $CI_TASK" >&2
+            exit 1
+          fi
+
+          if [ "$FLASH_ATTN_BUILD_VERSION" != "$CI_BENCHMARK_FA_VERSION" ]; then
+            echo "[CI][ERROR] Build and benchmark FA versions mismatch" >&2
+            exit 1
+          fi
 
           bash ci/run_ci_container.sh
 

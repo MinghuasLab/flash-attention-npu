@@ -504,12 +504,13 @@ def flash_attn_with_kvcache(
 
     Constraints:
         - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128.
         - nheads % nheads_k == 0.
-        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
         - batch_size > 0.
-        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
-        - alibi_slopes / rotary / FP8 descales / attention_chunk / pack_gqa not supported.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / rotary / attention_chunk / pack_gqa not supported.
         - cache_seqlens / page_table / cu_seqlens_* must be int32 when provided.
         - No backward pass.
 
@@ -584,12 +585,13 @@ def flash_attn_func(
 
     Constraints:
         - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
         - nheads % nheads_k == 0.
-        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
         - batch_size > 0.
-        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
-        - alibi_slopes / FP8 descales / attention_chunk / pack_gqa not supported.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / attention_chunk / pack_gqa not supported.
         - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
 
     Returns:
@@ -663,13 +665,14 @@ def flash_attn_varlen_func(
 
     Constraints:
         - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
         - nheads % nheads_k == 0.
-        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
         - batch_size > 0.
         - total_q > 0; Q must contain at least one query token.
-        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
-        - alibi_slopes / FP8 descales / attention_chunk / pack_gqa not supported.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / attention_chunk / pack_gqa not supported.
         - cu_seqlens_q / cu_seqlens_k must be int32 when provided.
         - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
 
@@ -834,11 +837,12 @@ def flash_attn_varlen_func(
 
     Constraints:
         - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
         - nheads % nheads_k == 0.
-        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
         - Q, K, V must have contiguous last dimension (stride(-1) == 1).
         - batch_size > 0.
-        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - softcap >= 0 (0.0 disables).
         - On Ascend 950, score_mod / mask_mod are routed to the native Flex backend.
         - Flex backend: learnable_sink is not supported.
         - pack_gqa / min_seqlen_k / gather_kv_indices are not supported.
@@ -935,7 +939,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Rotary Positional Embedding (RoPE) | - | - |
 | ALiBi | ✅ | - |
 | Softcapping | ✅ | ✅ |
-| FP8 Quantization | - | - |
+| FP8 Quantization | - | ✅ |
 | Variable-length Sequences | ✅ | ✅ |
 
 #### flash_attn_func
@@ -949,7 +953,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Backward Pass | ✅ | ✅ |
 | ALiBi | ✅ | - |
 | Softcapping | ✅ | ✅ |
-| FP8 Quantization | - | - |
+| FP8 Quantization | - | ✅ |
 | Dropout | ✅ | - |
 
 #### flash_attn_varlen_func
@@ -965,7 +969,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Paged KV Cache | ✅ | ✅ | ✅ |
 | ALiBi | ✅ | - | - |
 | Softcapping | ✅ | ✅ | ✅ |
-| FP8 Quantization | - | - | - |
+| FP8 Quantization | - | ✅ | ✅ |
 | Dropout | ✅ | - | - |
 
 #### flash_attn_combine

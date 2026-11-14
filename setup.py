@@ -73,6 +73,19 @@ if BUILD_EXTENSIONS:
 #          both 910 and 950.
 BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
 
+BUILD_VERSION_ALIASES = {
+    "fa2": "v2",
+    "fa3": "v3",
+    "fa4": "v4",
+}
+
+BUILD_VERSION = BUILD_VERSION_ALIASES.get(BUILD_VERSION, BUILD_VERSION)
+
+if BUILD_VERSION not in ("v2", "v3", "v4", "all"):
+    raise RuntimeError(
+        f"Invalid FLASH_ATTN_BUILD_VERSION={BUILD_VERSION!r}; choose fa2, fa3, fa4, or all."
+    )
+
 
 def get_build_npu():
     target = os.getenv("FLASH_ATTN_BUILD_NPU", "auto").lower()
@@ -457,7 +470,14 @@ class BishengBuildExt(build_ext):
         # switch or stash re-apply.
         aicpu_stamp = aicpu_obj + ".inputs"
         aicpu_inputs = [aicpu_src]
-        for name in ("tilingdata.h", "fa_metadata_args.h", "fa_split.h", "fused_task.h"):
+        for name in (
+            "tilingdata.h",
+            "fa_metadata_args.h",
+            "fa_split.h",
+            "fused_task.h",
+            "fwd_resource_plan.h",
+            "fwd_tiling_policy.h",
+        ):
             header = os.path.join(src_dir, name)
             if os.path.exists(header):
                 aicpu_inputs.append(header)
@@ -823,7 +843,10 @@ if BUILD_EXTENSIONS:
 
 def get_package_version():
     config = wheel_metadata.get_build_config()
-    if BUILD_EXTENSIONS:
+    wheel_commands = {"bdist_wheel", "dist_info", "egg_info"}
+    if os.getenv("FLASH_ATTN_WHEEL_VARIANT") or (
+        not FORCE_BUILD and not SKIP_NPU_BUILD and wheel_commands.intersection(sys.argv[1:])
+    ):
         return config.wheel_version
     return config.version
 
@@ -876,6 +899,12 @@ cmdclass = {"bdist_wheel": CachedWheelsCommand}
 if ext_modules:
     cmdclass["build_ext"] = BishengBuildExt
 
+print("[BUILD-CONFIG] version =", BUILD_VERSION)
+print("[BUILD-CONFIG] npu =", BUILD_NPU)
+print(
+    "[BUILD-CONFIG] extensions =",
+    [ext.name for ext in ext_modules],
+)
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),

@@ -51,7 +51,7 @@
                                              a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
                                              a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
                                              a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,            \
-                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated)
+                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage)
 
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a)
@@ -74,7 +74,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                             a.lse_device, a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,
                             a.workspace_device, a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,
                             a.max_num_blocks_per_batch, a.q_descale_device, a.k_descale_device, a.v_descale_device,
-                            a.kv_seqlen_allocated);
+                            a.kv_seqlen_allocated, a.storage);
                     });
                 });
             });
