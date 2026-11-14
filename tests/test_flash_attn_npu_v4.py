@@ -11,6 +11,7 @@ from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv_batch,
     make_block_table,
+    make_cu_seqlens,
     make_golden_attention_mask,
     make_packed_random_tensor,
     make_paged_kv_cache,
@@ -1804,3 +1805,91 @@ def test_v4_bnsd_flash_attn_func(
     assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
     assert_fa_close(out, out_ref, out_pt, name="v4_bnsd_func_out")
     assert_fa_close(lse, lse_ref, lse_pt, name="v4_bnsd_lse")
+
+
+# --- MLA (Multi-head Latent Attention) simple gate cases ---------------------
+# Ascend910 only; Ascend950 does not support MLA.
+_NPU_910 = torch_npu.npu.is_available() and "Ascend910" in torch_npu.npu.get_device_name()
+skip_unless_910_mla = pytest.mark.skipif(not _NPU_910, reason="MLA is Ascend910 only")
+
+# form, data_type, batch, q_seqlen, kv_seqlen, num_heads, kv_heads,
+# head_size_qk, head_size_v, is_causal
+#   prefill (unabsorbed): q/k head dim 192, v head dim 128
+#   decode  (absorbed)  : q head dim 64 (rope) + qv head dim 512 (nope),
+#                         k head dim 64, v head dim 512, kv_heads == 1
+mla_cases = [
+    ("prefill", torch.bfloat16, 1, 198, 198, 32, 32, 192, 128, True),
+    ("decode", torch.bfloat16, 1, 1, 1025, 32, 1, 64, 512, False),
+]
+
+
+def _mla_inputs(case, seed=2026):
+    form, data_type, batch, sq, sk, heads, heads_k, dq, dv, _ = case
+    gen = torch.Generator().manual_seed(seed)
+
+    def rnd(shape):
+        return make_random_tensor(shape, data_type, generator=gen, device="npu")
+
+    q = rnd((batch, sq, heads, dq))
+    k = rnd((batch, sk, heads_k, dq))
+    v = rnd((batch, sk, heads_k, dv))
+    qv = rnd((batch, sq, heads, dv)) if form == "decode" else None
+    return q, k, v, qv
+
+
+def _mla_scale(case):
+    form, _, _, _, _, _, _, dq, dv, _ = case
+    return (dq + (dv if form == "decode" else 0)) ** -0.5
+
+
+def _mla_golden(case, q, k, v, qv, scale):
+    form, data_type, _, sq, sk, _, _, _, _, is_causal = case
+    q_cpu = q.contiguous().cpu()
+    k_cpu = k.contiguous().cpu()
+    v_cpu = v.contiguous().cpu()
+    if form == "decode":
+        # absorbed score = scale * (q @ k^T + qv @ v^T): merge into a 576-wide
+        # q/k pair so the plain prefill reference applies unchanged.
+        q_cpu = torch.cat([q_cpu, qv.contiguous().cpu()], dim=-1)
+        k_cpu = torch.cat([k_cpu, v_cpu], dim=-1)
+    mask, _, _ = make_golden_attention_mask(sq, sk, is_causal, -1, -1)
+    return ref_flash_attention_pair(q_cpu, k_cpu, v_cpu, scale, mask, data_type, 0.0)
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@skip_unless_910_mla
+@pytest.mark.parametrize("case", mla_cases, ids=["mla_prefill", "mla_decode"])
+def test_v4_mla_flash_attn_func(case):
+    _, _, batch, sq, _, heads, _, _, dv, is_causal = case
+    scale = _mla_scale(case)
+    q, k, v, qv = _mla_inputs(case)
+    out_ref, _, out_pt, _ = _mla_golden(case, q, k, v, qv, scale)
+
+    out = flash_attn_func(q, k, v, qv=qv, softmax_scale=scale, causal=is_causal)
+    assert tuple(out.shape) == (batch, sq, heads, dv)
+    assert_fa_close(out, out_ref, out_pt, name="v4_mla_func_out")
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@skip_unless_910_mla
+@pytest.mark.parametrize("case", mla_cases, ids=["mla_prefill", "mla_decode"])
+def test_v4_mla_flash_attn_varlen_func(case):
+    _, _, _, sq, sk, heads, _, _, dv, is_causal = case
+    scale = _mla_scale(case)
+    q, k, v, qv = _mla_inputs(case)
+    out_ref, _, out_pt, _ = _mla_golden(case, q, k, v, qv, scale)
+
+    out = flash_attn_varlen_func(
+        q[0],
+        k[0],
+        v[0],
+        qv=None if qv is None else qv[0],
+        cu_seqlens_q=make_cu_seqlens([sq]).npu(),
+        cu_seqlens_k=make_cu_seqlens([sk]).npu(),
+        max_seqlen_q=sq,
+        max_seqlen_k=sk,
+        softmax_scale=scale,
+        causal=is_causal,
+    )
+    assert tuple(out.shape) == (sq, heads, dv)
+    assert_fa_close(out, out_ref[0], out_pt[0], name="v4_mla_varlen_out")

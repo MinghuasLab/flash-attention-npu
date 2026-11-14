@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "mha_fwd_kvcache.cpp"
+#include "mla_decode_gemv.hpp"
 
 // 8-parameter FAInfer: Q/KV/accumulator types, paged, mask/layout, LSE mode, softcap.
 #define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
@@ -26,7 +27,7 @@
                        SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tiling, kNewDevice, vNewDevice, sequsedQDevice, sequsedKVDevice,                 \
-        kvSeqlenAllocated)
+        kvSeqlenAllocated, qvDevice)
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
 // branch fixes the runtime bool as a named constexpr flag, so the dispatch
@@ -90,6 +91,13 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     uint8_t* sequsedQDevice = a.sequsedQDevice;
     uint8_t* sequsedKVDevice = a.sequsedKVDevice;
     const int64_t kvSeqlenAllocated = a.kv_seqlen_allocated;
+    uint8_t* qvDevice = a.qvDevice;
+    if (a.mlaDecodeGemv) {
+        SplitFuse::MlaDecodeGemv<DType, LAYOUT><<<launchBlockDim, nullptr, aclStream>>>(
+            fftsAddr, qDevice, kDevice, vDevice, oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice, sequsedKVDevice,
+            workspaceDevice, tiling, qvDevice, kvSeqlenAllocated);
+        return;
+    }
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
         FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
             FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });

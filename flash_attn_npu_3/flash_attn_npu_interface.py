@@ -46,8 +46,8 @@ _LAYOUT_BNSD = 2
 
 
 def _transposed_bnsd_view(t):
-    """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
-    if t is None or t.dim() != 4 or t.is_contiguous():
+    """``t.transpose(1, 2)`` if ``t`` is packed BNSD storage seen as a BSND view, else ``None``."""
+    if t is None or t.dim() != 4:
         return None
     _, n1, _, n3 = t.shape
     if t.stride(3) == 1 and t.stride(1) == n3 and t.stride(2) == n1 * n3:
@@ -55,10 +55,10 @@ def _transposed_bnsd_view(t):
     return None
 
 
-def _detect_layout(q, k, v, page_table, cu_seqlens_k):
-    """Return ``(layout, q, k, v, out_transposed)``: the layout code shared with the C++
-    host, the operands to hand the kernel, and whether ``out`` must be transposed back to
-    match the shape of the query the caller passed in.
+def _detect_layout(q, k, v, page_table, cu_seqlens_k, qv=None):
+    """Return ``(layout, q, k, v, qv, out_transposed)``: the layout code shared with the
+    C++ host, the operands to hand the kernel, and whether ``out`` must be transposed back
+    to match the shape of the query the caller passed in.
 
     Only a stride match selects BNSD; otherwise rank-4 operands are read as BSND. Paged and
     cu-packed (TND) Q/K/V are never BNSD.
@@ -69,15 +69,22 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
         )
 
     if q.dim() != 4 or k.dim() != 4 or page_table is not None or cu_seqlens_k is not None:
-        return _LAYOUT_BSND, q, k, v, False
+        return _LAYOUT_BSND, q, k, v, qv, False
+
+    if qv is not None:
+        q_bnsd = _transposed_bnsd_view(q)
+        qv_bnsd = _transposed_bnsd_view(qv)
+        if q_bnsd is not None and qv_bnsd is not None:
+            return _LAYOUT_BNSD, q_bnsd, k.transpose(1, 2), v.transpose(1, 2), qv_bnsd, True
+        return _LAYOUT_BSND, q, k, v, qv, False
 
     q_bnsd = _transposed_bnsd_view(q)
     k_bnsd = _transposed_bnsd_view(k)
     v_bnsd = _transposed_bnsd_view(v)
     if q_bnsd is not None and k_bnsd is not None and v_bnsd is not None:
-        return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, True
+        return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, qv, True
 
-    return _LAYOUT_BSND, q, k, v, False
+    return _LAYOUT_BSND, q, k, v, qv, False
 
 
 def _paged_kv_inner_layout(x):
@@ -85,17 +92,9 @@ def _paged_kv_inner_layout(x):
     if x is None or x.dim() != 4:
         return None
     page_size, num_heads, head_dim = x.shape[1:]
-    if (
-        x.stride(1) == num_heads * head_dim
-        and x.stride(2) == head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
         return "BBND"
-    if (
-        x.stride(1) == head_dim
-        and x.stride(2) == page_size * head_dim
-        and x.stride(3) == 1
-    ):
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
         return "BNBD"
     return None
 
@@ -256,6 +255,7 @@ def _flash_attn_forward(
         q, k, v, page_table, append_kv=k_new is not None or v_new is not None
     )
     k_new, v_new = [maybe_contiguous(x) for x in (k_new, v_new)]
+    qv = qv.contiguous() if qv is not None else None
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
         maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     ]
@@ -793,7 +793,7 @@ class FlashAttnFunc(torch.autograd.Function):
         # get_scheduler_metadata only takes numbers and reads them as BSND, so the
         # sizes above come from the pre-detection shapes; BNSD only re-views the
         # same storage.
-        layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
+        layout, q, k, v, qv, out_transposed = _detect_layout(q, k, v, None, None, qv)
         cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=q.device)
         scheduler_metadata = get_scheduler_metadata(
             batch_size,
@@ -804,6 +804,8 @@ class FlashAttnFunc(torch.autograd.Function):
             head_size,
             cache_seqlens,
             qkv_dtype=q.dtype,
+            # MLA prefill has a value head dim that differs from q/k (e.g. 192/128).
+            headdim_v=v.shape[-1],
             causal=causal,
             window_size=window_size,
             has_softcap=softcap > 0.0,
@@ -969,7 +971,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_heads,
             num_heads_k,
             head_size,
-            headdim_v=head_size,
+            headdim_v=v.shape[-1],
             qkv_dtype=q.dtype,
             cache_seqlens=maybe_contiguous(cache_seqlens),
             seqlens_q=seqlens_q,
@@ -1520,14 +1522,13 @@ def flash_attn_with_kvcache(
         layout, out_transposed = _LAYOUT_TND, False
     else:
         bsnd_seqlen_k = k_cache.shape[1]
-        layout, q, k_cache, v_cache, out_transposed = _detect_layout(
-            q, k_cache, v_cache, page_table, None
+        layout, q, k_cache, v_cache, qv, out_transposed = _detect_layout(
+            q, k_cache, v_cache, page_table, None, qv
         )
         if out_transposed:
-            if k is not None or v is not None or qv is not None:
+            if k is not None or v is not None:
                 raise NotImplementedError(
-                    "flash_attn_npu_3: 910 backend BNSD layout does not support "
-                    "append-KV (k/v) or qv"
+                    "flash_attn_npu_3: 910 backend BNSD layout does not support append-KV (k/v)"
                 )
             if cache_seqlens is not None:
                 max_seqlen_k_bound = int(cache_seqlens.max().item())

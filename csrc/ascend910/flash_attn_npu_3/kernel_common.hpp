@@ -86,6 +86,9 @@ struct FAIKernelParams {
     // BNSD only: the allocated KV sequence length (S_alloc = k.size(2)), i.e. the
     // KV head-plane stride in tokens. Unused (0) for BSND / TND.
     int64_t kvSeqlenAllocated;
+    // MLA absorbed decode only: the latent (nope) query. nullptr selects the
+    // regular non-MLA QK head dim.
+    GM_ADDR qv;
 
     __aicore__ inline FAIKernelParams() {}
 
@@ -93,10 +96,11 @@ struct FAIKernelParams {
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_,
                                       GM_ADDR workSpace_, FAInferTilingParams tiling_, GM_ADDR kNew_ = nullptr,
                                       GM_ADDR vNew_ = nullptr, GM_ADDR seqUsedQ_ = nullptr,
-                                      GM_ADDR seqUsedKv_ = nullptr, int64_t kvSeqlenAllocated_ = 0)
+                                      GM_ADDR seqUsedKv_ = nullptr, int64_t kvSeqlenAllocated_ = 0,
+                                      GM_ADDR qv_ = nullptr)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), kNew(kNew_),
-          vNew(vNew_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), kvSeqlenAllocated(kvSeqlenAllocated_)
+          vNew(vNew_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), kvSeqlenAllocated(kvSeqlenAllocated_), qv(qv_)
     {}
 };
 
