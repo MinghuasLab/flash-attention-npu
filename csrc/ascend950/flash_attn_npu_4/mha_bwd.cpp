@@ -15,6 +15,8 @@
 // Reuse Ascend950 v3 FAG kernels in place (same pattern as 910 v2 → v3).
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "../flash_attn_npu_3/fag_kernel.cpp"
+#include "../flash_attn_npu_3/fag_bwd_d512_partial.hpp"
+#include "../flash_attn_npu_3/fag_bwd_d512_partial_host.hpp"
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
@@ -93,8 +95,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     TORCH_CHECK(num_heads > 0 && num_heads_kv > 0 && num_heads % num_heads_kv == 0,
                 "Ascend950 v4 bwd: KV heads must divide query heads");
     TORCH_CHECK(qk_head_dim == k_head_dim, "Ascend950 v4 bwd: q and k must share the same head dimension");
-    TORCH_CHECK(qk_head_dim > 0 && qk_head_dim <= 256, "Ascend950 v4 bwd: q/k head dimension must be in (0, 256]");
-    TORCH_CHECK(v_head_dim > 0 && v_head_dim <= 256, "Ascend950 v4 bwd: v head dimension must be in (0, 256]");
+    TORCH_CHECK(qk_head_dim > 0 && qk_head_dim <= 512, "Ascend950 v4 bwd: q/k head dimension must be in (0, 512]");
+    TORCH_CHECK(v_head_dim > 0 && v_head_dim <= 512, "Ascend950 v4 bwd: v head dimension must be in (0, 512]");
+    TORCH_CHECK(!deterministic || (qk_head_dim <= 256 && v_head_dim <= 256),
+                "Ascend950 v4 bwd: deterministic with head dimension > 256 is not supported yet");
     TORCH_CHECK(dout.size(-1) == v_head_dim && out.size(-1) == v_head_dim,
                 "Ascend950 v4 bwd: dout/out head dimension must match v");
 
@@ -162,8 +166,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.detSchedule = 0;
     if (deterministic && !is_varlen) {
         const int64_t bh = batch_size * num_heads_kv;
-        const int64_t m = (q_seqlen + 127) / 128;
-        const int64_t n = (kv_seqlen + 127) / 128;
+        const uint32_t seqTile = 128;
+        const int64_t m = (q_seqlen + seqTile - 1) / seqTile;
+        const int64_t n = (kv_seqlen + seqTile - 1) / seqTile;
         const int64_t group_num = num_heads / num_heads_kv;
         const fag_det_host::Selection sel =
             fag_det_host::SelectSchedule(is_causal, bh, m, n, group_num, static_cast<int64_t>(aic_num));
@@ -425,7 +430,17 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
-    if (q.dtype() == at::kBFloat16) {
+    if (fag_tiling_data.d512Partial != 0) {
+        TORCH_CHECK(!deterministic,
+                    "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
+        launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
+            stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk,
+            dv, workspace, tiling_device, q.dtype() == at::kBFloat16,
+            is_varlen ? static_cast<uint32_t>(FAGTiling950::Layout::TND)
+                      : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
+                                 : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
+            has_attn_mask, has_softcap));
+    } else if (q.dtype() == at::kBFloat16) {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
         } else if (is_bnsd) {

@@ -90,7 +90,8 @@ public:
     static_assert((BlockTileShape::K == 64) || \
                   (BlockTileShape::K == 128) || \
                   (BlockTileShape::K == 192) || \
-                  (BlockTileShape::K == 256), "BlockK must be in (64, 128, 192, 256)!");
+                  (BlockTileShape::K == 256) || \
+                  (BlockTileShape::K == 512), "BlockK must be in (64, 128, 192, 256, 512)!");
 
     // Specify FAG templates
     static constexpr bool ENABLE_A_B_FullLoad = std::is_same_v<BlockTileShape, L1TileShape> && \
@@ -106,6 +107,12 @@ public:
         (BlockTileShape::K > L1TileShape::K) && \
         (L1A_STAGES == 2) && \
         (L1B_STAGES == 2);
+    // D=512：N仍全载，K(D)按L1.K切段，A按L1.M切块双缓冲
+    static constexpr bool ENABLE_A_TILED_B_K_TILED = (BlockTileShape::M > L1TileShape::M) && \
+        (BlockTileShape::N == L1TileShape::N) && \
+        (BlockTileShape::K > L1TileShape::K) && \
+        (L1A_STAGES == 2) && \
+        (L1B_STAGES == 1);
 
     // Check Layout
     static_assert(std::is_same_v<LayoutA, layout::RowMajor>, "LayoutA only support RowMajor yet!"); // A矩阵仅支持[M, K]格式
@@ -157,13 +164,14 @@ public:
             l1BEventList[i] = i + L1A_STAGES;
         }
 
-        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED) {
+        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
             for (uint32_t i = 0; i < L1A_STAGES; i++) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
             }
         }
 
-        if constexpr(ENABLE_A_TILED_B_TILED) {
+        if constexpr(ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
+            // ENABLE_A_TILED_B_K_TILED：L1B单缓冲、每个K段覆盖写，需要预置"可写"标志
             for (uint32_t i = 0; i < L1B_STAGES; i++) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
             }
@@ -194,13 +202,13 @@ public:
     CATLASS_DEVICE
     void WaitFlag()
     {
-        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED) {
+        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
             for (uint32_t i = 0; i < L1A_STAGES; i++) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
             }
         }
 
-        if constexpr(ENABLE_A_TILED_B_TILED) {
+        if constexpr(ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
             for (uint32_t i = 0; i < L1B_STAGES; i++) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[i]);
             }
@@ -229,6 +237,8 @@ public:
             GemmATiledBFullLoad(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
         } else if constexpr(ENABLE_A_TILED_B_TILED) {
             GemmATiledBTiled(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
+        } else if constexpr(ENABLE_A_TILED_B_K_TILED) {
+            GemmATiledBKTiled(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
         }
         WaitFlag();
     }
@@ -740,6 +750,219 @@ public:
                 } else {
                     copyL0CToGm(gmCTile, l0CTensor, layoutTileCInGM, layoutCInL0, 0b11);
                 }
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void GemmATiledBKTiled(
+        AscendC::GlobalTensor<ElementA> const &gmBlockA, LayoutA const &layoutA,
+        AscendC::GlobalTensor<ElementB> const &gmBlockB, LayoutB const &layoutB,
+        AscendC::GlobalTensor<ElementC> const &gmBlockC, LayoutC const &layoutC,
+        GemmCoord const &actualShape
+    )
+    // D=512：N全载，K(D)按L1TileShape::K切段（单缓冲覆盖写），L1A按L1TileShape::M切块双缓冲
+    {
+        // Specify single block MM size
+        // actual means original shape in GM which may not be block aligned
+        uint32_t actualM = actualShape.m();
+        uint32_t actualN = actualShape.n();
+        uint32_t actualK = actualShape.k();
+
+        // 基本块都是block对齐的，取数据取到尾块一定是最后一次
+        uint32_t MAlign = RoundUp<L1AAlignHelper::M_ALIGNED>(actualM);
+        uint32_t NAlign = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
+        uint32_t KAlign = RoundUp<L1BAlignHelper::K_ALIGNED>(actualK);
+
+        // K(D)方向按L1.K切段数、M方向按L1.M切段数、N方向L0刀数
+        uint32_t dTileCount = CeilDiv<L1TileShape::K>(KAlign);
+        uint32_t mL1TileCount = CeilDiv<L1TileShape::M>(MAlign);
+        uint32_t nL0TileCount = CeilDiv<L0TileShape::N>(NAlign);
+
+        // 实际被使用的只有stride（L1布局按L1TileShape，而非actualK）
+        auto layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1TileShape::M, L1TileShape::K);
+        auto layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(L1TileShape::K, L1TileShape::N);
+
+        for (uint32_t dTileIdx = 0; dTileIdx < dTileCount; dTileIdx++) { // DDR2L1LoopK(D)
+            uint32_t dBegin = dTileIdx * L1TileShape::K;
+            uint32_t dAct = (dTileIdx < dTileCount - 1) ?
+                L1TileShape::K : (actualK - dTileIdx * L1TileShape::K); // 当前K段的实际长度
+            uint32_t dActAlign = RoundUp<L1BAlignHelper::K_ALIGNED>(dAct);
+            uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(dActAlign); // 当前K段内的L0 K刀数
+
+            //====================================L1B MTE2=====================================
+            // 当前K段 x 整段N 覆盖写入同一块L1B
+            auto l1BTensor = l1BTensorList[0];
+
+            // BGM Tile Tensor
+            MatrixCoord BGMTileOffset{dBegin, 0};
+            auto gmBTile = gmBlockB[layoutB.GetOffset(BGMTileOffset)];
+
+            // BGM Tile Layout
+            auto layoutTileBInGM = layoutB.GetTileLayout(MakeCoord(dAct, actualN));
+
+            // 覆盖写前等待上一K段的全部L1->L0B(MTE1)消费完成（首段消耗SetFlag预置标志）
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+            copyGmToL1B(l1BTensor, gmBTile, layoutBInL1, layoutTileBInGM);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]); // notify L1B MTE2 done
+
+            for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) { // DDR2L1LoopM
+                uint32_t mL1Act = (mL1TileIdx < mL1TileCount - 1) ?
+                    L1TileShape::M : (actualM - mL1TileIdx * L1TileShape::M); // 当前M段的实际长度
+                uint32_t mL1Align = RoundUp<L1AAlignHelper::M_ALIGNED>(mL1Act);
+                uint32_t mL0TileCount = CeilDiv<L0TileShape::M>(mL1Align); // 当前M段内的L0 M刀数
+
+                //====================================L1A MTE2=====================================
+                // L1A Tensor
+                auto l1ATensor = l1ATensorList[l1AListId];
+
+                // AGM Tile Tensor
+                MatrixCoord AGMTileOffset{mL1TileIdx * L1TileShape::M, dBegin};
+                auto gmATile = gmBlockA[layoutA.GetOffset(AGMTileOffset)];
+
+                // AGM Tile Layout
+                auto layoutTileAInGM = layoutA.GetTileLayout(MakeCoord(mL1Act, dAct));
+
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]); // Wait for L1A MTE2 dst buffer free
+                copyGmToL1A(l1ATensor, gmATile, layoutAInL1, layoutTileAInGM);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]); // Notify L1A MTE2 done
+
+                for (uint32_t mL0TileIdx = 0; mL0TileIdx < mL0TileCount; mL0TileIdx++) {
+                    uint32_t mL0 = (mL0TileIdx < mL0TileCount - 1) ?
+                        L0TileShape::M : (mL1Align - (mL0TileCount - 1)*L0TileShape::M); // mL0 for mmad
+                    uint32_t actualML0 = (mL0TileIdx < mL0TileCount - 1) ?
+                        L0TileShape::M : (mL1Act - (mL0TileCount - 1)*L0TileShape::M); // Actual mL0 for fixpipe
+                    for (uint32_t nL0TileIdx = 0; nL0TileIdx < nL0TileCount; nL0TileIdx++) {
+                        uint32_t nL0 = (nL0TileIdx < nL0TileCount - 1) ?
+                            L0TileShape::N : (NAlign - (nL0TileCount - 1)*L0TileShape::N); // nL0 for mmad
+                        uint32_t actualNL0 = (nL0TileIdx < nL0TileCount - 1) ?
+                            L0TileShape::N : (actualN - (nL0TileCount - 1)*L0TileShape::N); // Actual nL0 for fixpipe
+                        for (uint32_t kL0TileIdx = 0; kL0TileIdx < kL0TileCount; kL0TileIdx++) {
+                            uint32_t kL0 = (kL0TileIdx < kL0TileCount - 1) ?
+                                L0TileShape::K : (dActAlign - (kL0TileCount - 1)*L0TileShape::K); // kL0 for mmad
+                            //====================================L0A MTE1=====================================
+                            // L0A Tensor
+                            auto l0ATensor = l0ATensorList[l0AListId];
+
+                            // L1A Tile Tensor
+                            MatrixCoord l1ATileOffset{mL0TileIdx * L0TileShape::M, kL0TileIdx * L0TileShape::K};
+                            auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ATileOffset)];
+
+                            // L0A Layout
+                            auto layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0, kL0);
+
+                            // Wait for L0A MTE1 dst buffer free
+                            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+
+                            // Wait for L1A MTE2 done for the first time L0A MTE1
+                            if ((mL0TileIdx == 0) && (nL0TileIdx == 0) && (kL0TileIdx == 0)) {
+                                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1AListId]);
+                            }
+
+                            // Load the current tile from L1 to L0A
+                            copyL1ToL0A(l0ATensor, l1ATile, layoutAInL0, layoutAInL1);
+
+                            // Notify L0A MTE1 src buffer free, the L1A MTE2 after next can be started
+                            if ((mL0TileIdx == mL0TileCount - 1) && (nL0TileIdx == nL0TileCount - 1) &&
+                                (kL0TileIdx == kL0TileCount - 1)) {
+                                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
+                            }
+
+                            //====================================L0B MTE1=====================================
+                            // L0B Tensor
+                            auto l0BTensor = l0BTensorList[l0BListId];
+
+                            // L1B Tile Tensor
+                            MatrixCoord l1BTileOffset{kL0TileIdx * L0TileShape::K, nL0TileIdx * L0TileShape::N};
+                            auto l1BTile = l1BTensor[layoutBInL1.GetOffset(l1BTileOffset)];
+
+                            // L0B Layout
+                            auto layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0, nL0);
+
+                            // Wait for L0B MTE1 dst buffer free
+                            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+
+                            // Wait for L1B MTE2 done for the first time L1B MTE1
+                            if ((mL1TileIdx == 0) && (mL0TileIdx == 0) && (nL0TileIdx == 0) && (kL0TileIdx == 0)) {
+                                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+                            }
+
+                            // Load the current tile from L1 to L0B
+                            copyL1ToL0B(l0BTensor, l1BTile, layoutBInL0, layoutBInL1);
+
+                            // 本K段最后一次消费L1B后，允许下一K段覆盖写同一块L1B
+                            if ((mL1TileIdx == mL1TileCount - 1) && (mL0TileIdx == mL0TileCount - 1) &&
+                                (nL0TileIdx == nL0TileCount - 1) && (kL0TileIdx == kL0TileCount - 1)) {
+                                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+                            }
+
+                            // Notify L0B MTE1 done, mmad can be started
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
+
+                            //====================================MMAD=========================================
+                            // Wait for L0B MTE1 done
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
+
+                            // If the current tile is the first tile on the k axis, the accumulator needs to be reset to 0
+                            bool initC = (kL0TileIdx == 0);
+
+                            // Wait for MMAD dst buffer free
+                            if constexpr (!ENABLE_UNIT_FLAG) {
+                                if (initC) {
+                                    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+                                }
+                            }
+
+                            // If the unit flag is enabled, the unit flag is set according to the calculation progress
+                            uint8_t unitFlag = 0b00;
+                            if constexpr (ENABLE_UNIT_FLAG) {
+                                if (kL0TileIdx == kL0TileCount - 1) { // L0C ready for fixpipe
+                                    unitFlag = 0b11;
+                                } else {
+                                    unitFlag = 0b10;
+                                }
+                            }
+                            tileMmad(l0CTensor, l0ATensor, l0BTensor, mL0, nL0, kL0, initC, unitFlag);
+
+                            // Notify mmad done, the L0A MTE1 after next can be started
+                            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+                            l0AListId = (l0AListId + 1 < L0_STAGES) ? (l0AListId + 1) : 0;
+
+                            // Notify mmad done, the L0B MTE1 after next can be started
+                            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+                            l0BListId = (l0BListId + 1 < L0_STAGES) ? (l0BListId + 1) : 0;
+                        }
+
+                        //====================================Fixpipe======================================
+                        // CGM Tile Tensor
+                        MatrixCoord CGMTileOffset{mL1TileIdx * L1TileShape::M + mL0TileIdx * L0TileShape::M,
+                                                  nL0TileIdx * L0TileShape::N};
+                        auto gmCTile = gmBlockC[layoutC.GetOffset(CGMTileOffset)];
+
+                        // CGM Tile Layout
+                        auto layoutTileCInGM = layoutC.GetTileLayout(MakeCoord(actualML0, actualNL0));
+
+                        // L0C Layout
+                        auto layoutCInL0 = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0, nL0));
+
+                        // 跨K段的部分和不能在L0C累加：首段普通覆盖写（GM初值是脏数据），后续段用原子加累加
+                        if (dTileIdx > 0) {
+                            AscendC::SetAtomicAdd<float>();
+                        }
+                        if constexpr (!ENABLE_UNIT_FLAG) {
+                            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+                            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+                            copyL0CToGm(gmCTile, l0CTensor, layoutTileCInGM, layoutCInL0);
+                            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+                        } else {
+                            copyL0CToGm(gmCTile, l0CTensor, layoutTileCInGM, layoutCInL0, 0b11);
+                        }
+                        if (dTileIdx > 0) {
+                            AscendC::SetAtomicNone();
+                        }
+                    }
+                }
+                l1AListId = (l1AListId + 1 < L1A_STAGES) ? (l1AListId + 1) : 0;
             }
         }
     }

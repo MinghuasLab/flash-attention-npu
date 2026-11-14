@@ -6,7 +6,7 @@
 //
 // Shared declarations/macros for the v3-910 backward FAGGeneral dispatch,
 // included by the generated autogen/bwd_dispatch_<dtype>_<layout>.cpp stubs so
-// each (dtype, layout) TU's 16 kernel instantiations compile in parallel.
+// each (dtype, layout) TU's 20 kernel instantiations compile in parallel.
 //
 // ADAPTATION vs opt_compiler: main wraps the FAGGeneral launch in an
 // at_npu::native::OpCommand::RunOpApiV2("ascendc_fag_general", ...) context
@@ -72,6 +72,9 @@
                 break;                                                                     \
             case 256:                                                                      \
                 BWD_KERNEL_LAUNCH(DTemplateType::Aligned256, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
+                break;                                                                     \
+            case 512:                                                                      \
+                BWD_KERNEL_LAUNCH(DTemplateType::Aligned512, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
                 break;                                                                     \
             default:                                                                       \
                 break;                                                                     \

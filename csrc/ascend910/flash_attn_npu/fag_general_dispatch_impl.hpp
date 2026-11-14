@@ -6,12 +6,12 @@
 #pragma once
 
 //
-// Light half of the v2 FAGGeneral backward dispatch: selects one of the 32
-// generated autogen/fag_<dtype>_<layout>_headdim<64|128|192|256>[_softcap]
+// Light half of the v2 FAGGeneral backward dispatch: selects one of the 40
+// generated autogen/fag_<dtype>_<layout>_headdim<64|128|192|256|512>[_softcap]
 // functions. Each FAG variant TU (heavy, via fag_kernel_launch.hpp) fixes one
 // (headdim, softcap) pair and instantiates the 8 causal x deterministic x
-// dropout FAGGeneral variants, so the 64 instantiations of a (dtype, layout)
-// family compile in 8 parallel TUs instead of one. This header stays
+// dropout FAGGeneral variants, so the 80 instantiations of a (dtype, layout)
+// family compile in 10 parallel TUs instead of one. This header stays
 // lightweight (no CATLASS / kernel includes) so the autogen stubs and host
 // TUs never drag in the kernel templates.
 //

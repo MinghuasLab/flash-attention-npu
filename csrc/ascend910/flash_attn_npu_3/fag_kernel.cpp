@@ -48,6 +48,7 @@ enum class DTemplateType {
     Aligned128 = 2,
     Aligned192 = 3,
     Aligned256 = 4,
+    Aligned512 = 5,
     DTemplateBottom
 };
 
@@ -1016,8 +1017,26 @@ struct TypeSelector<DTemplateType::Aligned256> {
     using L0TileShapeCube2 = GemmShape<128, 256, 64>;
 };
 
-template <const DTemplateType DTEMPLATETYPE, typename DataType = half, const uint32_t INPUT_LAYOUT = BSND,
-          const bool IS_ATTEN_MASK = 0, const bool IS_DROP = 0,
+// d=512
+template <>
+struct TypeSelector<DTemplateType::Aligned512> {
+    // cube1：L1的N、K沿用256档，M从128加到256用满空闲L1
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<2, 1, true>;
+    using BlockTileShape = GemmShape<512, 512, 512>;
+    using L1TileShapeCube1 = GemmShape<256, 512, 256>;
+    using L0TileShapeCube1 = GemmShape<128, 128, 128>;
+
+    // cube2：沿用256档的L1/L0，kernel内按N=256切段
+    using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
+    using BlockTileShapeCube2 = GemmShape<512, 512, 512>;
+    using L1ATileShapeCube2 = GemmShape<128, 0, 128>;
+    using L1BTileShapeCube2 = GemmShape<0, 256, 512>;
+    using L0TileShapeCube2 = GemmShape<128, 256, 64>;
+};
+
+template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
+          const uint32_t INPUT_LAYOUT = BSND, const bool IS_ATTEN_MASK = 0,
+          const bool IS_DROP = 0,
           const bool IS_DTM = 0, // 是否开启确定性计算
           const bool HAS_SOFTCAP = 0, const bool HAS_ALIBI = 0>
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,

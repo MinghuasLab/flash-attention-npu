@@ -143,11 +143,13 @@ def _check_fwd_dimension(value, name):
 
 
 _HEADDIM_BWD_ALIGN = 64
-
+_HEADDIM_BWD_ALIGN_LARGE = 16
 
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
-    Pad headdim to a multiple of 64 for the bwd kernel.
+    Pad headdim for the bwd kernel: a multiple of 64 up to 256 (which matches the
+    kernel buckets exactly), and a multiple of 16 above 256 (16 elements is the
+    hardware granularity; wider D is segmented along K/N inside the kernel).
     """
     q_dtype = q.dtype
     if q_dtype not in (torch.float16, torch.bfloat16):
@@ -169,9 +171,10 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
             "(unequal headdim is not supported)"
         )
     ctx_headdim = qkv_out_headdims[0]
-    if ctx_headdim <= 0 or ctx_headdim > 256:
-        raise ValueError(f"headdim must be in (0, 256], got {ctx_headdim} ")
-    target = round_multiple(ctx_headdim, _HEADDIM_BWD_ALIGN)
+    if ctx_headdim <= 0 or ctx_headdim > 512:
+        raise ValueError(f"headdim must be in (0, 512], got {ctx_headdim} ")
+    align = _HEADDIM_BWD_ALIGN if ctx_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    target = round_multiple(ctx_headdim, align)
 
     def _pad(t):
         cur = t.size(-1)
@@ -197,7 +200,10 @@ def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
 
 
 def round_up_headdim(head_size: int) -> int:
-    return round_multiple(head_size, _HEADDIM_BWD_ALIGN)
+    # 与 _pad_bwd_headdim 保持同一分档：<=256 对齐到 kernel bucket（64），
+    # >256 对齐到硬件粒度（16）。
+    align = _HEADDIM_BWD_ALIGN if head_size <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    return round_multiple(head_size, align)
 
 
 @_torch_custom_op_wrapper(

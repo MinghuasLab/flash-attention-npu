@@ -16,6 +16,8 @@ from tests.common.attention_ref import (
     cached_autograd_grads,
     ref_flash_attention_pair,
 )
+from flash_attn_npu.flash_attn_npu_interface import _flash_attn_backward, _flash_attn_varlen_backward
+from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv,
@@ -833,6 +835,166 @@ def test_fa_func_ops(
     assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
 
 
+# head_size > 256 backward test parameters
+# Single-option parameters: fixed values
+# batch_size: [1]
+# dropout_p: [0.0], window_size: [(-1, -1)], deterministic: [False]
+
+# Two-option parameters
+# data_type: [torch.float16, torch.bfloat16]
+# is_causal: [False, True]
+
+# Multi-option parameters: grouped values
+# head_size: [256, 272, 304, 320, 384, 464, 512]; 256 is the bucket-boundary control,
+# 272/304/464 cover the 16-aligned (non-64-multiple) path above 256
+# num_heads,kv_heads: [(2,2), (4,2), (1,1)]
+# q_seqlen,kv_seqlen: [(128,128), (64,96), (127,129)]
+# softcap: [0.0, 30.0]
+# use_alibi: [False, True]
+# The forward path still caps head_size at 256, so out/lse come from the CPU
+# reference; only the public bwd entry point is exercised.
+bwd_headdim_cases = [
+    # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi, case_name
+    (torch.float16, 1, 2, 2, 128, 128, 512, True, 0.0, False, "fp16-mha-causal"),
+    (torch.bfloat16, 1, 4, 2, 64, 96, 512, False, 30.0, False, "bf16-gqa-softcap"),
+    (torch.float16, 1, 1, 1, 127, 129, 512, True, 0.0, False, "fp16-tail"),
+    (torch.bfloat16, 1, 2, 2, 128, 128, 384, True, 0.0, False, "bf16-d384"),
+    (torch.float16, 1, 2, 2, 128, 128, 320, False, 0.0, False, "fp16-d320"),
+    (torch.float16, 1, 2, 2, 128, 128, 272, True, 0.0, False, "fp16-d272-align16"),
+    (torch.bfloat16, 1, 2, 2, 128, 128, 304, False, 0.0, False, "bf16-d304-align16"),
+    (torch.float16, 1, 2, 2, 128, 128, 464, True, 0.0, False, "fp16-d464-align16"),
+    (torch.float16, 1, 2, 2, 128, 128, 256, True, 0.0, False, "fp16-d256-control"),
+    (torch.bfloat16, 1, 2, 2, 128, 128, 512, True, 0.0, False, "bf16-d512-causal"),
+    (torch.float16, 1, 4, 2, 128, 128, 512, True, 0.0, False, "fp16-gqa-causal"),
+    (torch.float16, 1, 2, 2, 128, 128, 512, True, 0.0, True, "fp16-alibi"),
+]
+
+
+def _bwd_headdim_bsnd(dout, query, key, value, out, softmax_lse, *, is_causal, softcap,
+                      alibi_slopes=None, deterministic=False):
+    """Run the BSND backward through the public entry; dq/dk/dv are written in place."""
+    dq, dk, dv = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+    _flash_attn_backward(
+        dout, query, key, value, out, softmax_lse, dq, dk, dv,
+        0.0, 1.0 / (query.shape[-1] ** 0.5), is_causal, -1, -1, softcap,
+        alibi_slopes, deterministic,
+    )
+    return dq, dk, dv
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, softcap, use_alibi, case_name",
+    bwd_headdim_cases,
+    ids=[c[-1] for c in bwd_headdim_cases],
+)
+def test_bwd_headdim_bsnd(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
+    softcap,
+    use_alibi,
+    case_name,
+):
+    query, key, value, dout = make_attention_inputs(
+        (batch_size, q_seqlen, num_heads, head_size),
+        (batch_size, kv_seqlen, kv_heads, head_size),
+        (batch_size, kv_seqlen, kv_heads, head_size),
+        (batch_size, q_seqlen, num_heads, head_size),
+        data_type,
+        device="npu",
+    )
+    scale = 1.0 / (head_size**0.5)
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
+
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key.detach().cpu().requires_grad_(True)
+    value_ref = value.detach().cpu().requires_grad_(True)
+    atten_mask, _, _ = make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, -1, -1)
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Same post-processing as test_fa_func_ops; lets cached_autograd_grads rebuild the graph."""
+        out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+            query_ref,
+            key_ref,
+            value_ref,
+            scale,
+            atten_mask,
+            data_type,
+            softcap,
+            alibi_slopes=alibi_slopes_cpu,
+            differentiable=differentiable,
+        )
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            out_ref[:, fully_masked] = 0
+            out_pt[:, fully_masked] = 0
+            lse_ref[:, :, fully_masked] = torch.inf
+            lse_pt[:, :, fully_masked] = torch.inf
+        return out_ref, out_pt, lse_ref, lse_pt
+
+    golden_out_ref, golden_out_pt, golden_lse_ref, _ = reference_pair(query_ref, key_ref, value_ref)
+    # The reference out comes from permute(0, 2, 1, 3) and keeps last-dim stride 1,
+    # which the wrapper's maybe_contiguous does not fix; make it contiguous BSND explicitly.
+    dq, dk, dv = _bwd_headdim_bsnd(
+        dout, query, key, value,
+        golden_out_ref.npu().contiguous(), golden_lse_ref.npu().contiguous(),
+        is_causal=is_causal, softcap=softcap, alibi_slopes=alibi_slopes,
+    )
+    dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+        os.environ.get("GOLDEN_CACHE_NODEID", "v2"),
+        (golden_out_ref, golden_out_pt),
+        (query_ref, key_ref, value_ref),
+        dout,
+        metadata={"version": 2, "kind": "bsnd-bwd-headdim", "dropout_p": 0.0},
+        inputs={"query": query_ref, "key": key_ref, "value": value_ref, "dout": dout},
+        rebuild=reference_pair,
+    )
+    assert_fa_close(dq, dq_ref, dq_pt, softcap=softcap, name="dQ")
+    assert_fa_close(dk, dk_ref, dk_pt, softcap=softcap, name="dK")
+    assert_fa_close(dv, dv_ref, dv_pt, softcap=softcap, name="dV")
+
+
+def _bwd_headdim_invalid_inputs(head_size=512):
+    """Zero inputs for host-side validation only; no real computation is triggered."""
+    shape = (1, 16, 1, head_size)
+    query = torch.zeros(shape, dtype=torch.float16, device="npu")
+    key, value = torch.zeros_like(query), torch.zeros_like(query)
+    out, dout = torch.zeros_like(query), torch.zeros_like(query)
+    softmax_lse = torch.zeros((1, 1, 16), dtype=torch.float32, device="npu")
+    return dout, query, key, value, out, softmax_lse
+
+
+def test_bwd_headdim_rejects_deterministic():
+    with pytest.raises(RuntimeError, match="deterministic backward does not support headdim > 256"):
+        _bwd_headdim_bsnd(
+            *_bwd_headdim_invalid_inputs(), is_causal=False, softcap=0.0, deterministic=True
+        )
+
+
+def test_bwd_headdim_rejects_above_512():
+    with pytest.raises(RuntimeError, match=r"headdim must be in \(0, 512\]"):
+        _bwd_headdim_bsnd(*_bwd_headdim_invalid_inputs(513), is_causal=False, softcap=0.0)
+
+
+def test_bwd_headdim_rejects_unequal():
+    dout, query, _, _, out, softmax_lse = _bwd_headdim_invalid_inputs()
+    key = torch.zeros((1, 16, 1, 256), dtype=torch.float16, device="npu")
+    value = torch.zeros_like(key)
+    with pytest.raises(RuntimeError, match="must share the same headdim"):
+        _bwd_headdim_bsnd(dout, query, key, value, out, softmax_lse, is_causal=False, softcap=0.0)
+
+
 # flash_attn_varlen_func test parameters
 # Single-option parameters: fixed values
 # batch_size: [4]
@@ -1168,6 +1330,116 @@ def test_fa_varlen_ops(
         assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
         assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+
+
+# packed (TND) backward test parameters
+# The forward path does not support head_size > 256 either, so out/lse come from the
+# CPU reference; softmax_lse uses the varlen (num_heads, total_q) layout with valid tokens only.
+# head_size: [512, 464]; 464 covers the 16-aligned tail path in packed layout.
+varlen_bwd_headdim_cases = [
+    # data_type, num_heads, kv_heads, seqlens_q, seqlens_k, head_size, is_causal, softcap, case_name
+    (torch.float16, 2, 2, [33, 32, 63], [48, 31, 49], 512, True, 0.0, "fp16-d512-causal"),
+    (torch.bfloat16, 4, 2, [17, 47, 65], [31, 33, 65], 512, False, 30.0, "bf16-d512-gqa-softcap"),
+    (torch.float16, 2, 2, [33, 32, 63], [48, 31, 49], 464, True, 0.0, "fp16-d464-align16"),
+]
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize(
+    "data_type, num_heads, kv_heads, seqlens_q, seqlens_k, head_size, is_causal, softcap, case_name",
+    varlen_bwd_headdim_cases,
+    ids=[c[-1] for c in varlen_bwd_headdim_cases],
+)
+def test_varlen_bwd_headdim_tnd(
+    data_type, num_heads, kv_heads, seqlens_q, seqlens_k, head_size, is_causal, softcap, case_name
+):
+    max_seqlen_q, max_seqlen_k = max(seqlens_q), max(seqlens_k)
+    cu_q = make_cu_seqlens(seqlens_q).npu()
+    cu_k = make_cu_seqlens(seqlens_k).npu()
+    query = make_packed_random_tensor(
+        seqlens_q, max_seqlen_q, num_heads, head_size, data_type, device="npu"
+    )
+    key = make_packed_random_tensor(
+        seqlens_k, max_seqlen_k, kv_heads, head_size, data_type, device="npu"
+    )
+    value = make_packed_random_tensor(
+        seqlens_k, max_seqlen_k, kv_heads, head_size, data_type, device="npu"
+    )
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key.detach().cpu().requires_grad_(True)
+    value_ref = value.detach().cpu().requires_grad_(True)
+    q_valid, _, atten_mask = make_padded_varlen_mask(
+        seqlens_q, seqlens_k, max_seqlen_q, max_seqlen_k, is_causal, -1, -1
+    )
+    scale = 1.0 / (head_size**0.5)
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Pad packed inputs to BSND for the reference, then gather valid tokens back."""
+        query_padded = pad_packed_tensor(query_ref, seqlens_q, max_seqlen_q)
+        key_padded = pad_packed_tensor(key_ref, seqlens_k, max_seqlen_k)
+        value_padded = pad_packed_tensor(value_ref, seqlens_k, max_seqlen_k)
+        out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+            query_padded,
+            key_padded,
+            value_padded,
+            scale,
+            atten_mask,
+            data_type,
+            softcap,
+            q_seqlens=seqlens_q,
+            kv_seqlens=seqlens_k,
+            differentiable=differentiable,
+        )
+        fully_masked = atten_mask.all(dim=-1)
+        out_ref[fully_masked] = 0
+        out_pt[fully_masked] = 0
+        lse_ref = lse_ref.masked_fill(fully_masked[:, None, :], torch.inf)
+        lse_pt = lse_pt.masked_fill(fully_masked[:, None, :], torch.inf)
+        return (
+            out_ref[q_valid],
+            out_pt[q_valid],
+            lse_ref.permute(0, 2, 1)[q_valid].transpose(0, 1),
+            lse_pt.permute(0, 2, 1)[q_valid].transpose(0, 1),
+        )
+
+    golden_out_ref, golden_out_pt, golden_lse_ref, _ = reference_pair(query_ref, key_ref, value_ref)
+    dout = make_random_tensor(golden_out_ref.shape, data_type, low=-0.5, high=0.5, device="npu")
+    dq, dk, dv = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+    _flash_attn_varlen_backward(
+        dout,
+        query,
+        key,
+        value,
+        golden_out_ref.npu().contiguous(),
+        golden_lse_ref.npu().contiguous(),
+        dq,
+        dk,
+        dv,
+        cu_q,
+        cu_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        scale,
+        is_causal,
+        -1,
+        -1,
+        softcap,
+        None,
+        False,
+    )
+    dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+        os.environ.get("GOLDEN_CACHE_NODEID", "v2-varlen"),
+        (golden_out_ref, golden_out_pt),
+        (query_ref, key_ref, value_ref),
+        dout,
+        metadata={"version": 2, "kind": "varlen-bwd-headdim", "dropout_p": 0.0},
+        inputs={"query": query_ref, "key": key_ref, "value": value_ref, "dout": dout},
+        rebuild=reference_pair,
+    )
+    assert_fa_close(dq, dq_ref, dq_pt, softcap=softcap, name="dQ")
+    assert_fa_close(dk, dk_ref, dk_pt, softcap=softcap, name="dK")
+    assert_fa_close(dv, dv_ref, dv_pt, softcap=softcap, name="dV")
 
 
 @pytest.mark.golden_api("flash_attn_varlen_func")

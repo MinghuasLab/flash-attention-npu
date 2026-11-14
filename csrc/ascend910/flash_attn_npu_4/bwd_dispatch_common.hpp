@@ -49,6 +49,9 @@
             case 256:                                                                      \
                 BWD_KERNEL_LAUNCH(DTemplateType::Aligned256, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
                 break;                                                                     \
+            case 512:                                                                      \
+                BWD_KERNEL_LAUNCH(DTemplateType::Aligned512, DTYPE, IS_MASK, IS_DTM, IS_SOFTCAP); \
+                break;                                                                     \
             default:                                                                       \
                 break;                                                                     \
         }                                                                                  \

@@ -1313,13 +1313,16 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     uint32_t headdim = qsizes[2];
     uint32_t v_headdim = vsizes[2];
     uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[2]);
-    // FAG kernel specializations top out at Aligned256.
+    // FAG kernel specializations top out at Aligned512.
     TORCH_CHECK(nheads > 0 && nheads_k > 0, "mha_varlen_bwd: number of Q/KV heads must be positive");
     TORCH_CHECK(nheads % nheads_k == 0,
                 "mha_varlen_bwd: number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[2]) && headdim == v_headdim && headdim == dout_headdim,
                 "mha_varlen_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
-    TORCH_CHECK(headdim > 0 && headdim <= 256, "mha_varlen_bwd: headdim must be in (0, 256].");
+    TORCH_CHECK(headdim > 0 && headdim <= 512, "mha_varlen_bwd: headdim must be in (0, 512].");
+    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
+    TORCH_CHECK(!(deterministic && headdim > 256),
+                "mha_varlen_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(qsizes == dout_sizes, "mha_varlen_bwd: q and dout must have the same shape");
     TORCH_CHECK(ksizes == vsizes, "mha_varlen_bwd: k and v must have the same shape");
     TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k, "mha_varlen_bwd: v nheads_k must match k");
@@ -1551,7 +1554,10 @@ mha_bwd(const at::Tensor& dout,                   // batch_size x seqlen_q x num
     TORCH_CHECK(nheads % nheads_k == 0, "mha_bwd: number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[3]) && headdim == v_headdim && headdim == dout_headdim,
                 "mha_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
-    TORCH_CHECK(headdim > 0 && headdim <= 256, "mha_bwd: headdim must be in (0, 256].");
+    TORCH_CHECK(headdim > 0 && headdim <= 512, "mha_bwd: headdim must be in (0, 512].");
+    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
+    TORCH_CHECK(!(deterministic && headdim > 256),
+                "mha_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(qsizes == dout_sizes, "mha_bwd: q and dout must have the same shape");
     TORCH_CHECK(ksizes == vsizes, "mha_bwd: k and v must have the same shape");
     TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");

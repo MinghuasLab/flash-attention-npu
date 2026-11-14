@@ -5,6 +5,7 @@
  */
 
 #include "fag_common.h"
+#include "fag_ub_layout.hpp"
 #include "fag_cast_ub_plan.hpp"
 #include "fag_det_schedule_host.hpp"
 
@@ -37,6 +38,21 @@ int64_t CheckBn2s2CastUb(FAGTilingData& tiling, const FAGInfo& info)
     if (plan.chunkRows == 0) {
         fprintf(stderr, "FAG950 det bn2s2: UB too small for one cast row: pipeline %llu, UB %llu\n",
                 (unsigned long long)plan.pipelineBytes, (unsigned long long)info.ubSize);
+        return -1;
+    }
+    return 0;
+}
+
+// The legacy AIV pipeline keeps a 128-element physical UB row stride even
+// when the L1 task width is 64. This preserves the existing VF kernels.
+int64_t CheckLegacyUb(const FAGTilingData& tiling)
+{
+    const uint32_t pipelineUb = FagUbLayout::PipelineBytes(tiling.qTile);
+    const uint32_t deltaUb = 2 * FagUbLayout::DeltaSlotBytes(tiling.vHeadDim);
+    if (pipelineUb > tiling.ubSize || deltaUb > tiling.ubSize) {
+        fprintf(stderr, "FAG950 bwd: UB too small: pipeline %llu, delta %llu, capacity %llu\n",
+                (unsigned long long)pipelineUb, (unsigned long long)deltaUb,
+                (unsigned long long)tiling.ubSize);
         return -1;
     }
     return 0;
@@ -90,8 +106,50 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.scaleValue = info.scaleValue;
     tiling.softcapValue = info.softcapValue;
 
+    // D<=256 keeps the legacy 128x128 full-residency schedule. D>256 uses the
+    // 128x256 partial-resident puncture schedule.
+    const uint64_t maxHeadDim = std::max(info.qkHeadDim, info.vHeadDim);
+    const uint64_t alignedQk = RoundUpU64(info.qkHeadDim, 16);
+    const uint64_t alignedV = RoundUpU64(info.vHeadDim, 16);
+    tiling.d512Partial = 0;
     tiling.qTile = 128;
     tiling.kvTile = 128;
+    if (maxHeadDim > 256) {
+        // Precondition for the 128x256 partial schedule: Q/Dy keep a 256-wide
+        // half in one 64KB slot and the high halves stream through the 128KB
+        // scratch (RES_KT + RES_VT). Both budgets hold once the aligned head
+        // dim is <= 512:
+        //   full K[s2, D]  : 128 * 512 * 2B = 128KB <= scratch
+        //   Q/dY high half : 128 * 256 * 2B =  64KB <= slot
+        constexpr uint64_t MAX_ALIGNED_D = 512;
+        if (alignedQk > MAX_ALIGNED_D || alignedV > MAX_ALIGNED_D) {
+            fprintf(stderr,
+                    "FAG950 bwd: D>256 partial path requires aligned head dim <= %llu, "
+                    "got qk=%llu v=%llu\n",
+                    (unsigned long long)MAX_ALIGNED_D, (unsigned long long)alignedQk,
+                    (unsigned long long)alignedV);
+            return -1;
+        }
+        tiling.d512Partial = 1;
+    }
+
+    constexpr uint64_t L1_SIZE = 512 * 1024;
+    constexpr uint64_t L1_CUBE_SLOT_BYTES = 64 * 1024;
+    // Full-residency path budgets the full D column into one cube slot.
+    // Partial path only keeps a 256-wide half in Q/Dy; scratch holds the rest.
+    const uint64_t residentCols =
+        tiling.d512Partial ? 256ULL : std::max(alignedQk, alignedV);
+    const uint64_t maxOperandBytes =
+        residentCols * std::max(tiling.qTile, tiling.kvTile) * sizeof(uint16_t);
+    const uint64_t pdsBytes = 4ULL * tiling.qTile * tiling.kvTile * sizeof(uint16_t);
+    if (maxOperandBytes > L1_CUBE_SLOT_BYTES || 6 * L1_CUBE_SLOT_BYTES + pdsBytes > L1_SIZE) {
+        fprintf(stderr, "FAG950 bwd: invalid L1 tiling: operand %llu, P/dS %llu\n",
+                (unsigned long long)maxOperandBytes, (unsigned long long)pdsBytes);
+        return -1;
+    }
+    if (CheckLegacyUb(tiling) != 0) {
+        return -1;
+    }
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
 
