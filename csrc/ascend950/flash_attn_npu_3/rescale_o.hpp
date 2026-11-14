@@ -99,6 +99,80 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
     }
 
+
+    template <bool Partial = false>
+    __simd_vf__ static inline void ComputeStackLse(__ubuf__ float* output,
+        __ubuf__ float* max, __ubuf__ float* sum, uint32_t rows)
+    {
+        using namespace AscendC::MicroAPI;
+        MaskReg full=CreateMask<float,MaskPattern::ALL>();
+        uint32_t count=8; MaskReg block=UpdateMask<float>(count);
+        for(uint16_t row=0;row<rows;row++) {
+            RegTensor<float> m,l;
+            LoadAlign<float,LoadDist::DIST_BRC_B32>(m,max+row);
+            LoadAlign<float,LoadDist::DIST_BRC_B32>(l,sum+row);
+            MaskReg empty;Compares(empty,l,0.0F,full);
+            Ln(l,l,full);Add(l,l,m,full);
+            RegTensor<float> infinity;Duplicate(infinity,Partial ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity());
+            Select(l,infinity,l,empty);
+            StoreAlign<float,StoreDist::DIST_NORM_B32>(output+row*8,l,block);
+        }
+    }
+
+    // Fused row-major update for one 16x512 GM batch. Alpha belongs to the
+    // consumed stack; rowSum is used only for the final stack of its task.
+    template <bool Partial = false>
+    __simd_vf__ static inline void ComputeStack512(
+        __ubuf__ float* lo, __ubuf__ float* go, __ubuf__ ElementO* output,
+        __ubuf__ float* alpha, __ubuf__ float* rowSum,
+        uint16_t rows, bool firstStack, bool lastStack)
+    {
+        using namespace AscendC::MicroAPI;
+        MaskReg full = CreateMask<float, MaskPattern::ALL>();
+        MaskReg halfFull = CreateMask<uint16_t, MaskPattern::ALL>();
+        static constexpr CastTrait evenCast = {RegLayout::ZERO, SatMode::SAT,
+            MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        static constexpr CastTrait oddCast = {RegLayout::ONE, SatMode::SAT,
+            MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        for (uint16_t row = 0; row < rows; ++row) {
+            RegTensor<float> a, sum, even, odd, oldEven, oldOdd;
+            RegTensor<float> contiguous0, contiguous1;
+            RegTensor<ElementO> pEven, pOdd, packed;
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(a, alpha + row);
+            if (lastStack) { LoadAlign<float, LoadDist::DIST_BRC_B32>(sum, rowSum + row); Maxs(sum, sum, 1e-30F, full); }
+            #pragma unroll
+            for (uint16_t col = 0; col < 512; col += 128) {
+                LoadAlign<float, LoadDist::DIST_DINTLV_B32>(even, odd, lo + row * 512 + col);
+                if (!firstStack) {
+                    LoadAlign<float, LoadDist::DIST_DINTLV_B32>(oldEven, oldOdd, go + row * 512 + col);
+                    Mul(oldEven, oldEven, a, full);
+                    Mul(oldOdd, oldOdd, a, full);
+                    Add(even, even, oldEven, full);
+                    Add(odd, odd, oldOdd, full);
+                }
+                if (!lastStack) {
+                    Interleave(contiguous0, contiguous1, even, odd);
+                    StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col, contiguous0, full);
+                    StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col + 64, contiguous1, full);
+                } else {
+                    Div(even, even, sum, full);
+                    Div(odd, odd, sum, full);
+                    if constexpr (Partial) {
+                        Interleave(contiguous0, contiguous1, even, odd);
+                        StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col, contiguous0, full);
+                        StoreAlign<float, StoreDist::DIST_NORM_B32>(go + row * 512 + col + 64, contiguous1, full);
+                    } else {
+                    Cast<ElementO, float, evenCast>(pEven, even, full);
+                    Cast<ElementO, float, oddCast>(pOdd, odd, full);
+                    Or((RegTensor<uint16_t>&)packed, (RegTensor<uint16_t>&)pEven,
+                       (RegTensor<uint16_t>&)pOdd, halfFull);
+                    StoreAlign<ElementO>(output + row * 512 + col, packed, halfFull);
+                    }
+                }
+            }
+        }
+    }
+
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline void SetCrossCoreSync(Arch::CrossCoreFlag& crossCoreFlag)
     {
@@ -263,6 +337,30 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
 
+    // Shared per-head O transfer. Caller owns masking and synchronization.
+    __aicore__ static inline void CopyGroupedOutputToGm(AscendC::GlobalTensor<ElementO> gO,
+        AscendC::LocalTensor<ElementO> source, uint32_t qSBlockSize, uint32_t rowStart,
+        uint32_t rowCount, uint32_t embedV, uint32_t outputStride, uint32_t oHeadStride,
+        uint32_t colStride)
+    {
+        // scatter O rows to per-head GM addresses.
+        uint32_t groupRow = rowStart;
+        uint32_t ubRowOffset = 0U;
+        uint32_t remainingRows = rowCount;
+        while (remainingRows > 0U) {
+            uint32_t head = groupRow / qSBlockSize;
+            uint32_t localS = groupRow % qSBlockSize;
+            uint32_t rowsThisHead = qSBlockSize - localS;
+            rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+            AscendC::DataCopyPad(gO[static_cast<uint64_t>(head) * oHeadStride + static_cast<uint64_t>(localS) * outputStride], source[ubRowOffset * colStride],
+                                 AscendC::DataCopyExtParams(rowsThisHead, embedV * sizeof(ElementO), 0,
+                                                            (outputStride - embedV) * sizeof(ElementO), 0));
+            groupRow += rowsThisHead;
+            ubRowOffset += rowsThisHead;
+            remainingRows -= rowsThisHead;
+        }
+    }
+
     template <class TensorDst>
     __aicore__ inline void ScatterGroupedOutput(TensorDst& gOTensor, uint32_t qSBlockSize, uint32_t rowStart,
                                                 uint32_t rowCount, uint32_t embedV, uint32_t outputStride,
@@ -292,21 +390,33 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         }
-        // scatter O rows to per-head GM addresses.
-        uint32_t groupRow = rowStart;
-        uint32_t ubRowOffset = 0U;
-        uint32_t remainingRows = rowCount;
-        while (remainingRows > 0U) {
-            uint32_t head = groupRow / qSBlockSize;
-            uint32_t localS = groupRow % qSBlockSize;
-            uint32_t rowsThisHead = qSBlockSize - localS;
-            rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-            AscendC::DataCopyPad(gO[head * oHeadStride + localS * outputStride], goUbTensor16[ubRowOffset * colStride],
-                                 AscendC::DataCopyExtParams(rowsThisHead, embedV * sizeof(ElementO), 0,
-                                                            (outputStride - embedV) * sizeof(ElementO), 0));
-            groupRow += rowsThisHead;
-            ubRowOffset += rowsThisHead;
-            remainingRows -= rowsThisHead;
+        CopyGroupedOutputToGm(gO, goUbTensor16, qSBlockSize, rowStart, rowCount,
+                              embedV, outputStride, oHeadStride, colStride);
+    }
+
+    // Shared block-aligned UB to per-head GM LSE transfer. Caller owns synchronization.
+    __aicore__ static inline void CopyGroupedLseToGm(AscendC::GlobalTensor<float> gLse,
+        AscendC::LocalTensor<float> source, uint32_t qSBlockSize, uint32_t qNBlockSize,
+        uint32_t lseHeadStride, uint32_t rowStart, uint32_t rowCount)
+    {
+        if (qNBlockSize == 1U) {
+            AscendC::DataCopyPad(gLse[rowStart], source,
+                                 AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
+        } else {
+            uint32_t groupRow = rowStart;
+            uint32_t ubRowOffset = 0U;
+            uint32_t remainingRows = rowCount;
+            while (remainingRows > 0U) {
+                uint32_t head = groupRow / qSBlockSize;
+                uint32_t localS = groupRow % qSBlockSize;
+                uint32_t rowsThisHead = qSBlockSize - localS;
+                rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                AscendC::DataCopyPad(gLse[head * lseHeadStride + localS], source[ubRowOffset * FLOAT_BLOCK_SIZE],
+                                     AscendC::DataCopyExtParams(rowsThisHead, sizeof(float), 0, 0, 0));
+                groupRow += rowsThisHead;
+                ubRowOffset += rowsThisHead;
+                remainingRows -= rowsThisHead;
+            }
         }
     }
 
@@ -397,25 +507,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
-        if (qNBlockSize == 1U) {
-            AscendC::DataCopyPad(gLse[rowStart], goUbTensor32,
-                                 AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
-        } else {
-            uint32_t groupRow = rowStart;
-            uint32_t ubRowOffset = 0U;
-            uint32_t remainingRows = rowCount;
-            while (remainingRows > 0U) {
-                uint32_t head = groupRow / qSBlockSize;
-                uint32_t localS = groupRow % qSBlockSize;
-                uint32_t rowsThisHead = qSBlockSize - localS;
-                rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-                AscendC::DataCopyPad(gLse[head * lseHeadStride + localS], goUbTensor32[ubRowOffset * FLOAT_BLOCK_SIZE],
-                                     AscendC::DataCopyExtParams(rowsThisHead, sizeof(float), 0, 0, 0));
-                groupRow += rowsThisHead;
-                ubRowOffset += rowsThisHead;
-                remainingRows -= rowsThisHead;
-            }
-        }
+        CopyGroupedLseToGm(gLse, goUbTensor32, qSBlockSize, qNBlockSize, lseHeadStride, rowStart, rowCount);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
 

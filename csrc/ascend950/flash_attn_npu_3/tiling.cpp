@@ -150,7 +150,7 @@ uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t kSBlockTile = faInfo_.dataType == DataType::FP8 ? 256U : 128U;
+    uint32_t kSBlockTile = faInfo_.embeddingSizeV == 512 ? 512U : (faInfo_.dataType == DataType::FP8 ? 256U : 128U);
     return kSBlockTile;
 }
 
@@ -222,6 +222,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
+    fa950_plan::ApplyStack512Tiles(faTilingData);
 }
 
 void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData& faTilingData)
@@ -545,11 +546,13 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 
     // The Ascend950 FD pipeline keeps QK, softmax, PV and rescale buffers
     // on chip. Its GM workspace only needs the partial LSE and O regions.
+    if (faInfo_.embeddingSizeV != 512) {
     tiling.set_qkOutSize(0U);
     tiling.set_smOnlineOutSize(0U);
     tiling.set_pvOutSize(0U);
     tiling.set_UpdateSize(0U);
-    tiling.fdPartialLseOffset = 0U;
+    }
+    tiling.fdPartialLseOffset = AlignUpU64(tiling.qkOutSize + tiling.smOnlineOutSize + tiling.pvOutSize + tiling.UpdateSize, FD_WORKSPACE_ALIGNMENT);
     const uint64_t partialLseSize =
         static_cast<uint64_t>(tiling.fdPartialCapacity) * 2U * tiling.fdLseSubStride * sizeof(float);
     tiling.fdPartialOOffset = AlignUpU64(tiling.fdPartialLseOffset + partialLseSize, FD_WORKSPACE_ALIGNMENT);

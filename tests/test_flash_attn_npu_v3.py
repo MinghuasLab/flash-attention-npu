@@ -286,6 +286,9 @@ test_cases = [
     (torch.float16, 1, 8, 8, 512, 2048, 512, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 1, 16, 2, 1, 1024, 512, 0, 128, True, "TND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 8, 8, 16, 1024, 512, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
+    # Short paged TND workloads reach FlashDecode on Ascend950.
+    (torch.float16, 1, 32, 8, 1, 1024, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
+    (torch.bfloat16, 1, 32, 8, 1, 4096, 512, 1, 128, True, "TND", False, -1, -1, 0.0, 0, False),
     # head_dim <=256 controls for the same shapes (regression guard).
     (torch.float16, 1, 32, 8, 1, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 4, False),
     (torch.bfloat16, 1, 16, 2, 64, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
@@ -324,8 +327,6 @@ def test_fa_kvcache_ops(
         # as the original <=256 path, but append-KV remains unsupported.
         if head_size != 512:
             pytest.skip("head_size > 256 is only supported for exactly 512")
-        if "Ascend950" in name:
-            pytest.skip("Ascend950 v3 does not support head_size 512")
     elif head_size < 1:
         pytest.skip("head_size must be >= 1")
     if is_varied and layout != "TND":

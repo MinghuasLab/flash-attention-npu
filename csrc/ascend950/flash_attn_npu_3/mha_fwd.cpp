@@ -237,8 +237,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query, "total_q must be positive when max_seqlen_q is positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
-    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
-    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256, "FlashAttention supports value head dimensions in [1, 256]");
+    TORCH_CHECK((head_size_q >= 1 && head_size_q <= 256) || (head_size_q == 512 && head_size_v == 512 && quantMode == 0), "FlashAttention supports q/k dimensions in [1, 256], or Q/K/V all 512");
+    TORCH_CHECK((head_size_v >= 1 && head_size_v <= 256) || (head_size_q == 512 && head_size_v == 512 && quantMode == 0), "FlashAttention supports value dimensions in [1, 256], or Q/K/V all 512");
     TORCH_CHECK(
         !(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
         "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
@@ -330,6 +330,10 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor tiling_dev;
     at::Tensor mask_npu_tensor;
     bool is_local = false;
+    if(head_size_q == 512) {
+        TORCH_CHECK((num_splits == 0 || num_splits == 1 || num_splits == 2 || num_splits == 4), "D512 currently requires num_splits=0 (auto), 1, 2 or 4");
+        TORCH_CHECK(layout_enum != FwdLayout::BNSD, "D512 BNSD is not supported");
+    }
     bool flashDecodeEnabled = false;
     uint32_t launchBlockDim = blockDim;
 
@@ -478,9 +482,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
     at::Tensor workspace;
-    if (flashDecodeEnabled) {
-        workspace =
-            at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    if (flashDecodeEnabled || head_size_q == 512) {
+        const uint64_t workspaceBytes = scheduler_metadata_.has_value()
+            ? fa_metadata::WorkSpaceSize(blockDim)
+            : tilingData.workSpaceSize;
+        workspace = at::empty({static_cast<int64_t>(workspaceBytes)}, at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================
@@ -500,7 +506,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // pointer is used only by specializations that return softmax LSE.
     auto lseDev = return_softmax_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     uint8_t* wsDev = nullptr;
-    if (flashDecodeEnabled) {
+    if (flashDecodeEnabled || head_size_q == 512) {
         wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     }
     auto tilDev = tilingDevice;
@@ -535,7 +541,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
 
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
-    const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;
+    const float scale_value = is_softcap && head_size_q != 512 ? softmax_scale / softcap : softmax_scale;
     const FwdLaunchArgs fwdArgs{
         is_bf16,
         fmt,

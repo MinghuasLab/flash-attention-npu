@@ -114,8 +114,8 @@ def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
     view is rejected instead of copied.
     """
     q = q.contiguous()
-    # The FP8 kernel still uses packed page addressing.
-    if page_table is None or q.dtype == torch.float8_e4m3fn:
+    # FP8 and D512 kernels still use packed page addressing.
+    if page_table is None or q.dtype == torch.float8_e4m3fn or q.shape[-1] == 512:
         if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
             raise RuntimeError(
                 "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
@@ -1221,7 +1221,7 @@ def flash_attn_with_kvcache(
         and max_seqlen_q <= 16
     )
     empty_query = cu_seqlens_q is not None and q.shape[0] == 0 and max_seqlen_q == 0
-    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query
+    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query or q.shape[-1] == 512
     if scheduler_metadata is None and not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:

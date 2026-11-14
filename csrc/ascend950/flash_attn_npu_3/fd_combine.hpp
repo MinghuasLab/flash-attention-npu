@@ -22,7 +22,7 @@ class FlashDecodeCombine950 {
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
-    static constexpr uint32_t MAX_HEAD_DIM = 256U;
+    static constexpr uint32_t MAX_HEAD_DIM = 512U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
     static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;
@@ -103,9 +103,9 @@ class FlashDecodeCombine950 {
         const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
         const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
 
-        for (uint32_t row = 0U; row < assignedRows; row += MAX_ROW_TILE) {
+        for (uint32_t row = 0U; row < assignedRows; row += Min(MAX_ROW_TILE, MAX_O_ELEMS / dRound)) {
             const uint32_t sourceLocalRow = assignedStart + row;
-            const uint32_t rowCount = Min(MAX_ROW_TILE, assignedRows - row);
+            const uint32_t rowCount = Min(Min(MAX_ROW_TILE, MAX_O_ELEMS / dRound), assignedRows - row);
             const uint32_t rowStart = (sourceSubBlock == 0U ? 0U : sourceRowSplit) + sourceLocalRow;
             const uint32_t rowCountAlign = RoundUp(rowCount, FLOATS_PER_BLOCK);
             PrepareWeights(partialLse, firstPartial, partialCount, partialCountAlign, sourceSubBlock, sourceLocalRow,
@@ -163,7 +163,7 @@ class FlashDecodeCombine950 {
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t aivIdx = AscendC::GetBlockIdx();
         const uint32_t aivNum = AscendC::GetBlockNum() * subBlockNum;
-        const uint32_t rowTile = Min(MAX_ROW_TILE, Max(1U, CeilDiv(tiling->fdCombineRowNum, aivNum)));
+        const uint32_t rowTile = Min(Min(MAX_ROW_TILE, MAX_O_ELEMS / RoundUp(tiling->embeddingSizeV, 32U / sizeof(ElementO))), Max(1U, CeilDiv(tiling->fdCombineRowNum, aivNum)));
 
         AscendC::GlobalTensor<float> partialLse;
         partialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + tiling->fdPartialLseOffset));
@@ -200,7 +200,7 @@ class FlashDecodeCombine950 {
                 qLen = params.seqUsedQ != nullptr
                            ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
                            : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
-                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
+                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U && headDim != 512U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
                 qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
                 const uint32_t batchTasks = CeilDiv(qLen, tiling->qBaseTile) * qNTaskNum;

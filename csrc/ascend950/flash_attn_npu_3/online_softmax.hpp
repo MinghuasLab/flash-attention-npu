@@ -743,6 +743,102 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::PipeBarrier<PIPE_V>();
     }
 
+
+    // Row-major GM-stack epilogue. A row is reduced across all 512 columns
+    // before conversion to P; never normalize the four 128-column tiles alone.
+    // The caller supplies one <=16-row UB batch and task/stack-local statistics.
+    template<bool FullBlock = false>
+    __simd_vf__ static inline void ComputeStack512(
+        __ubuf__ float* scores, __ubuf__ ElementOutput* probabilities,
+        __ubuf__ float* runningMax, __ubuf__ float* runningSum,
+        __ubuf__ float* alpha, uint16_t rows, uint16_t validCols,
+        float scale, float softcap, bool firstStack,
+        uint16_t keepBegin = 0, uint16_t keepEnd = 512)
+    {
+        using namespace AscendC::MicroAPI;
+        MaskReg full = CreateMask<float, MaskPattern::ALL>();
+        MaskReg halfFull = CreateMask<uint16_t, MaskPattern::ALL>();
+        static constexpr CastTrait evenCast = {RegLayout::ZERO, SatMode::SAT,
+            MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        static constexpr CastTrait oddCast = {RegLayout::ONE, SatMode::SAT,
+            MaskMergeMode::ZEROING, AscendC::RoundMode::CAST_ROUND};
+        for (uint16_t row = 0; row < rows; ++row) {
+            RegTensor<float> scaled[8];
+            RegTensor<float> x, maxLanes, maxRow, oldMax, sumLanes, sumRow;
+            RegTensor<float> a, oldSum, even, odd, sumPair, cap;
+            RegTensor<ElementOutput> pEven, pOdd, packed;
+            Duplicate(maxLanes, MIN_VALUE);
+            // Apply scale/softcap once, pad the final stack with masked scores.
+            #pragma unroll
+            for (uint16_t col = 0; col < 512; col += 64) {
+                LoadAlign(x, scores + row * 512 + col);
+                Muls(x, x, HAS_SOFTCAP_ ? scale / softcap : scale, full);
+                if constexpr (HAS_SOFTCAP_) { ApplySoftcap(x, cap, full, softcap); }
+                if constexpr (!FullBlock) {
+                    uint32_t count = validCols > col ? validCols - col : 0U;
+                    count = count < 64U ? count : 64U;
+                    uint32_t endCount = keepEnd > col ? keepEnd-col : 0U;
+                    count = count < endCount ? count : endCount;
+                    uint32_t beginCount = keepBegin > col ? keepBegin-col : 0U;
+                    beginCount = beginCount < 64U ? beginCount : 64U;
+                    MaskReg prefix = UpdateMask<float>(beginCount);
+                    MaskReg valid = UpdateMask<float>(count);
+                    RegTensor<float> minimum;
+                    Duplicate(minimum, MIN_VALUE);
+                    Select(x, x, minimum, valid);
+                    Select(x, minimum, x, prefix);
+                }
+                Max(maxLanes, maxLanes, x, full);
+                scaled[col / 64] = x;
+            }
+            Reduce<ReduceType::MAX, float, float, MaskMergeMode::ZEROING>(maxRow, maxLanes, full);
+            Duplicate(maxRow, maxRow, full);
+            if (firstStack) {
+                Duplicate(a, 0.0F);
+                Duplicate(oldSum, 0.0F);
+            } else {
+                LoadAlign<float, LoadDist::DIST_BRC_B32>(oldMax, runningMax + row);
+                LoadAlign<float, LoadDist::DIST_BRC_B32>(oldSum, runningSum + row);
+                Max(maxRow, maxRow, oldMax, full);
+                Sub(a, oldMax, maxRow, full);
+                Exp(a, a, full);
+            }
+            Duplicate(sumLanes, 0.0F);
+            #pragma unroll
+            for (uint16_t col = 0; col < 512; col += 128) {
+                DeInterleave(even, odd, scaled[col / 64], scaled[col / 64 + 1]);
+                Sub(even, even, maxRow, full);
+                Sub(odd, odd, maxRow, full);
+                Exp(even, even, full);
+                Exp(odd, odd, full);
+                if constexpr (!FullBlock) {
+                    if(keepEnd <= keepBegin || validCols == 0) { Duplicate(even, 0.0F); Duplicate(odd, 0.0F); }
+                }
+                Add(sumPair, even, odd, full);
+                Add(sumLanes, sumLanes, sumPair, full);
+                Cast<ElementOutput, float, evenCast>(pEven, even, full);
+                Cast<ElementOutput, float, oddCast>(pOdd, odd, full);
+                Or((RegTensor<uint16_t>&)packed, (RegTensor<uint16_t>&)pEven,
+                   (RegTensor<uint16_t>&)pOdd, halfFull);
+                StoreAlign<ElementOutput>(probabilities + row * 512 + col, packed, halfFull);
+            }
+            Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(sumRow, sumLanes, full);
+            Duplicate(sumRow, sumRow, full);
+            Mul(oldSum, oldSum, a, full);
+            Add(sumRow, sumRow, oldSum, full);
+            __ubuf__ float* maxDst = runningMax + row;
+            __ubuf__ float* sumDst = runningSum + row;
+            __ubuf__ float* alphaDst = alpha + row;
+            UnalignRegForStore maxStore, sumStore, alphaStore;
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(maxDst, maxRow, maxStore, 1);
+            StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(maxDst, maxStore, 0);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(sumDst, sumRow, sumStore, 1);
+            StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(sumDst, sumStore, 0);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(alphaDst, a, alphaStore, 1);
+            StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(alphaDst, alphaStore, 0);
+        }
+    }
+
   private:
     ElementInput scaleValue;
     ElementInput softcapValue;
