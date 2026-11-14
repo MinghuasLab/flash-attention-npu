@@ -107,6 +107,25 @@ struct FAGTilingData {
     uint32_t usedCoreNum = 0;
     uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
     uint32_t detCastChunkRows = 0;
+    // Non-deterministic TND D<=128: cast each flushed dk/dv tile to bf16/fp16
+    // during the main loop and skip the trailing full-tensor FagPost for
+    // dk/dv.  Used by shortQ/shortBiDir.  dq still uses the fp32 workspace +
+    // FagPost because it is atomically accumulated across S2 tiles.  0 keeps
+    // the legacy end-of-kernel cast path (including all BSND).
+    uint32_t earlyDkvCast = 0;
+    // Non-deterministic short bidirectional (maxS1<=16 && maxS2<=16): isolated
+    // schedule that replaces the B×N2 full scan with core-strided task indexing.
+    // Must stay 0 for longer S1/S2 so those shapes keep the legacy pipeline.
+    uint32_t shortBiDir = 0;
+    // 1 when every batch shares the same S1/S2. Enables arithmetic batch
+    // offsets without cu_seqlens GetValue in the hot loop.
+    uint32_t shortBiDirUniform = 0;
+    // Non-deterministic short-Q long-KV (maxS1<=16 && maxS2>16): core-strided
+    // schedule over (b,n2) with S2 inner. Mutually exclusive with shortBiDir.
+    // Indexing is arithmetic (gid → b,n2 via kvHeadNum); no per-batch prefix table.
+    uint32_t shortQ = 0;
+    // 1 when every batch shares the same S1 (enables arithmetic Q offsets).
+    uint32_t shortQUniformS1 = 0;
 
     uint64_t ubSize = 0;
     uint64_t batch = 0;
@@ -192,6 +211,8 @@ struct FAGBlockInfo {
     bool loadKv = true;
     bool flushDkv = true;
     bool initDkv = true;
+    // shortQ: first S2 tile may overwrite zeroed dq workspace (no atomic).
+    bool atomicDq = true;
 
     // BN2S2 only: fold accumulator index of this task and, for every fold
     // buffer of the current column, the real (batch, n2, s2) column that the

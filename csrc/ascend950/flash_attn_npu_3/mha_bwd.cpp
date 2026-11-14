@@ -278,16 +278,20 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
             }
             fag_info.batch -= tail_zero;
         }
-        // TND BN2S2: hand the per-batch lengths to the tiler, which
-        // serializes the round/area prefix table.  MHA needs the swizzle's
-        // intra-round uniqueness condition; GQA uses opst's flat partition.
+        // Host per-batch lengths for the tiler (shortQ maxS1/S2, det BN2S2
+        // prefix). Non-det shortQ needs these so gating is not blocked on a
+        // nullptr actualSeqKv while max_seqlen alone already matches.
+        if (tndAllNonEmpty) {
+            fag_info.actualSeqQ = actual_seq_q.data();
+            fag_info.actualSeqKv = actual_seq_kv.data();
+        }
+        // TND BN2S2: serialize the round/area prefix table.  MHA needs the
+        // swizzle's intra-round uniqueness; GQA uses opst's flat partition.
         // Causal TND reuses the dense schedule with the causal mask applied
         // in the epilogue (masked blocks contribute exact zeros), same as
         // the rectangular BSND causal path.
         if (deterministic && tndAllNonEmpty &&
             batch_size + 1 <= static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM)) {
-            fag_info.actualSeqQ = actual_seq_q.data();
-            fag_info.actualSeqKv = actual_seq_kv.data();
             fag_info.detSchedule = static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2);
         }
     }
@@ -319,6 +323,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     }
     if (is_local && fag_tiling_data.dqPostAbsorb != 0) {
         dq.zero_();
+    }
+    // earlyDkvCast Fixpipe-writes only the columns that run; untouched
+    // (causal/band-skipped) columns must stay exact zeros.
+    if (fag_tiling_data.earlyDkvCast != 0) {
+        dk.zero_();
+        dv.zero_();
     }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
@@ -423,42 +433,55 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>     \
-        <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
-                                            ptr(tiling_device))
+    // shortQ/shortBiDir: SINGLE_VEC=true → NO_SPLIT Fixpipe + AIV0-only handshake.
+    // All other shapes (neither flag) stay on SPLIT_M dual-AIV.
+    const bool launch_single_vec = (fag_tiling_data.shortQ != 0) || (fag_tiling_data.shortBiDir != 0);
 
-#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC)                    \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP,     \
+                           SINGLE_VEC><<<launch_cores, nullptr, stream>>>(                                             \
+        ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, cu_k, seq_used_q, seq_used_k,       \
+        ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device))
+
+#define DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, SINGLE_VEC)                                                      \
     do {                                                                                                               \
         if (has_attn_mask) {                                                                                           \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true, SINGLE_VEC);                                  \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false, SINGLE_VEC);                                 \
                 }                                                                                                      \
             } else {                                                                                                   \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true, SINGLE_VEC);                                 \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false, SINGLE_VEC);                                \
                 }                                                                                                      \
             }                                                                                                          \
         } else {                                                                                                       \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true, SINGLE_VEC);                                 \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false, SINGLE_VEC);                                \
                 }                                                                                                      \
             } else {                                                                                                   \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true, SINGLE_VEC);                                \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false);                                           \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false, SINGLE_VEC);                               \
                 }                                                                                                      \
             }                                                                                                          \
+        }                                                                                                              \
+    } while (0)
+
+#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
+    do {                                                                                                               \
+        if (launch_single_vec) {                                                                                       \
+            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, true);                                                       \
+        } else {                                                                                                       \
+            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, false);                                                      \
         }                                                                                                              \
     } while (0)
 
@@ -481,6 +504,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     }
 
 #undef DISPATCH_BWD950_FLAGS
+#undef DISPATCH_BWD950_FLAGS_SV
 #undef LAUNCH_BWD950
 
     at::Tensor softmax_d = is_varlen ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))

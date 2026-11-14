@@ -90,8 +90,72 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.scaleValue = info.scaleValue;
     tiling.softcapValue = info.softcapValue;
 
-    tiling.qTile = 128;
+    // Default kvTile=128. shortQ keeps 128 (larger kvTile was tried and dropped).
+    // VF epilogues use a 128-col chunk loop with row pitch = kvTile.
+    // qTile shrinks for short S1.
     tiling.kvTile = 128;
+    tiling.qTile = 128;
+    tiling.shortBiDir = 0;
+    tiling.shortBiDirUniform = 0;
+    tiling.shortQ = 0;
+    tiling.shortQUniformS1 = 0;
+    if (!info.deterministic) {
+        uint64_t maxS1 = info.qSeqlen;
+        uint64_t maxS2 = info.kvSeqlen;
+        bool uniformS1 = true;
+        bool uniformS2 = true;
+        if (info.layout == Layout::TND && info.batch > 0) {
+            if (info.actualSeqQ != nullptr) {
+                maxS1 = 0;
+                for (uint64_t b = 0; b < info.batch; ++b) {
+                    const uint64_t s = static_cast<uint64_t>(info.actualSeqQ[b] > 0 ? info.actualSeqQ[b] : 0);
+                    if (s > maxS1) {
+                        maxS1 = s;
+                    }
+                    if (b > 0 && s != static_cast<uint64_t>(info.actualSeqQ[0] > 0 ? info.actualSeqQ[0] : 0)) {
+                        uniformS1 = false;
+                    }
+                }
+            }
+            if (info.actualSeqKv != nullptr) {
+                maxS2 = 0;
+                for (uint64_t b = 0; b < info.batch; ++b) {
+                    const uint64_t s = static_cast<uint64_t>(info.actualSeqKv[b] > 0 ? info.actualSeqKv[b] : 0);
+                    if (s > maxS2) {
+                        maxS2 = s;
+                    }
+                    if (b > 0 && s != static_cast<uint64_t>(info.actualSeqKv[0] > 0 ? info.actualSeqKv[0] : 0)) {
+                        uniformS2 = false;
+                    }
+                }
+            }
+        }
+        if (maxS1 > 0 && maxS1 <= 16) {
+            tiling.qTile = 16;
+        } else if (maxS1 <= 32) {
+            tiling.qTile = 32;
+        } else if (maxS1 <= 64) {
+            tiling.qTile = 64;
+        }
+        // Short bidirectional: one S1/S2 tile per (b,n2,g). Isolate the
+        // scalar-oriented schedule so longer S1/S2 shapes stay on legacy.
+        if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 0 && maxS2 <= 16) {
+            tiling.shortBiDir = 1;
+            if (uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
+                info.totalQ == info.batch * maxS1 && info.totalKv == info.batch * maxS2) {
+                tiling.shortBiDirUniform = 1;
+            }
+        } else if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 16 && info.batch > 0) {
+            // Short-Q long-KV scene: core-strided (b,n2); S2 inner.
+            // Gate on maxS1/S2 only (from actualSeq or max_seqlen). Runtime
+            // maps gid → (b,n2) as gid/kvHeadNum (kvHeadNum is global).
+            // kvTile stays 128 (256 N-split wiped the win).
+            tiling.shortQ = 1;
+            if (uniformS1 && info.totalQ == info.batch * maxS1) {
+                tiling.shortQUniformS1 = 1;
+            }
+        }
+    }
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
 
@@ -101,15 +165,24 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.dqVecNum = info.deterministic ? info.dqVecNum : 0;
     tiling.dkVecNum = info.deterministic ? info.dkVecNum : 0;
     tiling.dvVecNum = info.deterministic ? info.dvVecNum : 0;
+    tiling.earlyDkvCast = 0;
+    tiling.detCastChunkRows = 0;
 
     const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
     const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
 
     if (!info.deterministic) {
-        // Legacy layout, byte-identical to the non-deterministic path.
+        // Legacy layout.  earlyDkvCast (TND D<=128): cube Fixpipe writes
+        // bf16/fp16 dk/dv directly, so the multi-GB fp32 dk/dv workspaces are
+        // unused and can be dropped — FagPost also skips those casts.
+        // Scoped to TND for the short-S (shortQ/shortBiDir) path; BSND keeps
+        // the legacy fp32 workspace + FagPost cast.
+        const bool earlyDkv = info.layout == Layout::TND && info.qkHeadDim <= 128 && info.vHeadDim <= 128;
+        tiling.earlyDkvCast = earlyDkv ? 1 : 0;
+
         uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
+        uint64_t dkWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dvWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
         uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
 
         tiling.dqOffset = 0;
@@ -117,6 +190,8 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         tiling.dvOffset = tiling.dkOffset + dkWsSize;
         tiling.deltaOffset = tiling.dvOffset + dvWsSize;
         tiling.workspaceSize = tiling.deltaOffset + deltaWsSize;
+        tiling.dkPrivOffset = 0;
+        tiling.dvPrivOffset = 0;
         return 0;
     }
 
