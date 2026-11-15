@@ -3,6 +3,8 @@ prune .github
 prune .cache
 prune tests
 prune build
+prune ci
+prune benchmarks
 global-exclude __pycache__ *.py[cod]
 include flash_attn_npu_4/catlass_dsl/README.md
 recursive-include examples *.py

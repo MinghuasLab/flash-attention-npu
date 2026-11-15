@@ -905,6 +905,8 @@ setup(
     packages=find_packages(
         exclude=(
             "build",
+            "ci",
+            "ci.*",
             "csrc/ascend910",
             "csrc/ascend950",
             "include",
