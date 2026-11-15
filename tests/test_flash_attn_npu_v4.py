@@ -1292,6 +1292,100 @@ def test_combine_return_lse_false_and_inplace():
     assert (result.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
 
 
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_combine_nonfinite_out_partial_preserves_ieee_special(sign):
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    out_partial[0, 0, 0, 0, 0] = sign * float("inf")
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        out.float(),
+        out_ref.to(torch.bfloat16).float(),
+        atol=1e-3,
+        rtol=1e-3,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize("special_lse", [float("inf"), float("nan")])
+def test_combine_nonfinite_lse_masks_weights_and_preserves_lse(special_lse):
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    lse_partial[0, 0, 0, 0] = special_lse
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4, equal_nan=True)
+    torch.testing.assert_close(
+        out.float(),
+        out_ref.to(torch.bfloat16).float(),
+        atol=1e-3,
+        rtol=1e-3,
+        equal_nan=True,
+    )
+
+
+def test_combine_head_dim_zero_still_writes_lse():
+    num_splits, batch, seqlen, heads = 2, 1, 8, 3
+    out_partial = torch.empty(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        0,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    assert out.shape == (batch, seqlen, heads, 0)
+    assert out.numel() == 0
+    torch.testing.assert_close(lse, torch.logsumexp(lse_partial, dim=0), atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
 def test_combine_low_precision_partial(data_type):
     num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96

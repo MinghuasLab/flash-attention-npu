@@ -229,7 +229,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                     "seqused must be a 1-D int32 tensor");
     }
 
-    if (seqlen == 0 || num_heads == 0 || head_dim == 0) {
+    if (seqlen == 0 || num_heads == 0) {
         return {out, lse_out};
     }
 
