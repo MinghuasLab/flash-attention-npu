@@ -22,6 +22,23 @@ def load_metadata_module(repo_root: Path):
     return module
 
 
+def rename_release_wheel(wheel_path: Path, repo_root: Path) -> Path:
+    wheel_path = wheel_path.resolve()
+    metadata_module = load_metadata_module(repo_root)
+    config = metadata_module.get_build_config()
+    public_name = (
+        f"{metadata_module.PACKAGE_NAME}-{config.version}-{config.python_tag}-"
+        f"{config.abi_tag}-{config.platform_tag}.whl"
+    )
+    if wheel_path.name != public_name:
+        raise ValueError(
+            f"built wheel name mismatch: expected {public_name}, got {wheel_path.name}"
+        )
+    release_path = wheel_path.with_name(metadata_module.get_wheel_filename(config))
+    wheel_path.rename(release_path)
+    return release_path
+
+
 def validate_wheel(wheel_path: Path, repo_root: Path) -> None:
     metadata_module = load_metadata_module(repo_root)
     config = metadata_module.get_build_config()
@@ -34,10 +51,17 @@ def validate_wheel(wheel_path: Path, repo_root: Path) -> None:
         metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
         if len(metadata_names) != 1:
             raise ValueError(f"expected one METADATA file, found {len(metadata_names)}")
-        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_names[0]))
-        if metadata["Version"] != config.wheel_version:
+        expected_metadata_name = (
+            f"{metadata_module.PACKAGE_NAME}-{config.version}.dist-info/METADATA"
+        )
+        if metadata_names[0] != expected_metadata_name:
             raise ValueError(
-                f"wheel metadata version mismatch: {metadata['Version']} != {config.wheel_version}"
+                f"wheel metadata path mismatch: {metadata_names[0]} != {expected_metadata_name}"
+            )
+        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_names[0]))
+        if metadata["Version"] != config.version:
+            raise ValueError(
+                f"wheel metadata version mismatch: {metadata['Version']} != {config.version}"
             )
         if "flash_attn_npu/__init__.py" not in names:
             raise ValueError("wheel does not contain flash_attn_npu package")
@@ -77,9 +101,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--rename", action="store_true")
     args = parser.parse_args()
-    validate_wheel(args.wheel, args.repo_root)
-    print(args.wheel)
+    wheel_path = rename_release_wheel(args.wheel, args.repo_root) if args.rename else args.wheel
+    validate_wheel(wheel_path, args.repo_root)
+    print(wheel_path)
     return 0
 
 
