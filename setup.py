@@ -842,13 +842,7 @@ if BUILD_EXTENSIONS:
 
 
 def get_package_version():
-    config = wheel_metadata.get_build_config()
-    wheel_commands = {"bdist_wheel", "dist_info", "egg_info"}
-    if os.getenv("FLASH_ATTN_WHEEL_VARIANT") or (
-        not FORCE_BUILD and not SKIP_NPU_BUILD and wheel_commands.intersection(sys.argv[1:])
-    ):
-        return config.wheel_version
-    return config.version
+    return wheel_metadata.get_build_config().version
 
 
 def get_wheel_url():

@@ -94,11 +94,13 @@ python3 setup.py bdist_wheel --dist-dir="$dist_dir"
 mapfile -t wheels < <(find "$dist_dir" -maxdepth 1 -type f -name '*.whl' -print)
 [ "${#wheels[@]}" -eq 1 ] || die "expected one wheel in $dist_dir, found ${#wheels[@]}"
 wheel_path="${wheels[0]}"
-python3 ci/validate_wheel.py "$wheel_path"
+public_wheel_name="$(basename "$wheel_path")"
+wheel_path="$(python3 ci/validate_wheel.py --rename "$wheel_path")"
 install_dir="$(mktemp -d)"
 trap 'rm -rf "$install_dir"' EXIT
-python3 -m pip install --no-deps --no-index --target "$install_dir" "$wheel_path"
-PYTHONPATH="$install_dir" python3 -c \
+ln -s "$wheel_path" "$install_dir/$public_wheel_name"
+python3 -m pip install --no-deps --no-index --target "$install_dir/site" "$install_dir/$public_wheel_name"
+PYTHONPATH="$install_dir/site" python3 -c \
   'import importlib.metadata; print(importlib.metadata.version("flash-attn-npu"))'
 wheel_sha256="$(sha256sum "$wheel_path" | awk '{print $1}')"
 log "wheel=$wheel_path"
