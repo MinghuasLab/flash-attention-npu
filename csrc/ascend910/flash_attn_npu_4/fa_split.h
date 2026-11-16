@@ -519,6 +519,132 @@ inline void fillCoreInfoNoSplit(FAInferStaticTilingData* tiling, uint32_t groupS
     tiling->set_needCoreNum(usedCores);
 }
 
+// Dedicated gemv absorbed-MLA decode: host sinks only per-batch split rules,
+// the kernel re-derives the (batch, split) table; each core takes a slice.
+inline void splitKvForGemvDecode(FAInferStaticTilingData* tiling, const SplitContext& ctx, uint32_t kvTile = 128)
+{
+    constexpr uint32_t SIZE_OF_32BIT = 4;
+    // FA4 has no append-KV here, so SplitContext carries no kvNewSeqlen.
+    constexpr uint32_t kvNewSeqlen = 0;
+    const uint32_t qHeads = static_cast<uint32_t>(ctx.num_heads);
+    const uint32_t headSizeV = static_cast<uint32_t>(ctx.head_size_v);
+
+    uint32_t batchWithWork = 0;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + kvNewSeqlen);
+        if (kvLen > 0) {
+            batchWithWork++;
+        }
+    }
+    if (batchWithWork == 0) {
+        tiling->set_needCoreNum(0);
+        tiling->set_totalTaskNum(0);
+        tiling->set_nsplitPerBatch(1U);
+        tiling->set_totalSplitNodeNum(0);
+        tiling->set_splitLseTotalSize(0);
+        tiling->set_splitOTotalSize(0);
+        return;
+    }
+
+    // Split budget: explicit num_splits wins, else ~SEG_TARGET=4 tiles/split
+    // (c~1.4us/split, m~2.4us/tile => 4 optimal); batch*splits<=blockDim.
+    constexpr uint32_t SEG_TARGET = 4;
+    const uint32_t maxSplitsPerBatch = (ctx.blockDim / batchWithWork) ? (ctx.blockDim / batchWithWork) : 1U;
+    uint32_t nsplitPerBatch = maxSplitsPerBatch;
+    if (ctx.num_splits > 1) {
+        // An explicit budget (num_splits > 1) wins; num_splits <= 1 is not
+        // honoured as one core (training passes 1, kvcache 0) -> auto below.
+        nsplitPerBatch = static_cast<uint32_t>(ctx.num_splits);
+    } else {
+        uint32_t maxSegCount = 0;
+        for (int32_t b = 0; b < ctx.batch_size; b++) {
+            uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + kvNewSeqlen);
+            uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+            if (segCount > maxSegCount) {
+                maxSegCount = segCount;
+            }
+        }
+        uint32_t target = (maxSegCount + SEG_TARGET - 1) / SEG_TARGET;
+        nsplitPerBatch = (target == 0) ? 1U : target;
+    }
+    if (nsplitPerBatch == 0) {
+        nsplitPerBatch = 1;
+    }
+    if (nsplitPerBatch > maxSplitsPerBatch) {
+        nsplitPerBatch = maxSplitsPerBatch;
+    }
+
+    // Rule-only accumulation: device re-derives (b, s, segStart, segEnd) from
+    // nsplitPerBatch; host keeps only task/partial totals (no coreInfo).
+    uint32_t totalTaskNum = 0;
+    int32_t splitIdx = 0;
+    int64_t lseTaskOffset = 0;
+    int64_t oTaskOffset = 0;
+    bool anySplit = false;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + kvNewSeqlen);
+        uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+        if (segCount == 0) {
+            continue;
+        }
+        uint32_t blocksPerSplit = (segCount + nsplitPerBatch - 1) / nsplitPerBatch;
+        if (blocksPerSplit == 0) {
+            blocksPerSplit = 1;
+        }
+        uint32_t actualSplits = (segCount + blocksPerSplit - 1) / blocksPerSplit;
+        if (actualSplits > 1) {
+            anySplit = true;
+        }
+        totalTaskNum += actualSplits;
+        lseTaskOffset += static_cast<int64_t>(actualSplits) * qHeads;
+        oTaskOffset += static_cast<int64_t>(actualSplits) * qHeads * headSizeV;
+        splitIdx++;
+    }
+
+    tiling->set_needCoreNum(FaMin(totalTaskNum, ctx.blockDim));
+    tiling->set_totalTaskNum(totalTaskNum);
+    tiling->set_nsplitPerBatch(nsplitPerBatch);
+    if (anySplit) {
+        // Only split batches write partials and need the combine pass; when
+        // all batches are single tasks, cores write output (partials unused).
+        tiling->set_totalSplitNodeNum(static_cast<uint32_t>(splitIdx));
+        tiling->set_splitLseTotalSize(static_cast<uint64_t>(lseTaskOffset) * SIZE_OF_32BIT);
+        tiling->set_splitOTotalSize(static_cast<uint64_t>(oTaskOffset) * SIZE_OF_32BIT);
+        // CombineScale group table in fixed splitInfo[25], read by the kernel:
+        // rows = batches with work (<= blockDim/2 < 25), row idx = ordinal.
+        uint32_t row = 0;
+        int64_t lseAcc = 0;
+        int64_t oAcc = 0;
+        for (int32_t b = 0; b < ctx.batch_size; b++) {
+            uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + kvNewSeqlen);
+            uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+            if (segCount == 0) {
+                continue;
+            }
+            uint32_t blocksPerSplit = (segCount + nsplitPerBatch - 1) / nsplitPerBatch;
+            if (blocksPerSplit == 0) {
+                blocksPerSplit = 1;
+            }
+            uint32_t actualSplits = (segCount + blocksPerSplit - 1) / blocksPerSplit;
+            tiling->splitInfo[row].batchIdx = b;
+            tiling->splitInfo[row].headStartIdx = 0;
+            tiling->splitInfo[row].headEndIdx = static_cast<int>(qHeads);
+            tiling->splitInfo[row].qStartIdx = 0;
+            tiling->splitInfo[row].qEndIdx = 1;
+            tiling->splitInfo[row].splitNum = static_cast<int>(actualSplits);
+            tiling->splitInfo[row].lseTaskOffset = lseAcc;
+            tiling->splitInfo[row].oTaskOffset = oAcc;
+            lseAcc += static_cast<int64_t>(actualSplits) * qHeads;
+            oAcc += static_cast<int64_t>(actualSplits) * qHeads * headSizeV;
+            row++;
+        }
+    } else {
+        tiling->set_totalSplitNodeNum(0);
+        tiling->set_splitLseTotalSize(0);
+        tiling->set_splitOTotalSize(0);
+    }
+}
+
 inline void splitBN2S1GS2(FAInferStaticTilingData* tiling, const SplitContext& ctx)
 {
     uint64_t totalTaskNum = 0;

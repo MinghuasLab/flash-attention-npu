@@ -54,7 +54,9 @@ struct FAInferTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    // P0 (G2)：吸收式 MLA decode gemv 每 batch KV 切分预算，由宿主下沉；2376 字节 ABI 不变。
+    // kernel 据此在设备侧重算 (batch, split) task 表，使 task 数不再受 coreInfo[25] 截断。
+    uint32_t nsplitPerBatch;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -149,9 +151,9 @@ struct FAInferTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_nsplitPerBatch() const
     {
-        return padding3;
+        return nsplitPerBatch;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -275,9 +277,9 @@ struct FAInferTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_nsplitPerBatch(uint32_t value)
     {
-        padding3 = value;
+        nsplitPerBatch = value;
     }
     void set_splitLseTotalSize(uint64_t value)
     {

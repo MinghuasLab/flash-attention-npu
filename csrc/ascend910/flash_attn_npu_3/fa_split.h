@@ -15,14 +15,19 @@ constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MAX_KV_STACK_LEN = 512;
 
-inline uint32_t FaMin(uint32_t a, uint32_t b) { return a < b ? a : b; }
-inline uint32_t FaMax(uint32_t a, uint32_t b) { return a > b ? a : b; }
+inline uint32_t FaMin(uint32_t a, uint32_t b)
+{
+    return a < b ? a : b;
+}
+inline uint32_t FaMax(uint32_t a, uint32_t b)
+{
+    return a > b ? a : b;
+}
 
 inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
     uint32_t qRowNumCeil = Q_TILE_CEIL;
-    uint32_t qNBlockTile = (qSeqlen != 0) ?
-        (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
+    uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
     qNBlockTile = FaMin(qNBlockTile, groupSize);
     qNBlockTile = FaMax(qNBlockTile, static_cast<uint32_t>(1));
     return qNBlockTile;
@@ -50,7 +55,7 @@ struct BatchParams {
     uint32_t curQSBlockNum;
     uint32_t curKSBlockTile;
     uint32_t curKSBlockNum;
-    uint32_t curKSBlockTail;  // rows in the last S2 block (new segment tail, else old tail)
+    uint32_t curKSBlockTail; // rows in the last S2 block (new segment tail, else old tail)
 };
 
 struct SplitContext {
@@ -84,17 +89,17 @@ inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const Split
     // Per-phase S2 block count: old blocks + new blocks
     uint32_t kvSeqlenOld = static_cast<uint32_t>(p.kvSeqlen - ctx.kvNewSeqlen);
     uint32_t kvSBlockNumOld = (kvSeqlenOld + p.curKSBlockTile - 1) / p.curKSBlockTile;
-    uint32_t kvSBlockNumNew = ctx.kvNewSeqlen != 0
-        ? (static_cast<uint32_t>(ctx.kvNewSeqlen) + p.curKSBlockTile - 1) / p.curKSBlockTile : 0U;
+    uint32_t kvSBlockNumNew =
+        ctx.kvNewSeqlen != 0 ? (static_cast<uint32_t>(ctx.kvNewSeqlen) + p.curKSBlockTile - 1) / p.curKSBlockTile : 0U;
     p.curKSBlockNum = kvSBlockNumOld + kvSBlockNumNew;
     p.curKSBlockTail = kvSBlockNumNew != 0U
-        ? (static_cast<uint32_t>(ctx.kvNewSeqlen) - (kvSBlockNumNew - 1U) * p.curKSBlockTile)
-        : (kvSBlockNumOld != 0U ? (kvSeqlenOld - (kvSBlockNumOld - 1U) * p.curKSBlockTile) : 0U);
+                           ? (static_cast<uint32_t>(ctx.kvNewSeqlen) - (kvSBlockNumNew - 1U) * p.curKSBlockTile)
+                           : (kvSBlockNumOld != 0U ? (kvSeqlenOld - (kvSBlockNumOld - 1U) * p.curKSBlockTile) : 0U);
     return p;
 }
 
-inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize,
-                                       uint64_t perCoreTaskNum, const SplitContext& ctx)
+inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize, uint64_t perCoreTaskNum,
+                                       const SplitContext& ctx)
 {
     int32_t nowBIdx = 0;
     int32_t nowN1Idx = 0;
@@ -131,19 +136,30 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
         BatchParams p = getBatchParams(nowBIdx, groupSize, ctx);
 
         auto advanceCounters = [&]() {
-            if (nowS2Idx == static_cast<int32_t>(p.curKSBlockNum)) { nowS1Idx++; nowS2Idx = 0; }
-            if (nowS1Idx == static_cast<int32_t>(p.curQSBlockNum)) { nowN1Idx++; nowS1Idx = 0; nowS2Idx = 0; }
-            if (nowN1Idx == static_cast<int32_t>(p.curQNBlockNum)) { nowBIdx++; nowN1Idx = 0; nowS1Idx = 0; nowS2Idx = 0; }
+            if (nowS2Idx == static_cast<int32_t>(p.curKSBlockNum)) {
+                nowS1Idx++;
+                nowS2Idx = 0;
+            }
+            if (nowS1Idx == static_cast<int32_t>(p.curQSBlockNum)) {
+                nowN1Idx++;
+                nowS1Idx = 0;
+                nowS2Idx = 0;
+            }
+            if (nowN1Idx == static_cast<int32_t>(p.curQNBlockNum)) {
+                nowBIdx++;
+                nowN1Idx = 0;
+                nowS1Idx = 0;
+                nowS2Idx = 0;
+            }
         };
 
         while (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) && resTaskNum > 0) {
             p = getBatchParams(nowBIdx, groupSize, ctx);
             uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
-            uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
-                ? p.curKSBlockTile
-                : p.curKSBlockTail;
+                                      ? p.curQSBlockTile
+                                      : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
+            uint32_t remainingKV =
+                (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1) ? p.curKSBlockTile : p.curKSBlockTail;
             uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
             resTaskNum -= static_cast<int32_t>(singleS2Task);
             nowS2Idx += 1;
@@ -157,24 +173,35 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
         }
 
         advanceCounters();
-        if (nowBIdx < ctx.batch_size && resTaskNum <= 0) continue;
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx < ctx.batch_size && resTaskNum <= 0)
+            continue;
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
 
         while (nowBIdx < ctx.batch_size && resTaskNum > 0) {
             p = getBatchParams(nowBIdx, groupSize, ctx);
-            uint32_t remainingQ = p.qSeqlen * (ctx.num_heads - p.curQNBlockTile * nowN1Idx) - nowS1Idx * p.curQSBlockTile;
+            uint32_t remainingQ =
+                p.qSeqlen * (ctx.num_heads - p.curQNBlockTile * nowN1Idx) - nowS1Idx * p.curQSBlockTile;
             uint32_t remainingKV = p.kvSeqlen;
             uint32_t remainingInBatch = remainingQ * remainingKV;
 
             if (resTaskNum >= static_cast<int32_t>(remainingInBatch)) {
                 resTaskNum -= remainingInBatch;
-                nowBIdx++; nowN1Idx = 0; nowS1Idx = 0; nowS2Idx = 0;
+                nowBIdx++;
+                nowN1Idx = 0;
+                nowS1Idx = 0;
+                nowS2Idx = 0;
             } else {
                 break;
             }
         }
 
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
         p = getBatchParams(nowBIdx, groupSize, ctx);
 
         while (nowN1Idx < static_cast<int32_t>(p.curQNBlockNum) && resTaskNum > 0) {
@@ -182,46 +209,57 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
             uint32_t remainingInN1 = remainingQ * p.kvSeqlen;
             if (resTaskNum >= static_cast<int32_t>(remainingInN1)) {
                 resTaskNum -= remainingInN1;
-                nowN1Idx++; nowS1Idx = 0; nowS2Idx = 0;
+                nowN1Idx++;
+                nowS1Idx = 0;
+                nowS2Idx = 0;
             } else {
                 break;
             }
         }
 
         advanceCounters();
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
         p = getBatchParams(nowBIdx, groupSize, ctx);
 
         while (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) && resTaskNum > 0) {
             uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
+                                      ? p.curQSBlockTile
+                                      : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
             uint64_t remainingInS1 = static_cast<uint64_t>(remainingQ) * p.kvSeqlen;
             if (resTaskNum >= static_cast<int64_t>(remainingInS1)) {
                 resTaskNum -= static_cast<int32_t>(remainingInS1);
-                nowS1Idx++; nowS2Idx = 0;
+                nowS1Idx++;
+                nowS2Idx = 0;
             } else {
                 break;
             }
         }
 
         advanceCounters();
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
         p = getBatchParams(nowBIdx, groupSize, ctx);
 
         while (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) && resTaskNum > 0) {
             uint32_t remainingQ = (nowS1Idx < static_cast<int32_t>(p.curQSBlockNum) - 1)
-                ? p.curQSBlockTile
-                : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
-            uint32_t remainingKV = (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1)
-                ? p.curKSBlockTile
-                : p.curKSBlockTail;
+                                      ? p.curQSBlockTile
+                                      : (p.qSeqlen - nowS1Idx * p.curQSBlockTile) * p.curQNBlockTile;
+            uint32_t remainingKV =
+                (nowS2Idx < static_cast<int32_t>(p.curKSBlockNum) - 1) ? p.curKSBlockTile : p.curKSBlockTail;
             uint64_t singleS2Task = static_cast<uint64_t>(remainingQ) * remainingKV;
             resTaskNum -= static_cast<int32_t>(singleS2Task);
             nowS2Idx += 1;
         }
 
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
 
         tiling->coreInfo[coreIdx].endBIdx = nowBIdx;
         tiling->coreInfo[coreIdx].endN1Idx = nowN1Idx;
@@ -247,7 +285,10 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
         }
 
         advanceCounters();
-        if (nowBIdx == ctx.batch_size) { finishBatch(coreIdx); break; }
+        if (nowBIdx == ctx.batch_size) {
+            finishBatch(coreIdx);
+            break;
+        }
     }
 
     // Flush: if tasks remain unconsumed (nowBIdx < batch_size), trailing S2 blocks
@@ -264,8 +305,7 @@ inline void fillCoreInfoForFlashDecode(FAInferTilingData* tiling, uint32_t group
     }
 }
 
-inline void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize,
-                                        const SplitContext& ctx)
+inline void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t groupSize, const SplitContext& ctx)
 {
     constexpr uint32_t SIZE_OF_32BIT = 4;
 
@@ -309,11 +349,14 @@ inline void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t grou
 
             for (int N1Idx = curStartN1; N1Idx <= curEndN1; N1Idx++) {
                 int curStartS1 = (BIdx == startBIdx && N1Idx == startN1Idx) ? startS1Idx : 0;
-                int curEndS1 = (BIdx == endBIdx && N1Idx == endN1Idx) ? endS1Idx : static_cast<int>(p.curQSBlockNum) - 1;
+                int curEndS1 =
+                    (BIdx == endBIdx && N1Idx == endN1Idx) ? endS1Idx : static_cast<int>(p.curQSBlockNum) - 1;
 
                 for (int S1Idx = curStartS1; S1Idx <= curEndS1; S1Idx++) {
                     int curStartS2 = (BIdx == startBIdx && N1Idx == startN1Idx && S1Idx == startS1Idx) ? startS2Idx : 0;
-                    int curEndS2 = (BIdx == endBIdx && N1Idx == endN1Idx && S1Idx == endS1Idx) ? endS2Idx : static_cast<int>(p.curKSBlockNum);
+                    int curEndS2 = (BIdx == endBIdx && N1Idx == endN1Idx && S1Idx == endS1Idx)
+                                       ? endS2Idx
+                                       : static_cast<int>(p.curKSBlockNum);
 
                     int coveredS2 = curEndS2 - curStartS2;
                     bool isSplitKV = (coveredS2 > 0 && coveredS2 < static_cast<int>(p.curKSBlockNum));
@@ -366,8 +409,8 @@ inline void fillSplitInfoForFlashDecode(FAInferTilingData* tiling, uint32_t grou
         }
     }
 
-    uint32_t actualSplitNum = (splitIdx + 1 > static_cast<int32_t>(ctx.blockDim))
-        ? ctx.blockDim : static_cast<uint32_t>(splitIdx + 1);
+    uint32_t actualSplitNum =
+        (splitIdx + 1 > static_cast<int32_t>(ctx.blockDim)) ? ctx.blockDim : static_cast<uint32_t>(splitIdx + 1);
     tiling->set_totalSplitNodeNum(actualSplitNum);
     tiling->set_splitLseTotalSize(currentLseTaskOffset * SIZE_OF_32BIT);
     tiling->set_splitOTotalSize(currentOTaskOffset * SIZE_OF_32BIT);
@@ -393,8 +436,7 @@ inline uint32_t countForceSplitSegments(uint32_t groupSize, const SplitContext& 
     return totalSegs;
 }
 
-inline void fillCoreInfoForceSplit(FAInferTilingData* tiling, uint32_t groupSize,
-                                   const SplitContext& ctx)
+inline void fillCoreInfoForceSplit(FAInferTilingData* tiling, uint32_t groupSize, const SplitContext& ctx)
 {
     for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
         tiling->coreInfo[coreIdx].startBIdx = 0;
@@ -442,8 +484,7 @@ inline void fillCoreInfoForceSplit(FAInferTilingData* tiling, uint32_t groupSize
     tiling->set_needCoreNum(coreIdx);
 }
 
-inline void fillCoreInfoNoSplit(FAInferTilingData* tiling, uint32_t groupSize,
-                                const SplitContext& ctx)
+inline void fillCoreInfoNoSplit(FAInferTilingData* tiling, uint32_t groupSize, const SplitContext& ctx)
 {
     for (uint32_t coreIdx = 0; coreIdx < ctx.blockDim; coreIdx++) {
         tiling->coreInfo[coreIdx].startBIdx = 0;
@@ -521,6 +562,131 @@ inline void fillCoreInfoNoSplit(FAInferTilingData* tiling, uint32_t groupSize,
     tiling->set_needCoreNum(usedCores);
 }
 
+// Dedicated gemv absorbed-MLA decode: host passes only split rules; kernel
+// re-derives the (batch, split) table; FA3 append-KV kvLen=s_k[b]+kvNewSeqlen.
+inline void splitKvForGemvDecode(FAInferTilingData* tiling, const SplitContext& ctx, uint32_t kvTile = 128)
+{
+    constexpr uint32_t SIZE_OF_32BIT = 4;
+    const uint32_t qHeads = static_cast<uint32_t>(ctx.num_heads);
+    const uint32_t headSizeV = static_cast<uint32_t>(ctx.head_size_v);
+
+    uint32_t batchWithWork = 0;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + ctx.kvNewSeqlen);
+        if (kvLen > 0) {
+            batchWithWork++;
+        }
+    }
+    if (batchWithWork == 0) {
+        tiling->set_needCoreNum(0);
+        tiling->set_totalTaskNum(0);
+        tiling->set_nsplitPerBatch(1U);
+        tiling->set_totalSplitNodeNum(0);
+        tiling->set_splitLseTotalSize(0);
+        tiling->set_splitOTotalSize(0);
+        return;
+    }
+
+    // Split budget: explicit num_splits wins, else ~SEG_TARGET=4 tiles/split
+    // (c~1.4us/split, m~2.4us/tile => 4 optimal); batch*splits<=blockDim.
+    constexpr uint32_t SEG_TARGET = 4;
+    const uint32_t maxSplitsPerBatch = (ctx.blockDim / batchWithWork) ? (ctx.blockDim / batchWithWork) : 1U;
+    uint32_t nsplitPerBatch = maxSplitsPerBatch;
+    if (ctx.num_splits > 1) {
+        // An explicit budget (num_splits > 1) wins; num_splits <= 1 is not
+        // honoured as one core (training passes 1, kvcache 0) -> auto below.
+        nsplitPerBatch = static_cast<uint32_t>(ctx.num_splits);
+    } else {
+        uint32_t maxSegCount = 0;
+        for (int32_t b = 0; b < ctx.batch_size; b++) {
+            uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + ctx.kvNewSeqlen);
+            uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+            if (segCount > maxSegCount) {
+                maxSegCount = segCount;
+            }
+        }
+        uint32_t target = (maxSegCount + SEG_TARGET - 1) / SEG_TARGET;
+        nsplitPerBatch = (target == 0) ? 1U : target;
+    }
+    if (nsplitPerBatch == 0) {
+        nsplitPerBatch = 1;
+    }
+    if (nsplitPerBatch > maxSplitsPerBatch) {
+        nsplitPerBatch = maxSplitsPerBatch;
+    }
+
+    // Rule-only accumulation: device re-derives (b, s, segStart, segEnd) from
+    // nsplitPerBatch; host keeps only task/partial totals (no coreInfo).
+    uint32_t totalTaskNum = 0;
+    int32_t splitIdx = 0;
+    int64_t lseTaskOffset = 0;
+    int64_t oTaskOffset = 0;
+    bool anySplit = false;
+    for (int32_t b = 0; b < ctx.batch_size; b++) {
+        uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + ctx.kvNewSeqlen);
+        uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+        if (segCount == 0) {
+            continue;
+        }
+        uint32_t blocksPerSplit = (segCount + nsplitPerBatch - 1) / nsplitPerBatch;
+        if (blocksPerSplit == 0) {
+            blocksPerSplit = 1;
+        }
+        uint32_t actualSplits = (segCount + blocksPerSplit - 1) / blocksPerSplit;
+        if (actualSplits > 1) {
+            anySplit = true;
+        }
+        totalTaskNum += actualSplits;
+        lseTaskOffset += static_cast<int64_t>(actualSplits) * qHeads;
+        oTaskOffset += static_cast<int64_t>(actualSplits) * qHeads * headSizeV;
+        splitIdx++;
+    }
+
+    tiling->set_needCoreNum(FaMin(totalTaskNum, ctx.blockDim));
+    tiling->set_totalTaskNum(totalTaskNum);
+    tiling->set_nsplitPerBatch(nsplitPerBatch);
+    if (anySplit) {
+        // Only split batches write partials and need the combine pass; when
+        // all batches are single tasks, cores write output (partials unused).
+        tiling->set_totalSplitNodeNum(static_cast<uint32_t>(splitIdx));
+        tiling->set_splitLseTotalSize(static_cast<uint64_t>(lseTaskOffset) * SIZE_OF_32BIT);
+        tiling->set_splitOTotalSize(static_cast<uint64_t>(oTaskOffset) * SIZE_OF_32BIT);
+        // CombineScale group table in fixed splitInfo[25], read by the kernel:
+        // rows = batches with work (<= blockDim/2 < 25), row idx = ordinal.
+        uint32_t row = 0;
+        int64_t lseAcc = 0;
+        int64_t oAcc = 0;
+        for (int32_t b = 0; b < ctx.batch_size; b++) {
+            uint32_t kvLen = static_cast<uint32_t>(ctx.seqlens_k_cpu[b] + ctx.kvNewSeqlen);
+            uint32_t segCount = (kvLen + kvTile - 1) / kvTile;
+            if (segCount == 0) {
+                continue;
+            }
+            uint32_t blocksPerSplit = (segCount + nsplitPerBatch - 1) / nsplitPerBatch;
+            if (blocksPerSplit == 0) {
+                blocksPerSplit = 1;
+            }
+            uint32_t actualSplits = (segCount + blocksPerSplit - 1) / blocksPerSplit;
+            tiling->splitInfo[row].batchIdx = b;
+            tiling->splitInfo[row].headStartIdx = 0;
+            tiling->splitInfo[row].headEndIdx = static_cast<int>(qHeads);
+            tiling->splitInfo[row].qStartIdx = 0;
+            tiling->splitInfo[row].qEndIdx = 1;
+            tiling->splitInfo[row].splitNum = static_cast<int>(actualSplits);
+            tiling->splitInfo[row].lseTaskOffset = lseAcc;
+            tiling->splitInfo[row].oTaskOffset = oAcc;
+            lseAcc += static_cast<int64_t>(actualSplits) * qHeads;
+            oAcc += static_cast<int64_t>(actualSplits) * qHeads * headSizeV;
+            row++;
+        }
+    } else {
+        // 不切分时组表不使用（partial 缓冲保持未初始化，Combine 不运行）。
+        tiling->set_totalSplitNodeNum(0);
+        tiling->set_splitLseTotalSize(0);
+        tiling->set_splitOTotalSize(0);
+    }
+}
+
 inline void splitBN2S1GS2(FAInferTilingData* tiling, const SplitContext& ctx)
 {
     uint64_t totalTaskNum = 0;
@@ -550,6 +716,6 @@ inline void splitBN2S1GS2(FAInferTilingData* tiling, const SplitContext& ctx)
     fillSplitInfoForFlashDecode(tiling, groupSize, ctx);
 }
 
-}
+} // namespace fa_split
 
 #endif

@@ -67,7 +67,6 @@ extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
                                            const std::optional<at::Tensor>& seqlensQ)
 {
@@ -118,6 +117,15 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
         c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
+}
+
+// MLA absorbed decode: 1 q token/seq, 1 KV head, latent v=512, rope=64;
+// paged KV, windows and causal masks keep the generic FAInfer path.
+inline bool IsMlaDecodeGemvShape(bool has_q_v, int64_t num_heads, int64_t num_heads_k, int64_t head_size_og,
+                                 int64_t head_size_v, bool paged_KV, bool is_local, bool is_causal, int64_t seqlen_q)
+{
+    return has_q_v && num_heads <= 32 && num_heads_k == 1 && head_size_v == 512 && head_size_og + head_size_v == 576 &&
+           !paged_KV && !is_local && !is_causal && seqlen_q == 1;
 }
 
 std::vector<at::Tensor> mha_fwd(
@@ -194,8 +202,7 @@ std::vector<at::Tensor> mha_fwd(
                     "total_q must be positive (q must contain at least one query token)");
         int32_t cuQLast = 0;
         if (PackedCuLast(cu_seqlens_q, cuQLast)) {
-            TORCH_CHECK(q.size(0) >= cuQLast,
-                        "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
+            TORCH_CHECK(q.size(0) >= cuQLast, "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
                         "; packed T must be at least cu_seqlens_q[-1]");
         }
     }
@@ -207,9 +214,8 @@ std::vector<at::Tensor> mha_fwd(
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then paged table is not supported");
         int32_t cuKLast = 0;
         if (PackedCuLast(cu_seqlens_k, cuKLast)) {
-            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast,
-                        "k/v have ", k.size(0), "/", v.size(0), " tokens but cu_seqlens_k[-1] is ", cuKLast,
-                        "; packed T must be at least cu_seqlens_k[-1]");
+            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast, "k/v have ", k.size(0), "/", v.size(0),
+                        " tokens but cu_seqlens_k[-1] is ", cuKLast, "; packed T must be at least cu_seqlens_k[-1]");
         }
     }
 
@@ -245,6 +251,27 @@ std::vector<at::Tensor> mha_fwd(
     if (paged_KV) {
         block_table = page_table_.value();
     }
+    // MLA: v head dim differs from q/k; prefill q/k=(..,192) v=(..,128);
+    // absorbed decode q=(..,64) q_v=(..,512) k=(..,64) v=(..,512); else equal.
+    const bool has_q_v = q_v_.has_value();
+    int head_size_v = static_cast<int>(v.size(-1));
+    if (has_q_v) {
+        const at::Tensor& q_v = q_v_.value();
+        TORCH_CHECK(q_v.dtype() == q_dtype, "q_v must have the same dtype as q");
+        TORCH_CHECK(q_v.is_contiguous(), "Input tensor q_v must be contiguous because FA4 uses packed Qv strides");
+        TORCH_CHECK(q_v.size(-1) == v.size(-1),
+                    "q_v and v must share the same last (latent) dimension; got q_v=", q_v.size(-1),
+                    " and v=", v.size(-1));
+        head_size_v = static_cast<int>(q_v.size(-1));
+    }
+    // MLA is selected from the shape signature: an explicit q_v tensor, or a
+    // value head dim that differs from the query/key head dim.
+    const bool is_mla = has_q_v || (q.size(-1) != v.size(-1));
+    if (is_mla) {
+        TORCH_CHECK(!has_q_v || q.size(-1) <= 256, "MLA absorbed decode requires a query head dim <= 256");
+        TORCH_CHECK(head_size_v >= 1 && head_size_v <= 512, "MLA value head dimension must be in [1, 512]; got ",
+                    head_size_v);
+    }
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
@@ -252,7 +279,15 @@ std::vector<at::Tensor> mha_fwd(
     } else if (is_bnsd_layout) {
         // BNSD (B,H,S,D) input: the kernel reads BNSD but writes contiguous BSND, so
         // allocate the output as (B, S, H, dv) instead of empty_like(q) == (B,H,S,D).
-        out = torch::empty({q.size(0), q.size(2), q.size(1), v.size(-1)}, q.options());
+        // Precede the MLA branch: an MLA BNSD q is (B,H,S,dq), so q.sizes()
+        // would give wrong dv; MLA's dv is head_size_v (equal for non-MLA).
+        out = torch::empty({q.size(0), q.size(2), q.size(1), static_cast<int64_t>(head_size_v)}, q.options());
+    } else if (is_mla) {
+        // MLA output uses the value (latent) head dim, which differs from q's.
+        // Keep q's rank/layout: BSND (B,S,H,dv) and packed TND (total,H,dv).
+        auto out_sizes = q.sizes().vec();
+        out_sizes.back() = head_size_v;
+        out = torch::empty(out_sizes, q.options());
     } else {
         out = torch::empty_like(q);
     }
@@ -288,14 +323,10 @@ std::vector<at::Tensor> mha_fwd(
                     "paged key/value caches must have matching page, page-size, and head dimensions");
         const int64_t keyPageElements = k.size(1) * k.size(2) * k.size(3);
         const int64_t valuePageElements = v.size(1) * v.size(2) * v.size(3);
-        const bool keyBBND =
-            k.stride(1) == k.size(2) * k.size(3) && k.stride(2) == k.size(3) && k.stride(3) == 1;
-        const bool valueBBND =
-            v.stride(1) == v.size(2) * v.size(3) && v.stride(2) == v.size(3) && v.stride(3) == 1;
-        const bool keyBNBD =
-            k.stride(1) == k.size(3) && k.stride(2) == k.size(1) * k.size(3) && k.stride(3) == 1;
-        const bool valueBNBD =
-            v.stride(1) == v.size(3) && v.stride(2) == v.size(1) * v.size(3) && v.stride(3) == 1;
+        const bool keyBBND = k.stride(1) == k.size(2) * k.size(3) && k.stride(2) == k.size(3) && k.stride(3) == 1;
+        const bool valueBBND = v.stride(1) == v.size(2) * v.size(3) && v.stride(2) == v.size(3) && v.stride(3) == 1;
+        const bool keyBNBD = k.stride(1) == k.size(3) && k.stride(2) == k.size(1) * k.size(3) && k.stride(3) == 1;
+        const bool valueBNBD = v.stride(1) == v.size(3) && v.stride(2) == v.size(1) * v.size(3) && v.stride(3) == 1;
         TORCH_CHECK((keyBBND && valueBBND) || (keyBNBD && valueBNBD),
                     "paged key/value caches must use the same BBND or BNBD inner layout; only dimension 0 may "
                     "otherwise be non-contiguous");
@@ -370,12 +401,9 @@ std::vector<at::Tensor> mha_fwd(
         return {out, softmaxlse};
     }
 
-    // Derive the max KV length used to collapse the window. The explicit
-    // scheduler-metadata path must NOT do a synchronous D2H copy here (NPU
-    // graph capture forbids synchronized memcpy), so it falls back to the
-    // non-D2H bound that the metadata producer used. Only the host-tiling path
-    // reads exact per-batch lengths, matching how they are consumed below.
-    const bool use_explicit_metadata = scheduler_metadata_.has_value();
+    const bool mlaDecodeGemvShape = IsMlaDecodeGemvShape(has_q_v, num_heads, num_heads_k, head_size_og, head_size_v,
+                                                         paged_KV, is_local, is_causal, seqlen_q);
+    const bool use_explicit_metadata = scheduler_metadata_.has_value() && !mlaDecodeGemvShape;
     int32_t* seqlens_q_cpu = nullptr;
     at::Tensor seqlens_q_cpu_tensor;
     at::Tensor seqlens_k_cpu_tensor;
@@ -460,7 +488,7 @@ std::vector<at::Tensor> mha_fwd(
     }
     runtimeDevice = static_cast<uint8_t*>(runtime_gpu_tensor.data_ptr());
 
-    if (scheduler_metadata_.has_value()) {
+    if (use_explicit_metadata) {
         auto schedMd = scheduler_metadata_.value();
         TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
         TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
@@ -481,8 +509,7 @@ std::vector<at::Tensor> mha_fwd(
         const int64_t rowBlocksUpper =
             (coreNum == 0 || kvGroups == 0) ? 0 : std::min(2 * coreNum, kvGroups + coreNum - 1);
         const int64_t partialRowsUpper = fa_split::Q_TILE_CEIL * rowBlocksUpper;
-        const int64_t wsSplit =
-            partialRowsUpper * (static_cast<int64_t>(head_size_og) + 1) * sizeof(float);
+        const int64_t wsSplit = partialRowsUpper * (static_cast<int64_t>(head_size_v) + 1) * sizeof(float);
         workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
 
@@ -531,7 +558,9 @@ std::vector<at::Tensor> mha_fwd(
         tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
         tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
         tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
-        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
+        // MLA: q/k head dim and value head dim differ; the kernel already keeps
+        // them as independent runtime dims (embed / embedV).
+        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_v));
         tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
         tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
 
@@ -584,12 +613,22 @@ std::vector<at::Tensor> mha_fwd(
         splitCtx.num_heads = num_heads;
         splitCtx.num_heads_k = num_heads_k;
         splitCtx.seqlen_q = seqlen_q;
-        splitCtx.head_size_v = head_size_og;
+        splitCtx.head_size_v = head_size_v;
         splitCtx.seqlens_q_cpu = seqlens_q_cpu;
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
-        if (flashDecodeFlag) {
+        if (mlaDecodeGemvShape) {
+            // The gemv kernel splits the KV cache into 128-token tiles itself;
+            // generic flash-decode tiling does not apply and would fight it.
+            flashDecodeFlag = false;
+            tiling_cpu_ptr->set_flashDecodeFlag(0U);
+            fa_split::splitKvForGemvDecode(tiling_cpu_ptr, splitCtx);
+            auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
+            if (needCoreNum != 0) {
+                launchBlockDim = needCoreNum;
+            }
+        } else if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
             if (needCoreNum != 0) {
@@ -605,19 +644,25 @@ std::vector<at::Tensor> mha_fwd(
         uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
         uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
         uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
+        // The gemv kernel keeps scratch tables at the workspace front; its FD
+        // partials live past them; generic path keeps partials at offset 0.
+        uint64_t partialBase = mlaDecodeGemvShape ? (mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize) : 0U;
         int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize +
                                                      splitLseTotalSize + splitOTotalSize);
 
         workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
         // Empty FD splits never write partials; init like FA GPU (O=0, LSE=-inf).
-        if (flashDecodeFlag && (splitLseTotalSize > 0 || splitOTotalSize > 0)) {
+        // The gemv path shares this contract for its split batches (its gate
+        // is cleared for it, so test the gemv gate separately).
+        if ((flashDecodeFlag || mlaDecodeGemvShape) && (splitLseTotalSize > 0 || splitOTotalSize > 0)) {
             auto float_opts = workspace_tensor.options().dtype(at::kFloat);
             if (splitLseTotalSize > 0) {
                 TORCH_CHECK(splitLseTotalSize % sizeof(float) == 0,
                             "splitLseTotalSize must be a multiple of sizeof(float)");
                 at::Tensor lse_init = at::full({static_cast<int64_t>(splitLseTotalSize / sizeof(float))},
                                                -std::numeric_limits<float>::infinity(), float_opts);
-                workspace_tensor.narrow(/*dim=*/0, /*start=*/0, static_cast<int64_t>(splitLseTotalSize))
+                workspace_tensor
+                    .narrow(/*dim=*/0, static_cast<int64_t>(partialBase), static_cast<int64_t>(splitLseTotalSize))
                     .copy_(lse_init.view(at::kByte));
             }
             if (splitOTotalSize > 0) {
@@ -625,7 +670,8 @@ std::vector<at::Tensor> mha_fwd(
                             "splitOTotalSize must be a multiple of sizeof(float)");
                 at::Tensor o_init = at::zeros({static_cast<int64_t>(splitOTotalSize / sizeof(float))}, float_opts);
                 workspace_tensor
-                    .narrow(/*dim=*/0, static_cast<int64_t>(splitLseTotalSize), static_cast<int64_t>(splitOTotalSize))
+                    .narrow(/*dim=*/0, static_cast<int64_t>(partialBase + splitLseTotalSize),
+                            static_cast<int64_t>(splitOTotalSize))
                     .copy_(o_init.view(at::kByte));
             }
         }
@@ -695,12 +741,15 @@ std::vector<at::Tensor> mha_fwd(
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = flashDecodeFlag;
     fwd_args.has_softcap = has_softcap;
+    fwd_args.mlaDecodeGemv = mlaDecodeGemvShape;
     fwd_args.layout = is_bnsd_layout ? FaiKenel::inputLayout::BNSD
                                      : (is_tnd_layout ? FaiKenel::inputLayout::TND : FaiKenel::inputLayout::BSND);
     fwd_args.kv_seqlen_allocated = kv_seqlen_allocated;
     fwd_args.sequsedQDevice = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     fwd_args.sequsedKVDevice = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     fwd_args.sinkDevice = sinkDevice;
+    // MLA absorbed decode: latent (nope) q half; nullptr = non-MLA QK dim.
+    fwd_args.qvDevice = has_q_v ? static_cast<uint8_t*>(q_v_.value().data_ptr()) : nullptr;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -870,8 +919,7 @@ std::vector<at::Tensor> mha_bwd(
         cu_seqlens_q = cu_seqlens_q_.value();
         int32_t cuQLast = 0;
         if (PackedCuLast(cu_seqlens_q, cuQLast)) {
-            TORCH_CHECK(q.size(0) >= cuQLast,
-                        "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
+            TORCH_CHECK(q.size(0) >= cuQLast, "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
                         "; packed T must be at least cu_seqlens_q[-1]");
         }
     }
@@ -879,9 +927,8 @@ std::vector<at::Tensor> mha_bwd(
         cu_seqlens_k = cu_seqlens_k_.value();
         int32_t cuKLast = 0;
         if (PackedCuLast(cu_seqlens_k, cuKLast)) {
-            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast,
-                        "k/v have ", k.size(0), "/", v.size(0), " tokens but cu_seqlens_k[-1] is ", cuKLast,
-                        "; packed T must be at least cu_seqlens_k[-1]");
+            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast, "k/v have ", k.size(0), "/", v.size(0),
+                        " tokens but cu_seqlens_k[-1] is ", cuKLast, "; packed T must be at least cu_seqlens_k[-1]");
         }
     }
 
@@ -972,7 +1019,8 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.softcapValue = softcap;
     fagInfo.keepProb = 1.0f;
     bool is_local = false;
-    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal, is_local);
+    NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal,
+                             is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);

@@ -87,6 +87,34 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         pageStride = stride;
     }
 
+    // MLA absorbed decode: QK head dim is [latent | rope]. gA/gB and the
+    // K source hold the latent, rope is separate; one 576-wide QK spans both.
+    __aicore__ inline void SetMlaLatentQ(uint32_t headStride, uint32_t tokenStride)
+    {
+        mlaLatentQHeadStride = headStride;
+        mlaLatentQStride = tokenStride;
+    }
+
+    __aicore__ inline void SetMlaRopeQ(AscendC::GlobalTensor<ElementA> g, uint32_t headStride, uint32_t tokenStride)
+    {
+        mlaRopeQ = g;
+        mlaRopeQHeadStride = headStride;
+        mlaRopeQStride = tokenStride;
+    }
+
+    __aicore__ inline void SetMlaRopeK(AscendC::GlobalTensor<ElementB> g, uint32_t tokenStride, uint64_t pageStrideIn)
+    {
+        mlaAbsorbed = true;
+        mlaRopeK = g;
+        mlaRopeKStride = tokenStride;
+        mlaRopeKPageStride = pageStrideIn;
+    }
+
+    __aicore__ inline void SetMlaLatentDim(uint32_t dim)
+    {
+        mlaLatentDim = dim;
+    }
+
     __aicore__ inline void init(Arch::Resource<ArchTag>& resource, uint32_t nDyn, uint32_t kDyn,
                                 uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0, uint32_t qDyn = 0)
     {
@@ -107,6 +135,27 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         l1KDynamic = kDyn;
     }
 
+    // Stage one Q head-dim segment into columns [segStart, segStart +
+    // segWidth) of the L1 zN block; keeps the parent stride for C0 landing.
+    __aicore__ inline void loadQSegmentToL1(AscendC::GlobalTensor<ElementA> gSrc, uint32_t segStart, uint32_t segWidth,
+                                            uint32_t srcHeadStride, uint32_t srcTokenStride, uint32_t rowNum,
+                                            uint32_t rowNumRound, uint32_t singleGroupHeads,
+                                            LayoutAInL1 const& layoutAInL1)
+    {
+        LayoutAInL1 layoutSeg = layoutAInL1.GetTileLayout(MakeCoord(rowNum, segWidth));
+        MatrixCoord dstCoord{0, segStart};
+        auto dst = l1ATensor[layoutAInL1.GetOffset(dstCoord)];
+        uint32_t tokenNumPerGroup = rowNum / singleGroupHeads;
+        if (singleGroupHeads == 1U) {
+            LayoutA denseSrc(rowNum, segWidth, srcTokenStride);
+            copyGmToL1A(dst, gSrc, layoutSeg, denseSrc);
+        } else {
+            LayoutA headSrc(singleGroupHeads, segWidth, srcHeadStride);
+            copyGmToL1A(dst, gSrc, layoutSeg, headSrc, tokenNumPerGroup, srcTokenStride, tokenNumPerGroup, BLOCK_SIZE,
+                        rowNumRound);
+        }
+    }
+
     // layoutA carries the per-head plane pitch in its row stride (stride(0)):
     // embed for BSND / TND, maxQSeqlen * embed for BNSD. That value is the
     // Nd2Nz source row distance (srcDValue). srcNdStride is the distance
@@ -121,8 +170,17 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         auto layoutSingleANd = layoutA.GetTileLayout(MakeCoord(singleGroupHeads, embed));
         LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, embed);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
-        copyGmToL1A(l1ATensor, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, srcNdStride, tokenNumPerGroup,
-                    BLOCK_SIZE, rowNumRound);
+        if (mlaAbsorbed) {
+            // Absorbed decode: gA is the latent (nope) query, mlaRopeQ the
+            // rope query; both fill one 576-wide block, latent first.
+            loadQSegmentToL1(gA, 0U, mlaLatentDim, mlaLatentQHeadStride, mlaLatentQStride, rowNum, rowNumRound,
+                             singleGroupHeads, layoutAInL1);
+            loadQSegmentToL1(mlaRopeQ, mlaLatentDim, embed - mlaLatentDim, mlaRopeQHeadStride, mlaRopeQStride, rowNum,
+                             rowNumRound, singleGroupHeads, layoutAInL1);
+        } else {
+            copyGmToL1A(l1ATensor, gA, layoutAInL1, layoutSingleANd, tokenNumPerGroup, srcNdStride, tokenNumPerGroup,
+                        BLOCK_SIZE, rowNumRound);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID3);
     }
@@ -192,9 +250,8 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV,
                                       bool = false, AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
-                                      uint64_t = 0,
-                                      AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(), uint32_t = 0,
-                                      uint32_t = 0)
+                                      uint64_t = 0, AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(),
+                                      uint32_t = 0, uint32_t = 0)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t stackSeqTile = actualOriShape[COORD_DIM1];
@@ -322,6 +379,18 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                                  uint32_t dSlice, uint32_t kActual, uint32_t nActual, uint32_t stage)
     {
         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(kActual, nActual);
+        // MLA absorbed: head dim is [latent | rope]; latent slices come from
+        // gB and the rope tail from a separate tensor with its own pitches.
+        AscendC::GlobalTensor<ElementB> src = gB;
+        uint32_t srcStride = strideKV;
+        uint64_t srcPageStride = pageStride;
+        uint32_t dOffset = dSlice * l1KDynamic;
+        if (mlaAbsorbed && dOffset >= mlaLatentDim) {
+            src = mlaRopeK;
+            srcStride = mlaRopeKStride;
+            srcPageStride = mlaRopeKPageStride;
+            dOffset -= mlaLatentDim;
+        }
         if constexpr (PAGED_CACHE_FLAG_) {
             uint32_t pageIdx = rowBase / blockSize;
             uint32_t pageOff = rowBase % blockSize;
@@ -329,21 +398,22 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             while (dstRow < nActual) {
                 const uint32_t segLen = AscendC::Std::min(nActual - dstRow, blockSize - pageOff);
                 const uint32_t blockTableId = gBlockTable.GetValue(pageIdx);
-                const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                                         static_cast<uint64_t>(pageOff) * strideKV + dSlice * l1KDynamic;
-                auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, segLen));
+                const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * srcPageStride +
+                                         static_cast<uint64_t>(pageOff) * srcStride + dOffset;
+                auto layoutBTile = mlaAbsorbed ? LayoutB(kActual, segLen, srcStride)
+                                               : layoutB.GetTileLayout(MakeCoord(kActual, segLen));
                 MatrixCoord l1BTileCoord{0, dstRow};
                 auto l1BTile = l1BTensor[stage][layoutBInL1.GetOffset(l1BTileCoord)];
-                copyGmToL1B(l1BTile, gB[gOffset], layoutBInL1, layoutBTile);
+                copyGmToL1B(l1BTile, src[gOffset], layoutBInL1, layoutBTile);
                 dstRow += segLen;
                 ++pageIdx;
                 pageOff = 0U;
             }
         } else {
-            const uint64_t gOffset =
-                static_cast<uint64_t>(rowBase) * strideKV + static_cast<uint64_t>(dSlice) * l1KDynamic;
-            auto layoutBTile = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
-            copyGmToL1B(l1BTensor[stage], gB[gOffset], layoutBInL1, layoutBTile);
+            const uint64_t gOffset = static_cast<uint64_t>(rowBase) * srcStride + dOffset;
+            auto layoutBTile =
+                mlaAbsorbed ? LayoutB(kActual, nActual, srcStride) : layoutB.GetTileLayout(MakeCoord(kActual, nActual));
+            copyGmToL1B(l1BTensor[stage], src[gOffset], layoutBInL1, layoutBTile);
         }
     }
 
@@ -459,6 +529,18 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
     uint32_t blockStartOffset = 0;
     uint32_t maxKVStackLen = 0;
     uint64_t pageStride = 0;
+
+    // MLA split-source state (see SetMlaLatentQ / SetMlaRopeQ / SetMlaRopeK).
+    bool mlaAbsorbed = false;
+    uint32_t mlaLatentDim = 0;
+    uint32_t mlaLatentQHeadStride = 0;
+    uint32_t mlaLatentQStride = 0;
+    AscendC::GlobalTensor<ElementA> mlaRopeQ;
+    uint32_t mlaRopeQHeadStride = 0;
+    uint32_t mlaRopeQStride = 0;
+    AscendC::GlobalTensor<ElementB> mlaRopeK;
+    uint32_t mlaRopeKStride = 0;
+    uint64_t mlaRopeKPageStride = 0;
 };
 
 } // namespace Catlass::Gemm::Block
