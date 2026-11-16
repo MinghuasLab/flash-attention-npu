@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 QUALITY_IMAGE="${QUALITY_IMAGE:-flash-attention-npu-quality:local}"
 QUALITY_BASE_IMAGE="${QUALITY_BASE_IMAGE:-python:3.11-slim}"
 
+# shellcheck source=ci/docker_proxy.sh
+# shellcheck disable=SC1091
 source "$REPO_ROOT/ci/docker_proxy.sh"
 git_proxy_init "${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}"
 
