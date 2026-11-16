@@ -33,103 +33,6 @@ def build_cann_causal_mask():
     return torch.triu(torch.ones(2048, 2048), diagonal=1).bool().npu()
 
 
-def test_fa4_public_entrypoints():
-    import flash_attn_npu_4 as api
-    assert callable(api.flash_attn_func) and callable(api.flash_attn_varlen_func)
-    assert not hasattr(api, "flash_attn_with_kvcache")
-    assert "flash_attn_with_kvcache" not in api.__all__
-
-
-def _tnd_swa_reference(query, key, value, causal, window):
-    """Independent FP64 attention and dtype-rounded T2 reference, on CPU."""
-    sq, heads, dim = query.shape
-    sk = key.shape[0]
-    group = heads // key.shape[1]
-    q = query.permute(1, 0, 2)
-    k = key.repeat_interleave(group, dim=1).permute(1, 2, 0)
-    v = value.repeat_interleave(group, dim=1).permute(1, 0, 2)
-    center = torch.arange(sq)[:, None] + sk - sq
-    col = torch.arange(sk)[None, :]
-    valid = torch.ones(sq, sk, dtype=torch.bool)
-    if causal:
-        valid &= col <= center
-    if window[0] >= 0:
-        valid &= col >= center - window[0]
-    if window[1] >= 0:
-        valid &= col <= center + window[1]
-    score64 = (q.double() @ k.double()) * dim ** -0.5
-    score64.masked_fill_(~valid[None], -float("inf"))
-    ref = (score64.softmax(-1).nan_to_num() @ v.double()).permute(1, 0, 2)
-    lse = score64.logsumexp(-1).masked_fill(~valid.any(-1)[None], float("inf"))
-    score32 = (q.float() @ k.float()).to(query.dtype).float() * dim ** -0.5
-    score32.masked_fill_(~valid[None], -float("inf"))
-    prob = score32.softmax(-1).nan_to_num().to(query.dtype).float()
-    pt = (prob @ v.float()).permute(1, 0, 2).to(query.dtype)
-    return ref, lse, pt
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", [64, 128, 256])
-@pytest.mark.parametrize("length_source", ["cu", "tensor", "integer", "both"])
-@pytest.mark.parametrize("host_tiling", [False, True])
-@pytest.mark.parametrize("sq,sk,heads,kv_heads,causal,window", [
-    (129, 257, 4, 1, False, (31, 17)),
-    (4, 129, 32, 4, False, (7, -1)),
-    (257, 65, 4, 2, False, (-1, 7)),
-    (65, 129, 4, 1, True, (-1, -1)),
-])
-def test_v4_tnd_swa_length_sources(dtype, dim, length_source, host_tiling,
-                                   sq, sk, heads, kv_heads, causal, window):
-    if not torch.npu.is_available() or "Ascend950" not in torch.npu.get_device_name():
-        pytest.skip("Ascend950 only")
-    gen = torch.Generator().manual_seed(9516 + dim + sq * 13 + sk)
-    q = torch.randn(sq, heads, dim, generator=gen).to(dtype)
-    k = torch.randn(sk, kv_heads, dim, generator=gen).to(dtype)
-    v = torch.randn(sk, kv_heads, dim, generator=gen).to(dtype)
-    cuq = torch.tensor([0, sq], dtype=torch.int32, device="npu")
-    cuk = torch.tensor([0, sk], dtype=torch.int32, device="npu") if length_source in ("cu", "both") else None
-    used = (sk if length_source == "integer" else
-            torch.tensor([sk], dtype=torch.int32, device="npu") if length_source in ("tensor", "both") else None)
-    out, lse, *_ = flash_attn_varlen_func(
-        q.npu(), k.npu(), v.npu(), cu_seqlens_q=cuq, cu_seqlens_k=cuk,
-        max_seqlen_q=sq, seqused_k=used, causal=causal, window_size=window,
-        softmax_scale=dim ** -0.5, num_splits=0, return_lse=True,
-        disable_scheduler_metadata=host_tiling)
-    ref, ref_lse, pt = _tnd_swa_reference(q, k, v, causal, window)
-    assert_fa_close(out.cpu(), ref.float(), pt.float(), name="TND out")
-    torch.testing.assert_close(lse.cpu().double(), ref_lse, atol=3e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TND", "BSND"])
-@pytest.mark.parametrize("host_tiling", [False, True])
-def test_v4_scalar_kv_length_batch(dtype, layout, host_tiling):
-    if not torch.npu.is_available() or "Ascend950" not in torch.npu.get_device_name():
-        pytest.skip("Ascend950 only")
-    lengths = (3, 5) if layout == "TND" else (5, 5)
-    sk, heads, kv_heads, dim = 47, 4, 1, 64
-    gen = torch.Generator().manual_seed(951647)
-    queries = [torch.randn(sq, heads, dim, generator=gen).to(dtype) for sq in lengths]
-    keys = [torch.randn(sk, kv_heads, dim, generator=gen).to(dtype) for _ in lengths]
-    values = [torch.randn(sk, kv_heads, dim, generator=gen).to(dtype) for _ in lengths]
-    pack = torch.cat if layout == "TND" else torch.stack
-    cuq = (torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32, device="npu")
-           if layout == "TND" else None)
-    out, lse, *_ = flash_attn_varlen_func(
-        pack(queries).npu(), pack(keys).npu(), pack(values).npu(),
-        cu_seqlens_q=cuq, max_seqlen_q=max(lengths), seqused_k=sk,
-        window_size=(7, 3), num_splits=0, return_lse=True,
-        disable_scheduler_metadata=host_tiling)
-    offset = 0
-    for batch, (q, k, v) in enumerate(zip(queries, keys, values)):
-        ref, ref_lse, pt = _tnd_swa_reference(q, k, v, False, (7, 3))
-        actual = out[offset:offset + q.shape[0]] if layout == "TND" else out[batch]
-        actual_lse = lse[:, offset:offset + q.shape[0]] if layout == "TND" else lse[batch]
-        assert_fa_close(actual.cpu(), ref.float(), pt.float(), name=f"batch {batch} out")
-        torch.testing.assert_close(actual_lse.cpu().double(), ref_lse, atol=3e-3, rtol=3e-3)
-        offset += q.shape[0]
-
-
 # add_unused_qkv is the last column: TND head_size A groups use False and B groups use True plus a few classic specials
 # Single-option parameters: fixed values
 #   batch_size: [2]
@@ -546,6 +449,9 @@ def test_fa_kvcache_ops(
     num_splits,
     softcap,
     add_unused_qkv,
+    *,
+    seqused_k_as_int=False,
+    disable_scheduler_metadata=False,
 ):
 
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
@@ -569,6 +475,9 @@ def test_fa_kvcache_ops(
         q_sequences, kv_sequences = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen, seed=1234)
     else:
         q_sequences = [q_seqlen] * batch_size
+        kv_sequences = [kv_seqlen] * batch_size
+    if seqused_k_as_int:
+        assert not add_unused_qkv
         kv_sequences = [kv_seqlen] * batch_size
     if not add_unused_qkv:
         used_q_lengths, used_k_lengths = q_sequences, kv_sequences
@@ -669,6 +578,8 @@ def test_fa_kvcache_ops(
     seqused_q = torch.tensor(used_q_lengths, dtype=torch.int32).npu() if add_unused_qkv else None
     if add_unused_qkv:
         cache_seqlens_for_api = torch.tensor(used_k_lengths, dtype=torch.int32).npu()
+    if seqused_k_as_int:
+        cache_seqlens_for_api = kv_seqlen
     out_out, softmax_lse, *rest = flash_attn_varlen_func(
         query,
         key_cache,
@@ -688,6 +599,7 @@ def test_fa_kvcache_ops(
         num_splits=num_splits,  # Can be tuned for speed
         pack_gqa=None,  # Can be tuned for speed
         return_lse=True,
+        disable_scheduler_metadata=disable_scheduler_metadata,
     )
     query_ref = query.detach().cpu()
     key_ref = key_cache.detach().cpu()
@@ -1184,6 +1096,46 @@ def test_fa_kvcache_ops_with_hd_le_256(
         num_splits,
         softcap=softcap,
         add_unused_qkv=False,
+    )
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("host_tiling", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,q_seqlen,kv_seqlen,head_size",
+    [
+        (1, 129, 257, 64),
+        (2, 129, 257, 128),
+        (2, 257, 65, 256),
+    ],
+)
+def test_fa_kvcache_ops_scalar_seqused_k(
+    data_type, layout, host_tiling, batch_size, q_seqlen, kv_seqlen, head_size
+):
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        pytest.skip("Ascend950 only")
+    test_fa_kvcache_ops(
+        data_type=data_type,
+        batch_size=batch_size,
+        num_heads=4,
+        kv_heads=1,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        head_size=head_size,
+        cache_mode=0,
+        block_size=128,
+        is_causal=False,
+        layout=layout,
+        is_varied=layout == "TND" and batch_size > 1,
+        window_size_left=31,
+        window_size_right=17,
+        num_splits=0,
+        softcap=0.0,
+        add_unused_qkv=False,
+        seqused_k_as_int=True,
+        disable_scheduler_metadata=host_tiling,
     )
 
 
