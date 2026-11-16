@@ -2,7 +2,8 @@
 
 Compiled functions use dynamic tensor descriptors. Geometry and descriptors
 are rebuilt for each invocation; only code-generation features key the cache.
-Explicit record_stream protects allocations after asynchronous launches.
+Cross-stream records protect allocations after asynchronous launches without
+delaying reuse of buffers allocated on the launch stream.
 """
 
 from __future__ import annotations
@@ -208,6 +209,17 @@ def _compile(key, kernel, args, tensor_shapes=None):
     return compile_cache.get_or_compile(key, lambda: _compile_kernel(kernel, args, tensor_shapes))
 
 
+def _same_stream_eraser():
+    """Use the native allocator's allocation-stream check, never guess ownership."""
+    import torch_npu
+
+    # A custom allocator need not implement the native eraseStream guard.
+    # Leave graph capture's allocator bookkeeping unchanged as well.
+    if torch.npu.get_allocator_backend() != "native" or torch.npu.is_current_stream_capturing():
+        return None
+    return getattr(torch_npu, "erase_stream", None)
+
+
 def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=False):
     # Current-stream ordering remains the caller's dependency contract. In
     # addition, record every allocation used by this external launch so a
@@ -215,6 +227,7 @@ def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=Fal
     # Local runtime references remain live until launch submission completes;
     # record_stream protects their storage after this function returns.
     stream = torch.npu.current_stream(device)
+    erase_stream = _same_stream_eraser() if device.type == "npu" else None
     seen = set()
 
     def record(value):
@@ -222,6 +235,16 @@ def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=Fal
             if id(value) not in seen:
                 seen.add(id(value))
                 value.record_stream(stream)
+                if erase_stream is not None:
+                    # Older torch_npu versions also record the allocation
+                    # stream, preventing normal same-stream buffer reuse.
+                    # Native eraseStream refuses to erase when the allocation
+                    # stream differs from the current stream. Since `stream`
+                    # is current, only a redundant self-record is removed;
+                    # side-stream uses remain protected. Runtime owners stay
+                    # live until submission, then FIFO ordering makes reuse
+                    # on this stream safe without a device synchronization.
+                    erase_stream(value, stream)
         elif isinstance(value, tuple):
             for item in value:
                 record(item)
@@ -241,16 +264,16 @@ def _launch(executor, runtime, *, block_num, device, tensor_shapes=None, fp8=Fal
             return tuple(bind(item, logical=logical) for item in value)
         return value
 
-    bound = tuple(
-        bind(
-            arg,
-            shapes.get(i),
-            logical=i in (6, 15) and isinstance(arg, tuple),
-            quantized=fp8 and i < 3,
-        )
-        for i, arg in enumerate(runtime)
-    )
     try:
+        bound = tuple(
+            bind(
+                arg,
+                shapes.get(i),
+                logical=i in (6, 15) and isinstance(arg, tuple),
+                quantized=fp8 and i < 3,
+            )
+            for i, arg in enumerate(runtime)
+        )
         executor(*bound, block_num=block_num, stream=stream)
     finally:
         bindings.clear()

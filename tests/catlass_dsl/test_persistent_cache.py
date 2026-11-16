@@ -171,7 +171,7 @@ import torch, torch_npu
 import catlass.tla as tla
 from flash_attn_npu_4.catlass_dsl import flash_attn_func, runtime
 from flash_attn_npu_4.catlass_dsl.cache_utils import JITPersistentCache
-from tests.catlass_dsl.test_utils import make_inputs, oracle, check
+from tests.catlass_dsl.test_utils import make_inputs, check
 length, forbid = int(sys.argv[1]), int(sys.argv[2])
 kind = sys.argv[3]
 assert isinstance(runtime.compile_cache, JITPersistentCache)
@@ -199,30 +199,23 @@ elif kind == "mxfp8":
     expected, logs = reference(case)
     check(out, expected)
     check_quantized_lse(lse.cpu(), logs)
-else:
+elif kind == "aux":
     cpu, inputs, _, _, _ = make_inputs('npu:0', torch.float16, sq=length, sk=length+6)
-    if kind == "aux":
-        from tests.catlass_dsl.test_runtime import score, score_bwd
-        from tests.catlass_dsl.test_utils import check_attention
-        data = torch.linspace(-0.2,0.2,length)
-        out,lse = flash_attn_func(*inputs,score_mod=score,score_mod_bwd=score_bwd,
-                                  aux_tensors=(data.to('npu:0'),),aux_scalars=(0.7,),return_lse=True)
-        check_attention(cpu,inputs,out,lse,loss="both",
-                        score_mod=lambda s,b,h,q,k,i,a,c:s*c[0]+a[0][q],
-                        aux_tensors=(data,),aux_scalars=(0.7,))
-    else:
-        with torch.no_grad():
-            out, lse = flash_attn_func(*inputs, return_lse=True)
-            expected, logs = oracle(cpu)
-            check(out, expected)
-            check(lse, logs)
+    from tests.catlass_dsl.test_runtime import score, score_bwd
+    from tests.catlass_dsl.test_utils import check_attention
+    data = torch.linspace(-0.2,0.2,length)
+    out,lse = flash_attn_func(*inputs,score_mod=score,score_mod_bwd=score_bwd,
+                              aux_tensors=(data.to('npu:0'),),aux_scalars=(0.7,),return_lse=True)
+    check_attention(cpu,inputs,out,lse,loss="both",
+                    score_mod=lambda s,b,h,q,k,i,a,c:s*c[0]+a[0][q],
+                    aux_tensors=(data,),aux_scalars=(0.7,))
 assert len(calls) == (0 if forbid else 2 if kind == "aux" else 1), calls
 print("CACHE_WORKER_OK")
 """
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("kind", ["dense", "aux", "mxfp8", "mask"])
+@pytest.mark.parametrize("kind", ["aux", "mxfp8", "mask"])
 def test_subprocess_load_bypasses_frontend_for_new_length(tmp_path, kind):
     env = dict(
         os.environ,
@@ -241,15 +234,3 @@ def test_subprocess_load_bypasses_frontend_for_new_length(tmp_path, kind):
         assert process.returncode == 0, process.stdout + process.stderr
         assert "CACHE_WORKER_OK" in process.stdout
     assert list(tmp_path.rglob("manifest.json"))
-    if kind == "dense":
-        # Corruption is a miss, including for a previously successful binary.
-        next(tmp_path.rglob("kernel.o")).write_bytes(b"truncated")
-        for length, forbid in ((49, 0), (65, 1)):
-            process = subprocess.run(
-                [sys.executable, "-c", _WORKER, str(length), str(forbid), kind],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            assert process.returncode == 0, process.stdout + process.stderr

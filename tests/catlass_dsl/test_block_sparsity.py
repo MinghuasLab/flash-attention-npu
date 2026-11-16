@@ -98,6 +98,79 @@ def test_exact_block_classification(device, kind, compute_full):
             assert active_lists(sampled, full=True) == active_lists(expected, full=True)
 
 
+@tla.jit
+def _interior_exception_mask(b, h, q, k, info, aux, scalars):
+    exception = (q % 128 == scalars[0]) & (k % 128 == scalars[1])
+    return exception != scalars[2]
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("sq,sk", [(128, 128), (129, 137), (257, 2177), (129, 8321)])
+@pytest.mark.parametrize("background", [False, True])
+def test_exact_interior_exception(device, sq, sk, background):
+    # An interior island/hole must be found even when every corner and the
+    # center agree. This also crosses a classifier task's KV tile boundary.
+    scalars = (37, 53, background)
+
+    def reference(b, h, q, k, info, aux, scalars):
+        return ((q % 128 == 37) & (k % 128 == 53)) != background
+
+    blocks = compute_block_sparsity(
+        128, 128, 1, 1, sq, sk, _interior_exception_mask, None, device, aux_scalars=scalars
+    )
+    expected = reference_block_sparsity(1, 1, sq, sk, reference)
+    for full in (False, True):
+        assert active_lists(blocks, full) == active_lists(expected, full)
+
+
+@tla.jit
+def _compaction_mask(b, h, q, k, info, aux, scalars):
+    kind = (k // 128) % 3
+    return (kind == 1) | ((kind == 2) & (q == 1) & (k % 128 == 53))
+
+
+@pytest.mark.npu
+def test_exact_compaction_multiple_scan_chunks(device):
+    # More than 512 KV tiles require two compaction scans; lists contain both
+    # partial and full blocks, interleaved with omitted blocks and a tail.
+    sq, sk = 3, 65537
+
+    def reference(b, h, q, k, info, aux, scalars):
+        kind = (k // 128) % 3
+        return (kind == 1) | ((kind == 2) & (q == 1) & (k % 128 == 53))
+
+    blocks = compute_block_sparsity(128, 128, 1, 1, sq, sk, _compaction_mask, None, device)
+    expected = reference_block_sparsity(1, 1, sq, sk, reference)
+    for full in (False, True):
+        assert active_lists(blocks, full) == active_lists(expected, full)
+
+
+@tla.jit
+def _table_mask(b, h, q, k, info, aux, scalars):
+    return aux[0][b, h, q, k]
+
+
+@pytest.mark.npu
+def test_exact_arbitrary_mask_table(device):
+    # Independent data rather than an interval mask exercises batch/head
+    # indexing, individual visibility holes, and both sequence tails.
+    batch, heads, sq, sk = 2, 2, 129, 2177
+    table = torch.rand(batch, heads, sq, sk) < 0.37
+    table[:, :, :128, 128:256] = True
+    table[:, :, :128, 384:512] = False
+    table[1, 0, 37, 181] = False
+
+    def reference(b, h, q, k, info, aux, scalars):
+        return table[b, h, q, k]
+
+    blocks = compute_block_sparsity(
+        128, 128, batch, heads, sq, sk, _table_mask, (table.to(device),), device
+    )
+    expected = reference_block_sparsity(batch, heads, sq, sk, reference)
+    for full in (False, True):
+        assert active_lists(blocks, full) == active_lists(expected, full)
+
+
 def test_transpose_roundtrip_and_sampling():
     _, reference = mask_pair("causal")
     args = (2, 2, 257, 260, reference)
