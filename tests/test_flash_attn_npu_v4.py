@@ -449,6 +449,9 @@ def test_fa_kvcache_ops(
     num_splits,
     softcap,
     add_unused_qkv,
+    *,
+    seqused_k_as_int=False,
+    disable_scheduler_metadata=False,
 ):
 
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
@@ -472,6 +475,9 @@ def test_fa_kvcache_ops(
         q_sequences, kv_sequences = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen, seed=1234)
     else:
         q_sequences = [q_seqlen] * batch_size
+        kv_sequences = [kv_seqlen] * batch_size
+    if seqused_k_as_int:
+        assert not add_unused_qkv
         kv_sequences = [kv_seqlen] * batch_size
     if not add_unused_qkv:
         used_q_lengths, used_k_lengths = q_sequences, kv_sequences
@@ -572,6 +578,8 @@ def test_fa_kvcache_ops(
     seqused_q = torch.tensor(used_q_lengths, dtype=torch.int32).npu() if add_unused_qkv else None
     if add_unused_qkv:
         cache_seqlens_for_api = torch.tensor(used_k_lengths, dtype=torch.int32).npu()
+    if seqused_k_as_int:
+        cache_seqlens_for_api = kv_seqlen
     out_out, softmax_lse, *rest = flash_attn_varlen_func(
         query,
         key_cache,
@@ -591,6 +599,7 @@ def test_fa_kvcache_ops(
         num_splits=num_splits,  # Can be tuned for speed
         pack_gqa=None,  # Can be tuned for speed
         return_lse=True,
+        disable_scheduler_metadata=disable_scheduler_metadata,
     )
     query_ref = query.detach().cpu()
     key_ref = key_cache.detach().cpu()
@@ -1087,6 +1096,46 @@ def test_fa_kvcache_ops_with_hd_le_256(
         num_splits,
         softcap=softcap,
         add_unused_qkv=False,
+    )
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("host_tiling", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,q_seqlen,kv_seqlen,head_size",
+    [
+        (1, 129, 257, 64),
+        (2, 129, 257, 128),
+        (2, 257, 65, 256),
+    ],
+)
+def test_fa_kvcache_ops_scalar_seqused_k(
+    data_type, layout, host_tiling, batch_size, q_seqlen, kv_seqlen, head_size
+):
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        pytest.skip("Ascend950 only")
+    test_fa_kvcache_ops(
+        data_type=data_type,
+        batch_size=batch_size,
+        num_heads=4,
+        kv_heads=1,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        head_size=head_size,
+        cache_mode=0,
+        block_size=128,
+        is_causal=False,
+        layout=layout,
+        is_varied=layout == "TND" and batch_size > 1,
+        window_size_left=31,
+        window_size_right=17,
+        num_splits=0,
+        softcap=0.0,
+        add_unused_qkv=False,
+        seqused_k_as_int=True,
+        disable_scheduler_metadata=host_tiling,
     )
 
 

@@ -781,7 +781,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
         if seqused_k is not None and isinstance(seqused_k, int):
-            seqused_k = torch.full((q.shape[0],), seqused_k, dtype=torch.int32, device=k.device)
+            batch_size = cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
+            seqused_k = torch.full((batch_size,), seqused_k, dtype=torch.int32, device=k.device)
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
 
