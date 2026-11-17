@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Cross-length compilation reuse, including changing launch/aux geometry."""
 
 from unittest.mock import Mock

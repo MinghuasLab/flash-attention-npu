@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Minghua Shen.
+
 """Validate that a release tag matches the package's single public version."""
 
 from __future__ import annotations

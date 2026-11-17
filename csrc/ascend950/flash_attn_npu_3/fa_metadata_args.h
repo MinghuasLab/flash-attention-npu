@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 
 #ifndef CSRC_ASCEND950_FLASH_ATTN_NPU_3_FA_METADATA_ARGS_H
 #define CSRC_ASCEND950_FLASH_ATTN_NPU_3_FA_METADATA_ARGS_H

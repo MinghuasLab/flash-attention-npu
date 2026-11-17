@@ -1,19 +1,16 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- *
- *
- *   ✅ FP16 / BF16
- *   ✅ Causal mask
- *   ✅ Paged KV (page_table)
- *   ✅ MQA / GQA
- *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ✅ return_softmax_lse
- *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch)
- *   ✅ num_splits (FlashDecode for paged KV + TND)
- *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
- *   ✅ softcap (tanh, folded into the online-softmax epilogue)
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// ✅ FP16 / BF16
+// ✅ Causal mask
+// ✅ Paged KV (page_table)
+// ✅ MQA / GQA
+// ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
+// ✅ return_softmax_lse
+// ✅ SWA / window_size (host normalize + MASK_SWA dispatch)
+// ✅ num_splits (FlashDecode for paged KV + TND)
+// ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
+// ✅ softcap (tanh, folded into the online-softmax epilogue)
+
 
 #include <algorithm>
 #include <cmath>

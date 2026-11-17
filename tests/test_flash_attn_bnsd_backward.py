@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """FA3/FA4 direct backward tests. No repository forward kernel is called."""
 
 import importlib

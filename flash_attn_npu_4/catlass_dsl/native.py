@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Small source-backed helpers for native SIMT callbacks.
 
 Sequence information is (seqlen_q, seqlen_k, offset_q, offset_k). Integer

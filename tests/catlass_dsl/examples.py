@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Test-only native mask and score callback examples.
 
 These are illustrative SIMT callbacks, not dispatch hints. Torch references

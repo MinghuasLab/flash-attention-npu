@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Independent CPU MXFP8 inputs and online-attention oracle (tests only).
 
 No production quantizer, layout adapter, or kernel helper is imported here.

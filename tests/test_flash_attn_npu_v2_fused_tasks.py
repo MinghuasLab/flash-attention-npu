@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Grouped-task coverage, capacity, and NPU output/LSE regressions for v2."""
 
 from pathlib import Path

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """FA4 input checks, backend initialization and attention routing.
 
 Routing is available without CATLASS. Native dependencies and graph operators

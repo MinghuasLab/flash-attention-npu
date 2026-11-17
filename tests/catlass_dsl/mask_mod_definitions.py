@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Mask cases: native implementation paired with a Torch oracle.
 
 Native callbacks come from tests/flash_attn/examples.py. The reference expressions

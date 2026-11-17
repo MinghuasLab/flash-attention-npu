@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Prepared TLA launches with fresh Tensor bindings on a warm cache.
 
 Compiled functions use dynamic tensor descriptors. Geometry and descriptors

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Fullgraph plumbing on CPU oracles, plus independent Ascend precision tests.
 
 CPU fixtures explicitly substitute the device launcher and sparse builder; they

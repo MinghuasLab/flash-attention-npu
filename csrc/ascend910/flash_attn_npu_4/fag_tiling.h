@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef FAG_TILING_H
 #define FAG_TILING_H
 

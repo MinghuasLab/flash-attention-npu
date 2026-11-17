@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # CI 容器启动时调用，清理历史日志，默认保留 7 天。
 #

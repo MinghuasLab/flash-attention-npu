@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #ifndef FAG_GENERAL_HOST_HPP
 #define FAG_GENERAL_HOST_HPP
 
@@ -31,7 +33,7 @@ std::vector<at::Tensor> launch_fag_general(
     bool deterministic,
     float p_dropout,
     const std::optional<at::Tensor> &rng_state,
-    uint8_t *alibi_slopes_ptr,            
-    int64_t alibi_slopes_batch_stride);   
+    uint8_t *alibi_slopes_ptr,
+    int64_t alibi_slopes_batch_stride);
 
 #endif

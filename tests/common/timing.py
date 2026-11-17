@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Per-test timing and golden-cache diagnostics for CI output."""
 
 from __future__ import annotations

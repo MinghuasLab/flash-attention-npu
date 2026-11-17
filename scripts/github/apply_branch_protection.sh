@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026, flash-attention-npu CI maintainers.
+# Copyright (c) 2026, Minghua Shen.
 #
 # 通过 GitHub API 给指定分支应用分支保护规则, 并配置 weinachuan 的 bypass。
 #

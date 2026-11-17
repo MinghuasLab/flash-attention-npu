@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0.
- */
+// Copyright (c) 2026, Minghua Shen.
 
 // Host-side ABI for the split-attention combine operator on Ascend 950.
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """M128 DN/NZ forward with a continuous pipeline across query tasks.
 
 Three m/l state slots keep query producers independent of delayed PV consumers.

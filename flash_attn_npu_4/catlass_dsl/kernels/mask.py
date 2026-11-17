@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Exact or explicitly requested five-point block classification."""
 
 import catlass.tla as tla

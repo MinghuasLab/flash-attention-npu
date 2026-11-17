@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # Build the hardware-independent quality image and run the common checker in it.
 set -euo pipefail
 

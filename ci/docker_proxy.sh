@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 # Git-only proxy for CI. This helper never exports HTTP_PROXY/HTTPS_PROXY/NO_PROXY.
 #
 # Git uses http.<url>.proxy so only whitelist hosts are proxied (default: GitHub).

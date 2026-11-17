@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Minghua Shen.
+
 """Parse and validate the release build matrix."""
 
 from __future__ import annotations

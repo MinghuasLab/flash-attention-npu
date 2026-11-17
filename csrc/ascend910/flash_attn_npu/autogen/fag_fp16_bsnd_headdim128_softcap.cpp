@@ -1,7 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Modified by Minghua Shen, 2026.
- */
+// Copyright (c) 2026, Minghua Shen.
 // v2 FAGGeneral backward variant, BSND, headdim=128 softcap=true.
 // Fixes the (headdim, softcap) pair at compile time and switches over
 // causal x deterministic x dropout (8 FAGGeneral instantiations) so the 64

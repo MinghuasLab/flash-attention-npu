@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Minghua Shen.
+
 #pragma once
 
 #include <cstdint>

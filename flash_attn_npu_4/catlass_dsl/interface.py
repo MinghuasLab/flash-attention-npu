@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Public autograd interface. No Torch math is used to compute attention."""
 
 from __future__ import annotations

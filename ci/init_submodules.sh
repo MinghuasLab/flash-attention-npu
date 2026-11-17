@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Minghua Shen.
+
 #
 # 浅拉 csrc/catlass (只要 include/ 头文件)。FlashAttention-NPU 编译不依赖
 # catlass 嵌套的 googletest / llvm-project / triton (TLA DSL), 也不 --recursive,

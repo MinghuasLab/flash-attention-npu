@@ -1,15 +1,13 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# Modified by Minghua Shen, 2026.
+# Copyright (c) 2026, Minghua Shen.
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-# Mirrors flash-attention/csrc/flash_attn/src/generate_kernels.py, but adapted to
-# the v2 NPU dispatch layout. The GPU script's generation axis is
-# <dtype, head_dim, is_causal> - one explicit instantiation per .cu so nvcc
-# compiles them in parallel. On the NPU side head_dim is NOT a template axis:
+# Generates the v2 NPU dispatch translation units (one explicit instantiation
+# per .cpp so the kernel templates compile in parallel). head_dim is NOT a
+# template axis:
 # the forward (FAInfer) does not bin by head_dim at all, and the backward
 # (FAGGeneral) selects head_dim at runtime via a switch() inside the impl
 # (fag_general_dispatch_impl.hpp). So head_dim is deliberately dropped here.
@@ -62,10 +60,7 @@ FAG_HEADDIMS = [64, 128, 192, 256]
 BOOL_TOKEN = {0: "false", 1: "true"}
 
 PRELUDE = (
-    "/**\n"
-    " * Copyright (c) 2026 Huawei Technologies Co., Ltd.\n"
-    " * Modified by Minghua Shen, 2026.\n"
-    " */\n"
+    "// Copyright (c) 2026, Minghua Shen.\n"
 )
 
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Internal callback descriptors and normalization of public TLA callables."""
 
 from dataclasses import dataclass

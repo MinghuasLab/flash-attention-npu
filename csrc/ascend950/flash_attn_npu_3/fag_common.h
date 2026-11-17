@@ -1,12 +1,10 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- *
- * Host/device tiling ABI for the Ascend950 FlashAttention v3 backward path.
- *
- * Keep this structure POD-only.  It is copied byte-for-byte from a CPU tensor
- * to device global memory and will be consumed by the future arch35 FAG
- * kernel.
- */
+// Copyright (c) 2026, Minghua Shen.
+
+// Host/device tiling ABI for the Ascend950 FlashAttention v3 backward path.
+// Keep this structure POD-only.  It is copied byte-for-byte from a CPU tensor
+// to device global memory and will be consumed by the future arch35 FAG
+// kernel.
+
 
 #ifndef FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H
 #define FLASH_ATTN_NPU_ARCH35_V3_FAG_COMMON_H

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 from torch_compile_utils import (
     run_fixed_compile_test,
     load_api,
