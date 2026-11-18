@@ -109,26 +109,44 @@ def test_cross_stream_inputs_survive_early_release_and_reuse(device, dtype):
     shape = (1, 1024, 4, 128)
     cpu = tuple(torch.randn(shape, dtype=dtype) for _ in range(3))
     expected, expected_lse = oracle(cpu)
+    delay_done = torch.npu.Event()
     with torch.inference_mode(), torch.npu.stream(consumer):
+        # Warm public operators before the race, including their allocations.
+        delay_input = torch.ones((4096, 4096), dtype=torch.float32, device=device)
+        delay_output = torch.empty_like(delay_input)
+        torch.mm(delay_input, delay_input, out=delay_output)
+        delay_done.record(consumer)
         warm = tuple(t.to(device) for t in cpu)
         flash_attn_func(*warm, return_lse=True)
         del warm
+    with torch.inference_mode(), torch.npu.stream(producer):
+        warm_pressure = torch.full(shape, 99, dtype=dtype, device=device)
+        del warm_pressure
     torch.npu.synchronize(device)
     gc.collect()
     with torch.inference_mode():
         with torch.npu.stream(producer):
             inputs = tuple(t.to(device) for t in cpu)
         references = tuple(weakref.ref(t) for t in inputs)
-        with torch.npu.stream(consumer):
-            consumer.wait_stream(producer)
-            torch.npu._sleep(10_000_000)
-            output, lse = flash_attn_func(*inputs, return_lse=True)
-        del inputs
-        assert all(reference() is None for reference in references)
-        with torch.npu.stream(producer):
-            # Recycle allocations of the same size before waiting for FA.
-            pressure = [torch.full(shape, 99, dtype=dtype, device=device) for _ in range(8)]
-        torch.npu.synchronize(device)
+        input_ptrs = {t.data_ptr() for t in inputs}
+        try:
+            with torch.npu.stream(consumer):
+                consumer.wait_stream(producer)
+                # Keep FA queued while the producer tries to reuse its inputs.
+                # Reuse buffers to avoid output allocations during the delay.
+                for _ in range(32):
+                    torch.mm(delay_input, delay_input, out=delay_output)
+                delay_done.record(consumer)
+                output, lse = flash_attn_func(*inputs, return_lse=True)
+            del inputs
+            assert all(reference() is None for reference in references)
+            with torch.npu.stream(producer):
+                # Recycle allocations of the same size before waiting for FA.
+                pressure = [torch.full(shape, 99, dtype=dtype, device=device) for _ in range(8)]
+            assert not delay_done.query(), "consumer delay completed before allocator pressure"
+            assert input_ptrs.isdisjoint(t.data_ptr() for t in pressure)
+        finally:
+            torch.npu.synchronize(device)
         check(output, expected)
         check(lse, expected_lse)
         del pressure
