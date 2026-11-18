@@ -74,6 +74,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
+        lmUbTensor32Base = lmUbTensor32;
+        gmUbTensor32Base = gmUbTensor32;
+        glUbTensor32Base = glUbTensor32;
     }
 
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
@@ -88,6 +91,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+        lmUbTensor32Base = lmUbTensor32;
+        gmUbTensor32Base = gmUbTensor32;
+        glUbTensor32Base = glUbTensor32;
     }
 
     template <class Resource>
@@ -107,6 +113,18 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             lseOutUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lse);
             hasLseScratch_ = true;
         }
+        lmUbTensor32Base = lmUbTensor32;
+        gmUbTensor32Base = gmUbTensor32;
+        glUbTensor32Base = glUbTensor32;
+    }
+
+    // Read the statistics of the task that produced this delayed PV tile.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        const uint32_t off = slot * fa950_plan::STATS_SLOT_ELEM_NUM;
+        lmUbTensor32 = lmUbTensor32Base[off];
+        gmUbTensor32 = gmUbTensor32Base[off];
+        glUbTensor32 = glUbTensor32Base[off];
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -1040,6 +1058,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> lmUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor32;
     AscendC::LocalTensor<float> lseOutUbTensor32;
+    AscendC::LocalTensor<float> lmUbTensor32Base;
+    AscendC::LocalTensor<float> gmUbTensor32Base;
+    AscendC::LocalTensor<float> glUbTensor32Base;
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 

@@ -62,8 +62,10 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 7 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        // Must match online_softmax.hpp: lm/gm/gl hold one slot per in-flight
+        // task so a delayed rescale reads the statistics of its own task.
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
 
@@ -77,6 +79,11 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
+        for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
+            lmSlots_[i] = lmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            gmSlots_[i] = gmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            glSlots_[i] = glUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+        }
     }
 
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
@@ -91,13 +98,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+        for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
+            lmSlots_[i] = lmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            gmSlots_[i] = gmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            glSlots_[i] = glUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+        }
+    }
+
+    // Read the row statistics belonging to the tile's task.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        lmUbTensor32 = lmSlots_[slot];
+        gmUbTensor32 = gmSlots_[slot];
+        glUbTensor32 = glSlots_[slot];
     }
 
     template <class Resource>
     __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, bool enableRescaleSkip_ = false)
     {
         enableRescaleSkip = enableRescaleSkip_;
-        redUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.total);
+        // Reserve the UB tail for three extra task statistics slots first;
+        // the scalar reduction scratch must not alias any live slot.
+        redUbTensor = resource.ubBuf.template GetBufferByByte<float>(
+            ub.total + (fa950_stats::STATS_TASK_STAGES - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES);
         otmpStages_ = ub.otmpStages;
         for (uint32_t i = 0; i < otmpStages_; ++i) {
             loUbTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.lo + ub.loBytes * i);
@@ -108,6 +131,15 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        lmSlots_[0] = lmUbTensor32;
+        gmSlots_[0] = gmUbTensor32;
+        glSlots_[0] = glUbTensor32;
+        for (uint32_t i = 1; i < fa950_stats::STATS_TASK_STAGES; ++i) {
+            uint32_t off = ub.total + (i - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES;
+            lmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off);
+            gmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + fa950_stats::STATS_SLOT_BYTES);
+            glSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + 2U * fa950_stats::STATS_SLOT_BYTES);
+        }
         if (ub.lseBytes != 0U) {
             lseOutUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lse);
             hasLseScratch_ = true;
@@ -1286,6 +1318,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> lmUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor32;
     AscendC::LocalTensor<float> lseOutUbTensor32;
+    AscendC::LocalTensor<float> lmSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> gmSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> glSlots_[fa950_stats::STATS_TASK_STAGES];
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 

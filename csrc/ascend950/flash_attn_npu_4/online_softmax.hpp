@@ -85,11 +85,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 2 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 7 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        // lm/gm/gl are per-task row statistics: with cross-task pipelining a
+        // later task may already be filling its slot while the delayed rescale
+        // of an earlier tile still reads the previous one.
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
 
         subBlockIdx_ = AscendC::GetSubBlockIdx();
 
@@ -103,6 +106,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LM_UB_TENSOR_OFFSET);
         llUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LL_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
+        for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
+            lmSlots_[i] = lmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            gmSlots_[i] = gmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            glSlots_[i] = glUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+        }
     }
 
     __aicore__ inline ~BlockEpilogue() {}
@@ -118,12 +126,29 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         pStages_ = ub.pStages;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(ub.s);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(ub.p);
-        lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
-        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.ll);
-        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(ub.mask);
+        // The resource-aware plan reserves only one statistics slot inside
+        // its packed layout. Keep the other in-flight tasks in its UB tail.
+        lmSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
+        gmSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
+        glSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        for (uint32_t i = 1; i < fa950_stats::STATS_TASK_STAGES; ++i) {
+            uint32_t off = ub.total + (i - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES;
+            lmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off);
+            gmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + fa950_stats::STATS_SLOT_BYTES);
+            glSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + 2U * fa950_stats::STATS_SLOT_BYTES);
+        }
+        SetStatsSlot(0U);
+    }
+
+    // Use the statistics of the task that owns the current tile.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        lmUbTensor = lmSlots_[slot];
+        gmUbTensor = gmSlots_[slot];
+        glUbTensor = glSlots_[slot];
     }
 
     template <class TensorDst, class TensorSrc>
@@ -869,6 +894,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<ElementInput> lmUbTensor;
     AscendC::LocalTensor<ElementInput> llUbTensor;
+    AscendC::LocalTensor<ElementInput> lmSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> gmSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> glSlots_[fa950_stats::STATS_TASK_STAGES];
     uint32_t subBlockIdx_;
     uint32_t pStages_ = fa950_plan::SCORE_STAGES;
 

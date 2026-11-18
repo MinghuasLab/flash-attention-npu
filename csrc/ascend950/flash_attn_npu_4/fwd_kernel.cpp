@@ -51,6 +51,9 @@ static constexpr uint32_t PRE_LAUNCH = 2;
 static constexpr uint32_t MAX_CROSS_CORE_BUF_STAGES = PRE_LAUNCH + 1;
 static constexpr uint32_t UB_S_OTMP_BUF_STAGES = 2;
 static constexpr uint32_t UB_S_BUF_STAGES = 2;
+// One descriptor per in-flight kv tile: tile i is described when its QK is
+// issued and consumed PRE_LAUNCH steps later, possibly inside a later task.
+static constexpr uint32_t PV_DESC_SLOTS = PRE_LAUNCH + 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
           Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
@@ -82,6 +85,40 @@ class FAIKernel950 {
     bool hasSeqUsedKv = false;
 
     __aicore__ inline FAIKernel950() {}
+
+    // Parameters of one kv tile that must survive PV, RS
+    struct PvTileDesc {
+        // cube side: V matmul
+        uint64_t gmOffsetV;
+        uint64_t blockBOffset;
+        uint32_t kShapeRow;
+        uint32_t vShapeCol;
+        uint32_t kvNumTokens;
+        // vector side: rescale O and final lse
+        uint64_t gmOffsetO;
+        uint64_t lseOffset;
+        uint32_t strideO;
+        uint32_t oHeadStride;
+        uint32_t lseHeadStride;
+        // shared geometry / bookkeeping
+        uint32_t kvSTileIdx;
+        uint32_t kvSTileSizeAct;
+        uint32_t rowNum;
+        uint32_t rowNumRound;
+        uint32_t pipelineTileSeq;
+        uint32_t relIdx;
+        uint32_t kvSLoopCount;
+        uint32_t qSBlockSize;
+        uint32_t qNBlockSize;
+        uint32_t fullyMaskedRowsPerHead;
+        uint32_t statsSlot;
+        uint32_t partialId;
+        int32_t delStartRow;
+        int32_t delEndRow;
+        int64_t qSeqlen;
+        int64_t qSTileStart;
+        bool writePartial;
+    };
 
     // *Used* lengths from seqused when provided; cu stays the region layout.
     __aicore__ inline int64_t GetQSeqLen(uint32_t bIdx, uint32_t maxQSeqlen, AscendC::GlobalTensor<int32_t>& gQSeq,
@@ -348,9 +385,14 @@ class FAIKernel950 {
             taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
             taskStep = 1U;
         }
-        uint32_t pipelineTileBase = 0U;
-        uint64_t pipelineL0AStageBase = 0U;
-        uint64_t pipelineL0BStageBase = 0U;
+        // Cross-task pipelining state
+        uint32_t tileIssued = 0U;
+        uint32_t pvIssued = 0U;
+        uint32_t taskSeq = 0U;
+        PvTileDesc pvDescs[PV_DESC_SLOTS];
+        // L0 A/B stage counters in exact issue order
+        uint64_t l0AStagesIssued = 0U;
+        uint64_t l0BStagesIssued = 0U;
         for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
@@ -547,42 +589,40 @@ class FAIKernel950 {
             if constexpr (maskCategory == MaskCategory::MASK_SWA) {
                 emptySpan = emptySpan || (kvStart >= kvSLoopNum);
             }
-            if (emptySpan) {
-#ifdef __DAV_VEC__
-                initOutputs.template operator()<LseMode>(gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize,
-                                                         lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
-                                                         static_cast<uint32_t>(oHeadStride));
-#endif
-                continue;
-            }
-            uint32_t kvSplitStart = kvStart;
-            uint32_t kvSplitEnd = kvSLoopNum;
+            // An empty span still has to retire the PV/rescale work left pending by
+            // earlier tasks: initOutputs reuses the same epilogue UB, L1 P and O-tmp
+            // stages. Such a task runs only the drain iterations of the loop below
+            // and initializes its O/LSE afterwards.
+            uint32_t kvSplitStart = 0U;
+            uint32_t kvSplitEnd = 0U;
             bool writePartial = false;
             uint32_t partialId = 0U;
-            if (flashDecodeFlag_ != 0U) {
-                if (taskIdx == static_cast<uint32_t>(fdBaseTaskStart)) {
-                    kvSplitStart = static_cast<uint32_t>(fdFirstKvTileStart);
-                }
-                if (taskIdx + 1U == static_cast<uint32_t>(fdBaseTaskEnd)) {
-                    kvSplitEnd = static_cast<uint32_t>(fdLastKvTileEnd);
-                }
-                kvSplitEnd = AscendC::Std::min(kvSplitEnd, kvSLoopNum);
-                kvSplitStart = AscendC::Std::min(kvSplitStart, kvSplitEnd);
-                for (uint32_t combineIdx = 0; combineIdx < fdCombineTaskNum_; ++combineIdx) {
-                    const int32_t combineBaseTask = faiTilingData->fdCombineSchedules[combineIdx].baseTask;
-                    if (combineBaseTask == static_cast<int32_t>(taskIdx)) {
-                        writePartial = true;
-                        partialId = static_cast<uint32_t>(faiTilingData->fdCombineSchedules[combineIdx].partialStart +
-                                                          static_cast<int32_t>(coreIdx) -
-                                                          faiTilingData->fdCombineSchedules[combineIdx].firstCore);
-                        break;
+            if (!emptySpan) {
+                kvSplitStart = kvStart;
+                kvSplitEnd = kvSLoopNum;
+                if (flashDecodeFlag_ != 0U) {
+                    if (taskIdx == static_cast<uint32_t>(fdBaseTaskStart)) {
+                        kvSplitStart = static_cast<uint32_t>(fdFirstKvTileStart);
+                    }
+                    if (taskIdx + 1U == static_cast<uint32_t>(fdBaseTaskEnd)) {
+                        kvSplitEnd = static_cast<uint32_t>(fdLastKvTileEnd);
+                    }
+                    kvSplitEnd = AscendC::Std::min(kvSplitEnd, kvSLoopNum);
+                    kvSplitStart = AscendC::Std::min(kvSplitStart, kvSplitEnd);
+                    for (uint32_t combineIdx = 0; combineIdx < fdCombineTaskNum_; ++combineIdx) {
+                        const int32_t combineBaseTask = faiTilingData->fdCombineSchedules[combineIdx].baseTask;
+                        if (combineBaseTask == static_cast<int32_t>(taskIdx)) {
+                            writePartial = true;
+                            partialId = static_cast<uint32_t>(
+                                faiTilingData->fdCombineSchedules[combineIdx].partialStart +
+                                static_cast<int32_t>(coreIdx) -
+                                faiTilingData->fdCombineSchedules[combineIdx].firstCore);
+                            break;
+                        }
                     }
                 }
             }
             const uint32_t kvSLoopCount = kvSplitEnd - kvSplitStart;
-            if (kvSLoopCount == 0U) {
-                continue;
-            }
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
@@ -593,10 +633,12 @@ class FAIKernel950 {
             auto gmQTensorTlaDN = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTlaDN, Arch::PositionGM{});
 
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
-            if constexpr (IsDN) {
-                blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
-            } else {
-                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+            if (kvSLoopCount != 0U) {
+                if constexpr (IsDN) {
+                    blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                } else {
+                    blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                }
             }
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
@@ -608,19 +650,17 @@ class FAIKernel950 {
             auto gmKLayoutTlaDN = tla::MakeLayout<ElementK, LayoutK>(kShapeRow, kShapeCol);
             auto gmKTensorTla = tla::MakeTensor(gK[gmOffsetK], gmKLayoutTla, Arch::PositionGM{});
             auto gmKTensorTlaDN = tla::MakeTensor(gK[gmOffsetK], gmKLayoutTlaDN, Arch::PositionGM{});
-            auto gmVLayoutTla = tla::MakeLayout<ElementV, LayoutV>(kShapeRow, vShapeCol);
-            auto gmVTensorTla = tla::MakeTensor(gV[gmOffsetV], gmVLayoutTla, Arch::PositionGM{});
 #endif
-#ifdef __DAV_VEC__
-            uint32_t oShapeCol = strideO;
-            auto gmOLayoutTla = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, oShapeCol);
-            auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO], gmOLayoutTla, Arch::PositionGM{});
-#endif
-            for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; ++kvSTileRelIdx) {
-                const uint32_t kvSTileIdx = kvSplitStart + kvSTileRelIdx;
-                const uint32_t pipelineTileSeq =
-                    flashDecodeFlag_ != 0U ? pipelineTileBase + kvSTileRelIdx : kvSTileRelIdx;
-                if (kvSTileRelIdx < kvSLoopCount) {
+            const uint32_t taskStatsSlot = taskSeq % fa950_stats::STATS_TASK_STAGES;
+            // Only the last task flushes the delayed PV queue
+            const bool lastTaskOnCore = (taskIdx + taskStep >= taskEnd);
+            const bool flushPvQueue = lastTaskOnCore || emptySpan;
+            const uint32_t kvLoopEnd = kvSLoopCount + (flushPvQueue ? PV_DESC_SLOTS : 0U);
+            for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvLoopEnd; ++kvSTileRelIdx) {
+                const bool inDrain = (kvSTileRelIdx >= kvSLoopCount);
+                const uint32_t pipelineTileSeq = tileIssued;
+                if (!inDrain) {
+                    const uint32_t kvSTileIdx = kvSplitStart + kvSTileRelIdx;
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
                     } else {
@@ -636,18 +676,43 @@ class FAIKernel950 {
                     auto ubSTensorTlaDN = tla::MakeTensor(ubSTensor[ubSBufId], ubSLayoutTlaDN, Arch::PositionUB{});
                     uint32_t qkReadyFlagId = ubSBufId;
                     Arch::CrossCoreFlag qkReadyFlag(qkReadyFlagId);
+                    // Snapshot everything the delayed PV/rescale of this tile
+                    // needs; the task-local variables may describe another task
+                    // by the time it executes.
+                    PvTileDesc& pvDesc = pvDescs[tileIssued % PV_DESC_SLOTS];
+                    pvDesc.gmOffsetV = static_cast<uint64_t>(gmOffsetV);
+                    pvDesc.gmOffsetO = static_cast<uint64_t>(gmOffsetO);
+                    pvDesc.lseOffset = lseOffset;
+                    pvDesc.blockBOffset = static_cast<uint64_t>(blockBOffset);
+                    pvDesc.kvSTileIdx = kvSTileIdx;
+                    pvDesc.kvSTileSizeAct = kvSTileSizeAct;
+                    pvDesc.rowNum = rowNum;
+                    pvDesc.rowNumRound = rowNumRound;
+                    pvDesc.pipelineTileSeq = pipelineTileSeq;
+                    pvDesc.relIdx = kvSTileRelIdx;
+                    pvDesc.kvSLoopCount = kvSLoopCount;
+                    pvDesc.qSBlockSize = qSBlockSize;
+                    pvDesc.qNBlockSize = qNBlockSize;
+                    pvDesc.fullyMaskedRowsPerHead = fullyMaskedRowsPerHead;
+                    pvDesc.statsSlot = taskStatsSlot;
+                    pvDesc.partialId = partialId;
+                    pvDesc.delStartRow = delStartRow;
+                    pvDesc.delEndRow = delEndRow;
+                    pvDesc.qSeqlen = qSeqlen;
+                    pvDesc.qSTileStart = qSTileStart;
+                    pvDesc.strideO = static_cast<uint32_t>(strideO);
+                    pvDesc.oHeadStride = static_cast<uint32_t>(oHeadStride);
+                    pvDesc.lseHeadStride = lseHeadStride;
+                    pvDesc.kvNumTokens = kvNumTokens;
+                    pvDesc.writePartial = writePartial;
 #ifdef __DAV_CUBE__
-                    uint64_t prefixSumL0AStages =
-                        CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdx, qkL0ATotalStages_, pvL0ATotalStages_,
-                                                         kvSLoopCount, true) +
-                        (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
-                    uint64_t prefixSumL0BStages =
-                        CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdx, qkL0BTotalStages_, pvL0BTotalStages_,
-                                                         kvSLoopCount, true) +
-                        (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
+                    uint64_t prefixSumL0AStages = l0AStagesIssued;
+                    uint64_t prefixSumL0BStages = l0BStagesIssued;
+                    pvDesc.kShapeRow = kShapeRow;
+                    pvDesc.vShapeCol = vShapeCol;
                     if constexpr (IsDN) {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
+                                    blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
                                     0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
                     } else {
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
@@ -658,6 +723,8 @@ class FAIKernel950 {
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
                     }
+                    l0AStagesIssued += qkL0ATotalStages_;
+                    l0BStagesIssued += qkL0BTotalStages_;
 #endif
                     uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
@@ -665,6 +732,9 @@ class FAIKernel950 {
                     auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(rowNum, kvSTileSizeAct);
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId], l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
+                    // The previous task's final lse rescale may still read the
+                    // other slot; give this task its own row statistics.
+                    epilogueOnlineSoftmax.SetStatsSlot(taskStatsSlot);
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                         if (d512) {
                             // Positional causal mask: center of the tile's
@@ -768,86 +838,92 @@ class FAIKernel950 {
                         }
                     }
 #endif
+                    ++tileIssued;
                 }
-                if (kvSTileRelIdx >= PRE_LAUNCH) {
-                    uint32_t kvSTileRelIdxNow = kvSTileRelIdx - PRE_LAUNCH;
-                    uint32_t kvSTileIdxNow = kvSplitStart + kvSTileRelIdxNow;
-                    uint32_t pipelineTileSeqNow =
-                        flashDecodeFlag_ != 0U ? pipelineTileBase + kvSTileRelIdxNow : kvSTileRelIdxNow;
-                    if (kvSTileIdxNow == kvSLoopNum - 1) {
-                        kvSTileSizeAct = noSkipKvS - kvSTileIdxNow * kvBaseTile_;
-                    } else {
-                        kvSTileSizeAct = kvBaseTile_;
-                    }
-                    GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
+                if (pvIssued < tileIssued && (inDrain || pvIssued + PRE_LAUNCH < tileIssued)) {
+                    // Tile issued PRE_LAUNCH tiles ago (possibly by an earlier task).
+                    const PvTileDesc& pvDesc = pvDescs[pvIssued % PV_DESC_SLOTS];
+                    const uint32_t kvSTileRelIdxNow = pvDesc.relIdx;
+                    const uint32_t pipelineTileSeqNow = pvDesc.pipelineTileSeq;
+                    GemmCoord actualBlockShapePV{pvDesc.rowNum, embedV_, pvDesc.kvSTileSizeAct};
                     uint32_t ubOTmpBufId = pipelineTileSeqNow % otmpStages_;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
-                    // D512 LO holds one 128-column piece: FixPipe writes column
-                    // offset 0 every round, so the UB row pitch is 128.
-                    auto ubOTmpLayoutTla =
-                        tla::MakeLayout<ElementOTmp, LayoutOTmp>(rowNumRound, d512 ? 128U : embedVRound);
+                    // D512 LO stores one 128-column piece per FixPipe round.
+                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(
+                        pvDesc.rowNumRound, d512 ? 128U : embedVRound);
                     auto ubOTmpTensorTla =
                         tla::MakeTensor(ubOTmpTensor[ubOTmpBufId], ubOTmpLayoutTla, Arch::PositionUB{});
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
-                    uint64_t prefixSumL0AStages =
-                        CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdxNow, qkL0ATotalStages_, pvL0ATotalStages_,
-                                                         kvSLoopCount, false) +
-                        (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
-                    uint64_t prefixSumL0BStages =
-                        CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdxNow, qkL0BTotalStages_, pvL0BTotalStages_,
-                                                         kvSLoopCount, false) +
-                        (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
-                    blockMmadPV(gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset], actualBlockShapePV,
-                                blockSize_, kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
-                                0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, d512);
+                    auto gmVLayoutTlaNow = tla::MakeLayout<ElementV, LayoutV>(pvDesc.kShapeRow, pvDesc.vShapeCol);
+                    auto gmVTensorTlaNow =
+                        tla::MakeTensor(gV[pvDesc.gmOffsetV], gmVLayoutTlaNow, Arch::PositionGM{});
+                    blockMmadPV(gmVTensorTlaNow, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], actualBlockShapePV,
+                                blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens,
+                                kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued,
+                                l0BStagesIssued, d512);
+                    l0AStagesIssued += pvL0ATotalStages_;
+                    l0BStagesIssued += pvL0BTotalStages_;
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = pipelineTileSeqNow % (PRE_LAUNCH + 1);
-                    uint32_t fmRowsPerHead = fullyMaskedRowsPerHead;
+                    // Read the statistics slot of the task that owns this tile.
+                    epilogueRescaleO.SetStatsSlot(pvDesc.statsSlot);
+                    uint32_t fmRowsPerHead = pvDesc.fullyMaskedRowsPerHead;
                     int32_t swaDelStartRow = 0;
                     int32_t swaDelEndRow = 0;
                     uint32_t swaQSeqlen = 0;
                     uint32_t swaQSTileStart = 0;
                     if constexpr (maskCategory == MaskCategory::MASK_SWA) {
                         fmRowsPerHead = 0U;
-                        swaDelStartRow = delStartRow;
-                        swaDelEndRow = delEndRow;
-                        swaQSeqlen = static_cast<uint32_t>(qSeqlen);
-                        swaQSTileStart = static_cast<uint32_t>(qSTileStart);
+                        swaDelStartRow = pvDesc.delStartRow;
+                        swaDelEndRow = pvDesc.delEndRow;
+                        swaQSeqlen = static_cast<uint32_t>(pvDesc.qSeqlen);
+                        swaQSTileStart = static_cast<uint32_t>(pvDesc.qSTileStart);
                     }
-                    // Ordinary FP16/BF16: vDequantScale stays 1.0f; d512Mode
-                    // selects the four-piece LO128 consume on the exact D512
-                    // profile. FP8 keeps its own scale and never sets d512Mode.
-                    // FlashDecode prioritizes short-tile latency: compile
-                    // the scalar Dm reduction out of its rescale path.
+                    auto gmOLayoutTlaNow = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, pvDesc.strideO);
+                    auto gmOTensorTlaNow =
+                        tla::MakeTensor(gO[pvDesc.gmOffsetO], gmOLayoutTlaNow, Arch::PositionGM{});
+                    // FD bypasses scalar Dm reduction; the D512 path consumes
+                    // four 128-column LO pieces while keeping its planned UB pitch.
                     if (flashDecodeFlag_ != 0U) {
                         epilogueRescaleO.template operator()<LseMode, false>(
-                            gmOTensorTla, gLse[lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == kvSLoopCount - 1), pvReadyFlag, IsDN,
-                            fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
-                            static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen,
-                            swaQSTileStart, gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_,
+                            gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
+                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
+                            fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
+                            pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
+                            gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
                             fdLseSubStride_, 1.0f, d512);
                     } else {
                         epilogueRescaleO.template operator()<LseMode, true>(
-                            gmOTensorTla, gLse[lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == kvSLoopCount - 1), pvReadyFlag, IsDN,
-                            fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
-                            static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen,
-                            swaQSTileStart, gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_,
+                            gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
+                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
+                            fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
+                            pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
+                            gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
                             fdLseSubStride_, 1.0f, d512);
                     }
 #endif
+                    ++pvIssued;
                 }
             }
-            pipelineTileBase += kvSLoopCount;
-            pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0ATotalStages_ + pvL0ATotalStages_);
-            pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
+            if (emptySpan) {
+                // Every pending consumer is retired by the drain iterations above,
+                // so it is safe to hand the epilogue UB to initOutputs now.
+#ifdef __DAV_VEC__
+                initOutputs.template operator()<LseMode>(gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize,
+                                                         lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
+                                                         static_cast<uint32_t>(oHeadStride));
+#endif
+            }
+            // Only tasks that issued softmax work consume a statistics slot.
+            if (kvSLoopCount != 0U) {
+                ++taskSeq;
+            }
         }
         ReleaseSyncFlags<4, 4, 4>();
         constexpr bool denseBsnd = qFormat == Format::BSND && kvcacheType == CacheMode::normalCache;
