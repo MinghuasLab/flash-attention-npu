@@ -237,7 +237,9 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_);
         EpilogueRescaleO epilogueRescaleO(resource, ubPlan);
-        Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
+        // Plan-based buffers only for plans that carry a dedicated LSE scratch
+        // (D512); every legacy plan keeps the established fixed offsets.
+        Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource, ubPlan);
 #endif
 
         int64_t strideQ = 0;
@@ -298,6 +300,10 @@ class FAIKernel950 {
 
         uint32_t embedVRound = RoundUp(embedV_, 16);
         uint32_t groupSize = qHeads_ / kvHeads_;
+        // Exact D512 (Dq=Dk=Dv=512): single-slot Q/K/V L1, LO128/GO512 UB plan,
+        // positional causal/SWA mask and four-piece PV delivery. Every branch
+        // below keys on the tiling fields, which Host and AICPU write jointly.
+        const bool d512 = fa950_plan::IsD512(embed_, embedV_) && qBaseTile_ == Q_M_TILE_MAX;
         int64_t qBOffset = 0;
         int64_t kBOffset = 0;
         int64_t vBOffset = 0;
@@ -477,7 +483,14 @@ class FAIKernel950 {
             int32_t delEndRow = static_cast<int32_t>(qSeqlen);
             const int32_t qSTileStart = static_cast<int32_t>(qSTileIdx * qBaseTile_);
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
-                int64_t causalKvEnd = static_cast<int64_t>(qSTileIdx + 1U) * qBaseTile_ + kvSeqlen - qSeqlen;
+                int64_t causalKvEnd;
+                if (d512) {
+                    // Bottom-right aligned center of the tile's last row; use
+                    // the actual tile rows so tail tiles do not over-extend.
+                    causalKvEnd = static_cast<int64_t>(qSTileIdx) * qBaseTile_ + qSBlockSize + kvSeqlen - qSeqlen;
+                } else {
+                    causalKvEnd = static_cast<int64_t>(qSTileIdx + 1U) * qBaseTile_ + kvSeqlen - qSeqlen;
+                }
                 if (causalKvEnd < 0) {
                     causalKvEnd = 0;
                 }
@@ -650,25 +663,42 @@ class FAIKernel950 {
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId], l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
-                        auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
-                        auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
-                        int64_t triUp = static_cast<int64_t>(noSkipKvS) - qSBlockSize;
-                        uint32_t triDown = noSkipKvS;
-                        uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
-                        uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
-                        bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
-                        if (doTriUMask) {
-                            epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
-                                                  (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
-                                                  softmaxReadyFlag, triUp, triDown, 0u, 0u, kvSStartIdx, kvSEndIdx, 1,
-                                                  qSBlockSize, qNBlockSize);
+                        if (d512) {
+                            // Positional causal mask: center of the tile's
+                            // first logical row, bottom-right aligned with the
+                            // effective Q/KV lengths.
+                            int32_t qTileCenterStart = static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen);
+                            uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
+                            uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
+                            bool doTriUMask = qTileCenterStart < static_cast<int32_t>(kvSEndIdx - 1);
+                            if (doTriUMask) {
+                                epilogueOnlineSoftmax.template operator()<false>(
+                                    l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag, qTileCenterStart, kvSStartIdx, qSBlockSize,
+                                    qNBlockSize);
+                            } else {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            }
                         } else {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
+                            auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
+                            int64_t triUp = static_cast<int64_t>(noSkipKvS) - qSBlockSize;
+                            uint32_t triDown = noSkipKvS;
+                            uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
+                            uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
+                            bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
+                            if (doTriUMask) {
+                                epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
+                                                      (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
+                                                      softmaxReadyFlag, triUp, triDown, 0u, 0u, kvSStartIdx, kvSEndIdx,
+                                                      1, qSBlockSize, qNBlockSize);
+                            } else {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            }
                         }
                     } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
-                        auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
-                        auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
                         int64_t kvSStartIdxI = static_cast<int64_t>(kvSTileIdx) * kvBaseTile_;
                         int64_t kvSEndIdxI = kvSStartIdxI + kvSTileSizeAct;
                         bool doTriUPreMask =
@@ -683,15 +713,44 @@ class FAIKernel950 {
                                 : (windowSizeRightStartLen >= kvSStartIdxI && windowSizeRightStartLen < kvSEndIdxI) ||
                                       (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
                                       (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
-                        if (doTriUPreMask || doTriUNextMask) {
-                            epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
-                                                  (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
-                                                  softmaxReadyFlag, kvSStartIdxI, doTriUPreMask, doTriUNextMask,
-                                                  windowSizeLeftStartLen, windowSizeLeftEndLen, windowSizeRightStartLen,
-                                                  windowSizeRightEndLen, qSBlockSize, qNBlockSize, 1u);
+                        if (d512) {
+                            if (doTriUPreMask || doTriUNextMask) {
+                                // Window bounds are clamped to the effective
+                                // lengths (Sk-1 / Sq-1), matching the donor;
+                                // on effective positions this clamp behaves
+                                // like an unlimited window because no token
+                                // outside [0, Sk-1] is ever visited.
+                                const int32_t left = static_cast<int32_t>(
+                                    windowSizeLeft_ < 0
+                                        ? kvSeqlen - 1
+                                        : AscendC::Std::min(windowSizeLeft_, static_cast<int64_t>(kvSeqlen - 1)));
+                                const int32_t right = static_cast<int32_t>(
+                                    windowSizeRight_ < 0
+                                        ? qSeqlen - 1
+                                        : AscendC::Std::min(windowSizeRight_, static_cast<int64_t>(qSeqlen - 1)));
+                                epilogueOnlineSoftmax.template operator()<true>(
+                                    l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag,
+                                    static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen),
+                                    static_cast<uint32_t>(kvSStartIdxI), qSBlockSize, qNBlockSize, left, right);
+                            } else {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            }
                         } else {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
+                            auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
+                            if (doTriUPreMask || doTriUNextMask) {
+                                epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
+                                                      (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
+                                                      softmaxReadyFlag, kvSStartIdxI, doTriUPreMask, doTriUNextMask,
+                                                      windowSizeLeftStartLen, windowSizeLeftEndLen,
+                                                      windowSizeRightStartLen, windowSizeRightEndLen, qSBlockSize,
+                                                      qNBlockSize, 1u);
+                            } else {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                            }
                         }
                     } else {
                         if constexpr (IsDN) {
@@ -719,7 +778,10 @@ class FAIKernel950 {
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
-                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(rowNumRound, embedVRound);
+                    // D512 LO holds one 128-column piece: FixPipe writes column
+                    // offset 0 every round, so the UB row pitch is 128.
+                    auto ubOTmpLayoutTla =
+                        tla::MakeLayout<ElementOTmp, LayoutOTmp>(rowNumRound, d512 ? 128U : embedVRound);
                     auto ubOTmpTensorTla =
                         tla::MakeTensor(ubOTmpTensor[ubOTmpBufId], ubOTmpLayoutTla, Arch::PositionUB{});
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
@@ -735,7 +797,7 @@ class FAIKernel950 {
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     blockMmadPV(gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset], actualBlockShapePV,
                                 blockSize_, kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
-                                0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                                0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, d512);
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
@@ -752,12 +814,16 @@ class FAIKernel950 {
                         swaQSeqlen = static_cast<uint32_t>(qSeqlen);
                         swaQSTileStart = static_cast<uint32_t>(qSTileStart);
                     }
+                    // Ordinary FP16/BF16: vDequantScale stays 1.0f; d512Mode
+                    // selects the four-piece LO128 consume on the exact D512
+                    // profile. FP8 keeps its own scale and never sets d512Mode.
                     epilogueRescaleO.template operator()<LseMode>(
                         gmOTensorTla, gLse[lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
                         (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == kvSLoopCount - 1), pvReadyFlag, IsDN,
                         fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
                         static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
-                        gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_, fdLseSubStride_);
+                        gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_, fdLseSubStride_,
+                        1.0f, d512);
 #endif
                 }
             }

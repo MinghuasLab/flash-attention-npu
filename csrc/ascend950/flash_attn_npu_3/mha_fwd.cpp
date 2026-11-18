@@ -234,8 +234,13 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query, "total_q must be positive when max_seqlen_q is positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
-    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
-    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256, "FlashAttention supports value head dimensions in [1, 256]");
+    // D512 opens only the exact Dq=Dk=Dv=512 profile; 257..511 and asymmetric
+    // combinations remain rejected by the [1, 256] check.
+    const bool d512_heads = (head_size_q == 512 && head_size_v == 512);
+    TORCH_CHECK((head_size_q >= 1 && head_size_q <= 256) || d512_heads,
+                "FlashAttention supports q/k head dimensions in [1, 256] plus the exact D512 profile (Dq=Dk=Dv=512)");
+    TORCH_CHECK((head_size_v >= 1 && head_size_v <= 256) || d512_heads,
+                "FlashAttention supports value head dimensions in [1, 256] plus the exact D512 profile (Dq=Dk=Dv=512)");
     TORCH_CHECK(
         !(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
         "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
@@ -364,7 +369,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        if (hasMask && quantMode == 0) {
+        // D512 masks are positional: neither metadata nor the host path needs
+        // the cached 2048x2048 triu matrix. Legacy dimensions keep it.
+        if (hasMask && quantMode == 0 && !d512_heads) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -456,7 +463,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if ((is_causal || is_local) && quantMode == 0) {
+        if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }

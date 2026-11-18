@@ -12,6 +12,7 @@
 #ifndef FA950_FWD_TILING_POLICY_H
 #define FA950_FWD_TILING_POLICY_H
 #include "fwd_resource_plan.h"
+#include "tilingdata.h"
 
 namespace fa950_plan {
 // Host/AICPU policy: fully masked query rows do not provide Cube work. With
@@ -27,9 +28,34 @@ inline uint32_t ActiveQueryRows(uint32_t q, uint32_t kv, bool hasMask, int64_t r
     return rows < q ? static_cast<uint32_t>(rows) : q;
 }
 
+// D512 L1 tiling fields, shared by Host tiling and AICPU metadata so the
+// device-side address plan always matches. Q/K/V use one slot each, P keeps
+// three; QK N is 128 (one KV tile) and K covers the full D.
+inline void ApplyD512ResourceFields(FAInferTilingData& t)
+{
+    t.qkL1TileM = 128U;
+    t.qkL1TileN = 128U;
+    t.qkL1TileKLeft = 512U;
+    t.qkL1TileKRight = 512U;
+    t.pvL1TileM = 128U;
+    t.pvL1TileN = 512U;
+    t.pvL1TileKLeft = 128U;
+    t.pvL1TileKRight = 128U;
+    t.qL1BufNum = 1U;
+    t.kL1BufNum = 1U;
+    t.vL1BufNum = 1U;
+    t.pL1BufNum = 3U;
+    t.kvBaseTile = 128U;
+}
+
 inline uint32_t SelectQueryTile(uint32_t d, uint32_t dv, uint32_t maxQ, uint64_t fullTasks, uint32_t cores,
                                 bool isLocal, int64_t left, int64_t right)
 {
+    // D512 has one legal profile (Q128); skip every small-input or windowed
+    // fallback that would select the legacy fixed UB layout.
+    if (IsD512(d, dv)) {
+        return 128U;
+    }
     // A narrow finite window adds masked KV work when Q doubles. Single PV
     // storage also serializes Fixpipe/rescale: use a conservative four-KV-tile
     // window floor there, versus two tiles when both PV stages fit in UB.

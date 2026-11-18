@@ -29,13 +29,31 @@ class FlashDecodeCombine950 {
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
-    static constexpr uint32_t MAX_HEAD_DIM = 256U;
+    static constexpr uint32_t MAX_HEAD_DIM = 512U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
     static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;
     static constexpr uint32_t MAX_O_ELEMS = MAX_ROW_TILE * MAX_HEAD_DIM;
     static constexpr uint32_t MAX_O_INPUT_ELEMS = FD_COMBINE_O_INPUT_ELEMS;
     using Resource = Catlass::Arch::Resource<Catlass::Arch::Ascend950>;
+
+    // Actual-end capacity checks, mirroring the constructor layout below:
+    // lse + weight (2x MAX_LSE_ELEMS floats), global LSE, the 32B-expanded
+    // LSE store, one MAX_O_INPUT_ELEMS FP32 input window and one MAX_O_ELEMS
+    // FP32 accumulator. The 32 KiB partial-input window is kept: at D512 an
+    // 8-row tile occupies 8*512 floats, so each round fits
+    // MAX_O_INPUT_ELEMS / (8*512) = 2 splits, and the batch count is derived
+    // from the actual D at runtime.
+    static constexpr uint32_t COMBINE_UB_END = 2U * MAX_LSE_ELEMS * sizeof(float) +
+                                               MAX_ROW_TILE * sizeof(float) +
+                                               MAX_ROW_TILE * FLOATS_PER_BLOCK * sizeof(float) +
+                                               MAX_O_INPUT_ELEMS * sizeof(float) + MAX_O_ELEMS * sizeof(float);
+    static_assert(MAX_O_ELEMS <= MAX_O_INPUT_ELEMS,
+                  "FD combine row-tile accumulator must fit the input window");
+    static_assert(MAX_ROW_TILE * 512U <= MAX_O_INPUT_ELEMS,
+                  "D512 8-row FP32 accumulator must fit the input window");
+    static_assert(COMBINE_UB_END == 51488U, "FD combine actual-end capacity");
+    static_assert(COMBINE_UB_END <= 248U * 1024U, "FD combine UB layout exceeds the 248 KiB budget");
 
     template <class ResourceType>
     __aicore__ inline explicit FlashDecodeCombine950(ResourceType& resource)
@@ -207,7 +225,8 @@ class FlashDecodeCombine950 {
                 qLen = params.seqUsedQ != nullptr
                            ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
                            : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
-                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
+                // D512 uses Q128; keep the existing Q64 row cap only for legacy large D.
+                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U && headDim != 512U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
                 qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
                 const uint32_t batchTasks = CeilDiv(qLen, tiling->qBaseTile) * qNTaskNum;

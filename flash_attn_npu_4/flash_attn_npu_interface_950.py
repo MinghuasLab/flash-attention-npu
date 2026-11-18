@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+from typing import Union, Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -67,6 +67,7 @@ def _transposed_bnsd_view(t):
     return None
 
 
+
 def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     """Return ``(layout, q, k, v, out_transposed)``: the layout code shared with the C++
     host, the operands to hand the kernel, and whether ``out`` must be transposed back to
@@ -77,7 +78,7 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     """
     if k is not None and v is not None and v.dim() != k.dim():
         raise RuntimeError(
-            "flash_attn_npu_4_950: key and value must have the same rank for layout detection"
+            "flash_attn_npu_3_950: key and value must have the same rank for layout detection"
         )
 
     if q.dim() != 4 or k.dim() != 4 or page_table is not None or cu_seqlens_k is not None:
@@ -101,11 +102,56 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+
 # Ascend950 FA4 metadata contains only serialized FAInferStaticTilingData. Keep
 # this in sync with fa_metadata::MetadataBytes(false) in
 # csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
 # metadata, its size does not depend on the input sequence lengths or mask.
 _SCHEDULER_METADATA_TILING_BYTES = 5216
+
+
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
+        return "BBND"
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
+    """Apply the same forward stride policy as FA4 and FIA.
+
+    Dense operands use fixed packed kernel strides and are materialized. Paged
+    K/V remain zero-copy when both caches have the same packed BBND or BNBD
+    inner layout; dimension 0 may still be strided. Other paged views fall
+    back to packed BBND storage. FP8 caches always use packed BBND storage.
+
+    Append-KV is the exception: replacing a cache with a temporary contiguous
+    copy would lose the API's in-place cache update, so an unsupported cache
+    view is rejected instead of copied.
+    """
+    q = q.contiguous()
+    # The FP8 kernel still uses packed page addressing.
+    if page_table is None or q.dtype == torch.float8_e4m3fn:
+        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
+            raise RuntimeError(
+                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
+            )
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    if append_kv:
+        raise RuntimeError(
+            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
+        )
+    return q, k.contiguous(), v.contiguous()
 
 
 @_torch_custom_op_wrapper(
@@ -303,8 +349,9 @@ def _flash_attn_forward(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k = (_maybe_contiguous(x) for x in (q, k))
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    if qv is not None:
+        raise NotImplementedError("Ascend950 FA4 forward does not support qv")
+    q, k, v = _prepare_forward_qkv(q, k, v, page_table, append_kv=False)
     cu_seqlens_q, cu_seqlens_k = (_maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k))
     seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
     page_table = _maybe_contiguous(page_table)

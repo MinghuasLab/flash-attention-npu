@@ -206,7 +206,7 @@ def _run_paged(query, key, value, *, page_table, kv_lens, q_lens, causal=False, 
             max_seqlen_q=max(q_lens),
         )
     torch.npu.synchronize()
-    out, lse = flash_attn_varlen_func(query, key, value, **kwargs)
+    out, lse, *_ = flash_attn_varlen_func(query, key, value, **kwargs)
     torch.npu.synchronize()
     return out, lse
 
@@ -580,12 +580,8 @@ def test_paged_independent_dim0_stride_profiles(layout, profile):
             _assert_poison_untouched(*meta)
 
 
-@skip_unless_910
 def test_paged_d512_dim0_noncontiguous():
-    """FIA D512 MLA dim0 case, rewritten without split-RoPE (FA4 has no rope inputs)."""
-    name = torch_npu.npu.get_device_name()
-    if "Ascend950" in name:
-        pytest.skip("head_dim=512 is supported only on Ascend910")
+    """Ordinary D512 paged forward with a strided page axis on Ascend910/950."""
     q_lens = (1,)
     kv_lens = (129,)
     page_size, nheads, kv_heads, head_size = 128, 8, 1, 512

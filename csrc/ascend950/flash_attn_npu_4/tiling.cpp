@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <vector>
 #include "tilingdata.h"
+#include "fwd_resource_plan.h"
+#include "fwd_tiling_policy.h"
 
 namespace optiling {
 const uint32_t SIZE_OF_16BIT = 2;
@@ -57,7 +59,7 @@ struct FAInferContext {
     const int64_t* qSeqlenList{nullptr};
     const int64_t* kvSeqlenList{nullptr};
     float scaleValue = 0.0;
-    float softcapValue = 0.0f;
+    float softcapValue = 0.0;
     size_t* workspaces{nullptr};
     MaskType maskType = MaskType::MASK_SPEC;
     DataType dataType = DataType::FP16;
@@ -111,6 +113,7 @@ class FAInferTiling {
   private:
     FAInferContext faInfo_;
     uint32_t blockNum_;
+    uint32_t qBaseTile_ = Q_TILE_CEIL;
 };
 
 FAInferTiling::FAInferTiling(const FAInferContext& faInfo) : faInfo_(faInfo) {}
@@ -119,7 +122,7 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
     uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-    if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
+    if (GetQSBlockTile(faInfo_.maxKvSeqlen) < Q_TILE_CEIL && qSeqlen != 0) {
         constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
         uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
         qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
@@ -134,8 +137,7 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 
 uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t qSBlockTile = faInfo_.embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
-    return qSBlockTile;
+    return qBaseTile_;
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
 {
@@ -152,6 +154,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_embeddingSize(static_cast<uint32_t>(faInfo_.embeddingSize));
     faTilingData.set_embeddingSizeV(static_cast<uint32_t>(faInfo_.embeddingSizeV));
     faTilingData.set_numBlocks(static_cast<uint32_t>(faInfo_.numBlocks));
+
     if (faInfo_.pagedCacheFlag) {
         faTilingData.set_blockSize(static_cast<uint32_t>(faInfo_.blockSize));
     } else {
@@ -160,9 +163,11 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_maxQSeqlen(faInfo_.maxQSeqlen);
     faTilingData.set_maxKvSeqlen(faInfo_.maxKvSeqlen);
     faTilingData.set_maxNumBlocksPerBatch(faInfo_.maxNumBlocksPerBatch);
-    faTilingData.set_maskType(static_cast<uint32_t>(faInfo_.maskType));
     faTilingData.set_scaleValue(faInfo_.scaleValue);
     faTilingData.set_softcapValue(faInfo_.softcapValue);
+
+    faTilingData.set_maskType(static_cast<uint32_t>(faInfo_.maskType));
+
     faTilingData.set_sparseMode(faInfo_.sparseMode);
     faTilingData.set_cacheLayout(0U);
     faTilingData.set_flashDecodeFlag(faInfo_.flashDecodeFlag ? 1U : 0U);
@@ -175,8 +180,8 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
 
     auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
     const uint32_t quantMode = faInfo_.dataType == DataType::FP8 ? 1U : 0U;
-    faTilingData.quantMode = quantMode;
     auto kvBaseTile_ = quantMode == 1 ? 256U : BASE_KV_SIZE;
+    faTilingData.quantMode = quantMode;
     auto embeddingSizeAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
     auto qkL1TileM_ = Q_TILE_CEIL;
@@ -212,6 +217,12 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
+
+    // D512 keeps one Q/K/V L1 slot each and packs K by the full 512 dims;
+    // this must match fa_metadata.aicpu and the device address plan.
+    if (fa950_plan::IsD512(faInfo_.embeddingSize, faInfo_.embeddingSizeV)) {
+        fa950_plan::ApplyD512ResourceFields(faTilingData);
+    }
 }
 
 void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData& faTilingData)
@@ -598,6 +609,25 @@ BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)
 
 void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
 {
+    uint64_t fullQ128Tasks = 0;
+    for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
+        const uint32_t qLen =
+            faInfo_.qSeqlenList == nullptr
+                ? faInfo_.maxQSeqlen
+                : (faInfo_.layout == FwdLayout::TND ? faInfo_.qSeqlenList[b + 1] - faInfo_.qSeqlenList[b]
+                                                    : faInfo_.qSeqlenList[b]);
+        const uint32_t kvLen = faInfo_.kvSeqlenList == nullptr
+                                   ? faInfo_.maxKvSeqlen
+                                   : (faInfo_.layout == FwdLayout::TND && !faInfo_.pagedCacheFlag
+                                          ? faInfo_.kvSeqlenList[b + 1] - faInfo_.kvSeqlenList[b]
+                                          : faInfo_.kvSeqlenList[b]);
+        const uint32_t activeQ =
+            fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
+        fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
+    }
+    qBaseTile_ = faInfo_.dataType == DataType::FP8 ? Q_TILE_CEIL : fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
+                                             fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
+                                             faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
     FillBasicTilingData(tilingdata);
     if (!faInfo_.isTilingSink) {
         FillSplitCoreTilingData(tilingdata);

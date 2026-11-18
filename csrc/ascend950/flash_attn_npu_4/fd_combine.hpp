@@ -27,17 +27,36 @@ template <class ElementO, bool OutputLse, uint32_t quantMode = 0>
 class FlashDecodeCombine950 {
   public:
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
-    static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : 8U;
     static constexpr uint32_t MAX_SPLIT_NUM = MAX_FD_ACTIVE_CORE_NUM;
     static constexpr uint32_t MAX_ROW_TILE = FD_COMBINE_ROW_TILE;
-    static constexpr uint32_t MAX_HEAD_DIM = 256U;
+    static constexpr uint32_t MAX_HEAD_DIM = 512U;
     static constexpr uint32_t FLOATS_PER_BLOCK = 8U;
+    static constexpr uint32_t PARTIAL_ROW_SPLIT_ALIGN = FULL_QUANT_FP8 ? 32U : FLOATS_PER_BLOCK;
     static constexpr uint32_t MAX_LSE_ELEMS = MAX_SPLIT_NUM * MAX_ROW_TILE;
     static constexpr uint32_t MAX_O_ELEMS = MAX_ROW_TILE * MAX_HEAD_DIM;
     static constexpr uint32_t MAX_O_INPUT_ELEMS = FD_COMBINE_O_INPUT_ELEMS;
     using Resource = Catlass::Arch::Resource<Catlass::Arch::Ascend950>;
 
-    __aicore__ inline explicit FlashDecodeCombine950(Resource& resource)
+    // Actual-end capacity checks, mirroring the constructor layout below:
+    // lse + weight (2x MAX_LSE_ELEMS floats), global LSE, the 32B-expanded
+    // LSE store, one MAX_O_INPUT_ELEMS FP32 input window and one MAX_O_ELEMS
+    // FP32 accumulator. The 32 KiB partial-input window is kept: at D512 an
+    // 8-row tile occupies 8*512 floats, so each round fits
+    // MAX_O_INPUT_ELEMS / (8*512) = 2 splits, and the batch count is derived
+    // from the actual D at runtime.
+    static constexpr uint32_t COMBINE_UB_END = 2U * MAX_LSE_ELEMS * sizeof(float) +
+                                               MAX_ROW_TILE * sizeof(float) +
+                                               MAX_ROW_TILE * FLOATS_PER_BLOCK * sizeof(float) +
+                                               MAX_O_INPUT_ELEMS * sizeof(float) + MAX_O_ELEMS * sizeof(float);
+    static_assert(MAX_O_ELEMS <= MAX_O_INPUT_ELEMS,
+                  "FD combine row-tile accumulator must fit the input window");
+    static_assert(MAX_ROW_TILE * 512U <= MAX_O_INPUT_ELEMS,
+                  "D512 8-row FP32 accumulator must fit the input window");
+    static_assert(COMBINE_UB_END == 51488U, "FD combine actual-end capacity");
+    static_assert(COMBINE_UB_END <= 248U * 1024U, "FD combine UB layout exceeds the 248 KiB budget");
+
+    template <class ResourceType>
+    __aicore__ inline explicit FlashDecodeCombine950(ResourceType& resource)
     {
         constexpr uint32_t LSE_OFFSET = 0U;
         constexpr uint32_t WEIGHT_OFFSET = LSE_OFFSET + MAX_LSE_ELEMS * sizeof(float);
@@ -59,13 +78,7 @@ class FlashDecodeCombine950 {
     {
 #ifdef __DAV_VEC__
         __gm__ FAInferStaticTilingData* tiling = reinterpret_cast<__gm__ FAInferStaticTilingData*>(params.tiling);
-        uint32_t allowFlashDecode;
-        if constexpr (FULL_QUANT_FP8) {
-            allowFlashDecode = params.fp8Runtime.allowFlashDecode;
-        } else {
-            const auto* runtimeTiling = reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
-            allowFlashDecode = runtimeTiling->allowFlashDecode;
-        }
+        const uint32_t allowFlashDecode = params.runtime.allowFlashDecode;
         if (tiling->flashDecodeFlag == 0U || allowFlashDecode == 0U) {
             return;
         }
@@ -101,7 +114,10 @@ class FlashDecodeCombine950 {
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch)) : 0U;
+        const uint32_t totalQ = OutputLse
+                                    ? (FULL_QUANT_FP8 ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch))
+                                                      : static_cast<uint32_t>(params.storage.totalQTokens))
+                                    : 0U;
         const uint32_t combineIdx = tiling->fdCombineCoreSchedules[aivIdx].combineTaskIdx;
         const uint32_t sourceSubBlock = tiling->fdCombineCoreSchedules[aivIdx].sourceSubBlock;
         const uint32_t assignedStart = tiling->fdCombineCoreSchedules[aivIdx].sourceLocalRow;
@@ -201,7 +217,10 @@ class FlashDecodeCombine950 {
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch)) : 0U;
+        const uint32_t totalQ = OutputLse
+                                    ? (FULL_QUANT_FP8 ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch))
+                                                      : static_cast<uint32_t>(params.storage.totalQTokens))
+                                    : 0U;
         uint32_t workBase = 0U;
         for (uint32_t combineIdx = 0U; combineIdx < tiling->fdCombineTaskNum; ++combineIdx) {
             const uint32_t baseTask = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].baseTask);
@@ -216,7 +235,8 @@ class FlashDecodeCombine950 {
                 qLen = params.seqUsedQ != nullptr
                            ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
                            : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
-                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
+                // D512 uses Q128; keep the existing Q64 row cap only for legacy large D.
+                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U && headDim != 512U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
                 qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
                 const uint32_t batchTasks = CeilDiv(qLen, tiling->qBaseTile) * qNTaskNum;

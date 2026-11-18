@@ -121,6 +121,13 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->qSeqlenAligned = 0;
     tilingData->kvSeqlenAligned = 0;
 
+    // D512 packs one Q/K/V slot each with the full 512 dims; keep the fields
+    // identical to Host tiling and the device-side address plan.
+    const bool d512 = fa950_plan::IsD512(metaArgs->embeddingSize, metaArgs->embeddingSizeV);
+    if (d512) {
+        fa950_plan::ApplyD512ResourceFields(*tilingData);
+    }
+
     uint32_t maxQSeqlen = 0;
     uint32_t maxKvSeqlen = 0;
     uint32_t totalTaskNum = 0;

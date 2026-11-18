@@ -47,7 +47,11 @@
         <<<a.block_dim, nullptr, a.stream>>>(a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,  \
                                              a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
                                              a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
-                                             a.tiling_device, a.runtime_tiling_device, a.kv_seqlen_allocated)
+                                             a.tiling_device, a.runtime.scaleValue, a.runtime.softcapValue,           \
+                                             a.runtime.numBlocks, a.runtime.maxNumBlocksPerBatch,                     \
+                                             PackFwdBlockConfig(a.runtime),                                          \
+                                             PackFwdWindow<MASK_CAT == MaskCategory::MASK_SWA>(a.runtime),             \
+                                             a.kv_seqlen_allocated, a.storage)
 
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a)
@@ -68,7 +72,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                                                 kCacheLayout, LseMode, HasSoftcap><<<a.block_dim, nullptr, a.stream>>>(
                             a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device,
                             a.lse_device, a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,
-                            a.workspace_device, a.tiling_device, a.fp8_runtime, a.q_descale_device, a.k_descale_device,
+                            a.workspace_device, a.tiling_device, a.runtime, a.q_descale_device, a.k_descale_device,
                             a.v_descale_device, a.kv_seqlen_allocated);
                     });
                 });
@@ -84,9 +88,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                         // Only NO_MASK has an FAInferDn fast path: masked (causal /
                         // SWA) workloads always use FAInfer. Because this condition
                         // is a compile-time constant, if constexpr also prunes the
-                        // masked FAInferDn instantiations from this TU. BNSD is
-                        // supported: the per-head GM pitch is passed into loadQGM
-                        // as qHeadStride.
+                        // masked FAInferDn instantiations from this TU.
                         constexpr bool kUseDnFastPath = (MaskCat == MaskCategory::NO_MASK) && IsDN;
                         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
                             if constexpr (kUseDnFastPath) {

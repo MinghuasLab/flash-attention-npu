@@ -153,7 +153,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     static constexpr uint32_t STRIDE_LIMIT = 65535;
     static constexpr uint32_t C0_ELEMS = 16;
 
-    __aicore__ inline BlockMmadTla(Arch::Resource<ArchTag>& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
+    template <class Resource>
+    __aicore__ inline BlockMmadTla(Resource& resource, BlockMmadQKTileHelper& BlockMmadQKTileHelper)
     {
         l1ATileM = BlockMmadQKTileHelper.qkL1TileM;
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
@@ -213,11 +214,25 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qNBlockSize, embed),
-                                            tla::MakeStride(static_cast<uint32_t>(qHeadStride), tla::Int<1>{}));
-        auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
-        auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
-        copyGmToL1A(l1QTile, gmQTensorTla, qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+        if (embed == 512U && qNBlockSize == 1U) {
+            // D512 single head: one strided [S, D] matrix. Loading S separate
+            // one-row matrices adds ND2NZ overhead without changing the L1
+            // layout, so use one legal strided copy instead. Legacy dimensions
+            // keep the established multi-ND branch unchanged.
+            auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qSBlockSize, embed),
+                                               tla::MakeStride(tla::get<0>(gATensor.stride()), tla::Int<1>{}));
+            auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+            auto l1QLayoutTla = MakeCustomLayout(rowNum, embedPhysical, 1U);
+            auto l1QTensorTla = tla::MakeTensor(l1ATensor[0], l1QLayoutTla, Arch::PositionL1{});
+            auto l1QTile = GetTile(l1QTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qSBlockSize, embed));
+            copyGmToL1A(l1QTile, gmQTensorTla);
+        } else {
+            auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qNBlockSize, embed),
+                                                tla::MakeStride(static_cast<uint32_t>(qHeadStride), tla::Int<1>{}));
+            auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+            auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
+            copyGmToL1A(l1QTile, gmQTensorTla, qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+        }
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
@@ -252,6 +267,13 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     __aicore__ inline uint32_t GetCurLoopCounter(uint32_t outterLoopItr, uint32_t curLoopNum, uint32_t curLoopItr)
     {
         return outterLoopItr * curLoopNum + curLoopItr;
+    }
+
+    uint64_t pageStride = 0;
+
+    __aicore__ inline void SetPageStride(uint64_t stride)
+    {
+        pageStride = stride;
     }
 
     template <class TensorB, class L1BTile>
@@ -296,6 +318,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t l1BBufId = pipelineTileSeq % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
+        // Must match loadQGM: the multi-ND copy stores adjacent Q heads
+        // qSBlockSize rows apart in L1.
         auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
@@ -304,6 +328,11 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t nL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
+        // while splitting the base tile S to 2 AIVs,
+        // the order of the elements in each column is expected to be preserved,
+        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
+        // therefore, FixPipe won't launch until each portion(chunked only by columns, based on nbuffer strategy)
+        // of the base tile is ready on l0C
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
             uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
@@ -322,8 +351,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     uint32_t blockTableIdx = kvSTileIdx * 128 / blockSize;
                     uint32_t blockOffset = kvSTileIdx * 128 % blockSize;
                     auto blockIdx = gBlockTable.GetValue(blockTableIdx);
-                    auto gBTensorTlaTile = GetTile(gBTensor, tla::MakeCoord(0, blockIdx * blockSize + blockOffset),
-                                                   tla::MakeShape(embed, l0TileNAct));
+                    auto gPageTensor = tla::MakeTensor(gBTensor.data()[static_cast<uint64_t>(blockIdx) * pageStride],
+                                                       gBTensor.layout(), Arch::PositionGM{});
+                    auto gBTensorTlaTile =
+                        GetTile(gPageTensor, tla::MakeCoord(0, blockOffset), tla::MakeShape(embed, l0TileNAct));
                     copyGmToL1B(l1BTensorTlaTile, gBTensorTlaTile);
                 } else {
                     if (isShrink == 1) {

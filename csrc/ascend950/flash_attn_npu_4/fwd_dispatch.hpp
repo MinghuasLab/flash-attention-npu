@@ -30,13 +30,14 @@ struct FwdLaunchArgs {
     uint8_t* seq_used_kv_device; // per-batch used KV lengths (seqused_k); nullptr when absent
     uint8_t* workspace_device;
     uint8_t* tiling_device;
-    uint8_t* runtime_tiling_device;
     int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD head plane)
     uint32_t quant_mode = 0;
     uint8_t* q_descale_device = nullptr;
     uint8_t* k_descale_device = nullptr;
     uint8_t* v_descale_device = nullptr;
-    FAInferRuntimeData fp8_runtime{};
+    FAInferRuntimeData runtime{};
+    FwdStorageParams storage{};
+    bool kv_bnbd = false;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

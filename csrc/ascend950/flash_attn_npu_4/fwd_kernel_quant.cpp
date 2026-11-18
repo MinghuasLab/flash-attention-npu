@@ -120,7 +120,7 @@ class FAIKernel950 {
     {
         __gm__ const FAInferStaticTilingData* faiTilingData =
             reinterpret_cast<__gm__ const FAInferStaticTilingData*>(params.tiling);
-        const auto& runtime = params.fp8Runtime;
+        const auto& runtime = params.runtime;
         AscendC::GlobalTensor<ElementQ> gQ;
         gQ.SetGlobalBuffer((__gm__ ElementQ*)params.q);
         AscendC::GlobalTensor<ElementK> gK;
@@ -909,8 +909,8 @@ CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, LseMode>;
     FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,   seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      nullptr,       kvSeqlenAllocated};
-    params.fp8Runtime = runtime;
+                           seqUsedKv, o, lse, workspace, tiling, kvSeqlenAllocated};
+    params.runtime = runtime;
     params.qDescale = qDescale;
     params.kDescale = kDescale;
     params.vDescale = vDescale;
