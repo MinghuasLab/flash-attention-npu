@@ -61,8 +61,10 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 7 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        // Must match online_softmax.hpp: lm/gm/gl hold one slot per in-flight
+        // task so a delayed rescale reads the statistics of its own task.
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
 
@@ -77,6 +79,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
         redUbTensor = resource.ubBuf.template GetBufferByByte<float>(RESCALE_SKIP_SCRATCH_OFFSET);
+        lmUbTensor32Base = lmUbTensor32;
+        gmUbTensor32Base = gmUbTensor32;
+        glUbTensor32Base = glUbTensor32;
     }
 
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
@@ -91,6 +96,19 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+        lmUbTensor32Base = lmUbTensor32;
+        gmUbTensor32Base = gmUbTensor32;
+        glUbTensor32Base = glUbTensor32;
+    }
+
+    // Cross-task pipelining: read the row statistics of the task that produced
+    // this kv tile instead of the slot the following task is filling.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        const uint32_t off = slot * fa950_stats::STATS_SLOT_ELEM_NUM;
+        lmUbTensor32 = lmUbTensor32Base[off];
+        gmUbTensor32 = gmUbTensor32Base[off];
+        glUbTensor32 = glUbTensor32Base[off];
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -1016,6 +1034,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> glUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor32;
+    AscendC::LocalTensor<float> glUbTensor32Base;
+    AscendC::LocalTensor<float> lmUbTensor32Base;
+    AscendC::LocalTensor<float> gmUbTensor32Base;
     AscendC::LocalTensor<float> redUbTensor;
     bool enableRescaleSkip{false};
     float vDequantScale_ = 1.0f;

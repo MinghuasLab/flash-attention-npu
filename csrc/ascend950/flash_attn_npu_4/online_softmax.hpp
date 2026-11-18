@@ -85,11 +85,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 2 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 7 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        // lm/gm/gl are per-task row statistics: with cross-task pipelining a
+        // later task may already be filling its slot while the delayed rescale
+        // of an earlier tile still reads the previous one.
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
 
         subBlockIdx_ = AscendC::GetSubBlockIdx();
 
@@ -104,9 +107,22 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LM_UB_TENSOR_OFFSET);
         llUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LL_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
+        gmUbTensorBase = gmUbTensor;
+        glUbTensorBase = glUbTensor;
+        lmUbTensorBase = lmUbTensor;
     }
 
     __aicore__ inline ~BlockEpilogue() {}
+
+    // Cross-task pipelining: the row statistics of task n must survive while
+    // task n+1 overwrites the other slot with its own online softmax state.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        const uint32_t off = slot * fa950_stats::STATS_SLOT_ELEM_NUM;
+        lmUbTensor = lmUbTensorBase[off];
+        gmUbTensor = gmUbTensorBase[off];
+        glUbTensor = glUbTensorBase[off];
+    }
 
     template <class TensorDst, class TensorSrc>
     __aicore__ inline void CopyPUbToPL1(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t m)
@@ -751,6 +767,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<ElementInput> lmUbTensor;
     AscendC::LocalTensor<ElementInput> llUbTensor;
+    AscendC::LocalTensor<float> gmUbTensorBase;
+    AscendC::LocalTensor<float> glUbTensorBase;
+    AscendC::LocalTensor<ElementInput> lmUbTensorBase;
     uint32_t subBlockIdx_;
 
     enum class MAligendTileNum {
