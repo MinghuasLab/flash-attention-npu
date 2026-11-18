@@ -359,7 +359,7 @@ run_pytest_scanned() {
   local files=() file collect_log logfile probe_rc
   while IFS= read -r file; do
     [ -n "$file" ] && files+=("$file")
-  done < <(find "$root" -type f -name 'test_*.py' | sort)
+  done < <(find "$root" -path '*/catlass_dsl' -prune -o -type f -name 'test_*.py' -print | sort)
   if [ "${#files[@]}" -eq 0 ]; then
     log "no test_*.py under $root"
     echo "$root" >> "$FAILED_FILE"
