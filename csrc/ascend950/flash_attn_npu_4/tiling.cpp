@@ -12,6 +12,7 @@
 #include "tilingdata.h"
 #include "fwd_resource_plan.h"
 #include "fwd_tiling_policy.h"
+#include "fused_task.h"
 
 namespace optiling {
 const uint32_t SIZE_OF_16BIT = 2;
@@ -563,6 +564,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
 {
     uint32_t totalTaskNum = 0;
+    faTilingData.fusedCrossGroup = 0U;
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
     for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
         uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
@@ -575,12 +577,13 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
                 kvSeqlen = *(faInfo_.kvSeqlenList + batchIdx + 1) - prevKvSeqlenSum;
             }
         }
-        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
-        uint32_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint32_t curQNBlockNum = qNBlockNumPerGroup * faInfo_.kvHeads;
-        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
-        uint32_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const auto shape = fa950_task::MakeShape(
+            qSeqlen, faInfo_.numHeads, faInfo_.kvHeads, GetQSBlockTile(faInfo_.maxKvSeqlen), faInfo_.batch, blockNum_,
+            faInfo_.layout != FwdLayout::TND, faInfo_.dataType == DataType::FP8,
+            faInfo_.maskType != MaskType::NO_MASK && !fa950_plan::IsD512(faInfo_.embeddingSize, faInfo_.embeddingSizeV),
+            faInfo_.maxKvSeqlen <= BASE_KV_SIZE);
+        const uint32_t curTaskNum = shape.totalTasks;
+        faTilingData.fusedCrossGroup |= shape.tailRows && shape.tailHeadTile > groupSize;
         if (batchIdx == 0) {
             faTilingData.set_firstBatchTaskNum(curTaskNum);
         }

@@ -12,6 +12,7 @@
 
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
+#include "fused_task.h"
 
 #include "kernel_operator.h"
 #include "tilingdata.h"
@@ -115,18 +116,7 @@ enum class CacheLayout : uint8_t {
 __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
                                           bool restrictMergedRowsForLargeD = false)
 {
-    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX : (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
-        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
-        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
-        maxTile = maxTile > 0U ? maxTile : 1U;
-        tile = tile < maxTile ? tile : maxTile;
-    }
-    tile = tile < groupSize ? tile : groupSize;
-    if (tile > Q_N_SPLIT_ALIGN) {
-        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    }
-    return tile < 1U ? 1U : tile;
+    return fa950_task::LegacyHeadTile(qSeqlen, groupSize, restrictMergedRowsForLargeD ? 64U : 128U);
 }
 
 #endif

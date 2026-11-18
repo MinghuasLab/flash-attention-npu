@@ -15,6 +15,7 @@
 #include "tilingdata.h"
 #include "fwd_resource_plan.h"
 #include "fwd_tiling_policy.h"
+#include "fused_task.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -488,6 +489,18 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 
     uint32_t maxQSeqlen = 0;
     uint32_t maxKvSeqlen = 0;
+    // Short-KV flag must be identical to the host tiling and the AICore view, so
+    // it is resolved once from the global max KV length before the task loop.
+    uint32_t preMaxKv = 0;
+    for (uint32_t batchIdx = 0; batchIdx < metadataArgs->batch; ++batchIdx) {
+        const uint32_t kvSeqlen = metadataArgs->isVarlenKv
+                                      ? static_cast<uint32_t>(seqlensK[batchIdx + 1] - seqlensK[batchIdx])
+                                      : static_cast<uint32_t>(seqlensK[batchIdx]);
+        if (kvSeqlen > preMaxKv) {
+            preMaxKv = kvSeqlen;
+        }
+    }
+    const bool tinyKvFusion = preMaxKv <= BASE_KV_SIZE;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
@@ -502,9 +515,16 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
                                       : static_cast<uint32_t>(seqlensK[batchIndex]);
         maxQSeqlen = maxQSeqlen > qSeqlen ? maxQSeqlen : qSeqlen;
         maxKvSeqlen = maxKvSeqlen > kvSeqlen ? maxKvSeqlen : kvSeqlen;
-        const uint32_t qnBlockTile = GetQNBlockTile(qSeqlen, groupSize, tilingData->qBaseTile);
-        const uint32_t batchTaskNum =
-            CeilDiv(groupSize, qnBlockTile) * metadataArgs->numHeadsK * CeilDiv(qSeqlen, tilingData->qBaseTile);
+        // Cross-group tail fusion needs the masked kernel: the unmasked path runs
+        // the DN variant, which does not implement KV segments. Keeping the
+        // condition mask-only also keeps it identical to the AICore's view.
+        const auto shape = fa950_task::MakeShape(qSeqlen, metadataArgs->numHeads, metadataArgs->numHeadsK,
+            tilingData->qBaseTile, metadataArgs->batch, metadataArgs->blockDim,
+            metadataArgs->isVarlen == 0U, metadataArgs->quantMode != 0U,
+            metadataArgs->maskType != 0U && !fa950_plan::IsD512(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV),
+            tinyKvFusion);
+        const uint32_t batchTaskNum = shape.totalTasks;
+        tilingData->fusedCrossGroup |= shape.tailRows && shape.tailHeadTile > groupSize;
         if (batchIndex == 0) {
             firstBatchTaskNum = batchTaskNum;
         }

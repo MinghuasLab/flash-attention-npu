@@ -25,6 +25,7 @@
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
 #include "fwd_resource.hpp"
+#include "fwd_resource_plan.h"
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_SOFTMAX_HIGH_PREC_HPP
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP
 #include "catlass/epilogue/block/block_epilogue.hpp"
@@ -110,6 +111,10 @@ class FAIKernel950 {
         uint32_t kvSLoopCount;
         uint32_t qSBlockSize;
         uint32_t qNBlockSize;
+        // Cross-group fused tasks run one serial segment per KV head.
+        uint32_t segmentRows;
+        uint32_t segmentCount;
+        int64_t vHeadStride;
         uint32_t fullyMaskedRowsPerHead;
         uint32_t statsSlot;
         uint32_t partialId;
@@ -156,6 +161,7 @@ class FAIKernel950 {
         }
     }
 
+    template <bool FusedGroups = false>
     __aicore__ inline void operator()(FAIKernelParams const& params)
     {
         __gm__ const FAInferStaticTilingData* faiTilingData =
@@ -358,6 +364,17 @@ class FAIKernel950 {
         int64_t kvSeqlen = 0;
         int64_t kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
+        // Shared host/AICore decomposition: one geometry struct per batch, so
+        // the task loop only decodes indexes instead of recomputing the tile
+        // rules on every core and every task.
+        const uint32_t batchCount = faiTilingData->batch;
+        // Short-KV (single KV tile per task) MHA: merging distinct KV heads is
+        // what pays off there, so allow cross-group fusion even for group == 1.
+        // Must match host tiling / AICPU metadata exactly (task count contract).
+        const bool tinyKvFusion = faiTilingData->maxKvSeqlen <= kvBaseTile_;
+        fa950_task::Shape taskShape =
+            fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), qHeads_, kvHeads_, qBaseTile_, batchCount, coreNum,
+                                  qFormat != Format::TND, false, FusedGroups && !fa950_plan::IsD512(embed_, embedV_), tinyKvFusion);
         if constexpr (qFormat == Format::TND) {
             qPhysicalSeqlen =
                 static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
@@ -428,6 +445,7 @@ class FAIKernel950 {
                 }
                 oBOffset += oBatchStride;
 
+                const int64_t previousQSeqlen = qSeqlen;
                 qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
                 qPhysicalSeqlen = faiTilingData->maxQSeqlen;
                 kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
@@ -441,14 +459,12 @@ class FAIKernel950 {
                 } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
-                // GetQSBlockTile is a constant independent of kvSeqlen so the kv
-                // length is resolved in the cachedBatch gate below, not here. If this
-                // function ever becomes kv dependent move the kv resolution back.
-                uint32_t curQNBlockTile =
-                    GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
-                uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-                uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
-                curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
+                if (qSeqlen != previousQSeqlen) {
+                    taskShape =
+                        fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), qHeads_, kvHeads_, qBaseTile_, batchCount,
+                                              coreNum, qFormat != Format::TND, false, FusedGroups && !fa950_plan::IsD512(embed_, embedV_), tinyKvFusion);
+                }
+                curTotalTaskNum += taskShape.totalTasks;
             }
             if (curBatch != cachedBatch) {
                 kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
@@ -459,16 +475,32 @@ class FAIKernel950 {
             uint32_t kvHeadIdx;
             uint32_t qNStartIdx;
             uint32_t qNBlockSize;
-            uint32_t curQNBlockTile =
-                GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
-            uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-            uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
-            qSTileIdx = taskIdxCurBatch / qNTaskNum;
-            uint32_t qNBlockIdx = taskIdxCurBatch - qSTileIdx * qNTaskNum;
-            uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
-            kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
-            qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
-            qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
+            uint32_t qRowStart;
+            uint32_t qRowsInTask;
+            if (flashDecodeFlag_ != 0U) {
+                // FD base blocks are enumerated by the classic host schedule.
+                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize,
+                                                        qBaseTile_ < Q_M_TILE_MAX);
+                uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+                uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
+                qSTileIdx = taskIdxCurBatch / qNTaskNum;
+                uint32_t qNBlockIdx = taskIdxCurBatch - qSTileIdx * qNTaskNum;
+                uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
+                kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
+                qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
+                qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
+                qRowStart = qSTileIdx * qBaseTile_;
+                qRowsInTask = qSeqlen - qRowStart > qBaseTile_ ? qBaseTile_ : qSeqlen - qRowStart;
+            } else {
+                const fa950_task::Task geometry = fa950_task::Decode(
+                    taskShape, taskIdxCurBatch, static_cast<uint32_t>(qSeqlen), qHeads_, kvHeads_, qBaseTile_);
+                kvHeadIdx = geometry.headStart / groupSize;
+                qNStartIdx = geometry.headStart;
+                qNBlockSize = geometry.heads;
+                qRowStart = geometry.qStart;
+                qRowsInTask = geometry.qRows;
+                qSTileIdx = geometry.qStart / qBaseTile_;
+            }
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
@@ -491,20 +523,46 @@ class FAIKernel950 {
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             }
             int64_t kvSOffset = 0;
+            int64_t kHeadStrideL1 = 0;
+            int64_t vHeadStrideL1 = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache && kvcacheShape == PageShape::BnNBsD) {
                 strideK = embed_;
                 strideV = embedV_;
                 gmOffsetK = static_cast<uint64_t>(kvHeadIdx) * embed_ * blockSize_;
                 gmOffsetV = static_cast<uint64_t>(kvHeadIdx) * embedV_ * blockSize_;
+                kHeadStrideL1 = static_cast<int64_t>(embed_) * blockSize_;
+                vHeadStrideL1 = static_cast<int64_t>(embedV_) * blockSize_;
             } else if (cacheLayout == CacheLayout::nd) {
                 gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx) * kvHeadStrideK;
                 gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx) * kvHeadStrideV;
+                kHeadStrideL1 = kvHeadStrideK;
+                vHeadStrideL1 = kvHeadStrideV;
             } else {
                 gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx * embed_) * kvNumTokens;
                 gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_) * kvNumTokens;
+                kHeadStrideL1 = static_cast<int64_t>(embed_) * kvNumTokens;
+                vHeadStrideL1 = static_cast<int64_t>(embedV_) * kvNumTokens;
             }
-            uint32_t qsBlockNum = (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
-            uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
+            uint32_t qSBlockSize = qRowsInTask;
+            // Tasks spanning several KV heads are executed as serial segments
+            // that reuse the same L1 Q tile and accumulate into the same rows.
+            uint32_t segmentCount = 1U;
+            uint32_t segmentHeads = qNBlockSize;
+            if constexpr (FusedGroups) {
+                if (qNBlockSize > groupSize) {
+                    segmentCount = qNBlockSize / groupSize;
+                    segmentHeads = qNBlockSize / segmentCount;
+                }
+            }
+            const uint32_t segmentRows = qSBlockSize * segmentHeads;
+            const int64_t vHeadStride = vHeadStrideL1;
+            // P is written back per KV head so each segment starts on a 16-row
+            // L1 boundary; single-segment tasks keep the contiguous fast path.
+#ifdef __DAV_VEC__
+            // Always published (0 == no segmentation): the epilogue object is
+            // reused across tasks, so a stale count would corrupt later tasks.
+            epilogueOnlineSoftmax.SetSegmentRows(segmentCount > 1U ? segmentRows : 0U);
+#endif
             uint32_t rowNum = qSBlockSize * qNBlockSize;
             uint32_t rowNumRound = 0;
             if constexpr (IsDN) {
@@ -613,10 +671,10 @@ class FAIKernel950 {
                         const int32_t combineBaseTask = faiTilingData->fdCombineSchedules[combineIdx].baseTask;
                         if (combineBaseTask == static_cast<int32_t>(taskIdx)) {
                             writePartial = true;
-                            partialId = static_cast<uint32_t>(
-                                faiTilingData->fdCombineSchedules[combineIdx].partialStart +
-                                static_cast<int32_t>(coreIdx) -
-                                faiTilingData->fdCombineSchedules[combineIdx].firstCore);
+                            partialId =
+                                static_cast<uint32_t>(faiTilingData->fdCombineSchedules[combineIdx].partialStart +
+                                                      static_cast<int32_t>(coreIdx) -
+                                                      faiTilingData->fdCombineSchedules[combineIdx].firstCore);
                             break;
                         }
                     }
@@ -636,8 +694,21 @@ class FAIKernel950 {
             if (kvSLoopCount != 0U) {
                 if constexpr (IsDN) {
                     blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                } else if (segmentCount == 1U) {
+                    blockMmadQK.template loadQGM<false>(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize,
+                                                        qHeadStride);
                 } else {
-                    blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                    // One Q tile per KV head; each segment owns a 16-row padded
+                    // slice so the fused QK reads stay segment-local.
+                    for (uint32_t seg = 0U; seg < segmentCount; ++seg) {
+                        auto gmSegmentQ = tla::MakeTensor(gQ[gmOffsetQ + seg * segmentHeads * qHeadStride],
+                                                          gmQLayoutTla, Arch::PositionGM{});
+                        GemmCoord segmentShape{segmentRows, embed_, 0};
+                        blockMmadQK.template loadQGM<true>(gmSegmentQ, segmentShape, qSBlockSize, segmentHeads,
+                                                           qHeadStride,
+                                                           seg * RoundUp(segmentRows, 16U) * RoundUp(embed_, 16U),
+                                                           seg == 0U, seg + 1U == segmentCount);
+                    }
                 }
             }
             uint32_t kShapeRow = 0;
@@ -693,6 +764,11 @@ class FAIKernel950 {
                     pvDesc.kvSLoopCount = kvSLoopCount;
                     pvDesc.qSBlockSize = qSBlockSize;
                     pvDesc.qNBlockSize = qNBlockSize;
+                    if constexpr (FusedGroups) {
+                        pvDesc.segmentRows = segmentRows;
+                        pvDesc.segmentCount = segmentCount;
+                        pvDesc.vHeadStride = vHeadStride;
+                    }
                     pvDesc.fullyMaskedRowsPerHead = fullyMaskedRowsPerHead;
                     pvDesc.statsSlot = taskStatsSlot;
                     pvDesc.partialId = partialId;
@@ -712,19 +788,33 @@ class FAIKernel950 {
                     pvDesc.vShapeCol = vShapeCol;
                     if constexpr (IsDN) {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
-                                    0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
-                    } else {
-                        blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
                                     prefixSumL0BStages);
+                    } else if (!FusedGroups || segmentCount == 1U) {
+                        blockMmadQK.template operator()<false>(
+                            gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK, blockSize_,
+                            kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0, qSBlockSize,
+                            qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                    } else {
+                        for (uint32_t seg = 0U; seg < segmentCount; ++seg) {
+                            GemmCoord segmentShape{segmentRows, kvSTileSizeAct, embed_};
+                            auto gmSegmentK =
+                                tla::MakeTensor(gK[gmOffsetK + seg * kHeadStrideL1], gmKLayoutTla, Arch::PositionGM{});
+                            blockMmadQK.template operator()<true>(
+                                gmSegmentK, ubSTensorTla, gBlockTable[blockBOffset], segmentShape, blockSize_,
+                                kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0,
+                                qSBlockSize, segmentHeads, qkReadyFlag, prefixSumL0AStages + seg * qkL0ATotalStages_,
+                                prefixSumL0BStages + seg * qkL0BTotalStages_,
+                                seg * RoundUp(segmentRows, 16U) * RoundUp(embed_, 16U), seg * segmentRows, rowNum,
+                                seg == 0U, seg + 1U == segmentCount);
+                        }
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
                     }
-                    l0AStagesIssued += qkL0ATotalStages_;
-                    l0BStagesIssued += qkL0BTotalStages_;
+                    l0AStagesIssued += qkL0ATotalStages_ * segmentCount;
+                    l0BStagesIssued += qkL0BTotalStages_ * segmentCount;
 #endif
                     uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
@@ -859,14 +949,33 @@ class FAIKernel950 {
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     auto gmVLayoutTlaNow = tla::MakeLayout<ElementV, LayoutV>(pvDesc.kShapeRow, pvDesc.vShapeCol);
-                    auto gmVTensorTlaNow =
-                        tla::MakeTensor(gV[pvDesc.gmOffsetV], gmVLayoutTlaNow, Arch::PositionGM{});
-                    blockMmadPV(gmVTensorTlaNow, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], actualBlockShapePV,
-                                blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens,
-                                kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued,
-                                l0BStagesIssued, d512);
-                    l0AStagesIssued += pvL0ATotalStages_;
-                    l0BStagesIssued += pvL0BTotalStages_;
+                    auto gmVTensorTlaNow = tla::MakeTensor(gV[pvDesc.gmOffsetV], gmVLayoutTlaNow, Arch::PositionGM{});
+                    if (!FusedGroups || pvDesc.segmentCount == 1U) {
+                        blockMmadPV.template operator()<false>(
+                            gmVTensorTlaNow, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], actualBlockShapePV,
+                            blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens,
+                            kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued, l0BStagesIssued,
+                            d512);
+                        l0AStagesIssued += pvL0ATotalStages_;
+                        l0BStagesIssued += pvL0BTotalStages_;
+                    } else {
+                        // One PV per KV head: each segment starts a new 16-row
+                        // slice of the P tile and lands on its own O rows.
+                        for (uint32_t seg = 0U; seg < pvDesc.segmentCount; ++seg) {
+                            auto gmSegmentV = tla::MakeTensor(gV[pvDesc.gmOffsetV + seg * pvDesc.vHeadStride],
+                                                              gmVLayoutTlaNow, Arch::PositionGM{});
+                            GemmCoord segmentShape{pvDesc.segmentRows, embedV_, pvDesc.kvSTileSizeAct};
+                            blockMmadPV.template operator()<true>(
+                                gmSegmentV, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], segmentShape, blockSize_,
+                                pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens, kvBaseTile_, 0,
+                                0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued, l0BStagesIssued, false,
+                                seg * RoundUp(pvDesc.segmentRows, 16U) * RoundUp(pvDesc.kvSTileSizeAct, 16U),
+                                seg * pvDesc.segmentRows, pvDesc.rowNum, seg == 0U, seg + 1U == pvDesc.segmentCount,
+                                seg, pvDesc.segmentCount);
+                            l0AStagesIssued += pvL0ATotalStages_;
+                            l0BStagesIssued += pvL0BTotalStages_;
+                        }
+                    }
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
@@ -907,6 +1016,7 @@ class FAIKernel950 {
                             gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
                             fdLseSubStride_, 1.0f, d512);
                     }
+
 #endif
                     ++pvIssued;
                 }
@@ -1203,7 +1313,13 @@ __schedmode__(1) CATLASS_GLOBAL
     FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
                            seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
     Kernel faInfer;
-    faInfer(params);
+    // Cross-KV-head group fusion only exists on the masked path (the unmasked
+    // variants use the DN kernel, which has no segment decomposition).
+    if constexpr (maskCategory != MaskCategory::NO_MASK) {
+        faInfer.template operator()<true>(params);
+    } else {
+        faInfer.template operator()<false>(params);
+    }
 }
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
