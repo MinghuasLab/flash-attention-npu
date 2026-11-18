@@ -27,6 +27,11 @@ constexpr uint32_t SCORE_STAGES = 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
+constexpr uint32_t STATS_TASK_STAGES = 4;
+constexpr uint32_t STATS_SLOT_ELEM_NUM = 64;
+constexpr uint32_t STATS_SLOT_BYTES = STATS_SLOT_ELEM_NUM * 4U;
+constexpr uint32_t STATS_BYTES = STATS_TASK_STAGES * STATS_SLOT_BYTES;
+
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, mask, total;
     uint32_t sBytes, pBytes, loBytes, otmpStages;
@@ -46,11 +51,11 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.lo = u.p + SCORE_STAGES * u.pBytes;
     u.go = u.lo + otmpStages * u.loBytes;
     u.lm = u.go + u.loBytes;
-    u.gm = u.lm + 64U * 4U;
-    u.dm = u.gm + 64U * 4U;
+    u.gm = u.lm + STATS_BYTES;
+    u.dm = u.gm + STATS_BYTES;
     u.ll = u.dm + P_STAGES * 64U * 4U;
     u.gl = u.ll + 64U * 4U;
-    u.mask = u.gl + 64U * 4U;
+    u.mask = u.gl + STATS_BYTES;
     u.total = u.mask + 2U * 64U * 128U;
     return u;
 }
@@ -70,11 +75,11 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.lo = 128U * 1024U;
     u.go = 192U * 1024U;
     u.lm = 224U * 1024U;
-    u.gm = u.lm + 256U;
-    u.dm = u.gm + 256U;
+    u.gm = u.lm + STATS_BYTES;
+    u.dm = u.gm + STATS_BYTES;
     u.ll = u.dm + 768U;
     u.gl = u.ll + 256U;
-    u.mask = u.gl + 256U;
+    u.mask = u.gl + STATS_BYTES;
     u.total = u.mask + 16384U;
     return u;
 }
@@ -103,9 +108,9 @@ FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, 
     return dv > 128U && fullQ128Tasks < uint64_t(cores) * 4U ? 64U : QueryTile(d, dv, maxQ);
 }
 
-static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
-static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
-static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
+static_assert(MakeUbPlan(160, 2).total == 242176U, "D160 dual-buffer layout");
+static_assert(MakeUbPlan(192, 1).total == 217600U, "D192 single-buffer layout");
+static_assert(MakeUbPlan(256, 1).total == 250368U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan
