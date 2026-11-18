@@ -58,6 +58,12 @@ from flash_attn_npu_3 import (
 # Additional coverage: tiny head sizes 1/2/4, large-GQA decode, num_splits=2,
 # and special SWA windows
 # kv 131072 is kept only in a few rows per mode, other rows demoted to 16383 for CI time
+_ASCEND950_D512 = pytest.mark.skipif(
+    "not torch_npu.npu.is_available() or 'Ascend950' not in torch_npu.npu.get_device_name()",
+    reason="Ascend950 D512 coverage",
+)
+
+
 test_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
@@ -286,6 +292,21 @@ test_cases = [
     (torch.float16, 1, 8, 8, 512, 2048, 512, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 1, 16, 2, 1, 1024, 512, 0, 128, True, "TND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 8, 8, 16, 1024, 512, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),
+    pytest.param(
+        torch.float16, 1, 16, 4, 129, 4097, 512, 0, 128, False, "BSND", False, -1, -1, 0.0, 1, False,
+        marks=_ASCEND950_D512,
+        id="d512-bsnd-long-tail",
+    ),
+    pytest.param(
+        torch.float16, 1, 8, 2, 129, 127, 512, 0, 128, True, "BSND", False, -1, -1, 0.0, 1, False,
+        marks=_ASCEND950_D512,
+        id="d512-bsnd-fully-masked-prefix",
+    ),
+    pytest.param(
+        torch.float16, 2, 8, 2, 129, 1025, 512, 0, 128, True, "TND", True, -1, -1, 0.0, 1, False,
+        marks=_ASCEND950_D512,
+        id="d512-tnd-packed-multirequest",
+    ),
     # head_dim <=256 controls for the same shapes (regression guard).
     (torch.float16, 1, 32, 8, 1, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 4, False),
     (torch.bfloat16, 1, 16, 2, 64, 2048, 256, 1, 128, True, "TND", False, -1, -1, 0.0, 2, False),
@@ -324,8 +345,6 @@ def test_fa_kvcache_ops(
         # as the original <=256 path, but append-KV remains unsupported.
         if head_size != 512:
             pytest.skip("head_size > 256 is only supported for exactly 512")
-        if "Ascend950" in name:
-            pytest.skip("Ascend950 v3 does not support head_size 512")
     elif head_size < 1:
         pytest.skip("head_size must be >= 1")
     if is_varied and layout != "TND":

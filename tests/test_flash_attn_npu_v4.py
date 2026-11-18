@@ -71,6 +71,12 @@ def build_cann_causal_mask():
 #        (window_left,window_right) (NPU-specific):
 #            A=[(-1,-1),(0,256),(59,571),(460,62)], B=[(536,462),(563,425),(746,16)]
 # kv 131072 is kept only in a few rows per mode, other rows demoted to 16383 for CI time
+_ASCEND950_D512 = pytest.mark.skipif(
+    "not torch_npu.npu.is_available() or 'Ascend950' not in torch_npu.npu.get_device_name()",
+    reason="Ascend950 D512 coverage",
+)
+
+
 test_cases = [
     # ================ 1) dense BSND (func): cache_mode=0, layout=BSND, non-varlen, num_splits=0 ================
     # data_type=float16, is_causal=False, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
@@ -417,6 +423,16 @@ test_cases = [
     (torch.float16, 2, 6, 6, 16, 1024, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
     (torch.bfloat16, 2, 6, 6, 64, 2048, 512, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
     (torch.float16, 1, 8, 1, 32, 4096, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    pytest.param(
+        torch.float16, 1, 8, 8, 129, 513, 512, 0, 128, False, "BSND", False, 64, 128, 1, 0.0, False,
+        marks=_ASCEND950_D512,
+        id="d512-bsnd-window-tail",
+    ),
+    pytest.param(
+        torch.bfloat16, 2, 8, 2, 129, 1025, 512, 0, 128, False, "TND", True, -1, -1, 1, 0.0, False,
+        marks=_ASCEND950_D512,
+        id="d512-tnd-packed-multirequest",
+    ),
     # TND paged: decode / prefill / split-KV / MHA.
     (torch.float16, 2, 6, 3, 1, 1024, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
     (torch.bfloat16, 2, 6, 3, 16, 2048, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
@@ -457,8 +473,6 @@ def test_fa_kvcache_ops(
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     is_950 = "Ascend950" in name
-    if head_size == 512 and is_950:
-        pytest.skip("head_dim=512 is supported only on Ascend910")
     if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if not (1 <= head_size <= 256) and head_size != 512:
@@ -571,7 +585,7 @@ def test_fa_kvcache_ops(
             new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
     no_swa = window_size_left == -1 and window_size_right == -1
     dense_varlen = layout == "TND" and cache_mode == 0
-    bwd_supported = dense_varlen and num_splits <= 1 and (not is_950 or no_swa)
+    bwd_supported = dense_varlen and num_splits <= 1 and (not is_950 or (no_swa and head_size <= 256))
     cu_seqlens_k_for_api = new_kv_seqlen_list if dense_varlen else None
     max_seqlen_k_for_api = kv_seqlen if dense_varlen else None
     cache_seqlens_for_api = None if dense_varlen else kv_seqlen_list

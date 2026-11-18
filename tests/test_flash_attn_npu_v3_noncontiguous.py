@@ -522,10 +522,7 @@ def test_paged_independent_dim0_stride_profiles(layout, profile):
 
 
 def test_paged_d512_dim0_noncontiguous():
-    """FIA D512 MLA dim0 case, rewritten without split-RoPE."""
-    name = torch_npu.npu.get_device_name()
-    if "Ascend950" in name:
-        pytest.skip("head_dim=512 is supported only on Ascend910")
+    """D512 paged forward with independent K/V page strides."""
     q_lens = (1,)
     kv_lens = (129,)
     page_size, nheads, kv_heads, head_size = 128, 8, 1, 512

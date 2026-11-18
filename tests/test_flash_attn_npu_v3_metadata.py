@@ -1811,3 +1811,41 @@ def test_d512_paged_fixed_split_writes_empty_kv_output(monkeypatch):
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
         torch.testing.assert_close(lse[..., 1], torch.full_like(lse[..., 1], math.inf))
     torch.testing.assert_close(lse4[..., 0], lse1[..., 0], rtol=0, atol=2e-6)
+
+@pytest.mark.golden_api("flash_attn_with_kvcache")
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 D512 paged FlashDecode")
+def test_d512_paged_auto_flashdecode_varlen():
+    dtype = torch.float16
+    q_offsets, kv_lengths = [0, 1, 3], [2049, 1537]
+    page_size, heads, kv_heads, head_size = 256, 16, 4, 512
+    q = make_random_tensor((q_offsets[-1], heads, head_size), dtype, device="npu")
+    k, v, page_table = _make_paged_cache(2, max(kv_lengths), kv_heads, head_size, page_size, dtype)
+    scale = head_size**-0.5
+    out, lse, *_ = flash_attn_with_kvcache(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_int32_npu(q_offsets),
+        max_seqlen_q=2,
+        cache_seqlens=_int32_npu(kv_lengths),
+        page_table=page_table,
+        num_splits=0,
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+    keys, values = gather_paged_kv_batch(k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size)
+    for batch, kv_len in enumerate(kv_lengths):
+        start, end = q_offsets[batch : batch + 2]
+        _assert_tnd_matches_ref(
+            out[start:end],
+            lse[:, start:end],
+            q[start:end],
+            (keys[batch : batch + 1, :kv_len], values[batch : batch + 1, :kv_len]),
+            q_offsets=[0, end - start],
+            batch_size=1,
+            num_heads=heads,
+            head_size=head_size,
+            scale=scale,
+            data_type=dtype,
+            is_causal=False,
+        )
