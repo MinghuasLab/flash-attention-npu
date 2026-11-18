@@ -87,8 +87,12 @@ def _assert_950_flashdecode_metadata(metadata):
 @pytest.mark.parametrize(
     "dtype, q_shape, kv_shape, disable_scheduler_metadata",
     [
-        pytest.param(torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False, id="fp16-gqa-metadata"),
-        pytest.param(torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False, id="bf16-mqa-metadata"),
+        pytest.param(
+            torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False, id="fp16-gqa-metadata"
+        ),
+        pytest.param(
+            torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False, id="bf16-mqa-metadata"
+        ),
         pytest.param(torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True, id="fp16-gqa-host"),
     ],
 )
@@ -143,7 +147,9 @@ def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
         return_lse=True,
     )
     _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
-    keys, values = gather_paged_kv_batch(k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size)
+    keys, values = gather_paged_kv_batch(
+        k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
+    )
     for batch, kv_len in enumerate(kv_lengths):
         start, end = q_offsets[batch : batch + 2]
         _assert_tnd_matches_ref(
@@ -159,7 +165,6 @@ def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
             data_type=dtype,
             is_causal=False,
         )
-
 
 
 def test_950_scheduler_metadata_matches_signature():

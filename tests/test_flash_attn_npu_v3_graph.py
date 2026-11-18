@@ -182,7 +182,9 @@ def _check_kvcache_graph(is_causal, metadata_copy, head_size):
             name=f"graph updated KV={kv_length}",
         )
         if head_size == 512:
-            assert_fa_close(lse_npu, expected_lse_ref[0], expected_lse_pt[0], name="graph updated lse")
+            assert_fa_close(
+                lse_npu, expected_lse_ref[0], expected_lse_pt[0], name="graph updated lse"
+            )
         current_out = output_npu.cpu()
         assert not torch.equal(current_out, previous_out)
         previous_out = current_out.clone()

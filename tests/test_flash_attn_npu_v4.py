@@ -424,12 +424,44 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 64, 2048, 512, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
     (torch.float16, 1, 8, 1, 32, 4096, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
     pytest.param(
-        torch.float16, 1, 8, 8, 129, 513, 512, 0, 128, False, "BSND", False, 64, 128, 1, 0.0, False,
+        torch.float16,
+        1,
+        8,
+        8,
+        129,
+        513,
+        512,
+        0,
+        128,
+        False,
+        "BSND",
+        False,
+        64,
+        128,
+        1,
+        0.0,
+        False,
         marks=_ASCEND950_D512,
         id="d512-bsnd-window-tail",
     ),
     pytest.param(
-        torch.bfloat16, 2, 8, 2, 129, 1025, 512, 0, 128, False, "TND", True, -1, -1, 1, 0.0, False,
+        torch.bfloat16,
+        2,
+        8,
+        2,
+        129,
+        1025,
+        512,
+        0,
+        128,
+        False,
+        "TND",
+        True,
+        -1,
+        -1,
+        1,
+        0.0,
+        False,
         marks=_ASCEND950_D512,
         id="d512-tnd-packed-multirequest",
     ),
@@ -585,7 +617,9 @@ def test_fa_kvcache_ops(
             new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
     no_swa = window_size_left == -1 and window_size_right == -1
     dense_varlen = layout == "TND" and cache_mode == 0
-    bwd_supported = dense_varlen and num_splits <= 1 and (not is_950 or (no_swa and head_size <= 256))
+    bwd_supported = (
+        dense_varlen and num_splits <= 1 and (not is_950 or (no_swa and head_size <= 256))
+    )
     cu_seqlens_k_for_api = new_kv_seqlen_list if dense_varlen else None
     max_seqlen_k_for_api = kv_seqlen if dense_varlen else None
     cache_seqlens_for_api = None if dense_varlen else kv_seqlen_list

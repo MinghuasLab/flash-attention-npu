@@ -1812,6 +1812,7 @@ def test_d512_paged_fixed_split_writes_empty_kv_output(monkeypatch):
         torch.testing.assert_close(lse[..., 1], torch.full_like(lse[..., 1], math.inf))
     torch.testing.assert_close(lse4[..., 0], lse1[..., 0], rtol=0, atol=2e-6)
 
+
 @pytest.mark.golden_api("flash_attn_with_kvcache")
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 D512 paged FlashDecode")
 def test_d512_paged_auto_flashdecode_varlen():
@@ -1833,7 +1834,9 @@ def test_d512_paged_auto_flashdecode_varlen():
         softmax_scale=scale,
         return_softmax_lse=True,
     )
-    keys, values = gather_paged_kv_batch(k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size)
+    keys, values = gather_paged_kv_batch(
+        k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
+    )
     for batch, kv_len in enumerate(kv_lengths):
         start, end = q_offsets[batch : batch + 2]
         _assert_tnd_matches_ref(
