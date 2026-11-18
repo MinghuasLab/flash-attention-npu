@@ -2,6 +2,8 @@
 
 """Shared fixtures for CATLASS DSL tests."""
 
+import os
+
 import pytest
 import torch
 
@@ -11,19 +13,25 @@ except (ImportError, OSError):
     torch_npu = None
 
 
-class _UnsupportedHardwareModule(pytest.Module):
+_CI_TIMING_COMPARISON = os.environ.get("CI_MODE") in {"quick", "full"}
+
+
+class _SkippedModule(pytest.Module):
     def collect(self):
         # Skip before importing tests that load CATLASS or the FA4 extension.
+        if _CI_TIMING_COMPARISON:
+            pytest.skip("CATLASS DSL tests excluded for CI timing comparison")
         pytest.skip("CATLASS DSL tests require Ascend950")
 
 
 def pytest_pycollect_makemodule(module_path, parent):
     if (
-        torch_npu is None
+        _CI_TIMING_COMPARISON
+        or torch_npu is None
         or not torch_npu.npu.is_available()
         or "Ascend950" not in torch_npu.npu.get_device_name()
     ):
-        return _UnsupportedHardwareModule.from_parent(parent, path=module_path)
+        return _SkippedModule.from_parent(parent, path=module_path)
 
 
 @pytest.fixture(autouse=True)
