@@ -29,7 +29,11 @@ def mask_kernel(
     kind_ptr = tla.allocate(512, tla.Int32, tla.AddressSpace.ub, 256)
     nq = (max_q + 127) // 128
     nk = (max_k + 127) // 128
-    groups = (nk + 127) // 128
+    # Exact classification assigns 32 adjacent key columns to each tile.
+    # This halves the per-lane callback loop without increasing the 2048
+    # threads or scratch space. Sampling still uses one lane per tile.
+    group_tiles = 128 if tla.const_expr(use_fast_sampling) else 64
+    groups = (nk + group_tiles - 1) // group_tiles
     classification_done = tla.cross_flag("classification_done", mode=0)
     with tla.vector():
         counts = tla.make_tensor(
@@ -40,7 +44,7 @@ def mask_kernel(
             tla.arch.block_idx(), batches * heads * nq * groups, tla.arch.block_num()
         ):
             row = task // groups
-            group_base = (task % groups) * 128
+            group_base = (task % groups) * group_tiles
             qb = row % nq
             h = row // nq % heads
             b = row // (nq * heads)
@@ -91,21 +95,21 @@ def mask_kernel(
                     if sample_kb < nk:
                         pi[row * partial_columns + sample_kb] = sample_kind
             else:
-                if m == 128 and group_base + 128 <= klen // 128:
+                if m == 128 and group_base + group_tiles <= klen // 128:
                     with tla.vec.func(mode="simt", thread_block_dim=2048):
                         full_tid, _, _ = tla.arch.thread_idx()
-                        full_col = full_tid % 16
-                        full_group = full_tid // 16
+                        full_col = full_tid % 32
+                        full_group = full_tid // 32
                         full_kb = group_base + full_group
                         full_visible = tla.Int32(0)
                         for full_qbase in tla.range(0, 128, 2):
                             for full_qoff in tla.range_constexpr(2):
-                                for full_koff in tla.range_constexpr(8):
+                                for full_koff in tla.range_constexpr(4):
                                     full_keep = mask_mod(
                                         b,
                                         h,
                                         qb * 128 + full_qbase + full_qoff,
-                                        full_kb * 128 + full_col + full_koff * 16,
+                                        full_kb * 128 + full_col + full_koff * 32,
                                         info,
                                         aux_tensors,
                                         aux_scalars,
@@ -114,8 +118,8 @@ def mask_kernel(
                                         full_visible = full_visible + 1
                         counts[full_tid] = full_visible
                         tla.arch.sync_threads()
-                        for full_level in tla.range_constexpr(4):
-                            full_offset = 8 >> full_level
+                        for full_level in tla.range_constexpr(5):
+                            full_offset = 16 >> full_level
                             if full_col < full_offset:
                                 counts[full_tid] = counts[full_tid] + counts[full_tid + full_offset]
                             tla.arch.sync_threads()
@@ -130,8 +134,8 @@ def mask_kernel(
                 else:
                     with tla.vec.func(mode="simt", thread_block_dim=2048):
                         tid, _, _ = tla.arch.thread_idx()
-                        col = tid % 16
-                        group = tid // 16
+                        col = tid % 32
+                        group = tid // 32
                         kb = group_base + group
                         n = (
                             128
@@ -142,12 +146,12 @@ def mask_kernel(
                         if m == 128 and n == 128:
                             for qr_base in tla.range(0, 128, 2):
                                 for r_offset in tla.range_constexpr(2):
-                                    for c_offset in tla.range_constexpr(8):
+                                    for c_offset in tla.range_constexpr(4):
                                         keep_full = mask_mod(
                                             b,
                                             h,
                                             qb * 128 + qr_base + r_offset,
-                                            kb * 128 + col + c_offset * 16,
+                                            kb * 128 + col + c_offset * 32,
                                             info,
                                             aux_tensors,
                                             aux_scalars,
@@ -155,14 +159,14 @@ def mask_kernel(
                                         if keep_full:
                                             visible = visible + 1
                         else:
-                            for tail_col in tla.range_constexpr(8):
-                                if col + tail_col * 16 < n:
+                            for tail_col in tla.range_constexpr(4):
+                                if col + tail_col * 32 < n:
                                     for r in tla.range(m):
                                         keep = mask_mod(
                                             b,
                                             h,
                                             qb * 128 + r,
-                                            kb * 128 + col + tail_col * 16,
+                                            kb * 128 + col + tail_col * 32,
                                             info,
                                             aux_tensors,
                                             aux_scalars,
@@ -171,8 +175,8 @@ def mask_kernel(
                                             visible = visible + 1
                         counts[tid] = visible
                         tla.arch.sync_threads()
-                        for level in tla.range_constexpr(4):
-                            offset = 8 >> level
+                        for level in tla.range_constexpr(5):
+                            offset = 16 >> level
                             if col < offset:
                                 counts[tid] = counts[tid] + counts[tid + offset]
                             tla.arch.sync_threads()

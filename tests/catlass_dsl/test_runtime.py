@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import catlass.tla as tla
 import pytest
 import torch
+import torch_npu
 
 from .test_utils import DTYPES, check, check_attention, copy_aux_to_device, make_inputs, oracle
 
@@ -18,11 +19,24 @@ from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
 pytestmark = pytest.mark.npu
 
 
-@pytest.mark.parametrize("raises", [False, True], ids=["success", "launch-error"])
-def test_launch_releases_tensor_owners_without_gc(monkeypatch, raises):
+@pytest.mark.parametrize(
+    "failure", [None, "binding", "launch"], ids=["success", "binding-error", "launch-error"]
+)
+def test_launch_releases_tensor_owners_without_gc(monkeypatch, failure):
     """Launch providers must not retain tensors until cyclic GC runs."""
     monkeypatch.setattr(torch.npu, "current_stream", lambda device: object())
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    original_tensor = runtime._tensor
+    calls = 0
+
+    def bind(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if failure == "binding" and calls == 2:
+            raise RuntimeError("binding failed")
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_tensor", bind)
     gc.collect()
     was_enabled = gc.isenabled()
     gc.disable()
@@ -30,28 +44,114 @@ def test_launch_releases_tensor_owners_without_gc(monkeypatch, raises):
 
         def invoke():
             tensor = torch.empty(32)
-            reference = weakref.ref(tensor)
+            other = torch.empty(32)
+            references = [weakref.ref(tensor), weakref.ref(other)]
 
             def executor(*args, **kwargs):
-                if raises:
+                if failure == "launch":
                     raise RuntimeError("launch failed")
 
-            if raises:
+            if failure:
                 try:
-                    runtime._launch(executor, (tensor,), block_num=1, device=tensor.device)
+                    runtime._launch(executor, (tensor, other), block_num=1, device=tensor.device)
                 except RuntimeError as error:
-                    assert str(error) == "launch failed"
+                    assert str(error) == f"{failure} failed"
                 else:
-                    pytest.fail("executor did not raise")
+                    pytest.fail("launch did not raise")
             else:
-                runtime._launch(executor, (tensor,), block_num=1, device=tensor.device)
-            return reference
+                runtime._launch(executor, (tensor, other), block_num=1, device=tensor.device)
+            return references
 
-        reference = invoke()
-        assert reference() is None
+        references = invoke()
+        assert all(reference() is None for reference in references)
     finally:
         if was_enabled:
             gc.enable()
+
+
+@pytest.mark.parametrize("cross_stream", [False, True], ids=["same-stream", "cross-stream"])
+def test_launch_preserves_only_needed_stream_records(device, cross_stream):
+    """Same-stream reuse is immediate; side-stream use still defers release."""
+    if (
+        not callable(getattr(torch_npu, "erase_stream", None))
+        or torch.npu.get_allocator_backend() != "native"
+    ):
+        pytest.skip("native allocator erase_stream is unavailable")
+    torch.npu.synchronize(device)
+    gc.collect()
+    torch.npu.empty_cache()
+    producer = torch.npu.Stream(device=device)
+    consumer = torch.npu.Stream(device=device) if cross_stream else producer
+    before = torch.npu.memory_stats(device)
+    with torch.npu.stream(producer):
+        tensor = torch.empty(1024 * 1024, dtype=torch.float32, device=device)
+    size = tensor.numel() * tensor.element_size()
+    reference = weakref.ref(tensor)
+    with torch.npu.stream(consumer):
+        # A no-op executor isolates allocator lifetime rules from kernel work.
+        # Duplicate/nested arguments must keep the same storage contract.
+        runtime._launch(lambda *a, **kw: None, (tensor, (tensor,)), block_num=1, device=device)
+        del tensor
+        assert reference() is None
+        after = torch.npu.memory_stats(device)
+        assert after["allocated_bytes.all.current"] == before["allocated_bytes.all.current"]
+        pending = after["active_bytes.all.current"] - before["active_bytes.all.current"]
+        if cross_stream:
+            assert pending >= size
+        else:
+            assert pending == 0
+    torch.npu.synchronize(device)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_cross_stream_inputs_survive_early_release_and_reuse(device, dtype):
+    """A producer must not overwrite inputs still consumed by asynchronous FA."""
+    producer = torch.npu.Stream(device=device)
+    consumer = torch.npu.Stream(device=device)
+    shape = (1, 1024, 4, 128)
+    cpu = tuple(torch.randn(shape, dtype=dtype) for _ in range(3))
+    expected, expected_lse = oracle(cpu)
+    delay_done = torch.npu.Event()
+    with torch.inference_mode(), torch.npu.stream(consumer):
+        # Warm public operators before the race, including their allocations.
+        delay_input = torch.ones((4096, 4096), dtype=torch.float32, device=device)
+        delay_output = torch.empty_like(delay_input)
+        torch.mm(delay_input, delay_input, out=delay_output)
+        delay_done.record(consumer)
+        warm = tuple(t.to(device) for t in cpu)
+        flash_attn_func(*warm, return_lse=True)
+        del warm
+    with torch.inference_mode(), torch.npu.stream(producer):
+        warm_pressure = torch.full(shape, 99, dtype=dtype, device=device)
+        del warm_pressure
+    torch.npu.synchronize(device)
+    gc.collect()
+    with torch.inference_mode():
+        with torch.npu.stream(producer):
+            inputs = tuple(t.to(device) for t in cpu)
+        references = tuple(weakref.ref(t) for t in inputs)
+        input_ptrs = {t.data_ptr() for t in inputs}
+        try:
+            with torch.npu.stream(consumer):
+                consumer.wait_stream(producer)
+                # Keep FA queued while the producer tries to reuse its inputs.
+                # Reuse buffers to avoid output allocations during the delay.
+                for _ in range(32):
+                    torch.mm(delay_input, delay_input, out=delay_output)
+                delay_done.record(consumer)
+                output, lse = flash_attn_func(*inputs, return_lse=True)
+            del inputs
+            assert all(reference() is None for reference in references)
+            with torch.npu.stream(producer):
+                # Recycle allocations of the same size before waiting for FA.
+                pressure = [torch.full(shape, 99, dtype=dtype, device=device) for _ in range(8)]
+            assert not delay_done.query(), "consumer delay completed before allocator pressure"
+            assert input_ptrs.isdisjoint(t.data_ptr() for t in pressure)
+        finally:
+            torch.npu.synchronize(device)
+        check(output, expected)
+        check(lse, expected_lse)
+        del pressure
 
 
 @tla.jit

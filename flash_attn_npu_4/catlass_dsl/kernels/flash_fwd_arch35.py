@@ -19,6 +19,7 @@ from .common import (
 )
 from .window import window_block_bounds
 from .callbacks import prepare_scores_simt
+from ..mask import build as _separable_plan
 
 
 @tla.jit
@@ -120,6 +121,134 @@ def _fix(
     else:
         tla.set_flag(free1)
         _cset(channel1, tla.arch.FIX)
+
+
+@tla.jit
+def _separable_cache_mask_pair(
+    saved_plan: tla.Constexpr,
+    mask_mod: tla.Constexpr,
+    b,
+    head,
+    qstart,
+    cached_vi,
+    cached_k0,
+    cached_k1,
+    cached_mask0,
+    cached_mask1,
+    aux_tensors,
+    aux_scalars,
+    info,
+    bounds_checked: tla.Constexpr,
+    temporal_aux: tla.Constexpr = False,
+):
+    plan = None
+    if tla.const_expr(bounds_checked and not temporal_aux):
+        plan = saved_plan
+    if tla.const_expr(plan is None):
+        _cache_mask_pair(
+            mask_mod,
+            b,
+            head,
+            qstart,
+            cached_vi,
+            cached_k0,
+            cached_k1,
+            cached_mask0,
+            cached_mask1,
+            aux_tensors,
+            aux_scalars,
+            info,
+            bounds_checked,
+            temporal_aux,
+        )
+    else:
+        cache = tla.make_tensor(
+            cached_mask0.ptr + 2048, tla.make_layout(tla.make_shape(plan.words), tla.make_stride(1))
+        )
+        with tla.vec.func(mode="simt", thread_block_dim=384):
+            plan.stage(
+                cache,
+                aux_tensors,
+                aux_scalars,
+                qstart,
+                cached_vi,
+                cached_k0,
+                cached_k1,
+                b,
+                head,
+                info,
+            )
+        tla.pipe_barrier(tla.pipes.ALL)
+        with tla.vec.func():
+            plan.vector(
+                cache,
+                cached_mask0,
+                cached_mask1,
+                qstart,
+                cached_vi,
+                cached_k0,
+                cached_k1,
+                b,
+                head,
+                info,
+                aux_scalars,
+            )
+
+
+@tla.jit
+def _separable_cache_mask(
+    saved_plan: tla.Constexpr,
+    mask_mod: tla.Constexpr,
+    b,
+    head,
+    qstart,
+    vi,
+    kstart,
+    visibility,
+    aux_tensors,
+    aux_scalars,
+    info,
+    bounds_checked: tla.Constexpr,
+):
+    plan = None
+    if tla.const_expr(bounds_checked):
+        plan = saved_plan
+    if tla.const_expr(plan is None):
+        _cache_mask(
+            mask_mod,
+            b,
+            head,
+            qstart,
+            vi,
+            kstart,
+            visibility,
+            aux_tensors,
+            aux_scalars,
+            info,
+            bounds_checked,
+        )
+    else:
+        cache = tla.make_tensor(
+            visibility.ptr + 1024, tla.make_layout(tla.make_shape(plan.words), tla.make_stride(1))
+        )
+        with tla.vec.func(mode="simt", thread_block_dim=384):
+            plan.stage(cache, aux_tensors, aux_scalars, qstart, vi, kstart, kstart, b, head, info)
+        tla.pipe_barrier(tla.pipes.ALL)
+        with tla.vec.func():
+            plan.vector(
+                cache,
+                visibility,
+                visibility,
+                qstart,
+                vi,
+                kstart,
+                kstart,
+                b,
+                head,
+                info,
+                aux_scalars,
+                False,
+            )
 
 
 @tla.jit
@@ -430,6 +559,59 @@ def _cache_mask_eight(
 
 
 @tla.jit
+def _readonly_score_max(scores, scale):
+    # A positive scale preserves the max order. Fully visible, aligned tiles
+    # with identity scores can keep QK unchanged until the probability pass.
+    neginf = tla.full(float("-inf"), dtype=tla.Float32)
+    blockm0 = neginf
+    blockm1 = neginf
+    blockm2 = neginf
+    blockm3 = neginf
+    blockm4 = neginf
+    blockm5 = neginf
+    blockm6 = neginf
+    blockm7 = neginf
+    for key_group in tla.range(16):
+        z0 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 0, 0)
+        ).load()
+        z1 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 1, 0)
+        ).load()
+        z2 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 2, 0)
+        ).load()
+        z3 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 3, 0)
+        ).load()
+        blockm0 = tla.max(blockm0, z0)
+        blockm1 = tla.max(blockm1, z1)
+        blockm2 = tla.max(blockm2, z2)
+        blockm3 = tla.max(blockm3, z3)
+        z0 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 4, 0)
+        ).load()
+        z1 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 5, 0)
+        ).load()
+        z2 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 6, 0)
+        ).load()
+        z3 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(key_group * 8 + 7, 0)
+        ).load()
+        blockm4 = tla.max(blockm4, z0)
+        blockm5 = tla.max(blockm5, z1)
+        blockm6 = tla.max(blockm6, z2)
+        blockm7 = tla.max(blockm7, z3)
+    blockm = tla.max(
+        tla.max(tla.max(blockm0, blockm1), tla.max(blockm2, blockm3)),
+        tla.max(tla.max(blockm4, blockm5), tla.max(blockm6, blockm7)),
+    )
+    return tla.mul(blockm, scale)
+
+
+@tla.jit
 def _score_max_pass_impl(
     scores,
     scale,
@@ -686,6 +868,146 @@ def _empty_mask_prob(pflat, safem, dtype: tla.Constexpr):
                 packed, tla.params.BlockStoreParams(block_stride=129), mask=mask16
             )
     return tla.mul(prob, 128.0)
+
+
+@tla.jit
+def _probability_pass(
+    scores, pflat, safem, dtype: tla.Constexpr, scale, raw_scores: tla.Constexpr, accumulators
+):
+    blockl0, blockl1, blockl2, blockl3, blockl4, blockl5, blockl6, blockl7 = accumulators
+    mask16 = tla.update_mask(64, dtype=dtype)[0]
+    for prob_group in tla.range(16):
+        z0 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 0, 0)
+        ).load()
+        z1 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 1, 0)
+        ).load()
+        z2 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 2, 0)
+        ).load()
+        z3 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 3, 0)
+        ).load()
+        if tla.const_expr(raw_scores):
+            z0 = tla.mul(z0, scale)
+            z1 = tla.mul(z1, scale)
+            z2 = tla.mul(z2, scale)
+            z3 = tla.mul(z3, scale)
+        prob0 = tla.exp(tla.sub(z0, safem))
+        prob1 = tla.exp(tla.sub(z1, safem))
+        prob2 = tla.exp(tla.sub(z2, safem))
+        prob3 = tla.exp(tla.sub(z3, safem))
+        blockl0 = tla.add(blockl0, prob0)
+        blockl1 = tla.add(blockl1, prob1)
+        blockl2 = tla.add(blockl2, prob2)
+        blockl3 = tla.add(blockl3, prob3)
+        p0 = prob0.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p1 = prob1.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p2 = prob2.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p3 = prob3.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        packed0, unused0 = tla.deinterleave(p0, p0)
+        packed1, unused1 = tla.deinterleave(p1, p1)
+        packed2, unused2 = tla.deinterleave(p2, p2)
+        packed3, unused3 = tla.deinterleave(p3, p3)
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 0, 0)).store(
+            packed0, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 1, 0)).store(
+            packed1, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 2, 0)).store(
+            packed2, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 3, 0)).store(
+            packed3, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        z0 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 4, 0)
+        ).load()
+        z1 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 5, 0)
+        ).load()
+        z2 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 6, 0)
+        ).load()
+        z3 = tla.tile_view(
+            scores, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 7, 0)
+        ).load()
+        if tla.const_expr(raw_scores):
+            z0 = tla.mul(z0, scale)
+            z1 = tla.mul(z1, scale)
+            z2 = tla.mul(z2, scale)
+            z3 = tla.mul(z3, scale)
+        prob0 = tla.exp(tla.sub(z0, safem))
+        prob1 = tla.exp(tla.sub(z1, safem))
+        prob2 = tla.exp(tla.sub(z2, safem))
+        prob3 = tla.exp(tla.sub(z3, safem))
+        blockl4 = tla.add(blockl4, prob0)
+        blockl5 = tla.add(blockl5, prob1)
+        blockl6 = tla.add(blockl6, prob2)
+        blockl7 = tla.add(blockl7, prob3)
+        p0 = prob0.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p1 = prob1.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p2 = prob2.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        p3 = prob3.to(
+            dtype,
+            tla.params.CastParams(
+                round_mode=tla.params.RoundMode.CAST_ROUND, reg_slot=tla.params.RegSlot.ZERO
+            ),
+        )
+        packed0, unused0 = tla.deinterleave(p0, p0)
+        packed1, unused1 = tla.deinterleave(p1, p1)
+        packed2, unused2 = tla.deinterleave(p2, p2)
+        packed3, unused3 = tla.deinterleave(p3, p3)
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 4, 0)).store(
+            packed0, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 5, 0)).store(
+            packed1, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 6, 0)).store(
+            packed2, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+        tla.tile_view(pflat, tla.make_shape(1, 64), tla.make_coord(prob_group * 8 + 7, 0)).store(
+            packed3, tla.params.BlockStoreParams(block_stride=129), mask=mask16
+        )
+    return (blockl0, blockl1, blockl2, blockl3, blockl4, blockl5, blockl6, blockl7)
 
 
 @tla.jit
@@ -1024,6 +1346,58 @@ def _normalize_pair_pv(pv, out, m, l, lse, dtype: tla.Constexpr):
 
 
 @tla.jit
+def _full_pair_softmax(s0, s1, p1, mstate, lstate, astate, iteration, scale, dtype: tla.Constexpr):
+    # Exactly two full, aligned, identity-score tiles. Bounds and mask work
+    # stay in the general VF; all floating-point reductions keep their order.
+    zero = tla.full(0.0, dtype=tla.Float32)
+    neginf = tla.full(float("-inf"), dtype=tla.Float32)
+    blockm = tla.max(_readonly_score_max(s0, scale), _readonly_score_max(s1, scale))
+    oldm = neginf
+    oldl = zero
+    newm = blockm
+    if iteration != 0:
+        oldm = mstate.load()
+        oldl = lstate.load()
+        newm = tla.max(oldm, blockm)
+    safem = tla.where(tla.cmp(newm, neginf, mode="eq"), zero, newm)
+    alpha = zero
+    if iteration != 0:
+        alpha = tla.where(tla.cmp(oldl, zero, mode="gt"), tla.exp(tla.sub(oldm, safem)), zero)
+    mstate.store(newm)
+    astate.store(alpha)
+    tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
+    sums = _probability_pass(
+        s1, p1, safem, dtype, scale, True, (zero, zero, zero, zero, zero, zero, zero, zero)
+    )
+    blockl = tla.add(
+        tla.add(tla.add(sums[0], sums[1]), tla.add(sums[2], sums[3])),
+        tla.add(tla.add(sums[4], sums[5]), tla.add(sums[6], sums[7])),
+    )
+    if iteration == 0:
+        lstate.store(blockl)
+    else:
+        lstate.store(tla.add(tla.mul(oldl, alpha), blockl))
+    tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
+
+
+@tla.jit
+def _full_pair_first_prob(scores, pflat, mstate, lstate, scale, dtype: tla.Constexpr):
+    zero = tla.full(0.0, dtype=tla.Float32)
+    neginf = tla.full(float("-inf"), dtype=tla.Float32)
+    newm = mstate.load()
+    safem = tla.where(tla.cmp(newm, neginf, mode="eq"), zero, newm)
+    sums = _probability_pass(
+        scores, pflat, safem, dtype, scale, True, (zero, zero, zero, zero, zero, zero, zero, zero)
+    )
+    blockl = tla.add(
+        tla.add(tla.add(sums[0], sums[1]), tla.add(sums[2], sums[3])),
+        tla.add(tla.add(sums[4], sums[5]), tla.add(sums[6], sums[7])),
+    )
+    lstate.store(tla.add(lstate.load(), blockl))
+    tla.local_mem_bar(tla.params.MemType.VEC_STORE, tla.params.MemType.VEC_LOAD)
+
+
+@tla.jit
 def _paired_pipeline(
     q,
     k,
@@ -1057,6 +1431,9 @@ def _paired_pipeline(
     ragged: tla.Constexpr = False,
     temporal_aux: tla.Constexpr = False,
 ):
+    separable_plan = None
+    if tla.const_expr(indexed and not temporal_aux):
+        separable_plan = _separable_plan(mask_mod, aux_tensors, aux_scalars)
     # Two visible KV tiles share one softmax update and one FP32 PV accumulation.
     # Sparse block indices may be nonconsecutive; carry both through the pipeline.
     # PV ping-pong buffers retain the running accumulator, freeing space for
@@ -1471,7 +1848,8 @@ def _paired_pipeline(
                             if has_second and not full1:
                                 if tla.const_expr(ragged):
                                     if tail0 | tail1:
-                                        _cache_mask_pair(
+                                        _separable_cache_mask_pair(
+                                            separable_plan,
                                             mask_mod,
                                             b,
                                             head,
@@ -1488,7 +1866,8 @@ def _paired_pipeline(
                                             temporal_aux,
                                         )
                                     else:
-                                        _cache_mask_pair(
+                                        _separable_cache_mask_pair(
+                                            separable_plan,
                                             mask_mod,
                                             b,
                                             head,
@@ -1505,7 +1884,8 @@ def _paired_pipeline(
                                             temporal_aux,
                                         )
                                 else:
-                                    _cache_mask_pair(
+                                    _separable_cache_mask_pair(
+                                        separable_plan,
                                         mask_mod,
                                         b,
                                         head,
@@ -1524,7 +1904,8 @@ def _paired_pipeline(
                             else:
                                 if tla.const_expr(ragged):
                                     if tail0:
-                                        _cache_mask(
+                                        _separable_cache_mask(
+                                            separable_plan,
                                             mask_mod,
                                             b,
                                             head,
@@ -1538,7 +1919,8 @@ def _paired_pipeline(
                                             False,
                                         )
                                     else:
-                                        _cache_mask(
+                                        _separable_cache_mask(
+                                            separable_plan,
                                             mask_mod,
                                             b,
                                             head,
@@ -1552,7 +1934,8 @@ def _paired_pipeline(
                                             True,
                                         )
                                 else:
-                                    _cache_mask(
+                                    _separable_cache_mask(
+                                        separable_plan,
                                         mask_mod,
                                         b,
                                         head,
@@ -1569,7 +1952,8 @@ def _paired_pipeline(
                         elif has_second and not full1:
                             if tla.const_expr(ragged):
                                 if tail1:
-                                    _cache_mask(
+                                    _separable_cache_mask(
+                                        separable_plan,
                                         mask_mod,
                                         b,
                                         head,
@@ -1583,7 +1967,8 @@ def _paired_pipeline(
                                         False,
                                     )
                                 else:
-                                    _cache_mask(
+                                    _separable_cache_mask(
+                                        separable_plan,
                                         mask_mod,
                                         b,
                                         head,
@@ -1597,7 +1982,8 @@ def _paired_pipeline(
                                         True,
                                     )
                             else:
-                                _cache_mask(
+                                _separable_cache_mask(
+                                    separable_plan,
                                     mask_mod,
                                     b,
                                     head,
@@ -1651,44 +2037,69 @@ def _paired_pipeline(
                     astate = tla.make_tensor(
                         alphaptr, tla.make_layout(tla.make_shape(64), tla.make_stride(1))
                     )
-                    with tla.vec.func(mode="simd"):
-                        _pair_softmax(
-                            scores0,
-                            scores1,
-                            pflat0,
-                            pflat1,
-                            mstate,
-                            lstate,
-                            astate,
-                            has_second,
-                            iteration,
-                            scale,
-                            b,
-                            head,
-                            qstart,
-                            vi,
-                            kb * 128,
-                            aux_tensors,
-                            aux_scalars,
-                            score_mod,
-                            mask_mod,
-                            dtype,
-                            kb_second * 128,
-                            full0,
-                            full1,
-                            not dense or len(implicit_window) > 0 or dense_mask,
-                            indexed,
-                            visibility0,
-                            visibility1,
-                            empty0,
-                            empty1,
-                            mask_summary,
-                            dense_mask and indexed,
-                            dense_mask and indexed,
-                            info,
-                            tail0,
-                            tail1,
+                    full_pair = tla.Bool(False)
+                    if tla.const_expr(indexed and not dense_mask and separable_plan is None):
+                        full_pair = (
+                            has_second
+                            & full0
+                            & full1
+                            & (not tail0)
+                            & (not tail1)
+                            & (scale > 0.0)
+                            & (scale < float("inf"))
                         )
+                    if full_pair:
+                        with tla.vec.func(mode="simd"):
+                            _full_pair_softmax(
+                                scores0,
+                                scores1,
+                                pflat1,
+                                mstate,
+                                lstate,
+                                astate,
+                                iteration,
+                                scale,
+                                dtype,
+                            )
+                    else:
+                        with tla.vec.func(mode="simd"):
+                            _pair_softmax(
+                                scores0,
+                                scores1,
+                                pflat0,
+                                pflat1,
+                                mstate,
+                                lstate,
+                                astate,
+                                has_second,
+                                iteration,
+                                scale,
+                                b,
+                                head,
+                                qstart,
+                                vi,
+                                kb * 128,
+                                aux_tensors,
+                                aux_scalars,
+                                score_mod,
+                                mask_mod,
+                                dtype,
+                                kb_second * 128,
+                                full0,
+                                full1,
+                                not dense or len(implicit_window) > 0 or dense_mask,
+                                indexed,
+                                visibility0,
+                                visibility1,
+                                empty0,
+                                empty1,
+                                mask_summary,
+                                dense_mask and indexed,
+                                dense_mask and indexed,
+                                info,
+                                tail0,
+                                tail1,
+                            )
                     if tla.const_expr(reuse_score_buffers):
                         if tla.const_expr(dense_mask and indexed):
                             tla.pipe_barrier(tla.pipes.ALL)
@@ -1739,10 +2150,16 @@ def _paired_pipeline(
                                 first_probability_ptr,
                                 tla.make_layout(tla.make_shape(128, 64), tla.make_stride(16, 1)),
                             )
-                            with tla.vec.func(mode="simd"):
-                                _pair_first_prob(
-                                    scores0, first_pflat, mstate, lstate, dtype, empty0
-                                )
+                            if full_pair:
+                                with tla.vec.func(mode="simd"):
+                                    _full_pair_first_prob(
+                                        scores0, first_pflat, mstate, lstate, scale, dtype
+                                    )
+                            else:
+                                with tla.vec.func(mode="simd"):
+                                    _pair_first_prob(
+                                        scores0, first_pflat, mstate, lstate, dtype, empty0
+                                    )
                         if slot == 0:
                             _vset(sch00, tla.arch.VECTOR)
                         else:
@@ -1781,8 +2198,14 @@ def _paired_pipeline(
                         if tla.const_expr(indexed):
                             if has_second:
                                 _vset(sch01, tla.arch.VECTOR)
-                            with tla.vec.func(mode="simd"):
-                                _pair_first_prob(scores0, pflat0, mstate, lstate, dtype, empty0)
+                            if full_pair:
+                                with tla.vec.func(mode="simd"):
+                                    _full_pair_first_prob(
+                                        scores0, pflat0, mstate, lstate, scale, dtype
+                                    )
+                            else:
+                                with tla.vec.func(mode="simd"):
+                                    _pair_first_prob(scores0, pflat0, mstate, lstate, dtype, empty0)
                         if slot == 0:
                             _vset(sch00, tla.arch.VECTOR)
                             if tla.const_expr(not indexed):
@@ -1954,7 +2377,16 @@ def _paired_pipeline(
                         )
                         pv_lc = tla.make_tensor_like(loptr, pv_ref, tla.arch.L0Clayout)
                         _fix(
-                            pv_lc, uoptr, pvslot, odone0, odone1, ofree0, ofree1, och0, och1, False
+                            pv_lc,
+                            uoptr,
+                            pvslot,
+                            odone0,
+                            odone1,
+                            ofree0,
+                            ofree1,
+                            och0,
+                            och1,
+                            False,
                         )
                     with tla.vector():
                         if pvslot == 0:
