@@ -13,6 +13,7 @@
 #include "fa_metadata_args.h"
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
+#include "fa_bwd_mla.cpp"
 #include "combine_dispatch.hpp"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -334,6 +335,7 @@ PYBIND11_MODULE(flash_attn_npu_4_950, m)
     m.doc() = "FlashAttention v4 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
+    m.def("bwd_mla", &fa_bwd_mla, "Backward pass for MLA shapes Q/K=192, V=128 (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata");
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),

@@ -40,6 +40,15 @@ _LAYOUT_BSND = 1
 _LAYOUT_BNSD = 2
 
 
+def _backward_head_dims(qk_dim, v_dim):
+    """Round asymmetric backward inputs up to an implemented head-dim bucket."""
+    if not 0 < v_dim < qk_dim <= 256:
+        return qk_dim, v_dim
+    qk_bucket = ((qk_dim + 63) // 64) * 64
+    v_bucket = 128 if qk_bucket == 192 and v_dim <= 128 else qk_bucket
+    return qk_bucket, v_bucket
+
+
 def _maybe_contiguous(x):
     """Make tensors fully contiguous for kernels that use linear GM offsets."""
     return x.contiguous() if x is not None and not x.is_contiguous() else x
@@ -385,6 +394,29 @@ def _flash_attn_backward(
 
     dout, q, k, v, out = [x.contiguous() if x.stride(-1) != 1 else x for x in (dout, q, k, v, out)]
     softmax_lse = softmax_lse.contiguous()
+    qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
+    qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
+    dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
+    if pad_heads:
+        if softmax_scale is None:
+            softmax_scale = qk_head_dim ** (-0.5)
+        # Padding changes physical strides; keep the caller's logical BSND/TND axes.
+        q, k = q.contiguous(), k.contiguous()
+        layout = _LAYOUT_TND if cu_seqlens_q is not None else _LAYOUT_BSND
+        q, k = [
+            torch.nn.functional.pad(x, (0, qk_bucket - qk_head_dim))
+            if qk_bucket != qk_head_dim
+            else x
+            for x in (q, k)
+        ]
+        v, out, dout = [
+            torch.nn.functional.pad(x, (0, v_bucket - v_head_dim)) if v_bucket != v_head_dim else x
+            for x in (v, out, dout)
+        ]
+        dq_kernel = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        dk_kernel = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        dv_kernel = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     _, _, _, softmax_d = flash_attn_npu_3_950.bwd(
         dout,
         q,
@@ -392,9 +424,9 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         cu_seqlens_q,
         cu_seqlens_k,
         seqused_q,
@@ -410,6 +442,14 @@ def _flash_attn_backward(
         sm_margin,
         layout,
     )
+    if pad_heads:
+        if dq is not None:
+            dq.copy_(dq_kernel[..., :qk_head_dim])
+        if dk is not None:
+            dk.copy_(dk_kernel[..., :qk_head_dim])
+        if dv is not None:
+            dv.copy_(dv_kernel[..., :v_head_dim])
+
     return softmax_d
 
 
