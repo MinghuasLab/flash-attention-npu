@@ -99,7 +99,7 @@ struct FAInferTilingData {
 
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    uint32_t fusedCrossGroup;
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int64_t windowSizeLeft = 0;
@@ -236,9 +236,9 @@ struct FAInferTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_fusedCrossGroup() const
     {
-        return padding3;
+        return fusedCrossGroup;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -345,9 +345,9 @@ struct FAInferTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_fusedCrossGroup(uint32_t value)
     {
-        padding3 = value;
+        fusedCrossGroup = value;
     }
     void set_sparseMode(int32_t value)
     {

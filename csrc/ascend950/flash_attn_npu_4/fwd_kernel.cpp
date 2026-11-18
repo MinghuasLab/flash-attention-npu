@@ -540,12 +540,12 @@ class FAIKernel950 {
                     const int64_t leftOrigin = seqDiff - windowSizeLeft_;
                     windowSizeLeftStartLen = qBlockBase + leftOrigin;
                     windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
-                    const int64_t firstKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                    const int64_t firstKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
                     kvStart = static_cast<uint32_t>(firstKey) / kvBaseTile_;
                     if (windowSizeLeftEndLen > kvLength) {
-                        delStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
+                        delStartRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
                     }
                 }
                 if (!notNextMask) {
@@ -553,12 +553,12 @@ class FAIKernel950 {
                     windowSizeRightStartLen = qBlockBase + rightOrigin;
                     // Exclusive upper bound for the last Q row in this tile.
                     windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
-                    const int64_t endKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                    const int64_t endKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
                     noSkipKvS = static_cast<uint32_t>(endKey);
                     if (windowSizeRightStartLen < 0) {
-                        delEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                        delEndRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, -rightOrigin)));
                     }
                 }
                 kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
@@ -599,10 +599,10 @@ class FAIKernel950 {
                         const int32_t combineBaseTask = faiTilingData->fdCombineSchedules[combineIdx].baseTask;
                         if (combineBaseTask == static_cast<int32_t>(taskIdx)) {
                             writePartial = true;
-                            partialId = static_cast<uint32_t>(
-                                faiTilingData->fdCombineSchedules[combineIdx].partialStart +
-                                static_cast<int32_t>(coreIdx) -
-                                faiTilingData->fdCombineSchedules[combineIdx].firstCore);
+                            partialId =
+                                static_cast<uint32_t>(faiTilingData->fdCombineSchedules[combineIdx].partialStart +
+                                                      static_cast<int32_t>(coreIdx) -
+                                                      faiTilingData->fdCombineSchedules[combineIdx].firstCore);
                             break;
                         }
                     }
@@ -698,8 +698,9 @@ class FAIKernel950 {
                     pvDesc.vShapeCol = vShapeCol;
                     if constexpr (IsDN) {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
-                                    0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                                    blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
+                                    0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
+                                    prefixSumL0BStages);
                     } else {
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
@@ -794,12 +795,10 @@ class FAIKernel950 {
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     auto gmVLayoutTlaNow = tla::MakeLayout<ElementV, LayoutV>(pvDesc.kShapeRow, pvDesc.vShapeCol);
-                    auto gmVTensorTlaNow =
-                        tla::MakeTensor(gV[pvDesc.gmOffsetV], gmVLayoutTlaNow, Arch::PositionGM{});
+                    auto gmVTensorTlaNow = tla::MakeTensor(gV[pvDesc.gmOffsetV], gmVLayoutTlaNow, Arch::PositionGM{});
                     blockMmadPV(gmVTensorTlaNow, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], actualBlockShapePV,
                                 blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens,
-                                kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued,
-                                l0BStagesIssued);
+                                kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued, l0BStagesIssued);
                     l0AStagesIssued += pvL0ATotalStages_;
                     l0BStagesIssued += pvL0BTotalStages_;
 #endif
@@ -821,15 +820,13 @@ class FAIKernel950 {
                         swaQSTileStart = static_cast<uint32_t>(pvDesc.qSTileStart);
                     }
                     auto gmOLayoutTlaNow = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, pvDesc.strideO);
-                    auto gmOTensorTlaNow =
-                        tla::MakeTensor(gO[pvDesc.gmOffsetO], gmOLayoutTlaNow, Arch::PositionGM{});
+                    auto gmOTensorTlaNow = tla::MakeTensor(gO[pvDesc.gmOffsetO], gmOLayoutTlaNow, Arch::PositionGM{});
                     epilogueRescaleO.template operator()<LseMode>(
                         gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
                         (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
                         fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
-                        pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
-                        gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
-                        fdLseSubStride_);
+                        pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart, gPartialO,
+                        gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_, fdLseSubStride_);
 #endif
                     ++pvIssued;
                 }
