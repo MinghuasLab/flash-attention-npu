@@ -10,6 +10,12 @@
  * Modified by Minghua Shen, 2026.
  */
 
+/**
+ * InitOut for Ascend950 FA v3 empty spans (dense / causal / SWA):
+ * write O=0 and LSE=+inf for the current Q tile / head.
+ * SWA host already prefills LSE=+inf; rewriting +inf is harmless.
+ */
+
 #ifndef FAI950_INIT_OUTPUTS_HPP
 #define FAI950_INIT_OUTPUTS_HPP
 
@@ -20,6 +26,7 @@
 #include "kernel_operator.h"
 #include "kernel_common.hpp"
 #include "fa_block.h"
+#include "fwd_resource_plan.h"
 
 namespace Catlass::Epilogue::Block {
 
@@ -32,10 +39,22 @@ class InitOutputs950 {
     static constexpr uint32_t OUTPUT_UB_OFFSET = 6U * 32768U;
     static constexpr uint32_t LSE_UB_OFFSET = 7U * 32768U + 2048U;
 
-    __aicore__ inline explicit InitOutputs950(Arch::Resource<ArchTag>& resource)
+    template <class Resource>
+    __aicore__ inline explicit InitOutputs950(Resource& resource)
     {
         outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(OUTPUT_UB_OFFSET);
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
+    }
+
+    // Plans carrying a dedicated LSE scratch (D512) keep the empty-span
+    // buffers inside the plan; legacy plans keep the fixed offsets above.
+    template <class Resource>
+    __aicore__ inline InitOutputs950(Resource& resource, const fa950_plan::UbPlan& ub) : InitOutputs950(resource)
+    {
+        if (ub.lseBytes != 0U) {
+            outputUbTensor = resource.ubBuf.template GetBufferByByte<ElementO>(ub.go);
+            lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lse);
+        }
     }
 
     __aicore__ inline InitOutputs950(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
@@ -119,4 +138,4 @@ class InitOutputs950 {
 
 } // namespace Catlass::Epilogue::Block
 
-#endif
+#endif // FAI950_INIT_OUTPUTS_HPP

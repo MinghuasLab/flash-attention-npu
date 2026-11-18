@@ -1779,3 +1779,35 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         rtol=0,
         atol=1e-6,
     )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+def test_d512_paged_fixed_split_writes_empty_kv_output(monkeypatch):
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as api
+
+    q = torch.zeros((2, 1, 512), dtype=torch.float16, device="npu")
+    k = torch.zeros((16, 128, 1, 512), dtype=q.dtype, device=q.device)
+    v = torch.ones_like(k)
+    kwargs = dict(
+        cu_seqlens_q=_int32_npu([0, 1, 2]),
+        max_seqlen_q=1,
+        cache_seqlens=_int32_npu([2048, 0]),
+        page_table=_int32_npu([list(range(16)), [0] * 16]),
+        return_softmax_lse=True,
+    )
+    s1, lse1, *_ = flash_attn_with_kvcache(q, k, v, num_splits=1, **kwargs)
+    # Use the native out argument to detect a skipped write regardless of allocator contents.
+    prefilled = torch.full_like(q, 7)
+
+    def forward_with_prefilled_out(q, k, v, k_new, v_new, qv, out, *args, **kwargs):
+        return api._flash_attn_forward_impl(q, k, v, k_new, v_new, qv, prefilled, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_flash_attn_forward", forward_with_prefilled_out)
+    s4, lse4, *_ = flash_attn_with_kvcache(q, k, v, num_splits=4, **kwargs)
+
+    expected = torch.ones_like(q)
+    expected[1].zero_()
+    for out, lse in ((s1, lse1), (s4, lse4)):
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse[..., 1], torch.full_like(lse[..., 1], math.inf))
+    torch.testing.assert_close(lse4[..., 0], lse1[..., 0], rtol=0, atol=2e-6)
