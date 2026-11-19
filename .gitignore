@@ -36,3 +36,6 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+
+# Local benchmark results and profiling captures
+/benchmarks/results/
