@@ -30,7 +30,9 @@ struct BwdLaunchArgs {
     bool is_softcap;
     bool has_attn_mask;
     bool deterministic;
+    bool original_qk_gt_v;      // Semantic head dimensions before API padding.
     uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256 / 512
+    uint32_t v_headdim_kernel;  // v/dout headdim 桶值；qk > v 时走 MLA 专用配置（host 保证 qk<=192、v<=128）
     uint8_t* dOutDevice;
     uint8_t* qDevice;
     uint8_t* kDevice;

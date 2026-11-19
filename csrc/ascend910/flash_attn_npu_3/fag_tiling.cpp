@@ -52,6 +52,16 @@ float CalculateMaskRatio(FAGTilingData& fagTilingData)
 
 void AdjustCvInner(FAGTilingData& fagTilingData)
 {
+    // Short causal TND needs several Q tasks per core to fill the CV pipeline.
+    // Keep the existing CATLASS capacity and shrink only the runtime work tile.
+    if (fagTilingData.layoutType == TND && !fagTilingData.isDeterministic &&
+        fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) && fagTilingData.qkHeadDim == 192 &&
+        fagTilingData.vHeadDim == 128 && fagTilingData.qSeqlen > 0 && fagTilingData.qSeqlen <= 256 &&
+        fagTilingData.qSeqlen == fagTilingData.kvSeqlen) {
+        fagTilingData.s1CvInner = 128;
+        return;
+    }
+
     if (fagTilingData.isDeterministic) {
         int64_t vecBlockNum = fagTilingData.coreNum / VEC_SPLIT_NUM;
         int64_t s1CalcInner = (fagTilingData.s1CvInner + vecBlockNum - 1) / vecBlockNum;
@@ -426,6 +436,22 @@ int64_t GetFAGTilingParam(const FAGInfo& fagInfo, uint32_t aicNum, uint32_t aivN
         AdjustCvInner(fagTilingData);
         fagTilingData.qSeqlen = blobMaxQ;
         fagTilingData.kvSeqlen = blobMaxKv;
+    }
+
+    // Keep complete heads on a core; use a divisor to avoid a partial final wave.
+    if (isTnd && fagTilingData.batch == 1 && fagTilingData.g == 1 && fagTilingData.kvHeadNum >= 4 &&
+        !fagTilingData.isDeterministic && fagTilingData.maskType == static_cast<uint32_t>(MaskType::MASK_CAUSUAL) &&
+        fagTilingData.qkHeadDim == 192 && fagTilingData.vHeadDim == 128 && fagTilingData.qSeqlen > 0 &&
+        fagTilingData.qSeqlen <= 256 && fagTilingData.qSeqlen == fagTilingData.kvSeqlen &&
+        fagInfo.qUsedLenList == nullptr && fagInfo.kvUsedLenList == nullptr) {
+        uint32_t activeCores = std::min<uint32_t>(aicNum, fagTilingData.kvHeadNum);
+        while (fagTilingData.kvHeadNum % activeCores != 0) {
+            --activeCores;
+        }
+        if (activeCores * 4 >= std::min<uint32_t>(aicNum, fagTilingData.kvHeadNum) * 3) {
+            fagTilingData.aicNum = activeCores;
+            fagTilingData.coreNum = activeCores * 2;
+        }
     }
 
     fagTilingData.s1Outer = (fagTilingData.qSeqlen + fagTilingData.s1CvInner - 1) / fagTilingData.s1CvInner;

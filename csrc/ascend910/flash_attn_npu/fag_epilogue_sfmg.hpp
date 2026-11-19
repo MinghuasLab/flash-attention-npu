@@ -57,7 +57,8 @@ class BlockEpilogue<EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT_>, ElementVecDtype, Tili
         nheads_k = tilingData->kvHeadNum;
         g = tilingData->g;
         nheads = nheads_k * g;
-        headdim = tilingData->qkHeadDim;
+        // dO and O rows are vHeadDim wide. Equal head dims keep this equal to qkHeadDim.
+        headdim = tilingData->vHeadDim;
         uint32_t coreNum = tilingData->coreNum;
         dAlign = (headdim + 15) / 16 * 16;
         cu_seq_qlen_addr = cu_seq_qlen;

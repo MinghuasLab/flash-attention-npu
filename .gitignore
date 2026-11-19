@@ -36,3 +36,25 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+
+.agents/
+.cannbot/
+.opencode/
+AGENTS.md
+*.png
+MLA设计.md
+operators/
+.mla_logs/
+export_only_prof_dir/
+extra-info/
+test.sh
+
+# Local tooling, caches, and run artifacts
+.codex/
+.pytest_cache/
+.ruff_cache/
+.tmp_logs/
+*.whl
+atk_output/
+env.md
+算子详设文档模板.md

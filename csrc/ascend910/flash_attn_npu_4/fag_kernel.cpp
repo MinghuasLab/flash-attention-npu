@@ -33,6 +33,10 @@
 #include "../flash_attn_npu/fag_epilogue_pre.hpp"
 #include "fag_common/mmad_fag_sdp.hpp"
 #include "fag_common/mmad_fag_dqkv.hpp"
+#include <type_traits>
+#include "../flash_attn_npu/fag_mla/epilogue_op.hpp"
+#include "../flash_attn_npu/fag_mla/mmad_fag_sdp.hpp"
+#include "../flash_attn_npu/fag_mla/mmad_fag_dqkv.hpp"
 #include "fag_tiling.h"
 #include "kernel_operator.h"
 
@@ -61,12 +65,15 @@ enum class DTemplateType {
     Aligned192 = 3,
     Aligned256 = 4,
     Aligned512 = 5,
+    Mla192Dv128 = 6, // MLA：qk headdim > v headdim（如 192/128，qk<=192、v<=128 桶）
     DTemplateBottom
 };
 
+#include "../flash_attn_npu/fag_mla/kernel.hpp"
+
 template <class BlockMmad_, class BlockMmad2_, class BlockMmad3_, class EpilogueFAGPre_, class EpilogueFAGSfmg_,
           class EpilogueFAGSabVec_, class EpilogueFAGPost_, class EpilogueFAGDtmAdd_, const uint32_t INPUT_LAYOUT,
-          const bool IS_ATTEN_MASK, const uint32_t IS_DTM>
+          const bool IS_ATTEN_MASK, const uint32_t IS_DTM, const bool USE_ACTUAL_OUT = false>
 class FlashAttentionScoreGrad {
   public:
     using BlockMmad = BlockMmad_;
@@ -811,6 +818,11 @@ class FlashAttentionScoreGrad {
                                         params.workspace, params.tiling);
         epilogueFagSfmg();
         pipeSoftmaxGrad.Destroy();
+        if constexpr (USE_ACTUAL_OUT) {
+            // SFMG producers and attention tasks may own different rows.
+            // Publish every AIV's dO*O reduction before any task reads it.
+            AscendC::SyncAll();
+        }
 
         // 给L1custom的变量
         cBlockIdx = AscendC::GetBlockIdx();
@@ -1046,11 +1058,36 @@ struct TypeSelector<DTemplateType::Aligned512> {
     using L0TileShapeCube2 = GemmShape<128, 256, 64>;
 };
 
-template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
-          const uint32_t INPUT_LAYOUT = BSND, const bool IS_ATTEN_MASK = 0,
-          const bool IS_DROP = 0,
+// MLA 专用配置：Q/K head dimension 为 192，V/dOut head dimension 为 128。
+// mm12 对齐参考实现 Aligned192 的 L1 搬运：B(K/V) 按 128 列分块填完整块
+// 512x192 L1B（192KB），A(Q/dY) 的 4 个 128 行条带装入 4 个 L1A stage
+// （192KB）并在 n 维复用；V/dY 的 actualK 仍为 128，L0 按 96+32 尾块处理。
+// mm345：L1A(dS/P) 128x512 双缓冲，按 128(K) 分块搬运；L1B(K/Q/dY) 单份
+// 512x192，按 128(K)x(128+64)(N) 分块装载，dV 的 actualN 仍为 128。
+// L0 按 128x(128+64) 覆盖 N=192。L1A 的 M 不能超过 128：copyOut 以
+// L1ATileShape::M x N 整块经 fixpipe 出 L0C，M=256、N=192 时 L0C 瓦片达
+// 192 KiB，超过 128 KiB 的 L0C 容量。
+template <>
+struct TypeSelector<DTemplateType::Mla192Dv128> {
+    // cube1
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<4, 1, true>;
+    using BlockTileShape = GemmShape<512, 512, 192>;
+    using L1TileShapeCube1 = GemmShape<128, 512, 192>;
+    using L0TileShapeCube1 = GemmShape<128, 128, 96>;
+
+    // cube2：L1A 双缓冲（dS/P M-tile 加载与 MMAD 重叠；128KB x 2 + 192KB
+    // = 448KB <= 512KB L1）
+    using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
+    using BlockTileShapeCube2 = GemmShape<512, 192, 512>;
+    using L1ATileShapeCube2 = GemmShape<128, 0, 512>;
+    using L1BTileShapeCube2 = GemmShape<0, 192, 512>;
+    using L0TileShapeCube2 = GemmShape<128, 192, 64>;
+};
+
+template <const DTemplateType DTEMPLATETYPE, typename DataType = half, const uint32_t INPUT_LAYOUT = BSND,
+          const bool IS_ATTEN_MASK = 0, const bool IS_DROP = 0,
           const bool IS_DTM = 0, // 是否开启确定性计算
-          const bool HAS_SOFTCAP = 0>
+          const bool HAS_SOFTCAP = 0, const bool USE_ACTUAL_OUT = false>
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
                                GM_ADDR drop_mask, GM_ADDR atten_mask, GM_ADDR softmax_lse, GM_ADDR cu_seq_qlen,
                                GM_ADDR cu_seq_kvlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_, GM_ADDR dk_,
@@ -1063,6 +1100,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
 #endif
 
+    constexpr bool IS_MLA = DTEMPLATETYPE == DTemplateType::Mla192Dv128;
     using ArchTag = Arch::AtlasA2;
 
     // cube1
@@ -1078,8 +1116,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using L1BTileShapeCube2 = typename TypeSelector<DTEMPLATETYPE>::L1BTileShapeCube2;
     using L0TileShapeCube2 = typename TypeSelector<DTEMPLATETYPE>::L0TileShapeCube2;
 
-    // cube3
-    using DispatchPolicyCube3 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
+    // cube3: 与 cube2 共用全部配置（含 L1 stages），MLA 等专用配置才能生效
+    using DispatchPolicyCube3 =
+        std::conditional_t<IS_MLA, DispatchPolicyCube2, Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>>;
     using BlockTileShapeCube3 = BlockTileShapeCube2;
     using L1ATileShapeCube3 = L1ATileShapeCube2;
     using L1BTileShapeCube3 = L1BTileShapeCube2;
@@ -1095,9 +1134,12 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using A1Type = Catlass::Gemm::GemmType<ElementA1, LayoutA1>;
     using B1Type = Catlass::Gemm::GemmType<ElementB1, LayoutB1>;
     using C1Type = Catlass::Gemm::GemmType<ElementC1, LayoutC1>;
-    using BlockMmadFAGCube1 =
+    using BlockMmadFAGCube1 = std::conditional_t<
+        IS_MLA,
+        Catlass::Gemm::Block::Mla::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1,
+                                                   L0TileShapeCube1, A1Type, B1Type, C1Type>,
         Catlass::Gemm::Block::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1, L0TileShapeCube1,
-                                              A1Type, B1Type, C1Type>;
+                                              A1Type, B1Type, C1Type>>;
 
     // Cube2 计算：左矩阵不转置，右矩阵不转置。实现 dQ = dS * K
     using ElementA2 = DataType; // ds
@@ -1111,9 +1153,12 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B2Type = Catlass::Gemm::GemmType<ElementB2, LayoutB2>;
     using C2Type = Catlass::Gemm::GemmType<ElementC2, LayoutC2>;
 
-    using BlockMmadFAGCube2 =
+    using BlockMmadFAGCube2 = std::conditional_t<
+        IS_MLA,
+        Catlass::Gemm::Block::Mla::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2,
+                                                L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>,
         Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2,
-                                           L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>;
+                                           L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>>;
 
     // Cube3 计算：左矩阵转置，右矩阵不转置。 实现 dK = dS^T * Q 和 dV = P^T * dOut
     using ElementA3 = DataType; // ds和p
@@ -1127,9 +1172,12 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B3Type = Catlass::Gemm::GemmType<ElementB3, LayoutB3>;
     using C3Type = Catlass::Gemm::GemmType<ElementC3, LayoutC3>;
 
-    using BlockMmadFAGCube3 =
+    using BlockMmadFAGCube3 = std::conditional_t<
+        IS_MLA,
+        Catlass::Gemm::Block::Mla::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3,
+                                                L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>,
         Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3,
-                                           L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>;
+                                           L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>>;
 
     // Epilogue
     using ElementOutput = float;
@@ -1144,34 +1192,40 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using LayoutInput = layout::RowMajor;
     using InputType = DataType;
 
-    // VEC_Pre ：dQ/dOut/dV的workspace清零
-    using EpilogueAtlasA2FAGPre = Catlass::Epilogue::EpilogueAtlasA2FAGPre;
-    using EpilogueFAGPre = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, InputType, FAGTilingData>;
+    // VEC_Pre ：dQ/dK/dV 的 workspace 清零。dV 按 vSize 切，等维时与 kvSize 相同。
+    using EpilogueFAGPre =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGPre, InputType, FAGTilingData>;
 
-    // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
-    using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT>;
-
-    // 使用模板特化根据INPUT_LAYOUT选择布局标签
-    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, InputType, FAGTilingData>;
+    // VEC_Sfmg ：按 vHeadDim 计算 SoftmaxGrad(dOut, O)。等维时与 qkHeadDim 相同。
+    using EpilogueFAGSfmg =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT>, InputType,
+                                                FAGTilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2SameAbVec =
-        Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>;
+    // Preserve actual-O semantics when asymmetric inputs were padded to an equal tile.
+    using EpilogueAtlasA2SameAbVec = std::conditional_t<
+        IS_MLA || USE_ACTUAL_OUT,
+        Catlass::Epilogue::EpilogueAtlasA2MlaVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>,
+        Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>>;
     using EpilogueFAGSabVec =
         Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 
-    // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
-    using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
-    using EpilogueFAGPost = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, InputType, FAGTilingData>;
+    // VEC_Post：dQ*scale 和 dK*scale，并搬运输出 dQ/dK/dV。dV 按 vSize 切。
+    using EpilogueFAGPost =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGPost, InputType, FAGTilingData>;
 
     // VEC_DeterministicAdd：确定性计算累加
     using EpilogueAtlasA2FAGDtmAdd = Catlass::Epilogue::EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT>;
     using EpilogueFAGDtmAdd = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGDtmAdd>;
 
     // Kernel level
-    using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
-                                              EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd,
-                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
+    using FAGKernel = std::conditional_t<
+        IS_MLA,
+        FlashAttentionScoreGradMla<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
+                                   EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, INPUT_LAYOUT, IS_ATTEN_MASK>,
+        FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
+                                EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT,
+                                IS_ATTEN_MASK, IS_DTM, USE_ACTUAL_OUT>>;
     FAGKernelParams params{dout,         q,        k,         v,   out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen,
                            cu_seq_kvlen, seqUsedQ, seqUsedKv, dq_, dk_, dv_,       nullptr,    workspace,   tiling};
 

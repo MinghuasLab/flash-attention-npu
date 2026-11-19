@@ -113,6 +113,12 @@ public:
                   (BlockTileShape::N == 192) || \
                   (BlockTileShape::N == 256) || \
                   (BlockTileShape::N == 512), "BlockN must be in (64, 128, 192, 256, 512)!");
+    // qk=192, v=128 的 mm345：L1A 按 128(K) 分块，L1B 按 128(K)x(128+64)(N) 填 512x192。
+    static constexpr bool ENABLE_MLA_ALIGNED192_L1_TILES =
+        (BlockTileShape::M == 512) && (BlockTileShape::N == 192) && (BlockTileShape::K == 512) &&
+        (L1ATileShape::M == 128) && (L1ATileShape::K == 512) && (L1BTileShape::N == 192) && (L1BTileShape::K == 512) &&
+        (L0TileShape::M == 128) && (L0TileShape::N == 192) && (L0TileShape::K == 64) && (L1A_STAGES == 2) &&
+        (L1B_STAGES == 1);
 
     // Check Layout
     static_assert(std::is_same_v<LayoutA, layout::RowMajor> || std::is_same_v<LayoutA, layout::ColumnMajor>, "LayoutA can only be in RowMajor, or ColumnMajor yet!");
@@ -208,9 +214,15 @@ void operator()(
     AscendC::GlobalTensor<ElementB> gmBlockB,  // dO: (M, N)
     AscendC::GlobalTensor<ElementC> gmBlockC,  // dk: (D, N)
     LayoutA layoutA, LayoutB layoutB, LayoutC layoutC,
-    GemmCoord actualShape, const bool enAtomic)
+    GemmCoord actualShape, const bool enAtomic, uint32_t atomicRows = 0xffffffffU)
 {
     SetFlag();
+    if constexpr (ENABLE_MLA_ALIGNED192_L1_TILES) {
+        GemmMlaAligned192L1Tiles(gmBlockA, gmBlockB, gmBlockC, layoutA, layoutB, layoutC, actualShape, enAtomic,
+                                 atomicRows);
+        WaitFlag();
+        return;
+    }
     uint32_t actualN = actualShape.n();
 
     uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
@@ -372,6 +384,146 @@ void GemmNTile(
     // 本N段的全部L1->L0B(MTE1)消费已完成（MTE1队列保序），允许下一N段覆盖写L1B
     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
 }
+
+    CATLASS_DEVICE
+    void GemmMlaAligned192L1Tiles(AscendC::GlobalTensor<ElementA> gmBlockA, AscendC::GlobalTensor<ElementB> gmBlockB,
+                                  AscendC::GlobalTensor<ElementC> gmBlockC, LayoutA layoutA, LayoutB layoutB,
+                                  LayoutC layoutC, GemmCoord actualShape, const bool enAtomic, uint32_t atomicRows)
+    {
+        constexpr uint32_t L1_K_COPY_TILE = 128;
+        constexpr uint32_t L1_N_COPY_TILE = 128;
+
+        uint32_t actualM = actualShape.m();
+        uint32_t actualN = actualShape.n(); // dQ/dK 为192；dV/dY 仍为128
+        uint32_t actualK = actualShape.k();
+
+        uint32_t mRound = RoundUp<L1AAlignHelper::M_ALIGNED>(actualM);
+        uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
+        uint32_t kRound = RoundUp<L1BAlignHelper::K_ALIGNED>(actualK);
+
+        LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1ATileShape::M, L1ATileShape::K);
+        LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(L1BTileShape::K, L1BTileShape::N);
+
+        // 保持原有事件计数语义：L1B 常驻，开始时补一个 free flag 供最终 WaitFlag 消费。
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+
+        uint32_t mL1TileCount = CeilDiv<L1ATileShape::M>(mRound);
+        uint32_t kL1CopyCount = CeilDiv<L1_K_COPY_TILE>(kRound);
+        uint32_t nL1CopyCount = CeilDiv<L1_N_COPY_TILE>(nRound);
+
+        AscendC::SetAtomicNone();
+
+        for (uint32_t mL1TileIdx = 0; mL1TileIdx < mL1TileCount; mL1TileIdx++) {
+            uint32_t mAL1Actual =
+                (mL1TileIdx < mL1TileCount - 1) ? L1ATileShape::M : (actualM - mL1TileIdx * L1ATileShape::M);
+            uint32_t mAL1Round = RoundUp<L1AAlignHelper::M_ALIGNED>(mAL1Actual);
+            uint32_t l1ASlot = mL1TileIdx % L1A_STAGES;
+            auto l1ATensor = l1ATensorList[l1ASlot];
+
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ASlot]);
+
+            for (uint32_t kL1CopyIdx = 0; kL1CopyIdx < kL1CopyCount; kL1CopyIdx++) {
+                uint32_t kCopyOffset = kL1CopyIdx * L1_K_COPY_TILE;
+                uint32_t kCopyActual = (kL1CopyIdx < kL1CopyCount - 1) ? L1_K_COPY_TILE : (actualK - kCopyOffset);
+
+                if (mL1TileIdx == 0) {
+                    // B(K/Q/dY) 只在第一个 m 条带时装入。dk/dq 为 128+64 两段；
+                    // dv 的 actualN=128，因此只装第一段。
+                    for (uint32_t nL1CopyIdx = 0; nL1CopyIdx < nL1CopyCount; nL1CopyIdx++) {
+                        uint32_t nCopyOffset = nL1CopyIdx * L1_N_COPY_TILE;
+                        uint32_t nCopyActual =
+                            (nL1CopyIdx < nL1CopyCount - 1) ? L1_N_COPY_TILE : (actualN - nCopyOffset);
+                        MatrixCoord BGMTileOffset{kCopyOffset, nCopyOffset};
+                        auto gmBTile = gmBlockB[layoutB.GetOffset(BGMTileOffset)];
+                        auto layoutTileBInGM = layoutB.GetTileLayout(MakeCoord(kCopyActual, nCopyActual));
+                        MatrixCoord l1BCoord{kCopyOffset, nCopyOffset};
+                        auto l1BTile = l1BTensorList[0][layoutBInL1.GetOffset(l1BCoord)];
+                        copyGmToL1B(l1BTile, gmBTile, layoutBInL1, layoutTileBInGM);
+                    }
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+                }
+
+                // A(dS/P) 按 128(K) 分块装入当前 128(M)x512(K) stage。
+                MatrixCoord AGMTileOffset{mL1TileIdx * L1ATileShape::M, kCopyOffset};
+                auto gmATile = gmBlockA[layoutA.GetOffset(AGMTileOffset)];
+                auto layoutTileAInGM = layoutA.GetTileLayout(MakeCoord(mAL1Actual, kCopyActual));
+                MatrixCoord l1ACopyCoord{0, kCopyOffset};
+                auto l1ACopyTile = l1ATensor[layoutAInL1.GetOffset(l1ACopyCoord)];
+                copyGmToL1A(l1ACopyTile, gmATile, layoutAInL1, layoutTileAInGM);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ASlot]);
+
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ASlot]);
+                if (mL1TileIdx == 0) {
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+                }
+
+                uint32_t kL0TileCount = CeilDiv<L0TileShape::K>(kCopyActual);
+                for (uint32_t kL0TileIdx = 0; kL0TileIdx < kL0TileCount; kL0TileIdx++) {
+                    uint32_t kL0Offset = kCopyOffset + kL0TileIdx * L0TileShape::K;
+                    uint32_t kL0Actual =
+                        (kL0TileIdx < kL0TileCount - 1) ? L0TileShape::K : (kCopyActual - kL0TileIdx * L0TileShape::K);
+                    uint32_t kL0Round = RoundUp<L1AAlignHelper::K_ALIGNED>(kL0Actual);
+
+                    auto l0ATile = l0ATensorList[l0AListId];
+                    LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mAL1Round, kL0Round);
+                    MatrixCoord l1ACoord{0, kL0Offset};
+                    auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ACoord)];
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+                    copyL1ToL0A(l0ATile, l1ATile, layoutAInL0, layoutAInL1);
+                    if ((kL1CopyIdx == kL1CopyCount - 1) && (kL0TileIdx == kL0TileCount - 1)) {
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ASlot]);
+                    }
+
+                    auto l0BTile = l0BTensorList[l0BListId];
+                    LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Round, actualN);
+                    MatrixCoord l1BCoord{kL0Offset, 0};
+                    auto l1BTile = l1BTensorList[0][layoutBInL1.GetOffset(l1BCoord)];
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+                    copyL1ToL0B(l0BTile, l1BTile, layoutBInL0, layoutBInL1);
+
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(mmadSyncEventId);
+                    auto l0CTile = l0CTensorList[0];
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(mmadSyncEventId);
+
+                    bool initC = (kL1CopyIdx == 0) && (kL0TileIdx == 0);
+                    if (initC) {
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
+                    }
+
+                    uint8_t unitFlag = 0b00;
+                    if constexpr (ENABLE_UNIT_FLAG) {
+                        bool isLastK = (kL1CopyIdx == kL1CopyCount - 1) && (kL0TileIdx == kL0TileCount - 1);
+                        unitFlag = isLastK ? 0b11 : 0b10;
+                    }
+                    tileMmad(l0CTile, l0ATile, l0BTile, mAL1Round, actualN, kL0Actual, initC, unitFlag);
+
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+                    l0BListId = (l0BListId + 1 < L0AB_STAGES) ? (l0BListId + 1) : 0;
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+                    l0AListId = (l0AListId + 1 < L0AB_STAGES) ? (l0AListId + 1) : 0;
+                }
+            }
+
+            LayoutC layoutBlock = layoutC.GetTileLayout(MakeCoord(mAL1Actual, actualN));
+            auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mAL1Round, actualN));
+            MatrixCoord gmCoordC{mL1TileIdx * L1ATileShape::M, 0};
+            auto gmTileC = gmBlockC[layoutC.GetOffset(gmCoordC)];
+
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[0]);
+            // The head-owned causal path accumulates only the K rows written by
+            // earlier Q blocks. Its prefix boundary is aligned to this 128-row tile.
+            if (enAtomic && mL1TileIdx * L1ATileShape::M < atomicRows) {
+                AscendC::SetAtomicType<float>();
+                copyL0CToGm(gmTileC, l0CTensorList[0], layoutBlock, layoutInL0C, 0b11);
+                AscendC::SetAtomicNone();
+            } else {
+                copyL0CToGm(gmTileC, l0CTensorList[0], layoutBlock, layoutInL0C, 0b11);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[0]);
+        }
+    }
 
 protected:
     AscendC::LocalTensor<ElementA> l1ATensorList[L1A_STAGES];
