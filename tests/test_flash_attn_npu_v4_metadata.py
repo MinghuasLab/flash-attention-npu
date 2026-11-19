@@ -87,13 +87,9 @@ def _assert_950_flashdecode_metadata(metadata):
 @pytest.mark.parametrize(
     "dtype, q_shape, kv_shape, disable_scheduler_metadata",
     [
-        pytest.param(
-            torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False, id="fp16-gqa-metadata"
-        ),
-        pytest.param(
-            torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False, id="bf16-mqa-metadata"
-        ),
-        pytest.param(torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True, id="fp16-gqa-host"),
+        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False),
+        (torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False),
+        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True),
     ],
 )
 def test_950_d512_dense_auto_flashdecode(
