@@ -102,15 +102,15 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                             } else {
                                 if constexpr (std::is_same_v<DType, bfloat16_t> && IsPaged) {
                                     if (a.quant_mode == 2U) {
-                                        if constexpr (MaskCat != MaskCategory::MASK_SWA) {
-                                            if (a.paired_query_heads) {
-                                                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
-                                                                        LseMode, HasSoftcap, true);
-                                                return;
-                                            }
+                                        if constexpr (MaskCat == MaskCategory::MASK_SWA) {
+                                            launch_mixed_swa_layout<kLayout>(a);
+                                        } else if (a.paired_query_heads) {
+                                            FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                    LseMode, HasSoftcap, true);
+                                        } else {
+                                            FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                    LseMode, HasSoftcap, false);
                                         }
-                                        FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
-                                                                LseMode, HasSoftcap, false);
                                     } else {
                                         FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
                                     }
@@ -126,8 +126,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
     }
 }
 
-// Instantiated in a separate device image so adding window variants does not
-// move full-attention instructions or change the legacy device binaries.
+// Keep the window specializations together in their own device image.
 template <Format kLayout>
 void launch_mixed_swa_layout(const FwdLaunchArgs& a)
 {
@@ -136,7 +135,7 @@ void launch_mixed_swa_layout(const FwdLaunchArgs& a)
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
             FWD_BOOL_SWITCH(a.paired_query_heads, Paired, {
-                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCategory::MIXED_SWA, CacheMode::pagedCache, PageShape::BnBsND,
+                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCategory::MASK_SWA, CacheMode::pagedCache, PageShape::BnBsND,
                                         LseMode, HasSoftcap, Paired);
             });
         });

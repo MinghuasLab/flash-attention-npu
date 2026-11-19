@@ -59,17 +59,18 @@ extern template void launch_fwd_impl<half, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
 
-void launch_mixed_swa(const FwdLaunchArgs& a);
+template <Format kLayout>
+void launch_mixed_swa_layout(const FwdLaunchArgs& a);
+
+extern template void launch_mixed_swa_layout<Format::TND>(const FwdLaunchArgs&);
+extern template void launch_mixed_swa_layout<Format::BSND>(const FwdLaunchArgs&);
+extern template void launch_mixed_swa_layout<Format::BNSD>(const FwdLaunchArgs&);
 
 // Runtime entry: kLayout is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
 // per (dtype, Format) in the autogen TUs.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
-    if (a.quant_mode == 2U && a.mask_category == MaskCategory::MASK_SWA && a.paged_kv) {
-        launch_mixed_swa(a);
-        return;
-    }
     if (a.quant_mode == 1) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<float8_e4m3_t, Format::TND>(a);

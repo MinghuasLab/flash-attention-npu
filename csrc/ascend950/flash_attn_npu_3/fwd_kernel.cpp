@@ -54,13 +54,9 @@ static constexpr uint32_t UB_S_OTMP_BUF_STAGES = 2;
 static constexpr uint32_t UB_S_BUF_STAGES = 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
-          Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskVariant,
+          Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
           CacheLayout cacheLayout, bool IsDN, bool LseMode, bool MixedKv = false, bool PairedHeads = false>
 class FAIKernel950 {
-    static constexpr bool mixedSwa = maskVariant == MaskCategory::MIXED_SWA;
-    static constexpr MaskCategory maskCategory = mixedSwa ? MaskCategory::MASK_SWA : maskVariant;
-    static_assert(!mixedSwa || MixedKv);
-
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
 
@@ -760,7 +756,7 @@ class FAIKernel950 {
                         const uint32_t rows = page + 1U == kvSLoopNum ? noSkipKvS - page * 128U : 128U;
                         // Cube consumes the first visible page in bank zero.
                         // SWA can start at an odd physical tile index.
-                        const uint32_t bank = mixedSwa ?
+                        const uint32_t bank = maskCategory == MaskCategory::MASK_SWA ?
                             (page - kvSplitStart) % 2U : page % 2U;
                         const uint32_t kOffset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
                             + bank * qkL1TileKRight_ * qkL1TileN_ * 2U;
@@ -947,7 +943,7 @@ class FAIKernel950 {
                         int64_t kvSEndIdxI = kvSStartIdxI + kvSTileSizeAct;
                         bool doTriUPreMask;
                         bool doTriUNextMask;
-                        if constexpr (mixedSwa) {
+                        if constexpr (MixedKv) {
                             // The first and last keys are inclusive. A page that only
                             // touches the window edge can be valid for every query row.
                             doTriUPreMask = !notPreMask && windowSizeLeftEndLen - 1 > kvSStartIdxI;
