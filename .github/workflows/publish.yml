@@ -29,6 +29,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: publish-${{ github.event_name == 'push' && github.ref || inputs.ref }}
@@ -149,11 +150,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
-          submodules: recursive
+          submodules: false
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Initialize required CATLASS submodule
+        run: bash ci/init_submodules.sh "$PWD"
+
       - name: Clear temporary checkout proxy
+        if: always()
         run: git config --global --unset-all http.https://github.com.proxy 2>/dev/null || true
 
       - name: Build and validate wheel
@@ -220,16 +225,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload wheel to GitHub Release
-        if: needs.prepare_release.outputs.publish_release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare_release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          wheel="$(find "dist/${{ matrix.name }}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          bash ci/upload_release_asset.sh "$TAG" "$wheel"
-
       - name: Clean up release containers
         if: always()
         run: bash ci/cleanup_ci_containers.sh
@@ -239,23 +234,55 @@ jobs:
     needs: [prepare_release, build_wheels]
     runs-on: ubuntu-latest
     steps:
-      - name: Download and count wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-*
-          path: dist/wheels
-          merge-multiple: true
-
       - name: Verify complete wheel set
         env:
+          GH_TOKEN: ${{ github.token }}
           MATRIX_JSON: ${{ needs.prepare_release.outputs.matrix }}
         run: |
+          set -euo pipefail
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[].name' > artifact-names.txt
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
-          expected = len(json.loads(os.environ["MATRIX_JSON"])["include"])
-          wheels = list(Path("dist/wheels").glob("*.whl"))
-          if len(wheels) != expected:
-              raise SystemExit(f"expected {expected} wheels, found {len(wheels)}")
+          expected = sorted(
+              f"wheel-{row['name']}"
+              for row in json.loads(os.environ["MATRIX_JSON"])["include"]
+          )
+          actual = sorted(
+              name for name in Path("artifact-names.txt").read_text().splitlines()
+              if name.startswith("wheel-")
+          )
+          if actual != expected:
+              raise SystemExit(f"expected {len(expected)} wheel artifacts, found {len(actual)}")
           PY
+
+  publish_wheels:
+    name: Publish wheel (${{ matrix.name }})
+    if: needs.prepare_release.outputs.publish_release == 'true'
+    needs: [prepare_release, verify_wheels]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare_release.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/wheel
+
+      - name: Upload wheel to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          wheel="$(find dist/wheel -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          bash ci/upload_release_asset.sh "$TAG" "$wheel"
