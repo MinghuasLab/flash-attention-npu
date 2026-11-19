@@ -400,6 +400,12 @@ class BishengBuildExt(build_ext):
             abi_flag,
             *include_flags,
         ]
+        if ext_name == "flash_attn_npu.flash_attn_npu":
+            alignment = os.getenv("FLASH_ATTN_FA2_FUNCTION_ALIGNMENT", "32")
+            if alignment not in {str(1 << bits) for bits in range(2, 13)}:
+                raise ValueError("FLASH_ATTN_FA2_FUNCTION_ALIGNMENT must be a power of two from 4 to 4096")
+            compile_common += ["-Xaicore", f"-falign-functions={alignment}"]
+
         if use_ms_static:
             # msSanitizer 静态插桩：-g 生成定位信息（异常报告输出文件名/行号/调用栈），
             # --cce-enable-sanitizer 开启内存异常检测插桩。

@@ -905,6 +905,24 @@ class FAInferKernel {
             }
         }
 #endif
+#ifdef __DAV_C220_VEC__
+        int64_t causalTriUp = 0;
+        uint32_t causalTriDown = 0;
+        uint32_t causalLastNoMaskTile = 0;
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            causalTriUp = static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
+            causalTriDown = static_cast<uint32_t>(noSkipKvS);
+            if (causalTriUp + 1U == kvSeqlen) {
+                causalLastNoMaskTile = kvSLoopNumTotal - 1U;
+            } else if (causalTriUp + 1U == kvSeqlenOld) {
+                causalLastNoMaskTile = kvStartOld - 1U;
+            } else if (causalTriUp + 1U < kvSeqlenOld) {
+                causalLastNoMaskTile = (causalTriUp + 1U) / MAX_KV_STACK_LEN - 1U;
+            } else {
+                causalLastNoMaskTile = kvStartOld + (causalTriUp + 1U - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
+            }
+        }
+#endif
         for (uint32_t kvSIdx = kvStart; kvSIdx < kvEnd + pipelineDrain; kvSIdx++) {
             if (kvSIdx < kvEnd) {
                 const bool isAppendBlock = appendKVFlag && (kvSIdx >= kvStartOld);
@@ -993,8 +1011,8 @@ class FAInferKernel {
                 epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
                 epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
                 if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
-                    int64_t triUp = static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
-                    uint32_t triDown = static_cast<uint32_t>(noSkipKvS);
+                    const int64_t triUp = causalTriUp;
+                    const uint32_t triDown = causalTriDown;
                     bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
                     if (doTriUMask) {
                         if constexpr (FLASH_DECODE_FLAG) {
@@ -1011,16 +1029,7 @@ class FAInferKernel {
                                                   qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                         }
                     } else {
-                        uint32_t lastNoMaskTile;
-                        if (triUp + 1U == kvSeqlen) {
-                            lastNoMaskTile = kvSLoopNumTotal - 1U;
-                        } else if (triUp + 1U == kvSeqlenOld) {
-                            lastNoMaskTile = kvStartOld - 1U;
-                        } else if (triUp + 1U < kvSeqlenOld) {
-                            lastNoMaskTile = (triUp + 1U) / MAX_KV_STACK_LEN - 1U;
-                        } else {
-                            lastNoMaskTile = kvStartOld + (triUp + 1U - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
-                        }
+                        const uint32_t lastNoMaskTile = causalLastNoMaskTile;
                         int32_t lastNoMaskStackId;
                         if constexpr (FLASH_DECODE_FLAG) {
                             lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
