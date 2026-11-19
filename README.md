@@ -316,7 +316,8 @@ def flash_attn_func(
         - softcap >= 0 (0.0 disables; not supported on Ascend 950).
         - 0.0 <= dropout_p < 1.0; 0.0 disables dropout.
         - alibi_slopes not supported.
-        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim.
+          Deterministic backward does not support headdim > 256.
 
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
@@ -405,7 +406,8 @@ def flash_attn_varlen_func(
         - 0.0 <= dropout_p < 1.0; 0.0 disables dropout.
         - alibi_slopes not supported.
         - cu_seqlens_q / cu_seqlens_k / block_table must be int32 when provided.
-        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim.
+          Deterministic backward does not support headdim > 256.
 
     Returns:
         out: (total_q, nheads, headdim).
@@ -592,7 +594,8 @@ def flash_attn_func(
         - batch_size > 0.
         - softcap >= 0 (0.0 disables).
         - alibi_slopes / attention_chunk / pack_gqa not supported.
-        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
+          Deterministic backward does not support headdim > 256.
 
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
@@ -674,7 +677,8 @@ def flash_attn_varlen_func(
         - softcap >= 0 (0.0 disables).
         - alibi_slopes / attention_chunk / pack_gqa not supported.
         - cu_seqlens_q / cu_seqlens_k must be int32 when provided.
-        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
+          Deterministic backward does not support headdim > 256.
 
     Returns:
         out: (total_q, nheads, headdim).
@@ -848,7 +852,8 @@ def flash_attn_varlen_func(
         - pack_gqa / min_seqlen_k / gather_kv_indices are not supported.
         - cu_seqlens_* / seqused_* / page_table must be int32 when provided.
         - On Ascend 950, paged KV cache page_size must be one of 128, 256, 512, or 1024.
-        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
+          Deterministic backward does not support headdim > 256.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim_v) or (total_q, nheads, headdim_v) if varlen.
