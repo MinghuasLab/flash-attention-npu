@@ -75,7 +75,13 @@ class FlashDecodeCombine950 {
     {
 #ifdef __DAV_VEC__
         __gm__ FAInferStaticTilingData* tiling = reinterpret_cast<__gm__ FAInferStaticTilingData*>(params.tiling);
-        const uint32_t allowFlashDecode = params.runtime.allowFlashDecode;
+        uint32_t allowFlashDecode;
+        if constexpr (FULL_QUANT_FP8) {
+            allowFlashDecode = params.fp8Runtime.allowFlashDecode;
+        } else {
+            const auto* runtimeTiling = reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
+            allowFlashDecode = runtimeTiling->allowFlashDecode;
+        }
         if (tiling->flashDecodeFlag == 0U || allowFlashDecode == 0U) {
             return;
         }

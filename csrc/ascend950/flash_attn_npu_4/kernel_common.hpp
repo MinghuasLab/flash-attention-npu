@@ -15,7 +15,6 @@
 
 #include "kernel_operator.h"
 #include "tilingdata.h"
-#include "fwd_runtime_params.h"
 
 constexpr int32_t NUM1 = 1;
 constexpr int32_t NUM4 = 4;
@@ -60,10 +59,11 @@ struct FAIKernelParams {
     GM_ADDR lse;
     GM_ADDR workSpace;
     GM_ADDR tiling;
+    GM_ADDR runtimeTiling;
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
     GM_ADDR vDescale = nullptr;
-    FAInferRuntimeData runtime{};
+    FAInferRuntimeData fp8Runtime{};
     // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
     // BSND / TND, whose layout is the compile-time Format template parameter.
     int64_t kvSeqlenAllocated;
@@ -75,11 +75,11 @@ struct FAIKernelParams {
     __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR seqUsedQ_,
                                       GM_ADDR seqUsedKv_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_,
-                                      int64_t kvSeqlenAllocated_, FwdStorageParams storage_ = {},
-                                      FAInferRuntimeData runtime_ = {})
+                                      GM_ADDR runtimeTiling_, int64_t kvSeqlenAllocated_,
+                                      FwdStorageParams storage_ = {})
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), o(o_), lse(lse_),
-          workSpace(workSpace_), tiling(tiling_), runtime(runtime_), kvSeqlenAllocated(kvSeqlenAllocated_),
+          workSpace(workSpace_), tiling(tiling_), runtimeTiling(runtimeTiling_), kvSeqlenAllocated(kvSeqlenAllocated_),
           storage(storage_)
     {}
 };

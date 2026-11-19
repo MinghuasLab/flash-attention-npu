@@ -123,7 +123,8 @@ class FAIKernel950 {
     {
         __gm__ const FAInferStaticTilingData* faiTilingData =
             reinterpret_cast<__gm__ const FAInferStaticTilingData*>(params.tiling);
-        const FAInferRuntimeData& runtime = params.runtime;
+        __gm__ const FAInferRuntimeData* runtimeTilingData =
+            reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
         AscendC::GlobalTensor<ElementQ> gQ;
         gQ.SetGlobalBuffer((__gm__ ElementQ*)params.q);
         AscendC::GlobalTensor<ElementK> gK;
@@ -161,8 +162,8 @@ class FAIKernel950 {
         embedV_ = faiTilingData->embeddingSizeV;
         firstBatchTaskNum_ = faiTilingData->firstBatchTaskNum;
         totalTaskNum_ = faiTilingData->totalTaskNum;
-        scaleValue_ = runtime.scaleValue;
-        softcapValue_ = runtime.softcapValue;
+        scaleValue_ = runtimeTilingData->scaleValue;
+        softcapValue_ = runtimeTilingData->softcapValue;
         // base tile info
         qBaseTile_ = faiTilingData->qBaseTile;
         kvBaseTile_ = faiTilingData->kvBaseTile;
@@ -171,9 +172,9 @@ class FAIKernel950 {
         // aligned seqlen q & kv
         qSeqlenAligned_ = faiTilingData->qSeqlenAligned;
         kvSeqlenAligned_ = faiTilingData->kvSeqlenAligned;
-        maxNumBlocksPerBatch_ = runtime.maxNumBlocksPerBatch;
-        blockSize_ = runtime.blockSize;
-        numBlocks_ = runtime.numBlocks;
+        maxNumBlocksPerBatch_ = runtimeTilingData->maxNumBlocksPerBatch;
+        blockSize_ = runtimeTilingData->blockSize;
+        numBlocks_ = runtimeTilingData->numBlocks;
         qkL1TileM_ = faiTilingData->qkL1TileM;
         qkL1TileN_ = faiTilingData->qkL1TileN;
         qkL1TileKLeft_ = faiTilingData->qkL1TileKLeft;
@@ -186,9 +187,9 @@ class FAIKernel950 {
         kL1BufNum_ = faiTilingData->kL1BufNum;
         vL1BufNum_ = faiTilingData->vL1BufNum;
         pL1BufNum_ = faiTilingData->pL1BufNum;
-        windowSizeLeft_ = runtime.windowSizeLeft;
-        windowSizeRight_ = runtime.windowSizeRight;
-        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtime.allowFlashDecode != 0U;
+        windowSizeLeft_ = runtimeTilingData->windowSizeLeft;
+        windowSizeRight_ = runtimeTilingData->windowSizeRight;
+        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtimeTilingData->allowFlashDecode != 0U;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
@@ -1059,10 +1060,8 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
-                            GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocks, uint32_t blockConfig,
-                            FwdWindowLaunchParams<maskCategory == MaskCategory::MASK_SWA> windowBounds,
-                            int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                            GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling, int64_t kvSeqlenAllocated,
+                            FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1123,11 +1122,8 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
-    const auto runtime = MakeFwdRuntime<maskCategory == MaskCategory::MASK_SWA>(
-        scaleValue, softcapValue, numBlocks, maxNumBlocks, blockConfig, windowBounds,
-        maskCategory == MaskCategory::MASK_CAUSAL ? 0 : -1);
-    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen,     actualKvseqlen, seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      kvSeqlenAllocated, storage,        runtime};
+    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
+                           seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
     Kernel faInfer;
     faInfer(params);
 }
@@ -1136,9 +1132,7 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
-                              GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
-                              float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocks, uint32_t blockConfig,
-                              FwdWindowLaunchParams<maskCategory == MaskCategory::MASK_SWA> windowBounds,
+                              GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling,
                               int64_t kvSeqlenAllocated, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
@@ -1193,11 +1187,8 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
-    const auto runtime = MakeFwdRuntime<maskCategory == MaskCategory::MASK_SWA>(
-        scaleValue, softcapValue, numBlocks, maxNumBlocks, blockConfig, windowBounds,
-        maskCategory == MaskCategory::MASK_CAUSAL ? 0 : -1);
-    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen,     actualKvseqlen, seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      kvSeqlenAllocated, storage,        runtime};
+    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
+                           seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
     Kernel faInfer;
     faInfer(params);
 }
