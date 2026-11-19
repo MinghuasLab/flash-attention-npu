@@ -442,7 +442,6 @@ test_cases = [
         0.0,
         False,
         marks=_ASCEND950_D512,
-        id="d512-bsnd-window-tail",
     ),
     pytest.param(
         torch.bfloat16,
@@ -463,7 +462,6 @@ test_cases = [
         0.0,
         False,
         marks=_ASCEND950_D512,
-        id="d512-tnd-packed-multirequest",
     ),
     # TND paged: decode / prefill / split-KV / MHA.
     (torch.float16, 2, 6, 3, 1, 1024, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
