@@ -1,4 +1,4 @@
-/** Copyright (c) 2026 Huawei Technologies Co., Ltd. CANN Open Software License Agreement Version 2.0. */
+// Copyright (c) 2026, Minghua Shen.
 #ifndef FA950_FWD_RESOURCE_PLAN_H
 #define FA950_FWD_RESOURCE_PLAN_H
 
