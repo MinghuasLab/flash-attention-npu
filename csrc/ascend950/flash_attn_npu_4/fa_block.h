@@ -13,6 +13,13 @@ inline constexpr MaskCategory CAUSAL_MASK = MaskCategory::MASK_CAUSAL;
 inline constexpr MaskCategory SLIDING_WINDOW_MASK = MaskCategory::MASK_SWA;
 } // namespace QuantMask
 
+namespace fa950_stats {
+inline constexpr uint32_t STATS_TASK_STAGES = 4U;
+inline constexpr uint32_t STATS_SLOT_ELEM_NUM = 64U;
+inline constexpr uint32_t STATS_SLOT_BYTES = STATS_SLOT_ELEM_NUM * 4U;
+inline constexpr uint32_t STATS_BYTES = STATS_TASK_STAGES * STATS_SLOT_BYTES;
+} // namespace fa950_stats
+
 namespace Catlass::Epilogue {
 
 // Dispatch policy for the fwd online-softmax epilogue. HAS_SOFTCAP_ carries the

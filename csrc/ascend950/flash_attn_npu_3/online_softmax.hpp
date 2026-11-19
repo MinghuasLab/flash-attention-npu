@@ -103,6 +103,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LM_UB_TENSOR_OFFSET);
         llUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LL_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
+        gmUbTensorBase = gmUbTensor;
+        glUbTensorBase = glUbTensor;
+        lmUbTensorBase = lmUbTensor;
     }
 
     __aicore__ inline ~BlockEpilogue() {}
@@ -121,11 +124,54 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.ll);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(ub.mask);
+        gmUbTensorBase = gmUbTensor;
+        glUbTensorBase = glUbTensor;
+        lmUbTensorBase = lmUbTensor;
+    }
+
+    // Cross-task pipelining: the row statistics of task n must survive while
+    // task n+1 overwrites the other slot with its own online softmax state.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        const uint32_t off = slot * fa950_plan::STATS_SLOT_ELEM_NUM;
+        lmUbTensor = lmUbTensorBase[off];
+        gmUbTensor = gmUbTensorBase[off];
+        glUbTensor = glUbTensorBase[off];
+    }
+
+    uint32_t segmentRows_ = 0U;
+    __aicore__ inline void SetSegmentRows(uint32_t rows)
+    {
+        segmentRows_ = rows;
     }
 
     template <class TensorDst, class TensorSrc>
     __aicore__ inline void CopyPUbToPL1(TensorDst const& dstTensor, TensorSrc const& srcTensor, uint32_t m)
     {
+        if (segmentRows_ != 0U) {
+            const uint32_t rowStart = tla::get<0>(dstTensor.coord());
+            const uint32_t cols = tla::get<1>(srcTensor.originShape());
+            const uint32_t colBlocks = (cols + 15U) / 16U;
+            const uint32_t srcPitch = tla::get<1, 1>(srcTensor.stride());
+            const uint32_t paddedRows = RoundUp(segmentRows_, 16U);
+            uint32_t copied = 0U;
+            while (copied < m) {
+                const uint32_t row = rowStart + copied;
+                const uint32_t segment = row / segmentRows_;
+                const uint32_t inSegment = row % segmentRows_;
+                const uint32_t count = AscendC::Std::min(m - copied, segmentRows_ - inSegment);
+                AscendC::DataCopyParams params;
+                params.blockCount = colBlocks;
+                params.blockLen = count;
+                params.srcStride = srcPitch / 16U - count + 1U;
+                params.dstStride = paddedRows - count;
+                // P is zN: each row in a 16-column stripe occupies 32 bytes.
+                AscendC::DataCopy(dstTensor.data()[segment * paddedRows * colBlocks * 16U + inSegment * 16U],
+                                  srcTensor.data()[copied * 16U], params);
+                copied += count;
+            }
+            return;
+        }
         const uint32_t blockCount = tla::get<1, 1>(srcTensor.shape());
         const uint32_t blockLen = tla::get<0, 0>(srcTensor.shape()) * tla::get<0, 1>(srcTensor.shape());
         const uint32_t dstOuterStrideCol = tla::get<1, 1>(dstTensor.stride());
@@ -760,6 +806,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<ElementInput> lmUbTensor;
     AscendC::LocalTensor<ElementInput> llUbTensor;
+    AscendC::LocalTensor<float> gmUbTensorBase;
+    AscendC::LocalTensor<float> glUbTensorBase;
+    AscendC::LocalTensor<ElementInput> lmUbTensorBase;
     uint32_t subBlockIdx_;
 
     enum class MAligendTileNum {
