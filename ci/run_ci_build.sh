@@ -35,7 +35,19 @@ export FLASH_ATTN_SKIP_SUBMODULE_INIT=1
 export FLASH_ATTN_FORCE_BUILD=TRUE
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 log "python setup.py build_ext --inplace (FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:-all}, FLASH_ATTN_BUILD_NPU=${FLASH_ATTN_BUILD_NPU:-auto})"
-python3 setup.py build_ext --inplace
+build_rc=0
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::group::Compile native extensions\n'
+fi
+python3 setup.py build_ext --inplace || build_rc=$?
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::endgroup::\n'
+fi
+if [ "$build_rc" -ne 0 ]; then
+  log "Build failed (exit=$build_rc)"
+  exit "$build_rc"
+fi
+log "Build succeeded"
 
 log "build phase done (artifacts in build/)"
 log "build phase end: $(date '+%Y-%m-%d %H:%M:%S')"

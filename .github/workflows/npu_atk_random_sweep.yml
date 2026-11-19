@@ -87,15 +87,23 @@ jobs:
               mount_args+=(-v "$path:$path:ro")
             fi
           done
+          device_args=()
+          while IFS= read -r device_arg; do
+            [ -n "$device_arg" ] && device_args+=("$device_arg")
+          done < <(bash "$CI_HELPERS_DIR/ci/detect_npu.sh" --docker-device-args all)
+          if [ "${#device_args[@]}" -eq 0 ]; then
+            echo "No Ascend NPU device nodes found" >&2
+            exit 1
+          fi
           docker run --rm \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
-            --privileged \
+            "${device_args[@]}" \
             --network host \
             --ipc host \
             "${GIT_PROXY_DOCKER_ARGS[@]}" \
             "${mount_args[@]}" \
             -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
-            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
             -v "$ATK_WORKSPACE/harness:/ws/harness" \
             -w /ws/harness \
             "$CI_DOCKER_IMAGE" \

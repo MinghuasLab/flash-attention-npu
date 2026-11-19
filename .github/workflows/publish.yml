@@ -189,7 +189,6 @@ jobs:
             "${docker_cpu_args[@]}" \
             --user 0:0 \
             --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
-            --privileged \
             --ipc host \
             --network host \
             -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \

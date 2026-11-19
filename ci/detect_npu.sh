@@ -8,6 +8,7 @@
 #   bash ci/detect_npu.sh --summary      # 打印所有 NPU 与选中卡
 #   bash ci/detect_npu.sh --candidates   # 打印 CI 选卡顺序 (按 task_count 升序)
 #   bash ci/detect_npu.sh --env          # 打印 "export NPU_SELECTED_DEVICE=<id>"
+#   bash ci/detect_npu.sh --docker-device-args <id|all> # 输出 Docker NPU --device 参数
 #   eval "$(bash ci/detect_npu.sh --env)"
 #
 # 选卡策略 (动态选卡, 不锁卡):
@@ -181,6 +182,43 @@ select_device() {
   return 0
 }
 
+docker_device_args() {
+  local selection="${1:-all}"
+  local node
+  local found=0
+  local device_nodes=()
+
+  if [ "$selection" = "all" ]; then
+    for node in /dev/davinci[0-9]*; do
+      if [ -c "$node" ]; then
+        device_nodes+=("$node")
+      fi
+    done
+  elif [[ "$selection" =~ ^[0-9]+$ ]]; then
+    node="/dev/davinci$selection"
+    if [ -c "$node" ]; then
+      device_nodes+=("$node")
+    else
+      die "NPU device node not found: $node"
+    fi
+  else
+    die "invalid NPU device selection: $selection (expected numeric id or all)"
+  fi
+
+  for node in "${device_nodes[@]}"; do
+    printf -- '--device=%s:%s:rwm\n' "$node" "$node"
+    found=1
+  done
+
+  for node in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
+    if [ -c "$node" ]; then
+      printf -- '--device=%s:%s:rwm\n' "$node" "$node"
+    fi
+  done
+
+  [ "$found" -eq 1 ] || die "no Ascend NPU device nodes found"
+}
+
 case "${1:---summary}" in
   --summary)
     echo "Detected NPU devices:"
@@ -229,7 +267,10 @@ case "${1:---summary}" in
     fi
     printf 'export NPU_SELECTED_DEVICE=%s\n' "$sel"
     ;;
+  --docker-device-args)
+    docker_device_args "${2:-all}"
+    ;;
   *)
-    die "unknown argument: $1 (use --summary|--candidates|--env)"
+    die "unknown argument: $1 (use --summary|--candidates|--env|--docker-device-args)"
     ;;
 esac

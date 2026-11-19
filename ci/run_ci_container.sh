@@ -32,7 +32,7 @@
 #   CI_BENCHMARK_LAYOUT      (默认 all)     all|bsnd|tnd
 #   CI_RUN_EXAMPLE_ST        (默认 true)    是否跑 Example ST
 #   CI_CONTAINER_DEVICE      (默认 0)       容器内逻辑设备号
-#   CI_DOCKER_PRIVILEGED     (默认 true)    是否带 --privileged
+#   CI_DOCKER_PRIVILEGED     (默认 false)   显式设 true 可临时恢复特权模式
 #   CI_DOCKER_IMAGE          (默认 fa-npu-ci:910b-cann9.1-torch2.9)
 #   CI_DOCKER_CPUS           可选, 限制每个容器的 CPU 数
 #   CI_SKIP_BUILD            (默认 false)   true=跳过阶段1 (已有 build/ 产物)
@@ -111,7 +111,7 @@ if [ "$CI_CONTAINER_DEVICE" != "0" ]; then
   printf '[CI][ERROR] single-card mode requires CI_CONTAINER_DEVICE=0 (got %s)\n' "$CI_CONTAINER_DEVICE" >&2
   exit 1
 fi
-CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
+CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-false}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 docker_cpu_args=()
@@ -209,7 +209,7 @@ docker_mount_args() {
     /etc/ascend_install.info; do
 
     if [ -e "$path" ]; then
-      mount_args+=(-v "$path:$path")
+      mount_args+=(-v "$path:$path:ro")
     fi
 
   done
@@ -332,6 +332,7 @@ run_build_phase() {
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -e FLASH_ATTN_BUILD_NPU="${FLASH_ATTN_BUILD_NPU:-auto}" \
     -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
+    -e GITHUB_ACTIONS="${GITHUB_ACTIONS:-false}" \
     -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -e CI_BENCHMARK_COMMIT_SHA="$CI_BENCHMARK_COMMIT_SHA" \
     -w /workspace/flash-attention-npu \
@@ -389,6 +390,7 @@ run_docker_task() {
   local rc
   local entry_script
   local mount_args=()
+  local device_args=()
 
 
   case "$CI_TASK" in
@@ -416,6 +418,12 @@ run_docker_task() {
     [ -n "$m" ] && mount_args+=("$m")
 
   done < <(docker_mount_args)
+
+  while IFS= read -r device_arg; do
+    [ -n "$device_arg" ] && device_args+=("$device_arg")
+  done < <(bash "$SCRIPT_DIR/detect_npu.sh" --docker-device-args "$device_id")
+  [ "${#device_args[@]}" -gt 0 ] \
+    || die "no NPU device nodes found for physical device $device_id"
 
 
   log \
@@ -470,6 +478,7 @@ container=$GOLDEN_CACHE_DIR"
     "${docker_cpu_args[@]}" \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
+    "${device_args[@]}" \
     "${GIT_PROXY_DOCKER_ARGS[@]}" \
     --network host \
     --ipc host \
@@ -482,6 +491,7 @@ container=$GOLDEN_CACHE_DIR"
     \
     -e CI_TASK="$CI_TASK" \
     -e CI_ENTRY_SCRIPT="$entry_script" \
+    -e GITHUB_ACTIONS="${GITHUB_ACTIONS:-false}" \
     \
     -e CI_BENCHMARK_FA_VERSION="$CI_BENCHMARK_FA_VERSION" \
     -e CI_BENCHMARK_LAYOUT="$CI_BENCHMARK_LAYOUT" \

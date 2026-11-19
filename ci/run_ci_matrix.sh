@@ -21,7 +21,7 @@
 #   ARCH_FILTER / NPU_FILTER (可选) 只选择对应 CPU 架构和 NPU 后端
 #   IMAGE_PREFIX          (默认 fa-npu-ci)
 #   CI_MATRIX_MAX_JOBS    (默认 0=不限) 并发容器数上限 (内存吃紧时调小, 如 3)
-#   CI_DOCKER_PRIVILEGED  (默认 true)
+#   CI_DOCKER_PRIVILEGED  (默认 false; 显式设 true 可临时恢复特权模式)
 #   CI_DOCKER_CPUS        可选, 限制每个容器的 CPU 数
 #   CI_CONTAINER_SCOPE   （默认 -local-$(id -u)-$$）当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_VERSION (默认 all) 编译哪些 API 代 (all/v2/v3/v4)
@@ -37,7 +37,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/ci_build_matrix.tsv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fa-npu-ci}"
 CI_MATRIX_MAX_JOBS="${CI_MATRIX_MAX_JOBS:-0}"
-CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
+CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-false}"
 docker_cpu_args=()
 if [ -n "${CI_DOCKER_CPUS:-}" ]; then
   docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")

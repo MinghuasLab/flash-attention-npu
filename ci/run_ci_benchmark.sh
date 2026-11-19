@@ -64,7 +64,15 @@ PY
 ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 export ASCEND_TOOLKIT_HOME
 log "python setup.py install --skip-build (reuse Phase 1 build artifacts)"
-python3 setup.py install --skip-build
+install_rc=0
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::group::Copy built extensions into benchmark environment\n'
+fi
+python3 setup.py install --skip-build || install_rc=$?
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::endgroup::\n'
+fi
+[ "$install_rc" -eq 0 ] || die "failed to install built extensions (exit=$install_rc)"
 
 log "FlashAttention import check"
 # Keep one combined benchmark_results.csv/json output; skip FA2 on 950.

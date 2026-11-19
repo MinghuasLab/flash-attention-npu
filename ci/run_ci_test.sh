@@ -69,19 +69,27 @@ log "test phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 
 # ---------- 1. NPU 自检 (需要卡) ----------
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
-python3 - <<'PY' || die "torch_npu not functional inside container (check --privileged / driver mount)"
+python3 - <<'PY' || die "torch_npu not functional inside container (check NPU device passthrough / driver mount)"
 import torch
 import torch_npu
 print("torch:", torch.__version__)
 print("torch_npu:", torch_npu.__version__)
 print("torch_npu device_count:", torch_npu.npu.device_count())
-assert torch_npu.npu.device_count() >= 1, "device_count==0; --privileged or driver mount missing?"
+assert torch_npu.npu.device_count() >= 1, "device_count==0; NPU device passthrough or driver mount missing?"
 PY
 
 # ---------- 2. 安装 (复用 build/ 产物, 不重新编译) ----------
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 log "python setup.py install --skip-build (reuse build/ artifacts)"
-python3 setup.py install --skip-build
+install_rc=0
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::group::Copy built extensions into test environment\n'
+fi
+python3 setup.py install --skip-build || install_rc=$?
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+  printf '::endgroup::\n'
+fi
+[ "$install_rc" -eq 0 ] || die "failed to install built extensions (exit=$install_rc)"
 
 log "import check"
 python3 - <<'PY'
@@ -139,14 +147,14 @@ timing_total() {
 
 # top 3 nonzero phases from timing string
 timing_top_phases() {
-  printf '%s\n' $1 | sed 's/s$//' \
+  printf '%s\n' "$1" | sed 's/s$//' \
     | awk -F= '$1 != "total" && $2+0 > 0 {printf "%s=%.1fs\n", $1, $2}' \
     | sort -t= -k2 -rn | head -3 | awk '{printf "%s%s", sep, $0; sep = " "}'
 }
 
 # csv tail for one timing summary, 12 phase seconds then quoted event tags
 timing_csv_fields() {
-  printf '%s\n' $1 \
+  printf '%s\n' "$1" \
     | awk -F= 'BEGIN{split("rand h2d pack cache index postprocess forward backward ref golden compare other", o, " ")}
         NF < 2 {next}
         $2 ~ /^[0-9]+(\.[0-9]+)?s?$/ {v[$1] = $2 + 0; next}
@@ -214,7 +222,8 @@ run_pytest() {
   export CI_PROGRESS_FILE="$progress_file"
   (
     local total=0 done=0 passed=0 failed=0 skipped=0 events_seen=0 last_line=0
-    local started_at="$(date +%s)" running="" running_since=0
+    local started_at running="" running_since=0
+    started_at="$(date +%s)"
     local last_progress=$(( $(date +%s) - 20 ))
     local kind value duration encoded details nodeid timing dur_s
     local log_total log_pass log_fail log_skip now
@@ -280,15 +289,15 @@ run_pytest() {
         local log_size=0
         [ -f "$logfile" ] && log_size="$(stat -c%s "$logfile" 2>/dev/null || echo 0)"
         if [ "$total" -gt 0 ] 2>/dev/null; then
+          local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
           local overall_seg=""
           if [ "${OVERALL_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
             local overall_done=$(( ${OVERALL_BASE:-0} + done ))
             local pct=$(( overall_done * 100 / OVERALL_TOTAL ))
-            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) | "
+            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | "
           fi
-          local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
           printf '[progress] %sgroup %s/%s %s: %s/%s | %ss\n' \
-            "overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | " \
+            "$overall_seg" \
             "${FILE_IDX:-?}" "${FILE_TOT:-1}" "${short##*/}" \
             "$done" "$total" "$((now - started_at))"
           if [ -n "$running" ]; then
@@ -370,9 +379,6 @@ run_pytest_scanned() {
   # Group files by imported flash_attn version to avoid aicpu fold
   local common_files=() v2_files=() v3_files=() v4_files=()
   local skipped_files=() collect_failed_files=()
-  local runnable_common=() runnable_v2=() runnable_v3=() runnable_v4=()
-  local common_count=0 v2_count=0 v3_count=0 v4_count=0
-
   for file in "${files[@]}"; do
     local has_v2=0 has_v3=0 has_v4=0
     grep -q "flash_attn_npu_4" "$file" 2>/dev/null && has_v4=1
@@ -428,7 +434,7 @@ run_pytest_scanned() {
         *) skipped_files+=("$file") ;;
       esac
     done
-    group_counts[$gi]=$gtotal
+    group_counts[gi]=$gtotal
     if [ "$gtotal" -gt 0 ]; then
       group_runnable+=("$gi")
     fi
@@ -451,7 +457,7 @@ run_pytest_scanned() {
 
   local overall_total=0
   for gi in "${group_runnable[@]}"; do
-    overall_total=$((overall_total + group_counts[$gi]))
+    overall_total=$((overall_total + group_counts[gi]))
   done
 
   local group_idx=0 group_tot=${#group_runnable[@]}
