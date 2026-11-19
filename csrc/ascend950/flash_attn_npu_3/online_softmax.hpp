@@ -113,6 +113,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         subBlockIdx_ = AscendC::GetSubBlockIdx();
         scaleValue = scale;
         softcapValue = softcap;
+        pStages_ = ub.pStages;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(ub.s);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(ub.p);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
@@ -190,7 +191,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
-        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        // D512 keeps one P UB slot with a fixed copy event; the legacy path
+        // rotates P with the Score slot. Score slots keep rotating either way.
+        uint32_t pSlot = pStages_ == 1U ? 0U : ubSBufId;
+        uint32_t pCopyEventId = pStages_ == 1U ? 3U : ubSBufId + 2U;
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[pSlot * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
@@ -201,7 +206,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pCopyEventId);
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false>(
@@ -229,13 +234,110 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[pSlot * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
         auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pCopyEventId);
+        // crossCoreSync after PIPE_MTE1 move
+        SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+        if (!isFirstKvSTile) {
+            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
+                                                tailM);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // D512 positional causal/SWA visibility: Q/K positions are compared in
+    // registers, so no mask GM read and no mask UB handle exist on this path.
+    // qTileCenterStart is the bottom-right aligned center of the tile's first
+    // logical row; kvSStartIdx is this KV tile's first column. qRow advances
+    // with wraparound at qSBlockSize so merged GQA tail heads reuse the same
+    // per-token center sequence. Window bounds are normalized to the effective
+    // lengths by the caller. This operator only runs with a single-slot P plan.
+    template <bool IsSwa = false, class TensorP>
+    __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+                                      uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+                                      Arch::CrossCoreFlag softmaxReadyFlag, int32_t qTileCenterStart,
+                                      uint32_t kvSStartIdx, uint32_t qSBlockSize, uint32_t qNBlockSize,
+                                      int32_t windowLeft = 0, int32_t windowRight = 0)
+    {
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t totalRows = qSBlockSize * qNBlockSize;
+        uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows : (totalRows > splitRows ? totalRows - splitRows : 0U);
+        if (m == 0) {
+            WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+            SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+            WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+            SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+            return;
+        }
+        uint32_t n = actualBlockShape.n();
+        uint16_t mRound = RoundUp(m, C0_NUM_PER_FRACTAL);
+        uint16_t nRound = RoundUp(n, ELE_NUM_PER_C0);
+        uint32_t blockStride = mRound + 1;
+        constexpr int16_t vlSize = static_cast<int16_t>(AscendC::GetVecLen() / sizeof(ElementInput));
+        uint32_t tailN = (n - 1) % vlSize + 1;
+        int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
+        uint32_t tailM = (m - 1) % vlSize + 1;
+
+        // Single P UB slot with a fixed copy event, decoupled from the
+        // rotating Score slot (D512 plan).
+        constexpr uint32_t P_SLOT = 0U;
+        constexpr uint32_t P_COPY_EVENT = 3U;
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[P_SLOT * MAX_UB_P_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(P_COPY_EVENT);
+        if (isFirstKvSTile) {
+            if (n > 64) {
+                ComputeScaleAndMaxPositions<ElementInput, ElementOutput, false, IsSwa>(
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, tailN, scaleValue, softcapValue,
+                    blockStride, qTileCenterStart, kvSStartIdx, rowStart % qSBlockSize, qSBlockSize, windowLeft,
+                    windowRight);
+            } else {
+                ComputeScaleAndMaxPositions64<ElementInput, ElementOutput, false, IsSwa>(
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, tailN, scaleValue, softcapValue,
+                    blockStride, qTileCenterStart, kvSStartIdx, rowStart % qSBlockSize, qSBlockSize, windowLeft,
+                    windowRight);
+            }
+        } else {
+            if (n > 64) {
+                ComputeScaleAndMaxPositions<ElementInput, ElementOutput, true, IsSwa>(
+                    sAddr, nowMaxAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, tailN, scaleValue, softcapValue,
+                    blockStride, qTileCenterStart, kvSStartIdx, rowStart % qSBlockSize, qSBlockSize, windowLeft,
+                    windowRight);
+            } else {
+                ComputeScaleAndMaxPositions64<ElementInput, ElementOutput, true, IsSwa>(
+                    sAddr, nowMaxAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, tailN, scaleValue, softcapValue,
+                    blockStride, qTileCenterStart, kvSStartIdx, rowStart % qSBlockSize, qSBlockSize, windowLeft,
+                    windowRight);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
+        SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+
+        auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[P_SLOT * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
+        auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
+        WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
+
+        CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(P_COPY_EVENT);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
@@ -761,6 +863,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<ElementInput> lmUbTensor;
     AscendC::LocalTensor<ElementInput> llUbTensor;
     uint32_t subBlockIdx_;
+    uint32_t pStages_ = fa950_plan::SCORE_STAGES;
 
     enum class MAligendTileNum {
         Zero = 0,
@@ -769,6 +872,275 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Three = 3,
         Four = 4
     };
+
+    // Position-based causal softmax. qRow is the per-head row offset of this AIV;
+    // advancing it with wraparound preserves fused GQA without a mask tensor.
+    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa>
+    __simd_vf__ static inline void ComputeScaleAndMaxPositions(
+        __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* LastMaxUbStart,
+        __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t m, uint32_t tailN, ElementInput dScale,
+        ElementInput dSoftcap, uint32_t blockStride, int32_t qTileCenterStart, uint32_t kvSStartIdx, uint32_t qRow,
+        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight)
+    {
+        using namespace AscendC::MicroAPI;
+        constexpr uint16_t S2BaseSize = 128;
+        __ubuf__ ElementS* newMaxUbStart = newMaxUb;
+        RegTensor<float> minVreg;
+        RegTensor<float> srcVreg;
+        RegTensor<float> srcVreg_unroll;
+        RegTensor<float> srcVreg_mask;
+        RegTensor<float> srcVreg_mask_unroll;
+        RegTensor<float> srcVreg_unroll_new;
+        RegTensor<float> maxSrcVreg;
+        RegTensor<float> maxTmpVreg;
+        RegTensor<float> maxBrcVreg;
+        RegTensor<float> expEvenVreg;
+        RegTensor<float> expOddVreg;
+        RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
+        UnalignRegForStore maxUreg;
+        UnalignRegForStore expSumUreg;
+
+        RegTensor<bfloat16_t> vreg_exp_even_bf16;
+        RegTensor<bfloat16_t> vreg_exp_odd_bf16;
+        RegTensor<bfloat16_t> vreg_exp_bf16;
+
+        RegTensor<half> vreg_exp_even_f16;
+        RegTensor<half> vreg_exp_odd_f16;
+        RegTensor<half> vreg_exp_f16;
+
+        MaskReg pregCompare;
+        MaskReg pregCompare_unroll;
+        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
+        MaskReg pregTailN = UpdateMask<float>(tailN);
+        MaskReg preg_all_b16 = CreateMask<half, MaskPattern::ALL>();
+
+        constexpr static CastTrait castTraitZero = {
+            RegLayout::ZERO,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        constexpr static CastTrait castTraitOne = {
+            RegLayout::ONE,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        RegTensor<int32_t> kvIndexVreg;
+        Arange(kvIndexVreg, static_cast<int32_t>(kvSStartIdx));
+        RegTensor<int32_t> kvIndexUnrollVreg;
+        Adds(kvIndexUnrollVreg, kvIndexVreg, static_cast<int32_t>(FLOAT_REP_SIZE), pregFull);
+        Duplicate(minVreg, MIN_VALUE);
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+
+            Muls(srcVreg, srcVreg, dScale, pregFull);
+            Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
+                ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
+            const int32_t qPosition = qTileCenterStart + static_cast<int32_t>(qRow);
+            if constexpr (IsSwa) {
+                // Inclusive [qPosition-left, qPosition+right], with out-of-window
+                // negative distances wrapping above the unsigned window width.
+                // Bounds are clamped to actual sequence lengths, matching FP8.
+                RegTensor<uint32_t> distanceVreg;
+                const uint32_t offset = static_cast<uint32_t>(windowLeft) - static_cast<uint32_t>(qPosition);
+                const uint32_t width = static_cast<uint32_t>(windowLeft) + static_cast<uint32_t>(windowRight);
+                Adds(distanceVreg, (RegTensor<uint32_t>&)kvIndexVreg, offset, pregFull);
+                Compares<uint32_t, AscendC::CMPMODE::LE>(pregCompare, distanceVreg, width, pregFull);
+                Adds(distanceVreg, (RegTensor<uint32_t>&)kvIndexUnrollVreg, offset, pregFull);
+                Compares<uint32_t, AscendC::CMPMODE::LE>(pregCompare_unroll, distanceVreg, width, pregFull);
+            } else {
+                Compares<int32_t, AscendC::CMPMODE::LE>(pregCompare, kvIndexVreg, qPosition, pregFull);
+                Compares<int32_t, AscendC::CMPMODE::LE>(pregCompare_unroll, kvIndexUnrollVreg, qPosition, pregFull);
+            }
+            if (++qRow == qSBlockSize) {
+                qRow = 0;
+            }
+            Select(srcVreg_mask, srcVreg, minVreg, pregCompare);
+            Select(srcVreg_mask_unroll, srcVreg_unroll, minVreg, pregCompare_unroll);
+
+            Select(srcVreg_unroll_new, srcVreg_mask_unroll, minVreg, pregTailN);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_mask, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
+                                                        pregFull);
+            Max(maxTmpVreg, srcVreg_mask, srcVreg_unroll_new, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                maxSrcVreg, maxTmpVreg, pregFull);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
+        if constexpr (isUpdate) {
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+            LoadAlign(maxSrcVreg, newMaxUbStart);
+            LoadAlign(maxTmpVreg, LastMaxUbStart);
+            Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
+        }
+        LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
+                                                                           srcUb + i * S2BaseSize);
+            ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
+            ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
+
+            Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                expSumVreg, expSumVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
+            if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
+                Cast<bfloat16_t, float, castTraitZero>(vreg_exp_even_bf16, expEvenVreg, pregFull);
+                Cast<bfloat16_t, float, castTraitOne>(vreg_exp_odd_bf16, expOddVreg, pregFull);
+                Or((RegTensor<uint16_t>&)vreg_exp_bf16, (RegTensor<uint16_t>&)vreg_exp_even_bf16,
+                   (RegTensor<uint16_t>&)vreg_exp_odd_bf16, preg_all_b16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_bf16, blockStride, 1, preg_all_b16);
+            } else {
+                Cast<half, float, castTraitZero>(vreg_exp_even_f16, expEvenVreg, pregFull);
+                Cast<half, float, castTraitOne>(vreg_exp_odd_f16, expOddVreg, pregFull);
+                Or((RegTensor<uint16_t>&)vreg_exp_f16, (RegTensor<uint16_t>&)vreg_exp_even_f16,
+                   (RegTensor<uint16_t>&)vreg_exp_odd_f16, preg_all_b16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ half*&)expUb), vreg_exp_f16,
+                                                                             blockStride, 1, preg_all_b16);
+            }
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
+    }
+
+    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa>
+    __simd_vf__ static inline void ComputeScaleAndMaxPositions64(
+        __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* LastMaxUbStart,
+        __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t m, uint32_t tailN, ElementInput dScale,
+        ElementInput dSoftcap, uint32_t blockStride, int32_t qTileCenterStart, uint32_t kvSStartIdx, uint32_t qRow,
+        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight)
+    {
+        using namespace AscendC::MicroAPI;
+        constexpr uint16_t S2BaseSize = 128;
+        __ubuf__ ElementS* newMaxUbStart = newMaxUb;
+        RegTensor<float> minVreg;
+        RegTensor<float> srcVreg;
+        RegTensor<float> srcVreg_unroll;
+        RegTensor<float> srcVreg_unroll_new;
+        RegTensor<float> maxSrcVreg;
+        RegTensor<float> maxTmpVreg;
+        RegTensor<float> maxBrcVreg;
+        RegTensor<float> expEvenVreg;
+        RegTensor<float> expOddVreg;
+        RegTensor<float> expSumVreg;
+        RegTensor<float> softcapVreg;
+        UnalignRegForStore maxUreg;
+        UnalignRegForStore expSumUreg;
+
+        RegTensor<float> srcVreg_mask;
+
+        RegTensor<bfloat16_t> vreg_exp_even_bf16;
+        RegTensor<bfloat16_t> vreg_exp_odd_bf16;
+        RegTensor<bfloat16_t> vreg_exp_bf16;
+
+        RegTensor<half> vreg_exp_even_f16;
+        RegTensor<half> vreg_exp_odd_f16;
+        RegTensor<half> vreg_exp_f16;
+
+        MaskReg pregCompare;
+        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
+        MaskReg pregTailN = UpdateMask<float>(tailN);
+        MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
+
+        constexpr static CastTrait castTraitZero = {
+            RegLayout::ZERO,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        constexpr static CastTrait castTraitOne = {
+            RegLayout::ONE,
+            SatMode::SAT,
+            MaskMergeMode::ZEROING,
+            AscendC::RoundMode::CAST_ROUND,
+        };
+
+        RegTensor<int32_t> kvIndexVreg;
+        Arange(kvIndexVreg, static_cast<int32_t>(kvSStartIdx));
+        Duplicate(minVreg, MIN_VALUE);
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            Muls(srcVreg, srcVreg, dScale, pregTailN);
+            if constexpr (HAS_SOFTCAP_) {
+                ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
+            }
+            const int32_t qPosition = qTileCenterStart + static_cast<int32_t>(qRow);
+            if constexpr (IsSwa) {
+                // Inclusive [qPosition-left, qPosition+right], with out-of-window
+                // negative distances wrapping above the unsigned window width.
+                // Bounds are clamped to actual sequence lengths, matching FP8.
+                RegTensor<uint32_t> distanceVreg;
+                const uint32_t offset = static_cast<uint32_t>(windowLeft) - static_cast<uint32_t>(qPosition);
+                const uint32_t width = static_cast<uint32_t>(windowLeft) + static_cast<uint32_t>(windowRight);
+                Adds(distanceVreg, (RegTensor<uint32_t>&)kvIndexVreg, offset, pregFull);
+                Compares<uint32_t, AscendC::CMPMODE::LE>(pregCompare, distanceVreg, width, pregFull);
+            } else {
+                Compares<int32_t, AscendC::CMPMODE::LE>(pregCompare, kvIndexVreg, qPosition, pregFull);
+            }
+            if (++qRow == qSBlockSize) {
+                qRow = 0;
+            }
+            Select(srcVreg_mask, srcVreg, minVreg, pregCompare);
+            Select(srcVreg_unroll_new, srcVreg_mask, minVreg, pregTailN);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg_unroll_new, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                maxSrcVreg, srcVreg_unroll_new, pregFull);
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxSrcVreg, maxUreg, 1);
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(newMaxUb, maxUreg, 0);
+        if constexpr (isUpdate) {
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+            LoadAlign(maxSrcVreg, newMaxUbStart);
+            LoadAlign(maxTmpVreg, LastMaxUbStart);
+            Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
+        }
+        LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+
+        for (uint16_t i = 0; i < m; ++i) {
+            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
+            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
+            Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
+                expSumVreg, expEvenVreg, pregFull);
+            StoreUnAlign<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumVreg, expSumUreg, 1);
+
+            if constexpr (AscendC::IsSameType<ElementP, bfloat16_t>::value) {
+                Cast<bfloat16_t, float, castTraitZero>(vreg_exp_bf16, expEvenVreg, pregFull);
+                DeInterleave(vreg_exp_even_bf16, vreg_exp_odd_bf16, vreg_exp_bf16, vreg_exp_bf16);
+                StoreAlign<bfloat16_t, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ bfloat16_t*&)expUb), vreg_exp_even_bf16, blockStride, 1, preg_all_b16);
+            } else {
+                Cast<half, float, castTraitZero>(vreg_exp_f16, expEvenVreg, pregFull);
+                DeInterleave(vreg_exp_even_f16, vreg_exp_odd_f16, vreg_exp_f16, vreg_exp_f16);
+                StoreAlign<half, AscendC::MicroAPI::DataCopyMode::DATA_BLOCK_COPY,
+                           AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(
+                    ((__ubuf__ half*&)expUb), vreg_exp_even_f16, blockStride, 1, preg_all_b16);
+            }
+        }
+        StoreUnAlignPost<float, AscendC::MicroAPI::PostLiteral::POST_MODE_UPDATE>(((__ubuf__ float*&)expSumUb),
+                                                                                  expSumUreg, 0);
+    }
 
     template <typename Reg, typename Mask>
     __simd_callee__ static inline void ApplySoftcap(Reg& srcVreg, Reg& softcapVreg, Mask& maskVreg, float softcapValue)

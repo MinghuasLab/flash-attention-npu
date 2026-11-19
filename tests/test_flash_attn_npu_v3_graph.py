@@ -39,7 +39,7 @@ def _run_flash_attn(
         page_table=page_table,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=Q_SEQLEN,
-        softmax_scale=SCALE,
+        softmax_scale=query.shape[-1] ** -0.5,
         causal=is_causal,
         window_size=WINDOW_SIZE,
         scheduler_metadata=scheduler_metadata,
@@ -51,12 +51,24 @@ def _run_flash_attn(
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize("metadata_copy", ["original", "clone", "copy_"])
 def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
-    query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    _check_kvcache_graph(is_causal, metadata_copy, HEAD_SIZE)
+
+
+@pytest.mark.golden_api("flash_attn_with_kvcache")
+def test_d512_flash_attn_kvcache_graph():
+    if "Ascend950" not in torch.npu.get_device_name():
+        pytest.skip("Ascend950 D512 graph replay")
+    _check_kvcache_graph(False, "copy_", 512)
+
+
+def _check_kvcache_graph(is_causal, metadata_copy, head_size):
+    scale = head_size**-0.5
+    query = make_random_tensor((Q_SEQLEN, NUM_HEADS, head_size), DATA_TYPE, device="npu")
     key_cache = make_random_tensor(
-        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, head_size), DATA_TYPE, device="npu"
     )
     value_cache = make_random_tensor(
-        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, head_size), DATA_TYPE, device="npu"
     )
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()
@@ -69,7 +81,7 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
         max_seqlen_k=KV_SEQLEN,
         num_heads_q=NUM_HEADS,
         num_heads_kv=NUM_KV_HEADS,
-        headdim=HEAD_SIZE,
+        headdim=head_size,
         cache_seqlens=cache_seqlens,
         qkv_dtype=DATA_TYPE,
         page_size=BLOCK_SIZE,
@@ -90,11 +102,11 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
             torch.ones(Q_SEQLEN, KV_SEQLEN),
             diagonal=KV_SEQLEN - Q_SEQLEN + 1,
         ).bool()
-    golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
+    golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query.cpu().unsqueeze(0),
         key_cache.cpu(),
         value_cache.cpu(),
-        SCALE,
+        scale,
         causal_mask,
         DATA_TYPE,
         0.0,
@@ -116,7 +128,7 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        output_npu, *_ = _run_flash_attn(
+        output_npu, lse_npu, *_ = _run_flash_attn(
             query,
             key_cache,
             value_cache,
@@ -131,6 +143,8 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
     torch.npu.synchronize()
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="graph out")
+    if head_size == 512:
+        assert_fa_close(lse_npu, golden_lse_ref[0], golden_lse_pt[0], name="graph lse")
 
     # Keep the captured address and static kernel configuration unchanged while
     # replacing the schedule for shorter/longer actual KV lengths. This capacity
@@ -152,11 +166,11 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
                 torch.ones(Q_SEQLEN, kv_length),
                 diagonal=kv_length - Q_SEQLEN + 1,
             ).bool()
-        expected_ref, _, expected_pt, _ = ref_flash_attention_pair(
+        expected_ref, expected_lse_ref, expected_pt, expected_lse_pt = ref_flash_attention_pair(
             query_cpu,
             key_cpu[:, :kv_length],
             value_cpu[:, :kv_length],
-            SCALE,
+            scale,
             mask,
             DATA_TYPE,
             0.0,
@@ -167,6 +181,10 @@ def test_flash_attn_kvcache_graph(is_causal, metadata_copy):
             expected_pt.squeeze(0),
             name=f"graph updated KV={kv_length}",
         )
+        if head_size == 512:
+            assert_fa_close(
+                lse_npu, expected_lse_ref[0], expected_lse_pt[0], name="graph updated lse"
+            )
         current_out = output_npu.cpu()
         assert not torch.equal(current_out, previous_out)
         previous_out = current_out.clone()

@@ -425,12 +425,12 @@ class FAIKernel950 {
                     const int64_t leftOrigin = seqDiff - windowSizeLeft_;
                     windowSizeLeftStartLen = qBlockBase + leftOrigin;
                     windowSizeLeftEndLen = windowSizeLeftStartLen + qSBlockSize;
-                    const int64_t firstKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
+                    const int64_t firstKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeLeftStartLen));
                     kvStart = static_cast<uint32_t>(firstKey) / kvBaseTile_;
                     if (windowSizeLeftEndLen > kvLength) {
-                        delStartRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
+                        delStartRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, kvLength - leftOrigin)));
                     }
                 }
                 if (!notNextMask) {
@@ -438,12 +438,12 @@ class FAIKernel950 {
                     windowSizeRightStartLen = qBlockBase + rightOrigin;
                     // Exclusive upper bound for the last Q row in this tile.
                     windowSizeRightEndLen = windowSizeRightStartLen + qSBlockSize;
-                    const int64_t endKey = AscendC::Std::min(kvLength,
-                        AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
+                    const int64_t endKey =
+                        AscendC::Std::min(kvLength, AscendC::Std::max(int64_t{0}, windowSizeRightEndLen));
                     noSkipKvS = static_cast<uint32_t>(endKey);
                     if (windowSizeRightStartLen < 0) {
-                        delEndRow = static_cast<int32_t>(AscendC::Std::min(qLength,
-                            AscendC::Std::max(int64_t{0}, -rightOrigin)));
+                        delEndRow = static_cast<int32_t>(
+                            AscendC::Std::min(qLength, AscendC::Std::max(int64_t{0}, -rightOrigin)));
                     }
                 }
                 kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));

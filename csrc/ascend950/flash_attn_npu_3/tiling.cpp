@@ -213,6 +213,12 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
+
+    // D512 keeps one Q/K/V L1 slot each and packs K by the full 512 dims;
+    // this must match fa_metadata.aicpu and the device address plan.
+    if (fa950_plan::IsD512(faInfo_.embeddingSize, faInfo_.embeddingSizeV)) {
+        fa950_plan::ApplyD512ResourceFields(faTilingData);
+    }
 }
 
 void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData& faTilingData)
@@ -415,6 +421,10 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     std::vector<uint32_t> splitCounts(bases.size(), 1U);
     if (faInfo_.numSplits > 1U) {
         for (uint32_t base = 0; base < bases.size(); ++base) {
+            if (faInfo_.embeddingSizeV == 512U && bases[base].kvTiles == 0U) {
+                // Keep one candidate, as in auto, so the D512 kernel can write the empty result.
+                continue;
+            }
             splitCounts[base] = std::min(faInfo_.numSplits, bases[base].kvTiles);
         }
     } else {

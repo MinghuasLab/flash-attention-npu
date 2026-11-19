@@ -1779,3 +1779,76 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         rtol=0,
         atol=1e-6,
     )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
+def test_d512_paged_fixed_split_writes_empty_kv_output(monkeypatch):
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as api
+
+    q = torch.zeros((2, 1, 512), dtype=torch.float16, device="npu")
+    k = torch.zeros((16, 128, 1, 512), dtype=q.dtype, device=q.device)
+    v = torch.ones_like(k)
+    kwargs = dict(
+        cu_seqlens_q=_int32_npu([0, 1, 2]),
+        max_seqlen_q=1,
+        cache_seqlens=_int32_npu([2048, 0]),
+        page_table=_int32_npu([list(range(16)), [0] * 16]),
+        return_softmax_lse=True,
+    )
+    s1, lse1, *_ = flash_attn_with_kvcache(q, k, v, num_splits=1, **kwargs)
+    # Use the native out argument to detect a skipped write regardless of allocator contents.
+    prefilled = torch.full_like(q, 7)
+
+    def forward_with_prefilled_out(q, k, v, k_new, v_new, qv, out, *args, **kwargs):
+        return api._flash_attn_forward_impl(q, k, v, k_new, v_new, qv, prefilled, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_flash_attn_forward", forward_with_prefilled_out)
+    s4, lse4, *_ = flash_attn_with_kvcache(q, k, v, num_splits=4, **kwargs)
+
+    expected = torch.ones_like(q)
+    expected[1].zero_()
+    for out, lse in ((s1, lse1), (s4, lse4)):
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse[..., 1], torch.full_like(lse[..., 1], math.inf))
+    torch.testing.assert_close(lse4[..., 0], lse1[..., 0], rtol=0, atol=2e-6)
+
+
+@pytest.mark.golden_api("flash_attn_with_kvcache")
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 D512 paged FlashDecode")
+def test_d512_paged_auto_flashdecode_varlen():
+    dtype = torch.float16
+    q_offsets, kv_lengths = [0, 1, 3], [2049, 1537]
+    page_size, heads, kv_heads, head_size = 256, 16, 4, 512
+    q = make_random_tensor((q_offsets[-1], heads, head_size), dtype, device="npu")
+    k, v, page_table = _make_paged_cache(2, max(kv_lengths), kv_heads, head_size, page_size, dtype)
+    scale = head_size**-0.5
+    out, lse, *_ = flash_attn_with_kvcache(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_int32_npu(q_offsets),
+        max_seqlen_q=2,
+        cache_seqlens=_int32_npu(kv_lengths),
+        page_table=page_table,
+        num_splits=0,
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+    keys, values = gather_paged_kv_batch(
+        k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
+    )
+    for batch, kv_len in enumerate(kv_lengths):
+        start, end = q_offsets[batch : batch + 2]
+        _assert_tnd_matches_ref(
+            out[start:end],
+            lse[:, start:end],
+            q[start:end],
+            (keys[batch : batch + 1, :kv_len], values[batch : batch + 1, :kv_len]),
+            q_offsets=[0, end - start],
+            batch_size=1,
+            num_heads=heads,
+            head_size=head_size,
+            scale=scale,
+            data_type=dtype,
+            is_causal=False,
+        )

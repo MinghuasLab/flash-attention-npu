@@ -58,6 +58,111 @@ def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages)
     torch.testing.assert_close(lse.reshape(512), expected_lse, rtol=0, atol=1e-6)
 
 
+@pytest.fixture
+def capture_950_scheduler_metadata(monkeypatch):
+    from flash_attn_npu_4 import flash_attn_npu_interface_950 as api
+
+    metadata = []
+    get_metadata = api.get_scheduler_metadata
+
+    def record_metadata(*args, **kwargs):
+        tiling = get_metadata(*args, **kwargs)
+        metadata.append(tiling)
+        return tiling
+
+    monkeypatch.setattr(api, "get_scheduler_metadata", record_metadata)
+    return metadata
+
+
+def _assert_950_flashdecode_metadata(metadata):
+    (tiling,) = metadata
+    # Ascend950 FAInferStaticTilingData uint32 fields: FD flag, combine tasks, partial tasks.
+    tiling_words = tiling.cpu().view(torch.int32)
+    assert tiling_words[591].item() == 1
+    assert tiling_words[597].item() > tiling_words[596].item() > 0
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 dense FlashDecode")
+@pytest.mark.parametrize(
+    "dtype, q_shape, kv_shape, disable_scheduler_metadata",
+    [
+        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False),
+        (torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False),
+        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True),
+    ],
+)
+def test_950_d512_dense_auto_flashdecode(
+    dtype, q_shape, kv_shape, disable_scheduler_metadata, capture_950_scheduler_metadata
+):
+    query = make_random_tensor(q_shape, dtype, device="npu")
+    key = make_random_tensor(kv_shape, dtype, device="npu")
+    value = make_random_tensor(kv_shape, dtype, device="npu")
+    scale = q_shape[-1] ** -0.5
+    out, lse = flash_attn_func(
+        query,
+        key,
+        value,
+        num_splits=0,
+        softmax_scale=scale,
+        return_lse=True,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+    )
+    if disable_scheduler_metadata:
+        assert not capture_950_scheduler_metadata
+    else:
+        _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+
+    out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
+        query.cpu(), key.cpu(), value.cpu(), scale, None, dtype
+    )
+    assert_fa_close(out, out_ref, out_pt, name="D512 dense auto FlashDecode out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="D512 dense auto FlashDecode lse")
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 paged FlashDecode")
+def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
+    dtype = torch.bfloat16
+    q_offsets, kv_lengths = [0, 2, 3], [4097, 2049]
+    page_size, heads, kv_heads, head_size = 512, 16, 4, 512
+    q = make_random_tensor((q_offsets[-1], heads, head_size), dtype, device="npu")
+    k, v, page_table = _make_paged_cache(2, max(kv_lengths), kv_heads, head_size, page_size, dtype)
+    scale = head_size**-0.5
+    out, lse, *_ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_int32_npu(q_offsets),
+        max_seqlen_q=2,
+        max_seqlen_k=max(kv_lengths),
+        seqused_k=_int32_npu(kv_lengths),
+        page_table=page_table,
+        num_splits=0,
+        softmax_scale=scale,
+        return_lse=True,
+    )
+    _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+    keys, values = gather_paged_kv_batch(
+        k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
+    )
+    for batch, kv_len in enumerate(kv_lengths):
+        start, end = q_offsets[batch : batch + 2]
+        _assert_tnd_matches_ref(
+            out[start:end],
+            lse[:, start:end],
+            q[start:end],
+            (keys[batch : batch + 1, :kv_len], values[batch : batch + 1, :kv_len]),
+            q_offsets=[0, end - start],
+            batch_size=1,
+            num_heads=heads,
+            head_size=head_size,
+            scale=scale,
+            data_type=dtype,
+            is_causal=False,
+        )
+
+
 def test_950_scheduler_metadata_matches_signature():
     if "Ascend950" not in _device_name:
         pytest.skip("Ascend950-only API signature")

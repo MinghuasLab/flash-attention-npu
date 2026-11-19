@@ -11,7 +11,6 @@
 // ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
 // ✅ softcap (tanh, folded into the online-softmax epilogue)
 
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -78,8 +77,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     CHECK_CONTIGUOUS(q);
-    CHECK_CONTIGUOUS(k);
-    CHECK_CONTIGUOUS(v);
+    if (!page_table_.has_value() || quantMode != 0) {
+        CHECK_CONTIGUOUS(k);
+        CHECK_CONTIGUOUS(v);
+    }
 
     // ============================================================
     // 2. reject list
@@ -202,6 +203,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                     "(the head dimension may differ)");
     }
 
+    if (layout_enum == FwdLayout::BSND && !paged_KV && k.dim() == 4) {
+        kv_seqlen_allocated = static_cast<int64_t>(k.size(1));
+    }
+
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
@@ -211,12 +216,17 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(seqlen_q > 0 && num_heads > 0, "query sequence length and head count must be positive");
+    const bool empty_query = is_varlen_q && q.size(0) == 0 && seqlen_q == 0;
+    TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
+                "query sequence length and head count must be positive");
     TORCH_CHECK(seqlens_k.numel() == batch_size || seqlens_k.numel() == batch_size + 1,
                 "seqused_k must contain per-batch lengths or batch_size + 1 cumulative offsets");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
-    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256, "FlashAttention supports q/k head dimensions in [1, 256]");
-    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256, "FlashAttention supports value head dimensions in [1, 256]");
+    const bool d512_heads = head_size_q == 512 && head_size_v == 512;
+    TORCH_CHECK((head_size_q >= 1 && head_size_q <= 256) || d512_heads,
+                "FlashAttention supports q/k head dimensions in [1, 256] plus exact D512");
+    TORCH_CHECK((head_size_v >= 1 && head_size_v <= 256) || d512_heads,
+                "FlashAttention supports value head dimensions in [1, 256] plus exact D512");
     TORCH_CHECK(
         !(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
         "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
@@ -270,6 +280,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         out = at::empty(output_sizes, q.options().dtype(output_dtype));
     }
 
+    if (empty_query) {
+        auto empty_lse = at::empty(return_lse ? std::vector<int64_t>{num_heads, 0} : std::vector<int64_t>{0},
+                                   q.options().dtype(at::kFloat));
+        auto empty_accum = at::empty({0}, q.options().dtype(at::kFloat));
+        return {out, empty_lse, empty_accum, empty_accum};
+    }
+
     // Host tiling needs sequence lengths on CPU. Precomputed metadata keeps
     // this whole path off graph capture and avoids the D2H synchronization.
     at::Tensor cu_seqlen_q_cpu;
@@ -283,8 +300,12 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const int64_t declared_k = max_seqlen_k_.value_or(
         paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                  : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
-    fa_window::NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right,
-                                        is_causal, is_local);
+    fa_window::NormalizeAttentionWindow(is_causal, seqlen_q, declared_k, window_size_left, window_size_right, is_causal,
+                                        is_local);
+    const uint32_t fdGroupSize = static_cast<uint32_t>(num_heads / num_heads_k);
+    const bool denseFdShape = d512_heads && layout_enum == FwdLayout::BSND && !paged_KV && !is_varlen_kv &&
+                              !is_causal && !is_local && num_splits == 0 && seqlen_q > 0 && seqlen_q <= 16 &&
+                              static_cast<uint64_t>(seqlen_q) * fdGroupSize <= 128;
     if (!scheduler_metadata_.has_value()) {
         // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
         at::Tensor seqused_q_cpu;
@@ -318,7 +339,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
         }
         const bool fd_shape_supported =
-            !is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+            max_kv_seqlen >= 1024 &&
+            (denseFdShape || (!is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16));
         SeqlenScratch scratch;
         optiling::FAInferContext ctx;
         fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
@@ -342,14 +364,14 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const int64_t metadataKvBound = max_seqlen_k_.value_or(
         paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
                  : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
-    const uint32_t metadataGroupSize = num_heads_k == 0 ? 1U : static_cast<uint32_t>(num_heads / num_heads_k);
     const uint32_t metadataBaseTaskUpperBound =
-        static_cast<uint32_t>(batch_size) * static_cast<uint32_t>(num_heads_k) * ((metadataGroupSize + 4U - 1U) / 4U);
+        static_cast<uint32_t>(batch_size) * static_cast<uint32_t>(num_heads_k) * ((fdGroupSize + 4U - 1U) / 4U);
     const uint32_t metadataFdCoreCapacity = blockDim < MAX_FD_ACTIVE_CORE_NUM ? blockDim : MAX_FD_ACTIVE_CORE_NUM;
+    const bool pagedMetadataFdShape = num_splits != 1 && paged_KV && is_varlen_q && !is_local &&
+                                      max_seqlen_q_.has_value() && max_seqlen_q_.value() <= 16 &&
+                                      static_cast<uint64_t>(max_seqlen_q_.value()) * fdGroupSize <= 128;
     const bool metadataFlashDecodeCandidate =
-        scheduler_metadata_.has_value() && num_splits != 1 && paged_KV && is_varlen_q && !is_local &&
-        max_seqlen_q_.has_value() && max_seqlen_q_.value() <= 16 && metadataKvBound >= 1024 &&
-        static_cast<uint64_t>(max_seqlen_q_.value()) * metadataGroupSize <= 128 &&
+        scheduler_metadata_.has_value() && (denseFdShape || pagedMetadataFdShape) && metadataKvBound >= 1024 &&
         metadataBaseTaskUpperBound < metadataFdCoreCapacity &&
         metadataBaseTaskUpperBound <= (blockDim == 0 ? 0U : ((3U * blockDim - 1U) / 10U));
     const bool flashDecodeEnabled =
@@ -518,7 +540,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
-    if ((is_causal || is_local) && quantMode == 0) {
+    if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
         mask_npu_tensor = MakeDeviceTriuMask();
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
@@ -529,11 +551,21 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                         ? (flashDecodeEnabled ? metadataFdCoreCapacity : blockDim)
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
-    const FwdLaunchArgs fwdArgs{
+    FwdLaunchArgs fwdArgs{
         is_bf16,   fmt,      mask_category, paged_KV,     enableDN,  return_lse,    is_softcap, launchBlockDim,
         aclStream, qDev,     kDev,          vDev,         maskDev,   blockTableDev, oDev,       lseDev,
         qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,     tilDev,        runtimeDev, kv_seqlen_allocated,
         quantMode, qDescale, kDescale,      vDescale,     fp8Runtime};
+    fwdArgs.storage =
+        FwdStorageParams{static_cast<uint64_t>(paged_KV ? k.stride(0) : 0),
+                         static_cast<uint64_t>(paged_KV ? v.stride(0) : 0),
+                         static_cast<uint64_t>(paged_KV ? k.stride(1) : 0),
+                         static_cast<uint64_t>(paged_KV ? v.stride(1) : 0),
+                         static_cast<uint64_t>(paged_KV ? k.stride(2) : 0),
+                         static_cast<uint64_t>(paged_KV ? v.stride(2) : 0),
+                         static_cast<uint64_t>(layout_enum == FwdLayout::TND ? q.size(0) : batch_size * seqlen_q)};
+    fwdArgs.kv_bnbd = paged_KV && quantMode == 0 && k.stride(1) == head_size_q &&
+                      k.stride(2) == static_cast<int64_t>(page_block_size) * head_size_q;
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

@@ -22,7 +22,6 @@ Q_SEQLEN = 16
 KV_SEQLEN = 128
 HEAD_SIZE = 128
 BLOCK_SIZE = 128
-SCALE = 1.0 / (HEAD_SIZE**0.5)
 WINDOW_SIZE = (-1, -1)
 
 
@@ -44,7 +43,7 @@ def _run_flash_attn(
         seqused_k=cache_seqlens,
         page_table=page_table,
         max_seqlen_q=Q_SEQLEN,
-        softmax_scale=SCALE,
+        softmax_scale=query.shape[-1] ** -0.5,
         causal=is_causal,
         window_size=WINDOW_SIZE,
         scheduler_metadata=scheduler_metadata,
@@ -55,12 +54,24 @@ def _run_flash_attn(
 @pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_varlen_graph(is_causal):
-    query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    _check_varlen_graph(is_causal, HEAD_SIZE, BLOCK_SIZE)
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+def test_d512_flash_attn_varlen_graph():
+    if "Ascend950" not in torch.npu.get_device_name():
+        pytest.skip("Ascend950 D512 graph replay")
+    _check_varlen_graph(False, 512, 1024)
+
+
+def _check_varlen_graph(is_causal, head_size, page_size):
+    scale = head_size**-0.5
+    query = make_random_tensor((Q_SEQLEN, NUM_HEADS, head_size), DATA_TYPE, device="npu")
     key_cache = make_random_tensor(
-        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+        (BATCH_SIZE, page_size, NUM_KV_HEADS, head_size), DATA_TYPE, device="npu"
     )
     value_cache = make_random_tensor(
-        (BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu"
+        (BATCH_SIZE, page_size, NUM_KV_HEADS, head_size), DATA_TYPE, device="npu"
     )
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
@@ -71,9 +82,9 @@ def test_flash_attn_varlen_graph(is_causal):
         max_seqlen_k=KV_SEQLEN,
         nheads=NUM_HEADS,
         nheads_kv=NUM_KV_HEADS,
-        headdim=HEAD_SIZE,
+        headdim=head_size,
         num_splits=1,
-        headdim_v=HEAD_SIZE,
+        headdim_v=head_size,
         seqused_k=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         causal=is_causal,
@@ -88,11 +99,11 @@ def test_flash_attn_varlen_graph(is_causal):
             torch.ones(Q_SEQLEN, KV_SEQLEN),
             diagonal=KV_SEQLEN - Q_SEQLEN + 1,
         ).bool()
-    golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
+    golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query.cpu().unsqueeze(0),
-        key_cache.cpu(),
-        value_cache.cpu(),
-        SCALE,
+        key_cache.cpu()[:, :KV_SEQLEN],
+        value_cache.cpu()[:, :KV_SEQLEN],
+        scale,
         causal_mask,
         DATA_TYPE,
         0.0,
@@ -114,7 +125,7 @@ def test_flash_attn_varlen_graph(is_causal):
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        output_npu, *_ = _run_flash_attn(
+        output_npu, lse_npu, *_ = _run_flash_attn(
             query,
             key_cache,
             value_cache,
@@ -129,3 +140,5 @@ def test_flash_attn_varlen_graph(is_causal):
     torch.npu.synchronize()
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="graph out")
+    if head_size == 512:
+        assert_fa_close(lse_npu, golden_lse_ref[0], golden_lse_pt[0], name="graph lse")

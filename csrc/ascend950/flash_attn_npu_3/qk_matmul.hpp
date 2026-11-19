@@ -214,11 +214,25 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qNBlockSize, embed),
-                                            tla::MakeStride(static_cast<uint32_t>(qHeadStride), tla::Int<1>{}));
-        auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
-        auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
-        copyGmToL1A(l1QTile, gmQTensorTla, qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+        if (embed == 512U && qNBlockSize == 1U) {
+            // D512 single head: one strided [S, D] matrix. Loading S separate
+            // one-row matrices adds ND2NZ overhead without changing the L1
+            // layout, so use one legal strided copy instead. Legacy dimensions
+            // keep the established multi-ND branch unchanged.
+            auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qSBlockSize, embed),
+                                                tla::MakeStride(tla::get<0>(gATensor.stride()), tla::Int<1>{}));
+            auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+            auto l1QLayoutTla = MakeCustomLayout(rowNum, embedPhysical, 1U);
+            auto l1QTensorTla = tla::MakeTensor(l1ATensor[0], l1QLayoutTla, Arch::PositionL1{});
+            auto l1QTile = GetTile(l1QTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qSBlockSize, embed));
+            copyGmToL1A(l1QTile, gmQTensorTla);
+        } else {
+            auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qNBlockSize, embed),
+                                                tla::MakeStride(static_cast<uint32_t>(qHeadStride), tla::Int<1>{}));
+            auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+            auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
+            copyGmToL1A(l1QTile, gmQTensorTla, qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+        }
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
