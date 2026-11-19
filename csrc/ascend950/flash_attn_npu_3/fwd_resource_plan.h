@@ -34,16 +34,16 @@ struct UbPlan {
 
 // Score/P retain the 64-row capacity needed by merged GQA and DN. The
 // reduction vectors also retain 64 elements because VF loads whole registers.
-FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
+FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages, uint32_t outputRows = 64U, uint32_t scoreRows = 64U, uint32_t pStages = SCORE_STAGES, uint32_t scoreStages = SCORE_STAGES)
 {
     const uint32_t alignedDv = (dv + 15U) / 16U * 16U;
     UbPlan u{};
-    u.sBytes = 64U * 128U * 4U;
-    u.pBytes = (64U + 1U) * 128U * 2U;
-    u.loBytes = 64U * alignedDv * 4U;
+    u.sBytes = scoreRows * 128U * 4U;
+    u.pBytes = (scoreRows + 1U) * 128U * 2U;
+    u.loBytes = outputRows * alignedDv * 4U;
     u.otmpStages = otmpStages;
-    u.p = SCORE_STAGES * u.sBytes;
-    u.lo = u.p + SCORE_STAGES * u.pBytes;
+    u.p = scoreStages * u.sBytes;
+    u.lo = u.p + pStages * u.pBytes;
     u.go = u.lo + otmpStages * u.loBytes;
     u.lm = u.go + u.loBytes;
     u.gm = u.lm + 64U * 4U;
@@ -105,6 +105,7 @@ FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, 
 
 static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
 static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
+static_assert(MakeUbPlan(192, 1, 32).total == 166144U, "D192 small-query output layout");
 static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");

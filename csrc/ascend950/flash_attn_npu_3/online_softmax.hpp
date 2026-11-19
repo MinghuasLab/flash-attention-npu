@@ -56,6 +56,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;
     static constexpr uint32_t MAX_UB_P_ELEM_NUM = 8320;
+    uint32_t sStageElems_ = MAX_UB_S_ELEM_NUM;
+    uint32_t pBankMask_ = 1U;
+    uint32_t pStageElems_ = MAX_UB_P_ELEM_NUM;
     static constexpr uint32_t DM_UB_GLOBAL_ELEM_NUM = 64;
     static constexpr uint32_t ELE_NUM_PER_C0 = 16;
 
@@ -110,6 +113,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     template <class Resource>
     __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, float scale, float softcap)
     {
+        sStageElems_ = ub.sBytes / sizeof(ElementInput);
+        pBankMask_ = (ub.lo - ub.p == ub.pBytes) ? 0U : 1U;
+        pStageElems_ = pBankMask_ * (ub.pBytes / sizeof(ElementOutput));
         subBlockIdx_ = AscendC::GetSubBlockIdx();
         scaleValue = scale;
         softcapValue = softcap;
@@ -190,8 +196,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
-        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * pStageElems_].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * sStageElems_].GetPhyAddr();
         __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
@@ -201,7 +207,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false>(
@@ -229,13 +235,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * pStageElems_], ubPLayoutTla, Arch::PositionUB{});
         auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
@@ -275,8 +281,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
-        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * pStageElems_].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * sStageElems_].GetPhyAddr();
         __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
@@ -286,7 +292,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
 
         uint32_t mAligendTile = mRound / 4;
         uint32_t mFirstTile = m % mAligendTile;
@@ -345,7 +351,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * sStageElems_], ubPLayoutTla, Arch::PositionUB{});
         auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
@@ -355,11 +361,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         dataCopyParams.blockLen = mRound / 2;
         dataCopyParams.srcStride = 1;
         dataCopyParams.dstStride = mRound / 2;
-        DataCopy(l1PTensorTla.data()[mRound * rowStart], lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], dataCopyParams);
+        DataCopy(l1PTensorTla.data()[mRound * rowStart], lpUbTensor[ubSBufId * pStageElems_], dataCopyParams);
         DataCopy(l1PTensorTla.data()[mRound * 8 + mRound * rowStart],
-                 lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM + blockStride * 64], dataCopyParams);
+                 lpUbTensor[ubSBufId * pStageElems_ + blockStride * 64], dataCopyParams);
 
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
     }
@@ -428,8 +434,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         auto ubMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(m, maskColumnRound);
         auto ubMaskTensorTla = tla::MakeTensor(maskUbTensor, ubMaskLayoutTla, Arch::PositionUB{});
 
-        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * pStageElems_].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * sStageElems_].GetPhyAddr();
         __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
@@ -461,7 +467,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
@@ -489,13 +495,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * pStageElems_], ubPLayoutTla, Arch::PositionUB{});
         auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
@@ -639,8 +645,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             }
         }
 
-        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
-        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
+        __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * pStageElems_].GetPhyAddr();
+        __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * sStageElems_].GetPhyAddr();
         __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
         __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
@@ -656,7 +662,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if (doTriUPreMask && doTriUNextMask) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(5);
         }
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (doTriUPreMask && doTriUNextMask) {
             if (isFirstKvSTile) {
                 if (n > 64) {
@@ -734,13 +740,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
         auto ubPLayoutTla = tla::MakeLayout<ElementOutput, LayoutOutput>(mRound, nRound);
-        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], ubPLayoutTla, Arch::PositionUB{});
+        auto ubPTensorTla = tla::MakeTensor(lpUbTensor[ubSBufId * pStageElems_], ubPLayoutTla, Arch::PositionUB{});
         auto ubPTensorTlaTile = GetTile(ubPTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla, tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,

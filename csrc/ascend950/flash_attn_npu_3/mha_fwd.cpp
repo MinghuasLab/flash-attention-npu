@@ -68,13 +68,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     auto q_dtype = q.dtype();
     const bool is_bf16 = (q_dtype == torch::kBFloat16);
     const bool is_fp16 = (q_dtype == torch::kFloat16);
-    const uint32_t quantMode = q_dtype == at::ScalarType::Float8_e4m3fn ? 1U : 0U;
+    const bool mixedKv = is_bf16 && k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+    const uint32_t quantMode = mixedKv ? 2U : (q_dtype == at::ScalarType::Float8_e4m3fn ? 1U : 0U);
     TORCH_CHECK(is_bf16 || is_fp16 || quantMode == 1, "FlashAttention only supports FP16, BF16 and FP8_E4M3FN inputs");
     TORCH_CHECK(q.device().type() == at::kPrivateUse1, "query must be on NPU");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
                 "query, key and value must be on the same NPU device");
-    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(mixedKv || k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == k.dtype(), "key and value must have the same dtype");
     CHECK_CONTIGUOUS(q);
     if (!page_table_.has_value() || quantMode == 1) {
         CHECK_CONTIGUOUS(k);
@@ -87,7 +88,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(!leftpad_k_.has_value(), "950 backend (v3) does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value(),
                 "950 backend (v3) does not support rotary embedding");
-    TORCH_CHECK(quantMode == 1 || (!q_descale_ && !k_descale_ && !v_descale_),
+    TORCH_CHECK(quantMode != 0 || (!q_descale_ && !k_descale_ && !v_descale_),
                 "descales are only supported for FP8_E4M3FN inputs");
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
@@ -110,8 +111,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                     !kv_batch_idx_.has_value(),
                 "950 backend (v3) does not support KV-cache update inputs");
     if (num_splits > 1) {
-        TORCH_CHECK(paged_KV && is_varlen_q, "950 backend (v3) num_splits>1 requires paged KV cache and "
-                                             "TND varlen query");
+        TORCH_CHECK(paged_KV && (is_varlen_q || (mixedKv && layout == static_cast<int64_t>(FwdLayout::BSND))),
+                    "num_splits>1 requires paged KV and a TND query or mixed-KV BSND query");
     }
 
     at::Tensor cu_seqlens_q, cu_seqlens_k, page_table, seqlens_k;
@@ -265,8 +266,15 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(page_table.size(0) == batch_size, "page_table batch dimension must match query batch size");
     }
 
-    TORCH_CHECK(quantMode == 0 || (head_size_q == 128 && head_size_v == 128),
+    TORCH_CHECK(quantMode != 1 || (head_size_q == 128 && head_size_v == 128),
                 "950 V3 FP8 requires Q/K/V head dimensions of 128");
+    if (mixedKv) {
+        TORCH_CHECK(paged_KV && page_block_size == 128 && head_size_q == 192 && head_size_v == 192,
+                    "mixed BF16/FP8 KV currently requires paged cache, page size 128 and Dqk=Dv=192");
+        TORCH_CHECK(!q_descale_ && k_descale_ && v_descale_,
+                    "mixed BF16/FP8 KV requires separate per-token K/V descales and no Q descale");
+        TORCH_CHECK(!scheduler_metadata_, "mixed BF16/FP8 KV currently requires host tiling");
+    }
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
     GM_ADDR vDescale = nullptr;
@@ -275,8 +283,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             return;
         TORCH_CHECK(scale->device() == q.device() && scale->scalar_type() == at::kFloat,
                     "descale must be FP32 on the query device");
-        TORCH_CHECK(scale->dim() == 2 && scale->size(0) == batch_size && scale->size(1) == num_heads_k,
-                    "descale must have shape [batch, num_kv_heads]");
+        if (mixedKv) {
+            TORCH_CHECK(scale->dim() == 3 && scale->size(0) == num_blocks &&
+                        scale->size(1) == page_block_size && scale->size(2) == num_heads_k,
+                        "mixed KV descale must have shape [num_blocks, page_size, num_kv_heads]");
+        } else {
+            TORCH_CHECK(scale->dim() == 2 && scale->size(0) == batch_size && scale->size(1) == num_heads_k,
+                        "descale must have shape [batch, num_kv_heads]");
+        }
         TORCH_CHECK(scale->is_contiguous(), "descale must be contiguous");
         ptr = static_cast<uint8_t*>(scale->data_ptr());
     };
@@ -364,7 +378,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        if (hasMask && quantMode == 0) {
+        if (hasMask && quantMode != 1) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -423,7 +437,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             max_q_seqlen = std::max(max_q_seqlen, q_len);
         }
         const bool fd_shape_supported =
-            !is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+            !is_local && paged_KV && (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
+            min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
@@ -437,6 +452,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                                quantMode, batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
                                return_softmax_lse, layout_enum);
+        ctx.mixedKvStorage = mixedKv;
         ctx.flashDecodeFlag = flash_decode;
         ctx.numSplits = static_cast<uint32_t>(num_splits);
 
@@ -456,7 +472,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if ((is_causal || is_local) && quantMode == 0) {
+        if ((is_causal || is_local) && quantMode != 1) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -529,7 +545,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
     const bool enableDN =
-        !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
+        !mixedKv && !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
 
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
     const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;
@@ -568,7 +584,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         {paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
-         is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
+         is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
+        mixedKv && tilingData.qL1BufNum == 2U};
     auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
         launch_fwd(fwdArgs);
         return 0;

@@ -23,7 +23,7 @@
 #include "tilingdata.h"
 #include "kernel_common.hpp"
 
-template <class ElementO, bool OutputLse, uint32_t quantMode = 0>
+template <class ElementO, bool OutputLse, uint32_t quantMode = 0, bool DenseQ = false>
 class FlashDecodeCombine950 {
   public:
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
@@ -61,7 +61,13 @@ class FlashDecodeCombine950 {
 #ifdef __DAV_VEC__
         __gm__ FAInferTilingData* tiling = reinterpret_cast<__gm__ FAInferTilingData*>(params.tiling);
         constexpr uint32_t uniformMode = OutputLse ? FD_COMBINE_UNIFORM_WITH_LSE : FD_COMBINE_UNIFORM_NO_LSE;
-        if ((tiling->fdCombineUseUniform & uniformMode) != 0U) {
+        // With one decode row per participating AIV, the host has already
+        // assigned each output row. Use its direct partial range so that
+        // each AIV can skip walking the other KV heads' task descriptors.
+        const bool directMixedRows = params.kDescale != nullptr && !FULL_QUANT_FP8 &&
+            tiling->maxQSeqlen == 1U && tiling->fdCombineTaskNum > 1U &&
+            tiling->fdCombineRowNum == tiling->fdCombineAivNum;
+        if (!directMixedRows && (tiling->fdCombineUseUniform & uniformMode) != 0U) {
             RunUniform(params);
             return;
         }
@@ -92,7 +98,7 @@ class FlashDecodeCombine950 {
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
+        const uint32_t totalQ = DenseQ ? tiling->maxQSeqlen : static_cast<uint32_t>(params.storage.totalQTokens);
         const uint32_t combineIdx = tiling->fdCombineCoreSchedules[aivIdx].combineTaskIdx;
         const uint32_t sourceSubBlock = tiling->fdCombineCoreSchedules[aivIdx].sourceSubBlock;
         const uint32_t assignedStart = tiling->fdCombineCoreSchedules[aivIdx].sourceLocalRow;
@@ -105,7 +111,7 @@ class FlashDecodeCombine950 {
             Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / FD_SOURCE_SUB_BLOCK_NUM);
         // Host task geometry uses seqused_q, but packed storage follows cu-Q.
         const uint32_t qTokenBase =
-            static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + tiling->fdCombineTaskInfo[combineIdx].qStart;
+            (DenseQ ? batchIdx * tiling->maxQSeqlen : static_cast<uint32_t>(actualQ.GetValue(batchIdx))) + tiling->fdCombineTaskInfo[combineIdx].qStart;
         const uint32_t partialCount = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialCount);
         const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
         const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
@@ -120,7 +126,7 @@ class FlashDecodeCombine950 {
             if constexpr (OutputLse) {
                 // LSE is ready before O reduction. Its separate UB buffers
                 // remain live until the end of this row tile.
-                StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ);
+                StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ, batchIdx, tiling->numHeads);
             }
             const uint32_t tileElems = rowCount * dRound;
             AscendC::Duplicate(oAccUb_, 0.0F, tileElems);
@@ -184,57 +190,24 @@ class FlashDecodeCombine950 {
         }
         AscendC::GlobalTensor<int32_t> actualQ;
         actualQ.SetGlobalBuffer((__gm__ int32_t*)params.actualQseqlen);
-        AscendC::GlobalTensor<int32_t> seqUsedQ;
-        seqUsedQ.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedQ);
 
-        const uint32_t groupSize = tiling->numHeads / tiling->kvHeads;
         const uint32_t headDim = tiling->embeddingSizeV;
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
+        const uint32_t totalQ = DenseQ ? tiling->maxQSeqlen : static_cast<uint32_t>(params.storage.totalQTokens);
         uint32_t workBase = 0U;
         for (uint32_t combineIdx = 0U; combineIdx < tiling->fdCombineTaskNum; ++combineIdx) {
-            const uint32_t baseTask = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].baseTask);
-            uint32_t batchIdx = 0U;
-            uint32_t previousTasks = 0U;
-            uint32_t qLen = 0U;
-            uint32_t qNBlockTile = 1U;
-            uint32_t qNBlockNumPerGroup = 1U;
-            uint32_t qNTaskNum = 0U;
-            while (batchIdx < tiling->batch) {
-                // Used lengths select tasks; cu_seqlens_q defines storage offsets.
-                qLen = params.seqUsedQ != nullptr
-                           ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
-                           : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
-                qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
-                qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
-                qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
-                const uint32_t batchTasks = CeilDiv(qLen, tiling->qBaseTile) * qNTaskNum;
-                if (baseTask < previousTasks + batchTasks) {
-                    break;
-                }
-                previousTasks += batchTasks;
-                ++batchIdx;
-            }
-            if (batchIdx >= tiling->batch) {
-                return;
-            }
-
-            const uint32_t localTask = baseTask - previousTasks;
-            const uint32_t qTileIdx = localTask / qNTaskNum;
-            const uint32_t qNBlockIdx = localTask % qNTaskNum;
-            const uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
-            const uint32_t kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
-            const uint32_t qHeadStart = kvHeadIdx * groupSize + qNBlockIdxInGroup * qNBlockTile;
-            const uint32_t qNBlockSize = Min(qNBlockTile, groupSize - qNBlockIdxInGroup * qNBlockTile);
-            const uint32_t qStart = qTileIdx * tiling->qBaseTile;
-            const uint32_t qRows = Min(tiling->qBaseTile, qLen - qStart);
-            const uint32_t groupRows = qRows * qNBlockSize;
+            const auto& info = tiling->fdCombineTaskInfo[combineIdx];
+            const uint32_t batchIdx = info.batchIdx;
+            const uint32_t qRows = info.qRows;
+            const uint32_t qStart = info.qStart;
+            const uint32_t qHeadStart = info.qHeadStart;
+            const uint32_t groupRows = info.rowNum;
             const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / subBlockNum);
             const uint32_t sub0Tiles = CeilDiv(sourceRowSplit, rowTile);
             const uint32_t tilesPerTask = sub0Tiles + CeilDiv(groupRows - sourceRowSplit, rowTile);
-            const uint32_t qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;
+            const uint32_t qTokenBase = (DenseQ ? batchIdx * tiling->maxQSeqlen : static_cast<uint32_t>(actualQ.GetValue(batchIdx))) + qStart;
             const uint32_t partialCount = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialCount);
             const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
             const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
@@ -252,7 +225,7 @@ class FlashDecodeCombine950 {
                 PrepareWeights(partialLse, firstPartial, partialCount, partialCountAlign, sourceSubBlock,
                                sourceLocalRow, rowCount, rowCountAlign, tiling->fdLseSubStride);
                 if constexpr (OutputLse) {
-                    StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ);
+                    StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ, batchIdx, tiling->numHeads);
                 }
                 const uint32_t tileElems = rowCount * dRound;
                 AscendC::Duplicate(oAccUb_, 0.0F, tileElems);
@@ -445,12 +418,19 @@ class FlashDecodeCombine950 {
     // Submit asynchronously; the caller waits for MTE3_V EVENT_ID1 after O
     // writeback, before either LSE buffer can be reused by the next row tile.
     __aicore__ inline void StoreLse(AscendC::GlobalTensor<float>& outputLse, uint32_t rowStart, uint32_t rowCount,
-                                    uint32_t qRows, uint32_t qHeadStart, uint32_t qTokenBase, uint32_t totalQ)
+                                    uint32_t qRows, uint32_t qHeadStart, uint32_t qTokenBase, uint32_t totalQ,
+                                    uint32_t batchIdx, uint32_t heads)
     {
+        // Dense LSE is [B,H,Sq]. Address the batch before applying head strides.
+        uint64_t batchOffset = 0U;
+        if constexpr (DenseQ) {
+            batchOffset = static_cast<uint64_t>(batchIdx) * heads * totalQ;
+            qTokenBase -= batchIdx * totalQ;
+        }
         if (qRows == 1U && totalQ == 1U) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1);
-            AscendC::DataCopyPad(outputLse[qHeadStart + rowStart], globalLseUb_,
+            AscendC::DataCopyPad(outputLse[batchOffset + qHeadStart + rowStart], globalLseUb_,
                                  AscendC::DataCopyExtParams(1, rowCount * sizeof(float), 0, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             return;
@@ -467,7 +447,7 @@ class FlashDecodeCombine950 {
         if (qRows == 1U) {
             const uint64_t offset = static_cast<uint64_t>(qHeadStart + rowStart) * totalQ + qTokenBase;
             AscendC::DataCopyPad(
-                outputLse[offset], lseStoreUb_,
+                outputLse[batchOffset + offset], lseStoreUb_,
                 AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, (totalQ - 1U) * sizeof(float), 0));
         } else {
             for (uint32_t row = 0U; row < rowCount;) {
@@ -476,7 +456,7 @@ class FlashDecodeCombine950 {
                 const uint32_t count = Min(rowCount - row, qRows - tokenInHead);
                 const uint64_t offset =
                     static_cast<uint64_t>(qHeadStart + flatRow / qRows) * totalQ + qTokenBase + tokenInHead;
-                AscendC::DataCopyPad(outputLse[offset], lseStoreUb_[row * FLOATS_PER_BLOCK],
+                AscendC::DataCopyPad(outputLse[batchOffset + offset], lseStoreUb_[row * FLOATS_PER_BLOCK],
                                      AscendC::DataCopyExtParams(count, sizeof(float), 0, 0, 0));
                 row += count;
             }

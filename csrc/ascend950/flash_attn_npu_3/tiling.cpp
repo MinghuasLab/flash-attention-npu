@@ -72,6 +72,7 @@ struct FAInferContext {
     bool kvcacheNzFlag = false;
     FwdLayout layout = FwdLayout::BSND;
     bool pagedShapeFlag = true;
+    bool mixedKvStorage = false;
 };
 
 struct BatchParams {
@@ -356,6 +357,43 @@ void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
         }
     }
 }
+// For decode tasks with the same number of query rows, a KV tile is
+// the scheduling unit. Compare the normal round-robin critical path
+// with an even partition of all KV tiles, including unequal contexts.
+bool ScheduleKvTail(const FAInferContext& ctx, const std::vector<FdBaseTaskHost>& bases,
+                    uint32_t cores, FAInferTilingData& tiling)
+{
+    if (!ctx.mixedKvStorage || ctx.numSplits != 0U || bases.empty() || cores < 2U) {
+        return false;
+    }
+    std::vector<uint64_t> prefix{0U};
+    prefix.reserve(bases.size() + 1U);
+    std::vector<uint64_t> roundRobinLoad(cores);
+    for (size_t i = 0; i < bases.size(); ++i) {
+        const auto& task = bases[i];
+        if (task.kvTiles == 0U || task.rowNum != bases.front().rowNum) {
+            return false;
+        }
+        prefix.push_back(prefix.back() + task.kvTiles);
+        roundRobinLoad[i % cores] += task.kvTiles;
+    }
+    const uint64_t total = prefix.back();
+    const uint64_t longest = *std::max_element(roundRobinLoad.begin(), roundRobinLoad.end());
+    const uint64_t balanced = (total + cores - 1U) / cores;
+    if (total < cores || longest - balanced < 8U || (longest - balanced) * 8U < longest) {
+        return false;
+    }
+
+    for (uint32_t core = 0; core < cores; ++core) {
+        const uint64_t begin = total * core / cores;
+        const uint64_t last = total * (core + 1U) / cores - 1U;
+        const auto firstTask = std::upper_bound(prefix.begin(), prefix.end(), begin) - prefix.begin() - 1;
+        const auto lastTask = std::upper_bound(prefix.begin(), prefix.end(), last) - prefix.begin() - 1;
+        tiling.fdDecodeSchedules[core] = {static_cast<int32_t>(firstTask), static_cast<int32_t>(lastTask + 1),
+            static_cast<int32_t>(begin - prefix[firstTask]), static_cast<int32_t>(last - prefix[lastTask] + 1U)};
+    }
+    return true;
+}
 } // namespace
 
 void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
@@ -374,7 +412,11 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     }
 
     const uint32_t cfdMax = std::min(blockNum_, MAX_FD_ACTIVE_CORE_NUM);
-    const uint32_t bfdMax = std::min(MAX_FD_COMBINE_TASK_NUM, blockNum_ == 0U ? 0U : (3U * blockNum_ - 1U) / 10U);
+    // With fused KV dequantization, two KV segments per base still use all
+    // cores at half occupancy (e.g. B=8, Hkv=2, eight query tokens).
+    const uint32_t baseLimit = faInfo_.mixedKvStorage ? cfdMax / 2U :
+        (blockNum_ == 0U ? 0U : (3U * blockNum_ - 1U) / 10U);
+    const uint32_t bfdMax = std::min(MAX_FD_COMBINE_TASK_NUM, baseLimit);
     tiling.fdPartialCapacity = (bfdMax == 0U || cfdMax == 0U) ? 0U : bfdMax + cfdMax - 1U;
 
     std::vector<FdBaseTaskHost> bases;
@@ -407,84 +449,93 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     }
 
     tiling.fdBaseTaskNum = static_cast<uint32_t>(bases.size());
-    if (bases.empty() || bases.size() > bfdMax || cfdMax < 2U) {
-        tiling.flashDecodeFlag = 0U;
-        return;
-    }
-
-    std::vector<uint32_t> splitCounts(bases.size(), 1U);
-    if (faInfo_.numSplits > 1U) {
-        for (uint32_t base = 0; base < bases.size(); ++base) {
-            splitCounts[base] = std::min(faInfo_.numSplits, bases[base].kvTiles);
-        }
+    uint32_t activeCores = cfdMax;
+    if (bases.size() > bfdMax && ScheduleKvTail(faInfo_, bases, cfdMax, tiling)) {
+        // At most cores-1 boundaries split a base. Each base needs one
+        // partial per interior boundary plus one for its first core.
+        tiling.fdPartialCapacity = 2U * (cfdMax - 1U);
     } else {
-        uint32_t totalSegments = static_cast<uint32_t>(bases.size());
-        while (totalSegments < cfdMax) {
-            uint32_t bestBase = static_cast<uint32_t>(bases.size());
-            uint64_t bestCost = 0U;
+        if (bases.empty() || bases.size() > bfdMax || cfdMax < 2U) {
+            tiling.flashDecodeFlag = 0U;
+            return;
+        }
+
+        std::vector<uint32_t> splitCounts(bases.size(), 1U);
+        if (faInfo_.numSplits > 1U) {
             for (uint32_t base = 0; base < bases.size(); ++base) {
-                if (splitCounts[base] >= bases[base].kvTiles) {
-                    continue;
-                }
-                const uint64_t cost =
-                    static_cast<uint64_t>(bases[base].rowNum) * bases[base].kvTiles / splitCounts[base];
-                if (bestBase == bases.size() || cost > bestCost) {
-                    bestBase = base;
-                    bestCost = cost;
-                }
+                // Empty KV still needs a task to initialize O and LSE.
+                splitCounts[base] = std::max(1U, std::min(faInfo_.numSplits, bases[base].kvTiles));
             }
-            if (bestBase == bases.size()) {
-                break;
+        } else {
+            uint32_t totalSegments = static_cast<uint32_t>(bases.size());
+            while (totalSegments < cfdMax) {
+                uint32_t bestBase = static_cast<uint32_t>(bases.size());
+                uint64_t bestCost = 0U;
+                for (uint32_t base = 0; base < bases.size(); ++base) {
+                    if (splitCounts[base] >= bases[base].kvTiles) {
+                        continue;
+                    }
+                    const uint64_t cost =
+                        static_cast<uint64_t>(bases[base].rowNum) * bases[base].kvTiles / splitCounts[base];
+                    if (bestBase == bases.size() || cost > bestCost) {
+                        bestBase = base;
+                        bestCost = cost;
+                    }
+                }
+                if (bestBase == bases.size()) {
+                    break;
+                }
+                ++splitCounts[bestBase];
+                ++totalSegments;
             }
-            ++splitCounts[bestBase];
-            ++totalSegments;
         }
-    }
 
-    std::vector<FdCandidateHost> candidates;
-    for (uint32_t base = 0; base < bases.size(); ++base) {
-        const uint32_t count = splitCounts[base];
-        for (uint32_t split = 0; split < count; ++split) {
-            const uint32_t begin = static_cast<uint32_t>(static_cast<uint64_t>(bases[base].kvTiles) * split / count);
-            const uint32_t end =
-                static_cast<uint32_t>(static_cast<uint64_t>(bases[base].kvTiles) * (split + 1U) / count);
-            candidates.push_back({base, begin, end, static_cast<uint64_t>(bases[base].rowNum) * (end - begin)});
+        std::vector<FdCandidateHost> candidates;
+        for (uint32_t base = 0; base < bases.size(); ++base) {
+            const uint32_t count = splitCounts[base];
+            for (uint32_t split = 0; split < count; ++split) {
+                const uint32_t begin = static_cast<uint32_t>(static_cast<uint64_t>(bases[base].kvTiles) * split / count);
+                const uint32_t end =
+                    static_cast<uint32_t>(static_cast<uint64_t>(bases[base].kvTiles) * (split + 1U) / count);
+                candidates.push_back({base, begin, end, static_cast<uint64_t>(bases[base].rowNum) * (end - begin)});
+            }
         }
-    }
 
-    const uint32_t activeCores = std::min(cfdMax, static_cast<uint32_t>(candidates.size()));
-    if (activeCores <= bases.size()) {
-        tiling.flashDecodeFlag = 0U;
-        return;
-    }
+        activeCores = std::min(cfdMax, static_cast<uint32_t>(candidates.size()));
+        if (activeCores <= bases.size()) {
+            tiling.flashDecodeFlag = 0U;
+            return;
+        }
 
-    uint64_t totalCost = 0U;
-    for (const auto& candidate : candidates) {
-        totalCost += candidate.cost;
-    }
-    std::vector<uint32_t> coreBegin(activeCores);
-    std::vector<uint32_t> coreEnd(activeCores);
-    uint32_t candidateBegin = 0U;
-    uint64_t consumedCost = 0U;
-    for (uint32_t core = 0; core < activeCores; ++core) {
-        coreBegin[core] = candidateBegin;
-        const uint32_t coresLeft = activeCores - core;
-        const uint32_t maxEnd = static_cast<uint32_t>(candidates.size()) - (coresLeft - 1U);
-        uint32_t end = candidateBegin + 1U;
-        const uint64_t target = totalCost * (core + 1U) / activeCores;
-        while (end < maxEnd && consumedCost + candidates[end - 1U].cost < target) {
+        uint64_t totalCost = 0U;
+        for (const auto& candidate : candidates) {
+            totalCost += candidate.cost;
+        }
+        std::vector<uint32_t> coreBegin(activeCores);
+        std::vector<uint32_t> coreEnd(activeCores);
+        uint32_t candidateBegin = 0U;
+        uint64_t consumedCost = 0U;
+        for (uint32_t core = 0; core < activeCores; ++core) {
+            coreBegin[core] = candidateBegin;
+            const uint32_t coresLeft = activeCores - core;
+            const uint32_t maxEnd = static_cast<uint32_t>(candidates.size()) - (coresLeft - 1U);
+            uint32_t end = candidateBegin + 1U;
+            const uint64_t target = totalCost * (core + 1U) / activeCores;
+            while (end < maxEnd && consumedCost + candidates[end - 1U].cost < target) {
+                consumedCost += candidates[end - 1U].cost;
+                ++end;
+            }
             consumedCost += candidates[end - 1U].cost;
-            ++end;
-        }
-        consumedCost += candidates[end - 1U].cost;
-        coreEnd[core] = end;
-        candidateBegin = end;
+            coreEnd[core] = end;
+            candidateBegin = end;
 
-        const auto& first = candidates[coreBegin[core]];
-        const auto& last = candidates[end - 1U];
-        tiling.fdDecodeSchedules[core] = {static_cast<int32_t>(first.baseTask),
-                                          static_cast<int32_t>(last.baseTask + 1U), static_cast<int32_t>(first.kvBegin),
-                                          static_cast<int32_t>(last.kvEnd)};
+            const auto& first = candidates[coreBegin[core]];
+            const auto& last = candidates[end - 1U];
+            tiling.fdDecodeSchedules[core] = {static_cast<int32_t>(first.baseTask),
+                                              static_cast<int32_t>(last.baseTask + 1U), static_cast<int32_t>(first.kvBegin),
+                                              static_cast<int32_t>(last.kvEnd)};
+        }
+
     }
 
     uint32_t partialStart = 0U;
@@ -600,6 +651,7 @@ BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)
 void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
 {
     uint64_t fullQ128Tasks = 0;
+    bool fullQueryTileInEachBatch = true;
     for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
         const uint32_t qLen =
             faInfo_.qSeqlenList == nullptr
@@ -613,12 +665,27 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                           : faInfo_.kvSeqlenList[b]);
         const uint32_t activeQ =
             fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
+        fullQueryTileInEachBatch &= qLen >= Q_TILE_CEIL;
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
                                              fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
+    // Keep all 16 GQA heads together for MTP: a 64-row tile would read and
+    // dequantize the same KV twice when Sq is 5..8. Apply before task splitting.
+    if (faInfo_.mixedKvStorage && faInfo_.maxQSeqlen >= 5 && faInfo_.maxQSeqlen <= 8 &&
+        faInfo_.numHeads / faInfo_.kvHeads == 16) {
+        qBaseTile_ = 128U;
+    }
     FillBasicTilingData(tilingdata);
+    // Pair adjacent Q heads sharing a KV head. Each pair owns two Q banks in
+    // L1; the K and V banks are released only after both consumers read them.
+    if (faInfo_.mixedKvStorage && !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink &&
+        faInfo_.maskType != MaskType::MASK_BAND && qBaseTile_ == Q_TILE_CEIL &&
+        fullQueryTileInEachBatch && (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
+        fullQ128Tasks >= 2ULL * blockNum_) {
+        tilingdata.set_qL1BufNum(2U);
+    }
     if (!faInfo_.isTilingSink) {
         FillSplitCoreTilingData(tilingdata);
     }

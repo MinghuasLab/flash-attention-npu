@@ -91,8 +91,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
     template <class Resource>
-    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub)
+    __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, bool holdOutputCredit = false)
     {
+        holdOutputCredit_ = holdOutputCredit;
         otmpStages_ = ub.otmpStages;
         for (uint32_t i = 0; i < otmpStages_; ++i) {
             loUbTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.lo + ub.loBytes * i);
@@ -194,7 +195,11 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             (__ubuf__ ElementOTmp*)dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
 
         WaitCrossCoreSync<4, PIPE_V>(pvReadyFlag);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        // Intermediate updates only access GO on Vector. Keep the output-DMA
+        // credit until the final tile instead of fencing unrelated MTE3 work.
+        if (!holdOutputCredit_ || isFirstKvSTile) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        }
         if (isFirstKvSTile) {
             if (!isLastKvSTile) {
                 uint32_t totalCopyElems = rowNumCurSubCore * colStride;
@@ -266,7 +271,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 }
             }
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        if (!holdOutputCredit_ || isLastKvSTile) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        }
     }
 
     template <class TensorDst>
@@ -841,6 +848,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
   private:
+    bool holdOutputCredit_ = false;
     uint32_t otmpStages_ = UB_OTMP_BUF_STAGES;
     float vDequantScale_ = 1.0f;
     AscendC::LocalTensor<ElementOTmp> loUbTensor[UB_OTMP_BUF_STAGES];

@@ -48,7 +48,15 @@
                                              a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
                                              a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
                                              a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,            \
-                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage)
+                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage, a.k_descale_device, a.v_descale_device)
+
+#define FWD_MIXED_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP, PAIRED)                         \
+    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP, true, PAIRED>  \
+        <<<a.block_dim, nullptr, a.stream>>>(a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,  \
+                                             a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
+                                             a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
+                                             a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,            \
+                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage, a.k_descale_device, a.v_descale_device)
 
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a)
@@ -92,7 +100,23 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                             if constexpr (kUseDnFastPath) {
                                 FWD_KERNEL_LAUNCH(FAInferDn, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
                             } else {
-                                FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                                if constexpr (std::is_same_v<DType, bfloat16_t> && IsPaged) {
+                                    if (a.quant_mode == 2U) {
+                                        if constexpr (MaskCat != MaskCategory::MASK_SWA) {
+                                            if (a.paired_query_heads) {
+                                                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                        LseMode, HasSoftcap, true);
+                                                return;
+                                            }
+                                        }
+                                        FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                LseMode, HasSoftcap, false);
+                                    } else {
+                                        FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                                    }
+                                } else {
+                                    FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                                }
                             }
                         });
                     });
@@ -102,6 +126,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
     }
 }
 
+#undef FWD_MIXED_KERNEL_LAUNCH
 #undef FWD_KERNEL_LAUNCH
 #undef FWD_MASK_SWITCH
 #undef FWD_BOOL_SWITCH

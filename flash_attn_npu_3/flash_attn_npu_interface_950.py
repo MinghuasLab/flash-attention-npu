@@ -107,7 +107,7 @@ def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
     Dense operands use fixed packed kernel strides and are materialized. Paged
     K/V remain zero-copy when both caches have the same packed BBND or BNBD
     inner layout; dimension 0 may still be strided. Other paged views fall
-    back to packed BBND storage. FP8 caches always use packed BBND storage.
+    back to packed BBND storage. The all-FP8 path uses packed BBND storage.
 
     Append-KV is the exception: replacing a cache with a temporary contiguous
     copy would lose the API's in-place cache update, so an unsupported cache
@@ -1092,6 +1092,13 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
 ):
     """
+    On Ascend 950, BF16 Q can attend to a paged E4M3FN cache with Dqk=Dv=192
+    and page size 128. Supply separate contiguous FP32 k_descale and v_descale
+    tensors on the query device with shape (num_blocks, 128, num_kv_heads).
+    Each scale multiplies one physical token and KV head. The kernel rounds
+    K and V to BF16 on chip before matrix multiplication. Leave q_descale and
+    scheduler_metadata unset so the host can select the tiling.
+
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
     k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
     the previous step, and update them with the new keys/values from the current step, and do
@@ -1221,7 +1228,8 @@ def flash_attn_with_kvcache(
         and max_seqlen_q <= 16
     )
     empty_query = cu_seqlens_q is not None and q.shape[0] == 0 and max_seqlen_q == 0
-    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query
+    mixed_kv = q.dtype == torch.bfloat16 and k_cache.dtype == torch.float8_e4m3fn
+    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query or mixed_kv
     if scheduler_metadata is None and not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:

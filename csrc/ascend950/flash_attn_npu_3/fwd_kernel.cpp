@@ -43,6 +43,7 @@
 #include "pv_matmul.hpp"
 #include "tilingdata.h"
 #include "fd_combine.hpp"
+#include "kv_dequant.hpp"
 
 using namespace Catlass;
 using namespace tla;
@@ -54,7 +55,7 @@ static constexpr uint32_t UB_S_BUF_STAGES = 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
           Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
-          CacheLayout cacheLayout, bool IsDN, bool LseMode>
+          CacheLayout cacheLayout, bool IsDN, bool LseMode, bool MixedKv = false, bool PairedHeads = false>
 class FAIKernel950 {
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
@@ -200,7 +201,22 @@ class FAIKernel950 {
             l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementP>(
                 pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * sizeof(ElementP) * i);
         }
-        const auto ubPlan = fa950_plan::KernelUbPlan(embedV_, qBaseTile_);
+        const bool mixedKv = MixedKv || params.kDescale != nullptr;
+        static_assert(!PairedHeads || (MixedKv && !IsDN), "Paired heads require the mixed KV prefill kernel");
+        constexpr bool paired = PairedHeads;
+        const bool bufferedKv = !paired && mixedKv && qBaseTile_ <= 64U;
+        const bool splitRowKv = mixedKv && !bufferedKv && !IsDN;
+        const bool twoKvOutputs = bufferedKv &&
+            static_cast<uint64_t>(faiTilingData->maxQSeqlen) * (qHeads_ / kvHeads_) <= 32U;
+        const bool earlyKv = twoKvOutputs || (bufferedKv && !IsDN);
+        const uint32_t kvPrefetchDistance = earlyKv ? 2U : 1U;
+        // GetQNBlockTile limits merged rows to 64 for this path. Fixpipe splits
+        // them between two AIVs, so LO/GO need at most 32 rows per AIV.
+        // If the entire Q/GQA group has <=32 rows, 16 per AIV suffices.
+        const uint32_t outputRows = twoKvOutputs ? 16U : (bufferedKv ? 32U : 64U);
+        const uint32_t scoreRows = earlyKv ? outputRows : 64U;
+        const auto ubPlan = mixedKv ? fa950_plan::MakeUbPlan(embedV_, 1U, outputRows, scoreRows, splitRowKv ? 1U : 2U, paired ? 1U : 2U)
+                                    : fa950_plan::KernelUbPlan(embedV_, qBaseTile_);
         otmpStages_ = ubPlan.otmpStages;
         for (uint32_t i = 0; i < UB_S_BUF_STAGES; ++i) {
             ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(ubPlan.s + ubPlan.sBytes * i);
@@ -229,14 +245,44 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx();
         BlockMmadQK blockMmadQK(resource, qkL1TileHelper);
         BlockMmadPV blockMmadPV(resource, pvL1AddrStart_, pvL1TileHelper);
+        if constexpr (!IsDN) {
+            blockMmadQK.externalKv = mixedKv;
+            blockMmadQK.pairedHeads = paired;
+            blockMmadQK.singleKvProducer = bufferedKv || splitRowKv;
+        }
+        blockMmadPV.externalKv = mixedKv;
+        blockMmadPV.pairedHeads = paired;
+        blockMmadPV.singleKvProducer = bufferedKv || splitRowKv;
+        if (mixedKv) {
+            for (uint32_t flag = 7; flag < 11; ++flag) {
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(flag);
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(flag + 16);
+            }
+        }
         blockMmadQK.SetPageStride(params.storage.keyPageStride);
         blockMmadPV.SetPageStride(params.storage.valuePageStride);
 #endif
 
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_);
-        EpilogueRescaleO epilogueRescaleO(resource, ubPlan);
+        auto firstSmPlan = ubPlan;
+        auto secondPlan = ubPlan;
+        if (paired) {
+            secondPlan.go = ubPlan.mask;
+            secondPlan.gm = secondPlan.go + ubPlan.loBytes;
+            secondPlan.gl = secondPlan.gm + 64U * sizeof(float);
+            secondPlan.total = secondPlan.gl + 64U * sizeof(float);
+            // The causal mask borrows the first NZ output bank only during boundary Softmax.
+            firstSmPlan.mask = secondPlan.total + 2U * fa950_mixed::HALF_INPUT_BYTES;
+            secondPlan.mask = firstSmPlan.mask;
+        }
+        EpilogueOnlineSoftmax firstSm(resource, firstSmPlan, scaleValue_, softcapValue_);
+        EpilogueOnlineSoftmax secondSm(resource, secondPlan, scaleValue_, softcapValue_);
+        EpilogueRescaleO firstO(resource, ubPlan, mixedKv && !paired);
+        EpilogueRescaleO secondO(resource, secondPlan, mixedKv && !paired);
+        fa950_mixed::KvDequant kvDequant(resource, mixedKv ? ubPlan.total : 0U);
+        fa950_mixed::KvDequantBuffered halfDequant(resource, splitRowKv ? secondPlan.total : 0U);
+        fa950_mixed::KvDequantWhole bufferedDequant(resource, bufferedKv ? ubPlan.total : 0U, earlyKv, twoKvOutputs);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
 
@@ -342,7 +388,12 @@ class FAIKernel950 {
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
-        for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
+        if (paired) {
+            taskBegin *= 2U;
+            taskStep *= 2U;
+        }
+        for (uint32_t base = taskBegin; base < taskEnd; base += taskStep) {
+            const uint32_t taskIdx = base;
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
@@ -414,6 +465,17 @@ class FAIKernel950 {
             uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
             qSTileIdx = taskIdxCurBatch / qNTaskNum;
             uint32_t qNBlockIdx = taskIdxCurBatch - qSTileIdx * qNTaskNum;
+            if constexpr (PairedHeads && maskCategory == MaskCategory::MASK_CAUSAL) {
+                // Consecutive waves visit opposite ends of their Q-tile ranges.
+                // Keep the head pair and every incomplete wave at its original index.
+                const uint32_t tilesPerWave = qNTaskNum == coreNum ? 2U : (2U * qNTaskNum == coreNum ? 4U : 1U);
+                const uint32_t wave = qSTileIdx / tilesPerWave;
+                const uint32_t waveStart = wave * tilesPerWave;
+                if (tilesPerWave > 1U && ((wave + curBatch) & 1U) &&
+                    waveStart + tilesPerWave <= static_cast<uint32_t>(qSeqlen) / qBaseTile_) {
+                    qSTileIdx = waveStart + (tilesPerWave - 1U - (qSTileIdx - waveStart));
+                }
+            }
             uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
             kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
             qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
@@ -536,6 +598,11 @@ class FAIKernel950 {
                 initOutputs.template operator()<LseMode>(gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize,
                                                          lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
                                                          static_cast<uint32_t>(oHeadStride));
+                if (paired) {
+                    initOutputs.template operator()<LseMode>(gO[gmOffsetO + qNBlockSize * oHeadStride], gLse[lseOffset + qNBlockSize * lseHeadStride], qSBlockSize, qNBlockSize,
+                                                         lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
+                                                         static_cast<uint32_t>(oHeadStride));
+                }
 #endif
                 continue;
             }
@@ -563,7 +630,10 @@ class FAIKernel950 {
                     }
                 }
             }
-            const uint32_t kvSLoopCount = kvSplitEnd - kvSplitStart;
+            const uint32_t pageCount = kvSplitEnd - kvSplitStart;
+            // In each pair, operations 2*i and 2*i+1 consume the same K/V page.
+            const uint32_t headCount = paired ? 2U : 1U;
+            const uint32_t kvSLoopCount = headCount * pageCount;
             if (kvSLoopCount == 0U) {
                 continue;
             }
@@ -580,7 +650,14 @@ class FAIKernel950 {
             if constexpr (IsDN) {
                 blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
             } else {
+                blockMmadQK.qBank = 0U;
                 blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                if (paired) {
+                    auto nextQ = tla::MakeTensor(gQ[gmOffsetQ + qNBlockSize * qHeadStride], gmQLayoutTla, Arch::PositionGM{});
+                    blockMmadQK.qBank = 1U;
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                    blockMmadQK.loadQGM(nextQ, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                }
             }
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
@@ -598,12 +675,194 @@ class FAIKernel950 {
 #ifdef __DAV_VEC__
             uint32_t oShapeCol = strideO;
             auto gmOLayoutTla = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, oShapeCol);
-            auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO], gmOLayoutTla, Arch::PositionGM{});
+
+#endif
+#ifdef __DAV_VEC__
+            if (bufferedKv && kvSLoopCount != 0U) {
+                for (uint32_t ahead = 0; ahead < kvPrefetchDistance && ahead < kvSLoopCount; ++ahead) {
+                    const uint32_t firstTile = kvSplitStart + ahead;
+                    const uint32_t rows = firstTile == kvSLoopNum - 1 ? noSkipKvS - firstTile * 128U : 128U;
+                    bufferedDequant.Prefetch(params.v, params.vDescale, gBlockTable[blockBOffset],
+                        kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                        params.storage.valueHeadStride, firstTile, rows, 0U);
+                    bufferedDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                        kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                        params.storage.keyHeadStride, firstTile, rows, 1U);
+                }
+            }
+            if (splitRowKv && !paired && kvSLoopCount != 0U) {
+                const uint32_t rows = kvSplitStart == kvSLoopNum - 1 ? noSkipKvS - kvSplitStart * 128U : 128U;
+                halfDequant.Prefetch(params.v, params.vDescale, gBlockTable[blockBOffset],
+                    kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                    params.storage.valueHeadStride, kvSplitStart, rows, 0U);
+                halfDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                    kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                    params.storage.keyHeadStride, kvSplitStart, rows, 1U);
+                const uint32_t seq = flashDecodeFlag_ ? pipelineTileBase : 0U;
+                const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
+                    + (seq % kL1BufNum_) * qkL1TileKRight_ * qkL1TileN_ * 2U;
+                halfDequant.Produce(resource, rows, offset, 7U + seq % kL1BufNum_, 1U);
+                if (kvSLoopCount > 1U) {
+                    const uint32_t next = kvSplitStart + 1U;
+                    const uint32_t nextRows = next == kvSLoopNum - 1 ? noSkipKvS - next * 128U : 128U;
+                    halfDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                        kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                        params.storage.keyHeadStride, next, nextRows, 1U);
+                }
+            }
+            // Prime K0 so the loop can convert K(i+1) before Softmax(i).
+            // The two L1 K slots still use their existing FREE/READY credits.
+            if (earlyKv && kvSLoopCount != 0U) {
+                if (kvPrefetchDistance < kvSLoopCount) {
+                    const uint32_t tile = kvSplitStart + kvPrefetchDistance;
+                    const uint32_t rows = tile == kvSLoopNum - 1 ? noSkipKvS - tile * 128U : 128U;
+                    bufferedDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                        kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                        params.storage.keyHeadStride, tile, rows, 1U);
+                }
+                const uint32_t seq = flashDecodeFlag_ ? pipelineTileBase : 0U;
+                const uint32_t rows = kvSplitStart == kvSLoopNum - 1 ? noSkipKvS - kvSplitStart * 128U : 128U;
+                const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
+                    + (seq % kL1BufNum_) * qkL1TileKRight_ * qkL1TileN_ * 2U;
+                bufferedDequant.Produce(resource, rows, offset, 7U + seq % kL1BufNum_, 1U);
+            }
+
 #endif
             for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; ++kvSTileRelIdx) {
-                const uint32_t kvSTileIdx = kvSplitStart + kvSTileRelIdx;
+                const uint32_t kvSTileIdx = kvSplitStart + (paired ? kvSTileRelIdx / 2U : kvSTileRelIdx);
                 const uint32_t pipelineTileSeq =
                     flashDecodeFlag_ != 0U ? pipelineTileBase + kvSTileRelIdx : kvSTileRelIdx;
+#ifdef __DAV_VEC__
+                if (paired) {
+                    const bool keyLane = AscendC::GetSubBlockIdx() == 0U;
+                    const uint32_t kvSlot = keyLane ? 1U : 0U;
+                    const auto cache = keyLane ? params.k : params.v;
+                    const auto scales = keyLane ? params.kDescale : params.vDescale;
+                    const auto pageStride = keyLane ? params.storage.keyPageStride : params.storage.valuePageStride;
+                    const auto tokenStride = keyLane ? params.storage.keyTokenStride : params.storage.valueTokenStride;
+                    const auto headStride = keyLane ? params.storage.keyHeadStride : params.storage.valueHeadStride;
+                    if (kvSTileRelIdx == 0U) {
+                        const uint32_t rows = kvSplitStart + 1U == kvSLoopNum ? noSkipKvS - kvSplitStart * 128U : 128U;
+                        halfDequant.Prefetch(cache, scales, gBlockTable[blockBOffset], kvHeadIdx, kvHeads_,
+                            pageStride, tokenStride, headStride, kvSplitStart, rows, kvSlot);
+                    }
+                    // Keep the first two keys on the original schedule for startup.
+                    // In steady state, prepare 64 rows during each query-head step.
+                    const bool wholeKey = keyLane && kvSTileRelIdx < 2U;
+                    const uint32_t firstHalf = wholeKey ? 0U : kvSTileRelIdx % 2U;
+                    const uint32_t endHalf = wholeKey ? 2U : firstHalf + 1U;
+                    const uint32_t page = kvSTileIdx + (keyLane && kvSTileRelIdx != 0U ? 1U : 0U);
+                    if (kvSTileRelIdx < kvSLoopCount && page < kvSplitEnd) {
+                        const uint32_t rows = page + 1U == kvSLoopNum ? noSkipKvS - page * 128U : 128U;
+                        const uint32_t bank = page % 2U;
+                        const uint32_t kOffset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
+                            + bank * qkL1TileKRight_ * qkL1TileN_ * 2U;
+                        const uint32_t vOffset = pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
+                            + bank * pvL1TileKRight_ * pvL1TileN_ * 2U;
+                        halfDequant.Produce(resource, rows, keyLane ? kOffset : vOffset,
+                            (keyLane ? 7U : 9U) + bank, kvSlot, firstHalf, endHalf);
+                        if (endHalf == 2U && page + 1U < kvSplitEnd) {
+                            const uint32_t next = page + 1U;
+                            const uint32_t nextRows = next + 1U == kvSLoopNum ? noSkipKvS - next * 128U : 128U;
+                            halfDequant.Prefetch(cache, scales, gBlockTable[blockBOffset], kvHeadIdx, kvHeads_,
+                                pageStride, tokenStride, headStride, next, nextRows, kvSlot);
+                        }
+                    }
+                } else if (mixedKv) {
+                    // Small-Q: prepare V(i) while Cube consumes V(i-2). The
+                    // existing two L1 slots gate DMA reuse, not the VF itself.
+                    // P(i-2) was published before any wait for that slot's reuse.
+                    // With one staging output, produce V(i-1) before K(i).
+                    // Its L1 slot was last consumed by PV(i-3) in the prior
+                    // iteration, so reuse does not depend on the current QK.
+                    const uint32_t vProductionDelay = (earlyKv || splitRowKv) ? 0U : PRE_LAUNCH - 1U;
+                    if (kvSTileRelIdx >= vProductionDelay &&
+                        kvSTileRelIdx - vProductionDelay < kvSLoopCount) {
+                        const uint32_t rel = kvSTileRelIdx - vProductionDelay;
+                        const uint32_t tile = kvSplitStart + rel;
+                        const uint32_t seq = flashDecodeFlag_ ? pipelineTileBase + rel : rel;
+                        const uint32_t rows = tile == kvSLoopNum - 1 ? noSkipKvS - tile * 128U : 128U;
+                        const uint32_t offset = pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
+                            + (seq % vL1BufNum_) * pvL1TileKRight_ * pvL1TileN_ * 2U;
+                        if (bufferedKv) {
+                            // Keep one input slot free so its next DMA can precede this VF.
+                            if (earlyKv && rel + kvPrefetchDistance < kvSLoopCount) {
+                                const uint32_t nextTile = tile + kvPrefetchDistance;
+                                const uint32_t nextRows = nextTile == kvSLoopNum - 1 ? noSkipKvS - nextTile * 128U : 128U;
+                                bufferedDequant.Prefetch(params.v, params.vDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                                    params.storage.valueHeadStride, nextTile, nextRows, 0U);
+                            }
+                            bufferedDequant.Produce(resource, rows, offset, 9U + seq % vL1BufNum_, 0U);
+                            // Queue the next read before Softmax/Rescale. Input
+                            // reuse waits only for this VF; output remains protected.
+                            if (!earlyKv && rel + kvPrefetchDistance < kvSLoopCount) {
+                                const uint32_t nextTile = tile + kvPrefetchDistance;
+                                const uint32_t nextRows = nextTile == kvSLoopNum - 1 ? noSkipKvS - nextTile * 128U : 128U;
+                                bufferedDequant.Prefetch(params.v, params.vDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                                    params.storage.valueHeadStride, nextTile, nextRows, 0U);
+                            }
+                        } else if (splitRowKv) {
+                            halfDequant.Produce(resource, rows, offset, 9U + seq % vL1BufNum_, 0U);
+                            if (rel + 1U < kvSLoopCount) {
+                                const uint32_t next = tile + 1U;
+                                const uint32_t nextRows = next == kvSLoopNum - 1 ? noSkipKvS - next * 128U : 128U;
+                                halfDequant.Prefetch(params.v, params.vDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                                    params.storage.valueHeadStride, next, nextRows, 0U);
+                            }
+                        } else {
+                            kvDequant.Produce(resource, params.v, params.vDescale, gBlockTable[blockBOffset],
+                            kvHeadIdx, kvHeads_, params.storage.valuePageStride, params.storage.valueTokenStride,
+                            params.storage.valueHeadStride, tile, rows, offset, 9U + seq % vL1BufNum_);
+                        }
+                    }
+                    const uint32_t kRel = kvSTileRelIdx + ((earlyKv || splitRowKv) ? 1U : 0U);
+                    const uint32_t kTile = kvSplitStart + kRel;
+                    const uint32_t kSeq = flashDecodeFlag_ ? pipelineTileBase + kRel : kRel;
+                    if (kRel < kvSLoopCount) {
+                        const uint32_t rows = kTile == kvSLoopNum - 1 ? noSkipKvS - kTile * 128U : 128U;
+                        const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
+                            + (kSeq % kL1BufNum_) * qkL1TileKRight_ * qkL1TileN_ * 2U;
+                        if (bufferedKv) {
+                            // Keep one input slot free so its next DMA can precede this VF.
+                            if (earlyKv && kRel + kvPrefetchDistance < kvSLoopCount) {
+                                const uint32_t nextTile = kTile + kvPrefetchDistance;
+                                const uint32_t nextRows = nextTile == kvSLoopNum - 1 ? noSkipKvS - nextTile * 128U : 128U;
+                                bufferedDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                                    params.storage.keyHeadStride, nextTile, nextRows, 1U);
+                            }
+                            if (AscendC::GetSubBlockIdx() == 0U) {
+                                bufferedDequant.Produce(resource, rows, offset, 7U + kSeq % kL1BufNum_, 1U);
+                            }
+                            // Queue the next read before Softmax/Rescale. Input
+                            // reuse waits only for this VF; output remains protected.
+                            if (!earlyKv && kRel + kvPrefetchDistance < kvSLoopCount) {
+                                const uint32_t nextTile = kTile + kvPrefetchDistance;
+                                const uint32_t nextRows = nextTile == kvSLoopNum - 1 ? noSkipKvS - nextTile * 128U : 128U;
+                                bufferedDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                                    params.storage.keyHeadStride, nextTile, nextRows, 1U);
+                            }
+                        } else if (splitRowKv) {
+                            halfDequant.Produce(resource, rows, offset, 7U + kSeq % kL1BufNum_, 1U);
+                            if (kRel + 1U < kvSLoopCount) {
+                                const uint32_t next = kTile + 1U;
+                                const uint32_t nextRows = next == kvSLoopNum - 1 ? noSkipKvS - next * 128U : 128U;
+                                halfDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
+                                    kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                                    params.storage.keyHeadStride, next, nextRows, 1U);
+                            }
+                        } else {
+                            kvDequant.Produce(resource, params.k, params.kDescale, gBlockTable[blockBOffset],
+                            kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
+                            params.storage.keyHeadStride, kTile, rows, offset, 7U + kSeq % kL1BufNum_);
+                        }
+                    }
+                }
+#endif
                 if (kvSTileRelIdx < kvSLoopCount) {
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
@@ -611,7 +870,7 @@ class FAIKernel950 {
                         kvSTileSizeAct = kvBaseTile_;
                     }
                     GemmCoord actualBlockShapeQK{rowNum, kvSTileSizeAct, embed_};
-                    uint32_t ubSBufId = pipelineTileSeq % UB_S_OTMP_BUF_STAGES;
+                    uint32_t ubSBufId = paired ? 0U : pipelineTileSeq % UB_S_OTMP_BUF_STAGES;
                     int64_t stride = 64;
                     auto ubSLayoutTla =
                         tla::MakeLayout<ElementS, LayoutS>(qkRowNumRound, RoundUp(kvSTileSizeAct, ubSRoundTile));
@@ -634,6 +893,7 @@ class FAIKernel950 {
                                     blockSize_, kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
                                     0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
                     } else {
+                        blockMmadQK.qBank = paired ? kvSTileRelIdx % 2U : 0U;
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
@@ -649,6 +909,7 @@ class FAIKernel950 {
                     auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(rowNum, kvSTileSizeAct);
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId], l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
+                    auto& epilogueOnlineSoftmax = paired && kvSTileRelIdx % 2U ? secondSm : firstSm;
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                         auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
                         auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
@@ -658,12 +919,18 @@ class FAIKernel950 {
                         uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
                         bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
                         if (doTriUMask) {
+                            if (paired) {
+                                // Finish prior NZ->L1 reads before MTE2 writes the mask.
+                                // The next VF writer follows this masked VF on PIPE_V.
+                                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                            }
                             epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
-                                                  (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
+                                                  (kvSTileRelIdx < headCount), ubSBufId, l1PBufId, qkReadyFlag,
                                                   softmaxReadyFlag, triUp, triDown, 0u, 0u, kvSStartIdx, kvSEndIdx, 1,
                                                   qSBlockSize, qNBlockSize);
                         } else {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx < headCount), ubSBufId,
                                                   l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
                         }
                     } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
@@ -685,20 +952,20 @@ class FAIKernel950 {
                                       (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
                         if (doTriUPreMask || doTriUNextMask) {
                             epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
-                                                  (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
+                                                  (kvSTileRelIdx < headCount), ubSBufId, l1PBufId, qkReadyFlag,
                                                   softmaxReadyFlag, kvSStartIdxI, doTriUPreMask, doTriUNextMask,
                                                   windowSizeLeftStartLen, windowSizeLeftEndLen, windowSizeRightStartLen,
                                                   windowSizeRightEndLen, qSBlockSize, qNBlockSize, 1u);
                         } else {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx < headCount), ubSBufId,
                                                   l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
                         }
                     } else {
                         if constexpr (IsDN) {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx < headCount), ubSBufId,
                                                   l1PBufId, qkReadyFlag, softmaxReadyFlag, 1, qSBlockSize, qNBlockSize);
                         } else {
-                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx < headCount), ubSBufId,
                                                   l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
                         }
                     }
@@ -706,7 +973,7 @@ class FAIKernel950 {
                 }
                 if (kvSTileRelIdx >= PRE_LAUNCH) {
                     uint32_t kvSTileRelIdxNow = kvSTileRelIdx - PRE_LAUNCH;
-                    uint32_t kvSTileIdxNow = kvSplitStart + kvSTileRelIdxNow;
+                    uint32_t kvSTileIdxNow = kvSplitStart + (paired ? kvSTileRelIdxNow / 2U : kvSTileRelIdxNow);
                     uint32_t pipelineTileSeqNow =
                         flashDecodeFlag_ != 0U ? pipelineTileBase + kvSTileRelIdxNow : kvSTileRelIdxNow;
                     if (kvSTileIdxNow == kvSLoopNum - 1) {
@@ -752,9 +1019,12 @@ class FAIKernel950 {
                         swaQSeqlen = static_cast<uint32_t>(qSeqlen);
                         swaQSTileStart = static_cast<uint32_t>(qSTileStart);
                     }
+                    const uint32_t outMember = paired ? kvSTileRelIdxNow % 2U : 0U;
+                    auto& epilogueRescaleO = outMember ? secondO : firstO;
+                    auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO + outMember * qNBlockSize * oHeadStride], gmOLayoutTla, Arch::PositionGM{});
                     epilogueRescaleO.template operator()<LseMode>(
-                        gmOTensorTla, gLse[lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                        (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == kvSLoopCount - 1), pvReadyFlag, IsDN,
+                        gmOTensorTla, gLse[lseOffset + outMember * qNBlockSize * lseHeadStride], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
+                        (kvSTileRelIdxNow < headCount), (kvSTileRelIdxNow + headCount >= kvSLoopCount), pvReadyFlag, IsDN,
                         fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
                         static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
                         gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_, fdLseSubStride_);
@@ -765,8 +1035,19 @@ class FAIKernel950 {
             pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0ATotalStages_ + pvL0ATotalStages_);
             pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
         }
+#ifdef __DAV_VEC__
+        if (mixedKv) {
+            if (bufferedKv) { bufferedDequant.Drain(); }
+            else if (splitRowKv) { halfDequant.Drain(); }
+            else { kvDequant.Drain(kvHeads_); }
+            for (uint32_t flag = 7; flag < 11; ++flag) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(flag);
+            }
+        }
+#endif
         ReleaseSyncFlags<4, 4, 4>();
-        if constexpr (!IsDN && qFormat == Format::TND && kvcacheType == CacheMode::pagedCache &&
+        if constexpr (!IsDN && (qFormat == Format::TND || qFormat == Format::BSND) &&
+                      kvcacheType == CacheMode::pagedCache &&
                       maskCategory != MaskCategory::MASK_SWA) {
             if (flashDecodeFlag_ != 0U) {
                 // All launched AIC/AIV blocks join after their partial DMAs
@@ -774,7 +1055,7 @@ class FAIKernel950 {
                 AscendC::PipeBarrier<PIPE_ALL>();
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                FlashDecodeCombine950<ElementO, LseMode> combine(resource);
+                FlashDecodeCombine950<ElementO, LseMode, 0, qFormat == Format::BSND> combine(resource);
                 combine(params);
 #endif
             }
@@ -972,11 +1253,11 @@ class FAIKernel950 {
 };
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
-          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false>
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1036,7 +1317,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                                                             ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
-                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
+                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode, MixedKv, PairedHeads>;
     FAIKernelParams params{q,
                            k,
                            v,
@@ -1056,6 +1337,8 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                            maxNumBlocksPerBatch,
                            kvSeqlenAllocated,
                            storage};
+    params.kDescale = kDescale;
+    params.vDescale = vDescale;
     Kernel faInfer;
     faInfer(params);
 }
@@ -1066,7 +1349,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                              int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
