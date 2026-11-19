@@ -261,7 +261,7 @@ def _flash_attn_forward(
 # get_scheduler_metadata() implementation.
 # ----------------------------------------------------------------------
 
-_SCHEDULER_METADATA_TILING_BYTES = 2336
+_SCHEDULER_METADATA_TILING_BYTES = 2368
 
 
 @torch.library.custom_op(

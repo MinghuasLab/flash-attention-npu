@@ -537,18 +537,36 @@ std::vector<at::Tensor> mha_fwd(
 
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
+        const bool fusedTask = !paged_KV;
+        fa_fused::TaskShape fusedShape{};
+        if (fusedTask && seqlens_q_cpu == nullptr) {
+            fusedShape = fa_fused::MakeTaskShape(seqlen_q, num_heads, num_heads_k, batch_size, blockDim, true);
+            tiling_cpu_ptr->set_fusedShape(fusedShape.normQBlocks, fusedShape.normHeadTile, fusedShape.normHeadBlocks,
+                                           fusedShape.normTasks, fusedShape.tailRows, fusedShape.tailHeadTile,
+                                           fusedShape.tailHeadBlocks, fusedShape.totalTasks);
+        }
+        tiling_cpu_ptr->set_fusedTask(fusedTask ? 1U : 0U);
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             if (seqlens_q_cpu != nullptr) {
                 qSeqlen = *(seqlens_q_cpu + batchIdx);
             }
-            uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
-            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
-            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
-            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            uint64_t curTaskNum;
+            if (fusedTask) {
+                curTaskNum = seqlens_q_cpu != nullptr
+                                 ? fa_fused::MakeTaskShape(qSeqlen, num_heads, num_heads_k, batch_size, blockDim,
+                                                           false)
+                                       .totalTasks
+                                 : fusedShape.totalTasks;
+            } else {
+                uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
+                uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+                uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+                uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
+                uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+                uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+                curTaskNum = curQNBlockNum * curQSBlockNum;
+            }
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
             }

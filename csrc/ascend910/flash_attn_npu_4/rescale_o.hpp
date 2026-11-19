@@ -288,6 +288,17 @@ public:
         }
     }
 
+    // Cross-task WAR guard for lseStagingUbTensor (one staging buffer, reused by
+    // every task's LSE epilogue). The MTE3 store of task i reads the staging
+    // buffer, and a later task's epilogue rewrites it with Ln; with STACK_SLOTS
+    // task-state slots the rewrite lands >= 2 tasks later, so the wait belongs at
+    // the writer (epilogue), not at the next task's first softmax tile.
+    __aicore__ inline
+    uint32_t TaskStateEventId(uint32_t taskStateSlot)
+    {
+        return taskStateSlot == 0 ? EVENT_ID4 : (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+    }
+
     __aicore__ inline void
     SubCoreCompute(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
                    AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
@@ -517,99 +528,58 @@ public:
 
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Ln<float, false>(
-                        lseUbTensor,
-                        glUbTensor[taskStateSlot * 64],
-                        (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                        AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                    uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
+                    uint32_t lseSeqLen = totalRowNum / lseHeadCount;
+                    uint32_t lseHeadStrideGm = layoutLse.stride(0);
+                    bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
 
+                    // WAR: the LSE store of the matching task-state slot may still be
+                    // draining on MTE3; wait right before the staging buffer is rewritten.
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                     AscendC::PipeBarrier<PIPE_V>();
+                    // *** lse = ln(gl) + gm
+                    AscendC::Ln<float, false>(
+                        lseUbTensor, glUbTensor[taskStateSlot * 64], (uint64_t)0,
+                        CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE), AscendC::UnaryRepeatParams(1, 1, 8, 8));
                     AscendC::Add<float, false>(
-                        lseUbTensor,
-                        lseUbTensor,
-                        gmUbTensor[taskStateSlot * 64],
-                        (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-                    AscendC::PipeBarrier<PIPE_V>();
+                        lseUbTensor, lseUbTensor, gmUbTensor[taskStateSlot * 64], (uint64_t)0,
+                        CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE), AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
 
                     if (!hasSink_) {
                         InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx,
-                                inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
-                                lseUbTensor);
+                                              inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen,
+                                              qSThisSubBlock, lseUbTensor);
                     }
-                    AscendC::Brcb(
-                        lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
-                        lseUbTensor.ReinterpretCast<uint32_t>(),
-                        CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
-                        AscendC::BrcbRepeatParams(1, 8));
-                    if (!splitParams.isSplitkv) {
-                        AscendC::PipeBarrier<PIPE_V>();
-                    }
+                    AscendC::Brcb(lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                                  lseUbTensor.ReinterpretCast<uint32_t>(), CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
+                                  AscendC::BrcbRepeatParams(1, 8));
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
-                    if (splitParams.isSplitkv) {
-                        // isSplitkv: per-head strided write to token-major gCombineLse. UNCHANGED.
-                        if (qNThisSubBlock == 0U) {
-                            AscendC::DataCopyPad(
-                                splitParams.gCombineLse, lseBroadcastUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
-                        } else {
-                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                                AscendC::DataCopyPad(
-                                    splitParams.gCombineLse[qNIdx],
-                                    lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(
-                                        qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
-                                }
-                        }
+                    if (isLseContiguous) {
+                        AscendC::DataCopyPad(gLse, lseUbTensor,
+                                             AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
+                    } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
+                        AscendC::DataCopyPad(gLse, lseUbTensor,
+                                             AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0,
+                                                                        (lseHeadStrideGm - lseSeqLen) * sizeof(float), 0));
                     } else {
-                        // BNS/single-batch NT heads are contiguous; multi-batch NT strides by total tokens.
-                        uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
-                        uint32_t lseSeqLen = totalRowNum / lseHeadCount;
-                        uint32_t lseHeadStrideGm = layoutLse.stride(0);
-                        bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
-                        if (isLseContiguous) {
-                            AscendC::DataCopyPad(
-                                gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    1, totalRowNum * sizeof(float), 0, 0, 0));
-                        } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
-                            AscendC::DataCopyPad(
-                                gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    lseHeadCount,
-                                    lseSeqLen * sizeof(float),
-                                    0,
-                                    (lseHeadStrideGm - lseSeqLen) * sizeof(float),
-                                    0));
-                        } else {
-                            // FA4 already has aligned broadcast rows in UB. Scatter them directly;
-                            // the FA3 GM staging round-trip regresses TND varlen workloads on FA4.
-                            for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
-                                AscendC::DataCopyPad(
-                                    gLse[sIdx],
-                                    lseBroadcastUbTensor[sIdx * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(
-                                        lseHeadCount,
-                                        sizeof(float),
-                                        lseSeqLen - 1U,
-                                        (lseHeadStrideGm - 1U) * sizeof(float),
-                                        0));
-                            }
+                        // FA4 already has aligned broadcast rows in UB. Scatter them directly;
+                        // the FA3 GM staging round-trip regresses TND varlen workloads on FA4.
+                        for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
+                            AscendC::DataCopyPad(gLse[sIdx], lseBroadcastUbTensor[sIdx * FLOAT_BLOCK_SIZE],
+                                                 AscendC::DataCopyExtParams(lseHeadCount, sizeof(float), lseSeqLen - 1U,
+                                                                            (lseHeadStrideGm - 1U) * sizeof(float), 0));
                         }
                     }
-                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
                 // because the combine epilogue requires per-split LSE for rescaling.
                 if (splitParams.isSplitkv) {
                     if (isLastRowLoop) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
                             lseUbTensor,
@@ -649,8 +619,7 @@ public:
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
-                        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                        uint32_t taskStateEventId = TaskStateEventId(taskStateSlot);
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }

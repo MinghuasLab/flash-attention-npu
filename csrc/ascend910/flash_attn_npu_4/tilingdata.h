@@ -49,7 +49,7 @@ struct FAInferStaticTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    uint32_t fusedTask;
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
@@ -58,6 +58,14 @@ struct FAInferStaticTilingData {
     uint32_t numSplits;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
+    uint32_t fusedNormQBlocks;
+    uint32_t fusedNormHeadTile;
+    uint32_t fusedNormHeadBlocks;
+    uint32_t fusedNormTasks;
+    uint32_t fusedTailRows;
+    uint32_t fusedTailHeadTile;
+    uint32_t fusedTailHeadBlocks;
+    uint32_t fusedTotalTasks;
 
     uint32_t get_numHeads() const
     {
@@ -123,9 +131,41 @@ struct FAInferStaticTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_fusedTask() const
     {
-        return padding3;
+        return fusedTask;
+    }
+    uint32_t get_fusedNormQBlocks() const
+    {
+        return fusedNormQBlocks;
+    }
+    uint32_t get_fusedNormHeadTile() const
+    {
+        return fusedNormHeadTile;
+    }
+    uint32_t get_fusedNormHeadBlocks() const
+    {
+        return fusedNormHeadBlocks;
+    }
+    uint32_t get_fusedNormTasks() const
+    {
+        return fusedNormTasks;
+    }
+    uint32_t get_fusedTailRows() const
+    {
+        return fusedTailRows;
+    }
+    uint32_t get_fusedTailHeadTile() const
+    {
+        return fusedTailHeadTile;
+    }
+    uint32_t get_fusedTailHeadBlocks() const
+    {
+        return fusedTailHeadBlocks;
+    }
+    uint32_t get_fusedTotalTasks() const
+    {
+        return fusedTotalTasks;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -216,9 +256,21 @@ struct FAInferStaticTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_fusedTask(uint32_t value)
     {
-        padding3 = value;
+        fusedTask = value;
+    }
+    void set_fusedShape(uint32_t normQBlocks, uint32_t normHeadTile, uint32_t normHeadBlocks, uint32_t normTasks,
+                        uint32_t tailRows, uint32_t tailHeadTile, uint32_t tailHeadBlocks, uint32_t totalTasks)
+    {
+        fusedNormQBlocks = normQBlocks;
+        fusedNormHeadTile = normHeadTile;
+        fusedNormHeadBlocks = normHeadBlocks;
+        fusedNormTasks = normTasks;
+        fusedTailRows = tailRows;
+        fusedTailHeadTile = tailHeadTile;
+        fusedTailHeadBlocks = tailHeadBlocks;
+        fusedTotalTasks = totalTasks;
     }
     void set_splitLseTotalSize(uint64_t value)
     {
