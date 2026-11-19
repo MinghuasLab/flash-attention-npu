@@ -15,6 +15,7 @@
 #include "../flash_attn_npu_3/fag_kernel.cpp"
 #include "../flash_attn_npu_3/fag_bwd_d512_partial.hpp"
 #include "../flash_attn_npu_3/fag_bwd_d512_partial_host.hpp"
+#include "../flash_attn_npu_3/fa_bwd_mla_kernel.cpp"
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
@@ -69,6 +70,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     const int64_t qk_head_dim = q_sizes.back();
     const int64_t k_head_dim = k_sizes.back();
     const int64_t v_head_dim = v_sizes.back();
+
+    const bool is_mla = (qk_head_dim == 192 && v_head_dim == 128);
+    TORCH_CHECK(!is_mla || !deterministic,
+                "Ascend950 v4 bwd: deterministic backward is not supported for Q/K=192 and V=128");
 
     TORCH_CHECK(batch_size > 0, "Ascend950 v4 bwd: batch size must be positive");
     if (seqused_q_.has_value()) {
@@ -140,8 +145,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.layout =
         is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
     bool is_local = false;
-    fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right,
-                                        is_causal, is_local);
+    fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right, is_causal,
+                                        is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fag_info.maskType = FAGTiling950::MaskType::CAUSAL;
@@ -389,15 +394,15 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>         \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>     \
         <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
                                             cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
                                             ptr(tiling_device))
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
     do {                                                                                                               \
-        if (has_attn_mask) {                                                                                               \
+        if (has_attn_mask) {                                                                                           \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
                     LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
@@ -428,6 +433,29 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
+#define LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_SOFTCAP)                                              \
+    FlashAttentionV3BwdMla950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_SOFTCAP>                    \
+        <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
+                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
+                                            ptr(tiling_device))
+
+#define DISPATCH_BWD950_MLA_FLAGS(DTYPE, INPUT_LAYOUT)                                                                 \
+    do {                                                                                                               \
+        if (has_attn_mask) {                                                                                           \
+            if (has_softcap) {                                                                                         \
+                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, true, true);                                                    \
+            } else {                                                                                                   \
+                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, true, false);                                                   \
+            }                                                                                                          \
+        } else {                                                                                                       \
+            if (has_softcap) {                                                                                         \
+                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, false, true);                                                   \
+            } else {                                                                                                   \
+                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, false, false);                                                  \
+            }                                                                                                          \
+        }                                                                                                              \
+    } while (0)
+
     if (fag_tiling_data.d512Partial != 0) {
         TORCH_CHECK(!deterministic,
                     "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
@@ -438,6 +466,24 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                       : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
                                  : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
             has_attn_mask, has_softcap));
+    } else if (is_mla) {
+        if (q.dtype() == at::kBFloat16) {
+            if (is_varlen) {
+                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, TND);
+            } else if (is_bnsd) {
+                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BNSD);
+            } else {
+                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BSND);
+            }
+        } else {
+            if (is_varlen) {
+                DISPATCH_BWD950_MLA_FLAGS(half, TND);
+            } else if (is_bnsd) {
+                DISPATCH_BWD950_MLA_FLAGS(half, BNSD);
+            } else {
+                DISPATCH_BWD950_MLA_FLAGS(half, BSND);
+            }
+        }
     } else if (q.dtype() == at::kBFloat16) {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
@@ -458,6 +504,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
 
 #undef DISPATCH_BWD950_FLAGS
 #undef LAUNCH_BWD950
+#undef DISPATCH_BWD950_MLA_FLAGS
+#undef LAUNCH_BWD950_MLA
 
     at::Tensor softmax_d = is_varlen ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))
                                      : at::empty({batch_size, num_heads, q_seqlen}, q.options().dtype(at::kFloat));

@@ -20,12 +20,12 @@
 
 namespace Catlass::Gemm::Block {
 
-template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, bool ENABLE_UNIT_FLAG_, class L1TileShape_, class L0TileShape_,
-          class ElementA_, class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
-struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>, L1TileShape_, L0TileShape_,
-                    ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
+template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, class L1TileShape_, class L0TileShape_, class ElementA_,
+          class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_>, L1TileShape_, L0TileShape_, ElementA_, ElementB_,
+                    ElementC_, ElementBias_, TileCopy_, TileMmad_> {
   public:
-    using DispatchPolicy = MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>;
+    using DispatchPolicy = MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
     using L1TileShape = L1TileShape_;
@@ -62,7 +62,6 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
                   "L0TileShape must be tla::tuple and static!");
     static_assert(std::is_same_v<ArchTag, Arch::Ascend950>, "Requires Ascend950");
 
-    static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
     static constexpr uint16_t L1_FREE_FLAG_INVALID = 0xffff;
     static constexpr uint32_t L0AB_STAGES = DispatchPolicy::L0AB_STAGES;
     static constexpr uint32_t L0C_STAGES = DispatchPolicy::L0C_STAGES;
@@ -144,7 +143,6 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
             const uint32_t slot = Ascend950FagMlaL0CLayout::SLOT_SDP_0 + i;
             l0CTensorList[i] =
                 resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(Ascend950FagMlaL0CLayout::L0COffset(slot));
-            l0CMutexList[i] = static_cast<int32_t>(Ascend950FagMlaL1Layout::L0CMutex(slot));
         }
         for (uint32_t i = 0; i < Ascend950FagMlaL1Layout::SLOT_COUNT; i++) {
             l1MutexList[i] = static_cast<int32_t>(Ascend950FagMlaL1Layout::L1Mutex(i));
@@ -207,8 +205,7 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
         GemmColA(pNz, l1Dy[dySlot % Ascend950FagMlaL1Layout::QDY_BUFFER_DEPTH], l0CTensorList[SLOT_DV], skvRound,
                  dvRound, sqRound, skvActual, dvActual, sqActual, initDv, flushDv ? 0b11 : 0b10, SLOT_DV, dyEvent,
                  /*waitB=*/false, /*releaseB=*/true,
-                 /*bNOff=*/0, /*bNFull=*/0, /*loadA=*/true, /*releaseA=*/true,
-                 /*acquireC=*/true, /*publishC=*/true, l1AFreeFlag);
+                 /*bNOff=*/0, /*bNFull=*/0, /*loadA=*/true, /*releaseA=*/true, l1AFreeFlag);
         if (flushDv) {
             FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV);
         }
@@ -250,8 +247,7 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
             GemmRow(dsNz, l1KSlice, dqL0C, sqRound, nRound, skvRound, sqActual, nAct, skvActual, true, 0b11, SLOT_DQ,
                     L1_EVENT_K + residentKSlot_, /*waitB=*/false,
                     /*releaseB=*/lastSlice && releaseKT,
-                    /*loadA=*/firstSlice, /*releaseA=*/lastSlice,
-                    /*acquireC=*/firstSlice, /*publishC=*/lastSlice);
+                    /*loadA=*/firstSlice, /*releaseA=*/lastSlice);
         }
         FixpipeTla(dq, l0CTensorList[SLOT_DQ], sqActual, dActual, sqRound, enAtomicDq, SLOT_DQ);
 
@@ -273,8 +269,7 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
                      skvActual, nAct, sqActual, initC, flushDk ? 0b11 : 0b10, SLOT_DK, qEvent,
                      /*waitB=*/false, /*releaseB=*/lastSlice,
                      /*bNOff=*/nOff, /*bNFull=*/dFullRound,
-                     /*loadA=*/dIdx == 0, /*releaseA=*/lastSlice,
-                     /*acquireC=*/dIdx == 0, /*publishC=*/lastSlice, l1AFreeFlag);
+                     /*loadA=*/dIdx == 0, /*releaseA=*/lastSlice, l1AFreeFlag);
         }
         if (flushDk) {
             FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK);
@@ -287,9 +282,9 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
     void GemmRow(AscendC::LocalTensor<ElementA> l1A, AscendC::LocalTensor<ElementB> l1B,
                  AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
                  uint32_t mActual, uint32_t nActual, uint32_t kActual, bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-                 uint32_t l1BEvent, bool waitB, bool releaseB, bool loadA = true, bool releaseA = true,
-                 bool acquireC = true, bool publishC = true)
+                 uint32_t l1BEvent, bool waitB, bool releaseB, bool loadA = true, bool releaseA = true)
     {
+        (void)l0cSlot;
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0A>(mRound, kRound);
         auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, nRound);
@@ -326,16 +321,9 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
             AscendC::Mutex::Lock<PIPE_M>(l0AMutexList[l0AListId]);
         }
         AscendC::Mutex::Lock<PIPE_M>(l0BMutexList[l0BListId]);
-        if (!ENABLE_UNIT_FLAG && acquireC) {
-            AscendC::Mutex::Lock<PIPE_M>(l0CMutexList[l0cSlot]);
-        }
         uint32_t mMad = (mActual == 1) ? 2 : mRound;
-        uint8_t uf = ENABLE_UNIT_FLAG ? unitFlag : 0;
-        tileMmad(tensorL0C, tensorL0A, tensorL0B, mMad, nActual, kActual, initC, uf);
+        tileMmad(tensorL0C, tensorL0A, tensorL0B, mMad, nActual, kActual, initC, unitFlag);
 
-        if (!ENABLE_UNIT_FLAG && publishC) {
-            AscendC::Mutex::Unlock<PIPE_M>(l0CMutexList[l0cSlot]);
-        }
         if (releaseA) {
             AscendC::Mutex::Unlock<PIPE_M>(l0AMutexList[l0AListId]);
         }
@@ -351,9 +339,9 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
                   AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
                   uint32_t mActual, uint32_t nActual, uint32_t kActual, bool initC, uint8_t unitFlag, uint32_t l0cSlot,
                   uint32_t l1BEvent, bool waitB, bool releaseB, uint32_t bNOff = 0, uint32_t bNFull = 0,
-                  bool loadA = true, bool releaseA = true, bool acquireC = true, bool publishC = true,
-                  uint16_t l1AFreeFlag = L1_FREE_FLAG_INVALID)
+                  bool loadA = true, bool releaseA = true, uint16_t l1AFreeFlag = L1_FREE_FLAG_INVALID)
     {
+        (void)l0cSlot;
         const uint32_t nLayout = (bNFull == 0) ? nRound : bNFull;
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1ACol>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0ACol>(mRound, kRound);
@@ -396,16 +384,9 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
             AscendC::Mutex::Lock<PIPE_M>(l0AMutexList[l0AListId]);
         }
         AscendC::Mutex::Lock<PIPE_M>(l0BMutexList[l0BListId]);
-        if (!ENABLE_UNIT_FLAG && acquireC) {
-            AscendC::Mutex::Lock<PIPE_M>(l0CMutexList[l0cSlot]);
-        }
         uint32_t mMad = (mActual == 1) ? 2 : mRound;
-        uint8_t uf = ENABLE_UNIT_FLAG ? unitFlag : 0;
-        tileMmadCol(tileL0C, tensorL0A, tensorL0B, mMad, nActual, kActual, initC, uf);
+        tileMmadCol(tileL0C, tensorL0A, tensorL0B, mMad, nActual, kActual, initC, unitFlag);
 
-        if (!ENABLE_UNIT_FLAG && publishC) {
-            AscendC::Mutex::Unlock<PIPE_M>(l0CMutexList[l0cSlot]);
-        }
         if (releaseA) {
             AscendC::Mutex::Unlock<PIPE_M>(l0AMutexList[l0AListId]);
         }
@@ -426,28 +407,14 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
 
         using CopyL0CToDst = typename TileCopy::template CopyL0CToDst<decltype(tensorGmTile)>;
         CopyL0CToDst copyL0CToDst;
-
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::Mutex::Lock<PIPE_FIX>(l0CMutexList[l0cSlot]);
-        }
+        (void)l0cSlot;
 
         if (enAtomic) {
             AscendC::SetAtomicType<float>();
-            if constexpr (ENABLE_UNIT_FLAG) {
-                copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
-            } else {
-                copyL0CToDst(tensorGmTile, tensorL0C);
-            }
+            copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
             AscendC::SetAtomicNone();
         } else {
-            if constexpr (ENABLE_UNIT_FLAG) {
-                copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
-            } else {
-                copyL0CToDst(tensorGmTile, tensorL0C);
-            }
-        }
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::Mutex::Unlock<PIPE_FIX>(l0CMutexList[l0cSlot]);
+            copyL0CToDst(tensorGmTile, tensorL0C, 0b11);
         }
     }
 
@@ -463,7 +430,6 @@ struct BlockMmadTla<MmadAscend950FagMladQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNI
 
     int32_t l0AMutexList[L0AB_STAGES];
     int32_t l0BMutexList[L0AB_STAGES];
-    int32_t l0CMutexList[L0C_STAGES];
     int32_t l1MutexList[Ascend950FagMlaL1Layout::SLOT_COUNT];
 
     // References to the per-AIC cursor shared with the other GEMM block.

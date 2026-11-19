@@ -18,20 +18,18 @@
 #include "fag_mmad_mla_dqkv.hpp"
 #include "fag_kernel_mla.h"
 
-template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_SOFTCAP, bool ENABLE_UNIT_FLAG>
+template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_SOFTCAP>
 CATLASS_DEVICE void RunMlaBackward950(FAGKernelParams const& params)
 {
-    if constexpr (ENABLE_UNIT_FLAG) {
 #ifdef __DAV_CUBE__
-        AscendC::SetMMRowMajor();
+    AscendC::SetMMRowMajor();
 #endif
-    }
     using ArchTag = Catlass::Arch::Ascend950;
     // MLA A5 layout: outer tiles fixed at 128x128, inner K up to 192 for QK/dQ/dK.
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
     using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<192>, tla::Int<128>>;
 
-    using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagMlaSdP<2, 2, ENABLE_UNIT_FLAG>;
+    using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagMlaSdP<2, 2>;
     using TileCopySdP =
         Catlass::Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
                                                    Catlass::layout::ColumnMajor, float, Catlass::layout::RowMajor, void,
@@ -39,7 +37,7 @@ CATLASS_DEVICE void RunMlaBackward950(FAGKernelParams const& params)
     using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicySdP, L1TileShape, L0TileShape, DataType,
                                                             DataType, float, void, TileCopySdP>;
 
-    using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagMladQKV<2, 2, ENABLE_UNIT_FLAG>;
+    using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagMladQKV<2, 2>;
     using TileCopydQKV =
         Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
                                                Catlass::layout::RowMajor, float, Catlass::layout::RowMajor>;
@@ -68,14 +66,5 @@ CATLASS_GLOBAL void FlashAttentionV3BwdMla950(GM_ADDR dout, GM_ADDR q, GM_ADDR k
 {
     FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
                            cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
-    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::BSND && !IS_CAUSAL && !IS_SOFTCAP) {
-        const auto* td = reinterpret_cast<const __gm__ FAGTiling950::FAGTilingData*>(tiling);
-        if (seqUsedQ == nullptr && seqUsedKv == nullptr && td->qSeqlen % 128 == 0 && td->kvSeqlen % 128 == 0) {
-            RunMlaBackward950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP, true>(params);
-        } else {
-            RunMlaBackward950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP, false>(params);
-        }
-    } else {
-        RunMlaBackward950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP, false>(params);
-    }
+    RunMlaBackward950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP>(params);
 }

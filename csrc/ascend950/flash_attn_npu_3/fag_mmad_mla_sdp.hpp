@@ -20,12 +20,12 @@
 
 namespace Catlass::Gemm::Block {
 
-template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, bool ENABLE_UNIT_FLAG_, class L1TileShape_, class L0TileShape_,
-          class ElementA_, class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
-struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>, L1TileShape_, L0TileShape_,
-                    ElementA_, ElementB_, ElementC_, ElementBias_, TileCopy_, TileMmad_> {
+template <uint32_t L1A_STAGES_, uint32_t L1B_STAGES_, class L1TileShape_, class L0TileShape_, class ElementA_,
+          class ElementB_, class ElementC_, class ElementBias_, class TileCopy_, class TileMmad_>
+struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_>, L1TileShape_, L0TileShape_, ElementA_, ElementB_,
+                    ElementC_, ElementBias_, TileCopy_, TileMmad_> {
   public:
-    using DispatchPolicy = MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FLAG_>;
+    using DispatchPolicy = MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using TileCopy = TileCopy_;
     using L1TileShape = L1TileShape_;
@@ -54,7 +54,6 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
                   "L0TileShape must be tla::tuple and static!");
     static_assert(std::is_same_v<ArchTag, Arch::Ascend950>, "Requires Ascend950");
 
-    static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
     static constexpr uint32_t L0AB_STAGES = DispatchPolicy::L0AB_STAGES;
     static constexpr uint32_t L0C_STAGES = DispatchPolicy::L0C_STAGES;
     static constexpr uint32_t L0C_BUF_SIZE = DispatchPolicy::L0C_BUF_SIZE;
@@ -115,9 +114,7 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
                  uint32_t eventIdStart = 0)
         : l0AListId(cursor.a), l0BListId(cursor.b)
     {
-        if constexpr (ENABLE_UNIT_FLAG) {
-            AscendC::SetMMLayoutTransform(true);
-        }
+        AscendC::SetMMLayoutTransform(true);
         AscendC::SetHF32Mode(false);
 
         for (uint32_t i = 0; i < 2; ++i) {
@@ -142,7 +139,6 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
             const uint32_t slot = Ascend950FagMlaL0CLayout::SLOT_SDP_0 + i;
             l0CTensorList[i] =
                 resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(Ascend950FagMlaL0CLayout::L0COffset(slot));
-            l0CMutexList[i] = static_cast<int32_t>(Ascend950FagMlaL1Layout::L0CMutex(slot));
         }
         for (uint32_t i = 0; i < Ascend950FagMlaL1Layout::SLOT_COUNT; i++) {
             l1MutexList[i] = static_cast<int32_t>(Ascend950FagMlaL1Layout::L1Mutex(i));
@@ -321,6 +317,7 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
                  uint32_t mActual, uint32_t nActual, uint32_t kActual, uint32_t l0cSlot, uint32_t l1AEvent,
                  uint32_t l1BEvent, bool waitB, bool releaseB, bool releaseA = true)
     {
+        (void)l0cSlot;
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, nRound);
         auto tensorL1A = tla::MakeTensor(l1A, layoutAInL1, Arch::PositionL1{});
@@ -332,10 +329,6 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
         if (waitB) {
             AscendC::Mutex::Lock<PIPE_MTE1>(l1MutexList[l1BEvent]);
         }
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::Mutex::Lock<PIPE_M>(l0CMutexList[l0cSlot]);
-        }
-
         uint32_t kLoops = CeilDiv(kActual, BASE);
         for (uint32_t kIdx = 0; kIdx < kLoops; ++kIdx) {
             uint32_t kOff = kIdx * BASE;
@@ -362,20 +355,13 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
 
             bool initC = (kIdx == 0);
             uint32_t mMad = (mActual == 1) ? 2 : mRound;
-            uint8_t unitFlag = 0;
-            if constexpr (ENABLE_UNIT_FLAG) {
-                unitFlag = (kIdx + 1 == kLoops) ? 0b11 : 0b10;
-            }
+            uint8_t unitFlag = (kIdx + 1 == kLoops) ? 0b11 : 0b10;
             tileMmad(tensorL0C, tensorL0A, tensorL0B, mMad, nActual, tileK, initC, unitFlag);
 
             AscendC::Mutex::Unlock<PIPE_M>(l0AMutexList[l0AListId]);
             AscendC::Mutex::Unlock<PIPE_M>(l0BMutexList[l0BListId]);
             l0AListId = (l0AListId + 1 < L0AB_STAGES) ? (l0AListId + 1) : 0;
             l0BListId = (l0BListId + 1 < L0AB_STAGES) ? (l0BListId + 1) : 0;
-        }
-
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::Mutex::Unlock<PIPE_M>(l0CMutexList[l0cSlot]);
         }
 
         if (releaseA) {
@@ -390,19 +376,14 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
     CATLASS_DEVICE void FixpipeUb(TensorUb& ubC, AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mActual,
                                   uint32_t nActual, uint32_t mRound, uint32_t l0cSlot)
     {
+        (void)l0cSlot;
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nActual);
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
 
         using CopyL0CToDst = typename TileCopy::template CopyL0CToDst<TensorUb>;
         CopyL0CToDst copyL0CToDst;
 
-        if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::Mutex::Lock<PIPE_FIX>(l0CMutexList[l0cSlot]);
-            copyL0CToDst(ubC, tensorL0C);
-            AscendC::Mutex::Unlock<PIPE_FIX>(l0CMutexList[l0cSlot]);
-        } else {
-            copyL0CToDst(ubC, tensorL0C, 0b11);
-        }
+        copyL0CToDst(ubC, tensorL0C, 0b11);
     }
 
     AscendC::LocalTensor<ElementA> l1Q[Ascend950FagMlaL1Layout::QDY_BUFFER_DEPTH];
@@ -416,7 +397,6 @@ struct BlockMmadTla<MmadAscend950FagMlaSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT
 
     int32_t l0AMutexList[L0AB_STAGES];
     int32_t l0BMutexList[L0AB_STAGES];
-    int32_t l0CMutexList[L0C_STAGES];
     int32_t l1MutexList[Ascend950FagMlaL1Layout::SLOT_COUNT];
 
     // References to the per-AIC cursor shared with the other GEMM block.

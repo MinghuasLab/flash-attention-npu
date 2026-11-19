@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """Dense MLA core ranges that start/end inside a resident KV group."""
 
 import pytest

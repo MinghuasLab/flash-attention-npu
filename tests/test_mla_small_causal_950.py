@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """Two-block MHA causal partitions, split KV accumulation and guard boundaries."""
 
 import importlib
@@ -37,7 +37,7 @@ def test_small_mha_causal(version, dtype, sq, sk, heads, layout):
     if layout != "TND":
         cuk = None
     module = importlib.import_module(f"flash_attn_npu_{version}_950")
-    fn = module.bwd if version == 3 else module.bwd_mla
+    fn = module.bwd
     print("Launch", version, dtype, sq, sk, heads, layout, flush=True)
     fn(
         do,

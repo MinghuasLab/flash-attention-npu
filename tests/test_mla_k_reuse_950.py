@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """MLA resident-K/V lifetime across KV groups assigned to the same AIC."""
 
 import importlib
@@ -55,7 +55,7 @@ def test_mla_k_reuse(version, dtype, batch, seqlen, heads, kv_heads, causal):
 
     q, k, v, out, dout, lse = [x.npu() for x in (q, k, v, out, dout, lse)]
     actual = [torch.empty_like(x) for x in (q, k, v)]
-    bwd = backend.bwd if version == 3 else backend.bwd_mla
+    bwd = backend.bwd
     torch.npu.synchronize()
     print(f"Launching v{version} B={batch} S={seqlen} H={heads}/{kv_heads} {dtype}", flush=True)
     start = time.monotonic()

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """Public backward head-dim buckets, numerical semantics and output-buffer mutation."""
 
 import importlib
@@ -36,7 +36,10 @@ CASES = [
     (224, 80, (256, 256), "TND", False, -1, -1, 0.0, None),
     (256, 128, (256, 256), "BSND", True, -1, -1, 0.0, None),
     (256, 192, (256, 256), "BSND", False, -1, -1, 0.0, 0.08),
+    (64, 128, (64, 128), "BNSD", False, -1, -1, 0.0, None),
     (160, 81, (192, 128), "BNSD", True, -1, -1, 0.0, None),
+    (192, 128, (192, 128), "BNSD", True, -1, -1, 0.0, None),
+    (145, 128, (192, 128), "BNSD", True, -1, -1, 0.0, None),
 ]
 
 
@@ -71,15 +74,15 @@ def test_backward_head_dim_buckets(version, dtype, case, monkeypatch):
     scale = qdim ** (-0.5) if scale_arg is None else scale_arg
     api = importlib.import_module(f"flash_attn_npu_{version}.flash_attn_npu_interface_950")
     backend = importlib.import_module(f"flash_attn_npu_{version}_950")
+    assert not hasattr(backend, "bwd_mla")
     seen = []
-    for name in ["bwd"] if version == 3 else ["bwd", "bwd_mla"]:
-        original = getattr(backend, name)
+    original = backend.bwd
 
-        def record(*args, _original=original, _name=name):
-            seen.append((_name, args[1].shape[-1], args[3].shape[-1], args[15]))
-            return _original(*args)
+    def record(*args):
+        seen.append(("bwd", args[1].shape[-1], args[3].shape[-1], args[15]))
+        return original(*args)
 
-        monkeypatch.setattr(backend, name, record)
+    monkeypatch.setattr(backend, "bwd", record)
     lengths = [(17, 33), (65, 97)] if layout == "TND" else [(65, 97)]
     pieces = [
         _segment(qdim, vdim, dtype, sq, sk, causal, wl, wr, softcap, scale) for sq, sk in lengths
@@ -97,13 +100,10 @@ def test_backward_head_dim_buckets(version, dtype, case, monkeypatch):
         refs = list(pieces[0][1])
         cuq = cuk = None
         if layout == "BNSD":
-            if version == 3:
-                values[:5] = [x.transpose(1, 2).contiguous().transpose(1, 2) for x in values[:5]]
-            else:
-                values[:5] = [x.transpose(1, 2) for x in values[:5]]
-                refs = [x.transpose(1, 2) for x in refs]
+            # Logical BSND views with physical BNSD storage, shared by FA3/FA4.
+            values[:5] = [x.transpose(1, 2).contiguous().transpose(1, 2) for x in values[:5]]
     q, k, v, out, do, lse = values
-    grads = [torch.full_like(x, float("nan")) for x in (q, k, v)]
+    grads = [torch.full(x.shape, float("nan"), dtype=x.dtype, device=x.device) for x in (q, k, v)]
     print(f"Launch v{version} {dtype} {qdim}/{vdim}->{bucket} {layout}", flush=True)
     common = dict(
         cu_seqlens_q=cuq,
@@ -129,16 +129,17 @@ def test_backward_head_dim_buckets(version, dtype, case, monkeypatch):
             do,
             lse,
             causal=causal,
-            input_layout="bnsd" if layout == "BNSD" else None,
             **common,
         )
         assert all(got is buf for got, buf in zip(returned, grads))
     torch.npu.synchronize()
     assert len(seen) == 1
     assert seen[0][1:3] == bucket
-    if version == 4:
-        assert seen[0][0] == ("bwd_mla" if bucket == (192, 128) else "bwd")
-    assert seen[0][3] == pytest.approx(scale)
+    assert seen[0][0] == "bwd"
+    if scale_arg is None and (qdim, vdim) == bucket:
+        assert seen[0][3] is None  # The backend supplies the unpadded default scale.
+    else:
+        assert seen[0][3] == pytest.approx(scale)
     for got, ref in zip(grads, refs):
         _check(got, ref, dtype)
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """Generic FAG keeps its original metadata layout beside MLA epilogues."""
 
 import importlib

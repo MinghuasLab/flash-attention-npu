@@ -76,6 +76,9 @@ class BlockEpilogue<EpilogueAscend950FAGMlaScaledMaskSoftmax<INPUT_LAYOUT_, IS_A
         // l1PTensor: [128 / C0, AlignUp(block.s1Extend, 16), C0]
 
         // 1. Copy in attenMask
+        // Any MTE2 landing in UB here needs its own MTE2->V barrier: the LSE
+        // copy below is skipped once the metadata was prefetched.
+        bool pendingMte2 = false;
         if constexpr (IS_ATTEN_MASK) {
             if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL)) {
                 const int64_t diagOffset =
@@ -104,6 +107,7 @@ class BlockEpilogue<EpilogueAscend950FAGMlaScaledMaskSoftmax<INPUT_LAYOUT_, IS_A
                         AscendC::DataCopyPadExtParams<uint8_t> maskPadParams{false, 0, 0, 0};
                         AscendC::DataCopyPad(attenMaskUbTensor, attenMaskGm.data()[maskGmOffset], maskCopyParams,
                                              maskPadParams);
+                        pendingMte2 = true;
                     }
                 } else {
                     // This AIV slice lies completely below the causal diagonal.
@@ -115,12 +119,16 @@ class BlockEpilogue<EpilogueAscend950FAGMlaScaledMaskSoftmax<INPUT_LAYOUT_, IS_A
             } else if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::BAND)) {
                 ProcessBandMask(block, attenMaskGm, attenMaskUbTensor, ubPTensor, mte2ToVEvent, vToMte2Event,
                                 mte3ToVEvent, s1RealSize, subBlockIdx);
+                pendingMte2 = true;
             }
         }
 
         // 2. Copy in lse ([B,N1,S1] or [N1,totalS1])
         if (!metadataPrefetched) {
             PrefetchLse(softmaxLseGm, lseUbTensor, s1RealSize);
+            pendingMte2 = true;
+        }
+        if (pendingMte2) {
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         }

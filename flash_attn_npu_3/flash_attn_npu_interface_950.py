@@ -396,6 +396,8 @@ def _flash_attn_backward(
     softmax_lse = softmax_lse.contiguous()
     qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
     qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    if (qk_bucket, v_bucket) == (192, 128) and deterministic:
+        raise ValueError("flash_attn_npu_v3 950 MLA backward does not support deterministic=True")
     pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
     dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
     if pad_heads:

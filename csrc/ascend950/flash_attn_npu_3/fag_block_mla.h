@@ -140,7 +140,8 @@ struct Ascend950FagMlaL1Layout {
 };
 
 // Ascend950 MLA backward S / dP: S = Q * K^T, dP = dY * V^T.
-template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = true>
+// MLA always uses the unit-flag / MMLayoutTransform pipeline.
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2>
 struct MmadAscend950FagMlaSdP {
     using ArchTag = Arch::Ascend950;
     static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
@@ -149,11 +150,10 @@ struct MmadAscend950FagMlaSdP {
     static constexpr uint32_t L0C_STAGES = Ascend950FagMlaL0CLayout::L0C_SDP_SLOT_NUM;
     static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagMlaL0CLayout::L0C_BUF_SIZE;
     static constexpr uint32_t BASE = 128;
-    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 };
 
 // Ascend950 MLA backward dQKV: dq = dS * K, dk = dS^T * Q, dv = P^T * dY.
-template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2, bool ENABLE_UNIT_FLAG_ = true>
+template <uint32_t L1A_STAGES_ = 2, uint32_t L1B_STAGES_ = 2>
 struct MmadAscend950FagMladQKV {
     using ArchTag = Arch::Ascend950;
     static constexpr uint32_t L1A_STAGES = L1A_STAGES_;
@@ -162,7 +162,6 @@ struct MmadAscend950FagMladQKV {
     static constexpr uint32_t L0C_STAGES = Ascend950FagMlaL0CLayout::L0C_SLOT_NUM;
     static constexpr uint32_t L0C_BUF_SIZE = Ascend950FagMlaL0CLayout::L0C_BUF_SIZE;
     static constexpr uint32_t BASE = 128;
-    static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 };
 
 } // namespace Catlass::Gemm

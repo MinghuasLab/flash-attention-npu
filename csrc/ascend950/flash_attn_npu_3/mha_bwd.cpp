@@ -76,12 +76,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     const int64_t k_head_dim = k_sizes.back();
     const int64_t v_head_dim = v_sizes.back();
 
-    // MLA backward does not support deterministic mode; force non-deterministic
-    // scheduling to match the MLA-only kernel implementation.
     const bool is_mla = (qk_head_dim == 192 && v_head_dim == 128);
-    if (is_mla) {
-        deterministic = false;
-    }
+    TORCH_CHECK(!is_mla || !deterministic,
+                "Ascend950 v3 bwd: deterministic backward is not supported for Q/K=192 and V=128");
 
     TORCH_CHECK(batch_size > 0, "Ascend950 v3 bwd: batch size must be positive");
     if (seqused_q_.has_value()) {

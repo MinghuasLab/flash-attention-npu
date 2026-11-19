@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Minghua Shen.
 """Full-tile L0C handoffs with asymmetric Q/K lengths and resident dK/dV."""
 
 import importlib
@@ -32,7 +32,7 @@ def test_mla_l0c_handoff(version, dtype, sq, sk, heads, kv_heads):
     q, k, v, out, dout, lse = [x.npu() for x in values]
     grads = [torch.empty_like(x) for x in (q, k, v)]
     module = importlib.import_module(f"flash_attn_npu_{version}_950")
-    backward = module.bwd if version == 3 else module.bwd_mla
+    backward = module.bwd
     backward(
         dout,
         q,

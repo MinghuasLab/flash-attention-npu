@@ -66,34 +66,14 @@ def _window_to_npu(window_size: Optional[int]) -> int:
     return -1 if window_size is None else int(window_size)
 
 
-def _is_bnsd_tensor(t):
-    """Return True if ``t`` is a transposed view of contiguous BSND storage.
-
-    We deliberately do **not** treat an arbitrary contiguous 4-D tensor as
-    BNSD, because a contiguous (B, S, N, D) BSND tensor has the same stride
-    pattern as a contiguous (B, N, S, D) BNSD tensor when the dimensions are
-    ambiguous.  Only a non-contiguous transpose produced by ``t.transpose(1,2)``
-    is unambiguous.
-    """
+def _transposed_bnsd_view(t):
+    """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
     if t is None or t.dim() != 4 or t.is_contiguous():
-        return False
-    _, n, _, d = t.shape
-    return t.stride(3) == 1 and t.stride(1) == d and t.stride(2) == n * d
-
-
-def _is_bnsd_layout(q, k, v):
-    """Return True when q/k/v are transposed-view BNSD tensors.
-
-    k/v may be MQA (nheads_kv == 1); their transposed view may be contiguous,
-    but we still treat them as BNSD because the physical storage follows q.
-    """
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        return False
-    return _is_bnsd_tensor(q)
-
-
-def _bnsd_to_bsnd(t):
-    return t.transpose(1, 2).contiguous()
+        return None
+    _, n1, _, n3 = t.shape
+    if t.stride(3) == 1 and t.stride(1) == n3 and t.stride(2) == n1 * n3:
+        return t.transpose(1, 2)
+    return None
 
 
 def _detect_layout(q, k, v, page_table, cu_seqlens_k):
@@ -112,9 +92,9 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     if q.dim() != 4 or k.dim() != 4 or page_table is not None or cu_seqlens_k is not None:
         return _LAYOUT_BSND, q, k, v, False
 
-    q_bnsd = q.transpose(1, 2) if _is_bnsd_tensor(q) else None
-    k_bnsd = k.transpose(1, 2) if _is_bnsd_tensor(k) else None
-    v_bnsd = v.transpose(1, 2) if _is_bnsd_tensor(v) else None
+    q_bnsd = _transposed_bnsd_view(q)
+    k_bnsd = _transposed_bnsd_view(k)
+    v_bnsd = _transposed_bnsd_view(v)
     # A singleton sequence/head axis has identical BSND and BNSD storage.
     # Let a non-degenerate FP8 operand anchor layout detection for MQA and Q=1.
     if q.dtype == torch.float8_e4m3fn and any(x is not None for x in (q_bnsd, k_bnsd, v_bnsd)):
@@ -546,7 +526,6 @@ def _flash_attn_backward(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     deterministic: bool = False,
-    input_layout: Optional[str] = None,
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
@@ -579,25 +558,13 @@ def _flash_attn_backward(
     assert gather_kv_indices is None, "flash_attn_npu_v4 950 bwd does not support gather_kv_indices"
     assert learnable_sink is None, "flash_attn_npu_v4 950 bwd does not support learnable_sink"
 
-    # The C++ kernels consume BSND physical storage, while the Python API also
-    # accepts BNSD (as a transposed view of BSND storage).  Detect that case and
-    # convert q/k/v/out/dout to BSND physical up-front.  LSE is always stored as
-    # (B, Nq, Sq) RowMajor, which the BSND kernel path reads as a flattened
-    # (B*Nq, Sq) buffer, so it does not need to be transposed.
-    dq_in, dk_in, dv_in = dq, dk, dv
-    needs_transpose_back = input_layout == "bnsd" or _is_bnsd_layout(q, k, v)
-    if needs_transpose_back:
-        q = _bnsd_to_bsnd(q)
-        k = _bnsd_to_bsnd(k)
-        v = _bnsd_to_bsnd(v)
-        out = _bnsd_to_bsnd(out)
-        dout = _bnsd_to_bsnd(dout)
-
-    if dq is None or needs_transpose_back:
+    # Keep logical BSND/TND shapes, including views backed by BNSD storage.
+    # Layout detection and strided input addressing are handled by the backend.
+    if dq is None:
         dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    if dk is None or needs_transpose_back:
+    if dk is None:
         dk = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    if dv is None or needs_transpose_back:
+    if dv is None:
         dv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
     seqused_q_c = _full_contiguous(seqused_q) if seqused_q is not None else None
@@ -605,6 +572,8 @@ def _flash_attn_backward(
 
     qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
     qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    if (qk_bucket, v_bucket) == (192, 128) and deterministic:
+        raise ValueError("flash_attn_npu_v4 950 MLA backward does not support deterministic=True")
     pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
     if pad_heads:
         if softmax_scale is None:
@@ -626,83 +595,33 @@ def _flash_attn_backward(
         q_kernel, k_kernel, v_kernel, out_kernel, dout_kernel = q, k, v, out, dout
         dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
 
-    if (qk_bucket, v_bucket) == (192, 128):
-        if deterministic:
-            raise ValueError(
-                "flash_attn_npu_v4 950 MLA backward does not support deterministic=True"
-            )
-        layout = (
-            _LAYOUT_TND
-            if cu_seqlens_q is not None
-            else _detect_layout(q_kernel, k_kernel, v_kernel, None, cu_seqlens_k)[0]
-        )
-        flash_attn_npu_4_950.bwd_mla(
-            dout_kernel,
-            q_kernel,
-            k_kernel,
-            v_kernel,
-            out_kernel,
-            lse.contiguous(),
-            dq_kernel,
-            dk_kernel,
-            dv_kernel,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q_c,
-            seqused_k_c,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            _window_to_npu(window_size_left),
-            _window_to_npu(window_size_right),
-            softcap,
-            False,
-            0,
-            layout,
-        )
-    else:
-        _flash_attn_backward_op(
-            dout_kernel,
-            q_kernel,
-            k_kernel,
-            v_kernel,
-            out_kernel,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q_c,
-            seqused_k_c,
-            max_seqlen_q,
-            max_seqlen_k,
-            dq_kernel,
-            dk_kernel,
-            dv_kernel,
-            softmax_scale,
-            causal,
-            _window_to_npu(window_size_left),
-            _window_to_npu(window_size_right),
-            softcap,
-            deterministic,
-        )
+    _flash_attn_backward_op(
+        dout_kernel,
+        q_kernel,
+        k_kernel,
+        v_kernel,
+        out_kernel,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q_c,
+        seqused_k_c,
+        max_seqlen_q,
+        max_seqlen_k,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
+        softmax_scale,
+        causal,
+        _window_to_npu(window_size_left),
+        _window_to_npu(window_size_right),
+        softcap,
+        deterministic,
+    )
     if pad_heads:
         dq.copy_(dq_kernel[..., :qk_head_dim])
         dk.copy_(dk_kernel[..., :qk_head_dim])
         dv.copy_(dv_kernel[..., :v_head_dim])
-
-    if needs_transpose_back:
-        dq = dq.transpose(1, 2).contiguous()
-        dk = dk.transpose(1, 2).contiguous()
-        dv = dv.transpose(1, 2).contiguous()
-        if dq_in is not None:
-            dq_in.copy_(dq)
-            dq = dq_in
-        if dk_in is not None:
-            dk_in.copy_(dk)
-            dk = dk_in
-        if dv_in is not None:
-            dv_in.copy_(dv)
-            dv = dv_in
 
     return dq, dk, dv
 
@@ -808,7 +727,6 @@ class FlashAttnFunc(torch.autograd.Function):
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
-        ctx.input_layout = layout
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -874,10 +792,6 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=ctx.gather_kv_indices,
             learnable_sink=ctx.learnable_sink,
         )
-        if ctx.input_layout == _LAYOUT_BNSD:
-            dq = dq.transpose(1, 2).contiguous()
-            dk = dk.transpose(1, 2).contiguous()
-            dv = dv.transpose(1, 2).contiguous()
         return (
             dq,
             dk,

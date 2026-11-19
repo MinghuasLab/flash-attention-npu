@@ -698,12 +698,21 @@ class FlashAttentionScoreGradMla950 {
 
         FAGBlockInfo current{};
         bool hasCurrent = FindFirstCoreTask(coreIdx, current, kvGroupId);
+#ifdef __DAV_VEC__
+        if (hasCurrent) {
+            current.taskId = 0;
+            PrefetchVectorMetadata(current, subBlockIdx);
+        }
+#endif
         while (hasCurrent) {
             FAGBlockInfo block = current;
             block.taskId = taskId;
             FAGBlockInfo next{};
             uint64_t nextKvGroupId = 0;
             const bool hasNext = FindNextCoreTask(coreIdx, block, kvGroupId, next, nextKvGroupId);
+            if (hasNext) {
+                next.taskId = taskId + 1;
+            }
             if (!IS_ATTEN_MASK || smallCausal_) {
                 // Flush dK/dV whenever this core switches KV columns, including
                 // jumps between interleaved scheduling chunks.
@@ -724,39 +733,23 @@ class FlashAttentionScoreGradMla950 {
 
 #ifdef __DAV_CUBE__
             const bool boundary = block.loadKv && ktResident;
-            if constexpr (BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                // Match CANN D192's K DB: new QK can use the other K
-                // buffer while the previous dQ still owns its resident K.
-                if (block.loadKv) {
-                    if (vtResident) {
-                        mm12.ReleaseResidentVT();
-                        vtResident = false;
-                    }
-                    if (ktResident) {
-                        currentKSlot_ ^= 1U;
-                    }
-                }
-            } else {
-                if (boundary && hasPrev) {
-                    // New s2 group: the previous group's C34 must finish
-                    // before C1 reloads K. Process C5/C34 first, then C1/C2.
-                    ProcessC5Stage(previousBlock_, hasNext, mm345);
-                    ProcessC34Stage(previousBlock_, hasNext, mm345, BlockMmadSdP::ENABLE_UNIT_FLAG && boundary);
-                    mm12.ReleaseResidentKT();
-                    ktResident = false;
-                    // C1 also reloads V for the new group. C2 kept the
-                    // old V resident, so return its MTE2 credit first.
+            // Match CANN D192's K DB: new QK can use the other K
+            // buffer while the previous dQ still owns its resident K.
+            if (block.loadKv) {
+                if (vtResident) {
                     mm12.ReleaseResidentVT();
                     vtResident = false;
+                }
+                if (ktResident) {
+                    currentKSlot_ ^= 1U;
                 }
             }
 
             ProcessC1Stage(block, loadQ, mm12);
-            // Current Q/dY are already resident; start next-task MTE2
-            // before C2 so its MMAD can hide part of the transfer latency.
-            const bool earlyPrefetch = !IS_ATTEN_MASK && hasNext && !loadQ && !loadDY;
+            // Current Q/dY are already resident. Mask and no-mask prefetch
+            // the next scheduled Q/dY the same way, before C2.
+            const bool earlyPrefetch = hasNext && !loadQ && !loadDY;
             if (earlyPrefetch) {
-                next.taskId = taskId + 1;
                 PrefetchQDY(next, mm12);
             }
             ProcessC2Stage(block, loadDY, mm12);
@@ -767,7 +760,6 @@ class FlashAttentionScoreGradMla950 {
 
             // Look ahead and prefetch Q/dY for the next task on this core.
             if (hasNext) {
-                next.taskId = taskId + 1;
                 if (!earlyPrefetch) {
                     PrefetchQDY(next, mm12);
                 }
@@ -777,20 +769,21 @@ class FlashAttentionScoreGradMla950 {
                 hasPrefetched = false;
             }
 
-            if (hasPrev && (!boundary || BlockMmadSdP::ENABLE_UNIT_FLAG)) {
+            if (hasPrev) {
                 ProcessC5Stage(previousBlock_, hasNext, mm345);
-                ProcessC34Stage(previousBlock_, hasNext, mm345, BlockMmadSdP::ENABLE_UNIT_FLAG && boundary);
+                ProcessC34Stage(previousBlock_, hasNext, mm345, boundary);
             }
             previousKSlot_ = currentKSlot_;
 #endif
 #ifdef __DAV_VEC__
-            if constexpr (BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                PrefetchVectorMetadata(block, subBlockIdx);
+            // Vector stays in phase with C1/C2: this block's LSE/delta were
+            // prefetched one iteration earlier, so only issue the next
+            // block's metadata before consuming the current one.
+            if (hasNext) {
+                PrefetchVectorMetadata(next, subBlockIdx);
             }
-            if (hasPrev) {
-                ProcessV1Stage(previousBlock_, subBlockIdx);
-                ProcessV2Stage(previousBlock_, subBlockIdx);
-            }
+            ProcessV1Stage(block, subBlockIdx);
+            ProcessV2Stage(block, subBlockIdx);
 #endif
             previousBlock_ = block;
             hasPrev = true;
@@ -800,22 +793,14 @@ class FlashAttentionScoreGradMla950 {
             hasCurrent = hasNext;
         }
 
+        // Vector finished the last block inside the loop; only C5/C34 lag.
         if (hasPrev) {
 #ifdef __DAV_CUBE__
             ProcessC5Stage(previousBlock_, false, mm345);
-            ProcessC34Stage(previousBlock_, false, mm345, BlockMmadSdP::ENABLE_UNIT_FLAG);
-            if constexpr (!BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                if (ktResident) {
-                    mm12.ReleaseResidentKT(currentKSlot_);
-                }
-            }
+            ProcessC34Stage(previousBlock_, false, mm345, true);
             if (vtResident) {
                 mm12.ReleaseResidentVT();
             }
-#endif
-#ifdef __DAV_VEC__
-            ProcessV1Stage(previousBlock_, subBlockIdx);
-            ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
         }
 #ifdef __DAV_VEC__
@@ -1056,26 +1041,15 @@ class FlashAttentionScoreGradMla950 {
         event_t vToMte2Event = bufferId ? lseMte2WaitVPong : lseMte2WaitVPing;
         event_t vToMte3Event = bufferId ? mte3WaitVPong : mte3WaitVPing;
         event_t mte3ToVEvent = bufferId ? pVWaitMte3Pong : pVWaitMte3Ping;
-        if constexpr (BlockMmadSdP::ENABLE_UNIT_FLAG) {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
-        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         if (subBlockRealS1 != 0U) {
-            if constexpr (!BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            }
             epilogueScaledMaskSoftmax_(block, attenMaskGmTensor, softmaxLseGmTensor, attenMaskUbTensor[bufferId],
                                        lseUbTensor[bufferId], ubMm1ResTensor[bufferId], ubPTensor[bufferId],
                                        l1PTensor[bufferId], mte2ToVEvent, vToMte2Event, vToMte3Event, mte3ToVEvent,
-                                       softcapInputScale_, softcapValue_, subBlockRealS1, subBlockIdx,
-                                       BlockMmadSdP::ENABLE_UNIT_FLAG);
-            if constexpr (!BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            }
+                                       softcapInputScale_, softcapValue_, subBlockRealS1, subBlockIdx, true);
         }
 
-        if constexpr (BlockMmadSdP::ENABLE_UNIT_FLAG) {
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
 
         // Notify C5 only after this vector sub-block has finished writing P.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SLOT_P_READY[bufferId]);
@@ -1098,20 +1072,12 @@ class FlashAttentionScoreGradMla950 {
 
         const uint32_t subBlockRealS1 = subBlockIdx ? block.s1Extend - block.firstHalfRealS1 : block.firstHalfRealS1;
         if (subBlockRealS1 != 0U) {
-            if constexpr (!BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            }
             epilogueSubMul_(block, ubMm2ResTensor[bufferId], ubPTensor[bufferId], ubMm1ResTensor[bufferId],
                             ubDSTensor[bufferId], deltaUbTensor[bufferId], l1dSTensor[bufferId], mte2ToVEvent,
-                            vToMte3Event, mte3ToVEvent, subBlockIdx, BlockMmadSdP::ENABLE_UNIT_FLAG);
-            if constexpr (!BlockMmadSdP::ENABLE_UNIT_FLAG) {
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-            }
+                            vToMte3Event, mte3ToVEvent, subBlockIdx, true);
         }
 
-        if constexpr (BlockMmadSdP::ENABLE_UNIT_FLAG) {
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
-        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
 
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SLOT_DS_READY[bufferId]);
