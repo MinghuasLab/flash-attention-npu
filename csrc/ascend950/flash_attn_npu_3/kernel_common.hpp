@@ -109,6 +109,7 @@ enum class MaskCategory {
     NO_MASK = 0,
     MASK_CAUSAL = 1,
     MASK_SWA = 4,
+    MIXED_SWA = 5, // Device specialization only. Host tiling continues to use MASK_SWA.
 };
 
 enum class CacheLayout : uint8_t {

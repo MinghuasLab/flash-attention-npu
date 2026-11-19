@@ -54,9 +54,13 @@ static constexpr uint32_t UB_S_OTMP_BUF_STAGES = 2;
 static constexpr uint32_t UB_S_BUF_STAGES = 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
-          Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
+          Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskVariant,
           CacheLayout cacheLayout, bool IsDN, bool LseMode, bool MixedKv = false, bool PairedHeads = false>
 class FAIKernel950 {
+    static constexpr bool mixedSwa = maskVariant == MaskCategory::MIXED_SWA;
+    static constexpr MaskCategory maskCategory = mixedSwa ? MaskCategory::MASK_SWA : maskVariant;
+    static_assert(!mixedSwa || MixedKv);
+
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
 
@@ -272,7 +276,7 @@ class FAIKernel950 {
             secondPlan.gm = secondPlan.go + ubPlan.loBytes;
             secondPlan.gl = secondPlan.gm + 64U * sizeof(float);
             secondPlan.total = secondPlan.gl + 64U * sizeof(float);
-            // The causal mask borrows the first NZ output bank only during boundary Softmax.
+            // Boundary Softmax borrows NZ output storage after MTE3 finishes reading it.
             firstSmPlan.mask = secondPlan.total + 2U * fa950_mixed::HALF_INPUT_BYTES;
             secondPlan.mask = firstSmPlan.mask;
         }
@@ -754,7 +758,10 @@ class FAIKernel950 {
                     const uint32_t page = kvSTileIdx + (keyLane && kvSTileRelIdx != 0U ? 1U : 0U);
                     if (kvSTileRelIdx < kvSLoopCount && page < kvSplitEnd) {
                         const uint32_t rows = page + 1U == kvSLoopNum ? noSkipKvS - page * 128U : 128U;
-                        const uint32_t bank = page % 2U;
+                        // Cube consumes the first visible page in bank zero.
+                        // SWA can start at an odd physical tile index.
+                        const uint32_t bank = mixedSwa ?
+                            (page - kvSplitStart) % 2U : page % 2U;
                         const uint32_t kOffset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
                             + bank * qkL1TileKRight_ * qkL1TileN_ * 2U;
                         const uint32_t vOffset = pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
@@ -938,19 +945,32 @@ class FAIKernel950 {
                         auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
                         int64_t kvSStartIdxI = static_cast<int64_t>(kvSTileIdx) * kvBaseTile_;
                         int64_t kvSEndIdxI = kvSStartIdxI + kvSTileSizeAct;
-                        bool doTriUPreMask =
-                            notPreMask
-                                ? false
-                                : (windowSizeLeftStartLen >= kvSStartIdxI && windowSizeLeftStartLen < kvSEndIdxI) ||
-                                      (windowSizeLeftEndLen > kvSStartIdxI && windowSizeLeftEndLen <= kvSEndIdxI) ||
-                                      (windowSizeLeftStartLen <= kvSStartIdxI && windowSizeLeftEndLen >= kvSEndIdxI);
-                        bool doTriUNextMask =
-                            notNextMask
-                                ? false
-                                : (windowSizeRightStartLen >= kvSStartIdxI && windowSizeRightStartLen < kvSEndIdxI) ||
-                                      (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
-                                      (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
+                        bool doTriUPreMask;
+                        bool doTriUNextMask;
+                        if constexpr (mixedSwa) {
+                            // The first and last keys are inclusive. A page that only
+                            // touches the window edge can be valid for every query row.
+                            doTriUPreMask = !notPreMask && windowSizeLeftEndLen - 1 > kvSStartIdxI;
+                            doTriUNextMask = !notNextMask && windowSizeRightStartLen < kvSEndIdxI - 1;
+                        } else {
+                            doTriUPreMask =
+                                notPreMask
+                                    ? false
+                                    : (windowSizeLeftStartLen >= kvSStartIdxI && windowSizeLeftStartLen < kvSEndIdxI) ||
+                                          (windowSizeLeftEndLen > kvSStartIdxI && windowSizeLeftEndLen <= kvSEndIdxI) ||
+                                          (windowSizeLeftStartLen <= kvSStartIdxI && windowSizeLeftEndLen >= kvSEndIdxI);
+                            doTriUNextMask =
+                                notNextMask
+                                    ? false
+                                    : (windowSizeRightStartLen >= kvSStartIdxI && windowSizeRightStartLen < kvSEndIdxI) ||
+                                          (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
+                                          (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
+                        }
                         if (doTriUPreMask || doTriUNextMask) {
+                            if constexpr (PairedHeads) {
+                                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                            }
                             epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
                                                   (kvSTileRelIdx < headCount), ubSBufId, l1PBufId, qkReadyFlag,
                                                   softmaxReadyFlag, kvSStartIdxI, doTriUPreMask, doTriUNextMask,

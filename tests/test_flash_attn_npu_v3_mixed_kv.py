@@ -43,6 +43,23 @@ def make_case(sq, sk, heads, batch=1):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["TND", "BSND"])
 def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
+    _run_paged_case(sq, sk, heads, batch, splits, causal, layout)
+
+
+@pytest.mark.parametrize("sq,sk,heads,batch,splits,causal,window", [
+    (1, 2048, 4, 1, 0, True, (511, 0)),       # Exact page boundaries.
+    (8, 2049, 2, 1, 0, True, (511, 0)),       # Both ends fall inside a page.
+    (8, 1027, 1, 2, 1, False, (17, 3)),       # Both masks on the same page.
+    (513, 899, 4, 1, 1, True, (511, 0)),      # Paired heads, partial Q and KV tiles.
+    (512, 769, 4, 1, 1, False, (287, 257)),   # Finite noncausal window.
+    (513, 193, 4, 1, 1, True, (511, 0)),      # Fully masked prefix followed by valid rows.
+])
+@pytest.mark.parametrize("layout", ["TND", "BSND"])
+def test_mixed_kv_swa(sq, sk, heads, batch, splits, causal, window, layout):
+    _run_paged_case(sq, sk, heads, batch, splits, causal, layout, window)
+
+
+def _run_paged_case(sq, sk, heads, batch, splits, causal, layout, window=(-1, -1)):
     torch.set_num_threads(4)
     q, k, v, ks, vs, table = make_case(sq, sk, heads, batch)
     cu = torch.arange(batch + 1, dtype=torch.int32) * sq
@@ -53,7 +70,7 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
         page_table=table.npu(), cu_seqlens_q=cu.npu() if layout == "TND" else None,
         max_seqlen_q=sq if layout == "TND" else None,
         k_descale=ks.npu(), v_descale=vs.npu(), causal=causal,
-        num_splits=splits, return_softmax_lse=True,
+        num_splits=splits, window_size=window, return_softmax_lse=True,
     )
     torch.npu.synchronize()
     out = out.cpu().reshape(batch, sq, heads * 16, 192).float()
@@ -61,21 +78,28 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
     if layout == "TND":
         lse = lse.reshape(heads * 16, batch, sq).permute(1, 0, 2)
     for b in range(batch):
-        _check_sequence(q[b], k, v, ks, vs, table[b], sk, causal, out[b], lse[b])
+        _check_sequence(q[b], k, v, ks, vs, table[b], sk, causal, out[b], lse[b], window)
 
 
-def _check_sequence(q, k, v, ks, vs, pages, sk, causal, out, lse):
+def _check_sequence(q, k, v, ks, vs, pages, sk, causal, out, lse, window=(-1, -1)):
     sq, heads = q.shape[0], k.shape[2]
     kd = (k.float() * ks[..., None]).bfloat16()[pages.long()].reshape(-1, heads, 192)[:sk]
     vd = (v.float() * vs[..., None]).bfloat16()[pages.long()].reshape(-1, heads, 192)[:sk]
     kd = kd.repeat_interleave(16, dim=1).float()
     vd = vd.repeat_interleave(16, dim=1).float()
     scores = torch.einsum("qhd,khd->hqk", q.float(), kd) / math.sqrt(192)
-    if causal:
-        mask = torch.arange(sk)[None, :] > (sk - sq + torch.arange(sq)[:, None])
-        scores.masked_fill_(mask[None], -float("inf"))
+    anchor = (sk - sq + torch.arange(sq))[:, None]
+    keys = torch.arange(sk)[None, :]
+    if causal or window[1] >= 0:
+        right = 0 if causal else window[1]
+        scores.masked_fill_((keys > anchor + right)[None], -torch.inf)
+    if window[0] >= 0:
+        scores.masked_fill_((keys < anchor - window[0])[None], -torch.inf)
     ref_lse = scores.logsumexp(-1)
-    ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), vd)
+    empty = ref_lse.isneginf()
+    prob = scores.softmax(-1).masked_fill(empty[..., None], 0)
+    ref = torch.einsum("hqk,khd->qhd", prob, vd)
+    ref_lse.masked_fill_(empty, torch.inf)
     # BF16 probability/output rounding; check both aggregate and worst error.
     delta = out - ref
     assert torch.isfinite(out).all()
@@ -84,13 +108,15 @@ def _check_sequence(q, k, v, ks, vs, pages, sk, causal, out, lse):
     torch.testing.assert_close(lse, ref_lse, atol=0.003, rtol=0.0003)
 
 
-@pytest.mark.parametrize("heads,q_lengths,kv_lengths", [
-    (2, (128, 129, 257), (257, 385, 513)),
-    (2, (8, 129, 385), (257, 385, 513)),
-    (1, (513, 641), (544, 705)),
-    (2, (513, 641), (544, 705)),
+@pytest.mark.parametrize("heads,q_lengths,kv_lengths,window", [
+    (2, (128, 129, 257), (257, 385, 513), (-1, -1)),
+    (2, (8, 129, 385), (257, 385, 513), (-1, -1)),
+    (1, (513, 641), (544, 705), (-1, -1)),
+    (2, (513, 641), (544, 705), (-1, -1)),
+    (1, (513, 641), (1041, 1469), (511, 0)),
+    (2, (257, 385), (1025, 1283), (767, 0)),
 ])
-def test_mixed_kv_ragged_prefill(heads, q_lengths, kv_lengths):
+def test_mixed_kv_ragged_prefill(heads, q_lengths, kv_lengths, window):
     """Check every row across full causal waves, partial waves and ragged batch boundaries."""
     torch.set_num_threads(4)
     q, k, v, ks, vs, table = make_case(max(q_lengths), max(kv_lengths), heads, len(q_lengths))
@@ -99,12 +125,12 @@ def test_mixed_kv_ragged_prefill(heads, q_lengths, kv_lengths):
     out, lse, *_ = flash_attn_with_kvcache(
         packed.npu(), k.npu(), v.npu(), cache_seqlens=torch.tensor(kv_lengths, dtype=torch.int32).npu(),
         page_table=table.npu(), cu_seqlens_q=cu.npu(), max_seqlen_q=max(q_lengths),
-        k_descale=ks.npu(), v_descale=vs.npu(), causal=True, num_splits=1, return_softmax_lse=True,
+        k_descale=ks.npu(), v_descale=vs.npu(), causal=True, window_size=window, num_splits=1, return_softmax_lse=True,
     )
     out, lse = out.cpu().float(), lse.cpu()
     for b, sk in enumerate(kv_lengths):
         start, end = cu[b].item(), cu[b + 1].item()
-        _check_sequence(packed[start:end], k, v, ks, vs, table[b], sk, True, out[start:end], lse[:, start:end])
+        _check_sequence(packed[start:end], k, v, ks, vs, table[b], sk, True, out[start:end], lse[:, start:end], window)
 
 
 @pytest.mark.parametrize("bad_scale", ["missing", "per_head", "dtype", "q_scale"])

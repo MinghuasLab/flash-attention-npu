@@ -671,17 +671,27 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
                                              fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
-    // Keep all 16 GQA heads together for MTP: a 64-row tile would read and
-    // dequantize the same KV twice when Sq is 5..8. Apply before task splitting.
+    // For a sliding window the work per full Q tile stays bounded. One
+    // complete wave of paired heads is enough to use all Cube groups.
+    if (faInfo_.mixedKvStorage && faInfo_.maskType == MaskType::MASK_BAND &&
+        faInfo_.windowSizeLeft >= 511 && faInfo_.windowSizeRight == 0 &&
+        fullQueryTileInEachBatch && (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
+        fullQ128Tasks >= 2ULL * blockNum_ && fullQ128Tasks < 4ULL * blockNum_) {
+        qBaseTile_ = fa950_plan::QueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen);
+    }
+    // Full MTP amortizes KV conversion across all 16 GQA heads. For low-occupancy
+    // SWA, splitting them into two 64-row tasks shortens the critical path.
     if (faInfo_.mixedKvStorage && faInfo_.maxQSeqlen >= 5 && faInfo_.maxQSeqlen <= 8 &&
-        faInfo_.numHeads / faInfo_.kvHeads == 16) {
+        faInfo_.numHeads / faInfo_.kvHeads == 16 &&
+        !(faInfo_.maskType == MaskType::MASK_BAND &&
+          static_cast<uint64_t>(faInfo_.batch) * faInfo_.kvHeads * 2U <= blockNum_)) {
         qBaseTile_ = 128U;
     }
     FillBasicTilingData(tilingdata);
     // Pair adjacent Q heads sharing a KV head. Each pair owns two Q banks in
     // L1; the K and V banks are released only after both consumers read them.
     if (faInfo_.mixedKvStorage && !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink &&
-        faInfo_.maskType != MaskType::MASK_BAND && qBaseTile_ == Q_TILE_CEIL &&
+        qBaseTile_ == Q_TILE_CEIL &&
         fullQueryTileInEachBatch && (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
         fullQ128Tasks >= 2ULL * blockNum_) {
         tilingdata.set_qL1BufNum(2U);

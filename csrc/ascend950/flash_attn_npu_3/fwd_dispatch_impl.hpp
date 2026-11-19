@@ -126,6 +126,23 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
     }
 }
 
+// Instantiated in a separate device image so adding window variants does not
+// move full-attention instructions or change the legacy device binaries.
+template <Format kLayout>
+void launch_mixed_swa_layout(const FwdLaunchArgs& a)
+{
+    using DType = bfloat16_t;
+    constexpr CacheLayout kCacheLayout = CacheLayout::nd;
+    FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
+        FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
+            FWD_BOOL_SWITCH(a.paired_query_heads, Paired, {
+                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCategory::MIXED_SWA, CacheMode::pagedCache, PageShape::BnBsND,
+                                        LseMode, HasSoftcap, Paired);
+            });
+        });
+    });
+}
+
 #undef FWD_MIXED_KERNEL_LAUNCH
 #undef FWD_KERNEL_LAUNCH
 #undef FWD_MASK_SWITCH

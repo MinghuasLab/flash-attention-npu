@@ -464,6 +464,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
         if (flashDecodeEnabled) {
             launchBlockDim = tilingData.fdActiveCoreNum;
+        } else if (mixedKv && is_local && tilingData.totalTaskNum > 0U) {
+            // The SWA loop assigns at most one first task per (paired) core.
+            // Idle blocks still initialize tiling and cross-core flags.
+            const uint32_t tasksPerGroup = tilingData.qL1BufNum == 2U ? 2U : 1U;
+            const uint32_t tasks = (tilingData.totalTaskNum - 1U) / tasksPerGroup + 1U;
+            launchBlockDim = std::min(launchBlockDim, tasks);
         }
 
         at::Tensor tiling_cpu =

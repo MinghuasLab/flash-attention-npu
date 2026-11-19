@@ -38,6 +38,8 @@ def main():
                         help="By default clone inputs and stream 512 MiB before each sample; use same for warm addresses")
     parser.add_argument("--case", type=int, choices=range(6), help="Run one indexed workload for hardware profiling")
     parser.add_argument("--mode", choices=("bf16", "mixed"), help="Run only one storage mode")
+    parser.add_argument("--window-size", type=int, nargs=2, default=(-1, -1), metavar=("LEFT", "RIGHT"),
+                        help="Inclusive left and right attention-window radii; use 511 0 for causal SWA-512")
     parser.add_argument("--sk", type=int, help="Override KV length for the selected workloads")
     parser.add_argument("--sq", type=int, help="Override query length for a single workload")
     parser.add_argument("--kv-heads", type=int, choices=(1, 2, 4), help="Set per-device KV heads for TP4, TP2 or TP1")
@@ -49,6 +51,8 @@ def main():
     parser.add_argument("--splits", type=int, choices=range(33), metavar="0..32",
                         help="Use the public API's automatic scheduling (0) or request a split count")
     args = parser.parse_args()
+    if min(args.window_size) < -1:
+        parser.error("window sizes must be -1 or nonnegative")
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     if args.sk is not None and args.sk < 1:
@@ -79,6 +83,7 @@ def main():
             cu_seqlens_q=sample["cu_seqlens_q"], max_seqlen_q=sample["max_seqlen_q"],
             page_table=sample["page_table"], k_descale=sample["k_descale"], v_descale=sample["v_descale"],
             softmax_scale=sample["softmax_scale"], causal=sample["causal"], num_splits=sample["num_splits"],
+            window_size=(sample["window_size_left"], sample["window_size_right"]),
         )
 
     for batch, sq, sk, heads in (cases if args.case is None else [cases[args.case]]):
@@ -109,8 +114,8 @@ def main():
                   seqused_k=torch.full((batch,), sk, dtype=torch.int32).npu(),
                   max_seqlen_q=sq, max_seqlen_k=sk,
                   page_table=torch.arange(shape[0], dtype=torch.int32).reshape(batch, -1).npu(),
-                  softmax_scale=192 ** -0.5, causal=True, window_size_left=-1,
-                  window_size_right=-1, attention_chunk=0, softcap=0.0,
+                  softmax_scale=192 ** -0.5, causal=True, window_size_left=args.window_size[0],
+                  window_size_right=args.window_size[1], attention_chunk=0, softcap=0.0,
                   rotary_interleaved=True, num_splits=splits,
                   sm_margin=0, return_softmax_lse=False, layout=0 if args.q_layout == "TND" else 1)
         for mode in (("bf16", "mixed") if args.mode is None else (args.mode,)):
@@ -147,6 +152,8 @@ def main():
                 if args.trace_dir:
                     args.trace_dir.mkdir(parents=True, exist_ok=True)
                     trace = args.trace_dir / f"{mode}_b{batch}_q{sq}_k{sk}_h{heads}.json"
+                    if tuple(args.window_size) != (-1, -1):
+                        trace = trace.with_stem(f"{trace.stem}_window{args.window_size[0]}_{args.window_size[1]}")
                     if args.entry == "public":
                         trace = trace.with_stem(f"{trace.stem}_public")
                     if scrub is not None:
@@ -173,7 +180,7 @@ def main():
                     if len(kernel_times) != args.repeats:
                         raise RuntimeError(f"Expected {args.repeats} FA kernels, found {len(kernel_times)} in {trace}")
             print(json.dumps(dict(mode=mode, B=batch, Sq=sq, Sk=sk, Hkv=heads, Hq=heads * 16, requested_splits=splits,
-                                  entry=args.entry, q_layout=args.q_layout, synchronized_wall_median_us=statistics.median(wall_times),
+                                  entry=args.entry, q_layout=args.q_layout, window_size=args.window_size, synchronized_wall_median_us=statistics.median(wall_times),
                                   synchronized_wall_samples_us=wall_times, D=192, cache_layout=args.cache_layout, cache_protocol=args.cache_protocol, event_median_us=statistics.median(times),
                                   event_samples_us=times, kernel_samples_us=kernel_times,
                                   kernel_median_us=statistics.median(kernel_times) if kernel_times else None,

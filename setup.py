@@ -741,6 +741,7 @@ src_ascend950_v3 = glob.glob(
 src_ascend950_v3 += glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True
 )
+src_ascend950_v3.append(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fwd_dispatch_mixed_swa.cpp"))
 # Standalone split-attention combine (fwd_combine) kernel.
 src_ascend950_v3 += glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "combine_kernel.cpp"), recursive=True

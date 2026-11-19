@@ -241,6 +241,7 @@ static_assert(fa950_plan::MakeUbPlan(HEAD_DIM, 1, 64, 64, 1, 1).mask +
               2U * (HALF_INPUT_BYTES + OUTPUT_BANK_BYTES) <= fa950_plan::UB_CAPACITY,
               "Paired Q128 with two 32-row NZ banks must fit");
 static_assert(64U * 128U <= OUTPUT_BANK_BYTES, "The first NZ bank must contain the causal mask");
+static_assert(2U * 64U * 128U <= 2U * OUTPUT_BANK_BYTES, "The two NZ banks must contain both SWA masks");
 // Each AIV stages its operand in two 64-row inputs. Convert in 32-row
 // stripes so MTE3 can read one NZ bank while Vector fills the other.
 class KvDequantBuffered {
