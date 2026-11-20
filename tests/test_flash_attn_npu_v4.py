@@ -1193,7 +1193,10 @@ def test_bwd_headdim_rejects_unequal():
     dout, query, _, _, out, softmax_lse = _bwd_headdim_invalid_inputs()
     key = torch.zeros((1, 16, 1, 256), dtype=torch.float16, device="npu")
     value = torch.zeros_like(key)
-    with pytest.raises(RuntimeError, match="query and key must have the same head dimension"):
+    # 910-only case; keep a pattern that also matches Ascend950 wording if reused.
+    with pytest.raises(
+        RuntimeError, match=r"q(?:uery)? and k(?:ey)? must (?:have|share) the same head"
+    ):
         _bwd_headdim(dout, query, key, value, out, softmax_lse, is_causal=False, softcap=0.0)
 
 
