@@ -44,7 +44,7 @@ _LAYOUT_BNSD = 2
 
 def _backward_head_dims(qk_dim, v_dim):
     """Round asymmetric backward inputs up to an implemented head-dim bucket."""
-    if not 0 < v_dim < qk_dim <= 256:
+    if not 0 < v_dim < qk_dim <= 512:
         return qk_dim, v_dim
     qk_bucket = ((qk_dim + 63) // 64) * 64
     v_bucket = 128 if qk_bucket == 192 and v_dim <= 128 else qk_bucket
