@@ -62,10 +62,6 @@ class BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, TilingData> {
     uint64_t kvPostBlockTotal;
     int64_t kvPostBaseNum;
     int64_t kvPostTailNum;
-    int64_t vPostBlockFactor;
-    uint64_t vPostBlockTotal;
-    int64_t vPostBaseNum;
-    int64_t vPostTailNum;
     float scaleValue;
 
     CATLASS_DEVICE
@@ -119,15 +115,6 @@ class BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, TilingData> {
 
         kvPostTailNum = kvPostTailNumTmp == 0 ? kvPostBaseNum : kvPostTailNumTmp;
         kvPostBlockFactor = (kvPostBlockOuterTotal + coreNum - 1) / coreNum;
-
-        // dv workspace and output follow vHeadDim. Equal head dims keep vSize == kvSize.
-        int64_t vSize = tilingData->vSize;
-        vPostBaseNum = qPostBaseNum;
-        vPostBlockTotal = vSize;
-        int64_t vPostTailNumTmp = vPostBlockTotal % vPostBaseNum;
-        int64_t vPostBlockOuterTotal = (vPostBlockTotal + vPostBaseNum - 1) / vPostBaseNum;
-        vPostTailNum = vPostTailNumTmp == 0 ? vPostBaseNum : vPostTailNumTmp;
-        vPostBlockFactor = (vPostBlockOuterTotal + coreNum - 1) / coreNum;
 
         pipe->InitBuffer(inBuffer, ubBaseSize * 2);
         pipe->InitBuffer(outBuffer, ubBaseSize);
@@ -198,16 +185,10 @@ class BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, TilingData> {
         }
         AscendC::PipeBarrier<PIPE_ALL>();
 
-        uint64_t vBegin = cBlockIdx * vPostBlockFactor * vPostBaseNum;
-        uint64_t vEnd = (cBlockIdx + 1) * vPostBlockFactor * vPostBaseNum;
-        if (((cBlockIdx + 1) * vPostBlockFactor * vPostBaseNum) > vPostBlockTotal) {
-            vEnd = vPostBlockTotal;
-        }
-
-        for (uint64_t i = vBegin; i < vEnd; i = i + vPostBaseNum) {
+        for (uint64_t i = kvBegin; i < kvEnd; i = i + kvPostBaseNum) {
             AscendC::LocalTensor<float> vecIn = inBuffer.Get<float>();
             AscendC::LocalTensor<ElementVecDtype> vecOut = outBuffer.Get<ElementVecDtype>();
-            uint64_t dataSize = i + vPostBaseNum < vPostBlockTotal ? vPostBaseNum : vPostTailNum;
+            uint64_t dataSize = i + kvPostBaseNum < kvPostBlockTotal ? kvPostBaseNum : kvPostTailNum;
             DataCopy(vecIn, dvWorkSpaceGm[i], (dataSize + 7) / 8 * 8); // dataSize(fp32) align 32B
             event_t vWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
@@ -219,7 +200,7 @@ class BlockEpilogue<EpilogueAtlasA2FAGPost, ElementVecDtype, TilingData> {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
             DataCopy(dvGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
-            if (i + vPostBaseNum < vEnd) {
+            if (i + kvPostBaseNum < kvEnd) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             }

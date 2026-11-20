@@ -47,16 +47,10 @@ public:
     uint32_t kvPreBlockTotal;
     uint32_t kvPreBlockTail;
 
-    uint32_t vPreBlockFactor;
-    uint32_t vPreBlockTotal;
-    uint32_t vPreBlockTail;
-
     int64_t initdqSize;
     int64_t dqOffset;
     int64_t initdkSize;
     int64_t dkvOffset;
-    int64_t initdvSize;
-    int64_t dvOffset;
 
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *dq,
@@ -72,7 +66,6 @@ public:
         int64_t dvWorkSpaceOffset = tilingData->dvWorkSpaceOffset;
         int64_t qSize = tilingData->qSize;
         int64_t kvSize = tilingData->kvSize;
-        int64_t vSize = tilingData->vSize;
         uint32_t coreNum = tilingData->coreNum;
 
         // compute tiling params
@@ -86,12 +79,6 @@ public:
         int64_t kvPreTailNumTmp = kvSize % kvPreBlockFactor;
         kvPreBlockTail = kvPreTailNumTmp == 0 ? kvPreBlockFactor : kvPreTailNumTmp;
 
-        // dv workspace follows vHeadDim. Equal head dims keep vSize == kvSize.
-        vPreBlockFactor = (vSize + coreNum - 1) / coreNum;
-        vPreBlockTotal = (vSize + vPreBlockFactor - 1) / vPreBlockFactor;
-        int64_t vPreTailNumTmp = vSize % vPreBlockFactor;
-        vPreBlockTail = vPreTailNumTmp == 0 ? vPreBlockFactor : vPreTailNumTmp;
-
         dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dqWorkSpaceOffset / sizeof(float));
         dkWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dkWorkSpaceOffset / sizeof(float));
         dvWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dvWorkSpaceOffset / sizeof(float));
@@ -100,8 +87,6 @@ public:
         dqOffset = ((int64_t)cBlockIdx) * qPreBlockFactor;
         initdkSize = cBlockIdx == kvPreBlockTotal - 1 ? kvPreBlockTail : kvPreBlockFactor;
         dkvOffset = ((int64_t)cBlockIdx) * kvPreBlockFactor;
-        initdvSize = cBlockIdx == vPreBlockTotal - 1 ? vPreBlockTail : vPreBlockFactor;
-        dvOffset = ((int64_t)cBlockIdx) * vPreBlockFactor;
     }
 
     CATLASS_DEVICE
@@ -118,10 +103,7 @@ public:
 
         if (g_coreType == AscendC::AIV && cBlockIdx < kvPreBlockTotal) {
             AscendC::InitOutput<float>(dkWorkSpaceGm[dkvOffset], initdkSize, 0);
-        }
-
-        if (g_coreType == AscendC::AIV && cBlockIdx < vPreBlockTotal) {
-            AscendC::InitOutput<float>(dvWorkSpaceGm[dvOffset], initdvSize, 0);
+            AscendC::InitOutput<float>(dvWorkSpaceGm[dkvOffset], initdkSize, 0);
         }
     }
 };

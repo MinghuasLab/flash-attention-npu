@@ -15,7 +15,7 @@
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
-#include "../../flash_attn_npu/fag_block.h"
+#include "../../flash_attn_npu/fag_mla/fag_block.h"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"

@@ -24,13 +24,13 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 
-#include "../flash_attn_npu/fag_block.h"
+#include "../flash_attn_npu/fag_mla/fag_block.h"
 #include "../flash_attn_npu/fag_kernel_common.hpp"
 #include "fag_common/epilogue_fag_deterministic_add.hpp"
-#include "../flash_attn_npu/fag_epilogue_sfmg.hpp"
-#include "../flash_attn_npu/fag_epilogue_op.hpp"
-#include "../flash_attn_npu/fag_epilogue_post.hpp"
-#include "../flash_attn_npu/fag_epilogue_pre.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_sfmg.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_op.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_post.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_pre.hpp"
 #include "fag_common/mmad_fag_sdp.hpp"
 #include "fag_common/mmad_fag_dqkv.hpp"
 #include <type_traits>

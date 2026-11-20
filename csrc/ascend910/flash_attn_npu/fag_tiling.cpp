@@ -70,11 +70,9 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t& blockDim, int64_t* til
     fagV2TilingData->kvHeadNum = fagInfo.keyShape_1;
     fagV2TilingData->g = g;
     fagV2TilingData->qkHeadDim = fagInfo.queryShape_2;
-    fagV2TilingData->vHeadDim = fagInfo.queryShape_2; // v2 等维
     fagV2TilingData->qSeqlen = fagV2TilingData->t1 / fagV2TilingData->batch;
     fagV2TilingData->qSize = qSize;
     fagV2TilingData->kvSize = kvSize;
-    fagV2TilingData->vSize = kvSize; // v2 等维
     fagV2TilingData->alibiSlopesBatchStride = fagInfo.alibiSlopesBatchStride;
 
     // TODO set workspace offset

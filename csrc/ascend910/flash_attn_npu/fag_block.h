@@ -77,13 +77,12 @@ struct EpilogueAtlasA2FAGSfmg {
 };
 
 // For AtlasA2, MLAG Op
-template <uint32_t INPUT_LAYOUT_, bool IS_DROP_, bool IS_ATTEN_MASK_, bool HAS_SOFTCAP_, bool HAS_ALIBI_,
-          bool KEEP_SFMG_ = false>
+template <uint32_t INPUT_LAYOUT_, bool IS_DROP_, bool IS_ATTEN_MASK_,
+bool HAS_SOFTCAP_, bool HAS_ALIBI_>
 struct EpilogueAtlasA2SameAbVec {
     using ArchTag = Arch::AtlasA2;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
     static constexpr bool HAS_ALIBI = HAS_ALIBI_;
-    static constexpr bool KEEP_SFMG = KEEP_SFMG_;
 };
 
 // For AtlasA2, MLAG Post

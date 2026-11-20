@@ -1,5 +1,5 @@
 #pragma once
-#include "../fag_block.h"
+#include "fag_block.h"
 namespace Catlass::Gemm::Block::Mla {
 template <class DispatchPolicy, class BlockTileShape, class L1TileShape, class L0TileShape, class AType, class BType,
           class CType, class BiasType = void,

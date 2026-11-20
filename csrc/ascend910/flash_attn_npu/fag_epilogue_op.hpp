@@ -22,7 +22,6 @@
 #include "kernel_operator.h"
 #include "fag_kernel_common.hpp"
 #include "fag_common/common_header.h"
-#include "fag_sfmg.h"
 #include "alibi.hpp"
 
 using AscendC::CopyRepeatParams;
@@ -41,13 +40,11 @@ constexpr int64_t CAUSAL_COMPRESS_MODE = 1;
 constexpr int64_t BAND_COMPRESS_MODE = 2;
 
 template <class OutputType_, class InputType_, uint32_t INPUT_LAYOUT_, uint32_t IS_DROP_, uint32_t IS_ATTEN_MASK_,
-          class TilingData, bool HAS_SOFTCAP_, bool HAS_ALIBI_, bool KEEP_SFMG_>
-class BlockEpilogue<
-    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>,
-    OutputType_, InputType_, TilingData> {
+          class TilingData, bool HAS_SOFTCAP_, bool HAS_ALIBI_>
+class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_>,
+                    OutputType_, InputType_, TilingData> {
   public:
-    using DispatchPolicy =
-        EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>;
+    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using T1 = InputType_;
     using T2 = OutputType_;
@@ -55,7 +52,6 @@ class BlockEpilogue<
     static constexpr bool IS_DROP = IS_DROP_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
-    static constexpr bool KEEP_SFMG = KEEP_SFMG_;
     static constexpr bool HAS_ALIBI = HAS_ALIBI_;
 
     AscendC::TPipe* pipe;
@@ -100,9 +96,6 @@ class BlockEpilogue<
     GlobalTensor<float> dvGm;
 
     SoftMaxTiling softmaxTilingData;
-    bool taskSfmgEnabled = false;
-    bool singleAivTask = false;
-    FagTensorStrides taskDoStrides, taskOutStrides;
 
     constexpr static uint32_t BNGSD = 0;
     constexpr static uint32_t SBNGD = 1;
@@ -248,10 +241,6 @@ class BlockEpilogue<
         cSubIdx = cBlockIdx % 2;
 
         __gm__ TilingData* tilingData = reinterpret_cast<__gm__ TilingData*>(tiling_in);
-        taskDoStrides = {tilingData->inputStrides.dout.batch, tilingData->inputStrides.dout.sequence,
-                         tilingData->inputStrides.dout.head};
-        taskOutStrides = {tilingData->inputStrides.out.batch, tilingData->inputStrides.out.sequence,
-                          tilingData->inputStrides.out.head};
 
         // set softmax tilingdata
         softmaxTilingData.srcM = tilingData->softmaxTilingData.srcM;
@@ -352,9 +341,7 @@ class BlockEpilogue<
 
         pipe_in->InitBuffer(buf, TOTAL_SIZE);
         unifiedBuffer = buf;
-        if constexpr (!KEEP_SFMG) {
-            AscendC::SyncAll();
-        }
+        AscendC::SyncAll();
     }
 
     CATLASS_DEVICE
@@ -874,10 +861,8 @@ class BlockEpilogue<
             }
         }
 
-        const uint32_t sfmgLocalOffset =
-            taskSfmgEnabled ? SFMG_UB_OFFSET + 4 * 1024 + curS1Idx * s1VecSize * 8 * sizeof(float) : SFMG_UB_OFFSET;
-        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(1024, sfmgLocalOffset);
-        if (!taskSfmgEnabled && preS1Idx != curS1Idx) {
+        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
+        if (preS1Idx != curS1Idx) {
             preS1Idx = curS1Idx;
             AscendC::DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset + curS1Idx * s1VecSize * 8], s1ExtendSubGraph * 8);
         }
@@ -925,8 +910,6 @@ class BlockEpilogue<
         // When this vector tile contains the complete key row, form D
         // directly from FP32 P*dP. dot(dO, rounded_O) loses the small softmax
         // derivative for concentrated distributions (especially BF16).
-        // qk > v and actual-O callers keep the SFMG workspace row sum.
-        if constexpr (!KEEP_SFMG) {
         int64_t fullKeyCount = INPUT_LAYOUT == TND ? dbParam.actualS2Len : s2;
         if (dbParam.s2oIdx == 0 && curS2Idx == 0 && fullKeyCount <= s2Extend) {
             constexpr uint32_t partialStride = 128;
@@ -954,7 +937,6 @@ class BlockEpilogue<
                 AscendC::Brcb(sfmgClc3[first * 8], rowSums, static_cast<uint8_t>(CeilDiv(rows, 8)), {1, 8});
                 AscendC::PipeBarrier<PIPE_V>();
             }
-        }
         }
 
         uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
@@ -994,7 +976,6 @@ class BlockEpilogue<
 
         // With zero or one valid key, softmax is constant with respect to
         // Q/K. Do not let the rounded O used by SFMG create a spurious dS.
-        if constexpr (!KEEP_SFMG) {
         int64_t validKvLen = s2;
         if constexpr (INPUT_LAYOUT == TND) {
             validKvLen = dbParam.actualS2Len;
@@ -1013,7 +994,6 @@ class BlockEpilogue<
         } else if (validKvLen <= 1) {
             AscendC::Duplicate(vecClc1Buffer, 0.0f, s1ExtendSubGraph * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
-        }
         }
 
         LocalTensor<T1> vecCopyOutBuffer = vecClc1Buffer.template ReinterpretCast<T1>();
@@ -1037,71 +1017,6 @@ class BlockEpilogue<
         if (curIdx < vecLoopEnd - vecLoopStart - 1) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3B);
         }
-    }
-
-    // Prepare this AIV's Q rows while its AIC is computing MM12. The existing
-    // 8 KiB SFMG area is split into legacy scratch and a 128 x 8 FP32 task cache.
-    CATLASS_DEVICE
-    void PrepareTaskSfmg(DBParams& task)
-    {
-        if (!taskSfmgEnabled) {
-            return;
-        }
-        const uint32_t keyAlign = (task.s2CvExtend + 31) / 32 * 32;
-        const uint32_t rowsPerVec =
-            AscendC::Std::min(AscendC::Std::min(uint32_t(baseMN / keyAlign), uint32_t(task.s1CvExtend)), uint32_t(128));
-        const uint32_t vecRows = (task.s1CvExtend + rowsPerVec - 1) / rowsPerVec;
-        const uint32_t split = (vecRows / 2) * rowsPerVec;
-        const uint32_t begin = singleAivTask || cSubIdx == 0 ? 0 : split;
-        const uint32_t end = singleAivTask || cSubIdx != 0 ? task.s1CvExtend : split;
-        if (begin == end) {
-            return;
-        }
-        auto inDo = unifiedBuffer.GetWithOffset<T1>(4096, DbBegin);
-        auto inOut = unifiedBuffer.GetWithOffset<T1>(4096, DbBegin + 16 * 1024);
-        auto fpDo = unifiedBuffer.GetWithOffset<float>(4096, T2Begin);
-        auto fpOut = unifiedBuffer.GetWithOffset<float>(4096, T1Begin);
-        auto scratch = unifiedBuffer.GetWithOffset<uint8_t>(TMP_UB_SIZE, TMP_UB_OFFSET);
-        auto result = unifiedBuffer.GetWithOffset<float>(1024, SFMG_UB_OFFSET + 4 * 1024);
-        event_t copyFree = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_MTE2));
-        event_t inputReady = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
-        event_t vectorDone = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(copyFree);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(copyFree);
-        for (uint32_t first = begin; first < end; first += 32) {
-            uint32_t rows = AscendC::Std::min(uint32_t(32), end - first);
-            const int64_t token = task.s1oIdx * s1CvInner + first;
-            const int64_t head = task.n2Idx * g + task.gIdx;
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vectorDone);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vectorDone);
-            AscendC::DataCopyPad(inDo, dxGm[token * taskDoStrides.sequence + head * taskDoStrides.head],
-                                 {static_cast<uint16_t>(rows), 128 * sizeof(T1),
-                                  static_cast<uint32_t>((taskDoStrides.sequence - 128) * sizeof(T1)), 0, 0},
-                                 {false, 0, 0, 0});
-            AscendC::DataCopyPad(inOut, forwardResGm[token * taskOutStrides.sequence + head * taskOutStrides.head],
-                                 {static_cast<uint16_t>(rows), 128 * sizeof(T1),
-                                  static_cast<uint32_t>((taskOutStrides.sequence - 128) * sizeof(T1)), 0, 0},
-                                 {false, 0, 0, 0});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(inputReady);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady);
-            AscendC::Cast(fpDo, inDo, AscendC::RoundMode::CAST_NONE, rows * 128);
-            AscendC::Cast(fpOut, inOut, AscendC::RoundMode::CAST_NONE, rows * 128);
-            AscendC::PipeBarrier<PIPE_V>();
-            uint32_t inputShape[] = {rows, 128};
-            fpDo.SetShapeInfo(AscendC::ShapeInfo(2, inputShape, AscendC::DataFormat::ND));
-            fpOut.SetShapeInfo(AscendC::ShapeInfo(2, inputShape, AscendC::DataFormat::ND));
-            auto taskResult = result[first * 8];
-            uint32_t outputShape[] = {rows, 8};
-            taskResult.SetShapeInfo(AscendC::ShapeInfo(2, outputShape, AscendC::DataFormat::ND));
-            if (rows % 8 == 0) {
-                ::SoftmaxGradFront<float, true>(taskResult, fpDo, fpOut, scratch);
-            } else {
-                ::SoftmaxGradFront<float, false>(taskResult, fpDo, fpOut, scratch);
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vectorDone);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vectorDone);
     }
 
     CATLASS_DEVICE
@@ -1153,8 +1068,8 @@ class BlockEpilogue<
 
         halfLoop = (s1VecLoop / 2) * s2VecLoop;
 
-        vecLoopStart = singleAivTask ? 0 : (cSubIdx ? halfLoop : 0);
-        vecLoopEnd = singleAivTask ? loopSize : (cSubIdx ? loopSize : halfLoop);
+        vecLoopStart = cSubIdx ? halfLoop : 0;
+        vecLoopEnd = cSubIdx ? loopSize : halfLoop;
         preS1Idx = -1;
         event_t mte2WaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_MTE2));
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3);
