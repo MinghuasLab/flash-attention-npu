@@ -3,6 +3,9 @@
 // Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
 
 
+#ifndef FAG_TILING_950_CPP_H
+#define FAG_TILING_950_CPP_H
+
 #include "fag_common.h"
 #include "fag_ub_layout.hpp"
 #include "fag_cast_ub_plan.hpp"
@@ -148,6 +151,10 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     }
     if (CheckLegacyUb(tiling) != 0) {
         return -1;
+    }
+    if (info.qkHeadDim == 192 && info.vHeadDim == 128 && !info.deterministic) {
+        // Match CANN dense interleaving granularity for MLA backward.
+        tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
     }
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
@@ -515,3 +522,5 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
 }
 
 } // namespace FAGTiling950
+
+#endif // FAG_TILING_950_CPP_H

@@ -12,6 +12,9 @@
  * Ascend950 FlashAttention v3 backward device-kernel entrypoint.
  */
 
+#ifndef FAG_KERNEL_950_CPP_H
+#define FAG_KERNEL_950_CPP_H
+
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
@@ -373,8 +376,8 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx,
-                              uint32_t& firstValidS1, uint32_t& validS1Num)
+    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx, uint32_t& firstValidS1,
+                              uint32_t& validS1Num)
     {
         validS1Num = 0;
         // No mask: every S1 block is valid.
@@ -398,11 +401,12 @@ class FlashAttentionScoreGrad950 {
         }
 
         // BAND: both S1 boundaries depend on the window and actual KV tile size.
-        const int64_t s1IdxUp = tiling_->s2Token == INT32_MAX ? 0 :
-            Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
+        const int64_t s1IdxUp =
+            tiling_->s2Token == INT32_MAX ? 0 : Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
         const int64_t s2RealSize = Min(static_cast<int64_t>(kvBlockSize_), static_cast<int64_t>(s2Length) - s2Start);
-        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length :
-            Min(static_cast<int64_t>(s1Length), s2Start + s2RealSize - delta + tiling_->s1Token);
+        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length
+                                                                : Min(static_cast<int64_t>(s1Length),
+                                                                      s2Start + s2RealSize - delta + tiling_->s1Token);
         if (s1IdxUp >= s1IdxDown) {
             return;
         }
@@ -667,10 +671,13 @@ class FlashAttentionScoreGrad950 {
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
                     const int64_t delta = static_cast<int64_t>(block.curBatchS2) - block.curBatchS1;
-                    const int64_t firstCol = tiling_->s1Token == INT32_MAX ? 0 :
-                        static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
-                    const int64_t endCol = tiling_->s2Token == INT32_MAX ? block.curBatchS2 :
-                        static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
+                    const int64_t firstCol = tiling_->s1Token == INT32_MAX
+                                                 ? 0
+                                                 : static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
+                    const int64_t endCol =
+                        tiling_->s2Token == INT32_MAX
+                            ? block.curBatchS2
+                            : static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
                     if (static_cast<int64_t>(block.s2Start) + block.s2Extend <= firstCol ||
                         static_cast<int64_t>(block.s2Start) >= endCol) {
                         return false;
@@ -727,13 +734,13 @@ class FlashAttentionScoreGrad950 {
             int64_t firstCol = 0;
             if constexpr (IS_ATTEN_MASK) {
                 if (tiling_->s1Token != INT32_MAX) {
-                    firstCol = Max(static_cast<int64_t>(0),
-                        static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
-                        static_cast<int64_t>(decoderS2Length_) - decoderS1Length_ - tiling_->s1Token);
+                    firstCol = Max(static_cast<int64_t>(0), static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
+                                                                static_cast<int64_t>(decoderS2Length_) -
+                                                                decoderS1Length_ - tiling_->s1Token);
                 }
             }
-            const uint32_t s2BlockIdx = static_cast<uint32_t>(firstCol / kvBlockSize_) +
-                static_cast<uint32_t>(blockInS1 % validS2Num);
+            const uint32_t s2BlockIdx =
+                static_cast<uint32_t>(firstCol / kvBlockSize_) + static_cast<uint32_t>(blockInS1 % validS2Num);
             FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
             return true;
         }
@@ -1743,3 +1750,5 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
     FAGKernel950 fag;
     fag(params);
 }
+
+#endif // FAG_KERNEL_950_CPP_H
