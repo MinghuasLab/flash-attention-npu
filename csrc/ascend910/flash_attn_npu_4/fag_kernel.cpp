@@ -34,8 +34,6 @@
 #include "fag_common/mmad_fag_sdp.hpp"
 #include "fag_common/mmad_fag_dqkv.hpp"
 #include <type_traits>
-#include "../flash_attn_npu/fag_mla/mmad_fag_sdp.hpp"
-#include "../flash_attn_npu/fag_mla/mmad_fag_dqkv.hpp"
 #include "fag_tiling.h"
 #include "kernel_operator.h"
 
@@ -1197,12 +1195,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using A1Type = Catlass::Gemm::GemmType<ElementA1, LayoutA1>;
     using B1Type = Catlass::Gemm::GemmType<ElementB1, LayoutB1>;
     using C1Type = Catlass::Gemm::GemmType<ElementC1, LayoutC1>;
-    using BlockMmadFAGCube1 = std::conditional_t<
-        IS_MLA,
-        Catlass::Gemm::Block::Mla::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1,
-                                                   L0TileShapeCube1, A1Type, B1Type, C1Type>,
+    using BlockMmadFAGCube1 =
         Catlass::Gemm::Block::BlockMmadFagSdp<DispatchPolicyCube1, BlockTileShape, L1TileShapeCube1, L0TileShapeCube1,
-                                              A1Type, B1Type, C1Type>>;
+                                              A1Type, B1Type, C1Type>;
 
     // Cube2 计算：左矩阵不转置，右矩阵不转置。实现 dQ = dS * K
     using ElementA2 = DataType; // ds
@@ -1216,12 +1211,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B2Type = Catlass::Gemm::GemmType<ElementB2, LayoutB2>;
     using C2Type = Catlass::Gemm::GemmType<ElementC2, LayoutC2>;
 
-    using BlockMmadFAGCube2 = std::conditional_t<
-        IS_MLA,
-        Catlass::Gemm::Block::Mla::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2,
-                                                L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>,
+    using BlockMmadFAGCube2 =
         Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube2, BlockTileShapeCube2, L1ATileShapeCube2,
-                                           L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>>;
+                                           L1BTileShapeCube2, L0TileShapeCube2, A2Type, B2Type, C2Type>;
 
     // Cube3 计算：左矩阵转置，右矩阵不转置。 实现 dK = dS^T * Q 和 dV = P^T * dOut
     using ElementA3 = DataType; // ds和p
@@ -1235,12 +1227,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using B3Type = Catlass::Gemm::GemmType<ElementB3, LayoutB3>;
     using C3Type = Catlass::Gemm::GemmType<ElementC3, LayoutC3>;
 
-    using BlockMmadFAGCube3 = std::conditional_t<
-        IS_MLA,
-        Catlass::Gemm::Block::Mla::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3,
-                                                L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>,
+    using BlockMmadFAGCube3 =
         Catlass::Gemm::Block::BlockMmadFAG<DispatchPolicyCube3, BlockTileShapeCube3, L1ATileShapeCube3,
-                                           L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>>;
+                                           L1BTileShapeCube3, L0TileShapeCube3, A3Type, B3Type, C3Type>;
 
     // Epilogue
     using ElementOutput = float;
@@ -1267,8 +1256,8 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
     // qk>v 和垫成等宽的不等头都保留 SFMG 行和，不改写成 P·dP。
     using EpilogueAtlasA2SameAbVec =
-        Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false,
-                                                    IS_MLA || USE_ACTUAL_OUT>;
+        Catlass::Epilogue::EpilogueAtlasA2MlaSameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false,
+                                                       IS_MLA || USE_ACTUAL_OUT>;
     using EpilogueFAGSabVec =
         Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 

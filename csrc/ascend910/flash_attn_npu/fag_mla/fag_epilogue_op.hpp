@@ -43,11 +43,11 @@ constexpr int64_t BAND_COMPRESS_MODE = 2;
 template <class OutputType_, class InputType_, uint32_t INPUT_LAYOUT_, uint32_t IS_DROP_, uint32_t IS_ATTEN_MASK_,
           class TilingData, bool HAS_SOFTCAP_, bool HAS_ALIBI_, bool KEEP_SFMG_>
 class BlockEpilogue<
-    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>,
+    EpilogueAtlasA2MlaSameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>,
     OutputType_, InputType_, TilingData> {
   public:
     using DispatchPolicy =
-        EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>;
+        EpilogueAtlasA2MlaSameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_, KEEP_SFMG_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using T1 = InputType_;
     using T2 = OutputType_;
