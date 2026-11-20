@@ -234,6 +234,25 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         __ubuf__ ElementOTmp* dmUb =
             (__ubuf__ ElementOTmp*)dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
 
+        // Retain the first PV in its OTmp slot instead of copying it into GO.
+        // The next rescale reads it straight from that slot as the running O,
+        // and releases the slot together with its own pv flag.
+        if constexpr (!FULL_QUANT_FP8) {
+            if (otmpStages_ == 2U && isFirstKvSTile && !isLastKvSTile && zeroRowCount == 0U) {
+                heldFirstBuf_ = static_cast<int32_t>(ubOTmpBufId);
+                return;
+            }
+        }
+        __ubuf__ ElementOTmp* previousGoUb = goUb;
+        Arch::CrossCoreFlag heldFlag(0);
+        if (heldFirstBuf_ >= 0) {
+            // Same per-slot flag the PV side signalled when it finished the
+            // retained tile; consume it now and re-set it after the update.
+            heldFlag = Arch::CrossCoreFlag(static_cast<Arch::FlagID>(
+                static_cast<int32_t>(pvReadyFlag.id) + heldFirstBuf_ - static_cast<int32_t>(ubOTmpBufId)));
+            WaitCrossCoreSync<4, PIPE_V>(heldFlag);
+            previousGoUb = (__ubuf__ ElementOTmp*)loUbTensor[heldFirstBuf_].GetPhyAddr();
+        }
         WaitCrossCoreSync<4, PIPE_V>(pvReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         if (isFirstKvSTile) {
@@ -247,8 +266,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             }
         } else if (!isLastKvSTile) {
             if constexpr (FULL_QUANT_FP8) {
-                RescaleFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, loUb, dmUb, rowNumCurSubCore,
-                                                                      colNumCurSubCore, colStride, tailCols);
+                RescaleFuncGeneric<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                    goUb, previousGoUb, loUb, dmUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
             } else {
                 bool skip = false;
                 if constexpr (CheckDm) {
@@ -256,17 +275,18 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                            DmAllOne(dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM], rowNumCurSubCore);
                 }
                 if (skip) {
-                    AddFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, loUb, rowNumCurSubCore, colNumCurSubCore,
-                                                                      colStride, tailCols);
+                    AddFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, previousGoUb, loUb, rowNumCurSubCore,
+                                                                      colNumCurSubCore, colStride, tailCols);
                 } else {
-                    RescaleFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, loUb, dmUb, rowNumCurSubCore,
-                                                                          colNumCurSubCore, colStride, tailCols);
+                    RescaleFuncGeneric<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                        goUb, previousGoUb, loUb, dmUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
                 }
             }
         } else {
             if constexpr (FULL_QUANT_FP8) {
-                RescaleFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
-                    goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols, vDequantScale_);
+                RescaleFuncLastNotFirstGeneric<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                    goUb, previousGoUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols,
+                    vDequantScale_);
             } else {
                 bool skip = false;
                 if constexpr (CheckDm) {
@@ -275,10 +295,10 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 }
                 if (skip) {
                     AddDivFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
-                        goUb, loUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
+                        goUb, previousGoUb, loUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
                 } else {
-                    RescaleFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
-                        goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols,
+                    RescaleFuncLastNotFirstGeneric<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                        goUb, previousGoUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols,
                         vDequantScale_);
                 }
             }
@@ -286,6 +306,11 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         if (zeroRowCount > 0) {
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Duplicate(goUbTensor32, static_cast<ElementOTmp>(0), zeroRowCount * colStride);
+        }
+        if (heldFirstBuf_ >= 0) {
+            // Both OTmp slots have been read by the update above.
+            SetCrossCoreSync<4, PIPE_V>(heldFlag);
+            heldFirstBuf_ = -1;
         }
         // release lo buf
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
@@ -695,9 +720,12 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
 
+    // `previousGoUb` is where the running O of the previous kv tile lives: the
+    // GO buffer itself, or the retained first-PV OTmp slot.
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ static inline void RescaleFunc(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* dmUb, uint32_t row,
-                                               uint32_t col, uint32_t rowStride, uint32_t tailCols)
+    __simd_vf__ static inline void RescaleFuncGeneric(__ubuf__ T* goUb, __ubuf__ T* previousGoUb, __ubuf__ T* loUb,
+                                                      __ubuf__ T* dmUb, uint32_t row, uint32_t col, uint32_t rowStride,
+                                                      uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
@@ -720,26 +748,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         for (uint32_t i = 0; i < row; ++i) {
             LoadAlign<T, LoadDist::DIST_BRC_B32>(dm, dmUb + i);
             __ubuf__ T* go;
+            __ubuf__ T* previousGo;
             __ubuf__ T* lo;
             if constexpr (HeadDimAligned64) {
                 go = goUb + i * ColBlocks;
+                previousGo = previousGoUb + i * ColBlocks;
                 lo = loUb + i * ColBlocks;
             } else {
                 go = goUb + i * rowStride;
+                previousGo = previousGoUb + i * rowStride;
                 lo = loUb + i * rowStride;
             }
-            LoadAlign<T, LoadDist::DIST_NORM>(go0, go);
+            LoadAlign<T, LoadDist::DIST_NORM>(go0, previousGo);
             LoadAlign<T, LoadDist::DIST_NORM>(lo0, lo);
             if constexpr (ColBlocks >= 128) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go1, go + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(go1, previousGo + VL_ELEM_NUM);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo1, lo + VL_ELEM_NUM);
             }
             if constexpr (ColBlocks >= 192) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go2, go + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(go2, previousGo + VL_ELEM_NUM * 2);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo2, lo + VL_ELEM_NUM * 2);
             }
             if constexpr (ColBlocks >= 256) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go3, go + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(go3, previousGo + VL_ELEM_NUM * 3);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo3, lo + VL_ELEM_NUM * 3);
             }
 
@@ -779,9 +810,10 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ static inline void RescaleFuncLastNotFirst(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* dmUb,
-                                                           __ubuf__ T* glUb, uint32_t row, uint32_t col,
-                                                           uint32_t rowStride, uint32_t tailCols, float vDequantScale)
+    __simd_vf__ static inline void RescaleFuncLastNotFirstGeneric(__ubuf__ T* goUb, __ubuf__ T* previousGoUb,
+                                                                  __ubuf__ T* loUb, __ubuf__ T* dmUb, __ubuf__ T* glUb,
+                                                                  uint32_t row, uint32_t col, uint32_t rowStride,
+                                                                  uint32_t tailCols, float vDequantScale)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
@@ -828,26 +860,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             LoadAlign<T, LoadDist::DIST_BRC_B32>(glVreg, glUb + i);
 
             __ubuf__ T* goRow;
+            __ubuf__ T* previousGoRow;
             __ubuf__ T* loRow;
             if constexpr (HeadDimAligned64) {
                 goRow = goUb + i * ColBlocks;
+                previousGoRow = previousGoUb + i * ColBlocks;
                 loRow = loUb + i * ColBlocks;
             } else {
                 goRow = goUb + i * rowStride;
+                previousGoRow = previousGoUb + i * rowStride;
                 loRow = loUb + i * rowStride;
             }
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg0, goRow);
+            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg0, previousGoRow);
             LoadAlign<T, LoadDist::DIST_NORM>(loVreg0, loRow);
             if constexpr (ColBlocks >= 128) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg1, goRow + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg1, previousGoRow + VL_ELEM_NUM);
                 LoadAlign<T, LoadDist::DIST_NORM>(loVreg1, loRow + VL_ELEM_NUM);
             }
             if constexpr (ColBlocks >= 192) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg2, goRow + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg2, previousGoRow + VL_ELEM_NUM * 2);
                 LoadAlign<T, LoadDist::DIST_NORM>(loVreg2, loRow + VL_ELEM_NUM * 2);
             }
             if constexpr (ColBlocks >= 256) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg3, goRow + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg3, previousGoRow + VL_ELEM_NUM * 3);
                 LoadAlign<T, LoadDist::DIST_NORM>(loVreg3, loRow + VL_ELEM_NUM * 3);
             }
 
@@ -1150,8 +1185,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ static inline void AddFunc(__ubuf__ T* goUb, __ubuf__ T* loUb, uint32_t row, uint32_t col,
-                                           uint32_t rowStride, uint32_t tailCols)
+    __simd_vf__ static inline void AddFunc(__ubuf__ T* goUb, __ubuf__ T* previousGoUb, __ubuf__ T* loUb, uint32_t row,
+                                           uint32_t col, uint32_t rowStride, uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
@@ -1173,26 +1208,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
         for (uint32_t i = 0; i < row; ++i) {
             __ubuf__ T* go;
+            __ubuf__ T* previousGo;
             __ubuf__ T* lo;
             if constexpr (HeadDimAligned64) {
                 go = goUb + i * ColBlocks;
+                previousGo = previousGoUb + i * ColBlocks;
                 lo = loUb + i * ColBlocks;
             } else {
                 go = goUb + i * rowStride;
+                previousGo = previousGoUb + i * rowStride;
                 lo = loUb + i * rowStride;
             }
-            LoadAlign<T, LoadDist::DIST_NORM>(go0, go);
+            LoadAlign<T, LoadDist::DIST_NORM>(go0, previousGo);
             LoadAlign<T, LoadDist::DIST_NORM>(lo0, lo);
             if constexpr (ColBlocks >= 128) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go1, go + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(go1, previousGo + VL_ELEM_NUM);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo1, lo + VL_ELEM_NUM);
             }
             if constexpr (ColBlocks >= 192) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go2, go + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(go2, previousGo + VL_ELEM_NUM * 2);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo2, lo + VL_ELEM_NUM * 2);
             }
             if constexpr (ColBlocks >= 256) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go3, go + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(go3, previousGo + VL_ELEM_NUM * 3);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo3, lo + VL_ELEM_NUM * 3);
             }
 
@@ -1221,9 +1259,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ static inline void AddDivFuncLastNotFirst(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* glUb,
-                                                          uint32_t row, uint32_t col, uint32_t rowStride,
-                                                          uint32_t tailCols)
+    __simd_vf__ static inline void AddDivFuncLastNotFirst(__ubuf__ T* goUb, __ubuf__ T* previousGoUb, __ubuf__ T* loUb,
+                                                          __ubuf__ T* glUb, uint32_t row, uint32_t col,
+                                                          uint32_t rowStride, uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
@@ -1246,26 +1284,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         for (uint32_t i = 0; i < row; ++i) {
             LoadAlign<T, LoadDist::DIST_BRC_B32>(gl, glUb + i);
             __ubuf__ T* go;
+            __ubuf__ T* previousGo;
             __ubuf__ T* lo;
             if constexpr (HeadDimAligned64) {
                 go = goUb + i * ColBlocks;
+                previousGo = previousGoUb + i * ColBlocks;
                 lo = loUb + i * ColBlocks;
             } else {
                 go = goUb + i * rowStride;
+                previousGo = previousGoUb + i * rowStride;
                 lo = loUb + i * rowStride;
             }
-            LoadAlign<T, LoadDist::DIST_NORM>(go0, go);
+            LoadAlign<T, LoadDist::DIST_NORM>(go0, previousGo);
             LoadAlign<T, LoadDist::DIST_NORM>(lo0, lo);
             if constexpr (ColBlocks >= 128) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go1, go + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(go1, previousGo + VL_ELEM_NUM);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo1, lo + VL_ELEM_NUM);
             }
             if constexpr (ColBlocks >= 192) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go2, go + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(go2, previousGo + VL_ELEM_NUM * 2);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo2, lo + VL_ELEM_NUM * 2);
             }
             if constexpr (ColBlocks >= 256) {
-                LoadAlign<T, LoadDist::DIST_NORM>(go3, go + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(go3, previousGo + VL_ELEM_NUM * 3);
                 LoadAlign<T, LoadDist::DIST_NORM>(lo3, lo + VL_ELEM_NUM * 3);
             }
 
@@ -1310,6 +1351,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     bool enableRescaleSkip{false};
     float vDequantScale_ = 1.0f;
     bool hasLseScratch_ = false;
+    // OTmp slot of the retained first PV, or -1 when nothing is held.
+    int32_t heldFirstBuf_ = -1;
     AscendC::LocalTensor<ElementOTmp> loUbTensor[UB_OTMP_BUF_STAGES];
     AscendC::LocalTensor<SMDtype> dmUbTensor16;
     AscendC::LocalTensor<SMDtype> glUbTensor16;
