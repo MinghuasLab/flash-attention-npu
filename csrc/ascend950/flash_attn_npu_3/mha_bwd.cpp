@@ -102,7 +102,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     TORCH_CHECK(q_seqlen > 0 && kv_seqlen > 0, "Ascend950 v3 bwd: sequence lengths must be positive");
     TORCH_CHECK(num_heads > 0 && num_heads_kv > 0 && num_heads % num_heads_kv == 0,
                 "Ascend950 v3 bwd: KV heads must divide query heads");
-    TORCH_CHECK(qk_head_dim == k_head_dim, "Ascend950 v3 bwd: q and k must share the same head dimension");
+    TORCH_CHECK(qk_head_dim == k_head_dim, "mha_bwd: query and key must have the same head dimension");
     TORCH_CHECK(qk_head_dim > 0 && qk_head_dim <= 512, "Ascend950 v3 bwd: q/k head dimension must be in (0, 512]");
     TORCH_CHECK(v_head_dim > 0 && v_head_dim <= 512, "Ascend950 v3 bwd: v head dimension must be in (0, 512]");
     TORCH_CHECK(!deterministic || (qk_head_dim <= 256 && v_head_dim <= 256),
