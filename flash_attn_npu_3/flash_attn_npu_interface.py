@@ -144,6 +144,7 @@ def _check_fwd_dimension(value, name):
 _HEADDIM_BWD_ALIGN = 64
 _HEADDIM_BWD_ALIGN_LARGE = 16
 
+
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
     Pad headdim for the bwd kernel.
@@ -548,14 +549,7 @@ def _flash_attn_backward(
     else:
         layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
 
-    # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if dq is None:
-        dq = torch.empty_like(q)
-    if dk is None:
-        dk = torch.empty_like(k)
-    if dv is None:
-        dv = torch.empty_like(v)
     qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
     original_qk_gt_v = original_qk_gt_v or qk_head_dim > v_head_dim
     qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
@@ -609,9 +603,12 @@ def _flash_attn_backward(
         original_qk_gt_v,
     )
     if pad_heads:
-        dq.copy_(dq_kernel[..., :qk_head_dim])
-        dk.copy_(dk_kernel[..., :qk_head_dim])
-        dv.copy_(dv_kernel[..., :v_head_dim])
+        if dq is not None:
+            dq.copy_(dq_kernel[..., :qk_head_dim])
+        if dk is not None:
+            dk.copy_(dk_kernel[..., :qk_head_dim])
+        if dv is not None:
+            dv.copy_(dv_kernel[..., :v_head_dim])
     return softmax_d
 
 
