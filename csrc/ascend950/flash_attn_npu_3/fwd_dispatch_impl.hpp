@@ -156,6 +156,17 @@ void launch_mixed_swa_layout(const FwdLaunchArgs& a)
     });
 }
 
+template <Format kLayout>
+void launch_single_query_window_layout(const FwdLaunchArgs& a)
+{
+    using DType = bfloat16_t;
+    constexpr CacheLayout kCacheLayout = CacheLayout::nd;
+    FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
+        FWD_MIXED_KERNEL_LAUNCH(FAInferSingleQueryWindow, MaskCategory::MASK_SWA, CacheMode::pagedCache,
+                                PageShape::BnBsND, LseMode, false, false);
+    });
+}
+
 #undef FWD_MIXED_KERNEL_LAUNCH
 #undef FWD_KERNEL_LAUNCH
 #undef FWD_MASK_SWITCH

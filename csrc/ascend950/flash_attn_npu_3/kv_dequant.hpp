@@ -400,13 +400,12 @@ public:
     __aicore__ inline void Prefetch(GM_ADDR cache, GM_ADDR scales,
         AscendC::GlobalTensor<int32_t> pages, uint32_t head, uint32_t heads,
         uint64_t pageStride, uint64_t tokenStride, uint64_t headStride,
-        uint32_t tile, uint32_t rows, uint32_t slot)
+        uint32_t tile, uint32_t rows, uint32_t slot, uint32_t start = 0U)
     {
         if (AscendC::GetSubBlockIdx() != 1U - slot) { return; }
         const uint32_t bank = deepPipeline_ ? writeSequence_++ % 3U : 0U;
-        const uint32_t start = 0U;
         // slot 1 is K (AIV0); slot 0 is V (AIV1). Only the owner signals READY for its tile.
-        count_[bank] = rows;
+        count_[bank] = rows - start;
         if (count_[bank] == 0U) { return; }
         // Input/scales are dead as soon as the previous VF has consumed them.
         // Do not hold the next GM read until the independent NZ output DMA ends.

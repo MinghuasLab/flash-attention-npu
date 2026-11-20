@@ -538,6 +538,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 
     }
 
+    uint32_t maxFdRows = 0U;
     uint32_t partialStart = 0U;
     uint32_t combineCount = 0U;
     uint32_t combineRows = 0U;
@@ -553,6 +554,9 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
                 }
                 ++partialCount;
             }
+        }
+        if (partialCount > 1U || !faInfo_.mixedKvStorage) {
+            maxFdRows = std::max(maxFdRows, bases[base].rowNum);
         }
         if (partialCount > 1U) {
             tiling.fdCombineSchedules[combineCount] = {static_cast<int32_t>(base), firstCore,
@@ -576,9 +580,9 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     tiling.fdPartialTaskNum = partialStart;
     tiling.fdCombineRowNum = combineRows;
     FillFdCombineCoreSchedules(tiling);
-    uint32_t maxFdRows = 0U;
-    for (const auto& base : bases) {
-        maxFdRows = std::max(maxFdRows, base.rowNum);
+    if (faInfo_.mixedKvStorage) {
+        // Only tasks shared by multiple cores write partial O and LSE to GM.
+        tiling.fdPartialCapacity = tiling.fdPartialTaskNum;
     }
     tiling.fdRowCapacity = static_cast<uint32_t>(AlignUpU64(maxFdRows, 8U));
     tiling.fdLseSubStride = tiling.quantMode == 1
@@ -675,13 +679,14 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
                                fullQ128Tasks >= 2ULL * blockNum_;
     const bool pairedWindow = faInfo_.maskType == MaskType::MASK_BAND &&
-                              faInfo_.windowSizeLeft >= 511 && faInfo_.windowSizeRight == 0;
+                              faInfo_.windowSizeRight == 0 && faInfo_.windowSizeLeft >= 0 &&
+                              (faInfo_.softcapValue == 0.0f || faInfo_.windowSizeLeft >= 511);
     const bool pairedFull = faInfo_.maskType != MaskType::MASK_BAND && faInfo_.pagedCacheFlag &&
                             !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink && faInfo_.softcapValue == 0.0f &&
                             faInfo_.embeddingSize == 192 && faInfo_.embeddingSizeV == 192;
-    // Each pair consumes one KV tile for two Q heads. Once all Cube groups
-    // have a pair, smaller Q tiles duplicate dequantization without adding cores.
-    if (hasPairedWave && fullQ128Tasks < 4ULL * blockNum_ && (pairedWindow || pairedFull)) {
+    // Each KV page serves both Q heads. Once every Cube can run a pair,
+    // this reuse also pays off for narrow windows in the pipelined PV kernel.
+    if (hasPairedWave && (pairedWindow || pairedFull)) {
         qBaseTile_ = fa950_plan::QueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen);
     }
     // Full MTP amortizes KV conversion across all 16 GQA heads. For low-occupancy

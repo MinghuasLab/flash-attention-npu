@@ -342,6 +342,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor mask_npu_tensor;
     bool is_local = false;
     bool flashDecodeEnabled = false;
+    bool singleQueryWindow = false;
     uint32_t launchBlockDim = blockDim;
 
     if (scheduler_metadata_.has_value()) {
@@ -416,7 +417,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
 
-        int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+        bool fd_q_lengths_supported = true;
+        int64_t max_active_kv_seqlen = 0;
         int64_t max_q_seqlen = 0;
         const int32_t* q_cu_ptr = is_varlen_q ? cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
         const int32_t* q_used_ptr = seqused_q_cpu.defined() ? seqused_q_cpu.data_ptr<int32_t>() : nullptr;
@@ -433,12 +435,17 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                 TORCH_CHECK(q_len <= static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx],
                             "seqused_q must lie within the allocated sequence length");
             }
-            min_q_seqlen = std::min(min_q_seqlen, q_len);
+            // An empty packed sequence contributes no base tasks or output rows.
+            if (q_len > 0) {
+                max_active_kv_seqlen = std::max(max_active_kv_seqlen, kv_len);
+            } else if (!mixedKv || !is_varlen_q || q_used_ptr != nullptr) {
+                fd_q_lengths_supported = false;
+            }
             max_q_seqlen = std::max(max_q_seqlen, q_len);
         }
         const bool fd_shape_supported =
             !is_local && paged_KV && (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
-            min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+            fd_q_lengths_supported && max_q_seqlen <= 16 && max_active_kv_seqlen >= 1024;
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
@@ -462,6 +469,10 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             tiler.DoTiling(tilingData);
         }
         flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
+        // In a one-token right-aligned window, every query head consumes the same key interval.
+        singleQueryWindow = mixedKv && is_local && !is_softcap && seqlen_q == 1 && max_q_seqlen == 1 &&
+                            window_size_left >= page_block_size - 1 && window_size_right == 0 &&
+                            tilingData.qBaseTile <= 64U && tilingData.qL1BufNum == 1U;
         if (flashDecodeEnabled) {
             launchBlockDim = tilingData.fdActiveCoreNum;
         } else if (mixedKv && is_local && tilingData.totalTaskNum > 0U) {
@@ -478,7 +489,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if ((is_causal || is_local) && quantMode != 1) {
+        if ((is_causal || is_local) && quantMode != 1 && !singleQueryWindow) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
         }
@@ -592,8 +603,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
         mixedKv && tilingData.qL1BufNum == 2U};
-    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
-        launch_fwd(fwdArgs);
+    auto launch_fa_infer = [singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
+        if (singleQueryWindow) {
+            launch_single_query_window(fwdArgs);
+        } else {
+            launch_fwd(fwdArgs);
+        }
         return 0;
     };
     // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can

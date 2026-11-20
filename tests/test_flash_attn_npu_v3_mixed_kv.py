@@ -47,9 +47,11 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
 
 
 @pytest.mark.parametrize("sq,sk,heads,batch,splits,causal,window", [
+    (1, 4097, 2, 2, 0, True, (511, 0)),       # The first visible token is inside a physical page.
     (1, 2048, 4, 1, 0, True, (511, 0)),       # Exact page boundaries.
     (8, 2049, 2, 1, 0, True, (511, 0)),       # Both ends fall inside a page.
     (8, 1027, 1, 2, 1, False, (17, 3)),       # Both masks on the same page.
+    (257, 515, 2, 1, 0, True, (63, 0)),        # One wave of paired heads, narrow window and unaligned pages.
     (513, 899, 4, 1, 1, True, (511, 0)),      # Paired heads, partial Q and KV tiles.
     (512, 769, 4, 1, 1, False, (287, 257)),   # Finite noncausal window.
     (513, 193, 4, 1, 1, True, (511, 0)),      # Fully masked prefix followed by valid rows.
@@ -131,6 +133,36 @@ def test_mixed_kv_ragged_prefill(heads, q_lengths, kv_lengths, window):
     for b, sk in enumerate(kv_lengths):
         start, end = cu[b].item(), cu[b + 1].item()
         _check_sequence(packed[start:end], k, v, ks, vs, table[b], sk, True, out[start:end], lse[:, start:end], window)
+
+
+
+@pytest.mark.parametrize("splits", [0, 4])
+@pytest.mark.parametrize("q_lens,kv_lens", [
+    ((0, 3, 0, 8, 1, 0), (4097, 0, 17, 4097, 1025, 0)),
+    ((8, 0, 1), (1, 0, 1024)),  # The widest task writes directly; only the one-token task needs partials.
+])
+def test_mixed_kv_packed_decode_empty_queries(splits, q_lens, kv_lens):
+    q, k, v, ks, vs, table = make_case(max(q_lens), max(kv_lens), 2, len(q_lens))
+    packed = torch.cat([q[b, :n] for b, n in enumerate(q_lens)])
+    cu = torch.tensor((0, *q_lens), dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    out, lse, *_ = flash_attn_with_kvcache(
+        packed.npu(), k.npu(), v.npu(), k_descale=ks.npu(), v_descale=vs.npu(),
+        cu_seqlens_q=cu.npu(), max_seqlen_q=max(q_lens), page_table=table.npu(),
+        cache_seqlens=torch.tensor(kv_lens, dtype=torch.int32).npu(), causal=True,
+        num_splits=splits, return_softmax_lse=True,
+    )
+    out, lse = out.cpu().float(), lse.cpu()
+    assert out.shape == packed.shape
+    assert lse.shape == (packed.size(1), packed.size(0))
+    for b, (nq, nk) in enumerate(zip(q_lens, kv_lens)):
+        if nq == 0:
+            continue
+        rows = slice(cu[b].item(), cu[b + 1].item())
+        if nk:
+            _check_sequence(packed[rows], k, v, ks, vs, table[b], nk, True, out[rows], lse[:, rows], (-1, -1))
+        else:
+            assert torch.count_nonzero(out[rows]) == 0
+            assert torch.isposinf(lse[:, rows]).all()
 
 
 @pytest.mark.parametrize("bad_scale", ["missing", "per_head", "dtype", "q_scale"])
