@@ -99,6 +99,8 @@ enum class CacheLayout : uint8_t {
 #endif
 ////////////////////////////////////////////////////////////////////
 namespace Catlass::Gemm::Block {
+using PairedFullPvTile = tla::Shape<tla::Int<128>, tla::Int<96>, tla::Int<128>>;
+
 struct BlockMmadPVTileHelper {
     uint32_t pvL1TileM;
     uint32_t pvL1TileN;
@@ -440,6 +442,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
+        // One P tile covers all output column fragments when M and K each fit in L0A.
+        constexpr bool PipelineColumns = std::is_same_v<L0TileShape_, PairedFullPvTile>;
+        const bool reuseP = PipelineColumns && mL0LoopNum == 1U && kL0LoopNum == 1U;
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
@@ -450,7 +455,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             uint32_t l0TileNPhysical = RoundUp(l0TileNAct, C0_ELEMS);
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
-            uint32_t l0CLoopCounter = pipelineTileSeq;
+            // Rotate after each output fragment so FIX can drain one bank during the next MMAD.
+            uint32_t l0CLoopCounter = PipelineColumns ? pipelineTileSeq * nL0LoopNum + nL0Itr : pipelineTileSeq;
             uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId + 2;
             auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNPhysical);
@@ -501,29 +507,35 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileMAct, l0TileKPhysical);
                     auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
 
-                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
-                    if constexpr (!ENABLE_DN_ || FULL_QUANT_FP8) {
-                        copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
-                    } else {
-                        AscendC::LoadData2DParamsV2 loadData2DParamsA;
-                        loadData2DParamsA.mStartPosition = 0;
-                        loadData2DParamsA.kStartPosition = 0;
-                        loadData2DParamsA.ifTranspose = 1;
-                        loadData2DParamsA.mStep = RoundUp(l0TileKAct, 16) / 16;
-                        loadData2DParamsA.kStep = RoundUp(l0TileMAct, 16) / 16;
-                        loadData2DParamsA.srcStride = RoundUp(l0TileKAct, 16) / 16;
-                        loadData2DParamsA.dstStride = RoundUp(l0TileMAct, 16) / 16;
-                        AscendC::LoadData(l0ATensor[l0ABufId], l1ATensorTla.data(), loadData2DParamsA);
+                    const bool loadP = !reuseP || nL0Itr == 0U;
+                    if (loadP) {
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                        if constexpr (!ENABLE_DN_ || FULL_QUANT_FP8) {
+                            copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
+                        } else {
+                            AscendC::LoadData2DParamsV2 loadData2DParamsA;
+                            loadData2DParamsA.mStartPosition = 0;
+                            loadData2DParamsA.kStartPosition = 0;
+                            loadData2DParamsA.ifTranspose = 1;
+                            loadData2DParamsA.mStep = RoundUp(l0TileKAct, 16) / 16;
+                            loadData2DParamsA.kStep = RoundUp(l0TileMAct, 16) / 16;
+                            loadData2DParamsA.srcStride = RoundUp(l0TileKAct, 16) / 16;
+                            loadData2DParamsA.dstStride = RoundUp(l0TileMAct, 16) / 16;
+                            AscendC::LoadData(l0ATensor[l0ABufId], l1ATensorTla.data(), loadData2DParamsA);
+                        }
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
                     // reverse crossCoreSync for P
-                    if ((mL0Itr == mL0LoopNum - 1) && (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
+                    const bool lastPRead = reuseP ? nL0Itr == 0U : nL0Itr == nL0LoopNum - 1;
+                    if ((mL0Itr == mL0LoopNum - 1) && lastPRead && (kL0Itr == kL0LoopNum - 1)) {
                         SetCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
                     }
 
                     bool initMmad = (kL0Itr == 0);
                     uint32_t l0TileMAligned = RoundUp(l0TileMAct, 16);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                    if (loadP) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                    }
 
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
 
@@ -532,7 +544,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     }
                     tileMmad(l0CTensorTlaTile, l0ATensorTla, l0BTensorTla, l0TileMAligned, l0TileNAct, l0TileKAct,
                              initMmad);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                    if (!reuseP || nL0Itr + 1U == nL0LoopNum) {
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                    }
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                 }
             }

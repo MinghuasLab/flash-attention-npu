@@ -671,12 +671,17 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
                                              fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
-    // For a sliding window the work per full Q tile stays bounded. One
-    // complete wave of paired heads is enough to use all Cube groups.
-    if (faInfo_.mixedKvStorage && faInfo_.maskType == MaskType::MASK_BAND &&
-        faInfo_.windowSizeLeft >= 511 && faInfo_.windowSizeRight == 0 &&
-        fullQueryTileInEachBatch && (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
-        fullQ128Tasks >= 2ULL * blockNum_ && fullQ128Tasks < 4ULL * blockNum_) {
+    const bool hasPairedWave = faInfo_.mixedKvStorage && fullQueryTileInEachBatch &&
+                               (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
+                               fullQ128Tasks >= 2ULL * blockNum_;
+    const bool pairedWindow = faInfo_.maskType == MaskType::MASK_BAND &&
+                              faInfo_.windowSizeLeft >= 511 && faInfo_.windowSizeRight == 0;
+    const bool pairedFull = faInfo_.maskType != MaskType::MASK_BAND && faInfo_.pagedCacheFlag &&
+                            !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink && faInfo_.softcapValue == 0.0f &&
+                            faInfo_.embeddingSize == 192 && faInfo_.embeddingSizeV == 192;
+    // Each pair consumes one KV tile for two Q heads. Once all Cube groups
+    // have a pair, smaller Q tiles duplicate dequantization without adding cores.
+    if (hasPairedWave && fullQ128Tasks < 4ULL * blockNum_ && (pairedWindow || pairedFull)) {
         qBaseTile_ = fa950_plan::QueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen);
     }
     // Full MTP amortizes KV conversion across all 16 GQA heads. For low-occupancy
@@ -690,10 +695,7 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
     FillBasicTilingData(tilingdata);
     // Pair adjacent Q heads sharing a KV head. Each pair owns two Q banks in
     // L1; the K and V banks are released only after both consumers read them.
-    if (faInfo_.mixedKvStorage && !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink &&
-        qBaseTile_ == Q_TILE_CEIL &&
-        fullQueryTileInEachBatch && (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
-        fullQ128Tasks >= 2ULL * blockNum_) {
+    if (hasPairedWave && !faInfo_.flashDecodeFlag && !faInfo_.isTilingSink && qBaseTile_ == Q_TILE_CEIL) {
         tilingdata.set_qL1BufNum(2U);
     }
     if (!faInfo_.isTilingSink) {

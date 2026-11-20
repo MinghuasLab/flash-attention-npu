@@ -60,6 +60,13 @@ extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a)
 extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
 
 template <Format kLayout>
+void launch_paired_full_layout(const FwdLaunchArgs& a);
+
+extern template void launch_paired_full_layout<Format::TND>(const FwdLaunchArgs&);
+extern template void launch_paired_full_layout<Format::BSND>(const FwdLaunchArgs&);
+extern template void launch_paired_full_layout<Format::BNSD>(const FwdLaunchArgs&);
+
+template <Format kLayout>
 void launch_mixed_swa_layout(const FwdLaunchArgs& a);
 
 extern template void launch_mixed_swa_layout<Format::TND>(const FwdLaunchArgs&);
@@ -71,6 +78,17 @@ extern template void launch_mixed_swa_layout<Format::BNSD>(const FwdLaunchArgs&)
 // per (dtype, Format) in the autogen TUs.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
+    if (a.quant_mode == 2U && a.paired_query_heads && a.paged_kv && !a.has_softcap &&
+        a.mask_category != MaskCategory::MASK_SWA && !(a.enable_dn && a.mask_category == MaskCategory::NO_MASK)) {
+        if (a.layout == Format::TND) {
+            launch_paired_full_layout<Format::TND>(a);
+        } else if (a.layout == Format::BNSD) {
+            launch_paired_full_layout<Format::BNSD>(a);
+        } else {
+            launch_paired_full_layout<Format::BSND>(a);
+        }
+        return;
+    }
     if (a.quant_mode == 1) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<float8_e4m3_t, Format::TND>(a);

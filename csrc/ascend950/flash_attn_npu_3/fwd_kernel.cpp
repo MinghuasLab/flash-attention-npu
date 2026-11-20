@@ -1268,9 +1268,9 @@ class FAIKernel950 {
     uint32_t pvL0BTotalStages_;
 };
 
-template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+template <bool PipelineColumns, class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false>
-CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+__aicore__ inline void RunFAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
                             uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
@@ -1301,7 +1301,9 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     using LayoutMask = layout::RowMajor;
     // 处理单个tile内Q和K的matmul
     using L1TileShapeQK = Shape<Int<Q_BLK>, Int<128>, Int<128>>;
-    using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
+    // Split the 192-wide reduction and output into balanced Cube fragments.
+    constexpr bool pairedFull = PipelineColumns;
+    using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<pairedFull ? 96 : 128>>;
     using DispatchPolicyQK =
         Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
     using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS,
@@ -1318,7 +1320,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
         Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, MaskType, TileCopySoftmax>;
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
-    using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
+    using L0TileShapePV = std::conditional_t<pairedFull, Gemm::Block::PairedFullPvTile, Shape<Int<128>, Int<128>, Int<128>>>;
     using DispatchPolicyPV =
         Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
     using TileCopyPV =
@@ -1357,6 +1359,32 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     params.vDescale = vDescale;
     Kernel faInfer;
     faInfer(params);
+}
+
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false>
+CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                            GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                            GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
+{
+    RunFAInfer<false, InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout,
+               LseMode, HasSoftcap, MixedKv, PairedHeads>(
+        q, k, v, mask, blockTables, o, lse, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace,
+        tiling, scaleValue, softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage, kDescale, vDescale);
+}
+
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false>
+CATLASS_GLOBAL void FAInferPairedFull(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                            GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                            GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
+{
+    RunFAInfer<true, InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout,
+               LseMode, HasSoftcap, MixedKv, PairedHeads>(
+        q, k, v, mask, blockTables, o, lse, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace,
+        tiling, scaleValue, softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage, kDescale, vDescale);
 }
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
