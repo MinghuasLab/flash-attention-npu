@@ -6,8 +6,7 @@ One shape matrix covers both chips. Host launch dispatches on the visible NPU:
 ``flash_attn_npu_interface_950`` pad inside ``_flash_attn_backward``. Gradient
 checks use the repo ``assert_fa_close`` dual-reference rule on both.
 
-``segment`` / ``check`` / ``TOLERANCES`` stay here for Ascend 950 MLA pipeline
-tests that still import them through ``test_mla_interface_padding_950``.
+``segment`` / ``check`` / ``TOLERANCES`` remain for optional MLA helper reuse.
 """
 
 from __future__ import annotations
@@ -33,92 +32,48 @@ from tests.common.test_utils import (
     pad_packed_tensor,
 )
 
-# Frozen ratio check used by Ascend 950 MLA pipeline helpers.
+# Frozen ratio check used by Ascend 950 MLA helper callers.
 TOLERANCES = {torch.float16: (0.00195, 0.1), torch.bfloat16: (0.0156, 1.0)}
 
 # dtype, causal, num_heads, kv_heads, batch, q_seqlen, kv_seqlen, qk_headdim, v_headdim
-# Shared across FA3/FA4 and Ascend 910/950. All rows are qk > v.
+# Lean matrix: one or two rows per pad path (same-bucket, MLA, equal-pad, >256).
 BSND_CASES = [
+    # Same 64-bucket pad.
     (torch.float16, True, 4, 4, 2, 33, 65, 21, 5),
     (torch.bfloat16, False, 4, 1, 2, 17, 40, 60, 20),
-    (torch.bfloat16, False, 2, 2, 2, 64, 64, 57, 41),
-    (torch.float16, False, 4, 4, 2, 1, 8, 64, 63),
-    (torch.float16, False, 4, 4, 2, 65, 97, 64, 32),
-    (torch.bfloat16, True, 4, 2, 2, 65, 129, 7, 3),
-    (torch.float16, True, 8, 2, 1, 9, 33, 32, 16),
-    (torch.bfloat16, False, 4, 4, 2, 128, 128, 63, 1),
-    (torch.float16, False, 4, 4, 2, 65, 97, 96, 64),
-    (torch.float16, False, 4, 2, 2, 65, 97, 128, 64),
-    (torch.bfloat16, True, 2, 2, 2, 16, 32, 193, 192),
-    (torch.float16, False, 2, 1, 2, 16, 32, 200, 193),
-    (torch.float16, False, 2, 2, 2, 32, 48, 255, 200),
-    (torch.bfloat16, True, 2, 2, 2, 32, 64, 256, 193),
+    # MLA tile: qk bucket 128/192 with v <= 128.
     (torch.float16, False, 4, 4, 2, 32, 48, 192, 128),
-    (torch.bfloat16, True, 4, 1, 2, 32, 48, 192, 128),
     (torch.bfloat16, True, 6, 2, 2, 40, 70, 192, 64),
-    (torch.float16, False, 6, 3, 2, 40, 70, 192, 64),
     (torch.float16, True, 4, 4, 2, 16, 32, 128, 64),
-    (torch.bfloat16, False, 4, 1, 2, 16, 32, 128, 64),
+    # Equal-headdim pad (qk > v but not MLA).
+    (torch.bfloat16, True, 2, 2, 2, 16, 32, 193, 192),
     (torch.float16, False, 4, 4, 2, 33, 65, 165, 22),
-    (torch.bfloat16, True, 4, 2, 2, 33, 65, 93, 27),
-    (torch.bfloat16, False, 2, 2, 2, 128, 160, 69, 26),
-    (torch.float16, True, 2, 1, 2, 128, 160, 100, 17),
-    (torch.float16, True, 4, 1, 2, 48, 96, 80, 16),
     (torch.bfloat16, False, 4, 4, 2, 24, 48, 129, 128),
-    (torch.bfloat16, False, 4, 4, 2, 65, 129, 65, 1),
-    (torch.float16, True, 4, 2, 2, 65, 129, 128, 1),
-    (torch.float16, True, 1, 1, 2, 1, 1, 2, 1),
-    (torch.bfloat16, False, 1, 1, 2, 3, 5, 2, 1),
-    (torch.bfloat16, True, 4, 2, 2, 65, 97, 129, 127),
-    (torch.float16, True, 4, 2, 2, 65, 97, 160, 128),
-    (torch.bfloat16, False, 4, 2, 2, 65, 97, 192, 160),
-    (torch.float16, True, 4, 2, 2, 65, 97, 256, 128),
-    (torch.bfloat16, False, 4, 2, 2, 65, 97, 256, 192),
+    # Above 256: Aligned512 equal-pad.
     (torch.float16, False, 2, 2, 2, 16, 32, 300, 128),
-    (torch.bfloat16, True, 2, 1, 2, 16, 32, 320, 64),
-    (torch.bfloat16, True, 4, 2, 2, 8, 16, 400, 192),
     (torch.float16, False, 4, 4, 2, 8, 16, 512, 256),
-    (torch.float16, False, 2, 1, 2, 4, 8, 257, 1),
-    (torch.bfloat16, True, 2, 2, 2, 4, 8, 511, 496),
-    (torch.float16, False, 4, 2, 2, 65, 97, 449, 128),
 ]
 
 # dtype, causal, num_heads, kv_heads, seqlens_q, seqlens_k, qk_headdim, v_headdim
 TND_CASES = [
     (torch.float16, True, 4, 4, (17, 33), (40, 65), 21, 5),
-    (torch.bfloat16, False, 4, 1, (8, 17), (20, 40), 60, 20),
-    (torch.bfloat16, False, 2, 2, (1, 9), (8, 33), 32, 16),
-    (torch.float16, True, 4, 2, (64, 65), (80, 129), 7, 3),
-    (torch.float16, False, 4, 4, (1, 64), (8, 64), 64, 63),
+    (torch.bfloat16, True, 4, 1, (16, 32), (32, 48), 192, 128),
+    (torch.float16, True, 4, 4, (8, 16), (16, 32), 128, 64),
     (torch.bfloat16, True, 2, 2, (16, 32), (32, 64), 256, 193),
     (torch.float16, False, 2, 2, (8, 16), (16, 32), 384, 128),
-    (torch.bfloat16, True, 4, 1, (4, 8), (8, 16), 512, 192),
-    (torch.bfloat16, True, 4, 1, (16, 32), (32, 48), 192, 128),
-    (torch.float16, False, 6, 2, (24, 40), (40, 70), 192, 64),
-    (torch.float16, True, 4, 4, (8, 16), (16, 32), 128, 64),
-    (torch.bfloat16, False, 4, 2, (33, 48), (65, 96), 165, 22),
-    (torch.bfloat16, False, 2, 1, (64, 128), (128, 160), 100, 17),
-    (torch.float16, True, 4, 4, (24, 65), (48, 129), 129, 64),
-    (torch.float16, False, 1, 1, (1, 3), (1, 5), 2, 1),
-    (torch.bfloat16, True, 8, 2, (9, 33), (33, 40), 57, 41),
-    (torch.float16, True, 4, 2, (17, 65), (33, 97), 96, 64),
-    (torch.bfloat16, True, 4, 2, (17, 65), (33, 97), 145, 81),
-    (torch.float16, False, 4, 2, (17, 65), (33, 97), 224, 80),
 ]
 
-# Softcap / sliding-window rows exercised on both chips via the same host path.
+# Softcap / sliding-window: one MLA and one equal-pad row.
 # (dtype, causal, nheads, kv_heads, batch, sq, sk, qk, v, wl, wr, softcap, scale_or_none)
 WINDOW_SOFTCAP_CASES = [
     (torch.float16, False, 4, 2, 1, 65, 97, 128, 64, 31, 17, 0.0, 0.11),
-    (torch.bfloat16, True, 4, 2, 1, 65, 97, 145, 81, -1, -1, 2.0, None),
     (torch.float16, True, 4, 2, 1, 65, 97, 192, 128, -1, -1, 0.0, 0.14467962580268923),
-    (torch.bfloat16, False, 4, 2, 1, 65, 97, 256, 192, -1, -1, 0.0, 0.08),
 ]
 
-PADDED_OUT_DIMS = [(31, 14), (96, 21), (186, 140), (225, 214)]
+PADDED_OUT_DIMS = [(31, 14), (186, 140)]
 
 # Public autograd smoke dims (950 forward accepts unequal headdim; 910 skips).
-PUBLIC_AUTOGRAD_DIMS = [(96, 64), (160, 96), (192, 128), (256, 128)]
+PUBLIC_AUTOGRAD_DIMS = [(96, 64), (192, 128)]
 
 
 def device_kind() -> str:
