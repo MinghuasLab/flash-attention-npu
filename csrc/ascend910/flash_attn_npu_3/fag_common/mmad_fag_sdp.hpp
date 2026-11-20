@@ -17,7 +17,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/gemm_coord.hpp"
-#include "../../flash_attn_npu/fag_block.h"
+#include "../../flash_attn_npu/fag_mla/fag_block.h"
 #include "catlass/gemm/helper.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
@@ -114,6 +114,11 @@ public:
         (BlockTileShape::K == L1TileShape::K) && \
         (L1A_STAGES == 2) && \
         (L1B_STAGES == 1);
+    // qk=192, v=128 的 mm12：A 的 4 个 128 行条带驻留 L1A，B 按 128 列填充 512x192 L1B。
+    static constexpr bool ENABLE_MLA_ALIGNED192_L1_CACHE =
+        (BlockTileShape::M == 512) && (BlockTileShape::N == 512) && (BlockTileShape::K == 192) &&
+        (L1TileShape::M == 128) && (L1TileShape::N == 512) && (L1TileShape::K == 192) && (L0TileShape::M == 128) &&
+        (L0TileShape::N == 128) && (L0TileShape::K == 96) && (L1A_STAGES == 4) && (L1B_STAGES == 1);
     static constexpr bool ENABLE_A_TILED_B_TILED = (BlockTileShape::M > L1TileShape::M) && \
         (BlockTileShape::N > L1TileShape::N) && \
         (BlockTileShape::K > L1TileShape::K) && \
@@ -155,7 +160,7 @@ public:
     }
 
     CATLASS_DEVICE
-    void SetFlag(uint32_t l1BufAddrStart = 0)
+    void SetFlag(uint32_t l1BufAddrStart = 0, bool initializeFix = true)
     {
         uint32_t l1AAddrStart = l1BufAddrStart;
         uint32_t l1BAddrStart = l1BufAddrStart + L1A_SIZE * L1A_STAGES;
@@ -176,7 +181,7 @@ public:
             l1BEventList[i] = i + L1A_STAGES;
         }
 
-        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
+        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_MLA_ALIGNED192_L1_CACHE || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
             for (uint32_t i = 0; i < L1A_STAGES; i++) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
             }
@@ -202,7 +207,16 @@ public:
         }
 
         l0CTensor = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(0);
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+        if (initializeFix || !ENABLE_MLA_ALIGNED192_L1_CACHE) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+        }
+        if constexpr (ENABLE_MLA_ALIGNED192_L1_CACHE) {
+            static_assert(2 * L0C_TILE_SIZE <= L0C_SIZE, "192/128 L0C ping/pong exceeding the L0C space!");
+            l0CTensorPong = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(L0C_TILE_SIZE);
+            if (initializeFix) {
+                AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID1);
+            }
+        }
     }
 
     /// Destructor
@@ -212,9 +226,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void WaitFlag()
+    void WaitFlag(bool drainFix = true)
     {
-        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
+        if constexpr(ENABLE_A_TILED_B_FullLoad || ENABLE_MLA_ALIGNED192_L1_CACHE || ENABLE_A_TILED_B_TILED || ENABLE_A_TILED_B_K_TILED) {
             for (uint32_t i = 0; i < L1A_STAGES; i++) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[i]);
             }
@@ -231,7 +245,14 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[i]);
         }
 
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+        if (drainFix || !ENABLE_MLA_ALIGNED192_L1_CACHE) {
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+        }
+        if constexpr (ENABLE_MLA_ALIGNED192_L1_CACHE) {
+            if (drainFix) {
+                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID1);
+            }
+        }
     }
 
     /// Perform a block-scoped matrix multiply-accumulate
@@ -240,11 +261,13 @@ public:
         AscendC::GlobalTensor<ElementA> const &gmBlockA, LayoutA const &layoutA,
         AscendC::GlobalTensor<ElementB> const &gmBlockB, LayoutB const &layoutB,
         AscendC::GlobalTensor<ElementC> const &gmBlockC, LayoutC const &layoutC,
-        GemmCoord const &actualShape) // actual shape是实际每个block分到的数据量，可能是512*512，也有可能是尾块
+        GemmCoord const &actualShape, bool initializeFix = true, bool drainFix = true)
     {
-        SetFlag();
+        SetFlag(0, initializeFix);
         if constexpr(ENABLE_A_B_FullLoad) {
             GemmABFullLoad(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
+        } else if constexpr (ENABLE_MLA_ALIGNED192_L1_CACHE) {
+            GemmMlaAligned192L1Cache(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
         } else if constexpr(ENABLE_A_TILED_B_FullLoad) {
             GemmATiledBFullLoad(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
         } else if constexpr(ENABLE_A_TILED_B_TILED) {
@@ -252,7 +275,7 @@ public:
         } else if constexpr(ENABLE_A_TILED_B_K_TILED) {
             GemmATiledBKTiled(gmBlockA, layoutA, gmBlockB, layoutB, gmBlockC, layoutC, actualShape);
         }
-        WaitFlag();
+        WaitFlag(drainFix);
     }
 
     CATLASS_DEVICE
@@ -411,6 +434,136 @@ public:
                 } else {
                     copyL0CToGm(gmCTile, l0CTensor, layoutTileCInGM, layoutCInL0, 0b11);
                 }
+            }
+        }
+    }
+
+    CATLASS_DEVICE
+    void GemmMlaAligned192L1Cache(AscendC::GlobalTensor<ElementA> const& gmBlockA, LayoutA const& layoutA,
+                                  AscendC::GlobalTensor<ElementB> const& gmBlockB, LayoutB const& layoutB,
+                                  AscendC::GlobalTensor<ElementC> const& gmBlockC, LayoutC const& layoutC,
+                                  GemmCoord const& actualShape)
+    // MLA mm12 的 Aligned192 风格搬运：n 维 128 列 B 块先行驻留 L1，
+    // m 维 128 行 A 条带只在 n==0 时加载一次，后续 n 块直接复用。
+    {
+        uint32_t actualM = actualShape.m();
+        uint32_t actualN = actualShape.n();
+        uint32_t actualK = actualShape.k(); // Q/K 为192；V/dY 仍按128走尾块
+
+        uint32_t MAlign = RoundUp<L1AAlignHelper::M_ALIGNED>(actualM);
+        uint32_t NAlign = RoundUp<L1BAlignHelper::N_ALIGNED>(actualN);
+        uint32_t KAlign = RoundUp<L1BAlignHelper::K_ALIGNED>(actualK);
+
+        uint32_t mL0TileCount = CeilDiv<L0TileShape::M>(MAlign);
+        uint32_t nL0TileCount = CeilDiv<L0TileShape::N>(NAlign);
+        // dP has K=128: a single tile fits the existing 32 KiB L0A/B slots.
+        // Keep QK and larger output blocks on the original K blocking.
+        static_assert(128 * 128 * sizeof(ElementA) <= L0A_PINGPONG_BUF_SIZE);
+        static_assert(128 * 128 * sizeof(ElementB) <= L0B_PINGPONG_BUF_SIZE);
+        uint32_t kTileSize = actualM <= 128 && actualN <= 256 && actualK == 128 ? 128 : L0TileShape::K;
+        uint32_t kL0TileCount = (KAlign + kTileSize - 1) / kTileSize;
+
+        auto layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1TileShape::M, L1TileShape::K);
+        auto layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(L1TileShape::K, L1TileShape::N);
+
+        // L0C ping/pong：按输出 tile 交替，fixpipe(tile i) 与 MMA(tile i+1) 重叠。
+        uint32_t l0CListId = 0;
+
+        for (uint32_t nL0TileIdx = 0; nL0TileIdx < nL0TileCount; nL0TileIdx++) {
+            uint32_t nL0 =
+                (nL0TileIdx < nL0TileCount - 1) ? L0TileShape::N : (NAlign - (nL0TileCount - 1) * L0TileShape::N);
+            uint32_t actualNL0 =
+                (nL0TileIdx < nL0TileCount - 1) ? L0TileShape::N : (actualN - (nL0TileCount - 1) * L0TileShape::N);
+
+            // B(K/V)：每次只搬当前 128 列、完整 actualK 行，落到 L1B 对应偏移。
+            MatrixCoord BGMTileOffset{0, nL0TileIdx * L0TileShape::N};
+            auto gmBTile = gmBlockB[layoutB.GetOffset(BGMTileOffset)];
+            auto layoutTileBInGM = layoutB.GetTileLayout(MakeCoord(actualK, actualNL0));
+            MatrixCoord l1BTileOffset{0, nL0TileIdx * L0TileShape::N};
+            auto l1BTile = l1BTensorList[0][layoutBInL1.GetOffset(l1BTileOffset)];
+            copyGmToL1B(l1BTile, gmBTile, layoutBInL1, layoutTileBInGM);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+
+            for (uint32_t mL0TileIdx = 0; mL0TileIdx < mL0TileCount; mL0TileIdx++) {
+                uint32_t mL0 =
+                    (mL0TileIdx < mL0TileCount - 1) ? L0TileShape::M : (MAlign - (mL0TileCount - 1) * L0TileShape::M);
+                uint32_t actualML0 =
+                    (mL0TileIdx < mL0TileCount - 1) ? L0TileShape::M : (actualM - (mL0TileCount - 1) * L0TileShape::M);
+                uint32_t l1ASlot = mL0TileIdx;
+                auto l1ATensor = l1ATensorList[l1ASlot];
+                auto l0CTile = (l0CListId == 0) ? l0CTensor : l0CTensorPong;
+                const int32_t l0CEventId = (l0CListId == 0) ? EVENT_ID0 : EVENT_ID1;
+
+                // A(Q/dY)：n==0 时按 128 行条带装满 4 个 stage，后续 n 复用。
+                if (nL0TileIdx == 0) {
+                    MatrixCoord AGMTileOffset{mL0TileIdx * L0TileShape::M, 0};
+                    auto gmATile = gmBlockA[layoutA.GetOffset(AGMTileOffset)];
+                    auto layoutTileAInGM = layoutA.GetTileLayout(MakeCoord(actualML0, actualK));
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ASlot]);
+                    copyGmToL1A(l1ATensor, gmATile, layoutAInL1, layoutTileAInGM);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ASlot]);
+                }
+
+                for (uint32_t kL0TileIdx = 0; kL0TileIdx < kL0TileCount; kL0TileIdx++) {
+                    uint32_t kL0 =
+                        (kL0TileIdx < kL0TileCount - 1) ? kTileSize : (KAlign - (kL0TileCount - 1) * kTileSize);
+
+                    auto l0ATensor = l0ATensorList[l0AListId];
+                    MatrixCoord l1ATileOffset{0, kL0TileIdx * kTileSize};
+                    auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ATileOffset)];
+                    auto layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0, kL0);
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+                    if ((nL0TileIdx == 0) && (kL0TileIdx == 0)) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ASlot]);
+                    }
+                    copyL1ToL0A(l0ATensor, l1ATile, layoutAInL0, layoutAInL1);
+                    if ((nL0TileIdx == nL0TileCount - 1) && (kL0TileIdx == kL0TileCount - 1)) {
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ASlot]);
+                    }
+
+                    auto l0BTensor = l0BTensorList[l0BListId];
+                    MatrixCoord l1BOffset{kL0TileIdx * kTileSize, nL0TileIdx * L0TileShape::N};
+                    auto l1BTileForL0 = l1BTensorList[0][layoutBInL1.GetOffset(l1BOffset)];
+                    auto layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0, nL0);
+                    AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+                    copyL1ToL0B(l0BTensor, l1BTileForL0, layoutBInL0, layoutBInL1);
+
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
+
+                    bool initC = (kL0TileIdx == 0);
+                    if (initC) {
+                        // WAR：本 L0C buffer 上一个 tile 的 fixpipe 读完才能重写
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                    }
+
+                    uint8_t unitFlag = 0b00;
+                    if constexpr (ENABLE_UNIT_FLAG) {
+                        unitFlag = (kL0TileIdx == kL0TileCount - 1) ? 0b11 : 0b10;
+                    }
+                    tileMmad(l0CTile, l0ATensor, l0BTensor, mL0, nL0, kL0, initC, unitFlag);
+
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
+                    l0AListId = (l0AListId + 1 < L0_STAGES) ? (l0AListId + 1) : 0;
+                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
+                    l0BListId = (l0BListId + 1 < L0_STAGES) ? (l0BListId + 1) : 0;
+                }
+
+                MatrixCoord CGMTileOffset{mL0TileIdx * L0TileShape::M, nL0TileIdx * L0TileShape::N};
+                auto gmCTile = gmBlockC[layoutC.GetOffset(CGMTileOffset)];
+                auto layoutTileCInGM = layoutC.GetTileLayout(MakeCoord(actualML0, actualNL0));
+                auto layoutCInL0 = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0, nL0));
+                if constexpr (!ENABLE_UNIT_FLAG) {
+                    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+                    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+                    copyL0CToGm(gmCTile, l0CTile, layoutTileCInGM, layoutCInL0);
+                    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                } else {
+                    copyL0CToGm(gmCTile, l0CTile, layoutTileCInGM, layoutCInL0, 0b11);
+                    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                }
+                l0CListId = 1 - l0CListId;
             }
         }
     }
@@ -987,6 +1140,7 @@ protected:
     AscendC::LocalTensor<ElementA> l0ATensorList[L0_STAGES];
     AscendC::LocalTensor<ElementB> l0BTensorList[L0_STAGES];
     AscendC::LocalTensor<ElementAccumulator> l0CTensor;
+    AscendC::LocalTensor<ElementAccumulator> l0CTensorPong;
 
     int32_t l1AEventList[L1A_STAGES]; // set/wait for (MTE2, MTE1) and (MTE1, MTE2)
     int32_t l1BEventList[L1B_STAGES]; // set/wait for (MTE2, MTE1) and (MTE1, MTE2)

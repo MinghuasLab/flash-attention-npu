@@ -868,7 +868,7 @@ std::vector<at::Tensor> mha_bwd(
     std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int64_t> max_seqlen_q_, std::optional<int64_t> max_seqlen_k_, std::optional<double> softmax_scale_,
     bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap, bool deterministic,
-    int64_t sm_margin, int64_t layout)
+    int64_t sm_margin, int64_t layout, bool original_qk_gt_v)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -915,12 +915,18 @@ std::vector<at::Tensor> mha_bwd(
     TORCH_CHECK(!seqused_k_.has_value() || is_varlen_q, "seqused_k requires cu_seqlens_q in bwd");
     TORCH_CHECK(sm_margin == 0, "mha_bwd does not support sm_margin yet.");
 
+    const bool use_mla_host_path = q.dim() > 0 && v.dim() > 0 && q.size(-1) > v.size(-1);
     at::Tensor cu_seqlens_q;
     at::Tensor cu_seqlens_k;
+    at::Tensor cu_seqlens_q_cpu_for_tiling;
+    at::Tensor cu_seqlens_k_cpu_for_tiling;
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
         int32_t cuQLast = 0;
-        if (PackedCuLast(cu_seqlens_q, cuQLast)) {
+        if (use_mla_host_path) {
+            cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+        }
+        if (PackedCuLast(use_mla_host_path ? cu_seqlens_q_cpu_for_tiling : cu_seqlens_q, cuQLast)) {
             TORCH_CHECK(q.size(0) >= cuQLast, "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
                         "; packed T must be at least cu_seqlens_q[-1]");
         }
@@ -928,7 +934,13 @@ std::vector<at::Tensor> mha_bwd(
     if (is_varlen_kv) {
         cu_seqlens_k = cu_seqlens_k_.value();
         int32_t cuKLast = 0;
-        if (PackedCuLast(cu_seqlens_k, cuKLast)) {
+        if (use_mla_host_path) {
+            // MLA only: reuse this call's snapshot, never cache mutable lengths across calls.
+            cu_seqlens_k_cpu_for_tiling = cu_seqlens_q.defined() && cu_seqlens_q.is_same(cu_seqlens_k)
+                                              ? cu_seqlens_q_cpu_for_tiling
+                                              : cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+        }
+        if (PackedCuLast(use_mla_host_path ? cu_seqlens_k_cpu_for_tiling : cu_seqlens_k, cuKLast)) {
             TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast, "k/v have ", k.size(0), "/", v.size(0),
                         " tokens but cu_seqlens_k[-1] is ", cuKLast, "; packed T must be at least cu_seqlens_k[-1]");
         }
@@ -963,21 +975,51 @@ std::vector<at::Tensor> mha_bwd(
     uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[expected_dim - 1]);
     TORCH_CHECK(nheads > 0 && nheads_k > 0, "mha_bwd: number of Q/KV heads must be positive");
     TORCH_CHECK(nheads % nheads_k == 0, "mha_bwd: number of heads in key/value must divide number of heads in query");
-    // NPU FAG bwd currently requires q/k/v/dout headdim to be equal.
-    TORCH_CHECK(q_headdim == k_headdim && q_headdim == v_headdim && q_headdim == dout_headdim,
-                "mha_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
+    // Equal headdim keeps the caller's width. qk > v is padded by
+    // _flash_attn_backward before this call.
+    TORCH_CHECK(q_headdim == k_headdim, "mha_bwd: query and key must have the same head dimension");
+    TORCH_CHECK(v_headdim == dout_headdim, "mha_bwd: value and dout must have the same head dimension");
+    const bool is_mla_headdim = (q_headdim > v_headdim);
     TORCH_CHECK(q_headdim > 0 && q_headdim <= 512, "mha_bwd: headdim must be in (0, 512].");
-    TORCH_CHECK(qsizes == dout_sizes, "mha_bwd: q and dout must have the same shape");
-    TORCH_CHECK(ksizes == vsizes, "mha_bwd: k and v must have the same shape");
+    TORCH_CHECK(q_headdim >= v_headdim,
+                "mha_bwd: unequal headdim is only supported for MLA (qk > v), got qk=", q_headdim, ", v=", v_headdim);
+    // MLA 下 dout/out 的最后一维与 v 相同（128），其余维度与 q 相同。
+    for (int64_t i = 0; i + 1 < expected_dim; i++) {
+        TORCH_CHECK(qsizes[i] == dout_sizes[i] && qsizes[i] == out_sizes[i],
+                    "mha_bwd: q and dout/out must match except the head dimension");
+    }
+    TORCH_CHECK(static_cast<uint32_t>(out_sizes[expected_dim - 1]) == v_headdim, "mha_bwd: out head dim must match v");
+    for (int64_t i = 0; i + 1 < expected_dim; i++) {
+        TORCH_CHECK(ksizes[i] == vsizes[i], "mha_bwd: k and v must match except the head dimension");
+    }
     if (is_varlen_q) {
         TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k, "mha_bwd: v nheads_k must match k");
     } else {
         TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
     }
-    // Kernel template only has 64/128/192/256/512 specializations.
-    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 :
-                                 (q_headdim <= 256 ? 256 : 512)));
+    // Equal widths in (0, 512] select Aligned{64,128,192,256,512}; tiling keeps
+    // the real width. qk > v that is still unequal after padding uses Mla192Dv128.
+    auto headdim_template = [](uint32_t d) { return d == 64 || d == 128 || d == 192 || d == 256; };
+    auto headdim_bucket = [](uint32_t d) {
+        return d <= 64 ? 64u : (d <= 128 ? 128u : (d <= 192 ? 192u : (d <= 256 ? 256u : 512u)));
+    };
+    uint32_t qk_headdim_kernel = 0;
+    uint32_t v_headdim_kernel = 0;
+    if (is_mla_headdim) {
+        TORCH_CHECK(headdim_template(q_headdim),
+                    "mha_bwd: qk > v must already be padded to a kernel template (64/128/192/256), got ", q_headdim);
+        TORCH_CHECK(headdim_template(v_headdim),
+                    "mha_bwd: qk > v must already be padded to a kernel template (64/128/192/256), got v=", v_headdim);
+        TORCH_CHECK(q_headdim <= 192 && v_headdim <= 128,
+                    "mha_bwd: unequal headdim must fit Mla192Dv128 (qk > v, qk <= 192, v <= 128), got qk=", q_headdim,
+                    ", v=", v_headdim);
+        qk_headdim_kernel = q_headdim;
+        v_headdim_kernel = v_headdim;
+    } else {
+        qk_headdim_kernel = headdim_bucket(q_headdim);
+        v_headdim_kernel = qk_headdim_kernel;
+    }
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q.size(0) - 1) : qsizes[0];
     TORCH_CHECK(batch_size > 0, "mha_bwd: batch size must be positive");
     if (seqused_q_.has_value()) {
@@ -1027,6 +1069,8 @@ std::vector<at::Tensor> mha_bwd(
     bool is_local = false;
     NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right, is_causal,
                              is_local);
+    // 不等维（qk > v）MLA 走 BAND mask，支持 sliding window，不支持确定性计算。
+    TORCH_CHECK(!is_mla_headdim || !deterministic, "mha_bwd: unequal headdim (qk > v) does not support deterministic");
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
@@ -1050,13 +1094,13 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.vHeadDim = v_headdim;
     fagInfo.isDeterministic = deterministic;
     fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : (is_bnsd ? BNSD : BSND));
-    at::Tensor cu_seqlens_q_cpu_for_tiling;
-    at::Tensor cu_seqlens_k_cpu_for_tiling;
     at::Tensor seqused_q_cpu_for_tiling;
     at::Tensor seqused_k_cpu_for_tiling;
     if (is_varlen_q) {
-        cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        cu_seqlens_k_cpu_for_tiling = cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+        if (!use_mla_host_path) {
+            cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            cu_seqlens_k_cpu_for_tiling = cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+        }
         // Region lists only: sizes must cover the full packed tensors; seqused never shrinks them.
         // Tiling expects cumulative seqlens with length B and no leading zero.
         fagInfo.qSeqlenList = static_cast<int32_t*>(cu_seqlens_q_cpu_for_tiling.data_ptr()) + 1;
@@ -1070,11 +1114,15 @@ std::vector<at::Tensor> mha_bwd(
             fagInfo.kvUsedLenList = static_cast<int32_t*>(seqused_k_cpu_for_tiling.data_ptr());
         }
     }
+
     uint32_t aivNum = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAiv();
     uint64_t ubSize = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
     FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    if (is_mla_headdim) {
+        blockDim = static_cast<uint32_t>(fagTilingData.aicNum);
+    }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen_q ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
     }
@@ -1084,6 +1132,9 @@ std::vector<at::Tensor> mha_bwd(
     };
     fagTilingData.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
                                   tensor_strides(dout), tensor_strides(out), 1};
+    // The short head-owned path can initialize every output with its first write.
+    fagTilingData.fullPackedTensors = is_mla_headdim && is_varlen_q && q.size(0) == fagTilingData.t1 &&
+                                      k.size(0) == fagTilingData.t2 && v.size(0) == fagTilingData.t2;
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
@@ -1094,11 +1145,17 @@ std::vector<at::Tensor> mha_bwd(
     at::Tensor workspace_tensor =
         at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
+    // MLA 按 device 缓存 2048x2048 常量三角 mask，避免重复构造与 H2D 拷贝。
+    // 普通分支继续按原有路径构造 mask。
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
-        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
-        mask_gpu_tensor = at::triu(at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
-                              .to(at::Device(at::kPrivateUse1));
+        if (is_mla_headdim) {
+            mask_gpu_tensor = MakeDeviceTriuMask();
+        } else {
+            const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
+            mask_gpu_tensor = at::triu(at::ones({mask_dim, mask_dim}, at::device(c10::kCPU).dtype(at::kByte)), 1)
+                                  .to(at::Device(at::kPrivateUse1));
+        }
     }
 
     uint64_t fftsAddr{0};
@@ -1170,7 +1227,9 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.is_softcap = has_softcap;
     bwd_args.has_attn_mask = has_attn_mask;
     bwd_args.deterministic = deterministic;
+    bwd_args.original_qk_gt_v = original_qk_gt_v || q_headdim > v_headdim;
     bwd_args.qk_headdim_kernel = qk_headdim_kernel;
+    bwd_args.v_headdim_kernel = v_headdim_kernel;
     bwd_args.dOutDevice = dOutDevice;
     bwd_args.qDevice = qDevice;
     bwd_args.kDevice = kDevice;
@@ -1187,6 +1246,7 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.dvDevice = dvDevice;
     bwd_args.workspaceDevice = workspaceDevice;
     bwd_args.tilingDevice = tilingDevice;
+    // Keep v3/v4 on the same CATLASS backward route.
     if (is_varlen_q) {
         launch_bwd<TND>(bwd_args);
     } else if (is_bnsd) {
@@ -1414,8 +1474,15 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 PYBIND11_MODULE(flash_attn_npu_4, m)
 {
     m.doc() = "FlashAttention";
+    m.def("_clear_device_mask_cache", &ClearDeviceTriuMaskCache);
+    py::module_::import("atexit").attr("register")(m.attr("_clear_device_mask_cache"));
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");
-    m.def("bwd", &mha_bwd, "Backward pass");
+    m.def("bwd", &mha_bwd, "Backward pass", py::arg("dout"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+          py::arg("softmax_lse"), py::arg("dq"), py::arg("dk"), py::arg("dv"), py::arg("cu_seqlens_q"),
+          py::arg("cu_seqlens_k"), py::arg("seqused_q"), py::arg("seqused_k"), py::arg("max_seqlen_q"),
+          py::arg("max_seqlen_k"), py::arg("softmax_scale"), py::arg("is_causal"), py::arg("window_size_left"),
+          py::arg("window_size_right"), py::arg("softcap"), py::arg("deterministic"), py::arg("sm_margin"),
+          py::arg("layout"), py::arg("original_qk_gt_v") = false);
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),

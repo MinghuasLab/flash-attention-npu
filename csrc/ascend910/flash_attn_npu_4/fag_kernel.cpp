@@ -24,15 +24,16 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 
-#include "../flash_attn_npu/fag_block.h"
+#include "../flash_attn_npu/fag_mla/fag_block.h"
 #include "../flash_attn_npu/fag_kernel_common.hpp"
 #include "fag_common/epilogue_fag_deterministic_add.hpp"
-#include "../flash_attn_npu/fag_epilogue_sfmg.hpp"
-#include "../flash_attn_npu/fag_epilogue_op.hpp"
-#include "../flash_attn_npu/fag_epilogue_post.hpp"
-#include "../flash_attn_npu/fag_epilogue_pre.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_sfmg.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_op.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_post.hpp"
+#include "../flash_attn_npu/fag_mla/fag_epilogue_pre.hpp"
 #include "fag_common/mmad_fag_sdp.hpp"
 #include "fag_common/mmad_fag_dqkv.hpp"
+#include <type_traits>
 #include "fag_tiling.h"
 #include "kernel_operator.h"
 
@@ -61,12 +62,13 @@ enum class DTemplateType {
     Aligned192 = 3,
     Aligned256 = 4,
     Aligned512 = 5,
+    Mla192Dv128 = 6, // MLA：qk headdim > v headdim（如 192/128，qk<=192、v<=128 桶）
     DTemplateBottom
 };
 
 template <class BlockMmad_, class BlockMmad2_, class BlockMmad3_, class EpilogueFAGPre_, class EpilogueFAGSfmg_,
           class EpilogueFAGSabVec_, class EpilogueFAGPost_, class EpilogueFAGDtmAdd_, const uint32_t INPUT_LAYOUT,
-          const bool IS_ATTEN_MASK, const uint32_t IS_DTM>
+          const bool IS_ATTEN_MASK, const uint32_t IS_DTM, const bool USE_ACTUAL_OUT = false>
 class FlashAttentionScoreGrad {
   public:
     using BlockMmad = BlockMmad_;
@@ -177,6 +179,11 @@ class FlashAttentionScoreGrad {
         seqUsedKvAddr = params.seqUsedKv;
         hasSeqUsedQ = params.seqUsedQ != nullptr;
         hasSeqUsedKv = params.seqUsedKv != nullptr;
+        shortHeadSchedule = INPUT_LAYOUT == TND && b == 1 && g == 1 && n2 >= 4 && n2 % cubeCoreNum == 0 && d == 192 &&
+                            value_d == 128 && s1 > 0 && s1 <= 256 && s1 == s2 && s1CvInner == 128 &&
+                            fagTilingData->maskType == 1 && !hasSeqUsedQ && !hasSeqUsedKv;
+        shortOwnedWrite = shortHeadSchedule && s2Outer == 1 && fagTilingData->fullPackedTensors;
+        independentHeadStreams = shortHeadSchedule && n2 == 2 * cubeCoreNum;
 
         // From tiling: cu[b - 1] would undercount after used-length tail trimming.
         int64_t sfmgOutputSize = static_cast<int64_t>(fagTilingData->sfmgNormalAxisSize) * 8;
@@ -293,6 +300,33 @@ class FlashAttentionScoreGrad {
 
     __aicore__ inline bool CalcValidBlock(int64_t& baseIdx, int64_t& startCoreId, DBParams& dbParam)
     {
+        if (shortHeadSchedule) {
+            // Match CANN's contiguous per-AIV head ranges: AIV 2c and 2c+1
+            // own adjacent heads, each traversing Q blocks in increasing order.
+            const int64_t head = independentHeadStreams ? 2 * cCubeBlockIdx + shortTaskCursor % 2
+                                                        : cCubeBlockIdx + (shortTaskCursor / s1Outer) * cubeCoreNum;
+            if (head >= n2 || (independentHeadStreams && shortTaskCursor >= 2 * s1Outer)) {
+                dbParam.blockId = -1;
+                baseIdx = -1;
+                return true;
+            }
+            cachedActualSeqQlen = s1;
+            cachedActualSeqKvlen = s2;
+            dbParam.bIdx = 0;
+            dbParam.n2Idx = head;
+            dbParam.gIdx = 0;
+            dbParam.s2oIdx = 0;
+            dbParam.s1oIdx = independentHeadStreams ? shortTaskCursor / 2 : shortTaskCursor % s1Outer;
+            dbParam.blockId = head * s1Outer + dbParam.s1oIdx;
+            dbParam.s1CvExtend = dbParam.s1oIdx == s1Outer - 1 ? s1CvTail : s1CvInner;
+            const int64_t right = dbParam.s1oIdx * s1CvInner + dbParam.s1CvExtend;
+            dbParam.s2CvExtend = right < s2 ? right : s2;
+            dbParam.s1CvExtendAlign = (dbParam.s1CvExtend + 15) / 16 * 16;
+            dbParam.s2CvExtendAlign = (dbParam.s2CvExtend + 15) / 16 * 16;
+            ++shortTaskCursor;
+            baseIdx = shortTaskCursor;
+            return true;
+        }
         if (bDimIdx >= b) { // 越界情形
             if (cCubeBlockIdx >= startCoreId) {
                 dbParam.blockId = -1; // 没有数据需要处理
@@ -495,11 +529,14 @@ class FlashAttentionScoreGrad {
         {
             BlockMmad blockMmadDyV(resource);
             blockMmadDyV(dxGm[specify_for_v_aTensorOffsetCv], layoutA1, valueGm[specify_for_v_bTensorOffsetCv],
-                         layoutB1, mm1WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC1, actualBlockShape1);
+                         layoutB1, mm1WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC1, actualBlockShape1, true,
+                         !shortHeadSchedule);
         }
 
-        // fixpipe GM write done before reusing L1 for q*k
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        // L1/L0A/L0B are drained; short tasks carry L0C free flags into QK.
+        if (!shortHeadSchedule) {
+            AscendC::PipeBarrier<PIPE_MTE3>();
+        }
 
         // mm-qk
         GemmCoord actualBlockShape(dbParam.s1CvExtend, dbParam.s2CvExtend, d);
@@ -509,12 +546,17 @@ class FlashAttentionScoreGrad {
         BlockMmad blockMmadQk(resource);
         blockMmadQk(queryGm[InputOffset(inputStrides.q, dbParam, true)], layoutA,
                     keyGm[InputOffset(inputStrides.k, dbParam, false)], layoutB,
-                    mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC, actualBlockShape);
+                    mm2WorkspaceGm[pingpongIdx * cubeBaseMN], layoutC, actualBlockShape, !shortHeadSchedule, true);
     }
 
     __aicore__ inline void ComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
     {
         pingpongIdx = dbParam.taskId % 2;
+        const bool accumulateDq = !shortHeadSchedule;
+        const bool accumulateKv = !shortHeadSchedule || dbParam.s1oIdx != 0;
+        // Earlier Q blocks initialized only this causal K prefix. New K rows
+        // must use ordinary stores when the pre-zero stage is omitted.
+        const uint32_t atomicKvRows = shortOwnedWrite ? static_cast<uint32_t>(dbParam.s1oIdx * s1CvInner) : 0xffffffffU;
         int64_t dqOffset = 0;
         int64_t dqRopeOffset = 0;
         int64_t dkvOffset = 0;
@@ -580,7 +622,7 @@ class FlashAttentionScoreGrad {
         {
             BlockMmad2 blockMmad2(resource);
             blockMmad2(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], keyGm[InputOffset(inputStrides.k, dbParam, false)],
-                       dqWorkSpaceGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, true);
+                       dqWorkSpaceGm[dqOffset], layoutA1, layoutB1, layoutC1, actualBlockShape1, accumulateDq);
         }
 
         // dq GM write done; blockMmad3 reuses same L1
@@ -595,7 +637,8 @@ class FlashAttentionScoreGrad {
         LayoutB3 layoutB2{actualBlockShape2.k(), actualBlockShape2.n(), inputStrides.q.sequence};
         LayoutC3 layoutC2{actualBlockShape2.m(), actualBlockShape2.n(), dkvKc};
         blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], queryGm[InputOffset(inputStrides.q, dbParam, true)],
-                   dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, true);
+                   dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2, actualBlockShape2, accumulateKv,
+                   atomicKvRows);
 
         AscendC::PipeBarrier<PIPE_MTE3>();
 
@@ -608,7 +651,8 @@ class FlashAttentionScoreGrad {
         LayoutB3 layoutB3{actualBlockShape3.k(), actualBlockShape3.n(), inputStrides.dout.sequence};
         LayoutC3 layoutC3{actualBlockShape3.m(), actualBlockShape3.n(), dvKc};
         blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2], dxGm[InputOffset(inputStrides.dout, dbParam, true)],
-                   dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, true);
+                   dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3, actualBlockShape3, accumulateKv,
+                   atomicKvRows);
     }
 
     __aicore__ inline void DTMComputeMMDqkv(DBParams& dbParam, int64_t nextBlockId)
@@ -798,27 +842,39 @@ class FlashAttentionScoreGrad {
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIV>(FAGKernelParams const& params)
     {
-        // pre compute
-        AscendC::TPipe pipePre;
-        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask,
-                                      params.workspace, params.tiling);
-        epilogueFagPre();
-        pipePre.Destroy();
-
-        // vec SoftmaxGrad
-        AscendC::TPipe pipeSoftmaxGrad;
-        EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, params.cu_seq_qlen,
-                                        params.workspace, params.tiling);
-        epilogueFagSfmg();
-        pipeSoftmaxGrad.Destroy();
-
-        // 给L1custom的变量
         cBlockIdx = AscendC::GetBlockIdx();
         cCubeBlockIdx = cBlockIdx / 2;
         cSubIdx = cBlockIdx % 2;
 
         __gm__ FAGTilingData* fagTilingData = reinterpret_cast<__gm__ FAGTilingData*>(params.tiling);
         Init(params, fagTilingData);
+
+        if (!shortHeadSchedule) {
+            AscendC::TPipe pipePre;
+            EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask,
+                                          params.workspace, params.tiling);
+            epilogueFagPre();
+            pipePre.Destroy();
+
+            AscendC::TPipe pipeSoftmaxGrad;
+            EpilogueFAGSfmg epilogueFagSfmg(resource, &pipeSoftmaxGrad, params.dout, params.out, params.cu_seq_qlen,
+                                            params.workspace, params.tiling);
+            epilogueFagSfmg();
+            pipeSoftmaxGrad.Destroy();
+            if constexpr (USE_ACTUAL_OUT) {
+                // SFMG producers and attention tasks may own different rows.
+                // Publish every AIV's dO*O reduction before any task reads it.
+                AscendC::SyncAll();
+            }
+        } else if (!shortOwnedWrite) {
+            AscendC::TPipe pipePre;
+            EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask,
+                                          params.workspace, params.tiling);
+            epilogueFagPre();
+            pipePre.Destroy();
+            // Padded storage keeps the original zero-before-atomic contract.
+            AscendC::SyncAll();
+        }
 
         // vector process
         int64_t taskId = 1;
@@ -839,6 +895,14 @@ class FlashAttentionScoreGrad {
             isFinish = CalcValidBlock(blockStartIdx, startCoreId, dbParams[0]);
         }
         dbParams[0].taskId = 0;
+        // Publish the pre-zero before any atomic task. Owned short writes skip it.
+        if constexpr (INPUT_LAYOUT != TND) {
+            AscendC::SyncAll();
+        } else if (!shortOwnedWrite) {
+            AscendC::SyncAll();
+        }
+        epilogueFAGSabVec.taskSfmgEnabled = shortHeadSchedule;
+        epilogueFAGSabVec.singleAivTask = independentHeadStreams;
         if constexpr (IS_DTM == ENABLE) {
             extraLoopNum = 2;
         }
@@ -851,13 +915,18 @@ class FlashAttentionScoreGrad {
 
             dbParams[taskId % 3].taskId = taskId;
             if (taskId > 0 && dbParams[(taskId - 1) % 3].blockId != -1) {
+                const bool ownsTask = !shortHeadSchedule || !independentHeadStreams ||
+                                      dbParams[(taskId - 1) % 3].n2Idx == 2 * cCubeBlockIdx + cSubIdx;
+                if (shortHeadSchedule && ownsTask) {
+                    epilogueFAGSabVec.PrepareTaskSfmg(dbParams[(taskId - 1) % 3]);
+                }
                 AscendC::CrossCoreWaitFlag(SYNC_C1_V1_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
 
-                if (taskId > 0 && dbParams[(taskId - 1) % 3].blockId != -1) {
+                if (ownsTask) {
                     epilogueFAGSabVec(dbParams[(taskId - 1) % 3]);
-                    AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(
-                        SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                 }
+                AscendC::CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(
+                    SYNC_V1_C2_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
                 if constexpr (IS_DTM != ENABLE) {
                     if (dbParams[(taskId) % 3].blockId == -1) {
                         AscendC::CrossCoreWaitFlag(SYNC_C2_V1_FLAG[dbParams[(taskId - 1) % 3].taskId % 2]);
@@ -899,6 +968,10 @@ class FlashAttentionScoreGrad {
     static constexpr uint64_t SYNC_C1_V1_FLAG[3] = {1, 2, 3};
     static constexpr uint64_t SYNC_C2_V1_FLAG[3] = {7, 8, 9};
     int64_t blockStartIdx = 0;
+    bool shortHeadSchedule = false;
+    bool shortOwnedWrite = false;
+    bool independentHeadStreams = false;
+    int64_t shortTaskCursor = 0;
     DBParams dbParams[3];
     // base info
     int64_t bDimIdx{0};
@@ -1046,11 +1119,36 @@ struct TypeSelector<DTemplateType::Aligned512> {
     using L0TileShapeCube2 = GemmShape<128, 256, 64>;
 };
 
-template <const DTemplateType DTEMPLATETYPE, typename DataType = half,
-          const uint32_t INPUT_LAYOUT = BSND, const bool IS_ATTEN_MASK = 0,
-          const bool IS_DROP = 0,
+// MLA 专用配置：Q/K head dimension 为 192，V/dOut head dimension 为 128。
+// mm12 对齐参考实现 Aligned192 的 L1 搬运：B(K/V) 按 128 列分块填完整块
+// 512x192 L1B（192KB），A(Q/dY) 的 4 个 128 行条带装入 4 个 L1A stage
+// （192KB）并在 n 维复用；V/dY 的 actualK 仍为 128，L0 按 96+32 尾块处理。
+// mm345：L1A(dS/P) 128x512 双缓冲，按 128(K) 分块搬运；L1B(K/Q/dY) 单份
+// 512x192，按 128(K)x(128+64)(N) 分块装载，dV 的 actualN 仍为 128。
+// L0 按 128x(128+64) 覆盖 N=192。L1A 的 M 不能超过 128：copyOut 以
+// L1ATileShape::M x N 整块经 fixpipe 出 L0C，M=256、N=192 时 L0C 瓦片达
+// 192 KiB，超过 128 KiB 的 L0C 容量。
+template <>
+struct TypeSelector<DTemplateType::Mla192Dv128> {
+    // cube1
+    using DispatchPolicyCube1 = Catlass::Gemm::MmadAtlasA2FagSdp<4, 1, true>;
+    using BlockTileShape = GemmShape<512, 512, 192>;
+    using L1TileShapeCube1 = GemmShape<128, 512, 192>;
+    using L0TileShapeCube1 = GemmShape<128, 128, 96>;
+
+    // cube2：L1A 双缓冲（dS/P M-tile 加载与 MMAD 重叠；128KB x 2 + 192KB
+    // = 448KB <= 512KB L1）
+    using DispatchPolicyCube2 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
+    using BlockTileShapeCube2 = GemmShape<512, 192, 512>;
+    using L1ATileShapeCube2 = GemmShape<128, 0, 512>;
+    using L1BTileShapeCube2 = GemmShape<0, 192, 512>;
+    using L0TileShapeCube2 = GemmShape<128, 192, 64>;
+};
+
+template <const DTemplateType DTEMPLATETYPE, typename DataType = half, const uint32_t INPUT_LAYOUT = BSND,
+          const bool IS_ATTEN_MASK = 0, const bool IS_DROP = 0,
           const bool IS_DTM = 0, // 是否开启确定性计算
-          const bool HAS_SOFTCAP = 0>
+          const bool HAS_SOFTCAP = 0, const bool USE_ACTUAL_OUT = false>
 CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
                                GM_ADDR drop_mask, GM_ADDR atten_mask, GM_ADDR softmax_lse, GM_ADDR cu_seq_qlen,
                                GM_ADDR cu_seq_kvlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_, GM_ADDR dk_,
@@ -1063,6 +1161,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
 #endif
 
+    constexpr bool IS_MLA = DTEMPLATETYPE == DTemplateType::Mla192Dv128;
     using ArchTag = Arch::AtlasA2;
 
     // cube1
@@ -1078,8 +1177,9 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using L1BTileShapeCube2 = typename TypeSelector<DTEMPLATETYPE>::L1BTileShapeCube2;
     using L0TileShapeCube2 = typename TypeSelector<DTEMPLATETYPE>::L0TileShapeCube2;
 
-    // cube3
-    using DispatchPolicyCube3 = Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>;
+    // cube3: 与 cube2 共用全部配置（含 L1 stages），MLA 等专用配置才能生效
+    using DispatchPolicyCube3 =
+        std::conditional_t<IS_MLA, DispatchPolicyCube2, Catlass::Gemm::MmadAtlasA2FagdQKV<2, 1, true>>;
     using BlockTileShapeCube3 = BlockTileShapeCube2;
     using L1ATileShapeCube3 = L1ATileShapeCube2;
     using L1BTileShapeCube3 = L1BTileShapeCube2;
@@ -1144,25 +1244,26 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using LayoutInput = layout::RowMajor;
     using InputType = DataType;
 
-    // VEC_Pre ：dQ/dOut/dV的workspace清零
-    using EpilogueAtlasA2FAGPre = Catlass::Epilogue::EpilogueAtlasA2FAGPre;
-    using EpilogueFAGPre = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPre, InputType, FAGTilingData>;
+    // VEC_Pre ：dQ/dK/dV 的 workspace 清零。dV 按 vSize 切，等维时与 kvSize 相同。
+    using EpilogueFAGPre =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGPre, InputType, FAGTilingData>;
 
-    // VEC_Sfmg ：计算 SoftmaxGrad(dOut, atten_in)
-    using EpilogueAtlasA2FAGSfmg = Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT>;
-
-    // 使用模板特化根据INPUT_LAYOUT选择布局标签
-    using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, InputType, FAGTilingData>;
+    // VEC_Sfmg ：按 vHeadDim 计算 SoftmaxGrad(dOut, O)。等维时与 qkHeadDim 相同。
+    using EpilogueFAGSfmg =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGSfmg<INPUT_LAYOUT>, InputType,
+                                                FAGTilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
+    // qk>v 和垫成等宽的不等头都保留 SFMG 行和，不改写成 P·dP。
     using EpilogueAtlasA2SameAbVec =
-        Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>;
+        Catlass::Epilogue::EpilogueAtlasA2MlaSameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false,
+                                                       IS_MLA || USE_ACTUAL_OUT>;
     using EpilogueFAGSabVec =
         Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 
-    // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
-    using EpilogueAtlasA2FAGPost = Catlass::Epilogue::EpilogueAtlasA2FAGPost;
-    using EpilogueFAGPost = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGPost, InputType, FAGTilingData>;
+    // VEC_Post：dQ*scale 和 dK*scale，并搬运输出 dQ/dK/dV。dV 按 vSize 切。
+    using EpilogueFAGPost =
+        Catlass::Epilogue::Block::BlockEpilogue<Catlass::Epilogue::EpilogueAtlasA2FAGPost, InputType, FAGTilingData>;
 
     // VEC_DeterministicAdd：确定性计算累加
     using EpilogueAtlasA2FAGDtmAdd = Catlass::Epilogue::EpilogueAtlasA2FAGDtmAdd<INPUT_LAYOUT>;
@@ -1171,7 +1272,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre,
                                               EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd,
-                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
+                                              INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM, USE_ACTUAL_OUT>;
     FAGKernelParams params{dout,         q,        k,         v,   out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen,
                            cu_seq_kvlen, seqUsedQ, seqUsedKv, dq_, dk_, dv_,       nullptr,    workspace,   tiling};
 

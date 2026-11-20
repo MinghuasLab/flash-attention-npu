@@ -10,12 +10,30 @@
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
+inline std::unordered_map<c10::DeviceIndex, at::Tensor>& DeviceTriuMaskCache()
+{
+    static thread_local std::unordered_map<c10::DeviceIndex, at::Tensor> masks;
+    return masks;
+}
+
+// Python atexit runs before sanitizer/runtime global destructors. Release NPU
+// tensors there instead of waiting for the main thread's TLS destruction.
+inline void ClearDeviceTriuMaskCache()
+{
+    auto& masks = DeviceTriuMaskCache();
+    for (const auto& entry : masks) {
+        c10_npu::NPUGuard guard(entry.first);
+        c10_npu::device_synchronize();
+    }
+    masks.clear();
+}
+
 // Initialize and synchronize only the device used by this caller.
 // Per-thread device caches avoid touching other workers' devices.
 inline at::Tensor MakeDeviceTriuMask()
 {
     const auto idx = c10_npu::getCurrentNPUStream().device_index();
-    static thread_local std::unordered_map<c10::DeviceIndex, at::Tensor> masks;
+    auto& masks = DeviceTriuMaskCache();
     auto found = masks.find(idx);
     if (found != masks.end()) {
         return found->second;

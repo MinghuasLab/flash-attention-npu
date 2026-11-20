@@ -42,6 +42,15 @@ _LAYOUT_BSND = 1
 _LAYOUT_BNSD = 2
 
 
+def _backward_head_dims(qk_dim, v_dim):
+    """Round asymmetric backward inputs up to an implemented head-dim bucket."""
+    if not 0 < v_dim < qk_dim <= 512:
+        return qk_dim, v_dim
+    qk_bucket = ((qk_dim + 63) // 64) * 64
+    v_bucket = 128 if qk_bucket == 192 and v_dim <= 128 else qk_bucket
+    return qk_bucket, v_bucket
+
+
 def _maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -549,6 +558,8 @@ def _flash_attn_backward(
     assert gather_kv_indices is None, "flash_attn_npu_v4 950 bwd does not support gather_kv_indices"
     assert learnable_sink is None, "flash_attn_npu_v4 950 bwd does not support learnable_sink"
 
+    # Keep logical BSND/TND shapes, including views backed by BNSD storage.
+    # Layout detection and strided input addressing are handled by the backend.
     if dq is None:
         dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if dk is None:
@@ -558,12 +569,38 @@ def _flash_attn_backward(
 
     seqused_q_c = _full_contiguous(seqused_q) if seqused_q is not None else None
     seqused_k_c = _full_contiguous(seqused_k) if seqused_k is not None else None
+
+    qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
+    qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    if (qk_bucket, v_bucket) == (192, 128) and deterministic:
+        raise ValueError("flash_attn_npu_v4 950 MLA backward does not support deterministic=True")
+    pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
+    if pad_heads:
+        if softmax_scale is None:
+            softmax_scale = qk_head_dim ** (-0.5)
+        q_kernel, k_kernel = [
+            torch.nn.functional.pad(x, (0, qk_bucket - qk_head_dim))
+            if qk_bucket != qk_head_dim
+            else x
+            for x in (q, k)
+        ]
+        v_kernel, out_kernel, dout_kernel = [
+            torch.nn.functional.pad(x, (0, v_bucket - v_head_dim)) if v_bucket != v_head_dim else x
+            for x in (v, out, dout)
+        ]
+        dq_kernel = torch.empty(q_kernel.shape, dtype=q.dtype, device=q.device)
+        dk_kernel = torch.empty(k_kernel.shape, dtype=k.dtype, device=k.device)
+        dv_kernel = torch.empty(v_kernel.shape, dtype=v.dtype, device=v.device)
+    else:
+        q_kernel, k_kernel, v_kernel, out_kernel, dout_kernel = q, k, v, out, dout
+        dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
+
     _flash_attn_backward_op(
-        dout,
-        q,
-        k,
-        v,
-        out,
+        dout_kernel,
+        q_kernel,
+        k_kernel,
+        v_kernel,
+        out_kernel,
         lse,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -571,9 +608,9 @@ def _flash_attn_backward(
         seqused_k_c,
         max_seqlen_q,
         max_seqlen_k,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         softmax_scale,
         causal,
         _window_to_npu(window_size_left),
@@ -581,6 +618,11 @@ def _flash_attn_backward(
         softcap,
         deterministic,
     )
+    if pad_heads:
+        dq.copy_(dq_kernel[..., :qk_head_dim])
+        dk.copy_(dk_kernel[..., :qk_head_dim])
+        dv.copy_(dv_kernel[..., :v_head_dim])
+
     return dq, dk, dv
 
 

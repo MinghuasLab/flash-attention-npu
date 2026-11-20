@@ -97,6 +97,7 @@ struct FAGTilingData {
     int64_t alibiSlopesBatchStride = 0;
     int64_t dropMaskMaxQ = 0;
     int64_t dropMaskMaxK = 0;
+    bool fullPackedTensors = false;
 };
 
 struct FAGv2TilingData {

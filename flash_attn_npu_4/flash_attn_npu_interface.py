@@ -129,9 +129,16 @@ _HEADDIM_BWD_ALIGN_LARGE = 16
 
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
-    Pad headdim for the bwd kernel: a multiple of 64 up to 256 (which matches the
-    kernel buckets exactly), and a multiple of 16 above 256 (16 elements is the
-    hardware granularity; wider D is segmented along K/N inside the kernel).
+    Pad headdim for the bwd kernel.
+
+    q/k share one headdim (must equal ``head_size_og`` from the forward);
+    v/out/dout share another. Widths up to 256 pad to a multiple of 64, which
+    matches the kernel buckets. Widths above 256 and at most 512 pad to a
+    multiple of 16; the Aligned512 kernel segments that width along K/N.
+    qk > v uses the MLA tile when the qk bucket is in (v bucket, 192] and the v
+    bucket is <= 128; otherwise v/out/dout are padded up to the qk bucket so the
+    equal-headdim kernel is valid. The caller slices gradients back to the
+    original widths. qk < v is rejected.
     """
     q_dtype = q.dtype
     if q_dtype not in (torch.float16, torch.bfloat16):
@@ -142,23 +149,39 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
                 f"mha_bwd: q/k/v/out/dout must have the same dtype, "
                 f"got q={q_dtype}, {name}={t.dtype}"
             )
-    if dout.size(-1) != head_size_og:
+    qk_headdim = q.size(-1)
+    if k.size(-1) != qk_headdim:
+        raise ValueError(f"q/k must share the same headdim, got {qk_headdim}/{k.size(-1)}")
+    if qk_headdim != head_size_og:
         raise ValueError(
-            f"dout headdim ({dout.size(-1)}) must equal original q/k/v headdim ({head_size_og})"
+            f"q/k headdim ({qk_headdim}) must equal original q headdim ({head_size_og})"
         )
-    qkv_out_headdims = [t.size(-1) for t in (q, k, v, out)]
-    if len(set(qkv_out_headdims)) != 1:
+    v_headdims = [t.size(-1) for t in (v, out, dout)]
+    if len(set(v_headdims)) != 1:
+        raise ValueError(f"v/out/dout must share the same headdim, got {v_headdims}")
+    v_headdim_og = v_headdims[0]
+    if v_headdim_og <= 0:
+        raise ValueError(f"v headdim must be positive, got {v_headdim_og}")
+    if qk_headdim < v_headdim_og:
         raise ValueError(
-            f"q/k/v/out must share the same headdim, got {qkv_out_headdims} "
-            "(unequal headdim is not supported)"
+            f"unequal headdim is only supported for MLA (qk > v), "
+            f"got qk={qk_headdim}, v={v_headdim_og}"
         )
-    ctx_headdim = qkv_out_headdims[0]
-    if ctx_headdim <= 0 or ctx_headdim > 512:
-        raise ValueError(f"headdim must be in (0, 512], got {ctx_headdim} ")
-    align = _HEADDIM_BWD_ALIGN if ctx_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
-    target = round_multiple(ctx_headdim, align)
+    if qk_headdim <= 0 or qk_headdim > 512:
+        raise ValueError(f"headdim must be in (0, 512], got {qk_headdim} ")
+    qk_align = _HEADDIM_BWD_ALIGN if qk_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    v_align = _HEADDIM_BWD_ALIGN if v_headdim_og <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    qk_target = round_multiple(qk_headdim, qk_align)
+    v_target = round_multiple(v_headdim_og, v_align)
+    # MLA only covers a qk bucket in (v bucket, 192] with v bucket <= 128.
+    # Every other qk > v pair, including widths up to 512, pads v to the qk
+    # bucket and uses the equal-headdim kernel.
+    if qk_headdim != v_headdim_og and not (
+        qk_target > v_target and qk_target <= 192 and v_target <= 128
+    ):
+        v_target = qk_target
 
-    def _pad(t):
+    def _pad(t, target):
         cur = t.size(-1)
         if cur == target:
             return t
@@ -166,7 +189,15 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
             raise ValueError(f"headdim {cur} > pad target {target}")
         return torch.nn.functional.pad(t, [0, target - cur])
 
-    return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
+    return (
+        _pad(dout, v_target),
+        _pad(q, qk_target),
+        _pad(k, qk_target),
+        _pad(v, v_target),
+        _pad(out, v_target),
+        head_size_og,
+        v_headdim_og,
+    )
 
 
 def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
@@ -179,6 +210,29 @@ def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
     # inconsistent.
     if q.shape[0] == 0 and max_seqlen_q != 0:
         raise RuntimeError("total_q must be positive (q must contain at least one query token)")
+
+
+def _backward_head_dims(qk_dim, v_dim):
+    """Round asymmetric backward inputs up to an implemented head-dim bucket.
+
+    Up to 256, qk rounds to a 64-bucket. v stays at 128 only for the MLA tile
+    (qk bucket 192 and v <= 128); every other pair pads v up to the qk bucket.
+    Widths in (256, 512] align to 16 and share that qk bucket, so the equal
+    Aligned512 kernel runs.
+    """
+    if not 0 < v_dim < qk_dim <= 512:
+        return qk_dim, v_dim
+
+    def _align(size):
+        step = _HEADDIM_BWD_ALIGN if size <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+        return round_multiple(size, step)
+
+    qk_bucket = _align(qk_dim)
+    if qk_dim <= 256:
+        v_bucket = 128 if qk_bucket == 192 and v_dim <= 128 else qk_bucket
+    else:
+        v_bucket = qk_bucket
+    return qk_bucket, v_bucket
 
 
 def _window_to_npu(window_size: Optional[int]) -> int:
@@ -532,6 +586,7 @@ def _flash_attn_backward_op(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
+    original_qk_gt_v: bool = False,
 ) -> torch.Tensor:
     # Same storage detection as forward; retain logical BSND shapes for host/output.
     if cu_seqlens_q is not None:
@@ -564,6 +619,7 @@ def _flash_attn_backward_op(
         deterministic,
         0,  # sm_margin
         layout,
+        original_qk_gt_v,
     )
     return softmax_d
 
@@ -591,6 +647,7 @@ def _flash_attn_backward_op_fake(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
+    original_qk_gt_v: bool = False,
 ) -> torch.Tensor:
     """Metadata-only fake for V4 A2 backward_op. Returns softmax_d; mutates dq/dk/dv."""
     is_varlen_q = cu_seqlens_q is not None
@@ -654,6 +711,7 @@ def _flash_attn_backward(
     page_table: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    original_qk_gt_v: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FA4-aligned backward wrapper around FAG_v4. Returns (dq, dk, dv)."""
     del (
@@ -694,12 +752,36 @@ def _flash_attn_backward(
     if dv is None:
         dv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
+    qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
+    original_qk_gt_v = original_qk_gt_v or qk_head_dim > v_head_dim
+    qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
+    if pad_heads:
+        if softmax_scale is None:
+            softmax_scale = qk_head_dim ** (-0.5)
+        q_kernel, k_kernel = [
+            torch.nn.functional.pad(x, (0, qk_bucket - qk_head_dim))
+            if qk_bucket != qk_head_dim
+            else x
+            for x in (q, k)
+        ]
+        v_kernel, out_kernel, dout_kernel = [
+            torch.nn.functional.pad(x, (0, v_bucket - v_head_dim)) if v_bucket != v_head_dim else x
+            for x in (v, out, dout)
+        ]
+        dq_kernel = torch.empty(q_kernel.shape, dtype=q.dtype, device=q.device)
+        dk_kernel = torch.empty(k_kernel.shape, dtype=k.dtype, device=k.device)
+        dv_kernel = torch.empty(v_kernel.shape, dtype=v.dtype, device=v.device)
+    else:
+        q_kernel, k_kernel, v_kernel, out_kernel, dout_kernel = q, k, v, out, dout
+        dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
+
     _flash_attn_backward_op(
-        dout,
-        q,
-        k,
-        v,
-        out,
+        dout_kernel,
+        q_kernel,
+        k_kernel,
+        v_kernel,
+        out_kernel,
         lse,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -707,16 +789,21 @@ def _flash_attn_backward(
         seqused_k,
         max_seqlen_q,
         max_seqlen_k,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         softmax_scale,
         causal,
         _window_to_npu(window_size_left),
         _window_to_npu(window_size_right),
         softcap,
         deterministic,
+        original_qk_gt_v,
     )
+    if pad_heads:
+        dq.copy_(dq_kernel[..., :qk_head_dim])
+        dk.copy_(dk_kernel[..., :qk_head_dim])
+        dv.copy_(dv_kernel[..., :v_head_dim])
     return dq, dk, dv
 
 
@@ -839,7 +926,9 @@ class FlashAttnFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
@@ -871,10 +960,11 @@ class FlashAttnFunc(torch.autograd.Function):
             page_table=None,
             gather_kv_indices=ctx.gather_kv_indices,
             learnable_sink=ctx.learnable_sink,
+            original_qk_gt_v=head_size_og > head_size_v_og,
         )
         dq = dq[..., :head_size_og]
         dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        dv = dv[..., :head_size_v_og]
         return (
             dq,
             dk,
@@ -1069,7 +1159,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
@@ -1101,10 +1193,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             page_table=ctx.page_table,
             gather_kv_indices=ctx.gather_kv_indices,
             learnable_sink=ctx.learnable_sink,
+            original_qk_gt_v=head_size_og > head_size_v_og,
         )
         dq = dq[..., :head_size_og]
         dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        dv = dv[..., :head_size_v_og]
         return (
             dq,
             dk,

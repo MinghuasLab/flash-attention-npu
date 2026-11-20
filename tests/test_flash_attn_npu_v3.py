@@ -1045,7 +1045,7 @@ def test_bwd_headdim_rejects_unequal():
     dout, query, _, _, out, softmax_lse = _bwd_headdim_invalid_inputs()
     key = torch.zeros((1, 16, 1, 256), dtype=torch.float16, device="npu")
     value = torch.zeros_like(key)
-    with pytest.raises(RuntimeError, match="must share the same head"):
+    with pytest.raises(RuntimeError, match="query and key must have the same head dimension"):
         _bwd_headdim(dout, query, key, value, out, softmax_lse, is_causal=False, softcap=0.0)
 
 

@@ -219,6 +219,86 @@ def test_bnsd_backward_features(version, deterministic, causal, softcap, window)
         )
 
 
+@pytest.mark.skipif(IS_950, reason="910 MLA scheduling regression")
+@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize("layout", ["tnd", "bsnd"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_n96_mla_backward(version, layout, causal):
+    # Exercise both the short TND schedule and a 512-token tile boundary.
+    length = 198 if layout == "tnd" else 513
+    q = torch.randn(1, 96, length, 192, dtype=torch.bfloat16, device="npu") * 0.3
+    k = torch.randn_like(q) * 0.3
+    v = torch.randn(1, 96, length, 128, dtype=q.dtype, device=q.device) * 0.3
+    dout = torch.randn_like(v) * 0.3
+    out, lse, golden = _reference(q, k, v, dout, causal=causal)
+    inputs = [
+        x.transpose(1, 2).contiguous()
+        for x in (q, k, v, out.to(dtype=q.dtype, device=q.device), dout)
+    ]
+    lse = lse.float().to(device=q.device)
+    kwargs = {}
+    if layout == "tnd":
+        inputs = [x[0] for x in inputs]
+        lse = lse[0]
+        cu = torch.tensor([0, length], dtype=torch.int32, device=q.device)
+        kwargs = dict(
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=length,
+            max_seqlen_k=length,
+        )
+    actual = _backward(version, *inputs, lse, causal=causal, **kwargs)
+    for grad, expected in zip(actual, golden):
+        if layout == "tnd":
+            grad = grad.unsqueeze(0)
+        torch.testing.assert_close(
+            grad.transpose(1, 2).cpu().double(), expected, atol=0.015, rtol=0.015
+        )
+
+
+@pytest.mark.skipif(IS_950, reason="910 MLA SFMG regression")
+@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize("layout", ["tnd", "bsnd"])
+@pytest.mark.parametrize("heads", [32, 96])
+def test_mla_backward_consumes_forward_output(version, layout, heads):
+    # Change only O on the full-key Q block. Recomputing D from P*dP would
+    # incorrectly make dQ independent of the supplied forward output there.
+    length = 198
+    q = torch.randn(1, heads, length, 192, dtype=torch.bfloat16, device="npu") * 0.3
+    k = torch.randn_like(q) * 0.3
+    v = torch.randn(1, heads, length, 128, dtype=q.dtype, device=q.device) * 0.3
+    dout = torch.randn_like(v) * 0.3
+    out, lse, _ = _reference(q, k, v, dout, causal=True)
+    q, k, v, out, dout = [
+        x.transpose(1, 2).contiguous()
+        for x in (q, k, v, out.to(dtype=q.dtype, device=q.device), dout)
+    ]
+    lse = lse.float().to(device=q.device)
+    kwargs = {}
+    if layout == "tnd":
+        q, k, v, out, dout = [x[0] for x in (q, k, v, out, dout)]
+        lse = lse[0]
+        cu = torch.tensor([0, length], dtype=torch.int32, device=q.device)
+        kwargs = dict(
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=length,
+            max_seqlen_k=length,
+        )
+    changed_out = out.clone()
+    if layout == "tnd":
+        changed_out[128:, :, 0] += 1
+    else:
+        changed_out[:, 128:, :, 0] += 1
+    original = _backward(version, q, k, v, out, dout, lse, causal=True, **kwargs)
+    changed = _backward(version, q, k, v, changed_out, dout, lse, causal=True, **kwargs)
+    dq = original[0] if layout == "tnd" else original[0][0]
+    changed_dq = changed[0] if layout == "tnd" else changed[0][0]
+    assert not torch.equal(dq[128:], changed_dq[128:]), "full-key dQ ignored the O input"
+    # O is not an input to dV = P^T dO.
+    torch.testing.assert_close(changed[2], original[2], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("version", [3, 4])
 @pytest.mark.parametrize("invalid", ["lse", "output_shape", "output_stride"])
 def test_bnsd_backward_rejects_invalid(version, invalid):

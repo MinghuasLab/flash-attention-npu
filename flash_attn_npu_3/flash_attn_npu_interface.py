@@ -144,11 +144,19 @@ def _check_fwd_dimension(value, name):
 _HEADDIM_BWD_ALIGN = 64
 _HEADDIM_BWD_ALIGN_LARGE = 16
 
+
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
-    Pad headdim for the bwd kernel: a multiple of 64 up to 256 (which matches the
-    kernel buckets exactly), and a multiple of 16 above 256 (16 elements is the
-    hardware granularity; wider D is segmented along K/N inside the kernel).
+    Pad headdim for the bwd kernel.
+
+    q/k share one headdim (must equal ``head_size_og`` from the forward);
+    v/out/dout share another. Widths up to 256 pad to a multiple of 64, which
+    matches the kernel buckets. Widths above 256 and at most 512 pad to a
+    multiple of 16; the Aligned512 kernel segments that width along K/N.
+    qk > v uses the MLA tile when the qk bucket is in (v bucket, 192] and the v
+    bucket is <= 128; otherwise v/out/dout are padded up to the qk bucket so the
+    equal-headdim kernel is valid. The caller slices gradients back to the
+    original widths. qk < v is rejected.
     """
     q_dtype = q.dtype
     if q_dtype not in (torch.float16, torch.bfloat16):
@@ -159,23 +167,39 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
                 f"mha_bwd: q/k/v/out/dout must have the same dtype, "
                 f"got q={q_dtype}, {name}={t.dtype}"
             )
-    if dout.size(-1) != head_size_og:
+    qk_headdim = q.size(-1)
+    if k.size(-1) != qk_headdim:
+        raise ValueError(f"q/k must share the same headdim, got {qk_headdim}/{k.size(-1)}")
+    if qk_headdim != head_size_og:
         raise ValueError(
-            f"dout headdim ({dout.size(-1)}) must equal original q/k/v headdim ({head_size_og})"
+            f"q/k headdim ({qk_headdim}) must equal original q headdim ({head_size_og})"
         )
-    qkv_out_headdims = [t.size(-1) for t in (q, k, v, out)]
-    if len(set(qkv_out_headdims)) != 1:
+    v_headdims = [t.size(-1) for t in (v, out, dout)]
+    if len(set(v_headdims)) != 1:
+        raise ValueError(f"v/out/dout must share the same headdim, got {v_headdims}")
+    v_headdim_og = v_headdims[0]
+    if v_headdim_og <= 0:
+        raise ValueError(f"v headdim must be positive, got {v_headdim_og}")
+    if qk_headdim < v_headdim_og:
         raise ValueError(
-            f"q/k/v/out must share the same headdim, got {qkv_out_headdims} "
-            "(unequal headdim is not supported)"
+            f"unequal headdim is only supported for MLA (qk > v), "
+            f"got qk={qk_headdim}, v={v_headdim_og}"
         )
-    ctx_headdim = qkv_out_headdims[0]
-    if ctx_headdim <= 0 or ctx_headdim > 512:
-        raise ValueError(f"headdim must be in (0, 512], got {ctx_headdim} ")
-    align = _HEADDIM_BWD_ALIGN if ctx_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
-    target = round_multiple(ctx_headdim, align)
+    if qk_headdim <= 0 or qk_headdim > 512:
+        raise ValueError(f"headdim must be in (0, 512], got {qk_headdim} ")
+    qk_align = _HEADDIM_BWD_ALIGN if qk_headdim <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    v_align = _HEADDIM_BWD_ALIGN if v_headdim_og <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+    qk_target = round_multiple(qk_headdim, qk_align)
+    v_target = round_multiple(v_headdim_og, v_align)
+    # MLA only covers a qk bucket in (v bucket, 192] with v bucket <= 128.
+    # Every other qk > v pair, including widths up to 512, pads v to the qk
+    # bucket and uses the equal-headdim kernel.
+    if qk_headdim != v_headdim_og and not (
+        qk_target > v_target and qk_target <= 192 and v_target <= 128
+    ):
+        v_target = qk_target
 
-    def _pad(t):
+    def _pad(t, target):
         cur = t.size(-1)
         if cur == target:
             return t
@@ -183,7 +207,15 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
             raise ValueError(f"headdim {cur} > pad target {target}")
         return torch.nn.functional.pad(t, [0, target - cur])
 
-    return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
+    return (
+        _pad(dout, v_target),
+        _pad(q, qk_target),
+        _pad(k, qk_target),
+        _pad(v, v_target),
+        _pad(out, v_target),
+        head_size_og,
+        v_headdim_og,
+    )
 
 
 def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
@@ -203,6 +235,29 @@ def round_up_headdim(head_size: int) -> int:
     # >256 对齐到硬件粒度（16）。
     align = _HEADDIM_BWD_ALIGN if head_size <= 256 else _HEADDIM_BWD_ALIGN_LARGE
     return round_multiple(head_size, align)
+
+
+def _backward_head_dims(qk_dim, v_dim):
+    """Round asymmetric backward inputs up to an implemented head-dim bucket.
+
+    Up to 256, qk rounds to a 64-bucket. v stays at 128 only for the MLA tile
+    (qk bucket 192 and v <= 128); every other pair pads v up to the qk bucket.
+    Widths in (256, 512] align to 16 and share that qk bucket, so the equal
+    Aligned512 kernel runs.
+    """
+    if not 0 < v_dim < qk_dim <= 512:
+        return qk_dim, v_dim
+
+    def _align(size):
+        step = _HEADDIM_BWD_ALIGN if size <= 256 else _HEADDIM_BWD_ALIGN_LARGE
+        return round_multiple(size, step)
+
+    qk_bucket = _align(qk_dim)
+    if qk_dim <= 256:
+        v_bucket = 128 if qk_bucket == 192 and v_dim <= 128 else qk_bucket
+    else:
+        v_bucket = qk_bucket
+    return qk_bucket, v_bucket
 
 
 @_torch_custom_op_wrapper(
@@ -486,6 +541,7 @@ def _flash_attn_backward(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    original_qk_gt_v: bool = False,
 ) -> torch.Tensor:
     # Same storage detection as forward; retain logical BSND shapes for host/output.
     if cu_seqlens_q is not None:
@@ -493,12 +549,32 @@ def _flash_attn_backward(
     else:
         layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
 
-    # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
+    original_qk_gt_v = original_qk_gt_v or qk_head_dim > v_head_dim
+    qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
+    pad_heads = (qk_bucket, v_bucket) != (qk_head_dim, v_head_dim)
+    dq_kernel, dk_kernel, dv_kernel = dq, dk, dv
+    if pad_heads:
+        if softmax_scale is None:
+            softmax_scale = qk_head_dim ** (-0.5)
+        q, k = [
+            torch.nn.functional.pad(x, (0, qk_bucket - qk_head_dim))
+            if qk_bucket != qk_head_dim
+            else x
+            for x in (q, k)
+        ]
+        v, out, dout = [
+            torch.nn.functional.pad(x, (0, v_bucket - v_head_dim)) if v_bucket != v_head_dim else x
+            for x in (v, out, dout)
+        ]
+        dq_kernel = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        dk_kernel = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        dv_kernel = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     (
-        dq,
-        dk,
-        dv,
+        _,
+        _,
+        _,
         softmax_d,
     ) = flash_attn_npu_3.bwd(
         dout,
@@ -507,9 +583,9 @@ def _flash_attn_backward(
         v,
         out,
         softmax_lse,
-        dq,
-        dk,
-        dv,
+        dq_kernel,
+        dk_kernel,
+        dv_kernel,
         cu_seqlens_q,
         cu_seqlens_k,
         sequed_q,
@@ -524,7 +600,15 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
         layout,
+        original_qk_gt_v,
     )
+    if pad_heads:
+        if dq is not None:
+            dq.copy_(dq_kernel[..., :qk_head_dim])
+        if dk is not None:
+            dk.copy_(dk_kernel[..., :qk_head_dim])
+        if dv is not None:
+            dv.copy_(dv_kernel[..., :v_head_dim])
     return softmax_d
 
 
@@ -552,6 +636,7 @@ def _flash_attn_backward_fake(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    original_qk_gt_v: bool = False,
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None
@@ -618,7 +703,9 @@ def setup_context(ctx, inputs, output):
 
 def _backward(ctx, dout, *grads):
     q, k, v, out, softmax_lse = ctx.saved_tensors
-    dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+    dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+        dout, q, k, v, out, ctx.head_size_og
+    )
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
         dout,
@@ -643,10 +730,11 @@ def _backward(ctx, dout, *grads):
         ctx.softcap,
         False,  # deterministic
         ctx.sm_margin,
+        original_qk_gt_v=head_size_og > head_size_v_og,
     )
     dq = dq[..., :head_size_og]
     dk = dk[..., :head_size_og]
-    dv = dv[..., :head_size_og]
+    dv = dv[..., :head_size_v_og]
     return dq, dk, dv, *((None,) * 21)
 
 
@@ -728,7 +816,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
@@ -762,6 +852,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            original_qk_gt_v=head_size_og > head_size_v_og,
         )
         dqkv = dqkv[..., :head_size_og]  # We could have padded the head dimension
         return dqkv, None, None, None, None, None, None, None, None, None, None, None, None
@@ -871,7 +962,9 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,
@@ -896,10 +989,11 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            original_qk_gt_v=head_size_og > head_size_v_og,
         )
         dq = dq[..., :head_size_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        dv = dv[..., :head_size_v_og]
         return (
             dq,
             dk,
@@ -1054,7 +1148,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.saved_tensors
         )
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out, ctx.head_size_og)
+        dout, q, k, v, out, head_size_og, head_size_v_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,
@@ -1079,10 +1175,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            original_qk_gt_v=head_size_og > head_size_v_og,
         )
         dq = dq[..., :head_size_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        dv = dv[..., :head_size_v_og]
         return (
             dq,
             dk,
