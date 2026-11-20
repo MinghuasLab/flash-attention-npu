@@ -11,7 +11,14 @@ import pytest
 import torch
 import torch_npu
 
-from .test_utils import DTYPES, check, check_attention, copy_aux_to_device, make_inputs, oracle
+from .test_utils import (
+    DTYPES,
+    check,
+    check_attention,
+    copy_aux_to_device,
+    forward_golden,
+    make_inputs,
+)
 
 from flash_attn_npu_4.catlass_dsl import builtin, flash_attn_func, flash_attn_varlen_func, runtime
 from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
@@ -110,7 +117,7 @@ def test_cross_stream_inputs_survive_early_release_and_reuse(device, dtype):
     consumer = torch.npu.Stream(device=device)
     shape = (1, 1024, 4, 128)
     cpu = tuple(torch.randn(shape, dtype=dtype) for _ in range(3))
-    expected, expected_lse = oracle(cpu)
+    expected, expected_lse = forward_golden(cpu)
     delay_done = torch.npu.Event()
     with torch.inference_mode(), torch.npu.stream(consumer):
         # Warm public operators before the race, including their allocations.
@@ -126,32 +133,40 @@ def test_cross_stream_inputs_survive_early_release_and_reuse(device, dtype):
         del warm_pressure
     torch.npu.synchronize(device)
     gc.collect()
-    with torch.inference_mode():
-        with torch.npu.stream(producer):
-            inputs = tuple(t.to(device) for t in cpu)
-        references = tuple(weakref.ref(t) for t in inputs)
-        input_ptrs = {t.data_ptr() for t in inputs}
-        try:
-            with torch.npu.stream(consumer):
-                consumer.wait_stream(producer)
-                # Keep FA queued while the producer tries to reuse its inputs.
-                # Reuse buffers to avoid output allocations during the delay.
-                for _ in range(32):
-                    torch.mm(delay_input, delay_input, out=delay_output)
-                delay_done.record(consumer)
-                output, lse = flash_attn_func(*inputs, return_lse=True)
-            del inputs
-            assert all(reference() is None for reference in references)
+    # A fast device may drain the public-operator delay before the host applies
+    # pressure. Increase it only for that inconclusive race, with a fixed bound.
+    for delay_steps in (32, 128, 512):
+        with torch.inference_mode():
             with torch.npu.stream(producer):
-                # Recycle allocations of the same size before waiting for FA.
-                pressure = [torch.full(shape, 99, dtype=dtype, device=device) for _ in range(8)]
-            assert not delay_done.query(), "consumer delay completed before allocator pressure"
-            assert input_ptrs.isdisjoint(t.data_ptr() for t in pressure)
-        finally:
-            torch.npu.synchronize(device)
-        check(output, expected)
-        check(lse, expected_lse)
-        del pressure
+                inputs = tuple(t.to(device) for t in cpu)
+            references = tuple(weakref.ref(t) for t in inputs)
+            input_ptrs = {t.data_ptr() for t in inputs}
+            try:
+                with torch.npu.stream(consumer):
+                    consumer.wait_stream(producer)
+                    # Keep FA queued while the producer tries to reuse its inputs.
+                    # Reuse buffers to avoid output allocations during the delay.
+                    for _ in range(delay_steps):
+                        torch.mm(delay_input, delay_input, out=delay_output)
+                    delay_done.record(consumer)
+                    output, lse = flash_attn_func(*inputs, return_lse=True)
+                del inputs
+                assert all(reference() is None for reference in references)
+                with torch.npu.stream(producer):
+                    # Recycle allocations of the same size before waiting for FA.
+                    pressure = [torch.full(shape, 99, dtype=dtype, device=device) for _ in range(8)]
+                pending = not delay_done.query()
+                if pending:
+                    assert input_ptrs.isdisjoint(t.data_ptr() for t in pressure)
+            finally:
+                torch.npu.synchronize(device)
+            check(output, expected)
+            check(lse, expected_lse)
+            del pressure
+        if pending:
+            break
+    else:
+        pytest.fail("consumer delay completed before allocator pressure in every attempt")
 
 
 @tla.jit
@@ -276,7 +291,7 @@ def test_attention_plan_eviction_and_clear(device, monkeypatch):
         cpu, inputs, _, _, _ = make_inputs(device, torch.float16, seed=903 + step)
         with torch.no_grad():
             out, lse = flash_attn_func(*inputs, return_lse=True)
-            expected, expected_lse = oracle(cpu)
+            expected, expected_lse = forward_golden(cpu)
         check(out, expected)
         check(lse, expected_lse)
         assert compiler.call_count == expected_compilations

@@ -15,8 +15,6 @@ from importlib import import_module
 _EXPORTS = {
     "flash_attn_func": "interface",
     "flash_attn_varlen_func": "interface",
-    "flash_attn_func_with_quant": "interface",
-    "flash_attn_varlen_func_with_quant": "interface",
     "compute_block_sparsity": "block_sparsity",
     "simd": "decorators",
     "simt": "decorators",
@@ -24,10 +22,9 @@ _EXPORTS = {
 
 __all__ = [
     "TensorwiseScales",
+    "BlockScales",
     "flash_attn_func",
     "flash_attn_varlen_func",
-    "flash_attn_func_with_quant",
-    "flash_attn_varlen_func_with_quant",
     "compute_block_sparsity",
     "simd",
     "simt",
@@ -35,7 +32,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name == "TensorwiseScales":
+    if name in ("TensorwiseScales", "BlockScales"):
         return getattr(import_module("..", __name__), name)
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

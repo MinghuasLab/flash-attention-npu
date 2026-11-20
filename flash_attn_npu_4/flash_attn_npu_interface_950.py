@@ -614,6 +614,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -682,6 +685,9 @@ class FlashAttnFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
+            q_descale,
+            k_descale,
+            v_descale,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -811,6 +817,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -899,6 +908,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
+            q_descale,
+            k_descale,
+            v_descale,
         )
 
         ctx.save_for_backward(
@@ -1016,6 +1028,54 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+class TensorwiseScales(NamedTuple):
+    """Native AscendC FP32 descales of shape (batch, KV heads) for E4M3FN Q/K/V.
+
+    A missing member means scale 1. Forward inference only, head_dim=128; rejects
+    Flex score/mask callbacks, sparse metadata or auxiliary inputs.
+    """
+
+    q: Optional[torch.Tensor] = None
+    k: Optional[torch.Tensor] = None
+    v: Optional[torch.Tensor] = None
+
+
+class BlockScales(NamedTuple):
+    """MXFP8 E8M0 group32 scales in Ascend BSND/TND packing.
+
+    q/k: E4M3FN Q/K, scaled in 32-channel blocks.
+    v: E4M3FN V, scaled in 32-key blocks; required on Ascend 950.
+    All scales use uint8 or float8_e8m0fnu; CUDA interleave_sf is unsupported.
+    Forward inference only, head_dim=128; output BF16, optional LSE FP32.
+    See catlass_dsl/README.md for scale shapes and encoding.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor | None = None
+
+
+def _require_tensorwise_scales(q, k, v, scales, cu_seqlens_q=None):
+    _catlass_utils.require_fp8_inputs(q, k, v)
+    if q.dim() == 3:
+        if cu_seqlens_q is None:
+            raise ValueError("packed tensorwise Q requires cu_seqlens_q")
+        batch = cu_seqlens_q.numel() - 1
+    else:
+        batch = q.shape[0]
+    for scale in scales:
+        if scale is None:
+            continue
+        if not isinstance(scale, torch.Tensor):
+            raise TypeError("TensorwiseScales members must be tensors or None")
+        if scale.dtype != torch.float32 or scale.device != q.device:
+            raise ValueError("TensorwiseScales must be FP32 on the query device")
+        if scale.shape != (batch, k.shape[-2]):
+            raise ValueError("TensorwiseScales must have shape [batch, num_kv_heads]")
+        if scale.requires_grad:
+            raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
+
+
 def flash_attn_func(
     q,
     k,
@@ -1040,8 +1100,21 @@ def flash_attn_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    config: None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-    if _catlass_utils.has_flex(
+    """Attention with optional FP8 dequantization scales.
+
+    TensorwiseScales uses native AscendC FP32 descales and rejects Flex features.
+    BlockScales uses MXFP8 group32 DSL attention. None keeps existing dispatch.
+    ``config`` is reserved; only ``None`` is supported.
+    """
+    if config is not None:
+        raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
+    if scales is not None and not isinstance(scales, TensorwiseScales):
+        _catlass_utils.require_fp8_inputs(q, k, v)
+        _catlass_utils.require_mxfp8_scales(scales)
+    if isinstance(scales, BlockScales) or _catlass_utils.has_flex(
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,
         mask_mod=mask_mod,
@@ -1050,6 +1123,8 @@ def flash_attn_func(
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
     ):
+        if isinstance(scales, TensorwiseScales):
+            raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
         return _catlass_utils.attention(
             q,
             k,
@@ -1075,7 +1150,10 @@ def flash_attn_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            scales=scales,
         )
+    if isinstance(scales, TensorwiseScales):
+        _require_tensorwise_scales(q, k, v, scales)
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
     if q.dtype == torch.float8_e4m3fn:
@@ -1107,6 +1185,7 @@ def flash_attn_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
+        *((scales.q, scales.k, scales.v) if isinstance(scales, TensorwiseScales) else ()),
     )
 
 
@@ -1310,8 +1389,21 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    config: None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-    if _catlass_utils.has_flex(
+    """Attention with optional FP8 dequantization scales.
+
+    TensorwiseScales uses native AscendC FP32 descales and rejects Flex features.
+    BlockScales uses MXFP8 group32 DSL attention. None keeps existing dispatch.
+    ``config`` is reserved; only ``None`` is supported.
+    """
+    if config is not None:
+        raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
+    if scales is not None and not isinstance(scales, TensorwiseScales):
+        _catlass_utils.require_fp8_inputs(q, k, v)
+        _catlass_utils.require_mxfp8_scales(scales)
+    if isinstance(scales, BlockScales) or _catlass_utils.has_flex(
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,
         mask_mod=mask_mod,
@@ -1319,6 +1411,8 @@ def flash_attn_varlen_func(
         aux_tensors=aux_tensors,
         aux_scalars=aux_scalars,
     ):
+        if isinstance(scales, TensorwiseScales):
+            raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
         return _catlass_utils.attention(
             q,
             k,
@@ -1351,7 +1445,10 @@ def flash_attn_varlen_func(
             return_lse=return_lse,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            scales=scales,
         )
+    if isinstance(scales, TensorwiseScales):
+        _require_tensorwise_scales(q, k, v, scales, cu_seqlens_q)
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
     if q.dtype == torch.float8_e4m3fn:
@@ -1390,152 +1487,5 @@ def flash_attn_varlen_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
-    )
-
-
-class TensorwiseScales(NamedTuple):
-    """Dequantization tensors for Q, K and V.
-
-    The MXFP8 attention backend expects all three operands' E8M0 group
-    scales, encoded as uint8 or float8_e8m0fnu.
-    """
-
-    q: Optional[torch.Tensor] = None
-    k: Optional[torch.Tensor] = None
-    v: Optional[torch.Tensor] = None
-
-
-def flash_attn_func_with_quant(
-    q,
-    k,
-    v,
-    scales: TensorwiseScales,
-    qv=None,
-    gather_kv_indices=None,
-    softmax_scale=None,
-    causal: bool = False,
-    window_size=(-1, -1),
-    learnable_sink=None,
-    softcap=0.0,
-    num_splits=1,
-    pack_gqa=None,
-    deterministic: bool = False,
-    score_mod=None,
-    score_mod_bwd=None,
-    mask_mod=None,
-    aux_tensors=None,
-    aux_scalars=None,
-    block_sparse_tensors=None,
-    block_sparse_tensors_bwd=None,
-    return_lse: bool = False,
-    scheduler_metadata: Optional[torch.Tensor] = None,
-    disable_scheduler_metadata: bool = False,
-):
-    """Quantized fixed-length attention for prequantized E4M3FN inputs.
-
-    Supply all three E8M0 dequantization tensors in scales for MXFP8.
-    """
-    _catlass_utils.require_fp8_inputs(q, k, v)
-    _catlass_utils.require_mxfp8_scales(scales)
-    return _catlass_utils.attention(
-        q,
-        k,
-        v,
-        varlen=False,
-        qv=qv,
-        gather_kv_indices=gather_kv_indices,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        learnable_sink=learnable_sink,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        deterministic=deterministic,
-        score_mod=score_mod,
-        score_mod_bwd=score_mod_bwd,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
-        aux_scalars=aux_scalars,
-        block_sparse_tensors=block_sparse_tensors,
-        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
-        return_lse=return_lse,
-        scheduler_metadata=scheduler_metadata,
-        disable_scheduler_metadata=disable_scheduler_metadata,
-        scales=scales,
-    )
-
-
-def flash_attn_varlen_func_with_quant(
-    q,
-    k,
-    v,
-    scales: TensorwiseScales,
-    qv=None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
-    min_seqlen_k: Optional[int] = None,
-    seqused_q=None,
-    seqused_k=None,
-    gather_kv_indices: Optional[torch.Tensor] = None,
-    page_table: Optional[torch.Tensor] = None,
-    softmax_scale=None,
-    causal: bool = False,
-    window_size=(-1, -1),
-    learnable_sink: Optional[torch.Tensor] = None,
-    softcap=0.0,
-    num_splits=0,
-    pack_gqa=None,
-    deterministic: bool = False,
-    score_mod=None,
-    score_mod_bwd=None,
-    mask_mod=None,
-    block_sparse_tensors=None,
-    aux_tensors=None,
-    aux_scalars=None,
-    return_lse: bool = False,
-    scheduler_metadata: Optional[torch.Tensor] = None,
-    disable_scheduler_metadata: bool = False,
-):
-    """Quantized variable-length attention for prequantized E4M3FN inputs.
-
-    Supply all three E8M0 dequantization tensors in scales for MXFP8.
-    """
-    _catlass_utils.require_fp8_inputs(q, k, v)
-    _catlass_utils.require_mxfp8_scales(scales)
-    return _catlass_utils.attention(
-        q,
-        k,
-        v,
-        varlen=True,
-        qv=qv,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        min_seqlen_k=min_seqlen_k,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        gather_kv_indices=gather_kv_indices,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        learnable_sink=learnable_sink,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        deterministic=deterministic,
-        score_mod=score_mod,
-        score_mod_bwd=score_mod_bwd,
-        mask_mod=mask_mod,
-        block_sparse_tensors=block_sparse_tensors,
-        aux_tensors=aux_tensors,
-        aux_scalars=aux_scalars,
-        return_lse=return_lse,
-        scheduler_metadata=scheduler_metadata,
-        disable_scheduler_metadata=disable_scheduler_metadata,
-        scales=scales,
+        *((scales.q, scales.k, scales.v) if isinstance(scales, TensorwiseScales) else ()),
     )

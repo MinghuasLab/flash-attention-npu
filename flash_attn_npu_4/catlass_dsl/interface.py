@@ -12,7 +12,7 @@ from typing import Callable, NamedTuple, Optional, Tuple
 import torch
 from torch.autograd.function import once_differentiable
 
-from .. import TensorwiseScales
+from .. import BlockScales, TensorwiseScales
 from .block_sparsity import (
     BlockSparseTensorsTorch,
     normalize_block_sparse_tensors,
@@ -497,72 +497,6 @@ def _flash(q, k, v, *, input_requires_grad=None, autograd_func=None, **options):
     return out, lse if (options["return_lse"] or input_requires_grad) else None
 
 
-def flash_attn_func_with_quant(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scales: TensorwiseScales,
-    qv: Optional[torch.Tensor] = None,
-    gather_kv_indices: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
-    softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
-    score_mod: Optional[Callable] = None,
-    score_mod_bwd: Optional[Callable] = None,
-    mask_mod: Optional[Callable] = None,
-    aux_tensors: Optional[list] = None,
-    aux_scalars: Optional[tuple] = None,
-    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
-    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
-    return_lse: bool = False,
-    gather_bwd_recompute_p: bool = False,
-    gather_bwd_token_chunk: Optional[int] = None,
-):
-    """Run inference-only MXFP8 attention with prequantized E4M3FN Q/K/V.
-
-    See :func:`flash_attn_func` for layouts and common attention options.
-    Supply all three E8M0 tensors as ``scales=TensorwiseScales(q=..., k=..., v=...)``
-    with dtype uint8 or float8_e8m0fnu on the same Ascend 950 device as Q/K/V.
-    Q/K scale shapes replace the head dimension 128 with (2, 2). V scales
-    have shape (B, ceil(Sk/64), Hkv, 128, 2) for BSND or
-    (capacity, Hkv, 128, 2) for packed TND, where capacity covers
-    sum(ceil(segment_length/64)) and each segment starts a new group.
-    The output is BF16 and the optional LSE is FP32.
-    """
-    require_mxfp8_scales(scales)
-    return _flash_attn_fixed(
-        q,
-        k,
-        v,
-        qv=qv,
-        gather_kv_indices=gather_kv_indices,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        learnable_sink=learnable_sink,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        deterministic=deterministic,
-        score_mod=score_mod,
-        score_mod_bwd=score_mod_bwd,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
-        aux_scalars=aux_scalars,
-        block_sparse_tensors=block_sparse_tensors,
-        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
-        return_lse=return_lse,
-        gather_bwd_recompute_p=gather_bwd_recompute_p,
-        gather_bwd_token_chunk=gather_bwd_token_chunk,
-        scales=scales,
-    )
-
-
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -587,8 +521,20 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    config: None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-    """Compute fixed-length BSND attention on FP16/BF16 inputs.
+    """Compute fixed-length BSND attention with optional MXFP8 scales.
+
+    With ``scales=None``, Q/K/V use the FP16/BF16 path. For inference-only
+    MXFP8, pass prequantized E4M3FN Q/K/V and
+    ``scales=BlockScales(q=..., k=..., v=...)`` containing E8M0 tensors
+    (uint8 or float8_e8m0fnu) on the same Ascend 950 device. Q/K scale shapes
+    replace the head dimension 128 with (2, 2). V scales have shape
+    (B, ceil(Sk/64), Hkv, 128, 2) for BSND or (capacity, Hkv, 128, 2) for TND;
+    capacity covers sum(ceil(segment_length/64)), with groups restarted per
+    segment. Inputs/scales must not require gradients. Output is BF16 and
+    optional LSE is FP32.
 
     Parameters
     ----------
@@ -672,10 +618,17 @@ def flash_attn_func(
         Reserved gather-backward chunk size; only ``None`` is supported.
         Invalid gather combinations are validated before capability checks.
 
+    config : None, optional
+        Reserved tuning configuration; only ``None`` is supported.
+    scales : TensorwiseScales or BlockScales or None, optional
+        None selects FP16/BF16; BlockScales selects prequantized MXFP8.
+        TensorwiseScales requires the top-level AscendC path; Flex rejects it.
+
     Returns
     -------
     out : torch.Tensor
-        Attention output with the same shape, dtype, and device as ``q``.
+        Attention output with the same shape and device as ``q``. Dtype matches
+        ``q`` for FP16/BF16 and is BF16 for MXFP8.
     lse : torch.Tensor or None
         Contiguous FP32 natural-log log-sum-exp of shape ``(B, Hq, Sq)``.
         Returned when ``return_lse`` is true or any original Q/K/V input
@@ -738,6 +691,10 @@ def flash_attn_func(
     >>> tuple(out.shape), tuple(lse.shape)
     ((2, 256, 4, 128), (2, 4, 256))
     """
+    if config is not None:
+        raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
+    if scales is not None:
+        require_mxfp8_scales(scales)
     return _flash_attn_fixed(
         q,
         k,
@@ -762,6 +719,7 @@ def flash_attn_func(
         return_lse=return_lse,
         gather_bwd_recompute_p=gather_bwd_recompute_p,
         gather_bwd_token_chunk=gather_bwd_token_chunk,
+        scales=scales,
     )
 
 
@@ -790,9 +748,8 @@ def _flash_attn_fixed(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     *,
-    scales: TensorwiseScales | None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -836,92 +793,6 @@ def _flash_attn_fixed(
     )
 
 
-def flash_attn_varlen_func_with_quant(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scales: TensorwiseScales,
-    qv: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
-    min_seqlen_k: Optional[int] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    gather_kv_indices: Optional[torch.Tensor] = None,
-    page_table: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
-    softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
-    score_mod: Optional[Callable] = None,
-    score_mod_bwd: Optional[Callable] = None,
-    mask_mod: Optional[Callable] = None,
-    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
-    aux_tensors: Optional[list] = None,
-    aux_scalars: Optional[tuple] = None,
-    return_lse: bool = False,
-    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
-    seqlen_k_per_split: Optional[int] = None,
-    disable_scheduler_metadata: bool = False,
-    gather_bwd_recompute_p: bool = False,
-    gather_bwd_token_chunk: Optional[int] = None,
-):
-    """Run inference-only MXFP8 attention with prequantized E4M3FN Q/K/V.
-
-    See :func:`flash_attn_varlen_func` for layouts and common attention options.
-    Supply all three E8M0 tensors as ``scales=TensorwiseScales(q=..., k=..., v=...)``
-    with dtype uint8 or float8_e8m0fnu on the same Ascend 950 device as Q/K/V.
-    Q/K scale shapes replace the head dimension 128 with (2, 2). V scales
-    have shape (B, ceil(Sk/64), Hkv, 128, 2) for BSND or
-    (capacity, Hkv, 128, 2) for packed TND, where capacity covers
-    sum(ceil(segment_length/64)) and each segment starts a new group.
-    The output is BF16 and the optional LSE is FP32.
-    """
-    require_mxfp8_scales(scales)
-    return _flash_attn_varlen(
-        q,
-        k,
-        v,
-        qv=qv,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        min_seqlen_k=min_seqlen_k,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        gather_kv_indices=gather_kv_indices,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        learnable_sink=learnable_sink,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        deterministic=deterministic,
-        score_mod=score_mod,
-        score_mod_bwd=score_mod_bwd,
-        mask_mod=mask_mod,
-        block_sparse_tensors=block_sparse_tensors,
-        aux_tensors=aux_tensors,
-        aux_scalars=aux_scalars,
-        return_lse=return_lse,
-        scheduler_metadata=scheduler_metadata,
-        seqlen_k_per_split=seqlen_k_per_split,
-        disable_scheduler_metadata=disable_scheduler_metadata,
-        gather_bwd_recompute_p=gather_bwd_recompute_p,
-        gather_bwd_token_chunk=gather_bwd_token_chunk,
-        scales=scales,
-    )
-
-
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -956,8 +827,20 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    config: None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-    """Compute attention on independently fixed BSND or packed TND FP16/BF16 inputs.
+    """Compute attention on independently fixed BSND or packed TND inputs.
+
+    With ``scales=None``, Q/K/V use the FP16/BF16 path. For inference-only
+    MXFP8, pass prequantized E4M3FN Q/K/V and
+    ``scales=BlockScales(q=..., k=..., v=...)`` containing E8M0 tensors
+    (uint8 or float8_e8m0fnu) on the same Ascend 950 device. Q/K scale shapes
+    replace the head dimension 128 with (2, 2). V scales have shape
+    (B, ceil(Sk/64), Hkv, 128, 2) for BSND or (capacity, Hkv, 128, 2) for TND;
+    capacity covers sum(ceil(segment_length/64)), with groups restarted per
+    segment. Inputs/scales must not require gradients. Output is BF16 and
+    optional LSE is FP32.
 
     Parameters
     ----------
@@ -1068,10 +951,17 @@ def flash_attn_varlen_func(
         Reserved gather-backward chunk size; only ``None`` is supported.
         Invalid gather combinations are validated before capability checks.
 
+    config : None, optional
+        Reserved tuning configuration; only ``None`` is supported.
+    scales : TensorwiseScales or BlockScales or None, optional
+        None selects FP16/BF16; BlockScales selects prequantized MXFP8.
+        TensorwiseScales requires the top-level AscendC path; Flex rejects it.
+
     Returns
     -------
     out : torch.Tensor
-        Output with the same shape, dtype, device, and layout as ``q``.
+        Output with the same shape, device, and layout as ``q``. Dtype matches
+        ``q`` for FP16/BF16 and is BF16 for MXFP8.
     lse : torch.Tensor or None
         Contiguous FP32 natural-log log-sum-exp: ``(Hq, Tq)`` for packed Q
         or ``(B, Hq, Sq)`` for fixed Q. Returned when ``return_lse`` is true
@@ -1144,6 +1034,10 @@ def flash_attn_varlen_func(
     >>> tuple(out.shape), tuple(lse.shape)
     ((40, 4, 128), (4, 40))
     """
+    if config is not None:
+        raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
+    if scales is not None:
+        require_mxfp8_scales(scales)
     return _flash_attn_varlen(
         q,
         k,
@@ -1178,6 +1072,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata=disable_scheduler_metadata,
         gather_bwd_recompute_p=gather_bwd_recompute_p,
         gather_bwd_token_chunk=gather_bwd_token_chunk,
+        scales=scales,
     )
 
 
@@ -1216,9 +1111,8 @@ def _flash_attn_varlen(
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
     *,
-    scales: TensorwiseScales | None = None,
+    scales: TensorwiseScales | BlockScales | None = None,
 ):
-
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )

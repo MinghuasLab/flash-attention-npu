@@ -7,10 +7,11 @@ The probability oracle uses float64 exponent selection and PyTorch's CPU RNE
 FP8 conversion, independently of the device bit-manipulation implementation.
 """
 
+from functools import wraps
 import torch
 
-
-from flash_attn_npu_4.catlass_dsl import TensorwiseScales
+from flash_attn_npu_4.catlass_dsl import BlockScales
+from .golden import cached_golden
 
 SCALE_NAMES = ("q_descale", "k_descale", "v_descale")
 
@@ -151,7 +152,7 @@ def to_device(case, device):
         for name, value in case["kwargs"].items()
         if name not in SCALE_NAMES
     }
-    options["scales"] = TensorwiseScales(*(case["kwargs"][name].to(device) for name in SCALE_NAMES))
+    options["scales"] = BlockScales(*(case["kwargs"][name].to(device) for name in SCALE_NAMES))
     return tuple(t.to(device) for t in case["qkv"]), options
 
 
@@ -198,7 +199,7 @@ def decoded_inputs(case, dtype=torch.bfloat16):
     return tuple(values)
 
 
-def reference(
+def _reference(
     case,
     *,
     scale=None,
@@ -332,6 +333,22 @@ def reference(
         qoff += qn
         koff += kn
     return result, lse
+
+
+@wraps(_reference)
+def reference(case, **kwargs):
+    callbacks = {kind: kwargs.get(kind + "_mod") for kind in ("score", "mask")}
+    options = {
+        name: value for name, value in kwargs.items() if name not in ("score_mod", "mask_mod")
+    }
+    return cached_golden(
+        "catlass_dsl.mxfp8",
+        ("out", "lse"),
+        lambda: _reference(case, **kwargs),
+        inputs=(case, options),
+        callbacks=callbacks,
+        source_files=(__file__,),
+    )
 
 
 def check_quantized_lse(actual, expected):

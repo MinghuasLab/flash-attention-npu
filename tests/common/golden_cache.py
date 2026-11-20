@@ -123,7 +123,7 @@ def _json_value(value: Any) -> Any:
 
 def _tensor_digest(tensor: torch.Tensor) -> dict[str, Any]:
     cpu = tensor.detach().to(device="cpu").contiguous()
-    data = cpu.view(torch.uint8).numpy().tobytes()
+    data = cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
     return {
         "dtype": str(cpu.dtype),
         "shape": list(cpu.shape),

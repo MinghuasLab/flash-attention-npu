@@ -123,14 +123,28 @@ out, lse = compiled_attention(q, k, v)
 
 ## Prequantized MXFP8 inference
 
-MXFP8 entry points take a required `TensorwiseScales` argument immediately
-after Q/K/V. Pass it positionally or as `scales=...`.
+`flash_attn_func` (fixed BSND) and `flash_attn_varlen_func` (variable-length /
+mixed BSND/TND) accept an optional
+`scales: TensorwiseScales | BlockScales | None = None` argument at the end
+of their signatures, preserving existing positional arguments. This also
+applies to the top-level FA4 APIs on Ascend 950.
 
-- `flash_attn_func_with_quant(...)` — fixed-length BSND
-- `flash_attn_varlen_func_with_quant(...)` — variable-length / mixed BSND/TND
+The preceding `config: None = None` parameter is reserved for future tuning.
+Only `None` is accepted; non-`None` values raise `NotImplementedError` before
+backend dispatch.
 
-The non-quantized `flash_attn_func` / `flash_attn_varlen_func` remain FP16/BF16
-only. All three scales are required and Q/K/V must already be
+With `scales=None` (the default), the DSL uses FP16/BF16 attention. With
+`scales=BlockScales(q=..., k=..., v=...)`, it uses MXFP8 inference.
+The top-level FA4 API accepts `TensorwiseScales` for the native AscendC path:
+FP32 `[batch, num_kv_heads]` descales on the query device, with missing members
+treated as 1. Tensorwise FP8 is inference-only. Adding Flex callbacks, sparse
+metadata or nonempty auxiliary inputs raises `NotImplementedError`; the direct
+DSL API also rejects `TensorwiseScales`. The current MXFP8 block mode
+requires `BlockScales.q`, `.k` and `.v` (unlike upstream, omitting `.v` does not
+select BF16 V). The E8M0 packing below is the Ascend layout, not the upstream
+CUDA `interleave_sf` buffer layout.
+
+All three scales are required and Q/K/V must already be
 `torch.float8_e4m3fn`; this API does not quantize floating-point inputs. MXFP8
 is supported on Ascend 950 with head dimension
 128 and logical sparse blocks of 128x128. Q/K/V and scale tensors must not
@@ -155,11 +169,11 @@ least `sum(ceil(segment_kv_length/64))`; extra trailing capacity is allowed.
 
 ```python
 # q_fp8/k_fp8/v_fp8 and their scale tensors are supplied by the caller.
-from flash_attn_npu_4.catlass_dsl import TensorwiseScales, flash_attn_func_with_quant
+from flash_attn_npu_4.catlass_dsl import BlockScales, flash_attn_func
 
-out, lse = flash_attn_func_with_quant(
+out, lse = flash_attn_func(
     q_fp8, k_fp8, v_fp8,
-    scales=TensorwiseScales(q=q_scale, k=k_scale, v=v_scale),
+    scales=BlockScales(q=q_scale, k=k_scale, v=v_scale),
     mask_mod=local_mask,
     return_lse=True,
 )

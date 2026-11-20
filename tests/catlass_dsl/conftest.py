@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from tests.common.golden_cache import get_or_compute_golden
+from tests.common.timing import begin, finish
+
 try:
     import torch_npu
 except (ImportError, OSError):
@@ -27,10 +30,16 @@ def pytest_pycollect_makemodule(module_path, parent):
 
 
 @pytest.fixture(autouse=True)
-def _seed_per_case():
+def _seed_per_case(request, monkeypatch):
     # Override the repository timing fixture, which wraps attention callables.
     torch.manual_seed(0)
+    nodeid = request.node.nodeid
+    monkeypatch.setenv("GOLDEN_CACHE_NODEID", nodeid)
+    monkeypatch.setenv("GOLDEN_CACHE_TEST_FILE", str(request.path))
+    state = begin()
+    monkeypatch.setattr(get_or_compute_golden, "_ci_timing_state", state, raising=False)
     yield
+    request.node.user_properties.append(("ci_timing", finish(state, nodeid)))
 
 
 @pytest.fixture(scope="module")

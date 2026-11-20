@@ -68,6 +68,8 @@ def test_each_flex_trigger_precedes_legacy(monkeypatch, entry, name):
     "options",
     [
         {},
+        {"scales": None},
+        {"config": None},
         {"aux_tensors": [], "aux_scalars": ()},
         {"aux_tensors": (), "aux_scalars": []},
         {"causal": True},
@@ -87,30 +89,177 @@ def test_default_backend_and_empty_aux(monkeypatch, entry, options):
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-def test_quantized_entry_signature_and_forwarding(monkeypatch, entry):
-    quant_entry = getattr(fa4, f"{entry.__name__}_with_quant")
-    quant_parameters = dict(inspect.signature(quant_entry).parameters)
-    assert list(quant_parameters)[:4] == ["q", "k", "v", "scales"]
-    scales_parameter = quant_parameters.pop("scales")
+def test_optional_scales_signature_and_forwarding(monkeypatch, entry):
+    parameters = dict(inspect.signature(entry).parameters)
+    scales_parameter = parameters.pop("scales")
     assert scales_parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert scales_parameter.default is inspect.Parameter.empty
-    assert list(quant_parameters.values()) == list(inspect.signature(entry).parameters.values())
+    assert scales_parameter.default is None
+    assert not hasattr(fa4, f"{entry.__name__}_with_quant")
 
     backend = Mock(return_value=object())
     monkeypatch.setattr(dsl_utils, "attention", backend)
     native = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
     monkeypatch.setattr(native, "apply", Mock(side_effect=AssertionError("native backend")))
-    arguments = {name: object() for name in quant_parameters}
+    arguments = {name: object() for name in parameters}
+    arguments["config"] = None
     arguments.update({name: torch.empty(0, dtype=torch.float8_e4m3fn) for name in ("q", "k", "v")})
     scale = torch.empty(0, dtype=torch.uint8)
-    scales = fa4.TensorwiseScales(q=scale, k=scale, v=scale)
+    scales = fa4.BlockScales(q=scale, k=scale, v=scale)
 
     qkv = tuple(arguments.pop(name) for name in ("q", "k", "v"))
-    assert quant_entry(*qkv, scales, *arguments.values()) is backend.return_value
-    assert quant_entry(*qkv, **arguments, scales=scales) is backend.return_value
+    assert entry(*qkv, *arguments.values(), scales) is backend.return_value
+    assert entry(*qkv, **arguments, scales=scales) is backend.return_value
     for call in backend.call_args_list:
         assert call.args == qkv
-        assert call.kwargs == dict(arguments, scales=scales, varlen=entry is flash_attn_varlen_func)
+        forwarded = {name: value for name, value in arguments.items() if name != "config"}
+        assert call.kwargs == dict(forwarded, scales=scales, varlen=entry is flash_attn_varlen_func)
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+def test_native_float_backward_argument_count_is_unchanged(monkeypatch, entry):
+    q = torch.zeros((2, 7, 4, 128), dtype=torch.float16, requires_grad=True)
+    k = torch.zeros((2, 9, 2, 128), dtype=q.dtype, requires_grad=True)
+    v = k.detach().clone().requires_grad_()
+    out = torch.zeros_like(q)
+    monkeypatch.setattr(legacy, "get_scheduler_metadata", Mock(return_value=None))
+    monkeypatch.setattr(
+        legacy,
+        "_flash_attn_forward",
+        Mock(return_value=(out, torch.zeros((2, 4, 7)), torch.empty(0), torch.empty(0))),
+    )
+    monkeypatch.setattr(
+        legacy,
+        "_flash_attn_backward",
+        Mock(return_value=tuple(torch.ones_like(t) for t in (q, k, v))),
+    )
+    entry(q, k, v).sum().backward()
+    for t in (q, k, v):
+        torch.testing.assert_close(t.grad, torch.ones_like(t))
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("missing", [None, "q", "all"])
+def test_tensorwise_descales_reach_native_forward(monkeypatch, entry, missing):
+    q = torch.zeros((2, 7, 4, 128), dtype=torch.float8_e4m3fn)
+    k = torch.zeros((2, 9, 2, 128), dtype=q.dtype)
+    values = [torch.full((2, 2), value) for value in (0.5, 0.75, 1.25)]
+    if missing == "q":
+        values[0] = None
+    elif missing == "all":
+        values = [None] * 3
+    out = torch.zeros_like(q, dtype=torch.bfloat16)
+    lse = torch.zeros((2, 4, 7))
+    backend = Mock(return_value=(out, lse, torch.empty(0), torch.empty(0)))
+    monkeypatch.setattr(legacy, "_flash_attn_forward", backend)
+    monkeypatch.setattr(legacy, "get_scheduler_metadata", Mock(return_value=None))
+    monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("Flex")))
+    result = entry(q, k, k, scales=fa4.TensorwiseScales(*values), return_lse=True)
+    assert result[0] is out
+    assert len(result) == (2 if entry is flash_attn_func else 4)
+    for actual, expected in zip(backend.call_args.args[-3:], values):
+        assert actual is expected
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("name", TRIGGERS)
+def test_tensorwise_rejects_flex_without_native_fallback(monkeypatch, entry, name):
+    if name not in inspect.signature(entry).parameters:
+        pytest.skip("No backward sparse parameter")
+    native = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
+    backend = Mock(side_effect=AssertionError("native fallback"))
+    monkeypatch.setattr(native, "apply", backend)
+    monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("Flex launch")))
+    with pytest.raises(NotImplementedError, match="Flex.*TensorwiseScales"):
+        entry(None, None, None, scales=fa4.TensorwiseScales(), **{name: trigger(name)})
+    backend.assert_not_called()
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "grad", "member"])
+def test_tensorwise_validation_before_launch(monkeypatch, entry, invalid):
+    q = torch.empty((2, 7, 4, 128), dtype=torch.float8_e4m3fn)
+    k = torch.empty((2, 9, 2, 128), dtype=q.dtype)
+    scale = torch.ones((2, 2))
+    if invalid == "shape":
+        scale = scale[:1]
+    elif invalid == "dtype":
+        scale = scale.to(torch.float16)
+    elif invalid == "grad":
+        scale.requires_grad_()
+    else:
+        scale = 1.0
+    native = legacy.FlashAttnFunc if entry is flash_attn_func else legacy.FlashAttnVarlenFunc
+    backend = Mock(side_effect=AssertionError("native launch"))
+    monkeypatch.setattr(native, "apply", backend)
+    error = (
+        NotImplementedError
+        if invalid == "grad"
+        else TypeError
+        if invalid == "member"
+        else ValueError
+    )
+    with pytest.raises(error):
+        entry(q, k, k, scales=fa4.TensorwiseScales(q=scale))
+    backend.assert_not_called()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("missing", [None, "q", "all"])
+def test_tensorwise_native_precision(device, packed, missing):
+    from tests.common.attention_ref_fp8 import read_inputs, ref_flash_attention_pair
+    from tests.common.compare import assert_fa_close
+
+    rng = torch.Generator().manual_seed(42)
+
+    def shape(length, heads):
+        return (2 * length, heads, 128) if packed else (2, length, heads, 128)
+
+    q, k, v = [
+        (torch.randn(shape(length, heads), generator=rng) * 0.2).to(torch.float8_e4m3fn)
+        for length, heads in ((17, 4), (23, 2), (23, 2))
+    ]
+    base = torch.tensor([[1.0, 0.0, 0.5, 0.0], [0.75, 0.0, 1.25, 0.0]])
+    scales = [(base * value)[:, ::2] for value in (0.5, 0.75, 1.25)]
+    if missing == "q":
+        scales[0] = None
+    elif missing == "all":
+        scales = [None] * 3
+    options = dict(
+        softmax_scale=128**-0.5, causal=True, window_size=(-1, -1), softcap=0.0, num_splits=1
+    )
+    if packed:
+        options.update(
+            cu_seqlens_q=torch.tensor([0, 17, 34], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 23, 46], dtype=torch.int32),
+            max_seqlen_q=17,
+            max_seqlen_k=23,
+        )
+    cpu = dict(
+        q=q, k=k, v=v, **options, **dict(zip(("q_descale", "k_descale", "v_descale"), scales))
+    )
+    cpu["return_attn_probs"] = True
+    case, inputs = read_inputs(cpu, "varlen" if packed else "dense")
+    high, low = ref_flash_attention_pair(case, inputs)
+    options = {
+        name: value.to(device) if isinstance(value, torch.Tensor) else value
+        for name, value in options.items()
+    }
+    entry = flash_attn_varlen_func if packed else flash_attn_func
+    actual = entry(
+        q.to(device),
+        k.to(device),
+        v.to(device),
+        scales=fa4.TensorwiseScales(*(t.to(device) if t is not None else None for t in scales)),
+        return_lse=True,
+        **options,
+    )
+    out, lse = actual[:2]
+    if not packed:
+        out = out.reshape(-1, 4, 128)
+        lse = lse.transpose(0, 1).reshape(4, -1)
+    for name, result, reference, benchmark in zip(("O", "LSE"), (out, lse), high, low):
+        assert_fa_close(result, reference, benchmark, softcap=0.0, name=name)
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
@@ -159,6 +308,7 @@ def test_910_package_does_not_export_quantized_attention(monkeypatch):
     assert package.flash_attn_varlen_func is backend.flash_attn_varlen_func
     for name in (
         "TensorwiseScales",
+        "BlockScales",
         "flash_attn_func_with_quant",
         "flash_attn_varlen_func_with_quant",
     ):
