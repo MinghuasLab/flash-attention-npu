@@ -138,8 +138,7 @@ class FlashAttentionScoreGrad950Partial {
         // Fixpipe SPLIT_M sends half of the logical M rows to each AIV.
         // Offsets come from fag_ub_layout.hpp, which is also used by the host
         // budget check in fag_tiling.cpp.
-        static_assert(sizeof(DataType) == FagUbLayout::P_ELEMENT_BYTES,
-                      "FagUbLayout assumes 2-byte P/dS elements");
+        static_assert(sizeof(DataType) == FagUbLayout::P_ELEMENT_BYTES, "FagUbLayout assumes 2-byte P/dS elements");
         const FagUbLayout::PipelineSlots ubSlots = FagUbLayout::MakePipelineSlots(qBlockSize_);
         const uint32_t mm1SlotOffset = ubSlots.mm1;
         const uint32_t mm2SlotOffset = ubSlots.mm2;
@@ -245,8 +244,8 @@ class FlashAttentionScoreGrad950Partial {
     }
 
     CATLASS_DEVICE
-    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx,
-                              uint32_t& firstValidS1, uint32_t& validS1Num)
+    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx, uint32_t& firstValidS1,
+                              uint32_t& validS1Num)
     {
         validS1Num = 0;
         // No mask: every S1 block is valid.
@@ -270,11 +269,12 @@ class FlashAttentionScoreGrad950Partial {
         }
 
         // BAND: both S1 boundaries depend on the window and actual KV tile size.
-        const int64_t s1IdxUp = tiling_->s2Token == INT32_MAX ? 0 :
-            Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
+        const int64_t s1IdxUp =
+            tiling_->s2Token == INT32_MAX ? 0 : Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
         const int64_t s2RealSize = Min(static_cast<int64_t>(kvBlockSize_), static_cast<int64_t>(s2Length) - s2Start);
-        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length :
-            Min(static_cast<int64_t>(s1Length), s2Start + s2RealSize - delta + tiling_->s1Token);
+        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length
+                                                                : Min(static_cast<int64_t>(s1Length),
+                                                                      s2Start + s2RealSize - delta + tiling_->s1Token);
         if (s1IdxUp >= s1IdxDown) {
             return;
         }
@@ -333,7 +333,7 @@ class FlashAttentionScoreGrad950Partial {
                             FillBlockInfoFrom(batchIdx, n2Idx, groupIdx, s1BlockIdx, s2BlockIdx, qBatchStart,
                                               kvBatchStart, s1Length, s2Length, block);
                             block.taskId = taskId;
-                            block.loadKv = true;  // partial: no KT/VT group residency
+                            block.loadKv = true; // partial: no KT/VT group residency
 
 #ifdef __DAV_CUBE__
                             ProcessC1Stage(block, mm12);
@@ -534,7 +534,6 @@ class FlashAttentionScoreGrad950Partial {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
     }
-
 
     CATLASS_DEVICE uint64_t InputOffset(const FagTensorStrides& strides, const FAGBlockInfo& block, bool isQ) const
     {
@@ -757,11 +756,15 @@ class FlashAttentionScoreGrad950Partial {
     FAGBlockInfo previousBlock_{};
 };
 
-template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool /*IS_DETERMINISTIC*/, bool IS_SOFTCAP>
-CATLASS_GLOBAL void FlashAttentionV3Bwd950Partial(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
-                                           GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
-                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
-                                           GM_ADDR workspace, GM_ADDR tiling)
+template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool /*IS_DETERMINISTIC*/,
+          bool IS_SOFTCAP>
+// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
+// concurrent streams running other sync kernels can deadlock on core allocation.
+__schedmode__(1) CATLASS_GLOBAL
+    void FlashAttentionV3Bwd950Partial(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
+                                       GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
+                                       GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
+                                       GM_ADDR workspace, GM_ADDR tiling)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -790,8 +793,8 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950Partial(GM_ADDR dout, GM_ADDR q, GM_AD
     using EpilogueSubMul = Catlass::Epilogue::Block::BlockEpilogue<DispatchPolicySubMul, DataType, DataType, float,
                                                                    FAGTiling950::FAGTilingData>;
     using FAGKernel950 =
-        FlashAttentionScoreGrad950Partial<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
-                                   INPUT_LAYOUT, IS_CAUSAL, /*IS_DTM=*/false, IS_SOFTCAP>;
+        FlashAttentionScoreGrad950Partial<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax,
+                                          EpilogueSubMul, INPUT_LAYOUT, IS_CAUSAL, /*IS_DTM=*/false, IS_SOFTCAP>;
     FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
                            cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     FAGKernel950 fag;

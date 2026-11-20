@@ -72,8 +72,6 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
                                    event_t vToMte3Event, event_t mte3ToVEvent, uint32_t subBlockIdx)
     {
         using namespace AscendC::MicroAPI;
-        constexpr uint32_t rowStride = 128;  // Physical UB stride; see fag_kernel.cpp.
-        constexpr uint32_t lanes = 64;
         constexpr uint32_t c0 = 32U / sizeof(ElementDS);
         const uint32_t l1RowWidth = tiling_->kvTile;
 

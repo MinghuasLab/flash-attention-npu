@@ -99,7 +99,8 @@ FAG_UB_LAYOUT_API uint32_t DeltaTileRows(uint64_t vHeadDim)
 
 FAG_UB_LAYOUT_API uint32_t DeltaAlignedD(uint64_t vHeadDim)
 {
-    return vHeadDim > 256 ? static_cast<uint32_t>(RoundUp(vHeadDim, 16)) : 256U;
+    // LargeD uses unmasked 128-element LoadAlign operations for the tail;
+    return vHeadDim > 256 ? static_cast<uint32_t>(RoundUp(vHeadDim, 128)) : 256U;
 }
 
 // Bytes of one delta slot: in/out b16 tiles plus the fp32 delta row.
