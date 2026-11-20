@@ -99,7 +99,7 @@ enum class CacheLayout : uint8_t {
 #endif
 ////////////////////////////////////////////////////////////////////
 namespace Catlass::Gemm::Block {
-using PairedFullPvTile = tla::Shape<tla::Int<128>, tla::Int<96>, tla::Int<128>>;
+using PairedPrefillPvTile = tla::Shape<tla::Int<128>, tla::Int<96>, tla::Int<128>>;
 
 struct BlockMmadPVTileHelper {
     uint32_t pvL1TileM;
@@ -443,7 +443,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
         // One P tile covers all output column fragments when M and K each fit in L0A.
-        constexpr bool PipelineColumns = std::is_same_v<L0TileShape_, PairedFullPvTile>;
+        constexpr bool PipelineColumns = std::is_same_v<L0TileShape_, PairedPrefillPvTile>;
         const bool reuseP = PipelineColumns && mL0LoopNum == 1U && kL0LoopNum == 1U;
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,

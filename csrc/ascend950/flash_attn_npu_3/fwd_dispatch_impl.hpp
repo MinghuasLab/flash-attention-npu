@@ -126,21 +126,17 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
     }
 }
 
-// Full paired prefill has a distinct Cube schedule. Keep its device code in
-// its own image so changing its matrix tiles does not move small decode kernels.
+// Paired Q heads use a dedicated device image to pipeline PV columns.
 template <Format kLayout>
-void launch_paired_full_layout(const FwdLaunchArgs& a)
+void launch_paired_prefill_layout(const FwdLaunchArgs& a)
 {
     using DType = bfloat16_t;
     constexpr auto kCacheLayout = CacheLayout::nd;
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
-            if (a.mask_category == MaskCategory::MASK_CAUSAL) {
-                FWD_MIXED_KERNEL_LAUNCH(FAInferPairedFull, MaskCategory::MASK_CAUSAL, CacheMode::pagedCache,
-                                        PageShape::BnBsND, LseMode, false, true);
-            } else {
-                FWD_MIXED_KERNEL_LAUNCH(FAInferPairedFull, MaskCategory::NO_MASK, CacheMode::pagedCache,
-                                        PageShape::BnBsND, LseMode, false, true);
-            }
+        FWD_MASK_SWITCH(a.mask_category, MaskCat, {
+            FWD_MIXED_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCat, CacheMode::pagedCache,
+                                    PageShape::BnBsND, LseMode, false, true);
+        });
     });
 }
 

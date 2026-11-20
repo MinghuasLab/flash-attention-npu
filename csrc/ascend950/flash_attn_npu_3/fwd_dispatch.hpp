@@ -60,11 +60,11 @@ extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a)
 extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
 
 template <Format kLayout>
-void launch_paired_full_layout(const FwdLaunchArgs& a);
+void launch_paired_prefill_layout(const FwdLaunchArgs& a);
 
-extern template void launch_paired_full_layout<Format::TND>(const FwdLaunchArgs&);
-extern template void launch_paired_full_layout<Format::BSND>(const FwdLaunchArgs&);
-extern template void launch_paired_full_layout<Format::BNSD>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::TND>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::BSND>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::BNSD>(const FwdLaunchArgs&);
 
 template <Format kLayout>
 void launch_mixed_swa_layout(const FwdLaunchArgs& a);
@@ -79,13 +79,13 @@ extern template void launch_mixed_swa_layout<Format::BNSD>(const FwdLaunchArgs&)
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
     if (a.quant_mode == 2U && a.paired_query_heads && a.paged_kv && !a.has_softcap &&
-        a.mask_category != MaskCategory::MASK_SWA && !(a.enable_dn && a.mask_category == MaskCategory::NO_MASK)) {
+        !(a.enable_dn && a.mask_category == MaskCategory::NO_MASK)) {
         if (a.layout == Format::TND) {
-            launch_paired_full_layout<Format::TND>(a);
+            launch_paired_prefill_layout<Format::TND>(a);
         } else if (a.layout == Format::BNSD) {
-            launch_paired_full_layout<Format::BNSD>(a);
+            launch_paired_prefill_layout<Format::BNSD>(a);
         } else {
-            launch_paired_full_layout<Format::BSND>(a);
+            launch_paired_prefill_layout<Format::BSND>(a);
         }
         return;
     }
