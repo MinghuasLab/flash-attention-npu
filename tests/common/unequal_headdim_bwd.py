@@ -16,12 +16,14 @@ import os
 
 import torch
 
+from tests.common import attention_ref, test_utils
 from tests.common.attention_ref import (
     cached_autograd_grads,
     ref_flash_attention,
     ref_flash_attention_pair,
 )
 from tests.common.compare import assert_fa_close
+from tests.common.golden_cache import get_or_compute_golden
 from tests.common.test_utils import (
     make_attention_inputs,
     make_cu_seqlens,
@@ -446,11 +448,32 @@ def segment(qdim, vdim, dtype, sq, sk, causal, wl, wr, softcap, scale, heads=4, 
         torch.randn(1, sk, kv_heads, vdim, dtype=dtype),
     ]
     do = torch.randn(1, sq, heads, vdim, dtype=dtype)
-    xs = [x.float().requires_grad_() for x in inputs]
-    mask = make_golden_attention_mask(sq, sk, causal, wl, wr)[0]
-    out, lse = ref_flash_attention(*xs, scale, mask, torch.float32, softcap=softcap)
-    refs = torch.autograd.grad(out, xs, do.float())
-    return (*inputs, out.detach().to(dtype), do, lse.detach()), refs
+    names = ("out", "lse", "dq", "dk", "dv")
+
+    def compute():
+        xs = [x.float().requires_grad_() for x in inputs]
+        mask = make_golden_attention_mask(sq, sk, causal, wl, wr)[0]
+        out, lse = ref_flash_attention(*xs, scale, mask, torch.float32, softcap=softcap)
+        refs = torch.autograd.grad(out, xs, do.float())
+        return dict(zip(names, (out.detach().to(dtype), lse.detach(), *refs)))
+
+    values = get_or_compute_golden(
+        nodeid=os.environ.get("GOLDEN_CACHE_NODEID", "standalone"),
+        api_name="unequal_headdim_backward.segment",
+        metadata={
+            "scale": scale,
+            "causal": causal,
+            "window": (wl, wr),
+            "softcap": softcap,
+            "cpu_threads": torch.get_num_threads(),
+            "matmul_precision": torch.get_float32_matmul_precision(),
+        },
+        inputs=(*inputs, do),
+        compute_fn=compute,
+        expected_keys=names,
+        source_files=(__file__, attention_ref.__file__, test_utils.__file__),
+    )
+    return (*inputs, values["out"], do, values["lse"]), tuple(values[name] for name in names[2:])
 
 
 _segment = segment

@@ -8,7 +8,7 @@ from dataclasses import FrozenInstanceError
 import catlass.tla as tla
 import pytest
 import torch
-from .test_utils import DTYPES, check, check_attention, make_inputs
+from .test_utils import DTYPES, _cached_attention, check, check_attention, make_inputs, oracle
 
 from flash_attn_npu_4.catlass_dsl import (
     compute_block_sparsity,
@@ -19,7 +19,6 @@ from flash_attn_npu_4.catlass_dsl import (
 )
 from flash_attn_npu_4.catlass_dsl.callbacks import prepare_mod
 from flash_attn_npu_4.catlass_dsl.mods import UnsupportedModError, callback_mode, normalize_mod
-from .reference import reference_attention
 
 
 @tla.jit
@@ -231,12 +230,23 @@ def test_decorated_sparse_mask_device_builder_and_attention(device, mask):
         128, 128, 1, 4, 137, 143, builder, aux_tensors=None, device=device
     )
     out, lse = flash_attn_func(*inputs, mask_mod=mask, block_sparse_tensors=blocks, return_lse=True)
-    expected, logsum = reference_attention(
-        *(t.transpose(1, 2) for t in cpu), mask_mod=_mask_ref, return_lse=True
+
+    def compute():
+        expected, logsum = oracle(cpu, mask_mod=_mask_ref)
+        expected_grads = torch.autograd.grad(logsum, cpu, torch.ones_like(logsum))
+        return expected, logsum, *expected_grads
+
+    expected, logsum, *expected_grads = _cached_attention(
+        "catlass_dsl.forward_backward",
+        ("out", "lse", "dq", "dk", "dv"),
+        compute,
+        cpu,
+        None,
+        None,
+        {"mask_mod": _mask_ref},
+        loss="lse_ones",
     )
-    expected = expected.transpose(1, 2)
     grads = torch.autograd.grad(lse, inputs, torch.ones_like(lse))
-    expected_grads = torch.autograd.grad(logsum, cpu, torch.ones_like(logsum))
     for actual, wanted in zip((out, lse, *grads), (expected, logsum, *expected_grads)):
         check(actual, wanted)
     assert not grads[2].count_nonzero()
