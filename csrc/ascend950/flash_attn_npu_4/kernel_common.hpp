@@ -17,6 +17,19 @@
 #include "kernel_operator.h"
 #include "tilingdata.h"
 
+// Fixed L1 buffer counts of the 950 FA v4 forward kernel. They are compile-time
+// constants so the cube side resolves the per-tile buffer index and the L0 loop
+// bounds without a runtime division/modulo on the scalar unit for every KV tile.
+// The host tiling (tiling.cpp / fa_metadata.aicpu) writes the same values into
+// qL1BufNum..pL1BufNum; keep the two in sync if the pipeline depth changes.
+constexpr uint32_t Q_L1_BUF_NUM = 1U; // Q stays resident across KV tiles
+constexpr uint32_t K_L1_BUF_NUM = 2U;
+constexpr uint32_t V_L1_BUF_NUM = 2U;
+constexpr uint32_t P_L1_BUF_NUM = 3U; // P is pre-launched two tiles ahead
+// One forward task covers at most Q_TASK_ROWS Q rows and one KV base tile.
+constexpr uint32_t FA4_Q_TASK_ROWS = 128U;
+constexpr uint32_t FA4_KV_BASE_TILE = 128U;
+
 constexpr int32_t NUM1 = 1;
 constexpr int32_t NUM4 = 4;
 

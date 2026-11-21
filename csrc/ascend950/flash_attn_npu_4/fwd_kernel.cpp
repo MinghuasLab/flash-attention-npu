@@ -224,10 +224,6 @@ class FAIKernel950 {
         pvL1TileN_ = faiTilingData->pvL1TileN;
         pvL1TileKLeft_ = faiTilingData->pvL1TileKLeft;
         pvL1TileKRight_ = faiTilingData->pvL1TileKRight;
-        qL1BufNum_ = faiTilingData->qL1BufNum;
-        kL1BufNum_ = faiTilingData->kL1BufNum;
-        vL1BufNum_ = faiTilingData->vL1BufNum;
-        pL1BufNum_ = faiTilingData->pL1BufNum;
         windowSizeLeft_ = runtimeTilingData->windowSizeLeft;
         windowSizeRight_ = runtimeTilingData->windowSizeRight;
         flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtimeTilingData->allowFlashDecode != 0U;
@@ -1197,10 +1193,12 @@ class FAIKernel950 {
     uint32_t pvL1TileN_;
     uint32_t pvL1TileKLeft_;
     uint32_t pvL1TileKRight_;
-    uint32_t qL1BufNum_;
-    uint32_t kL1BufNum_;
-    uint32_t vL1BufNum_;
-    uint32_t pL1BufNum_;
+    // L1 buffer counts are fixed by kernel_common.hpp (the host tiling writes the
+    // same values), so the scalar unit does not need a runtime modulo to index them.
+    static constexpr uint32_t qL1BufNum_ = Q_L1_BUF_NUM;
+    static constexpr uint32_t kL1BufNum_ = K_L1_BUF_NUM;
+    static constexpr uint32_t vL1BufNum_ = V_L1_BUF_NUM;
+    static constexpr uint32_t pL1BufNum_ = P_L1_BUF_NUM;
 
     int64_t windowSizeLeft_ = 0;
     int64_t windowSizeRight_ = 0;

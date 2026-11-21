@@ -43,6 +43,12 @@ constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
+// DN-only fallbacks; when this header is reached through fwd_kernel.cpp the values
+// come from kernel_common.hpp (KERNEL_COMMON is already defined and this block is
+// skipped), so the two copies must stay in sync with Q_L1_BUF_NUM/K_L1_BUF_NUM.
+constexpr uint32_t Q_L1_BUF_NUM = 1U; // Q stays resident across KV tiles
+constexpr uint32_t K_L1_BUF_NUM = 2U;
+constexpr uint32_t FA4_KV_BASE_TILE = 128U;
 
 struct PFAKernelParams {
     // Data members
@@ -146,8 +152,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
         l1ATileK = BlockMmadQKTileHelper.qkL1TileKLeft;
         l1BTileK = BlockMmadQKTileHelper.qkL1TileKRight;
-        l1ABufNum = BlockMmadQKTileHelper.qL1BufNum;
-        l1BBufNum = BlockMmadQKTileHelper.kL1BufNum;
+
+        // Buffer counts come from the compile-time plan (kernel_common.hpp) rather than
+        // from the tiling blob, so the per-tile buffer index below is resolved
+        // without a runtime modulo.
 
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] =
@@ -292,8 +300,12 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1
+        // One QK task consumes one KV base tile, which fits a single L0 N tile, so the
+        // KV loop is single-iteration by construction: keep it compile-time so no
+        // runtime CeilDiv / last-iteration test remains on the scalar unit.
+        static_assert(FA4_KV_BASE_TILE <= L0_TILE_N, "KV base tile must fit one L0 N tile");
+        constexpr uint32_t nL0LoopNum = 1U;
         uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
-        uint32_t nL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
         // while splitting the base tile S to 2 AIVs,
@@ -304,7 +316,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
             uint32_t kvL0Start = kvTileStart + nL0Itr * L0_TILE_N;
-            uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
+            auto l0TileNAct = (curBaseTileSize <= L0_TILE_N) ? curBaseTileSize : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
             uint32_t l0CLoopCounter = kvSTileRelIdx;
@@ -559,8 +571,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    uint32_t l1ABufNum;
-    uint32_t l1BBufNum;
+    static constexpr uint32_t l1ABufNum = Q_L1_BUF_NUM;
+    static constexpr uint32_t l1BBufNum = K_L1_BUF_NUM;
+    static_assert(l1ABufNum <= MAX_L1_STAGES, "Q L1 buffer count exceeds the static L1 tensor array");
+    static_assert(l1BBufNum <= MAX_L1_STAGES, "K L1 buffer count exceeds the static L1 tensor array");
 
     uint32_t l1PPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;

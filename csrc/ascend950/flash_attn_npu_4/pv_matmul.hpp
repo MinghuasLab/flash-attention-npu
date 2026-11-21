@@ -163,8 +163,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = pvL1TileHelper.pvL1TileN;
         l1ATileK = pvL1TileHelper.pvL1TileKLeft;
         l1BTileK = pvL1TileHelper.pvL1TileKRight;
-        l1ABufNum = pvL1TileHelper.pL1BufNum;
-        l1BBufNum = pvL1TileHelper.vL1BufNum;
+        // Buffer counts come from the compile-time plan (kernel_common.hpp) rather than
+        // from the tiling blob, so the per-tile buffer index below is resolved
+        // without a runtime modulo.
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + l1ATileM * l1ATileK *
                                                                                                   sizeof(ElementA) * i);
@@ -433,9 +434,14 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
         }
         // P full base tile already on L1
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
+        // One PV task covers at most FA4_Q_TASK_ROWS Q rows and one KV base
+        // tile, so the M and K loops are single-iteration by construction: keep
+        // them compile-time so no runtime CeilDiv / last-iteration test remains.
+        static_assert(FA4_Q_TASK_ROWS <= L0_TILE_M, "Q rows per task must fit one L0 M tile");
+        static_assert(FA4_KV_BASE_TILE <= L0_TILE_K, "KV base tile must fit one L0 K tile");
+        constexpr uint32_t mL0LoopNum = 1U;
+        constexpr uint32_t kL0LoopNum = 1U;
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
-        uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
@@ -585,8 +591,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    uint32_t l1ABufNum;
-    uint32_t l1BBufNum;
+    static constexpr uint32_t l1ABufNum = P_L1_BUF_NUM;
+    static constexpr uint32_t l1BBufNum = V_L1_BUF_NUM;
+    static_assert(l1ABufNum <= MAX_L1_STAGES, "P L1 buffer count exceeds the static L1 tensor array");
+    static_assert(l1BBufNum <= MAX_L1_STAGES, "V L1 buffer count exceeds the static L1 tensor array");
 };
 ////////////////////////////////////////////////////////////////////
 
