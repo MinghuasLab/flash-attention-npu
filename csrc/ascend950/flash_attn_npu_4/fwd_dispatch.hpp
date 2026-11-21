@@ -20,7 +20,6 @@ struct FwdLaunchArgs {
     uint8_t* q_device;
     uint8_t* k_device;
     uint8_t* v_device;
-    uint8_t* mask_device;        // may be nullptr when not masked
     uint8_t* block_table_device; // may be nullptr when !paged_kv
     uint8_t* o_device;
     uint8_t* lse_device;
@@ -31,7 +30,7 @@ struct FwdLaunchArgs {
     uint8_t* workspace_device;
     uint8_t* tiling_device;
     uint8_t* runtime_tiling_device;
-    int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD head plane)
+    int64_t kv_seqlen_allocated; // physical sequence length for fixed-layout KV
     uint32_t quant_mode = 0;
     uint8_t* q_descale_device = nullptr;
     uint8_t* k_descale_device = nullptr;
