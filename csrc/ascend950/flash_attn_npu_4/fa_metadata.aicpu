@@ -13,6 +13,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "tilingdata.h"
+#include "fwd_task_shape.h"
 #include "fwd_resource_plan.h"
 #include "fwd_tiling_policy.h"
 
@@ -21,9 +22,8 @@
 #include <cstring>
 
 namespace {
-constexpr uint32_t Q_TILE_CEIL = 128;
-constexpr uint32_t N_SPLIT_HELPER = 2;
-constexpr uint32_t BASE_KV_SIZE = 128;
+constexpr uint32_t Q_TILE_CEIL = fa950_plan::MAX_Q_ROWS;
+constexpr uint32_t BASE_KV_SIZE = fa950_plan::KV_TILE;
 constexpr uint32_t MAX_FD_CORES = 32;
 constexpr uint32_t MAX_FD_COMBINE_TASKS = 32;
 constexpr uint32_t MAX_FD_BASE_TASKS = 32;
@@ -60,17 +60,7 @@ inline uint64_t AlignUp(uint64_t value, uint64_t alignment)
 
 inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize, uint32_t qBaseTile)
 {
-    uint32_t qnBlockTile = qSeqlen == 0 ? Q_TILE_CEIL : (Q_TILE_CEIL / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER;
-    if (qBaseTile < Q_TILE_CEIL && qSeqlen != 0) {
-        uint32_t maxQnBlockTile = Q_TILE_CEIL / 2 / qSeqlen;
-        maxQnBlockTile = maxQnBlockTile == 0 ? 1 : maxQnBlockTile;
-        qnBlockTile = qnBlockTile < maxQnBlockTile ? qnBlockTile : maxQnBlockTile;
-    }
-    qnBlockTile = qnBlockTile < groupSize ? qnBlockTile : groupSize;
-    if (qnBlockTile > N_SPLIT_HELPER) {
-        qnBlockTile = qnBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
-    }
-    return qnBlockTile == 0 ? 1 : qnBlockTile;
+    return fa950_task::HeadTile(qSeqlen, groupSize, qBaseTile);
 }
 
 inline void DisableFlashDecode(FAInferStaticTilingData* tilingData)
@@ -461,16 +451,18 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
             metadataArgs->maxQSeqlen, fullQ128Tasks, metadataArgs->blockDim, metadataArgs->maskType == 2,
             metadataArgs->windowSizeLeft, metadataArgs->windowSizeRight);
     tilingData->quantMode = metadataArgs->quantMode;
-    tilingData->kvBaseTile = metadataArgs->quantMode == 1 ? 256U : 128U;
+    tilingData->kvBaseTile = metadataArgs->quantMode == 1 ? 256U : fa950_plan::KV_TILE;
     tilingData->qkL1TileM = 128;
-    tilingData->qkL1TileN = 256;
+    const auto qkLayout = fa950_plan::MakeQkL1Layout(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV,
+                                                     tilingData->kvBaseTile, metadataArgs->quantMode == 1U);
+    tilingData->qkL1TileN = qkLayout.kRows;
     tilingData->qkL1TileKLeft = (metadataArgs->embeddingSize + 15) / 16 * 16;
-    tilingData->qkL1TileKRight = metadataArgs->quantMode == 1 ? 128U : 192U;
+    tilingData->qkL1TileKRight = qkLayout.kDepth;
     tilingData->pvL1TileM = 128;
     tilingData->pvL1TileN = (metadataArgs->embeddingSizeV + 15) / 16 * 16;
     tilingData->pvL1TileKLeft = tilingData->kvBaseTile;
     tilingData->pvL1TileKRight = tilingData->kvBaseTile;
-    tilingData->qL1BufNum = 1;
+    tilingData->qL1BufNum = qkLayout.qSlots;
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
@@ -485,9 +477,12 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 
     uint32_t maxQSeqlen = 0;
     uint32_t maxKvSeqlen = 0;
+    bool uniformTasks = true;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
+    tilingData->useGqaTailGrouping = metadataArgs->quantMode == 0U && groupSize > 1U &&
+                                    metadataArgs->maxQSeqlen > tilingData->qBaseTile;
     for (uint32_t batchIndex = 0; batchIndex < metadataArgs->batch; ++batchIndex) {
         const uint32_t qSeqlen =
             metadataArgs->isVarlen ? (metadataArgs->hasSequsedQ != 0
@@ -499,17 +494,20 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
                                       : static_cast<uint32_t>(seqlensK[batchIndex]);
         maxQSeqlen = maxQSeqlen > qSeqlen ? maxQSeqlen : qSeqlen;
         maxKvSeqlen = maxKvSeqlen > kvSeqlen ? maxKvSeqlen : kvSeqlen;
-        const uint32_t qnBlockTile = GetQNBlockTile(qSeqlen, groupSize, tilingData->qBaseTile);
-        const uint32_t batchTaskNum =
-            CeilDiv(groupSize, qnBlockTile) * metadataArgs->numHeadsK * CeilDiv(qSeqlen, tilingData->qBaseTile);
+        const auto shape = fa950_task::MakeShape(qSeqlen, groupSize, metadataArgs->numHeadsK, tilingData->qBaseTile,
+                                               tilingData->useGqaTailGrouping);
+        const uint32_t batchTaskNum = shape.totalTasks;
         if (batchIndex == 0) {
             firstBatchTaskNum = batchTaskNum;
+        } else if (batchTaskNum != firstBatchTaskNum) {
+            uniformTasks = false;
         }
         totalTaskNum += batchTaskNum;
     }
     tilingData->maxQSeqlen = maxQSeqlen;
     tilingData->maxKvSeqlen = maxKvSeqlen;
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
+    tilingData->uniformBatchTaskCount = uniformTasks ? firstBatchTaskNum : 0U;
     tilingData->totalTaskNum = totalTaskNum;
 
     const uint32_t groupSizeForFlashDecode =

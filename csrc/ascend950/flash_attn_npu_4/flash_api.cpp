@@ -3,13 +3,11 @@
 // Pybind entrypoint for `flash_attn_npu_4_950` — the Ascend 950 backend
 // for FlashAttention v4.
 
-
 #include <torch/extension.h>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
 
-#include "device_triu_mask.h"
 #include "fa_metadata_args.h"
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"

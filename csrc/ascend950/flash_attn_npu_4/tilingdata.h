@@ -93,9 +93,9 @@ struct FAInferStaticTilingData {
     uint64_t pvOutSize;
     uint64_t UpdateSize;
     uint64_t workSpaceSize;
-    uint64_t padding1;
+    uint64_t uniformBatchTaskCount = 0; // Zero selects variable per-batch task counts.
     uint64_t padding2;
-    uint32_t padding3;
+    uint32_t useGqaTailGrouping = 0; // A zero reserved word retains the original tail schedule.
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int32_t sparseMode = 0;
@@ -211,17 +211,17 @@ struct FAInferStaticTilingData {
     {
         return workSpaceSize;
     }
-    uint64_t get_padding1() const
+    uint64_t get_uniformBatchTaskCount() const
     {
-        return padding1;
+        return uniformBatchTaskCount;
     }
     uint64_t get_padding2() const
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_useGqaTailGrouping() const
     {
-        return padding3;
+        return useGqaTailGrouping;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -309,17 +309,17 @@ struct FAInferStaticTilingData {
     {
         workSpaceSize = value;
     }
-    void set_padding1(uint64_t value)
+    void set_uniformBatchTaskCount(uint64_t value)
     {
-        padding1 = value;
+        uniformBatchTaskCount = value;
     }
     void set_padding2(uint64_t value)
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_useGqaTailGrouping(uint32_t value)
     {
-        padding3 = value;
+        useGqaTailGrouping = value;
     }
     void set_sparseMode(int32_t value)
     {

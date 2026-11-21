@@ -538,24 +538,18 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
-    uint8_t* maskDev = nullptr;
-    at::Tensor mask_npu_tensor;
-    if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
-        mask_npu_tensor = MakeDeviceTriuMask();
-        maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-    }
-
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
     const uint32_t launchBlockDim = scheduler_metadata_.has_value()
                                         ? (flashDecodeEnabled ? metadataFdCoreCapacity : blockDim)
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
-    FwdLaunchArgs fwdArgs{
-        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,  return_lse,    is_softcap, launchBlockDim,
-        aclStream, qDev,     kDev,          vDev,         maskDev,   blockTableDev, oDev,       lseDev,
-        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,     tilDev,        runtimeDev, kv_seqlen_allocated,
-        quantMode, qDescale, kDescale,      vDescale,     fp8Runtime};
+    FwdLaunchArgs fwdArgs{is_bf16,    fmt,        mask_category,       paged_KV,     enableDN,
+                          return_lse, is_softcap, launchBlockDim,      aclStream,    qDev,
+                          kDev,       vDev,       blockTableDev,       oDev,         lseDev,
+                          qSeqDev,    kvSeqDev,   seqUsedQDev,         seqUsedKvDev, wsDev,
+                          tilDev,     runtimeDev, kv_seqlen_allocated, quantMode,    qDescale,
+                          kDescale,   vDescale,   fp8Runtime};
     fwdArgs.storage =
         FwdStorageParams{static_cast<uint64_t>(paged_KV ? k.stride(0) : 0),
                          static_cast<uint64_t>(paged_KV ? v.stride(0) : 0),
