@@ -194,8 +194,6 @@ class FAIKernel950 {
         gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
         AscendC::GlobalTensor<float> gPartialO;
         gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
-        AscendC::GlobalTensor<ElementMask> gMask;
-        gMask.SetGlobalBuffer((__gm__ ElementMask*)params.mask);
         //tiling data
 
         batch_ = faiTilingData->batch;
@@ -826,42 +824,25 @@ class FAIKernel950 {
                     // other slot; give this task its own row statistics.
                     epilogueOnlineSoftmax.SetStatsSlot(taskStatsSlot);
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
-                        if (d512) {
-                            // Positional causal mask: center of the tile's
-                            // first logical row, bottom-right aligned with the
-                            // effective Q/KV lengths.
-                            int32_t qTileCenterStart = static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen);
-                            uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
-                            uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
-                            bool doTriUMask = qTileCenterStart < static_cast<int32_t>(kvSEndIdx - 1);
-                            if (doTriUMask) {
-                                epilogueOnlineSoftmax.template operator()<false>(
+                        // Bottom-right aligned position of the tile's first Q row.
+                        const int32_t qTileCenterStart = static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen);
+                        const uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
+                        const uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
+                        if (qTileCenterStart < static_cast<int32_t>(kvSEndIdx - 1)) {
+                            if (d512) {
+                                epilogueOnlineSoftmax.template RunPositionalD512<false>(
                                     l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
                                     qkReadyFlag, softmaxReadyFlag, qTileCenterStart, kvSStartIdx, qSBlockSize,
                                     qNBlockSize);
                             } else {
-                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
+                                epilogueOnlineSoftmax.template operator()<false>(
+                                    l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag, qTileCenterStart, kvSStartIdx, qSBlockSize,
+                                    qNBlockSize);
                             }
                         } else {
-                            auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
-                            auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
-                            int64_t triUp = static_cast<int64_t>(noSkipKvS) - qSBlockSize;
-                            uint32_t triDown = noSkipKvS;
-                            uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
-                            uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
-                            bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
-                            if (doTriUMask) {
-                                epilogueOnlineSoftmax(l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK,
-                                                      (kvSTileRelIdx == 0), ubSBufId, l1PBufId, qkReadyFlag,
-                                                      softmaxReadyFlag, triUp, triDown, 0u, 0u, kvSStartIdx, kvSEndIdx,
-                                                      1, qSBlockSize, qNBlockSize);
-                            } else {
-                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
-                            }
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
                         }
                     } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
                         int64_t kvSStartIdxI = static_cast<int64_t>(kvSTileIdx) * kvBaseTile_;
@@ -878,45 +859,33 @@ class FAIKernel950 {
                                 : (windowSizeRightStartLen >= kvSStartIdxI && windowSizeRightStartLen < kvSEndIdxI) ||
                                       (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
                                       (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
-                        if (d512) {
-                            if (doTriUPreMask || doTriUNextMask) {
-                                // Window bounds are clamped to the effective
-                                // lengths (Sk-1 / Sq-1), matching the donor;
-                                // on effective positions this clamp behaves
-                                // like an unlimited window because no token
-                                // outside [0, Sk-1] is ever visited.
-                                const int32_t left = static_cast<int32_t>(
-                                    windowSizeLeft_ < 0
-                                        ? kvSeqlen - 1
-                                        : AscendC::Std::min(windowSizeLeft_, static_cast<int64_t>(kvSeqlen - 1)));
-                                const int32_t right = static_cast<int32_t>(
-                                    windowSizeRight_ < 0
-                                        ? qSeqlen - 1
-                                        : AscendC::Std::min(windowSizeRight_, static_cast<int64_t>(qSeqlen - 1)));
+                        if (doTriUPreMask || doTriUNextMask) {
+                            // Clamp unlimited windows to effective lengths, as on the D512 path.
+                            const uint32_t left = static_cast<uint32_t>(
+                                windowSizeLeft_ < 0
+                                    ? kvSeqlen - 1
+                                    : AscendC::Std::min(windowSizeLeft_, static_cast<int64_t>(kvSeqlen - 1)));
+                            const uint32_t right = static_cast<uint32_t>(
+                                windowSizeRight_ < 0
+                                    ? qSeqlen - 1
+                                    : AscendC::Std::min(windowSizeRight_, static_cast<int64_t>(qSeqlen - 1)));
+                            if (d512) {
+                                epilogueOnlineSoftmax.template RunPositionalD512<true>(
+                                    l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag,
+                                    static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen),
+                                    static_cast<uint32_t>(kvSStartIdxI), qSBlockSize, qNBlockSize,
+                                    static_cast<int32_t>(left), static_cast<int32_t>(right));
+                            } else {
                                 epilogueOnlineSoftmax.template operator()<true>(
                                     l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId, l1PBufId,
                                     qkReadyFlag, softmaxReadyFlag,
                                     static_cast<int32_t>(qSTileStart + kvSeqlen - qSeqlen),
                                     static_cast<uint32_t>(kvSStartIdxI), qSBlockSize, qNBlockSize, left, right);
-                            } else {
-                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
                             }
                         } else {
-                            auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
-                            auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
-                            if (doTriUPreMask || doTriUNextMask) {
-                                epilogueOnlineSoftmax(
-                                    l1PTensorTla, gmMaskTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                    l1PBufId, qkReadyFlag, softmaxReadyFlag, kvSStartIdxI, doTriUPreMask,
-                                    doTriUNextMask, windowSizeLeftStartLen, windowSizeLeftEndLen,
-                                    windowSizeRightStartLen, windowSizeRightEndLen, qSBlockSize, qNBlockSize, 1u);
-                            } else {
-                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                      l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
-                            }
+                            epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
+                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
                         }
                     } else {
                         if constexpr (IsDN) {

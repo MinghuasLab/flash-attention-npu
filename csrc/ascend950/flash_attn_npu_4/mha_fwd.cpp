@@ -535,12 +535,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
+    // Causal and SWA visibility are derived from Q/K positions in UB;
+    // neither the D512 nor the standard path needs a device-side mask.
     uint8_t* maskDev = nullptr;
-    at::Tensor mask_npu_tensor;
-    if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
-        mask_npu_tensor = MakeDeviceTriuMask();
-        maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-    }
 
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
