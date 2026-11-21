@@ -53,11 +53,13 @@ class FagPost {
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Ping);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Pong);
         uint32_t pingPongIdx = 0;
-        // BN2S2 with per-core private dk/dv: they have already been converted
-        // to the bf16 outputs by the paired AIVs at each column end; only dq
-        // is finalized here.  GQA keeps the shared fp32 path.
-        const bool privDkv = tiling_->detPrivDkv != 0;
-        if (!privDkv) {
+        // Skip dk/dv when they were already cast to bf16 outputs:
+        //   - BN2S2 detPrivDkv: per-column private cast at column end
+        //   - earlyDkvCast: non-det D<=128 tile cast during the main loop
+        // Only dq still needs the trailing fp32→bf16 conversion in those modes.
+        // Softcap scales dk/dq via postScale (mainline).
+        const bool dkvAlreadyCast = tiling_->detPrivDkv != 0 || tiling_->earlyDkvCast != 0;
+        if (!dkvAlreadyCast) {
             ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F, vectorCoreId, vectorCoreNum, pingPongIdx,
                                  mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
             ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, postScale, vectorCoreId, vectorCoreNum, pingPongIdx,

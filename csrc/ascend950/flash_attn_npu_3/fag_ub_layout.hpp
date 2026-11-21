@@ -35,9 +35,11 @@ FAG_UB_LAYOUT_API uint64_t RoundUp(uint64_t value, uint64_t alignment)
 }
 
 // Rows of one L1 task tile handled by a single AIV sub-block.
-FAG_UB_LAYOUT_API uint32_t RowsPerSubBlock(uint32_t qTile)
+// SPLIT_M (default): half M per AIV. SINGLE_VEC/NO_SPLIT: full M on AIV0.
+FAG_UB_LAYOUT_API uint32_t RowsPerSubBlock(uint32_t qTile, bool singleVec = false)
 {
-    return static_cast<uint32_t>(RoundUp(qTile, 16) / 2);
+    const uint32_t mAligned = static_cast<uint32_t>(RoundUp(qTile, 16));
+    return singleVec ? mAligned : (mAligned / 2);
 }
 
 /*
@@ -58,9 +60,9 @@ struct PipelineSlots {
     uint32_t halfBytes = 0; // size of one ping (or pong) half
 };
 
-FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile)
+FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile, bool singleVec = false)
 {
-    const uint32_t rowsPerSub = RowsPerSubBlock(qTile);
+    const uint32_t rowsPerSub = RowsPerSubBlock(qTile, singleVec);
     const uint32_t mmResBytes = rowsPerSub * ROW_STRIDE * sizeof(float);
     const uint32_t attenMaskBytes = rowsPerSub * ROW_STRIDE * sizeof(uint8_t);
     const uint32_t lseBytes = static_cast<uint32_t>(RoundUp(rowsPerSub, 8) * 8 * sizeof(float));
@@ -80,9 +82,9 @@ FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile)
 }
 
 // Total UB bytes of the two ping/pong halves.
-FAG_UB_LAYOUT_API uint32_t PipelineBytes(uint32_t qTile)
+FAG_UB_LAYOUT_API uint32_t PipelineBytes(uint32_t qTile, bool singleVec = false)
 {
-    return 2 * MakePipelineSlots(qTile).halfBytes;
+    return 2 * MakePipelineSlots(qTile, singleVec).halfBytes;
 }
 
 /*
