@@ -24,9 +24,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import flash_attn_npu_4 as fa4
 from flash_attn_npu_4.catlass_dsl import (
-    TensorwiseScales,
-    flash_attn_func_with_quant as flash_attn_func,
-    flash_attn_varlen_func_with_quant as flash_attn_varlen_func,
+    BlockScales,
+    flash_attn_func,
+    flash_attn_varlen_func,
     graph,
     interface,
     runtime,
@@ -405,16 +405,12 @@ def cpu_mxfp8_runtime(monkeypatch):
 )
 def test_mxfp8_fullgraph_dynamic_scale_rebinding(cpu_mxfp8_runtime, public, packed):
     if public:
-        entry = fa4.flash_attn_varlen_func_with_quant if packed else fa4.flash_attn_func_with_quant
+        entry = fa4.flash_attn_varlen_func if packed else fa4.flash_attn_func
     else:
-        entry = (
-            interface.flash_attn_varlen_func_with_quant
-            if packed
-            else interface.flash_attn_func_with_quant
-        )
+        entry = interface.flash_attn_varlen_func if packed else interface.flash_attn_func
 
     def call(q, k, v, qs, ks, vs, cq, ck):
-        options = dict(scales=TensorwiseScales(qs, ks, vs), return_lse=True)
+        options = dict(scales=BlockScales(qs, ks, vs), return_lse=True)
         if packed:
             options.update(
                 cu_seqlens_q=cq, cu_seqlens_k=ck, max_seqlen_q=q.shape[0], max_seqlen_k=k.shape[0]
@@ -1113,7 +1109,7 @@ def test_mxfp8_rebinds_packed_boundaries_with_capacity(device, compiled):
             q,
             k,
             v,
-            scales=TensorwiseScales(qs, ks, vs),
+            scales=BlockScales(qs, ks, vs),
             cu_seqlens_q=cq,
             cu_seqlens_k=ck,
             max_seqlen_q=64,
@@ -1248,7 +1244,7 @@ def test_mxfp8_noncontiguous_data_and_scales(device, packed, native_scales):
         return result.view(value.dtype)
 
     inputs = tuple(strided(value) for value in inputs)
-    kwargs["scales"] = TensorwiseScales(*(strided(scale) for scale in kwargs["scales"]))
+    kwargs["scales"] = BlockScales(*(strided(scale) for scale in kwargs["scales"]))
     out, lse = flash_attn_varlen_func(*inputs, **kwargs, return_lse=True)
     expected, el = reference(case)
     check(out, expected)

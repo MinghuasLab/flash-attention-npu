@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import math
 
 import torch
-from .reference import reference_attention
+from . import reference
+from .golden import cached_golden
 
 from flash_attn_npu_4.catlass_dsl import flash_attn_varlen_func
 
@@ -198,26 +199,72 @@ def oracle(inputs, *, cu_q=None, cu_k=None, **kwargs):
     """Adapt public layouts around the independent, BNSD-based Torch oracle."""
     q = inputs[0]
     tensors = [t.transpose(1, 2) if t.ndim == 4 else t for t in inputs]
-    out, lse = reference_attention(
+    out, lse = reference.reference_attention(
         *tensors, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, return_lse=True, **kwargs
     )
     return (out.transpose(1, 2) if q.ndim == 4 else out), (lse if q.ndim == 4 else lse.T)
 
 
-def check_attention(cpu, inputs, out, lse, *, cq=None, ck=None, loss="out", **kwargs):
-    """Check output, LSE and all Q/K/V adjoints against Torch autograd."""
-    expected, el = oracle(cpu, cu_q=cq, cu_k=ck, **kwargs)
-    assert out.dtype == inputs[0].dtype and out.device == inputs[0].device
-    assert lse.dtype == torch.float32 and lse.is_contiguous()
+def _attention_tangents(expected, el, loss):
     generator = torch.Generator().manual_seed(2902)
     dout = torch.randn(expected.shape, generator=generator).to(expected.dtype) * 0.2
     dlse = torch.randn(el.shape, generator=generator) * 0.2
     dout = torch.zeros_like(dout) if loss == "lse" else dout
     dlse = torch.zeros_like(dlse) if loss == "out" else torch.where(torch.isfinite(el), dlse, 0.0)
+    return dout, dlse
+
+
+def _cached_attention(api, names, compute, inputs, cq, ck, options, loss=None):
+    callback_names = {"score_mod": "score", "mask_mod": "mask", "score_mod_bwd": "score_bwd"}
+    callbacks = {kind: options.get(name) for name, kind in callback_names.items()}
+    options = {name: value for name, value in options.items() if name not in callback_names}
+    return cached_golden(
+        api,
+        names,
+        compute,
+        inputs=(inputs, cq, ck, options, loss, tuple(t.requires_grad for t in inputs)),
+        callbacks=callbacks,
+        source_files=(__file__, reference.__file__),
+    )
+
+
+def forward_golden(inputs, *, cu_q=None, cu_k=None, **kwargs):
+    """Compute or load a CPU reference for comparisons that only need values."""
+    return _cached_attention(
+        "catlass_dsl.forward",
+        ("out", "lse"),
+        lambda: oracle(inputs, cu_q=cu_q, cu_k=cu_k, **kwargs),
+        inputs,
+        cu_q,
+        cu_k,
+        kwargs,
+    )
+
+
+def check_attention(cpu, inputs, out, lse, *, cq=None, ck=None, loss="out", **kwargs):
+    """Check output, LSE and all Q/K/V adjoints against Torch autograd."""
+
+    def compute():
+        expected, el = oracle(cpu, cu_q=cq, cu_k=ck, **kwargs)
+        grads = torch.autograd.grad((expected, el), cpu, _attention_tangents(expected, el, loss))
+        return expected, el, *grads
+
+    expected, el, *expected_grads = _cached_attention(
+        "catlass_dsl.forward_backward",
+        ("out", "lse", "dq", "dk", "dv"),
+        compute,
+        cpu,
+        cq,
+        ck,
+        kwargs,
+        loss,
+    )
+    assert out.dtype == inputs[0].dtype and out.device == inputs[0].device
+    assert lse.dtype == torch.float32 and lse.is_contiguous()
+    dout, dlse = _attention_tangents(expected, el, loss)
     targets = (lse,) if loss == "lse" else (out,) if loss == "out" else (out, lse)
     tangents = (dlse,) if loss == "lse" else (dout,) if loss == "out" else (dout, dlse)
     actual_grads = torch.autograd.grad(targets, inputs, tuple(t.to(out.device) for t in tangents))
-    expected_grads = torch.autograd.grad((expected, el), cpu, (dout, dlse))
     for actual, wanted in zip((out, lse, *actual_grads), (expected, el, *expected_grads)):
         check(actual, wanted)
     if loss == "lse":

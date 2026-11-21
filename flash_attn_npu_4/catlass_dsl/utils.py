@@ -31,12 +31,16 @@ def require_fp8_inputs(q, k, v):
 
 
 def require_mxfp8_scales(scales):
-    from .. import TensorwiseScales
+    from .. import BlockScales, TensorwiseScales
 
     if scales is None:
-        raise ValueError("MXFP8 requires scales=TensorwiseScales(q=..., k=..., v=...)")
-    if not isinstance(scales, TensorwiseScales):
-        raise TypeError("scales must be a TensorwiseScales instance")
+        raise ValueError("MXFP8 requires scales=BlockScales(q=..., k=..., v=...)")
+    if isinstance(scales, TensorwiseScales):
+        raise NotImplementedError(
+            "FA4 Flex attention does not support TensorwiseScales; use BlockScales for MXFP8"
+        )
+    if not isinstance(scales, BlockScales):
+        raise TypeError("scales must be a BlockScales instance")
     if any(t is None for t in scales):
         raise ValueError("MXFP8 requires all three tensors in scales.q, scales.k and scales.v")
 
@@ -205,15 +209,9 @@ def attention(
     window = tuple(None if bound is None or bound < 0 else bound for bound in window_size)
     from . import interface
 
+    entry = interface.flash_attn_varlen_func if varlen else interface.flash_attn_func
     if scales is not None:
-        entry = (
-            interface.flash_attn_varlen_func_with_quant
-            if varlen
-            else interface.flash_attn_func_with_quant
-        )
         options["scales"] = scales
-    else:
-        entry = interface.flash_attn_varlen_func if varlen else interface.flash_attn_func
     out, lse = entry(
         q,
         k,

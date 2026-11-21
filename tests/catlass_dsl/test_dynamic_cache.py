@@ -12,7 +12,6 @@ from flash_attn_npu_4.catlass_dsl import (
     compute_block_sparsity,
     flash_attn_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_func_with_quant,
     runtime,
 )
 from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache
@@ -166,7 +165,7 @@ def _constant_score(factor):
 
 
 def test_callback_constants_and_aux_abi_isolation(device, compiler):
-    from .test_utils import check, oracle
+    from .test_utils import check, forward_golden
 
     programs = {factor: _constant_score(factor) for factor in (0.5, 0.75)}
     for step, (factor, stride, expected_compiles) in enumerate(
@@ -182,7 +181,7 @@ def test_callback_constants_and_aux_abi_isolation(device, compiler):
                 aux_tensors=(copy_aux_to_device(aux, device),),
                 return_lse=True,
             )
-            expected, logs = oracle(
+            expected, logs = forward_golden(
                 cpu,
                 score_mod=lambda s, b, h, q, k, i, a, c: s * factor + a[0][q],
                 aux_tensors=(aux,),
@@ -223,7 +222,7 @@ def test_mxfp8_reuses_dynamic_lengths_and_scales(device, compiler, monkeypatch, 
         )
         expected, logs = reference(case)
         inputs, options = to_device(case, device)
-        out, lse = flash_attn_varlen_func_with_quant(*inputs, **options, return_lse=True)
+        out, lse = flash_attn_varlen_func(*inputs, **options, return_lse=True)
         check(out, expected)
         check_quantized_lse(lse.cpu(), logs)
         owners = tuple(runtime.compile_cache.values())
@@ -297,7 +296,7 @@ def test_mxfp8_aux_cache_rebinds_geometry(device, compiler, monkeypatch, tail):
         inputs, options = to_device(case, device)
         rows = [0, 63, 127, 191, 255, length - 1]
         expected, logs = reference(case, mask_mod=mask_ref, aux=auxiliary, query_rows=[rows])
-        out, lse = flash_attn_varlen_func_with_quant(
+        out, lse = flash_attn_varlen_func(
             *inputs,
             **options,
             return_lse=True,
