@@ -20,6 +20,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
+#include "fwd_resource_plan.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -423,9 +424,11 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         // fwd crossCoreSync from online sm to pv
         WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
         // P full base tile already on L1
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
+        constexpr bool singleTile = std::is_same_v<ElementA, half> || std::is_same_v<ElementA, bfloat16_t>;
+        static_assert(!singleTile || (L0_TILE_M >= fa950_plan::MAX_Q_ROWS && L0_TILE_K >= fa950_plan::KV_TILE));
+        const uint32_t mL0LoopNum = singleTile ? 1U : CeilDiv(rowNum, L0_TILE_M);
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
-        uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
+        const uint32_t kL0LoopNum = singleTile ? 1U : CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
