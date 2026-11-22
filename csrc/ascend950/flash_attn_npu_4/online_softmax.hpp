@@ -57,6 +57,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;
     static constexpr uint32_t MAX_UB_P_ELEM_NUM = 8320;
     static constexpr uint32_t DM_UB_GLOBAL_ELEM_NUM = 64;
+    // Per in-flight tile: one 32B block holding min(dm) of that tile.  dm[r] is
+    // exp(lastMax[r] - nowMax[r]) in (0, 1], so min(dm) == 1 exactly when the
+    // delayed rescale degenerates into go += lo.  Reducing here (where dm is
+    // already in a register) keeps the reduction off the rescale critical path.
+    static constexpr uint32_t SKIP_UB_SLOT_ELEM_NUM = 8;
     static constexpr uint32_t ELE_NUM_PER_C0 = 16;
 
     static constexpr uint32_t REDUCE_UB_SIZE = 1024;
@@ -90,7 +95,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         // of an earlier tile still reads the previous one.
         constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
+        constexpr uint32_t SKIP_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
+        constexpr uint32_t LL_UB_TENSOR_OFFSET = SKIP_UB_TENSOR_OFFSET + 3 * SKIP_UB_SLOT_ELEM_NUM * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
 
         subBlockIdx_ = AscendC::GetSubBlockIdx();
@@ -104,6 +110,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LM_UB_TENSOR_OFFSET);
         llUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LL_UB_TENSOR_OFFSET);
+        skipUbTensor = resource.ubBuf.template GetBufferByByte<float>(SKIP_UB_TENSOR_OFFSET);
         for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
             lmSlots_[i] = lmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
             gmSlots_[i] = gmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
@@ -139,6 +146,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             glSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + 2U * fa950_stats::STATS_SLOT_BYTES);
         }
         SetStatsSlot(0U);
+        // Share the UB tail with rescale: the three extra task statistics slots
+        // precede the three per-tile min(dm) slots.
+        skipUbTensor = resource.ubBuf.template GetBufferByByte<float>(
+            ub.total + (fa950_stats::STATS_TASK_STAGES - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES);
     }
 
     // Use the statistics of the task that owns the current tile.
@@ -258,6 +269,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -300,7 +312,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+                                                tailM, expSkipUbAddr);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -353,6 +365,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(P_COPY_EVENT);
@@ -397,7 +410,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+                                                tailM, expSkipUbAddr);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -440,6 +453,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -455,45 +469,45 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             }
         } else {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr);
+                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
             }
         }
 
@@ -563,6 +577,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
+        __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
         // Row r of a head sees KV columns j <= qTileCenterStart + r; advance the
         // per-head row index so fused GQA segments wrap exactly like the mask did.
@@ -614,7 +629,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+                                                tailM, expSkipUbAddr);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -637,6 +652,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<ElementInput> lmSlots_[fa950_stats::STATS_TASK_STAGES];
     AscendC::LocalTensor<float> gmSlots_[fa950_stats::STATS_TASK_STAGES];
     AscendC::LocalTensor<float> glSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> skipUbTensor;
     uint32_t subBlockIdx_;
     uint32_t pStages_ = fa950_plan::SCORE_STAGES;
 
@@ -1436,7 +1452,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                          __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t mRound, uint16_t m,
                          uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, ElementInput dSoftcap,
                          uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, __ubuf__ float* expMaxUb,
-                         __ubuf__ ElementS* lastExpSumUb)
+                         __ubuf__ ElementS* lastExpSumUb, __ubuf__ float* skipUb)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> src0Vreg;
@@ -1463,6 +1479,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         RegTensor<float> max3Vreg;
 
         RegTensor<float> expMaxVreg;
+        RegTensor<float> minDmVreg;
         RegTensor<float> updateExpSumVreg;
 
         RegTensor<float> sum0Vreg;
@@ -1507,6 +1524,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg preg_all_b16 = CreateMask<uint16_t, MaskPattern::ALL>();
         MaskReg pregTailN = UpdateMask<float>(tailN);
+        uint32_t sreg_1 = 1U;
+        MaskReg pregOne = UpdateMask<float>(sreg_1);
         uint32_t sreg_92 = (uint32_t)128ULL;
         MaskReg preg_136 = UpdateMask<uint16_t>(sreg_92);
         std::conditional_t<AscendC::IsSameType<ElementP, bfloat16_t>::value, __ubuf__ bfloat16_t*, __ubuf__ half*>
@@ -1551,6 +1570,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             Mul(updateExpSumVreg, expMaxVreg, lastExpSumVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(expMaxUb, expMaxVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(LastMaxUbStart, max0Vreg, pregTailN);
+            // Same contract as UpdateExpSumAndExpMax: hand the delayed rescale
+            // the per-tile min(dm) so it can skip the rescale when it is 1.
+            ReduceMin(minDmVreg, expMaxVreg, pregTailN);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
         }
 
         StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ float*&)newMaxUb, max0Vreg, pregFull);
@@ -1775,7 +1798,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     template <typename ElementS>
     __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float* sumUb, __ubuf__ float* expMaxUb,
                                                          __ubuf__ float* maxUb, __ubuf__ ElementS* expSumUb,
-                                                         __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM)
+                                                         __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM,
+                                                         __ubuf__ float* skipUb)
     {
         using namespace AscendC::MicroAPI;
 
@@ -1798,14 +1822,21 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         RegTensor<ElementS> brcExpSumTmpVreg;
         RegTensor<float> brcExpSumFloatVreg;
         RegTensor<float> updateExpSumVreg;
+        RegTensor<float> minDmVreg;
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailM = UpdateMask<float>(tailM);
+        uint32_t sreg_1 = 1U;
+        MaskReg pregOne = UpdateMask<float>(sreg_1);
         MaskReg pregNowMaxFull = CreateMask<ElementS, MaskPattern::ALL>();
         LoadAlign(lastMaxVreg, maxUb);
         LoadAlign(nowMaxTmpVreg, nowMaxUb);
         FusedExpSub(expMaxVreg, lastMaxVreg, nowMaxTmpVreg, pregFull);
         StoreAlign<float, StoreDist::DIST_NORM_B32>(expMaxUb, expMaxVreg, pregFull);
         StoreAlign<float, StoreDist::DIST_NORM_B32>(maxUb, nowMaxTmpVreg, pregFull);
+        // dm is still live in a register: reduce it now and hand the delayed
+        // rescale a single scalar instead of making it re-reduce dm later.
+        ReduceMin(minDmVreg, expMaxVreg, pregTailM);
+        StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
 
         LoadAlign(lastExpSumVreg, sumUb);
         LoadAlign(brcExpSumTmpVreg, expSumUb);

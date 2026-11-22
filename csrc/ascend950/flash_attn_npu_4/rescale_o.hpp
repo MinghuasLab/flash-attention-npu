@@ -53,12 +53,13 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     static constexpr uint32_t RESCALE_COL_MAX_ELEM_NUM = 128;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
     static constexpr uint32_t VECTOR_SIZE = 128;
-    static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
+    // Must match online_softmax.hpp: one 32B block per in-flight tile holding
+    // min(dm) of that tile, written by the online softmax that produces dm.
+    static constexpr uint32_t SKIP_UB_SLOT_ELEM_NUM = 8;
 
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, bool enableRescaleSkip_ = false)
     {
         enableRescaleSkip = enableRescaleSkip_;
-        redUbTensor = resource.ubBuf.template GetBufferByByte<float>(250U * 1024U);
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 7 * UB_UINT8_BLOCK_SIZE;
@@ -66,8 +67,11 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         // task so a delayed rescale reads the statistics of its own task.
         constexpr uint32_t GM_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
+        constexpr uint32_t SKIP_UB_TENSOR_OFFSET = DM_UB_TENSOR_OFFSET + 3 * 64 * sizeof(float);
+        constexpr uint32_t LL_UB_TENSOR_OFFSET = SKIP_UB_TENSOR_OFFSET + 3 * SKIP_UB_SLOT_ELEM_NUM * sizeof(float);
         constexpr uint32_t GL_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 64 * sizeof(float);
+        static_assert(GL_UB_TENSOR_OFFSET + fa950_stats::STATS_BYTES <= ArchTag::UB_SIZE,
+                      "rescale UB layout exceeds UB");
 
         for (uint32_t i = 0; i < UB_OTMP_BUF_STAGES; i++) {
             loUbTensor[i] =
@@ -79,6 +83,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
+        skipUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(SKIP_UB_TENSOR_OFFSET);
         for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
             lmSlots_[i] = lmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
             gmSlots_[i] = gmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
@@ -97,6 +102,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lmStartOffset);
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
+        // The FP8 path (the only user of this ctor) never enables the rescale
+        // skip, so no dedicated scratch is carved out of its UB budget.
+        skipUbTensor32 = dmUbTensor32;
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
         for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
             lmSlots_[i] = lmUbTensor32[i * fa950_stats::STATS_SLOT_ELEM_NUM];
@@ -117,9 +125,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, bool enableRescaleSkip_ = false)
     {
         enableRescaleSkip = enableRescaleSkip_;
-        // Reserve the UB tail for three extra task statistics slots first;
-        // the scalar reduction scratch must not alias any live slot.
-        redUbTensor = resource.ubBuf.template GetBufferByByte<float>(
+        // The three per-tile skip slots follow the extra task statistics in
+        // the UB tail, at the same offset used by online softmax.
+        skipUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(
             ub.total + (fa950_stats::STATS_TASK_STAGES - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES);
         otmpStages_ = ub.otmpStages;
         for (uint32_t i = 0; i < otmpStages_; ++i) {
@@ -271,8 +279,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             } else {
                 bool skip = false;
                 if constexpr (CheckDm) {
-                    skip = enableRescaleSkip && rowNumCurSubCore >= 64U &&
-                           DmAllOne(dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM], rowNumCurSubCore);
+                    if (enableRescaleSkip && rowNumCurSubCore >= 64U) {
+                        skip = DmAllOne(curTileMod);
+                    }
                 }
                 if (skip) {
                     AddFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, previousGoUb, loUb, rowNumCurSubCore,
@@ -290,8 +299,9 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             } else {
                 bool skip = false;
                 if constexpr (CheckDm) {
-                    skip = enableRescaleSkip && rowNumCurSubCore >= 64U &&
-                           DmAllOne(dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM], rowNumCurSubCore);
+                    if (enableRescaleSkip && rowNumCurSubCore >= 64U) {
+                        skip = DmAllOne(curTileMod);
+                    }
                 }
                 if (skip) {
                     AddDivFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
@@ -468,12 +478,12 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             if (piece == 0U) {
                 // GO is reusable only after the previous output DMA read it.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
-                // The V->S reduction costs more than the saved vector multiply
+                // The V->S scalar read costs more than the saved vector multiply
                 // for short decode tiles. Keep conditional rescale for full
                 // AIV tiles; multiplying by dm=1 is equivalent on short tiles.
                 if constexpr (CheckDm) {
                     if (!isFirstKvSTile && rowNumCurSubCore >= 64U && enableRescaleSkip) {
-                        skipRescale = DmAllOne(dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM], rowNumCurSubCore);
+                        skipRescale = DmAllOne(curTileMod);
                     }
                 }
             }
@@ -1151,37 +1161,13 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
     }
 
-    __aicore__ inline void SetMask(int32_t len)
+    // min(dm) was reduced by online softmax; consume its per-tile scalar
+    // instead of reducing dm on the delayed rescale path.
+    __aicore__ inline bool DmAllOne(uint32_t tileMod)
     {
-        uint64_t mask = 0;
-        uint64_t one = 1;
-        uint64_t temp = len % FLOAT_VECTOR_SIZE;
-        for (int64_t i = 0; i < temp; i++) {
-            mask |= one << i;
-        }
-        if (len == VECTOR_SIZE) {
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-        } else if (len >= FLOAT_VECTOR_SIZE) {
-            AscendC::SetVectorMask<int8_t>(mask, (uint64_t)-1);
-        } else {
-            AscendC::SetVectorMask<int8_t>(0x0, mask);
-        }
-    }
-
-    __aicore__ inline bool DmAllOne(AscendC::LocalTensor<float> dm, uint32_t row)
-    {
-        SetMask((int32_t)row);
-        AscendC::WholeReduceMin<float, false>(redUbTensor, dm, (int32_t)0, 1, 1, 1, 8,
-                                              AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID7);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID7);
-        float minDm = redUbTensor.GetValue(0);
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
-        // Restore the full vector mask so later legacy-API vector ops are unaffected.
-        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-        return minDm >= 1.0f;
+        return skipUbTensor32[tileMod * SKIP_UB_SLOT_ELEM_NUM].GetValue(0) >= 1.0f;
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
@@ -1347,7 +1333,6 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
   private:
     uint32_t otmpStages_ = UB_OTMP_BUF_STAGES;
-    AscendC::LocalTensor<float> redUbTensor;
     bool enableRescaleSkip{false};
     float vDequantScale_ = 1.0f;
     bool hasLseScratch_ = false;
@@ -1364,6 +1349,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> lmSlots_[fa950_stats::STATS_TASK_STAGES];
     AscendC::LocalTensor<float> gmSlots_[fa950_stats::STATS_TASK_STAGES];
     AscendC::LocalTensor<float> glSlots_[fa950_stats::STATS_TASK_STAGES];
+    AscendC::LocalTensor<float> skipUbTensor32;
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 
