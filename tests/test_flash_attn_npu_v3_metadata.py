@@ -1852,3 +1852,86 @@ def test_d512_paged_auto_flashdecode_varlen():
             data_type=dtype,
             is_causal=False,
         )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 forward tiling")
+@pytest.mark.parametrize("sq,sk,group,dim", [(5, 143, 1, 256), (5, 129, 3, 193), (131, 143, 4, 64)])
+def test_950_query_slots_and_grouped_tail(monkeypatch, sq, sk, group, dim):
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as api
+
+    batch, hk = (4 if sq > 128 else 64), 5
+    hq = hk * group
+    gen = torch.Generator().manual_seed(975)
+    q, k, v = [
+        (torch.randn(shape, generator=gen) * 0.5).bfloat16()
+        for shape in ((batch, sq, hq, dim), (batch, sk, hk, dim), (batch, sk, hk, dim))
+    ]
+    expected_scores = (
+        q.transpose(1, 2).float()
+        @ k.transpose(1, 2).float().repeat_interleave(group, 1).transpose(-1, -2)
+    ) * dim**-0.5
+    expected_scores.masked_fill_(torch.ones(sq, sk, dtype=torch.bool).triu(sk - sq + 1), -torch.inf)
+    expected = (
+        expected_scores.softmax(-1) @ v.transpose(1, 2).float().repeat_interleave(group, 1)
+    ).transpose(1, 2)
+    expected_lse = expected_scores.logsumexp(-1).transpose(0, 1).reshape(hq, -1)
+    ends = _int32_npu([i * sq for i in range(batch + 1)])
+    used = _int32_npu([sk] * batch)
+    q, k, v = [a.flatten(0, 1).npu() for a in (q, k, v)]
+    metadata = get_scheduler_metadata(
+        batch, sq, sk, hq, hk, dim, used, cu_seqlens_q=ends, causal=True
+    )
+    if sq == 131:
+        # One full Q tile per Q head, then one short tail per KV head.
+        assert int(metadata.cpu().view(torch.int32)[9]) == batch * (hq + hk)
+    monkeypatch.setattr(api, "get_scheduler_metadata", lambda **kwargs: None)
+    for meta in (metadata, None):
+        out, lse, *_ = flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            cache_seqlens=used,
+            cu_seqlens_q=ends,
+            max_seqlen_q=sq,
+            scheduler_metadata=meta,
+            causal=True,
+            return_softmax_lse=True,
+            num_splits=1,
+        )
+        torch.testing.assert_close(
+            out.cpu().float(), expected.reshape_as(out), rtol=0.015, atol=0.003
+        )
+        torch.testing.assert_close(
+            lse.cpu().reshape_as(expected_lse), expected_lse, rtol=0, atol=0.001
+        )
+
+
+@pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 fixed-layout KV addressing")
+def test_950_dense_cache_batch_stride(monkeypatch):
+    from flash_attn_npu_3 import flash_attn_npu_interface_950 as api
+
+    batch, sq, capacity, heads, dim = 64, 3, 32, 5, 16
+    lengths = torch.tensor([3, 19, 2, 31] * (batch // 4), dtype=torch.int32)
+    q = torch.zeros(batch, sq, heads, dim, device="npu", dtype=torch.bfloat16)
+    k = torch.zeros(batch, capacity, heads, dim, device="npu", dtype=q.dtype)
+    tags = (torch.arange(batch)[:, None] % 11 + 2 * torch.arange(heads)[None, :]).to(q.dtype)
+    v = tags[:, None, :, None].expand(batch, capacity, heads, dim).clone()
+    v.masked_fill_(torch.arange(capacity)[None, :, None, None] >= lengths[:, None, None, None], -64)
+    v = v.npu()
+    used = lengths.npu()
+    metadata = get_scheduler_metadata(batch, sq, capacity, heads, heads, dim, used)
+    monkeypatch.setattr(api, "get_scheduler_metadata", lambda **kwargs: None)
+    for meta in (metadata, None):
+        out, lse, *_ = flash_attn_with_kvcache(
+            q,
+            k,
+            v,
+            cache_seqlens=used,
+            scheduler_metadata=meta,
+            return_softmax_lse=True,
+            num_splits=1,
+        )
+        torch.testing.assert_close(out.cpu(), tags[:, None, :, None].expand_as(out), rtol=0, atol=0)
+        torch.testing.assert_close(
+            lse.cpu(), lengths.float().log()[:, None, None].expand_as(lse), rtol=0, atol=1e-5
+        )

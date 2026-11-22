@@ -13,6 +13,7 @@
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
 
+#include "fwd_task_shape.h"
 #include "kernel_operator.h"
 
 constexpr int32_t NUM1 = 1;
@@ -25,8 +26,7 @@ constexpr int32_t BASIC_BLOCK_SIZE = 256;
 constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
-constexpr uint32_t Q_M_TILE_MAX = 128;
-constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
+constexpr uint32_t Q_M_TILE_MAX = fa950_plan::MAX_Q_ROWS;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
@@ -47,7 +47,6 @@ struct FAIKernelParams {
     GM_ADDR q;
     GM_ADDR k;
     GM_ADDR v;
-    GM_ADDR mask;
     GM_ADDR blockTables;
     GM_ADDR actualQseqlen;
     GM_ADDR actualKvseqlen;
@@ -74,13 +73,12 @@ struct FAIKernelParams {
     // Methods
     __aicore__ inline FAIKernelParams() {}
 
-    __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
-                                      GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR seqUsedQ_,
-                                      GM_ADDR seqUsedKv_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_,
-                                      float scaleValue_, float softcapValue_, uint32_t numBlocks_,
-                                      uint32_t maxNumBlocksPerBatch_, int64_t kvSeqlenAllocated_,
-                                      FwdStorageParams storage_)
-        : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
+    __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR blockTables_, GM_ADDR actualQseqlen_,
+                                      GM_ADDR actualKvseqlen_, GM_ADDR seqUsedQ_, GM_ADDR seqUsedKv_, GM_ADDR o_,
+                                      GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_, float scaleValue_,
+                                      float softcapValue_, uint32_t numBlocks_, uint32_t maxNumBlocksPerBatch_,
+                                      int64_t kvSeqlenAllocated_, FwdStorageParams storage_)
+        : q(q_), k(k_), v(v_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), o(o_), lse(lse_),
           workSpace(workSpace_), tiling(tiling_), scaleValue(scaleValue_), softcapValue(softcapValue_),
           numBlocks(numBlocks_), maxNumBlocksPerBatch(maxNumBlocksPerBatch_), kvSeqlenAllocated(kvSeqlenAllocated_),
@@ -119,18 +117,7 @@ enum class CacheLayout : uint8_t {
 __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
                                           bool restrictMergedRowsForLargeD = false)
 {
-    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX : (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
-        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
-        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
-        maxTile = maxTile > 0U ? maxTile : 1U;
-        tile = tile < maxTile ? tile : maxTile;
-    }
-    tile = tile < groupSize ? tile : groupSize;
-    if (tile > Q_N_SPLIT_ALIGN) {
-        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    }
-    return tile < 1U ? 1U : tile;
+    return fa950_task::HeadTile(qSeqlen, groupSize, restrictMergedRowsForLargeD ? Q_M_TILE_MAX / 2U : Q_M_TILE_MAX);
 }
 
 #endif

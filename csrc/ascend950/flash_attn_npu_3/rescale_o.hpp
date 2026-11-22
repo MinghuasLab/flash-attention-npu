@@ -178,6 +178,36 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
     }
 
+    template <class Stored, class Register, class Mask>
+    __simd_callee__ static inline void StoreOutput(__ubuf__ Stored* dst, Register& value, Mask mask)
+    {
+        using namespace AscendC::MicroAPI;
+        if constexpr (std::is_same_v<Stored, float>) {
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(dst, value, mask);
+        } else {
+            // On 950, FP32 -> FP16 CAST_NONE and FP32 -> BF16 CAST_RINT both use RINT.
+            static constexpr CastTrait trait = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                                AscendC::RoundMode::CAST_RINT};
+            RegTensor<Stored> packed;
+            Cast<Stored, float, trait>(packed, value, mask);
+            StoreAlign<Stored, StoreDist::DIST_PACK_B32>(dst, packed, mask);
+        }
+    }
+
+    template <uint32_t ColBlocks, bool HeadDimAligned64, bool CastOutput>
+    __aicore__ inline void FinalizeOutput(__ubuf__ ElementOTmp* go, __ubuf__ ElementOTmp* lo, __ubuf__ ElementOTmp* dm,
+                                          __ubuf__ ElementOTmp* gl, uint32_t rows, uint32_t cols, uint32_t stride,
+                                          uint32_t tailCols, bool first)
+    {
+        if (first) {
+            DivFuncLastAndFirst<ElementOTmp, ColBlocks, HeadDimAligned64, CastOutput>(go, lo, gl, rows, cols, stride,
+                                                                                      tailCols, vDequantScale_);
+        } else {
+            RescaleFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64, CastOutput>(
+                go, lo, dm, gl, rows, cols, stride, tailCols, vDequantScale_);
+        }
+    }
+
     template <uint32_t ColBlocks, bool HeadDimAligned64, class TensorDst>
     __aicore__ inline void
     SubCoreCompute(TensorDst& gOTensorTlaTile, uint32_t colStride, uint32_t curTileMod, uint32_t ubOTmpBufId,
@@ -199,25 +229,29 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
         WaitCrossCoreSync<4, PIPE_V>(pvReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
-        if (isFirstKvSTile) {
-            if (!isLastKvSTile) {
-                uint32_t totalCopyElems = rowNumCurSubCore * colStride;
-                AscendC::DataCopy(goUbTensor32, loUbTensor[ubOTmpBufId], totalCopyElems);
-                AscendC::PipeBarrier<PIPE_V>();
+        const bool castFinalOutput = !FULL_QUANT_FP8 && !writePartial && isLastKvSTile;
+        if (isLastKvSTile) {
+            if (castFinalOutput) {
+                FinalizeOutput<ColBlocks, HeadDimAligned64, true>(
+                    goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols, isFirstKvSTile);
             } else {
-                DivFuncLastAndFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
-                    goUb, loUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols, vDequantScale_);
+                FinalizeOutput<ColBlocks, HeadDimAligned64, false>(
+                    goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols, isFirstKvSTile);
             }
-        } else if (!isLastKvSTile) {
+        } else if (isFirstKvSTile) {
+            AscendC::DataCopy(goUbTensor32, loUbTensor[ubOTmpBufId], rowNumCurSubCore * colStride);
+            AscendC::PipeBarrier<PIPE_V>();
+        } else {
             RescaleFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(goUb, loUb, dmUb, rowNumCurSubCore, colNumCurSubCore,
                                                                   colStride, tailCols);
-        } else {
-            RescaleFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
-                goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols, vDequantScale_);
         }
         if (zeroRowCount > 0) {
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate(goUbTensor32, static_cast<ElementOTmp>(0), zeroRowCount * colStride);
+            if (castFinalOutput) {
+                AscendC::Duplicate(goUbTensor16, static_cast<ElementO>(0), zeroRowCount * colStride);
+            } else {
+                AscendC::Duplicate(goUbTensor32, static_cast<ElementOTmp>(0), zeroRowCount * colStride);
+            }
         }
         // release lo buf
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
@@ -249,14 +283,16 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             } else {
-                if (std::is_same<ElementO, bfloat16_t>::value) {
-                    AscendC::Cast(goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_RINT,
-                                  rowNumCurSubCore * colStride);
-                } else {
-                    AscendC::Cast(goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_NONE,
-                                  rowNumCurSubCore * colStride);
+                if constexpr (FULL_QUANT_FP8) {
+                    if (std::is_same<ElementO, bfloat16_t>::value) {
+                        AscendC::Cast(goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_RINT,
+                                      rowNumCurSubCore * colStride);
+                    } else {
+                        AscendC::Cast(goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_NONE,
+                                      rowNumCurSubCore * colStride);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
                 }
-                AscendC::PipeBarrier<PIPE_V>();
                 ZeroInvalidSwaRows(rowNumCurSubCore, colStride, rowOffsetCurSubCore, qSBlockSize, delStartRow,
                                    delEndRow, qSeqlen, qSTileStart);
                 AscendC::PipeBarrier<PIPE_V>();
@@ -509,7 +545,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
     // Keep LSE behind the final O GM write.  goUbTensor32 is free after the
     // EVENT_ID4 wait, so it is a dedicated LSE expansion scratch and never
-    // aliases OnlineSoftmax's maskUb on the following task.
+    // aliases the online softmax statistics.
     __aicore__ inline void WriteGroupedLse(AscendC::GlobalTensor<float> gLse, uint32_t qSBlockSize,
                                            uint32_t qNBlockSize, uint32_t lseHeadStride, bool isDN,
                                            uint32_t fullyMaskedRowsPerHead, int32_t delStartRow = 0,
@@ -527,18 +563,18 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         if (rowCount == 0U) {
             return;
         }
-        if (hasLseScratch_ && qNBlockSize == 1U && fullyMaskedRowsPerHead == 0U &&
+        if (qNBlockSize == 1U && fullyMaskedRowsPerHead == 0U &&
             (qSeqlen == 0U || (delStartRow == 0 && delEndRow == static_cast<int32_t>(qSeqlen)))) {
-            // The dedicated 256-byte scratch keeps LSE independent of the
-            // preceding O DMA: no wait for MTE3_V(4) and no GO aliasing.
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+            const uint32_t freeEvent = hasLseScratch_ ? EVENT_ID6 : EVENT_ID4;
+            auto scratch = hasLseScratch_ ? lseOutUbTensor32 : goUbTensor32;
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(freeEvent);
             ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
-                       (__ubuf__ float*)lseOutUbTensor32.GetPhyAddr(), rowCount);
+                       (__ubuf__ float*)scratch.GetPhyAddr(), rowCount);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
-            AscendC::DataCopyPad(gLse[rowStart], lseOutUbTensor32,
+            AscendC::DataCopyPad(gLse[rowStart], scratch,
                                  AscendC::DataCopyExtParams(1, rowCount * sizeof(float), 0, 0, 0));
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(freeEvent);
             return;
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
@@ -691,142 +727,121 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
     }
 
-    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ static inline void RescaleFuncLastNotFirst(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* dmUb,
-                                                           __ubuf__ T* glUb, uint32_t row, uint32_t col,
-                                                           uint32_t rowStride, uint32_t tailCols, float vDequantScale)
+    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64, bool CastOutput>
+    __simd_vf__ static inline void
+    RescaleFuncLastNotFirst(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* dmUb, __ubuf__ T* glUb, uint32_t row,
+                            uint32_t col, uint32_t rowStride, uint32_t tailCols, float vDequantScale = 1.0f)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
-
-        RegTensor<float> dmVreg;
-        RegTensor<float> glVreg;
-        RegTensor<float> goPreVreg0;
-        RegTensor<float> goPreVreg1;
-        RegTensor<float> goPreVreg2;
-        RegTensor<float> goPreVreg3;
-        RegTensor<float> loVreg0;
-        RegTensor<float> loVreg1;
-        RegTensor<float> loVreg2;
-        RegTensor<float> loVreg3;
-        RegTensor<float> mulVreg0;
-        RegTensor<float> mulVreg1;
-        RegTensor<float> mulVreg2;
-        RegTensor<float> mulVreg3;
-        RegTensor<float> goCurVreg0;
-        RegTensor<float> goCurVreg1;
-        RegTensor<float> goCurVreg2;
-        RegTensor<float> goCurVreg3;
-        RegTensor<float> divVreg0;
-        RegTensor<float> divVreg1;
-        RegTensor<float> divVreg2;
-        RegTensor<float> divVreg3;
-
-        MaskReg preg0 = CreateMask<float, MaskPattern::ALL>();
-        MaskReg preg1 = CreateMask<float, MaskPattern::ALL>();
-        MaskReg preg2 = CreateMask<float, MaskPattern::ALL>();
-        MaskReg preg3 = CreateMask<float, MaskPattern::ALL>();
+        RegTensor<float> dm, gl, go0, go1, go2, go3, lo0, lo1, lo2, lo3;
+        RegTensor<float> mul0, mul1, mul2, mul3, sum0, sum1, sum2, sum3;
+        RegTensor<float> out0, out1, out2, out3;
+        MaskReg p0 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p1 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p2 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p3 = CreateMask<float, MaskPattern::ALL>();
         if constexpr (ColBlocks == 64) {
-            preg0 = UpdateMask<float>(tailCols);
+            p0 = UpdateMask<float>(tailCols);
         } else if constexpr (ColBlocks == 128) {
-            preg1 = UpdateMask<float>(tailCols);
+            p1 = UpdateMask<float>(tailCols);
         } else if constexpr (ColBlocks == 192) {
-            preg2 = UpdateMask<float>(tailCols);
+            p2 = UpdateMask<float>(tailCols);
         } else {
-            preg3 = UpdateMask<float>(tailCols);
+            p3 = UpdateMask<float>(tailCols);
         }
 
         for (uint32_t i = 0; i < row; ++i) {
-            LoadAlign<T, LoadDist::DIST_BRC_B32>(dmVreg, dmUb + i);
-            LoadAlign<T, LoadDist::DIST_BRC_B32>(glVreg, glUb + i);
-
-            __ubuf__ T* goRow;
-            __ubuf__ T* loRow;
+            LoadAlign<T, LoadDist::DIST_BRC_B32>(dm, dmUb + i);
+            LoadAlign<T, LoadDist::DIST_BRC_B32>(gl, glUb + i);
+            __ubuf__ T* go;
+            __ubuf__ T* lo;
             if constexpr (HeadDimAligned64) {
-                goRow = goUb + i * ColBlocks;
-                loRow = loUb + i * ColBlocks;
+                go = goUb + i * ColBlocks;
+                lo = loUb + i * ColBlocks;
             } else {
-                goRow = goUb + i * rowStride;
-                loRow = loUb + i * rowStride;
+                go = goUb + i * rowStride;
+                lo = loUb + i * rowStride;
             }
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg0, goRow);
-            LoadAlign<T, LoadDist::DIST_NORM>(loVreg0, loRow);
+            LoadAlign<T, LoadDist::DIST_NORM>(go0, go);
+            LoadAlign<T, LoadDist::DIST_NORM>(lo0, lo);
             if constexpr (ColBlocks >= 128) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg1, goRow + VL_ELEM_NUM);
-                LoadAlign<T, LoadDist::DIST_NORM>(loVreg1, loRow + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(go1, go + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo1, lo + VL_ELEM_NUM);
             }
             if constexpr (ColBlocks >= 192) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg2, goRow + VL_ELEM_NUM * 2);
-                LoadAlign<T, LoadDist::DIST_NORM>(loVreg2, loRow + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(go2, go + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo2, lo + VL_ELEM_NUM * 2);
             }
             if constexpr (ColBlocks >= 256) {
-                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg3, goRow + VL_ELEM_NUM * 3);
-                LoadAlign<T, LoadDist::DIST_NORM>(loVreg3, loRow + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(go3, go + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo3, lo + VL_ELEM_NUM * 3);
             }
 
-            Mul(mulVreg0, goPreVreg0, dmVreg, preg0);
+            Mul(mul0, go0, dm, p0);
             if constexpr (ColBlocks >= 128) {
-                Mul(mulVreg1, goPreVreg1, dmVreg, preg1);
+                Mul(mul1, go1, dm, p1);
             }
             if constexpr (ColBlocks >= 192) {
-                Mul(mulVreg2, goPreVreg2, dmVreg, preg2);
+                Mul(mul2, go2, dm, p2);
             }
             if constexpr (ColBlocks >= 256) {
-                Mul(mulVreg3, goPreVreg3, dmVreg, preg3);
+                Mul(mul3, go3, dm, p3);
             }
-
-            Add(goCurVreg0, mulVreg0, loVreg0, preg0);
+            Add(sum0, mul0, lo0, p0);
             if constexpr (ColBlocks >= 128) {
-                Add(goCurVreg1, mulVreg1, loVreg1, preg1);
+                Add(sum1, mul1, lo1, p1);
             }
             if constexpr (ColBlocks >= 192) {
-                Add(goCurVreg2, mulVreg2, loVreg2, preg2);
+                Add(sum2, mul2, lo2, p2);
             }
             if constexpr (ColBlocks >= 256) {
-                Add(goCurVreg3, mulVreg3, loVreg3, preg3);
+                Add(sum3, mul3, lo3, p3);
             }
-
-            Div(divVreg0, goCurVreg0, glVreg, preg0);
+            Div(out0, sum0, gl, p0);
             if constexpr (ColBlocks >= 128) {
-                Div(divVreg1, goCurVreg1, glVreg, preg1);
+                Div(out1, sum1, gl, p1);
             }
             if constexpr (ColBlocks >= 192) {
-                Div(divVreg2, goCurVreg2, glVreg, preg2);
+                Div(out2, sum2, gl, p2);
             }
             if constexpr (ColBlocks >= 256) {
-                Div(divVreg3, goCurVreg3, glVreg, preg3);
+                Div(out3, sum3, gl, p3);
             }
 
             if constexpr (FULL_QUANT_FP8) {
-                Muls(divVreg0, divVreg0, vDequantScale, preg0);
+                Muls(out0, out0, vDequantScale, p0);
                 if constexpr (ColBlocks >= 128) {
-                    Muls(divVreg1, divVreg1, vDequantScale, preg1);
+                    Muls(out1, out1, vDequantScale, p1);
                 }
                 if constexpr (ColBlocks >= 192) {
-                    Muls(divVreg2, divVreg2, vDequantScale, preg2);
+                    Muls(out2, out2, vDequantScale, p2);
                 }
                 if constexpr (ColBlocks >= 256) {
-                    Muls(divVreg3, divVreg3, vDequantScale, preg3);
+                    Muls(out3, out3, vDequantScale, p3);
                 }
             }
 
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow, divVreg0, preg0);
+            // Load every FP32 lane of this row before writing the packed output.
+            using Stored = std::conditional_t<CastOutput, ElementO, T>;
+            auto dst = reinterpret_cast<__ubuf__ Stored*>(goUb) + i * (HeadDimAligned64 ? ColBlocks : rowStride);
+            StoreOutput(dst, out0, p0);
             if constexpr (ColBlocks >= 128) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM, divVreg1, preg1);
+                StoreOutput(dst + VL_ELEM_NUM, out1, p1);
             }
             if constexpr (ColBlocks >= 192) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM * 2, divVreg2, preg2);
+                StoreOutput(dst + VL_ELEM_NUM * 2, out2, p2);
             }
             if constexpr (ColBlocks >= 256) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM * 3, divVreg3, preg3);
+                StoreOutput(dst + VL_ELEM_NUM * 3, out3, p3);
             }
         }
     }
 
-    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
+    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64, bool CastOutput>
     __simd_vf__ static inline void DivFuncLastAndFirst(__ubuf__ T* goUb, __ubuf__ T* loUb, __ubuf__ T* glUb,
                                                        uint32_t row, uint32_t col, uint32_t rowStride,
-                                                       uint32_t tailCols, float vDequantScale)
+                                                       uint32_t tailCols, float vDequantScale = 1.0f)
     {
         using namespace AscendC::MicroAPI;
         const uint32_t VL_ELEM_NUM = 64;
@@ -844,15 +859,13 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         } else {
             p3 = UpdateMask<float>(tailCols);
         }
+
         for (uint32_t i = 0; i < row; ++i) {
             LoadAlign<T, LoadDist::DIST_BRC_B32>(gl, glUb + i);
-            __ubuf__ T* go;
             __ubuf__ T* lo;
             if constexpr (HeadDimAligned64) {
-                go = goUb + i * ColBlocks;
                 lo = loUb + i * ColBlocks;
             } else {
-                go = goUb + i * rowStride;
                 lo = loUb + i * rowStride;
             }
             LoadAlign<T, LoadDist::DIST_NORM>(in0, lo);
@@ -876,6 +889,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             if constexpr (ColBlocks >= 256) {
                 Div(out3, in3, gl, p3);
             }
+
             if constexpr (FULL_QUANT_FP8) {
                 Muls(out0, out0, vDequantScale, p0);
                 if constexpr (ColBlocks >= 128) {
@@ -889,15 +903,18 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 }
             }
 
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(go, out0, p0);
+            // Load every FP32 lane of this row before writing the packed output.
+            using Stored = std::conditional_t<CastOutput, ElementO, T>;
+            auto dst = reinterpret_cast<__ubuf__ Stored*>(goUb) + i * (HeadDimAligned64 ? ColBlocks : rowStride);
+            StoreOutput(dst, out0, p0);
             if constexpr (ColBlocks >= 128) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM, out1, p1);
+                StoreOutput(dst + VL_ELEM_NUM, out1, p1);
             }
             if constexpr (ColBlocks >= 192) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 2, out2, p2);
+                StoreOutput(dst + VL_ELEM_NUM * 2, out2, p2);
             }
             if constexpr (ColBlocks >= 256) {
-                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 3, out3, p3);
+                StoreOutput(dst + VL_ELEM_NUM * 3, out3, p3);
             }
         }
     }

@@ -27,8 +27,27 @@ constexpr uint32_t SCORE_STAGES = 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
+constexpr uint32_t MAX_Q_ROWS = 128U;
+constexpr uint32_t KV_TILE = 128U;
+
+struct QkL1Layout {
+    uint32_t qSlots;
+    uint32_t kRows;
+    uint32_t kDepth;
+};
+
+// Each K slot holds one KV tile. For equal-width 16-bit inputs at D=256,
+// Q/K/V use 128 KiB each and P uses 96 KiB (480 KiB of the 512 KiB L1).
+FA950_PLAN_INLINE constexpr QkL1Layout MakeQkL1Layout(uint32_t dq, uint32_t dv, uint32_t kvTile, bool fp8)
+{
+    if (dq == dv && dq > 0U && dq <= 256U) {
+        return {2U, kvTile, (dq + 15U) / 16U * 16U};
+    }
+    return {1U, 256U, fp8 ? 128U : 192U};
+}
+
 struct UbPlan {
-    uint32_t s, p, lo, go, lm, gm, dm, ll, gl, mask, lse, total;
+    uint32_t s, p, lo, go, lm, gm, dm, ll, gl, lse, total;
     uint32_t sBytes, pBytes, loBytes, goBytes, lseBytes, otmpStages;
     // P UB slots: the legacy plan keeps two slots rotating with the Score
     // slot; the D512 plan keeps a single slot with a fixed copy event.
@@ -60,9 +79,8 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlanD512()
     u.dm = u.gm + 64U * 4U;            // 246528
     u.ll = u.dm + P_STAGES * 64U * 4U; // 247296
     u.gl = u.ll + 64U * 4U;            // 247552
-    u.mask = 0U;
-    u.lse = u.gl + 64U * 4U;      // 247808
-    u.total = u.lse + u.lseBytes; // 248064
+    u.lse = u.gl + 64U * 4U;           // 247808
+    u.total = u.lse + u.lseBytes;      // 248064
     return u;
 }
 
@@ -87,9 +105,9 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.dm = u.gm + 64U * 4U;
     u.ll = u.dm + P_STAGES * 64U * 4U;
     u.gl = u.ll + 64U * 4U;
-    u.mask = u.gl + 64U * 4U;
     u.lse = 0U;
-    u.total = u.mask + 2U * 64U * 128U;
+    // Keep the legacy 16 KiB reservation used to select the OTmp stage count.
+    u.total = u.gl + 64U * 4U + 16384U;
     return u;
 }
 
@@ -120,8 +138,7 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.dm = u.gm + 256U;
     u.ll = u.dm + 768U;
     u.gl = u.ll + 256U;
-    u.mask = u.gl + 256U;
-    u.total = u.mask + 16384U;
+    u.total = u.gl + 256U + 16384U;
     return u;
 }
 
@@ -137,8 +154,9 @@ FA950_PLAN_INLINE constexpr uint32_t L1Bytes(uint32_t d, uint32_t dv)
     if (IsD512(d, dv)) {
         return D512L1Bytes();
     }
-    return 128U * ((d + 15U) / 16U * 16U) * 2U + 192U * 256U * 2U * 2U + 128U * 128U * 2U * P_STAGES +
-           128U * ((dv + 15U) / 16U * 16U) * 2U * 2U;
+    const auto qk = MakeQkL1Layout(d, dv, KV_TILE, false);
+    return qk.qSlots * MAX_Q_ROWS * ((d + 15U) / 16U * 16U) * 2U + qk.kDepth * qk.kRows * 2U * 2U +
+           128U * 128U * 2U * P_STAGES + 128U * ((dv + 15U) / 16U * 16U) * 2U * 2U;
 }
 
 FA950_PLAN_INLINE constexpr uint32_t QueryTile(uint32_t d, uint32_t dv, uint32_t maxQ)
@@ -180,7 +198,7 @@ static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
 static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
-static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
+static_assert(L1Bytes(256, 256) == 480U * 1024U && L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan
 
 #undef FA950_PLAN_INLINE

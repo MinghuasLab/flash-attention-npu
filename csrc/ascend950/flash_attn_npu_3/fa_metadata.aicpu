@@ -15,41 +15,13 @@
 #include "tilingdata.h"
 #include "fwd_resource_plan.h"
 #include "fwd_tiling_policy.h"
+#include "fwd_task_shape.h"
 #include <cstdint>
 #include <cstring>
 
 namespace {
-constexpr uint32_t Q_TILE_CEIL = 128;
-constexpr uint32_t BASE_KV_SIZE = 128;
-
-inline uint32_t CeilDiv(uint32_t a, uint32_t b)
-{
-    return (b == 0) ? 0 : (a + b - 1) / b;
-}
-
-inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
-                            bool restrictMergedRowsForLargeD)
-{
-    // Must match kernel GetQNBlockTile (S/N combined axis): several Q heads are
-    // merged into one task. Using a per-head task count here overcounts
-    // totalTaskNum for GQA/MQA and makes the kernel schedule phantom tasks past
-    // the last batch, causing out-of-bounds GM access (507015).
-    constexpr uint32_t Q_M_TILE_MAX = 128;
-    constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
-    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
-        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
-        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
-        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
-        maxTile = maxTile > 0U ? maxTile : 1U;
-        tile = tile < maxTile ? tile : maxTile;
-    }
-    tile = tile < groupSize ? tile : groupSize;
-    if (tile > Q_N_SPLIT_ALIGN) {
-        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
-    }
-    return tile < 1U ? 1U : tile;
-}
+constexpr uint32_t Q_TILE_CEIL = fa950_plan::MAX_Q_ROWS;
+constexpr uint32_t BASE_KV_SIZE = fa950_plan::KV_TILE;
 }  // namespace
 
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
@@ -107,14 +79,16 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->kvBaseTile = metaArgs->quantMode == 1 ? 256U : BASE_KV_SIZE;
     tilingData->quantMode = metaArgs->quantMode;
     tilingData->qkL1TileM = qBaseTile;
-    tilingData->qkL1TileN = 256;
+    const auto qkLayout = fa950_plan::MakeQkL1Layout(metaArgs->embeddingSize, metaArgs->embeddingSizeV,
+                                                     tilingData->kvBaseTile, metaArgs->quantMode == 1U);
+    tilingData->qkL1TileN = qkLayout.kRows;
     tilingData->qkL1TileKLeft = embeddingSizeAligned16;
-    tilingData->qkL1TileKRight = metaArgs->quantMode == 1 ? 128U : 192U;
+    tilingData->qkL1TileKRight = qkLayout.kDepth;
     tilingData->pvL1TileM = qBaseTile;
     tilingData->pvL1TileN = embeddingSizeVAligned16;
     tilingData->pvL1TileKLeft = tilingData->kvBaseTile;
     tilingData->pvL1TileKRight = tilingData->kvBaseTile;
-    tilingData->qL1BufNum = 1;
+    tilingData->qL1BufNum = qkLayout.qSlots;
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
@@ -133,6 +107,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metaArgs->numHeads / metaArgs->numHeadsK;
+    const bool groupTail = metaArgs->quantMode == 0U && groupSize > 1U && actualMaxQ > qBaseTile;
+    tilingData->useGqaTailGrouping = groupTail;
+    bool uniformTasks = true;
     int32_t *kvCum = reinterpret_cast<int32_t *>(
         metaArgs->metaOutAddr + fa_metadata::KvSeqlenOffset(hasMask));
     kvCum[0] = 0;
@@ -151,17 +128,15 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         }
         kvCumSum += kvSeqlen;
         kvCum[batchIdx + 1] = static_cast<int32_t>(kvCumSum);
-        const uint32_t curQNBlockTile = QNBlockTile(
-            qSeqlen, groupSize, qBaseTile < Q_TILE_CEIL);
-        const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-        const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
-        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qBaseTile);
-        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const auto shape = fa950_task::MakeShape(qSeqlen, groupSize, metaArgs->numHeadsK, qBaseTile, groupTail);
         if (batchIdx == 0) {
-            firstBatchTaskNum = curTaskNum;
+            firstBatchTaskNum = shape.totalTasks;
+        } else if (shape.totalTasks != firstBatchTaskNum) {
+            uniformTasks = false;
         }
-        totalTaskNum += curTaskNum;
+        totalTaskNum += shape.totalTasks;
     }
+    tilingData->uniformBatchTaskCount = uniformTasks ? firstBatchTaskNum : 0U;
     tilingData->maxQSeqlen = maxQSeqlen;
     tilingData->maxKvSeqlen = maxKvSeqlen;
     tilingData->firstBatchTaskNum = firstBatchTaskNum;

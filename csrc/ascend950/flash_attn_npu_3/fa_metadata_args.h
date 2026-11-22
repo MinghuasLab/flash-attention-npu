@@ -13,17 +13,13 @@ static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
               "FAInferTilingData must be trivially copyable to cross the AICPU/device boundary");
 
 namespace fa_metadata {
-constexpr uint32_t MASK_DIM = 2048;
-constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
-
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint32_t SIZE_OF_16BIT = 2;
 constexpr uint32_t SIZE_OF_32BIT = 4;
 constexpr uint32_t PRELAUNCH_NUM = 3;
 constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
 
-// scheduler_metadata is tiling + kvCum. The 2048x2048 compressed triu(1) mask
-// is generated locally on the device by MakeDeviceTriuMask when required.
+// Scheduler metadata stores tiling followed by the cumulative KV lengths.
 inline uint64_t TilingOffset(bool /*hasMask*/)
 {
     return 0;

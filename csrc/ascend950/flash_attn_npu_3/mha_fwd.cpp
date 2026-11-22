@@ -27,7 +27,6 @@
 #include "tiling.cpp"
 #include "tilingdata.h"
 #include "fa_metadata_args.h"
-#include "device_triu_mask.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
@@ -321,7 +320,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // 6/7. Tiling source: precomputed AICPU metadata or host tiling
     // ============================================================
     uint8_t* tilingDevice = nullptr;
-    uint8_t* maskDevice = nullptr;
     uint8_t* metaBase = nullptr;
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
@@ -329,7 +327,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "FAInferTilingData must remain a trivially-copyable Device ABI");
     at::Tensor tiling_dev;
-    at::Tensor mask_npu_tensor;
     bool is_local = false;
     bool flashDecodeEnabled = false;
     uint32_t launchBlockDim = blockDim;
@@ -341,9 +338,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1, "scheduler_metadata must be an NPU tensor");
         // Derive the mask axes from this call's arguments the same way
         // get_scheduler_metadata did when producing the buffer, so the
-        // template selection matches the AICPU-written tiling. The compressed
-        // triu mask is generated locally on the device and is not packed into
-        // metadata.
+        // template selection matches the AICPU-written tiling.
         int64_t kvSeqlenBound = 0;
         if (is_varlen_kv) {
             kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
@@ -368,12 +363,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        // D512 masks are positional: neither metadata nor the host path needs
-        // the cached 2048x2048 triu matrix. Legacy dimensions keep it.
-        if (hasMask && quantMode == 0 && !d512_heads) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-        }
     } else {
         at::Tensor cu_seqlen_q_cpu;
         if (is_varlen_q) {
@@ -461,11 +450,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData, sizeof(FAInferTilingData));
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
-
-        if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-        }
     }
 
     // ============================================================
@@ -552,7 +536,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         qDev,
         kDev,
         vDev,
-        maskDevice,
         blockTableDev,
         oDev,
         lseDev,

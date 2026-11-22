@@ -164,6 +164,7 @@ class FAIKernel950 {
 #endif
         // tiling data
 
+        qL1BufNum_ = faiTilingData->qL1BufNum == 2U ? 2U : 1U;
         batch_ = faiTilingData->batch;
         qHeads_ = faiTilingData->numHeads;
         kvHeads_ = faiTilingData->kvHeads;
@@ -293,6 +294,7 @@ class FAIKernel950 {
             taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
             taskStep = 1U;
         }
+        uint32_t nextQSlot = 0U;
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
@@ -494,6 +496,9 @@ class FAIKernel950 {
                 }
             }
             const uint32_t kvSLoopCount = kvSplitEnd - kvSplitStart;
+            if (kvSLoopCount == 0U) {
+                continue;
+            }
 
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
@@ -502,8 +507,10 @@ class FAIKernel950 {
             auto gmQLayoutTla = tla::MakeLayout<ElementQ, LayoutQ>(qShapeCol, qBaseTile_);
             auto gmQTensorTla = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTla, Arch::PositionGM{});
 
+            const Gemm::Block::QueryL1Slot qSlot{nextQSlot};
+            nextQSlot ^= qL1BufNum_ - 1U;
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
-            blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+            blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride, qSlot);
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
                 kShapeRow = numBlocks_ * blockSize_;
@@ -548,9 +555,9 @@ class FAIKernel950 {
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK, blockSize_,
                                 kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0, qSBlockSize,
-                                qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                                qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages, qSlot);
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
                     }
 #endif
                     uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
@@ -649,6 +656,9 @@ class FAIKernel950 {
         // same core sync between pipes
         // Query
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         // Key
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
@@ -712,6 +722,9 @@ class FAIKernel950 {
 #ifdef __DAV_CUBE__
         // same core sync between pipes
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
@@ -839,7 +852,7 @@ class FAIKernel950 {
     static constexpr uint32_t pvL1TileN_ = embedV_;
     static constexpr uint32_t pvL1TileKLeft_ = kvBaseTile_;
     static constexpr uint32_t pvL1TileKRight_ = kvBaseTile_;
-    static constexpr uint32_t qL1BufNum_ = 1;
+    uint32_t qL1BufNum_;
     static constexpr uint32_t kL1BufNum_ = 2;
     static constexpr uint32_t vL1BufNum_ = 2;
     static constexpr uint32_t pL1BufNum_ = 3;
@@ -859,11 +872,11 @@ class FAIKernel950 {
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
-                                   GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
-                                   GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
-                                   float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                                   GM_ADDR qDescale, GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated,
+CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                                   GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                                   GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue,
+                                   uint32_t numBlocks, uint32_t maxNumBlocksPerBatch, GM_ADDR qDescale,
+                                   GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated,
                                    FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
@@ -916,7 +929,6 @@ CATLASS_GLOBAL void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask
     FAIKernelParams params{q,
                            k,
                            v,
-                           mask,
                            blockTables,
                            actualQseqlen,
                            actualKvseqlen,

@@ -20,7 +20,6 @@ struct FwdLaunchArgs {
     uint8_t* q_device;
     uint8_t* k_device;
     uint8_t* v_device;
-    uint8_t* mask_device;        // may be nullptr when not masked
     uint8_t* block_table_device; // may be nullptr when !paged_kv
     uint8_t* o_device;
     uint8_t* lse_device;
