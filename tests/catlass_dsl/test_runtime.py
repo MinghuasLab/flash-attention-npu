@@ -21,7 +21,7 @@ from .test_utils import (
 )
 
 from flash_attn_npu_4.catlass_dsl import builtin, flash_attn_func, flash_attn_varlen_func, runtime
-from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
+from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache
 
 pytestmark = pytest.mark.npu
 
@@ -278,7 +278,7 @@ def test_cached_plan_rebinds_scale_and_segment_boundaries(device, dtype, packed)
 
 def test_attention_plan_eviction_and_clear(device, monkeypatch):
     """Both item eviction and clear must discard the prepared executor."""
-    cache = get_jit_cache()
+    cache = JITCache()
     monkeypatch.setattr(runtime, "compile_cache", cache)
     compiler = Mock(wraps=runtime._compile_kernel)
     monkeypatch.setattr(runtime, "_compile_kernel", compiler)
