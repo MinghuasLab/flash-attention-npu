@@ -410,9 +410,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     } else {
         softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    if (return_lse) {
-        softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    }
 
     // ============================================================
     // 9. Static scheduling and per-call execution data have separate device ABIs.
