@@ -1,0 +1,81 @@
+name: Trusted PR Review
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: Review PR snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve PR snapshot and prior audit
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/prepare_review.py
+
+      - name: Install Cursor CLI
+        if: steps.prepare.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          agent --version
+
+      - name: Run read-only Cursor review
+        id: review
+        if: steps.prepare.outputs.should_run == 'true'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/real_review.py \
+            --pr "${{ steps.prepare.outputs.pr_number }}" \
+            --audit-required "${{ steps.prepare.outputs.audit_required }}" \
+            --expected-head-sha "${{ steps.prepare.outputs.head_sha }}" \
+            --expected-base-sha "${{ steps.prepare.outputs.base_sha }}" \
+            --model cursor-grok-4.5-high-fast \
+            --output-dir "$RUNNER_TEMP/pr-review-result"
+
+      - name: Publish review for the fixed SHA
+        if: steps.prepare.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish_github_review.py \
+            --result "$RUNNER_TEMP/pr-review-result/review_result.json" \
+            --pr "${{ steps.prepare.outputs.pr_number }}" \
+            --expected-head-sha "${{ steps.prepare.outputs.head_sha }}" \
+            --expected-base-sha "${{ steps.prepare.outputs.base_sha }}" \
+            --previous-audit "${{ steps.prepare.outputs.previous_audit }}"
+
+      - name: Save review diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/pr-review-result/
+          if-no-files-found: ignore
+          retention-days: 14
