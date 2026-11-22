@@ -13,6 +13,7 @@
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
 
+#include "../fwd_storage.h"
 #include "kernel_operator.h"
 #include "tilingdata.h"
 
@@ -30,18 +31,6 @@ constexpr uint32_t Q_M_TILE_MAX = 128;
 constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
-
-// Per-call storage geometry, independent of reusable scheduler metadata.
-// Strides are in elements of logical [page, token, head, dim] K/V tensors.
-struct FwdStorageParams {
-    uint64_t keyPageStride;
-    uint64_t valuePageStride;
-    uint64_t keyTokenStride;
-    uint64_t valueTokenStride;
-    uint64_t keyHeadStride;
-    uint64_t valueHeadStride;
-    uint64_t totalQTokens;
-};
 
 struct FAIKernelParams {
     // Data members
@@ -64,9 +53,6 @@ struct FAIKernelParams {
     GM_ADDR kDescale = nullptr;
     GM_ADDR vDescale = nullptr;
     FAInferRuntimeData fp8Runtime{};
-    // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
-    // BSND / TND, whose layout is the compile-time Format template parameter.
-    int64_t kvSeqlenAllocated;
     FwdStorageParams storage{};
 
     // Methods
@@ -75,30 +61,21 @@ struct FAIKernelParams {
     __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                                       GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR seqUsedQ_,
                                       GM_ADDR seqUsedKv_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_,
-                                      GM_ADDR runtimeTiling_, int64_t kvSeqlenAllocated_,
-                                      FwdStorageParams storage_ = {})
+                                      GM_ADDR runtimeTiling_, FwdStorageParams storage_)
         : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
           actualKvseqlen(actualKvseqlen_), seqUsedQ(seqUsedQ_), seqUsedKv(seqUsedKv_), o(o_), lse(lse_),
-          workSpace(workSpace_), tiling(tiling_), runtimeTiling(runtimeTiling_), kvSeqlenAllocated(kvSeqlenAllocated_),
-          storage(storage_)
+          workSpace(workSpace_), tiling(tiling_), runtimeTiling(runtimeTiling_), storage(storage_)
     {}
 };
 
 enum class Format {
     TND = 0,
-    BSND = 1,
-    BNSD = 2
+    BSND = 1
 };
 
 enum class CacheMode {
     normalCache = 0,
     pagedCache = 1,
-};
-
-enum class PageShape {
-    BnBsND = 0,
-    BnNBsD = 1,
-    normalShape = 2,
 };
 
 enum class MaskCategory {

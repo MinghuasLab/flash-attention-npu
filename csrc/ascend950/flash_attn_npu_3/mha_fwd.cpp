@@ -23,6 +23,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "../fwd_tensor_view.hpp"
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"
@@ -74,11 +75,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                 "query, key and value must be on the same NPU device");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-    CHECK_CONTIGUOUS(q);
-    if (!page_table_.has_value() || quantMode == 1) {
-        CHECK_CONTIGUOUS(k);
-        CHECK_CONTIGUOUS(v);
-    }
 
     // ============================================================
     // 2. reject list
@@ -172,58 +168,21 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(cu_seqlens_k.dim() == 1 && cu_seqlens_k.numel() == cu_seqlens_q.numel(),
                     "cu_seqlens_k must be a rank-1 tensor of length batch_size + 1");
     }
-    const auto sizes = q.sizes();
-    int batch_size, seqlen_q, num_heads, head_size_q;
-    // 4b. Layout (FwdLayout, resolved by the Python caller; Q/K/V share one layout)
-    TORCH_CHECK(layout >= static_cast<int64_t>(FwdLayout::TND) && layout <= static_cast<int64_t>(FwdLayout::BNSD),
-                "950 backend (v3) received an unsupported layout code (", layout, ")");
-    const FwdLayout layout_enum = static_cast<FwdLayout>(layout);
-    TORCH_CHECK((layout_enum == FwdLayout::TND) == is_varlen_q,
-                "950 backend (v3) layout code conflicts with cu_seqlens_q: TND requires it, "
-                "BSND and BNSD forbid it");
-
-    if (layout_enum == FwdLayout::TND) {
-        batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
-        seqlen_q = static_cast<int>(max_seqlen_q_.value());
-        num_heads = static_cast<int>(sizes[1]);
-        head_size_q = static_cast<int>(sizes[2]);
-    } else {
-        batch_size = static_cast<int>(sizes[0]);
-        head_size_q = static_cast<int>(sizes[3]);
-        if (layout_enum == FwdLayout::BNSD) {
-            num_heads = static_cast<int>(sizes[1]);
-            seqlen_q = static_cast<int>(sizes[2]);
-        } else {
-            num_heads = static_cast<int>(sizes[2]);
-            seqlen_q = static_cast<int>(sizes[1]);
-        }
-    }
-
-    int64_t kv_seqlen_allocated = 0;
-    if (layout_enum == FwdLayout::BNSD) {
-        // BNSD requires Q, K and V to share the same rank-4 (B, H, S, D) layout.
-        TORCH_CHECK(!paged_KV && !is_varlen_kv && k.dim() == 4 && v.dim() == 4,
-                    "950 backend (v3) BNSD layout requires rank-4, non-paged key/value tensors with "
-                    "the same (B, H, S, D) layout as the query");
-        kv_seqlen_allocated = static_cast<int64_t>(k.size(2));
-        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
-                    "950 backend (v3) BNSD key and value must share batch, head and sequence dimensions "
-                    "(the head dimension may differ)");
-    } else if (layout_enum == FwdLayout::BSND && !paged_KV && k.dim() == 4) {
-        // Dense BSND cache is [B, S_alloc, H, D]. S_alloc is the physical batch
-        // stride; seqused_k / cache_seqlens is only the used prefix.
-        TORCH_CHECK(v.dim() == 4 && k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
-                    "950 backend (v3) dense BSND key and value must share batch, sequence and head dimensions");
-        kv_seqlen_allocated = static_cast<int64_t>(k.size(1));
-    }
+    const auto layout_enum = PrepareFwdViews(layout, is_varlen_q, is_varlen_kv, paged_KV, seqlens_k.numel(), q, k, v);
+    const int batch_size = is_varlen_q ? cu_seqlens_q.numel() - 1 : q.size(0);
+    const int seqlen_q = is_varlen_q ? max_seqlen_q_.value() : q.size(1);
+    const int num_heads = q.size(-2);
+    const int head_size_q = q.size(-1);
+    TORCH_CHECK(k.sizes().slice(0, k.dim() - 1) == v.sizes().slice(0, v.dim() - 1),
+                "key and value must share all dimensions except head dimension D");
+    const int64_t kv_seqlen_allocated = !is_varlen_q && !paged_KV ? k.size(1) : 0;
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
     // k is 3D TND for flash_attn_varlen_func, but 4D
     // (batch/num_blocks, seqlen/block, kv_heads, head) for flash_attn_with_kvcache.
-    const int num_heads_k = layout_enum == FwdLayout::BNSD ? static_cast<int>(k.size(1))
-                                                           : static_cast<int>(k.dim() == 3 ? k.size(1) : k.size(2));
+    const int num_heads_k = k.size(-2);
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -249,21 +208,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(q.size(0) == k.size(0), "query and key/value batch sizes must match in BSND layout");
     }
     if (paged_KV) {
-        TORCH_CHECK(k.size(0) == v.size(0) && k.size(1) == v.size(1) && k.size(2) == v.size(2),
-                    "paged key/value caches must have matching page, page-size, and head dimensions");
-        const auto isBBND = [](const at::Tensor& t) {
-            return t.stride(1) == t.size(2) * t.size(3) && t.stride(2) == t.size(3) && t.stride(3) == 1;
-        };
-        const auto isBNBD = [](const at::Tensor& t) {
-            return t.stride(1) == t.size(3) && t.stride(2) == t.size(1) * t.size(3) && t.stride(3) == 1;
-        };
-        TORCH_CHECK((isBBND(k) && isBBND(v)) || (isBNBD(k) && isBNBD(v)),
-                    "paged key/value caches must use the same BBND or BNBD inner layout; "
-                    "only dimension 0 may otherwise be non-contiguous");
-        TORCH_CHECK(k.size(0) <= 1 || k.stride(0) >= k.size(1) * k.size(2) * k.size(3),
-                    "paged key cache first-axis stride must not overlap physical pages");
-        TORCH_CHECK(v.size(0) <= 1 || v.stride(0) >= v.size(1) * v.size(2) * v.size(3),
-                    "paged value cache first-axis stride must not overlap physical pages");
         TORCH_CHECK(num_blocks > 0 && max_num_blocks_per_seq > 0,
                     "paged KV cache and page_table must contain at least one block");
         TORCH_CHECK(page_table.size(0) == batch_size, "page_table batch dimension must match query batch size");
@@ -291,12 +235,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
     output_sizes.back() = head_size_v;
-    if (layout_enum == FwdLayout::BNSD) {
-        // The BNSD zero-copy path reads Q/K/V as (B, H, S, D) but the kernel
-        // writes O with BSND addressing, so the returned tensor is a contiguous
-        // (B, S, H, D) block equal to the caller's BSND query shape.
-        output_sizes = {batch_size, seqlen_q, num_heads, head_size_v};
-    }
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -351,10 +289,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             kvSeqlenBound = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
         } else if (is_varlen_q) {
             kvSeqlenBound = k.size(0); // 3D TND non-paged: total_kv is an upper bound
-        } else if (layout_enum == FwdLayout::BNSD) {
-            // BNSD stores the sequence on dim2 (heads live on dim1), so the KV
-            // bound must not be read from dim1 here.
-            kvSeqlenBound = k.size(2);
         } else {
             kvSeqlenBound = k.size(1);
         }
@@ -399,9 +333,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                         "950 backend (v3) allocated KV sequence dimension (", kv_seqlen_allocated,
                         ") is too small to cover the actual KV length (", max_kv_seqlen, ")");
         }
-        const int64_t declared_k = max_seqlen_k_.value_or(
-            paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
-                     : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
+        const int64_t declared_k =
+            max_seqlen_k_.value_or(paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+                                            : (k.dim() == 4 ? k.size(1) : k.size(0)));
         const auto maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, declared_k);
         window_size_left = maskDer.window_left;
         window_size_right = maskDer.window_right;
@@ -473,13 +407,13 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // ============================================================
     at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (return_softmax_lse && is_varlen_q) {
-        softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+        softmaxlse = at::empty({num_heads, q.size(0)}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     } else if (return_softmax_lse) {
         softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    if (return_softmax_lse) {
-        softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    }
+    // if (return_softmax_lse) {
+    //     softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    // }
     at::Tensor workspace;
     if (flashDecodeEnabled) {
         workspace =
@@ -566,16 +500,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         softcap,
         static_cast<uint32_t>(num_blocks),
         static_cast<uint32_t>(max_num_blocks_per_seq),
-        kv_seqlen_allocated,
         quantMode,
         qDescale,
         kDescale,
         vDescale,
-        {paged_KV ? static_cast<uint64_t>(k.stride(0)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(0)) : 0U,
-         paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
-         paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
-         is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
-    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
+        {GetFwdStrides(q), GetFwdStrides(k), GetFwdStrides(v), static_cast<uint64_t>(is_varlen_q ? q.size(0) : 0)}};
+    auto launch_fa_infer = [q, k, v, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
         launch_fwd(fwdArgs);
         return 0;
     };

@@ -770,13 +770,14 @@ def flash_attn_varlen_func(
     For paged KV cache, pass page_table and shape k/v as
     (num_pages, page_size, nheads_k, headdim).
     For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass `k.transpose(1, 2)`
-    and `v.transpose(1, 2)`. The transpose is a metadata-only view; FA3 and FA4 recognize its
-    token/head strides and read the original BNBD storage directly.
-    Appending new K/V into a physical BNBD cache is not supported yet.
-    The physical-page axis may be non-contiguous: `stride(0)` is honored independently
-    for K and V, while the selected layout's inner dimensions must be dense. TND batches
-    may contain zero-length Q or KV sequences; an all-zero-Q batch returns empty
-    output/LSE tensors without launching a kernel.
+    and `v.transpose(1, 2)`. On Ascend 950, FA3 and FA4 use each operand's element strides.
+    K and V can have different page, token and head strides, including padding between pages.
+    A dense tensor stored as (batch_size, nheads, seqlen, headdim) likewise uses a
+    `transpose(1, 2)` view. These views preserve the underlying storage.
+    On Ascend 910 the selected cache layout requires dense inner dimensions and supports
+    independent physical-page strides. Appending new K/V into a physical BNBD cache is
+    unsupported. TND batches may contain zero-length Q or KV sequences. An all-zero-Q
+    batch returns empty output/LSE tensors without launching a kernel.
 
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
     than Q. The number of heads in Q must be divisible by the number of heads in KV.

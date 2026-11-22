@@ -124,7 +124,7 @@ class FlashAttentionScoreGradMla950 {
         groupNum_ = static_cast<uint32_t>(tiling_->groupSize);
         qkHeadDim_ = tiling_->qkHeadDim;
         vHeadDim_ = tiling_->vHeadDim;
-        balancedCausal_ = INPUT_LAYOUT == FAGTiling950::Layout::BSND &&
+        balancedCausal_ = inputStrides_.q.head == qkHeadDim_ && INPUT_LAYOUT == FAGTiling950::Layout::BSND &&
                           tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) && !hasSeqUsedQ_ &&
                           !hasSeqUsedKv_ && tiling_->qTile == 128 && tiling_->kvTile == 128 && qSeqlen_ == kvSeqlen_ &&
                           qSeqlen_ >= 4096 && qSeqlen_ % 128 == 0 && qHeadNum_ % 2 == 0 && groupNum_ >= 16;
@@ -506,7 +506,7 @@ class FlashAttentionScoreGradMla950 {
         }
         if (batchNum_ == 1 && groupNum_ == 1 && !hasSeqUsedQ_ && !hasSeqUsedKv_ &&
             tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) && qBlockSize_ == 128 &&
-            kvBlockSize_ == 128 && INPUT_LAYOUT != FAGTiling950::Layout::BNSD) {
+            kvBlockSize_ == 128 && inputStrides_.q.head == qkHeadDim_) {
             uint64_t qbs = 0;
             uint64_t kbs = 0;
             uint32_t sq = 0;

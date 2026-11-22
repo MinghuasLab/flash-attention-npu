@@ -365,7 +365,7 @@ def run_case(
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr(backend, "fwd", capture)
             actual = run_forward(case, inputs, "npu:0")
-        assert layouts and all(value == interface._LAYOUT_BNSD for value in layouts)
+        assert layouts and all(value == interface._LAYOUT_BSND for value in layouts)
         for result, reference in zip(actual, expected):
             assert torch.equal(result, reference)
     else:

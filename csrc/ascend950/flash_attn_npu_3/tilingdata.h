@@ -5,11 +5,7 @@
 
 #include <cstdint>
 
-enum class FwdLayout : uint32_t {
-    TND = 0,
-    BSND = 1,
-    BNSD = 2,
-};
+#include "../fwd_storage.h"
 
 struct coreNode {
     int startBIdx;

@@ -24,12 +24,9 @@ DTYPE_MAP = {
 LAYOUTS = [
     ("bsnd", "BSND", "Format::BSND"),
     ("tnd", "TND", "Format::TND"),
-    ("bnsd", "BNSD", "Format::BNSD"),
 ]
 
-PRELUDE = (
-    "// Copyright (c) 2026, Minghua Shen.\n"
-)
+PRELUDE = "// Copyright (c) 2026, Minghua Shen.\n"
 
 
 @dataclass

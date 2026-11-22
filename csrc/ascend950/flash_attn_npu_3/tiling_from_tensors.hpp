@@ -88,7 +88,7 @@ fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, co
                        bool is_local, int64_t window_size_left, int64_t window_size_right, bool is_varlen_q,
                        bool is_bf16, uint32_t quantMode, int batch_size, int seqlen_q, int num_heads, int num_heads_k,
                        int head_size_q, int head_size_v, float softmax_scale, float softcapValue, bool lse_flag,
-                       FwdLayout layout) // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
+                       FwdLayout layout) // TND (varlen), BSND (B,S,H,D)
 {
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr, "fill_inference_context: varlen Q requires cu_seqlens_q");
@@ -118,13 +118,6 @@ fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, co
     }
     TORCH_CHECK(seqused_k_cpu_int32 != nullptr,
                 "fill_inference_context: per-batch KV seqlen (seqused_k / cache_seqlens) is required");
-    if (layout == FwdLayout::BNSD) {
-        // BNSD KV always uses a per-batch length list; a cumulative (batch+1)
-        // cu-packed list has no meaning for this layout.
-        TORCH_CHECK(seqused_k_cpu_int32->numel() == batch_size,
-                    "fill_inference_context: BNSD KV requires per-batch KV lengths (size = batch), "
-                    "not a cumulative batch+1 list");
-    }
     auto kv_per_batch = copy_int32_vec(*seqused_k_cpu_int32, batch_size);
 
     if (layout == FwdLayout::TND && !paged_KV) {
@@ -195,7 +188,7 @@ fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, co
         quantMode == 1 ? optiling::DataType::FP8 : (is_bf16 ? optiling::DataType::BF16 : optiling::DataType::FP16);
     ctx.pagedCacheFlag = paged_KV;
     ctx.lseFlag = lse_flag;
-    ctx.layout = layout; // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
+    ctx.layout = layout; // TND (varlen), BSND (B,S,H,D)
 
     ctx.innerPrecise = 0; // fixed FP32 accumulation
     ctx.isTilingSink = false;

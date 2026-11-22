@@ -124,8 +124,7 @@ class FlashDecodeCombine950 {
             if constexpr (DenseBsnd) {
                 lseHeadStride = tiling->maxQSeqlen;
             } else {
-                lseHeadStride = FULL_QUANT_FP8 ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch))
-                                               : static_cast<uint32_t>(params.storage.totalQTokens);
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
             }
         }
         const uint32_t combineIdx = tiling->fdCombineCoreSchedules[aivIdx].combineTaskIdx;
@@ -238,8 +237,7 @@ class FlashDecodeCombine950 {
             if constexpr (DenseBsnd) {
                 lseHeadStride = tiling->maxQSeqlen;
             } else {
-                lseHeadStride = FULL_QUANT_FP8 ? static_cast<uint32_t>(actualQ.GetValue(tiling->batch))
-                                               : static_cast<uint32_t>(params.storage.totalQTokens);
+                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
             }
         }
         uint32_t workBase = 0U;

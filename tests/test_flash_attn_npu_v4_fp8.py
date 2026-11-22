@@ -216,7 +216,7 @@ def prepare_v4_forward(kwargs, entry, metadata=False):
     if cuq is None:
         q_max, k_max = q.shape[1], k.shape[1]
         q_heads, kv_heads = q.shape[2], k.shape[2]
-        layout, q, k, v, _ = fa._detect_layout(q, k, v, table, cuk)
+        layout = fa._LAYOUT_BSND
         used_k = torch.full((q.shape[0],), k_max, dtype=torch.int32, device=q.device)
     else:
         layout = fa._LAYOUT_TND
@@ -435,7 +435,7 @@ def run_case(
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr(backend, "fwd", capture)
             actual = run_forward(case, inputs, "npu:0")
-        assert layouts and all(value == interface._LAYOUT_BNSD for value in layouts)
+        assert layouts and all(value == interface._LAYOUT_BSND for value in layouts)
         for result, reference in zip(actual, expected):
             assert torch.equal(result, reference)
     else:

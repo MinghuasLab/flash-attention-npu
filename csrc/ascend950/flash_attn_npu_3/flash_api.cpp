@@ -3,7 +3,6 @@
 // Pybind entrypoint for `flash_attn_npu_3_950` — the Ascend 950 backend
 // for FlashAttention v3.
 
-
 #include <torch/extension.h>
 #include <unordered_map>
 
@@ -27,17 +26,22 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
     c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
     aclrtStream curHandle = currentStream.stream(false);
+    if (aicpuStream.stream(false) == curHandle) {
+        aicpuStream = c10_npu::getNPUStreamFromPool();
+    }
     aclrtStream aicpuHandle = aicpuStream.stream(false);
 
     struct MetadataEvents {
         aclrtEvent inputReady = nullptr;
         aclrtEvent metadataDone = nullptr;
     };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
-    MetadataEvents& events = eventsByDevice[currentStream.device_index()];
+    // Keep capture dependencies local to the stream requesting the schedule.
+    static thread_local std::unordered_map<c10::Stream, MetadataEvents> eventsByStream;
+    MetadataEvents& events = eventsByStream[currentStream.unwrap()];
     if (events.inputReady == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
-        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
+        constexpr uint32_t eventFlags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
+        ACL_CHECK(aclrtCreateEventExWithFlag(&events.inputReady, eventFlags));
+        ACL_CHECK(aclrtCreateEventExWithFlag(&events.metadataDone, eventFlags));
     }
 
     FAMetadataArgs metaArgs = args;
