@@ -86,6 +86,8 @@ struct FAGInfo {
     float scaleValue = 1.0f;
     float softcapValue = 0.0f;
 
+    bool enableBand512 = false;
+
     // TND only: host pointers to per-batch actual sequence lengths.
     const int64_t* actualSeqQ = nullptr;
     const int64_t* actualSeqKv = nullptr;
@@ -167,6 +169,9 @@ struct FAGTilingData {
     uint64_t dqDetOffset = 0;
     uint64_t dkDetOffset = 0;
     uint64_t dvDetOffset = 0;
+    uint32_t dqSwizzle = 0;
+    // Zero uses the standard workspace and schedule. Otherwise this is the dV cast chunk height.
+    uint32_t bandEarlyDvRows = 0;
     uint64_t workspaceSize = 0;
 };
 

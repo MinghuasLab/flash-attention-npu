@@ -15,6 +15,8 @@
 #include "catlass/arch/resource.hpp"
 #include "fag_common.h"
 
+#include <type_traits>
+
 namespace Catlass::Epilogue::Block {
 
 template <typename DataType, class ArchTag, class TilingData, bool ScaleBySoftcap = false>
@@ -27,7 +29,9 @@ class FagPost {
         dqGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(dq));
         dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(dk));
         dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(dv));
-        dqWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dqOffset));
+        // dq workspace is fp16 (halves the atomic fixpipe traffic); dk/dv are
+        // fp32. The fp16 view of the over-allocated dq region is read directly.
+        dqWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(workspace + tiling_->dqOffset));
         dkWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dkOffset));
         dvWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->dvOffset));
         constexpr uint32_t tileElements = 20U * 1024U;
@@ -60,10 +64,14 @@ class FagPost {
         // Softcap scales dk/dq via postScale (mainline).
         const bool dkvAlreadyCast = tiling_->detPrivDkv != 0 || tiling_->earlyDkvCast != 0;
         if (!dkvAlreadyCast) {
-            ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F, vectorCoreId, vectorCoreNum, pingPongIdx,
-                                 mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
-            ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, postScale, vectorCoreId, vectorCoreNum, pingPongIdx,
-                                mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            if (tiling_->bandEarlyDvRows == 0) {
+                ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F, vectorCoreId, vectorCoreNum, pingPongIdx,
+                                     mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            }
+            if (tiling_->bandEarlyDvRows == 0) {
+                ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, postScale, vectorCoreId, vectorCoreNum, pingPongIdx,
+                                    mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            }
         }
         // dqPostAbsorb=1 (deterministic): VecDTM has already written dqGm_
         // directly and dqWorkspace_ is only a single rolling tile — FagPost
@@ -77,8 +85,8 @@ class FagPost {
     }
 
   private:
-    template <bool ApplyScale>
-    CATLASS_DEVICE void ProcessRegion(AscendC::GlobalTensor<DataType>& dst, AscendC::GlobalTensor<float>& src,
+    template <bool ApplyScale, typename SrcElement>
+    CATLASS_DEVICE void ProcessRegion(AscendC::GlobalTensor<DataType>& dst, AscendC::GlobalTensor<SrcElement>& src,
                                       uint64_t elementCount, float scale, uint32_t vectorCoreId, uint32_t vectorCoreNum,
                                       uint32_t& pingPongIdx, event_t mte3ToMte2Ping, event_t mte3ToMte2Pong,
                                       event_t mte2ToVPing, event_t mte2ToVPong, event_t vToMte3Ping,
@@ -101,12 +109,24 @@ class FagPost {
             const uint64_t remaining = rangeCount - done;
             const uint32_t current = static_cast<uint32_t>(remaining < tileElements ? remaining : tileElements);
             const uint64_t gmOffset = rangeBegin + done;
-            AscendC::DataCopyExtParams inputParams{1, static_cast<uint32_t>(current * sizeof(float)), 0, 0, 0};
-            AscendC::DataCopyPadExtParams<float> inputPad{false, 0, 0, 0};
+            AscendC::DataCopyExtParams inputParams{1, static_cast<uint32_t>(current * sizeof(SrcElement)), 0, 0, 0};
+            AscendC::DataCopyPadExtParams<SrcElement> inputPad{false, 0, 0, 0};
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
-            AscendC::DataCopyPad(srcUb_[slot], src[gmOffset], inputParams, inputPad);
+            // fp16 sources stage through the bf16 output tile (same 2-byte
+            // width, no extra UB), then up-cast to fp32 for scale / final cast.
+            if constexpr (std::is_same_v<SrcElement, float>) {
+                AscendC::DataCopyPad(srcUb_[slot], src[gmOffset], inputParams, inputPad);
+            } else {
+                AscendC::DataCopyPad(dstUb_[slot].template ReinterpretCast<SrcElement>(), src[gmOffset], inputParams,
+                                     inputPad);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
+            if constexpr (!std::is_same_v<SrcElement, float>) {
+                AscendC::Cast(srcUb_[slot], dstUb_[slot].template ReinterpretCast<SrcElement>(),
+                              AscendC::RoundMode::CAST_NONE, current);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             if constexpr (ApplyScale) {
                 AscendC::Muls(srcUb_[slot], srcUb_[slot], scale, current);
                 AscendC::PipeBarrier<PIPE_V>();
@@ -127,7 +147,7 @@ class FagPost {
     AscendC::GlobalTensor<DataType> dqGm_;
     AscendC::GlobalTensor<DataType> dkGm_;
     AscendC::GlobalTensor<DataType> dvGm_;
-    AscendC::GlobalTensor<float> dqWorkspace_;
+    AscendC::GlobalTensor<half> dqWorkspace_;
     AscendC::GlobalTensor<float> dkWorkspace_;
     AscendC::GlobalTensor<float> dvWorkspace_;
     AscendC::LocalTensor<float> srcUb_[2];

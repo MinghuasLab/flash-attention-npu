@@ -47,13 +47,18 @@ class FagPre {
                                      : static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
-        ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
+        const uint64_t dqClearFloats = tiling_->bandEarlyDvRows ? (dqCount + 1U) / 2U : dqCount;
+        ClearRegion(dqWorkspace_, dqClearFloats, vectorCoreId, vectorCoreNum);
         // Skip dk/dv workspace clear when those regions are unused:
         //   - detPrivDkv: first write overwrites the private column buffer
         //   - earlyDkvCast: Fixpipe writes bf16 outputs; dk/dv WS size is 0
         if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0) {
-            ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
-            ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+            if (tiling_->bandEarlyDvRows == 0) {
+                ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
+            }
+            if (tiling_->bandEarlyDvRows == 0) {
+                ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+            }
         }
         // readyCounter/doneCounter live at workspace_[0..15]. The non-det
         // tiler sets dqOffset=0 so ClearRegion already zeros that range;

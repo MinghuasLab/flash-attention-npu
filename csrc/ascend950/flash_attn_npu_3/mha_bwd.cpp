@@ -166,6 +166,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         fag_info.window_size_right = window_size_right;
     }
     fag_info.deterministic = deterministic ? 1U : 0U;
+    fag_info.enableBand512 = q.dtype() == at::kBFloat16 && !seqused_q_.has_value() && !seqused_k_.has_value();
     // Deterministic accumulation strategy.  BN2S2 applies the opst arch35
     // column-private schedule when the shape is covered; otherwise fall back
     // to the per-round det-slot + streaming VecDTM reduction.

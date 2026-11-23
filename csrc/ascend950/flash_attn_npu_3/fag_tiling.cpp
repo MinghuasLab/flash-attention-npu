@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace FAGTiling950 {
@@ -196,6 +197,20 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         }
     }
 
+    // Equal Q/KV lengths keep the diagonal inside every BAND window.
+    // Direct dK stores and first-write dV rely on this KV coverage.
+    const char* bandOpt = std::getenv("FAG950_EXPERIMENT_BAND_512");
+    if (bandOpt && bandOpt[0] == '1' && bandOpt[1] == '\0' && info.enableBand512 &&
+        !info.deterministic && (info.layout == Layout::BSND || info.layout == Layout::BNSD) &&
+        info.maskType == MaskType::BAND &&
+        info.qkHeadDim == 256 && info.vHeadDim == 256 &&
+        info.qSeqlen == info.kvSeqlen && info.qSeqlen >= 2048 && info.qSeqlen <= 16384 &&
+        info.softcapValue == 0.0f) {
+        const CastUbPlan plan =
+            PlanBn2s2CastUb(tiling.qTile, tiling.kvTile, info.qkHeadDim, info.vHeadDim, info.ubSize);
+        tiling.bandEarlyDvRows = plan.chunkRows;
+    }
+
     constexpr uint64_t L1_SIZE = 512 * 1024;
     constexpr uint64_t L1_CUBE_SLOT_BYTES = 64 * 1024;
     // Full-residency path budgets the full D column into one cube slot.
@@ -217,6 +232,18 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
     }
 
+    // Opt-in traversal for the measured dense D=256, S=4096 workload.
+    if (!info.deterministic && info.layout == Layout::BSND &&
+        info.qkHeadDim == 256 && info.vHeadDim == 256 &&
+        info.qSeqlen == 4096 && info.kvSeqlen == 4096) {
+        if (const char* value = std::getenv("FAG950_EXPERIMENT_DQ_SWIZZLE")) {
+            const long stride = std::strtol(value, nullptr, 10);
+            if (stride >= 1 && stride <= 31) {
+                tiling.dqSwizzle = static_cast<uint32_t>(stride);
+            }
+        }
+    }
+    if (tiling.bandEarlyDvRows) tiling.dqSwizzle = 2;
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
 
     // Deterministic knobs are only meaningful when the deterministic path is
@@ -240,8 +267,9 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
                               (tiling.shortQ != 0 || tiling.shortBiDir != 0);
         tiling.earlyDkvCast = earlyDkv ? 1 : 0;
 
-        uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dkWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim *
+                            (tiling.bandEarlyDvRows ? sizeof(uint16_t) : FP32_BYTES);
+        uint64_t dkWsSize = (earlyDkv || tiling.bandEarlyDvRows) ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
         uint64_t dvWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
         uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
 
