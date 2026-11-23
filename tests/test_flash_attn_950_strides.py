@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Logical tensor strides at the public Ascend950 FA3/FA4 interfaces."""
 
 import importlib

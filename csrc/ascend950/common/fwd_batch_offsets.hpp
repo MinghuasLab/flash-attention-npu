@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+// Copyright (c) 2026, Minghua Shen.
 #pragma once
 
 #include "kernel_operator.h"

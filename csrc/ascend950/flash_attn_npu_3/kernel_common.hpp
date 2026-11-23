@@ -13,7 +13,7 @@
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
 
-#include "../fwd_storage.h"
+#include "../common/fwd_storage.h"
 #include "kernel_operator.h"
 
 constexpr int32_t NUM1 = 1;

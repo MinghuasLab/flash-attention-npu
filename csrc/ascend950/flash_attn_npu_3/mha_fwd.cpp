@@ -23,7 +23,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
-#include "../fwd_tensor_view.hpp"
+#include "../common/fwd_tensor_view.hpp"
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"

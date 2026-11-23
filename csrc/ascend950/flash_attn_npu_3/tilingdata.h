@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-#include "../fwd_storage.h"
+#include "../common/fwd_storage.h"
 
 struct coreNode {
     int startBIdx;

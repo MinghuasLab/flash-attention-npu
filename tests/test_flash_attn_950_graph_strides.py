@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Ascend950 graph replay with scheduler metadata and strided Q/K/V."""
 
 import importlib

@@ -33,7 +33,7 @@
 #include "tla/layout.hpp"
 
 #include "kernel_common.hpp"
-#include "../fwd_batch_offsets.hpp"
+#include "../common/fwd_batch_offsets.hpp"
 #include "fa_block.h"
 #include "rescale_o.hpp"
 #include "online_softmax_quant.hpp"

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Regression tests for Ascend950 scheduler metadata generated inside an NPUGraph."""
 
 import importlib

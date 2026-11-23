@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 """Paged TND FlashDecode must write every live Q row when its KV length becomes zero."""
 
 import importlib

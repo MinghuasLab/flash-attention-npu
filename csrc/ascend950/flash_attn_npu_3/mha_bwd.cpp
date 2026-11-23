@@ -12,7 +12,7 @@
 #include <optional>
 #include <vector>
 
-#include "../fwd_tensor_view.hpp"
+#include "../common/fwd_tensor_view.hpp"
 #include <torch/extension.h>
 
 #include "acl/acl.h"
