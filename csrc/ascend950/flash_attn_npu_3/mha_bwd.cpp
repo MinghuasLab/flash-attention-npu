@@ -15,6 +15,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "device_triu_mask.h"
 #include "fag_tiling.cpp"
 #include "fag_kernel.cpp"
 #include "fag_bwd_d512_partial.hpp"
@@ -422,13 +423,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         seq_used_k = ptr(seqused_k_.value());
     }
 
-    at::Tensor mask_cpu_tensor;
+    // Causal/band: cached on-device 256x256 compressed triu (epilogue RowMajor).
     at::Tensor mask_npu_tensor;
     uint8_t* mask = nullptr;
     if (has_attn_mask) {
-        mask_cpu_tensor =
-            at::triu(at::ones({256, 256}, at::device(c10::kCPU).dtype(at::kByte)), 1).to(at::Device(at::kPrivateUse1));
-        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        mask_npu_tensor = MakeDeviceTriuMask(/*dim=*/256);
         mask = ptr(mask_npu_tensor);
     }
 

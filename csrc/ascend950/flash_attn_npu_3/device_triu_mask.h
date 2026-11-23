@@ -12,21 +12,27 @@
 
 // Initialize and synchronize only the device used by this caller.
 // Per-thread device caches avoid touching other workers' devices.
-inline at::Tensor MakeDeviceTriuMask()
+//
+// dim=2048: forward compressed mask (mha_fwd).
+// dim=256:  backward FAG epilogue layout RowMajor(256,256) (mha_bwd).
+inline at::Tensor MakeDeviceTriuMask(int64_t dim = 2048)
 {
+    TORCH_CHECK(dim > 0, "MakeDeviceTriuMask: dim must be positive");
     const auto idx = c10_npu::getCurrentNPUStream().device_index();
-    static thread_local std::unordered_map<c10::DeviceIndex, at::Tensor> masks;
-    auto found = masks.find(idx);
+    using Key = uint64_t;
+    const Key key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(idx)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(dim));
+    static thread_local std::unordered_map<Key, at::Tensor> masks;
+    auto found = masks.find(key);
     if (found != masks.end()) {
         return found->second;
     }
     c10_npu::NPUGuard guard(idx);
-    constexpr int64_t dim = 2048;
     at::Tensor mask =
         at::ones({dim, dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, idx)));
     mask.triu_(/*diagonal=*/1);
     c10_npu::getCurrentNPUStream().synchronize();
-    return masks.emplace(idx, std::move(mask)).first->second;
+    return masks.emplace(key, std::move(mask)).first->second;
 }
 
 #endif
