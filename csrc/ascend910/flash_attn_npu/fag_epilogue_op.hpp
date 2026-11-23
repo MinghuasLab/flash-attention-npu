@@ -907,38 +907,6 @@ class BlockEpilogue<EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_M
                           s1ExtendSubGraph * s2ExtendAlign);
         }
 
-        // When this vector tile contains the complete key row, form D
-        // directly from FP32 P*dP. dot(dO, rounded_O) loses the small softmax
-        // derivative for concentrated distributions (especially BF16).
-        int64_t fullKeyCount = INPUT_LAYOUT == TND ? dbParam.actualS2Len : s2;
-        if (dbParam.s2oIdx == 0 && curS2Idx == 0 && fullKeyCount <= s2Extend) {
-            constexpr uint32_t partialStride = 128;
-            LocalTensor<float> rowSums = unifiedBuffer.GetWithOffset<float>(512, 181 * 1024);
-            LocalTensor<float> products = unifiedBuffer.GetWithOffset<float>(1536, 183 * 1024);
-            LocalTensor<float> probabilities = unifiedBuffer.GetWithOffset<float>(8192, DbBegin);
-            uint32_t rowsPerTile = 1536 / s2ExtendAlign;
-            for (uint32_t first = 0; first < s1ExtendSubGraph; first += rowsPerTile) {
-                uint32_t rows = AscendC::Std::min(rowsPerTile, s1ExtendSubGraph - first);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(products, probabilities[first * s2ExtendAlign], vecClc1Buffer[first * s2ExtendAlign],
-                             rows * s2ExtendAlign);
-                AscendC::PipeBarrier<PIPE_V>();
-                uint32_t chunks = CeilDiv(s2Extend, cal_repeat_num);
-                for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-                    uint32_t lanes = AscendC::Std::min(cal_repeat_num, s2Extend - chunk * cal_repeat_num);
-                    AscendC::WholeReduceSum(rowSums[chunk * partialStride], products[chunk * cal_repeat_num], lanes,
-                                            rows, 1, 1, s2ExtendAlign / 8);
-                }
-                AscendC::PipeBarrier<PIPE_V>();
-                for (uint32_t chunk = 1; chunk < chunks; ++chunk) {
-                    AscendC::Add(rowSums, rowSums, rowSums[chunk * partialStride], rows);
-                    AscendC::PipeBarrier<PIPE_V>();
-                }
-                AscendC::Brcb(sfmgClc3[first * 8], rowSums, static_cast<uint8_t>(CeilDiv(rows, 8)), {1, 8});
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-        }
-
         uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t subIdx = 0; subIdx < sub_block_cout; subIdx++) {
