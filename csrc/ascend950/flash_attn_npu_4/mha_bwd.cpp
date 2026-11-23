@@ -1,4 +1,14 @@
-// Copyright (c) 2026, Minghua Shen.
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0.
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
 
 #include "../attention_window.h"
 #include <cmath>
@@ -300,6 +310,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
             dv.zero_();
         }
     }
+    // earlyDkvCast Fixpipe-writes only the columns that run; untouched
+    // columns must stay exact zeros. Dense TND pitches are used for writes.
+    if (fag_tiling_data.earlyDkvCast != 0) {
+        dk.zero_();
+        dv.zero_();
+    }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
     }
@@ -394,42 +410,57 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>     \
-        <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
-                                            ptr(tiling_device))
+    // shortQ/shortBiDir: SINGLE_VEC=true → NO_SPLIT Fixpipe + AIV0-only handshake.
+    // All other shapes (neither flag) stay on SPLIT_M dual-AIV.
+    // Must match flash_attn_npu_3/mha_bwd.cpp: tiling sets shortQ but the
+    // kernel only uses the matching CV sync protocol when SINGLE_VEC=true.
+    const bool launch_single_vec = (fag_tiling_data.shortQ != 0) || (fag_tiling_data.shortBiDir != 0);
 
-#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC)                    \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP,     \
+                           SINGLE_VEC><<<launch_cores, nullptr, stream>>>(                                             \
+        ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, cu_k, seq_used_q, seq_used_k,       \
+        ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device))
+
+#define DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, SINGLE_VEC)                                                      \
     do {                                                                                                               \
         if (has_attn_mask) {                                                                                           \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true, SINGLE_VEC);                                  \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false, SINGLE_VEC);                                 \
                 }                                                                                                      \
             } else {                                                                                                   \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true, SINGLE_VEC);                                 \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false, SINGLE_VEC);                                \
                 }                                                                                                      \
             }                                                                                                          \
         } else {                                                                                                       \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true);                                             \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true, SINGLE_VEC);                                 \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false, SINGLE_VEC);                                \
                 }                                                                                                      \
             } else {                                                                                                   \
                 if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true);                                            \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true, SINGLE_VEC);                                \
                 } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false);                                           \
+                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false, SINGLE_VEC);                               \
                 }                                                                                                      \
             }                                                                                                          \
+        }                                                                                                              \
+    } while (0)
+
+#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
+    do {                                                                                                               \
+        if (launch_single_vec) {                                                                                       \
+            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, true);                                                       \
+        } else {                                                                                                       \
+            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, false);                                                      \
         }                                                                                                              \
     } while (0)
 
@@ -457,11 +488,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     } while (0)
 
     if (fag_tiling_data.d512Partial != 0) {
-        TORCH_CHECK(!deterministic,
-                    "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
+        TORCH_CHECK(!deterministic, "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
-            stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk,
-            dv, workspace, tiling_device, q.dtype() == at::kBFloat16,
+            stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk, dv,
+            workspace, tiling_device, q.dtype() == at::kBFloat16,
             is_varlen ? static_cast<uint32_t>(FAGTiling950::Layout::TND)
                       : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
                                  : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
@@ -503,6 +533,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     }
 
 #undef DISPATCH_BWD950_FLAGS
+#undef DISPATCH_BWD950_FLAGS_SV
 #undef LAUNCH_BWD950
 #undef DISPATCH_BWD950_MLA_FLAGS
 #undef LAUNCH_BWD950_MLA
