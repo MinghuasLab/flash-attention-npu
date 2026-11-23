@@ -5,11 +5,11 @@
 
 #include <cstdint>
 #include "acl/acl.h"
-#include "kernel_common.hpp" // Format / CacheMode / PageShape / MaskCategory / CacheLayout
+#include "kernel_common.hpp" // Format / CacheMode / MaskCategory / CacheLayout
 
 struct FwdLaunchArgs {
     bool is_bf16;
-    Format layout; // TND, BSND or BNSD
+    Format layout; // TND or dense
     MaskCategory mask_category;
     bool paged_kv;
     bool enable_dn;   // use the FAInferDn fast path
@@ -34,7 +34,6 @@ struct FwdLaunchArgs {
     float softcap_value;
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
-    int64_t kv_seqlen_allocated; // allocated KV sequence length (BNSD S, dense BSND S)
     uint32_t quant_mode = 0;
     uint8_t* q_descale_device = nullptr;
     uint8_t* k_descale_device = nullptr;
@@ -50,13 +49,10 @@ void launch_fwd_impl(const FwdLaunchArgs& a);
 
 extern template void launch_fwd_impl<float8_e4m3_t, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<float8_e4m3_t, Format::BSND>(const FwdLaunchArgs& a);
-extern template void launch_fwd_impl<float8_e4m3_t, Format::BNSD>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<bfloat16_t, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<bfloat16_t, Format::BSND>(const FwdLaunchArgs& a);
-extern template void launch_fwd_impl<bfloat16_t, Format::BNSD>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a);
-extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
 
 // Runtime entry: kLayout is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
@@ -66,24 +62,18 @@ inline void launch_fwd(const FwdLaunchArgs& a)
     if (a.quant_mode == 1) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<float8_e4m3_t, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<float8_e4m3_t, Format::BNSD>(a);
         } else {
             launch_fwd_impl<float8_e4m3_t, Format::BSND>(a);
         }
     } else if (a.is_bf16) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<bfloat16_t, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<bfloat16_t, Format::BNSD>(a);
         } else {
             launch_fwd_impl<bfloat16_t, Format::BSND>(a);
         }
     } else {
         if (a.layout == Format::TND) {
             launch_fwd_impl<half, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<half, Format::BNSD>(a);
         } else {
             launch_fwd_impl<half, Format::BSND>(a);
         }

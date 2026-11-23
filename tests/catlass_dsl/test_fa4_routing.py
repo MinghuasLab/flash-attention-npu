@@ -125,7 +125,7 @@ def test_native_float_backward_argument_count_is_unchanged(monkeypatch, entry):
     monkeypatch.setattr(
         legacy,
         "_flash_attn_forward",
-        Mock(return_value=(out, torch.zeros((2, 4, 7)), torch.empty(0), torch.empty(0))),
+        Mock(return_value=(out, torch.zeros((2, 4, 7)))),
     )
     monkeypatch.setattr(
         legacy,
@@ -149,7 +149,7 @@ def test_tensorwise_descales_reach_native_forward(monkeypatch, entry, missing):
         values = [None] * 3
     out = torch.zeros_like(q, dtype=torch.bfloat16)
     lse = torch.zeros((2, 4, 7))
-    backend = Mock(return_value=(out, lse, torch.empty(0), torch.empty(0)))
+    backend = Mock(return_value=(out, lse))
     monkeypatch.setattr(legacy, "_flash_attn_forward", backend)
     monkeypatch.setattr(legacy, "get_scheduler_metadata", Mock(return_value=None))
     monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("Flex")))

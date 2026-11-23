@@ -421,11 +421,8 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     std::vector<uint32_t> splitCounts(bases.size(), 1U);
     if (faInfo_.numSplits > 1U) {
         for (uint32_t base = 0; base < bases.size(); ++base) {
-            if (faInfo_.embeddingSizeV == 512U && bases[base].kvTiles == 0U) {
-                // Keep one candidate, as in auto, so the D512 kernel can write the empty result.
-                continue;
-            }
-            splitCounts[base] = std::min(faInfo_.numSplits, bases[base].kvTiles);
+            // A Q tile with empty KV still needs one task to write zero output and +inf LSE.
+            splitCounts[base] = std::max(1U, std::min(faInfo_.numSplits, bases[base].kvTiles));
         }
     } else {
         uint32_t totalSegments = static_cast<uint32_t>(bases.size());

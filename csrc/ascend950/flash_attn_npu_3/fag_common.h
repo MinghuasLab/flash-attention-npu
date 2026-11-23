@@ -35,7 +35,6 @@ constexpr uint32_t MAX_DTM_CHUNK_TASKS = 64;
 enum class Layout : uint32_t {
     BSND = 0,
     TND = 1,
-    BNSD = 2,
 };
 
 enum class MaskType : uint32_t {

@@ -54,94 +54,6 @@ def _maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
 
-def _transposed_bnsd_view(t):
-    """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
-    if t is None or t.dim() != 4 or t.is_contiguous():
-        return None
-    _, n1, _, n3 = t.shape
-    if t.stride(3) == 1 and t.stride(1) == n3 and t.stride(2) == n1 * n3:
-        return t.transpose(1, 2)
-    return None
-
-
-def _detect_layout(q, k, v, page_table, cu_seqlens_k):
-    """Return ``(layout, q, k, v, out_transposed)``: the layout code shared with the C++
-    host, the operands to hand the kernel, and whether ``out`` must be transposed back to
-    match the shape of the query the caller passed in.
-
-    Only a stride match selects BNSD; otherwise rank-4 operands are read as BSND. Paged and
-    cu-packed (TND) Q/K/V are never BNSD.
-    """
-    if k is not None and v is not None and v.dim() != k.dim():
-        raise RuntimeError(
-            "flash_attn_npu_3_950: key and value must have the same rank for layout detection"
-        )
-
-    if q.dim() != 4 or k.dim() != 4 or page_table is not None or cu_seqlens_k is not None:
-        return _LAYOUT_BSND, q, k, v, False
-
-    q_bnsd = _transposed_bnsd_view(q)
-    k_bnsd = _transposed_bnsd_view(k)
-    v_bnsd = _transposed_bnsd_view(v)
-    # A singleton sequence/head axis has identical BSND and BNSD storage.
-    # Let a non-degenerate FP8 operand anchor layout detection for MQA and Q=1.
-    if q.dtype == torch.float8_e4m3fn and any(x is not None for x in (q_bnsd, k_bnsd, v_bnsd)):
-        if q_bnsd is None and q.is_contiguous() and (q.shape[1] == 1 or q.shape[2] == 1):
-            q_bnsd = q.transpose(1, 2)
-        if k_bnsd is None and k.is_contiguous() and (k.shape[1] == 1 or k.shape[2] == 1):
-            k_bnsd = k.transpose(1, 2)
-        if v_bnsd is None and v.is_contiguous() and (v.shape[1] == 1 or v.shape[2] == 1):
-            v_bnsd = v.transpose(1, 2)
-    if q_bnsd is not None and k_bnsd is not None and v_bnsd is not None:
-        return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, True
-
-    return _LAYOUT_BSND, q, k, v, False
-
-
-def _paged_kv_inner_layout(x):
-    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
-    if x is None or x.dim() != 4:
-        return None
-    page_size, num_heads, head_dim = x.shape[1:]
-    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
-        return "BBND"
-    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
-        return "BNBD"
-    return None
-
-
-def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
-    """Apply the same forward stride policy as FA4 and FIA.
-
-    Dense operands use fixed packed kernel strides and are materialized. Paged
-    K/V remain zero-copy when both caches have the same packed BBND or BNBD
-    inner layout; dimension 0 may still be strided. Other paged views fall
-    back to packed BBND storage. FP8 caches always use packed BBND storage.
-
-    Append-KV is the exception: replacing a cache with a temporary contiguous
-    copy would lose the API's in-place cache update, so an unsupported cache
-    view is rejected instead of copied.
-    """
-    q = q.contiguous()
-    # The FP8 kernel still uses packed page addressing.
-    if page_table is None or q.dtype == torch.float8_e4m3fn:
-        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
-            raise RuntimeError(
-                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
-            )
-        return q, k.contiguous(), v.contiguous()
-
-    key_layout = _paged_kv_inner_layout(k)
-    value_layout = _paged_kv_inner_layout(v)
-    if key_layout is not None and key_layout == value_layout:
-        return q, k, v
-    if append_kv:
-        raise RuntimeError(
-            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
-        )
-    return q, k.contiguous(), v.contiguous()
-
-
 def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
     if q.dim() != 3:
         raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
@@ -194,9 +106,9 @@ def _flash_attn_forward_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if cu_seqlens_q is not None:
         _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
-    q, k, v = _prepare_forward_qkv(
-        q, k, v, page_table, append_kv=k_new is not None or v_new is not None
-    )
+    if (k_new is not None or v_new is not None) and page_table is None:
+        if not k.is_contiguous() or not v.is_contiguous():
+            raise RuntimeError("FA3 append-KV requires contiguous dense K/V caches")
     k_new, v_new = (_maybe_contiguous(x) for x in (k_new, v_new))
     q_descale, k_descale, v_descale = (
         _maybe_contiguous(x) for x in (q_descale, k_descale, v_descale)
@@ -386,13 +298,8 @@ def _flash_attn_backward(
     deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
-    # Same storage detection as forward; retain logical BSND shapes for host/output.
-    if cu_seqlens_q is not None:
-        layout = _LAYOUT_TND
-    else:
-        layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
+    layout = _LAYOUT_TND if cu_seqlens_q is not None else _LAYOUT_BSND
 
-    dout, q, k, v, out = [x.contiguous() if x.stride(-1) != 1 else x for x in (dout, q, k, v, out)]
     softmax_lse = softmax_lse.contiguous()
     qk_head_dim, v_head_dim = q.shape[-1], v.shape[-1]
     qk_bucket, v_bucket = _backward_head_dims(qk_head_dim, v_head_dim)
@@ -685,7 +592,7 @@ def _training_forward(
 ):
     if seqused_k is None:
         if cu_seqlens_q is None:
-            kv_seqlen = k.shape[2] if layout == _LAYOUT_BNSD else k.shape[1]
+            kv_seqlen = k.shape[1]
             seqused_k = torch.full(
                 (q.shape[0],),
                 kv_seqlen,
@@ -772,13 +679,11 @@ class FlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
         quant_mode = 1 if q.dtype == torch.float8_e4m3fn else 0
 
-        # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
-        # below come from the pre-detection shapes; BNSD only re-views the same storage.
         batch_size, seqlen_q, num_heads_q, headdim = q.shape
         seqlen_k, num_heads_kv = k.shape[1], k.shape[2]
         headdim_v = v.shape[3]
 
-        layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
+        layout = _LAYOUT_BSND
         if scheduler_metadata is None:
             meta_cache_seqlens = torch.full(
                 (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
@@ -832,7 +737,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if ctx.quant_mode == 1:
             raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
         q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = (torch.empty(x.shape, dtype=x.dtype, device=x.device) for x in (q, k, v))
         _flash_attn_backward(
             dout,
             q,
@@ -857,7 +762,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
         )
-        return dq, dk, dv, *((None,) * 15)
+        return (dq, dk, dv) + (None,) * (len(ctx.needs_input_grad) - 3)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -906,7 +811,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
         _validate_varlen_query(q, cu_seqlens_q)
-        # The packed varlen query (cu_seqlens_q present) is always TND, never BNSD.
         layout = _LAYOUT_TND
         if scheduler_metadata is None:
             meta_seqused_k = (
@@ -979,7 +883,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if ctx.quant_mode == 1:
             raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
         q, k, v, out, softmax_lse, cu_q, cu_k, seqused_q, seqused_k = ctx.saved_tensors
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = (torch.empty(x.shape, dtype=x.dtype, device=x.device) for x in (q, k, v))
         _flash_attn_backward(
             dout,
             q,
@@ -1186,9 +1090,8 @@ def flash_attn_with_kvcache(
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
             When cu_seqlens_q is provided (TND), non-paged cache must be 3D:
             (total_tokens, nheads_k, headdim_v).
-        Paged K/V may have different non-overlapping page strides. Physical BNBD
-        storage (pages, heads, page_size, dim) is accepted through transpose(1, 2).
-        Other read-only views are materialized as contiguous BBND caches.
+        K and V use independent page, token and head strides. For cache storage
+        shaped (pages, heads, page_size, dim), pass cache.transpose(1, 2).
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
@@ -1238,18 +1141,11 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
 
-    # cu_seqlens_q pins the layout to TND; otherwise _detect_layout picks BSND or BNSD.
-    if cu_seqlens_q is not None:
-        layout, out_transposed = _LAYOUT_TND, False
-    else:
-        # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
-        # below come from the pre-detection shapes; BNSD only re-views the same storage.
+    layout = _LAYOUT_TND if cu_seqlens_q is not None else _LAYOUT_BSND
+    if cu_seqlens_q is None:
         bsnd_batch, bsnd_seqlen_q, bsnd_heads_q, bsnd_headdim = q.shape
         bsnd_seqlen_k, bsnd_heads_kv = k_cache.shape[1], k_cache.shape[2]
         bsnd_headdim_v = v_cache.shape[-1]
-        layout, q, k_cache, v_cache, out_transposed = _detect_layout(
-            q, k_cache, v_cache, page_table, None
-        )
 
     # FlashDecode schedules depend on the runtime KV lengths and are produced
     # by the host tiler.  Keep the upstream metadata path for normal FA, but
@@ -1281,25 +1177,19 @@ def flash_attn_with_kvcache(
             headdim_v = bsnd_headdim_v
             kv_heads = bsnd_heads_kv
             max_q = bsnd_seqlen_q
+        page_size = None
         if page_table is not None:
+            # Match the native forward's mask bound. The planner reads actual KV lengths on device.
             page_size = k_cache.shape[1]
-            max_blocks = page_table.shape[1]
-        else:
-            page_size = None
-            max_blocks = None
-        if cache_seqlens is not None:
+            max_seqlen_k_bound = page_table.shape[1] * page_size
+        elif cache_seqlens is not None:
             max_seqlen_k_bound = int(cache_seqlens.max().item())
-            # BNSD gives every head a max_q_seqlen-wide KV plane, so the per-batch KV
-            # lengths must fit the allocated sequence dim. The host tiler enforces the
-            # same invariant on the non-metadata path.
-            if out_transposed and max_seqlen_k_bound > bsnd_seqlen_k:
+            if cu_seqlens_q is None and max_seqlen_k_bound > bsnd_seqlen_k:
                 raise ValueError(
-                    "flash_attn_npu_3_950: BNSD KV sequence dimension "
+                    "flash_attn_npu_3_950: KV sequence dimension "
                     f"({bsnd_seqlen_k}) is too small to cover the actual KV length "
                     f"({max_seqlen_k_bound})"
                 )
-        elif page_table is not None:
-            max_seqlen_k_bound = max_blocks * page_size
         elif cu_seqlens_q is not None:
             max_seqlen_k_bound = k_cache.shape[0]  # TND 3D non-paged fallback
         else:

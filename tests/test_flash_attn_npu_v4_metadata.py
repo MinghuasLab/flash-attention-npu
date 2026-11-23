@@ -1,5 +1,7 @@
 # Copyright (c) 2026, Minghua Shen.
 
+import math
+
 import pytest
 import torch
 import torch_npu
@@ -1604,3 +1606,64 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     assert_fa_close(out_meta, golden_out_ref, golden_out_pt, softcap=softcap, name="meta_out")
     assert_fa_close(lse_host, golden_lse_ref, golden_lse_pt, softcap=softcap, name="host_lse")
     assert_fa_close(lse_meta, golden_lse_ref, golden_lse_pt, softcap=softcap, name="meta_lse")
+
+
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950 FA4 host tiling")
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,paged,num_splits",
+    [
+        ([2, 0, 3, 0, 1], [5, 7, 0, 0, 4], False, 1),
+        ([0, 2], [3, 0], False, 1),
+        ([2, 0, 3, 0, 1], [5, 7, 0, 0, 4], True, 1),
+        ([1, 2, 1], [0, 1024, 0], True, 4),
+    ],
+    ids=["packed", "packed-disjoint", "paged", "paged-split-kv"],
+)
+def test_host_tiling_tnd_empty_sequences(q_lens, kv_lens, paged, num_splits):
+    q = torch.zeros((sum(q_lens), 2, 64), device="npu", dtype=torch.float16)
+    cu_q = torch.tensor([0, *q_lens], dtype=torch.int32, device=q.device).cumsum(
+        0, dtype=torch.int32
+    )
+    kv_lengths = torch.tensor(kv_lens, dtype=torch.int32, device=q.device)
+    if paged:
+        page_size = 128
+        cols = (max(kv_lens) + page_size - 1) // page_size
+        pages = len(kv_lens) * cols
+        table = torch.arange(pages, dtype=torch.int32, device=q.device).view(len(kv_lens), cols)
+        k = q.new_zeros((pages, page_size, 1, 64))
+        v = torch.empty_like(k)
+        for i in range(len(kv_lens)):
+            v[i * cols : (i + 1) * cols].fill_(i + 1)
+        kv_args = dict(page_table=table, seqused_k=kv_lengths)
+    else:
+        cu_k = torch.tensor([0, *kv_lens], dtype=torch.int32, device=q.device).cumsum(
+            0, dtype=torch.int32
+        )
+        k = q.new_zeros((sum(kv_lens), 1, 64))
+        v = torch.empty_like(k)
+        for i, values in enumerate(v.split(kv_lens)):
+            values.fill_(i + 1)
+        kv_args = dict(cu_seqlens_k=cu_k)
+
+    out, lse, *_ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(kv_lens),
+        disable_scheduler_metadata=True,
+        num_splits=num_splits,
+        return_lse=True,
+        **kv_args,
+    )
+    # Zero logits give uniform attention over each sample's constant V.
+    for i, (rows, logsumexp) in enumerate(
+        zip(out.cpu().split(q_lens), lse.cpu().split(q_lens, dim=1))
+    ):
+        expected = i + 1 if kv_lens[i] else 0
+        torch.testing.assert_close(rows, torch.full_like(rows, expected), rtol=1e-3, atol=1e-3)
+        expected_lse = math.log(kv_lens[i]) if kv_lens[i] else float("inf")
+        torch.testing.assert_close(
+            logsumexp, torch.full_like(logsumexp, expected_lse), rtol=1e-5, atol=1e-5
+        )

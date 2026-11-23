@@ -42,13 +42,12 @@
         }                                                                                                              \
     } while (0)
 
-#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP)                         \
-    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP>  \
-        <<<a.block_dim, nullptr, a.stream>>>(a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,  \
-                                             a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
-                                             a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
-                                             a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,            \
-                                             a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage)
+#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, LSE_MODE, HAS_SOFTCAP)                                       \
+    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP>                \
+        <<<a.block_dim, nullptr, a.stream>>>(                                                                          \
+            a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device, a.lse_device,         \
+            a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
+            a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks, a.max_num_blocks_per_batch, a.storage)
 
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a)
@@ -63,15 +62,14 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
             FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
                 FWD_BOOL_SWITCH(a.paged_kv, IsPaged, {
                     constexpr auto CacheModeV = IsPaged ? CacheMode::pagedCache : CacheMode::normalCache;
-                    constexpr auto PageShapeV = IsPaged ? PageShape::BnBsND : PageShape::normalShape;
                     FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
-                        QuantFA::FAInferDnQuant<DType, float, kLayout, kLayout, CacheModeV, PageShapeV, MaskCat,
-                                                kCacheLayout, LseMode, HasSoftcap><<<a.block_dim, nullptr, a.stream>>>(
+                        QuantFA::FAInferDnQuant<DType, float, kLayout, kLayout, CacheModeV, MaskCat, kCacheLayout,
+                                                LseMode, HasSoftcap><<<a.block_dim, nullptr, a.stream>>>(
                             a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device,
                             a.lse_device, a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,
                             a.workspace_device, a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,
                             a.max_num_blocks_per_batch, a.q_descale_device, a.k_descale_device, a.v_descale_device,
-                            a.kv_seqlen_allocated, a.storage);
+                            a.storage);
                     });
                 });
             });
@@ -82,7 +80,6 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                 FWD_BOOL_SWITCH(a.enable_dn, IsDN, {
                     FWD_BOOL_SWITCH(a.paged_kv, IsPaged, {
                         constexpr auto CacheModeV = IsPaged ? CacheMode::pagedCache : CacheMode::normalCache;
-                        constexpr auto PageShapeV = IsPaged ? PageShape::BnBsND : PageShape::normalShape;
                         // Only NO_MASK has an FAInferDn fast path: masked (causal /
                         // SWA) workloads always use FAInfer. Because this condition
                         // is a compile-time constant, if constexpr also prunes the
@@ -90,9 +87,9 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                         constexpr bool kUseDnFastPath = (MaskCat == MaskCategory::NO_MASK) && IsDN;
                         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
                             if constexpr (kUseDnFastPath) {
-                                FWD_KERNEL_LAUNCH(FAInferDn, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                                FWD_KERNEL_LAUNCH(FAInferDn, MaskCat, CacheModeV, LseMode, HasSoftcap);
                             } else {
-                                FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
+                                FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, LseMode, HasSoftcap);
                             }
                         });
                     });

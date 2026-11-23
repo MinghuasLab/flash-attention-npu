@@ -266,8 +266,8 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
     if (metadataArgs->numSplits > 1) {
         totalSegments = 0;
         for (uint32_t base = 0; base < baseTaskCount; ++base) {
-            splitCounts[base] =
-                metadataArgs->numSplits < bases[base].kvTiles ? metadataArgs->numSplits : bases[base].kvTiles;
+            // A Q tile with empty KV still needs one task to write zero output and +inf LSE.
+            splitCounts[base] = std::max(1U, std::min(metadataArgs->numSplits, bases[base].kvTiles));
             totalSegments += splitCounts[base];
         }
     } else {

@@ -17,6 +17,7 @@
 #include <optional>
 #include <vector>
 
+#include "../common/fwd_tensor_view.hpp"
 #include <torch/extension.h>
 
 #include "acl/acl.h"
@@ -42,9 +43,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     const bool is_varlen = cu_seqlens_q_.has_value();
     TORCH_CHECK(layout >= 0 && layout <= 2, "mha_bwd: invalid layout");
-    const bool is_bnsd = layout == 2;
     TORCH_CHECK(layout != 0 || is_varlen, "mha_bwd: TND requires cu_seqlens_q/k");
-    TORCH_CHECK(!is_bnsd ||
+    TORCH_CHECK(layout != 2 ||
                     (!is_varlen && !cu_seqlens_k_.has_value() && !seqused_q_.has_value() && !seqused_k_.has_value()),
                 "mha_bwd: BNSD does not support cu_seqlens or seqused");
 
@@ -68,6 +68,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                 "Ascend950 v4 bwd: q/k/v/out/dout must use the same layout rank");
     TORCH_CHECK(!is_varlen || (max_seqlen_q_.has_value() && max_seqlen_k_.has_value()),
                 "Ascend950 v4 bwd: max sequence lengths are required for TND");
+
+    for (auto* tensor : {&q, &k, &v, &out, &dout}) {
+        TORCH_CHECK(tensor->device() == q.device(), "mha_bwd: inputs must share the query device");
+        *tensor = PrepareFwdTensor(*tensor);
+    }
 
     const auto q_sizes = q.sizes();
     const auto k_sizes = k.sizes();
@@ -118,12 +123,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     at::Tensor dq = dq_.has_value() ? dq_.value() : at::empty(q.sizes(), q.options());
     at::Tensor dk = dk_.has_value() ? dk_.value() : at::empty(k.sizes(), k.options());
     at::Tensor dv = dv_.has_value() ? dv_.value() : at::empty(v.sizes(), v.options());
-    if (is_bnsd) {
-
-        TORCH_CHECK(k.sizes().slice(0, 3) == v.sizes().slice(0, 3), "mha_bwd: BNSD k/v must share logical B/S/N shape");
+    if (!is_varlen) {
+        TORCH_CHECK(k.sizes().slice(0, 3) == v.sizes().slice(0, 3),
+                    "mha_bwd: dense k/v must share logical B/S/N shape");
         TORCH_CHECK(q.size(0) == k.size(0) && q.sizes().slice(0, 3) == out.sizes().slice(0, 3) &&
                         out.sizes() == dout.sizes(),
-                    "mha_bwd: invalid BNSD batch or out/dout shape");
+                    "mha_bwd: invalid dense batch or out/dout shape");
         TORCH_CHECK(dq.sizes() == q.sizes() && dk.sizes() == k.sizes() && dv.sizes() == v.sizes(),
                     "mha_bwd: dq/dk/dv must match q/k/v shapes");
         TORCH_CHECK(dq.dtype() == q.dtype() && dk.dtype() == q.dtype() && dv.dtype() == q.dtype(),
@@ -131,17 +136,13 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(softmax_lse.dim() == 3 && softmax_lse.size(0) == batch_size && softmax_lse.size(1) == num_heads &&
                         softmax_lse.size(2) == q_seqlen && softmax_lse.scalar_type() == at::kFloat &&
                         softmax_lse.device() == q.device(),
-                    "mha_bwd: BNSD LSE must be float32 [B,Nq,Sq] on q device");
+                    "mha_bwd: dense LSE must be float32 [B,Nq,Sq] on q device");
         softmax_lse = softmax_lse.contiguous();
     }
 
     // ============================================================
     // FAG tiling (host)
     // ============================================================
-    for (const auto& tensor : {q, k, v, out, dout}) {
-        TORCH_CHECK(tensor.stride(-1) == 1 && tensor.device() == q.device(),
-                    "mha_bwd: inputs require contiguous D and the same device");
-    }
     for (const auto& tensor : {dq, dk, dv}) {
         TORCH_CHECK(tensor.is_contiguous() && tensor.device() == q.device(),
                     "mha_bwd: gradients must be contiguous BSND/TND on q device");
@@ -152,8 +153,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         static_cast<float>(softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
     const bool has_softcap = softcap > 0.0;
     fag_info.softcapValue = static_cast<float>(softcap);
-    fag_info.layout =
-        is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
+    fag_info.layout = is_varlen ? FAGTiling950::Layout::TND : FAGTiling950::Layout::BSND;
     bool is_local = false;
     fa_window::NormalizeAttentionWindow(is_causal, q_seqlen, kv_seqlen, window_size_left, window_size_right, is_causal,
                                         is_local);
@@ -316,12 +316,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         dk.zero_();
         dv.zero_();
     }
-    for (const auto& tensor : {q, k, v, out, dout}) {
-        TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
-    }
-    auto tensor_strides = [is_varlen](const at::Tensor& tensor) {
-        return FagTensorStrides{is_varlen ? 0 : tensor.stride(0), tensor.stride(is_varlen ? 0 : 1),
-                                tensor.stride(is_varlen ? 1 : 2)};
+    auto tensor_strides = [](const at::Tensor& tensor) {
+        const auto strides = GetFwdStrides(tensor);
+        return FagTensorStrides{strides.outer, strides.token, strides.head};
     };
     fag_tiling_data.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
                                     tensor_strides(dout), tensor_strides(out), 1};
@@ -491,25 +488,18 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(!deterministic, "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
             stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk, dv,
-            workspace, tiling_device, q.dtype() == at::kBFloat16,
-            is_varlen ? static_cast<uint32_t>(FAGTiling950::Layout::TND)
-                      : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
-                                 : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
-            has_attn_mask, has_softcap));
+            workspace, tiling_device, q.dtype() == at::kBFloat16, static_cast<uint32_t>(fag_info.layout), has_attn_mask,
+            has_softcap));
     } else if (is_mla) {
         if (q.dtype() == at::kBFloat16) {
             if (is_varlen) {
                 DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BNSD);
             } else {
                 DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BSND);
             }
         } else {
             if (is_varlen) {
                 DISPATCH_BWD950_MLA_FLAGS(half, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(half, BNSD);
             } else {
                 DISPATCH_BWD950_MLA_FLAGS(half, BSND);
             }
@@ -517,16 +507,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     } else if (q.dtype() == at::kBFloat16) {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
         } else {
             DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
         }
     } else {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(half, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(half, BNSD);
         } else {
             DISPATCH_BWD950_FLAGS(half, BSND);
         }

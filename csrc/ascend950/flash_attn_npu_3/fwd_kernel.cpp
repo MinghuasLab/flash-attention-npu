@@ -34,6 +34,7 @@
 #include "tla/layout.hpp"
 
 #include "kernel_common.hpp"
+#include "../common/fwd_batch_offsets.hpp"
 #include "fa_block.h"
 #include "rescale_o.hpp"
 #include "online_softmax.hpp"
@@ -53,8 +54,8 @@ static constexpr uint32_t UB_S_OTMP_BUF_STAGES = 2;
 static constexpr uint32_t UB_S_BUF_STAGES = 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
-          Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
-          CacheLayout cacheLayout, bool IsDN, bool LseMode>
+          Format kvFormat, CacheMode kvcacheType, MaskCategory maskCategory, CacheLayout cacheLayout, bool IsDN,
+          bool LseMode>
 class FAIKernel950 {
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
@@ -99,14 +100,7 @@ class FAIKernel950 {
     __aicore__ inline int64_t GetKvSeqLen(uint32_t bIdx, AscendC::GlobalTensor<int32_t>& gKvSeq,
                                           AscendC::GlobalTensor<int32_t>& gSeqUsedKv) const
     {
-        if constexpr (kvFormat == Format::BNSD) {
-            // BNSD KV is indexed per (batch, head) with the allocated plane length;
-            // never use the TND cumulative-length differencing.
-            if (hasSeqUsedKv) {
-                return static_cast<int64_t>(gSeqUsedKv.GetValue(bIdx));
-            }
-            return static_cast<int64_t>(gKvSeq.GetValue(bIdx));
-        } else if constexpr (kvFormat == Format::TND) {
+        if constexpr (kvFormat == Format::TND) {
             if (hasSeqUsedKv) {
                 return static_cast<int64_t>(gSeqUsedKv.GetValue(bIdx));
             }
@@ -229,8 +223,8 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx();
         BlockMmadQK blockMmadQK(resource, qkL1TileHelper);
         BlockMmadPV blockMmadPV(resource, pvL1AddrStart_, pvL1TileHelper);
-        blockMmadQK.SetPageStride(params.storage.keyPageStride);
-        blockMmadPV.SetPageStride(params.storage.valuePageStride);
+        blockMmadQK.SetPageStride(params.storage.k.outer);
+        blockMmadPV.SetPageStride(params.storage.v.outer);
 #endif
 
 #ifdef __DAV_VEC__
@@ -242,61 +236,14 @@ class FAIKernel950 {
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource, ubPlan);
 #endif
 
-        int64_t strideQ = 0;
-        int64_t strideO = 0;
-        int64_t strideK = 0;
-        int64_t strideV = 0;
-        // Per-head element distances. For BSND the head plane is D wide and the
-        // token stride is H*D; for BNSD each head plane is S_alloc*D wide and
-        // the token stride is D.
-        int64_t qHeadStride = 0;
-        int64_t oHeadStride = 0;
-        int64_t kvHeadStrideK = 0;
-        int64_t kvHeadStrideV = 0;
-        int64_t kvNumTokens;
-        if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-            kvNumTokens = gActualKvseqlen.GetValue(batch_);
-        } else {
-            kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1);
-        }
-        // int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
-
-        if constexpr (qFormat == Format::BNSD) {
-            strideQ = embed_;
-            qHeadStride = static_cast<int64_t>(faiTilingData->maxQSeqlen) * embed_;
-        } else {
-            strideQ = qHeads_ * embed_;
-            qHeadStride = embed_;
-        }
-        // Q/K/V are read with the input layout's strides (BNSD stays zero-copy),
-        // but O is always addressed with BSND semantics so the returned tensor is
-        // a contiguous (B, S, H, D) block regardless of the input layout. The
-        // head plane is D wide and the token stride is H*D in BSND.
-        strideO = qHeads_ * embedV_;
-        oHeadStride = embedV_;
-        kvHeadStrideK = embed_;
-        kvHeadStrideV = embedV_;
-        if constexpr (cacheLayout == CacheLayout::nd) {
-            if constexpr (kvFormat == Format::BNSD) {
-                strideK = embed_;
-                strideV = embedV_;
-                kvHeadStrideK = static_cast<int64_t>(params.kvSeqlenAllocated) * embed_;
-                kvHeadStrideV = static_cast<int64_t>(params.kvSeqlenAllocated) * embedV_;
-            } else {
-                strideK = kvHeads_ * embed_;
-                strideV = kvHeads_ * embedV_;
-            }
-        } else {
-            strideK = 16;
-            strideV = 16;
-        }
-
-        if constexpr (kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd) {
-            strideK = params.storage.keyTokenStride;
-            strideV = params.storage.valueTokenStride;
-            kvHeadStrideK = params.storage.keyHeadStride;
-            kvHeadStrideV = params.storage.valueHeadStride;
-        }
+        const int64_t strideQ = params.storage.q.token;
+        const int64_t strideK = params.storage.k.token;
+        const int64_t strideV = params.storage.v.token;
+        const int64_t qHeadStride = params.storage.q.head;
+        const int64_t strideO = static_cast<int64_t>(qHeads_) * embedV_;
+        // Only the NZ tile-copy variant needs a physical token count.
+        constexpr int64_t kvNumTokens = 0;
+        static_assert(cacheLayout == CacheLayout::nd);
 
         uint32_t embedVRound = RoundUp(embedV_, 16);
         uint32_t groupSize = qHeads_ / kvHeads_;
@@ -304,31 +251,15 @@ class FAIKernel950 {
         // positional causal/SWA mask and four-piece PV delivery. Every branch
         // below keys on the tiling fields, which Host and AICPU write jointly.
         const bool d512 = fa950_plan::IsD512(embed_, embedV_) && qBaseTile_ == Q_M_TILE_MAX;
-        int64_t qBOffset = 0;
-        int64_t kBOffset = 0;
-        int64_t vBOffset = 0;
-        int64_t oBOffset = 0;
-        int64_t blockBOffset = 0;
+        FwdBatchOffsets batchOffsets{};
+        const uint32_t lseHeadStride = qFormat == Format::TND ? params.storage.totalQTokens : faiTilingData->maxQSeqlen;
         uint32_t preTotalTaskNum = 0;
         uint32_t curBatch = 0;
         uint32_t cachedBatch = 0xFFFFFFFFU;
         // Used lengths drive task counts; physical (region) lengths drive offsets.
         int64_t qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
-        int64_t qPhysicalSeqlen = faiTilingData->maxQSeqlen;
         int64_t kvSeqlen = 0;
-        int64_t kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
-        if constexpr (qFormat == Format::TND) {
-            qPhysicalSeqlen =
-                static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
-        }
-        if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-            kvPhysicalSeqlen =
-                static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
-        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
-            // Dense BSND is [B, S_alloc, H, D]; S_alloc may exceed cache_seqlens.
-            kvPhysicalSeqlen = params.kvSeqlenAllocated;
-        }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
         uint32_t taskStep = coreNum;
@@ -352,53 +283,7 @@ class FAIKernel950 {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
-                // Batch strides are recomputed on every batch advance because packed
-                // TND regions have a per-batch physical seqlen. Dense BSND uses the
-                // allocated S (constant). BNSD planes are maxSeqlen sized so they
-                // are constant.
-                int64_t qBatchStride = 0;
-                if constexpr (qFormat == Format::BNSD) {
-                    qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
-                } else {
-                    qBatchStride = qPhysicalSeqlen * strideQ;
-                }
-                // O always follows BSND: one batch is qPhysicalSeqlen rows of
-                // strideO elements each.
-                int64_t oBatchStride = qPhysicalSeqlen * strideO;
-                int64_t kBatchStride = 0;
-                int64_t vBatchStride = 0;
-                if constexpr (kvFormat == Format::BNSD) {
-                    kBatchStride = static_cast<int64_t>(kvHeads_) * kvHeadStrideK;
-                    vBatchStride = static_cast<int64_t>(kvHeads_) * kvHeadStrideV;
-                } else {
-                    kBatchStride = kvPhysicalSeqlen * strideK;
-                    vBatchStride = kvPhysicalSeqlen * strideV;
-                }
-                qBOffset += qBatchStride;
-                if constexpr (kvcacheType == CacheMode::normalCache) {
-                    kBOffset += static_cast<uint64_t>(kBatchStride);
-                    vBOffset += static_cast<uint64_t>(vBatchStride);
-                } else {
-                    blockBOffset += static_cast<uint64_t>(maxNumBlocksPerBatch_);
-                }
-                oBOffset += oBatchStride;
-
                 qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
-                qPhysicalSeqlen = faiTilingData->maxQSeqlen;
-                kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
-                if constexpr (qFormat == Format::TND) {
-                    qPhysicalSeqlen =
-                        static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
-                }
-                if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-                    kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
-                                                            gActualKvseqlen.GetValue(curBatch));
-                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
-                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
-                }
-                // GetQSBlockTile is a constant independent of kvSeqlen so the kv
-                // length is resolved in the cachedBatch gate below, not here. If this
-                // function ever becomes kv dependent move the kv resolution back.
                 uint32_t curQNBlockTile =
                     GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -407,6 +292,9 @@ class FAIKernel950 {
             }
             if (curBatch != cachedBatch) {
                 kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
+                batchOffsets = GetFwdBatchOffsets<qFormat == Format::TND, kvcacheType == CacheMode::pagedCache>(
+                    params.storage, curBatch, faiTilingData->maxQSeqlen, qHeads_, maxNumBlocksPerBatch_, gActualQseqlen,
+                    gActualKvseqlen);
                 cachedBatch = curBatch;
             }
             uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNum;
@@ -424,40 +312,14 @@ class FAIKernel950 {
             kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
             qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
             qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
-            int64_t gmOffsetQ = 0;
-            int64_t gmOffsetK = 0;
-            int64_t gmOffsetV = 0;
-            int64_t gmOffsetO = 0;
-            int64_t qSOffset = qSTileIdx * qBaseTile_;
-            gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * qHeadStride;
-            gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * oHeadStride;
-            uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
-            uint64_t lseOffset = static_cast<uint64_t>(qBOffset / strideQ) * qHeads_ +
-                                 static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
-            if constexpr (qFormat == Format::BNSD) {
-                // LSE is packed as (B, H, maxQSeqlen); the batch index cannot be
-                // recovered from qBOffset/strideQ in BNSD, so use curBatch.
-                lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
-                lseOffset = static_cast<uint64_t>(curBatch) * qHeads_ * lseHeadStride +
-                            static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
-            } else if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
-                lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
-                            static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
-            }
+            const int64_t qSOffset = qSTileIdx * qBaseTile_;
+            const int64_t gmOffsetQ = batchOffsets.q + qSOffset * strideQ + qNStartIdx * qHeadStride;
+            const int64_t gmOffsetO =
+                (batchOffsets.outputToken + qSOffset) * strideO + static_cast<int64_t>(qNStartIdx) * embedV_;
+            const uint64_t lseOffset = batchOffsets.lse + static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
+            const int64_t gmOffsetK = batchOffsets.k + kvHeadIdx * params.storage.k.head;
+            const int64_t gmOffsetV = batchOffsets.v + kvHeadIdx * params.storage.v.head;
             int64_t kvSOffset = 0;
-            if constexpr (kvcacheType == CacheMode::pagedCache && kvcacheShape == PageShape::BnNBsD) {
-                strideK = embed_;
-                strideV = embedV_;
-                gmOffsetK = static_cast<uint64_t>(kvHeadIdx) * embed_ * blockSize_;
-                gmOffsetV = static_cast<uint64_t>(kvHeadIdx) * embedV_ * blockSize_;
-            } else if (cacheLayout == CacheLayout::nd) {
-                gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx) * kvHeadStrideK;
-                gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx) * kvHeadStrideV;
-            } else {
-                gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx * embed_) * kvNumTokens;
-                gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_) * kvNumTokens;
-            }
             uint32_t qsBlockNum = (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
             uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
             uint32_t rowNum = qSBlockSize * qNBlockSize;
@@ -548,7 +410,7 @@ class FAIKernel950 {
 #ifdef __DAV_VEC__
                 initOutputs.template operator()<LseMode>(gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize,
                                                          lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
-                                                         static_cast<uint32_t>(oHeadStride));
+                                                         embedV_);
 #endif
                 continue;
             }
@@ -643,14 +505,15 @@ class FAIKernel950 {
                                                          kvSLoopCount, true) +
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     if constexpr (IsDN) {
-                        blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
-                                    0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
-                    } else {
-                        blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
-                                    0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
+                        blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[batchOffsets.blockTable],
+                                    actualBlockShapeQK, blockSize_, kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens,
+                                    kvBaseTile_, 0, 0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
                                     prefixSumL0BStages);
+                    } else {
+                        blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[batchOffsets.blockTable],
+                                    actualBlockShapeQK, blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_,
+                                    kvNumTokens, kvBaseTile_, 0, 0, 0, qSBlockSize, qNBlockSize, qkReadyFlag,
+                                    prefixSumL0AStages, prefixSumL0BStages);
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -798,7 +661,7 @@ class FAIKernel950 {
                         CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdxNow, qkL0BTotalStages_, pvL0BTotalStages_,
                                                          kvSLoopCount, false) +
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
-                    blockMmadPV(gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset], actualBlockShapePV,
+                    blockMmadPV(gmVTensorTla, ubOTmpTensorTla, gBlockTable[batchOffsets.blockTable], actualBlockShapePV,
                                 blockSize_, kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                 0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, d512);
 #endif
@@ -823,10 +686,9 @@ class FAIKernel950 {
                     epilogueRescaleO.template operator()<LseMode>(
                         gmOTensorTla, gLse[lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
                         (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == kvSLoopCount - 1), pvReadyFlag, IsDN,
-                        fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
-                        static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
-                        gPartialO, gPartialLse, writePartial && !IsDN, partialId, fdRowCapacity_, fdLseSubStride_, 1.0f,
-                        d512);
+                        fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO), embedV_,
+                        swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart, gPartialO, gPartialLse,
+                        writePartial && !IsDN, partialId, fdRowCapacity_, fdLseSubStride_, 1.0f, d512);
 #endif
                 }
             }
@@ -1040,12 +902,12 @@ class FAIKernel950 {
     uint32_t pvL0BTotalStages_;
 };
 
-template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
-                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                            uint32_t maxNumBlocksPerBatch, FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1074,8 +936,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     // 处理单个tile内Q和K的matmul
     using L1TileShapeQK = Shape<Int<Q_BLK>, Int<128>, Int<128>>;
     using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
-    using DispatchPolicyQK =
-        Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
+    using DispatchPolicyQK = Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, false, false>;
     using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS,
                                                          LayoutS, void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK,
@@ -1091,8 +952,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
-    using DispatchPolicyPV =
-        Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
+    using DispatchPolicyPV = Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, false, false>;
     using TileCopyPV =
         Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementP, LayoutPDummy, ElementV, LayoutV, ElementOTmp, LayoutOTmp,
                                           void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
@@ -1105,7 +965,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                                                             ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
-                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
+                                kvcacheType, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q,
                            k,
                            v,
@@ -1123,19 +983,19 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated,
+
                            storage};
     Kernel faInfer;
     faInfer(params);
 }
 
-template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
-                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                              FwdStorageParams storage)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1157,8 +1017,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
     using LayoutMask = layout::RowMajor;
     using L1TileShapeQK = Shape<Int<128>, Int<Q_BLK>, Int<128>>;
     using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
-    using DispatchPolicyQK =
-        Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, true>;
+    using DispatchPolicyQK = Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, false, true>;
     using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementK, LayoutK, ElementQ, LayoutQ, ElementS,
                                                          LayoutS, void, Gemm::Tile::CopyL0CToUBMode::SPLIT_N>;
     using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementK, ElementQ,
@@ -1174,8 +1033,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
     // 处理单个tile内P和Value的matmul
     using L1TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
     using L0TileShapePV = Shape<Int<128>, Int<128>, Int<128>>;
-    using DispatchPolicyPV =
-        Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, true>;
+    using DispatchPolicyPV = Gemm::MmadFlashAttentionPV<ArchTag, (bool)kvcacheType, (bool)cacheLayout, false, true>;
     using TileCopyPV =
         Gemm::Tile::PackedTileCopyTlaToUB<ArchTag, ElementP, LayoutPDummy, ElementV, LayoutV, ElementOTmp, LayoutOTmp,
                                           void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
@@ -1188,7 +1046,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                                                             ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
-                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
+                                kvcacheType, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q,
                            k,
                            v,
@@ -1206,7 +1064,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            softcapValue,
                            numBlocks,
                            maxNumBlocksPerBatch,
-                           kvSeqlenAllocated,
+
                            storage};
     Kernel faInfer;
     faInfer(params);

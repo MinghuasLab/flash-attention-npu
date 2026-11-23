@@ -419,7 +419,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
             tiling.dvDetOffset = 0;
             return CheckBn2s2CastUb(tiling, info);
         }
-        if (info.layout != Layout::BSND && info.layout != Layout::BNSD) {
+        if (info.layout != Layout::BSND) {
             fprintf(stderr, "FAG950 det bn2s2: only BSND/TND are supported\n");
             return -1;
         }
