@@ -20,6 +20,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 
+#include "fused_task.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -28,7 +29,6 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
-#include "kernel_common.hpp"
 
 ////////////////////////////////////////////////////////////////////
 #ifndef KERNEL_COMMON
@@ -102,6 +102,17 @@ enum class CacheLayout : uint8_t {
 #include "fused_copy.hpp"
 
 namespace Catlass::Gemm::Block {
+// MTE1 -> MTE2 free events: Q uses 0/5, K uses 1/2, V uses 3/4.
+struct QueryL1Slot {
+    static constexpr uint32_t PONG_EVENT = 5U;
+    uint32_t index;
+
+    __aicore__ inline uint32_t FreeEvent() const
+    {
+        return index == 0U ? EVENT_ID0 : PONG_EVENT;
+    }
+};
+
 struct BlockMmadQKTileHelper {
     uint32_t qkL1TileM;
     uint32_t qkL1TileN;
@@ -163,10 +174,9 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
         l1ATileK = BlockMmadQKTileHelper.qkL1TileKLeft;
         l1BTileK = BlockMmadQKTileHelper.qkL1TileKRight;
+        l1ABufNum = BlockMmadQKTileHelper.qL1BufNum;
+        l1BBufNum = BlockMmadQKTileHelper.kL1BufNum;
 
-        // Buffer counts come from the compile-time plan (kernel_common.hpp) rather than
-        // from the tiling blob, so the per-tile buffer index below is resolved
-        // without a runtime modulo.
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] =
                 resource.l1Buf.template GetBufferByByte<ElementA>(l1ATileM * l1ATileK * sizeof(ElementA) * i);
@@ -205,13 +215,14 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     // qHeadStride is the source-tensor distance (in elements) between adjacent
     // Q heads: embed for BSND, maxQSeqlen * embed for BNSD.  It is the row
     // pitch of the Nd2Nz source matrix (rows are Q heads).
-    // Segmented == false compiles to the plain single-tile Q load: the fusion
-    // bookkeeping (L1 offset, first/last segment flags) is compile-time removed
-    // so non-fused kernels keep the original pipeline.
+    // Segmented == false compiles to the plain single-tile Q load. When a task
+    // spans several KV heads, one segment per KV head is copied into its own
+    // 16-row aligned L1 slice behind a single Q slot; the free/wait pair is
+    // issued only once around the whole task.
     template <bool Segmented = false, class TensorA>
     __aicore__ inline void loadQGM(TensorA& gATensor, GemmCoord actualOriShape, uint32_t qSBlockSize,
-                                   uint32_t qNBlockSize, int64_t qHeadStride, uint32_t qL1Offset = 0U,
-                                   bool firstSegment = true, bool lastSegment = true)
+                                   uint32_t qNBlockSize, int64_t qHeadStride, QueryL1Slot qSlot,
+                                   uint32_t qL1Offset = 0U, bool firstSegment = true, bool lastSegment = true)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
@@ -219,13 +230,14 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t rowNum = actualOriShape[0];
         auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qSlot.index][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
 
         if constexpr (Segmented) {
-            if (firstSegment)
-                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+            if (firstSegment) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
+            }
         } else {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
         }
         if (embed == 512U && qNBlockSize == 1U) {
             // D512 single head uses one strided [S, D] matrix; legacy
@@ -235,7 +247,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                                 tla::MakeStride(tla::get<0>(gATensor.stride()), tla::Int<1>{}));
             auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
             auto l1QLayoutTla = MakeCustomLayout(rowNum, embedPhysical, 1U);
-            auto l1QTensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1QLayoutTla, Arch::PositionL1{});
+            auto l1QTensorTla = tla::MakeTensor(l1ATensor[qSlot.index][qL1Offset], l1QLayoutTla, Arch::PositionL1{});
             auto l1QTile = GetTile(l1QTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qSBlockSize, embed));
             copyGmToL1A(l1QTile, gmQTensorTla);
         } else {
@@ -321,8 +333,9 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                uint32_t kvSeqlenTriDown, uint32_t kvHeads, uint32_t kvNumTokens, uint32_t kvSBaseTile,
                uint32_t isShrink, uint32_t globalWindowSize, uint32_t localWindowSize, uint32_t qSBlockSize,
                uint32_t qNBlockSize, Arch::CrossCoreFlag qkReadyFlag, uint64_t prefixSumL0AStages,
-               uint64_t prefixSumL0BStages, uint32_t qL1Offset = 0U, uint32_t rowOffset = 0U, uint32_t totalRows = 0U,
-               bool firstSegment = true, bool lastSegment = true, uint32_t segIdx = 0U, uint32_t segTotal = 1U)
+               uint64_t prefixSumL0BStages, QueryL1Slot qSlot, uint32_t qL1Offset = 0U, uint32_t rowOffset = 0U,
+               uint32_t totalRows = 0U, bool firstSegment = true, bool lastSegment = true, uint32_t segIdx = 0U,
+               uint32_t segTotal = 1U)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -341,19 +354,14 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t l1BBufId = Segmented ? (pipelineTileSeq * segTotal + segIdx) % l1BBufNum : pipelineTileSeq % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
-        // Must match loadQGM: the multi-ND copy stores adjacent Q heads
-        // qSBlockSize rows apart in L1.
         auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qSlot.index][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1
-        // One QK task covers at most FA4_Q_TASK_ROWS Q rows and one KV base
-        // tile, so the M and N loops are single-iteration by construction: keep
-        // them compile-time so no runtime CeilDiv / last-iteration test remains.
-        static_assert(FA4_Q_TASK_ROWS <= L0_TILE_M, "Q rows per task must fit one L0 M tile");
-        static_assert(FA4_KV_BASE_TILE <= L0_TILE_N, "KV base tile must fit one L0 N tile");
-        constexpr uint32_t mL0LoopNum = 1U;
-        constexpr uint32_t nL0LoopNum = 1U;
+        constexpr bool singleTile = std::is_same_v<ElementA, half> || std::is_same_v<ElementA, bfloat16_t>;
+        static_assert(!singleTile || (L0_TILE_M >= fa950_task::MAX_Q_ROWS && L0_TILE_N >= fa950_task::KV_TILE));
+        const uint32_t mL0LoopNum = singleTile ? 1U : CeilDiv(rowNum, L0_TILE_M);
+        const uint32_t nL0LoopNum = singleTile ? 1U : CeilDiv(curBaseTileSize, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
         // while splitting the base tile S to 2 AIVs,
@@ -588,8 +596,9 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
         }
         // crossCoreSync after all fixPipe move
-        if (!Segmented || lastSegment)
+        if (!Segmented || lastSegment) {
             SetCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);
+        }
     }
 
   protected:
@@ -608,10 +617,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    static constexpr uint32_t l1ABufNum = Q_L1_BUF_NUM;
-    static constexpr uint32_t l1BBufNum = K_L1_BUF_NUM;
-    static_assert(l1ABufNum <= MAX_L1_STAGES, "Q L1 buffer count exceeds the static L1 tensor array");
-    static_assert(l1BBufNum <= MAX_L1_STAGES, "K L1 buffer count exceeds the static L1 tensor array");
+    uint32_t l1ABufNum;
+    uint32_t l1BBufNum;
 
     uint32_t l1PPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;

@@ -93,9 +93,10 @@ struct FAInferStaticTilingData {
     uint64_t pvOutSize;
     uint64_t UpdateSize;
     uint64_t workSpaceSize;
-    uint64_t padding1;
+    uint64_t uniformBatchTaskCount = 0; // Formerly reserved; zero selects variable task counts.
     uint64_t padding2;
-    uint32_t fusedCrossGroup;
+    // 0/1 retain the former fusedCrossGroup boolean. New metadata stores 2 + group budget.
+    uint32_t headGroupBudget = 0U;
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int32_t sparseMode = 0;
@@ -211,17 +212,13 @@ struct FAInferStaticTilingData {
     {
         return workSpaceSize;
     }
-    uint64_t get_padding1() const
+    uint64_t get_uniformBatchTaskCount() const
     {
-        return padding1;
+        return uniformBatchTaskCount;
     }
     uint64_t get_padding2() const
     {
         return padding2;
-    }
-    uint32_t get_fusedCrossGroup() const
-    {
-        return fusedCrossGroup;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -309,17 +306,13 @@ struct FAInferStaticTilingData {
     {
         workSpaceSize = value;
     }
-    void set_padding1(uint64_t value)
+    void set_uniformBatchTaskCount(uint64_t value)
     {
-        padding1 = value;
+        uniformBatchTaskCount = value;
     }
     void set_padding2(uint64_t value)
     {
         padding2 = value;
-    }
-    void set_fusedCrossGroup(uint32_t value)
-    {
-        fusedCrossGroup = value;
     }
     void set_sparseMode(int32_t value)
     {

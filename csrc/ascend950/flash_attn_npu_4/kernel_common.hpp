@@ -12,23 +12,9 @@
 
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
-#include "fused_task.h"
 
 #include "kernel_operator.h"
 #include "tilingdata.h"
-
-// Fixed L1 buffer counts of the 950 FA v4 forward kernel. They are compile-time
-// constants so the cube side resolves the per-tile buffer index and the L0 loop
-// bounds without a runtime division/modulo on the scalar unit for every KV tile.
-// The host tiling (tiling.cpp / fa_metadata.aicpu) writes the same values into
-// qL1BufNum..pL1BufNum; keep the two in sync if the pipeline depth changes.
-constexpr uint32_t Q_L1_BUF_NUM = 1U; // Q stays resident across KV tiles
-constexpr uint32_t K_L1_BUF_NUM = 2U;
-constexpr uint32_t V_L1_BUF_NUM = 2U;
-constexpr uint32_t P_L1_BUF_NUM = 3U; // P is pre-launched two tiles ahead
-// One forward task covers at most Q_TASK_ROWS Q rows and one KV base tile.
-constexpr uint32_t FA4_Q_TASK_ROWS = 128U;
-constexpr uint32_t FA4_KV_BASE_TILE = 128U;
 
 constexpr int32_t NUM1 = 1;
 constexpr int32_t NUM4 = 4;
@@ -129,7 +115,18 @@ enum class CacheLayout : uint8_t {
 __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
                                           bool restrictMergedRowsForLargeD = false)
 {
-    return fa950_task::LegacyHeadTile(qSeqlen, groupSize, restrictMergedRowsForLargeD ? 64U : 128U);
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX : (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
+        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
+        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
+        maxTile = maxTile > 0U ? maxTile : 1U;
+        tile = tile < maxTile ? tile : maxTile;
+    }
+    tile = tile < groupSize ? tile : groupSize;
+    if (tile > Q_N_SPLIT_ALIGN) {
+        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    }
+    return tile < 1U ? 1U : tile;
 }
 
 #endif

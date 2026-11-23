@@ -20,6 +20,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
+#include "fused_task.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -28,6 +29,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
+#include "fused_copy.hpp"
 
 ////////////////////////////////////////////////////////////////////
 #ifndef KERNEL_COMMON
@@ -98,8 +100,6 @@ enum class CacheLayout : uint8_t {
 
 #endif
 ////////////////////////////////////////////////////////////////////
-#include "fused_copy.hpp"
-
 namespace Catlass::Gemm::Block {
 struct BlockMmadPVTileHelper {
     uint32_t pvL1TileM;
@@ -163,9 +163,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = pvL1TileHelper.pvL1TileN;
         l1ATileK = pvL1TileHelper.pvL1TileKLeft;
         l1BTileK = pvL1TileHelper.pvL1TileKRight;
-        // Buffer counts come from the compile-time plan (kernel_common.hpp) rather than
-        // from the tiling blob, so the per-tile buffer index below is resolved
-        // without a runtime modulo.
+        l1ABufNum = pvL1TileHelper.pL1BufNum;
+        l1BBufNum = pvL1TileHelper.vL1BufNum;
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + l1ATileM * l1ATileK *
                                                                                                   sizeof(ElementA) * i);
@@ -428,20 +427,18 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         // fwd crossCoreSync from online sm to pv
         if (Segmented) {
-            if (firstSegment)
+            if (firstSegment) {
                 WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+            }
         } else {
             WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
         }
         // P full base tile already on L1
-        // One PV task covers at most FA4_Q_TASK_ROWS Q rows and one KV base
-        // tile, so the M and K loops are single-iteration by construction: keep
-        // them compile-time so no runtime CeilDiv / last-iteration test remains.
-        static_assert(FA4_Q_TASK_ROWS <= L0_TILE_M, "Q rows per task must fit one L0 M tile");
-        static_assert(FA4_KV_BASE_TILE <= L0_TILE_K, "KV base tile must fit one L0 K tile");
-        constexpr uint32_t mL0LoopNum = 1U;
-        constexpr uint32_t kL0LoopNum = 1U;
+        constexpr bool singleTile = std::is_same_v<ElementA, half> || std::is_same_v<ElementA, bfloat16_t>;
+        static_assert(!singleTile || (L0_TILE_M >= fa950_task::MAX_Q_ROWS && L0_TILE_K >= fa950_task::KV_TILE));
+        const uint32_t mL0LoopNum = singleTile ? 1U : CeilDiv(rowNum, L0_TILE_M);
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
+        const uint32_t kL0LoopNum = singleTile ? 1U : CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
@@ -512,8 +509,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
                     // reverse crossCoreSync for P
                     if ((mL0Itr == mL0LoopNum - 1) && (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
-                        if (!Segmented || lastSegment)
+                        if (!Segmented || lastSegment) {
                             SetCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+                        }
                     }
 
                     bool initMmad = (kL0Itr == 0);
@@ -591,10 +589,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    static constexpr uint32_t l1ABufNum = P_L1_BUF_NUM;
-    static constexpr uint32_t l1BBufNum = V_L1_BUF_NUM;
-    static_assert(l1ABufNum <= MAX_L1_STAGES, "P L1 buffer count exceeds the static L1 tensor array");
-    static_assert(l1BBufNum <= MAX_L1_STAGES, "V L1 buffer count exceeds the static L1 tensor array");
+    uint32_t l1ABufNum;
+    uint32_t l1BBufNum;
 };
 ////////////////////////////////////////////////////////////////////
 

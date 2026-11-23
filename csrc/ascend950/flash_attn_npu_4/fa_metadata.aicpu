@@ -22,7 +22,7 @@
 #include <cstring>
 
 namespace {
-constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t Q_TILE_CEIL = fa950_task::MAX_Q_ROWS;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t BASE_KV_SIZE = 128;
 constexpr uint32_t MAX_FD_CORES = 32;
@@ -230,7 +230,8 @@ __attribute__((noinline)) void FillFlashDecodeTiling(FAInferStaticTilingData* ti
                                 : static_cast<uint32_t>(seqlensK[batchIndex]);
         const uint32_t qTileCount = CeilDiv(qSeqlen, qBaseTile);
         const uint32_t kvTileCount = CeilDiv(kvSeqlen, tilingData->kvBaseTile);
-        const uint32_t qnBlockTile = GetQNBlockTile(qSeqlen, groupSize, tilingData->qBaseTile);
+        const uint32_t qnBlockTile = GetQNBlockTile(qSeqlen, groupSize,
+            tilingData->quantMode == 1U && tilingData->embeddingSizeV > 128U ? 64U : tilingData->qBaseTile);
         const uint32_t qnBlocksPerGroup = CeilDiv(groupSize, qnBlockTile);
         const uint32_t qnTaskCount = qnBlocksPerGroup * metadataArgs->numHeadsK;
 
@@ -464,17 +465,20 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
         fa950_plan::SelectQueryTile(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV,
             metadataArgs->maxQSeqlen, fullQ128Tasks, metadataArgs->blockDim, metadataArgs->maskType == 2,
             metadataArgs->windowSizeLeft, metadataArgs->windowSizeRight);
+
     tilingData->quantMode = metadataArgs->quantMode;
-    tilingData->kvBaseTile = metadataArgs->quantMode == 1 ? 256U : 128U;
+    tilingData->kvBaseTile = metadataArgs->quantMode == 1 ? 256U : fa950_task::KV_TILE;
     tilingData->qkL1TileM = 128;
-    tilingData->qkL1TileN = 256;
+    const auto qkLayout = fa950_task::MakeQkL1Layout(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV,
+                                                     tilingData->kvBaseTile, metadataArgs->quantMode == 1U);
+    tilingData->qkL1TileN = qkLayout.kRows;
     tilingData->qkL1TileKLeft = (metadataArgs->embeddingSize + 15) / 16 * 16;
-    tilingData->qkL1TileKRight = metadataArgs->quantMode == 1 ? 128U : 192U;
+    tilingData->qkL1TileKRight = qkLayout.kDepth;
     tilingData->pvL1TileM = 128;
     tilingData->pvL1TileN = (metadataArgs->embeddingSizeV + 15) / 16 * 16;
     tilingData->pvL1TileKLeft = tilingData->kvBaseTile;
     tilingData->pvL1TileKRight = tilingData->kvBaseTile;
-    tilingData->qL1BufNum = 1;
+    tilingData->qL1BufNum = qkLayout.qSlots;
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
@@ -489,21 +493,28 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 
     uint32_t maxQSeqlen = 0;
     uint32_t maxKvSeqlen = 0;
-    // Short-KV flag must be identical to the host tiling and the AICore view, so
-    // it is resolved once from the global max KV length before the task loop.
-    uint32_t preMaxKv = 0;
-    for (uint32_t batchIdx = 0; batchIdx < metadataArgs->batch; ++batchIdx) {
-        const uint32_t kvSeqlen = metadataArgs->isVarlenKv
-                                      ? static_cast<uint32_t>(seqlensK[batchIdx + 1] - seqlensK[batchIdx])
-                                      : static_cast<uint32_t>(seqlensK[batchIdx]);
-        if (kvSeqlen > preMaxKv) {
-            preMaxKv = kvSeqlen;
-        }
-    }
-    const bool tinyKvFusion = preMaxKv <= BASE_KV_SIZE;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
+    // The D512 positional pipeline has no segmented multi-KV-head delivery.
+    const uint32_t maxBudget = metadataArgs->quantMode == 0U &&
+        !fa950_plan::IsD512(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV) ?
+        fa950_task::HeadGroupBudget(metadataArgs->batch, metadataArgs->numHeadsK, metadataArgs->blockDim) : 0U;
+    bool multipleKvTiles = false;
+    if (groupSize == 1U && maxBudget > 4U) {
+        for (uint32_t i = 0; i < metadataArgs->batch; ++i) {
+            const uint32_t length = metadataArgs->isVarlenKv
+                ? static_cast<uint32_t>(seqlensK[i + 1] - seqlensK[i])
+                : static_cast<uint32_t>(seqlensK[i]);
+            if (length > tilingData->kvBaseTile) {
+                multipleKvTiles = true;
+                break;
+            }
+        }
+    }
+    const uint32_t budget = fa950_task::MultiTileBudget(maxBudget, groupSize, multipleKvTiles);
+    bool hasCrossHeadTasks = false;
+    bool uniformTaskCount = true;
     for (uint32_t batchIndex = 0; batchIndex < metadataArgs->batch; ++batchIndex) {
         const uint32_t qSeqlen =
             metadataArgs->isVarlen ? (metadataArgs->hasSequsedQ != 0
@@ -515,23 +526,25 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
                                       : static_cast<uint32_t>(seqlensK[batchIndex]);
         maxQSeqlen = maxQSeqlen > qSeqlen ? maxQSeqlen : qSeqlen;
         maxKvSeqlen = maxKvSeqlen > kvSeqlen ? maxKvSeqlen : kvSeqlen;
-        // Cross-group tail fusion needs the masked kernel: the unmasked path runs
-        // the DN variant, which does not implement KV segments. Keeping the
-        // condition mask-only also keeps it identical to the AICore's view.
-        const auto shape = fa950_task::MakeShape(qSeqlen, metadataArgs->numHeads, metadataArgs->numHeadsK,
-            tilingData->qBaseTile, metadataArgs->batch, metadataArgs->blockDim,
-            metadataArgs->isVarlen == 0U, metadataArgs->quantMode != 0U,
-            metadataArgs->maskType != 0U && !fa950_plan::IsD512(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV),
-            tinyKvFusion);
-        const uint32_t batchTaskNum = shape.totalTasks;
-        tilingData->fusedCrossGroup |= shape.tailRows && shape.tailHeadTile > groupSize;
+        const auto taskShape = fa950_task::MakeShape(qSeqlen, groupSize, metadataArgs->numHeadsK,
+                                                    tilingData->qBaseTile, budget);
+        hasCrossHeadTasks |= taskShape.headsPerTailTask > groupSize;
+        const uint32_t quantHeadTile = GetQNBlockTile(qSeqlen, groupSize,
+            metadataArgs->quantMode == 1U && metadataArgs->embeddingSizeV > 128U ? 64U : tilingData->qBaseTile);
+        const uint32_t batchTasks = metadataArgs->quantMode == 1U
+            ? CeilDiv(qSeqlen, tilingData->qBaseTile) * metadataArgs->numHeadsK * CeilDiv(groupSize, quantHeadTile)
+            : taskShape.totalTasks;
         if (batchIndex == 0) {
-            firstBatchTaskNum = batchTaskNum;
+            firstBatchTaskNum = batchTasks;
+        } else {
+            uniformTaskCount &= batchTasks == firstBatchTaskNum;
         }
-        totalTaskNum += batchTaskNum;
+        totalTaskNum += batchTasks;
     }
     tilingData->maxQSeqlen = maxQSeqlen;
     tilingData->maxKvSeqlen = maxKvSeqlen;
+    tilingData->uniformBatchTaskCount = uniformTaskCount ? firstBatchTaskNum : 0U;
+    tilingData->headGroupBudget = 2U + (hasCrossHeadTasks ? budget : (budget != 0U));
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
 
@@ -547,6 +560,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     const bool isFlashDecodeCandidate = (pagedFdCandidate || denseFdCandidate) && maxQSeqlen <= 16 &&
                                         maxQSeqlen * groupSizeForFlashDecode <= 128 && maxKvSeqlen >= 1024;
     if (isFlashDecodeCandidate) {
+        // FlashDecode only accepts Q lengths that fit in one tile.
         FillFlashDecodeTiling(tilingData, metadataArgs, cuSeqlensQ, seqlensQ, seqlensK);
     }
     AscendC::DataStoreBarrier();

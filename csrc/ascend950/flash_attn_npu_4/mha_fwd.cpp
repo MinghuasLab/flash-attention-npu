@@ -200,7 +200,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         seqlen_q = static_cast<int>(sizes[2]);
     }
 
-    int64_t kv_seqlen_allocated = 0;
+    int64_t kv_seqlen_allocated = !paged_KV && k.dim() == 4 ? k.size(1) : 0;
     if (layout_enum == FwdLayout::BNSD) {
         // BNSD requires Q, K and V to share the same rank-4 (B, H, S, D) layout.
         TORCH_CHECK(!paged_KV && !is_varlen_kv && k.dim() == 4 && v.dim() == 4,

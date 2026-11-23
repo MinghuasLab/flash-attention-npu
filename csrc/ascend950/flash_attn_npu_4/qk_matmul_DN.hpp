@@ -20,6 +20,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_DN_HPP_T
 
+#include "fused_task.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -43,12 +44,6 @@ constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
-// DN-only fallbacks; when this header is reached through fwd_kernel.cpp the values
-// come from kernel_common.hpp (KERNEL_COMMON is already defined and this block is
-// skipped), so the two copies must stay in sync with Q_L1_BUF_NUM/K_L1_BUF_NUM.
-constexpr uint32_t Q_L1_BUF_NUM = 1U; // Q stays resident across KV tiles
-constexpr uint32_t K_L1_BUF_NUM = 2U;
-constexpr uint32_t FA4_KV_BASE_TILE = 128U;
 
 struct PFAKernelParams {
     // Data members
@@ -152,10 +147,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
         l1ATileK = BlockMmadQKTileHelper.qkL1TileKLeft;
         l1BTileK = BlockMmadQKTileHelper.qkL1TileKRight;
-
-        // Buffer counts come from the compile-time plan (kernel_common.hpp) rather than
-        // from the tiling blob, so the per-tile buffer index below is resolved
-        // without a runtime modulo.
+        l1ABufNum = BlockMmadQKTileHelper.qL1BufNum;
+        l1BBufNum = BlockMmadQKTileHelper.kL1BufNum;
 
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] =
@@ -180,7 +173,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     // srcNdMatrixStride of the Nd2Nz copy (one ND matrix per Q head).
     template <class TensorA>
     __aicore__ inline void loadQGM(TensorA& gATensor, GemmCoord actualOriShape, uint32_t qSBlockSize,
-                                   uint32_t qNBlockSize, int64_t qHeadStride)
+                                   uint32_t qNBlockSize, int64_t qHeadStride, QueryL1Slot qSlot)
     {
         using CopyGmToL1B = typename TileCopy_::template CopyGmToL1B<TensorA>;
         CopyGmToL1B copyGmToL1B;
@@ -188,9 +181,9 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t rowNum = actualOriShape[0];
         auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, rowNum);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qSlot.index], l1ALayoutTla, Arch::PositionL1{});
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
         auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(embed, qSBlockSize));
         auto gmQTile = GetTile(gATensor, tla::MakeCoord(0, 0), tla::MakeShape(embed, qSBlockSize));
         copyGmToL1B(l1QTile, gmQTile, qNBlockSize, static_cast<uint32_t>(qHeadStride), qSBlockSize * C0_ELEMS);
@@ -280,7 +273,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                       uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
                                       uint32_t globalWindowSize, uint32_t localWindowSize, uint32_t qSBlockSize,
                                       uint32_t qNBlockSize, Arch::CrossCoreFlag qkReadyFlag,
-                                      uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages)
+                                      uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages, QueryL1Slot qSlot)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -297,15 +290,13 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t l1BEventId = l1BBufId + 1;
 
         auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, rowNum);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qSlot.index], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1
-        // One QK task consumes one KV base tile, which fits a single L0 N tile, so the
-        // KV loop is single-iteration by construction: keep it compile-time so no
-        // runtime CeilDiv / last-iteration test remains on the scalar unit.
-        static_assert(FA4_KV_BASE_TILE <= L0_TILE_N, "KV base tile must fit one L0 N tile");
-        constexpr uint32_t nL0LoopNum = 1U;
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
+        constexpr bool singleTile = std::is_same_v<ElementA, half> || std::is_same_v<ElementA, bfloat16_t>;
+        static_assert(!singleTile || (L0_TILE_M >= fa950_task::MAX_Q_ROWS && L0_TILE_N >= fa950_task::KV_TILE));
+        const uint32_t mL0LoopNum = singleTile ? 1U : CeilDiv(rowNum, L0_TILE_M);
+        const uint32_t nL0LoopNum = singleTile ? 1U : CeilDiv(curBaseTileSize, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
         // while splitting the base tile S to 2 AIVs,
@@ -316,7 +307,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
             uint32_t kvL0Start = kvTileStart + nL0Itr * L0_TILE_N;
-            auto l0TileNAct = (curBaseTileSize <= L0_TILE_N) ? curBaseTileSize : L0_TILE_N;
+            uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
             uint32_t l0CLoopCounter = kvSTileRelIdx;
@@ -571,10 +562,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    static constexpr uint32_t l1ABufNum = Q_L1_BUF_NUM;
-    static constexpr uint32_t l1BBufNum = K_L1_BUF_NUM;
-    static_assert(l1ABufNum <= MAX_L1_STAGES, "Q L1 buffer count exceeds the static L1 tensor array");
-    static_assert(l1BBufNum <= MAX_L1_STAGES, "K L1 buffer count exceeds the static L1 tensor array");
+    uint32_t l1ABufNum;
+    uint32_t l1BBufNum;
 
     uint32_t l1PPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;

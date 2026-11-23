@@ -83,7 +83,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     static constexpr uint32_t SM_ROW_MAX_ELEM_NUM = 64;
     static constexpr uint32_t SM_COL_MAX_ELEM_NUM = 256;
 
-    __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, float scaleValue_, float softcapValue_)
+    __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, float scaleValue_, float softcapValue_,
+                                    bool useRescaleThreshold = true, bool trackMin = true)
+        : useRescaleThreshold_(useRescaleThreshold), trackRescale(trackMin)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -103,6 +105,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         scaleValue = static_cast<ElementInput>(scaleValue_);
         softcapValue = static_cast<ElementInput>(softcapValue_);
+
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
@@ -123,8 +126,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
     template <class Resource>
     __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, float scale, float softcap,
-                                    bool useRescaleThreshold)
-        : useRescaleThreshold_(useRescaleThreshold)
+                                    bool useRescaleThreshold, bool trackMin = true)
+        : useRescaleThreshold_(useRescaleThreshold), trackRescale(trackMin)
     {
         subBlockIdx_ = AscendC::GetSubBlockIdx();
         scaleValue = scale;
@@ -410,7 +413,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM, expSkipUbAddr);
+                                                tailM, expSkipUbAddr, trackRescale);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -459,55 +462,79 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
 
-        uint32_t mAligendTile = mRound / 4;
-        uint32_t mFirstTile = m % mAligendTile;
-        uint32_t mAligned16TileNum = m / mAligendTile;
-        if (mAligned16TileNum == 4) {
-            mFirstTile = mAligendTile;
-        }
-        if (isFirstKvSTile) {
-            if (mAligned16TileNum == 0) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 1) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 2) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 3) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else {
+        // Full KV tiles need no runtime partition division or tail dispatch.
+        if (m == 128U) {
+            if (isFirstKvSTile) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            }
-        } else {
-            if (mAligned16TileNum == 0) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 1) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 2) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
-            } else if (mAligned16TileNum == 3) {
-                ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, 128, 128, tailN, 32, scaleValue,
+                    softcapValue, 64, 65, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr,
+                    trackRescale);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
-                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
-                    softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr);
+                    sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, 128, 128, tailN, 32, scaleValue, softcapValue,
+                    64, 65, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold, expSkipUbAddr, trackRescale);
+            }
+        } else {
+            uint32_t mAligendTile = mRound / 4;
+            uint32_t mFirstTile = m % mAligendTile;
+            uint32_t mAligned16TileNum = m / mAligendTile;
+            if (mAligned16TileNum == 4) {
+                mFirstTile = mAligendTile;
+            }
+            if (isFirstKvSTile) {
+                if (mAligned16TileNum == 0) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
+                        sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile,
+                        scaleValue, softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 1) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
+                        sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile,
+                        scaleValue, softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 2) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
+                        sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile,
+                        scaleValue, softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 3) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
+                        sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile,
+                        scaleValue, softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
+                        sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile,
+                        scaleValue, softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                }
+            } else {
+                if (mAligned16TileNum == 0) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
+                        sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                        softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 1) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
+                        sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                        softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 2) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
+                        sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                        softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else if (mAligned16TileNum == 3) {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
+                        sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                        softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                } else {
+                    ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
+                        sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue,
+                        softcapValue, 64, blockStride, nRound, expMaxUbAddr, lastSumAddr, rescaleThreshold,
+                        expSkipUbAddr, trackRescale);
+                }
             }
         }
 
@@ -629,7 +656,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM, expSkipUbAddr);
+                                                tailM, expSkipUbAddr, trackRescale);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -642,6 +669,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     static constexpr float rescaleThreshold = 4.0f;
     bool useRescaleThreshold_{true};
     ElementInput softcapValue;
+    bool trackRescale{true};
     AscendC::LocalTensor<ElementInput> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<float> gmUbTensor;
@@ -1452,7 +1480,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                          __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t mRound, uint16_t m,
                          uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, ElementInput dSoftcap,
                          uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, __ubuf__ float* expMaxUb,
-                         __ubuf__ ElementS* lastExpSumUb, __ubuf__ float* skipUb)
+                         __ubuf__ ElementS* lastExpSumUb, float rescaleThreshold, __ubuf__ float* skipUb, bool trackMin)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> src0Vreg;
@@ -1572,8 +1600,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             StoreAlign<float, StoreDist::DIST_NORM_B32>(LastMaxUbStart, max0Vreg, pregTailN);
             // Same contract as UpdateExpSumAndExpMax: hand the delayed rescale
             // the per-tile min(dm) so it can skip the rescale when it is 1.
-            ReduceMin(minDmVreg, expMaxVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
+            if (trackMin) {
+                ReduceMin(minDmVreg, expMaxVreg, pregTailN);
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
+            }
         }
 
         StoreAlign<float, AscendC::MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ float*&)newMaxUb, max0Vreg, pregFull);
@@ -1799,7 +1829,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float* sumUb, __ubuf__ float* expMaxUb,
                                                          __ubuf__ float* maxUb, __ubuf__ ElementS* expSumUb,
                                                          __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM,
-                                                         __ubuf__ float* skipUb)
+                                                         __ubuf__ float* skipUb, bool trackMin)
     {
         using namespace AscendC::MicroAPI;
 
@@ -1835,8 +1865,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         StoreAlign<float, StoreDist::DIST_NORM_B32>(maxUb, nowMaxTmpVreg, pregFull);
         // dm is still live in a register: reduce it now and hand the delayed
         // rescale a single scalar instead of making it re-reduce dm later.
-        ReduceMin(minDmVreg, expMaxVreg, pregTailM);
-        StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
+        if (trackMin) {
+            ReduceMin(minDmVreg, expMaxVreg, pregTailM);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(skipUb, minDmVreg, pregOne);
+        }
 
         LoadAlign(lastExpSumVreg, sumUb);
         LoadAlign(brcExpSumTmpVreg, expSumUb);

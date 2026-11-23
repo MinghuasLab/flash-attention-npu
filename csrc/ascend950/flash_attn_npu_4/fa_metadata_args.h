@@ -14,11 +14,7 @@ static_assert(std::is_trivially_copyable<FAInferRuntimeData>::value, "runtime ti
 static_assert(std::is_standard_layout<FAInferRuntimeData>::value, "runtime tiling must have a stable layout");
 static_assert(sizeof(FAInferRuntimeData) == 48, "runtime tiling ABI changed");
 namespace fa_metadata {
-constexpr uint32_t MASK_DIM = 2048;
-constexpr uint64_t MASK_BYTES = uint64_t(MASK_DIM) * MASK_DIM;
-// Scheduler metadata is tiling-only. The fixed triangular mask is generated
-// once on each visible NPU by MakeDeviceTriuMask instead of being serialized
-// into every metadata tensor by AICPU.
+// Scheduler metadata contains only tiling. Forward visibility uses Q/K positions.
 inline uint64_t TilingOffset(bool /*has_mask*/)
 {
     return 0;
