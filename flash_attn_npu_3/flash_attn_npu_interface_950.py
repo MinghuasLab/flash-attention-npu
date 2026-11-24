@@ -45,6 +45,14 @@ def _maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
 
+def _contiguous_all(tensors):
+    """One-pass contiguity normalization (avoids a helper call per tensor)."""
+    out = []
+    for t in tensors:
+        out.append(t if t is None or t.is_contiguous() else t.contiguous())
+    return out
+
+
 def _transposed_bnsd_view(t):
     """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
     if t is None or t.dim() != 4 or t.is_contiguous():
@@ -113,6 +121,15 @@ def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
     copy would lose the API's in-place cache update, so an unsupported cache
     view is rejected instead of copied.
     """
+    # Packed contiguous paged caches are already the BBND kernel layout, so the
+    # common steady-state call skips the inner-layout probing entirely.
+    if (
+        page_table is not None
+        and q.dtype != torch.float8_e4m3fn
+        and k.is_contiguous()
+        and v.is_contiguous()
+    ):
+        return (q if q.is_contiguous() else q.contiguous()), k, v
     q = q.contiguous()
     # The FP8 kernel still uses packed page addressing.
     if page_table is None or q.dtype == torch.float8_e4m3fn:
@@ -188,20 +205,59 @@ def _flash_attn_forward_impl(
     q, k, v = _prepare_forward_qkv(
         q, k, v, page_table, append_kv=k_new is not None or v_new is not None
     )
-    k_new, v_new = (_maybe_contiguous(x) for x in (k_new, v_new))
-    q_descale, k_descale, v_descale = (
-        _maybe_contiguous(x) for x in (q_descale, k_descale, v_descale)
+    (
+        k_new,
+        v_new,
+        q_descale,
+        k_descale,
+        v_descale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+    ) = _contiguous_all(
+        (
+            k_new,
+            v_new,
+            q_descale,
+            k_descale,
+            v_descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            page_table,
+            kv_batch_idx,
+            leftpad_k,
+            rotary_cos,
+            rotary_sin,
+            seqlens_rotary,
+        )
     )
-    cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = (
-        _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
-    )
-    seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
-    page_table, kv_batch_idx, leftpad_k = (
-        _maybe_contiguous(x) for x in (page_table, kv_batch_idx, leftpad_k)
-    )
-    rotary_cos, rotary_sin = (_maybe_contiguous(x) for x in (rotary_cos, rotary_sin))
-    seqlens_rotary = _maybe_contiguous(seqlens_rotary)
 
+    paired_prefill = (
+        getattr(scheduler_metadata, "paired_prefill", None)
+        if scheduler_metadata is not None
+        else None
+    )
+    fd_active_cores = (
+        getattr(scheduler_metadata, "fd_active_cores", None)
+        if scheduler_metadata is not None
+        else None
+    )
+    fd_workspace_bytes = (
+        getattr(scheduler_metadata, "fd_workspace_bytes", None)
+        if scheduler_metadata is not None
+        else None
+    )
     out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_3_950.fwd(
         q,
         k,
@@ -239,6 +295,9 @@ def _flash_attn_forward_impl(
         sm_margin,
         return_softmax_lse,
         layout,
+        paired_prefill,
+        fd_active_cores,
+        fd_workspace_bytes,
     )
 
     if out_accum is None:
@@ -272,7 +331,12 @@ def _can_use_eager_forward(tensors):
         or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
     ):
         return False
-    return all(t is None or (type(t) is torch.Tensor and not t.requires_grad) for t in tensors)
+    tensor_type = torch.Tensor
+    for t in tensors:
+        if t is not None:
+            if t.__class__ is not tensor_type or t.requires_grad:
+                return False
+    return True
 
 
 @_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_forward")
@@ -555,6 +619,7 @@ def get_scheduler_metadata(
     cache_seqlens: torch.Tensor,
     qkv_dtype=torch.bfloat16,
     headdim_v=None,
+    kv_dtype=None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
@@ -590,7 +655,17 @@ def get_scheduler_metadata(
         headdim_v = headdim
     if qkv_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError("qkv_dtype must be FP16, BF16 or FP8_E4M3FN")
-    quant_mode = 1 if qkv_dtype == torch.float8_e4m3fn else 0
+    kv_dtype = qkv_dtype if kv_dtype is None else kv_dtype
+    if kv_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("kv_dtype must be FP16, BF16 or FP8_E4M3FN")
+    if qkv_dtype == torch.float8_e4m3fn:
+        quant_mode = 1  # full FP8 (Q/K/V all fp8)
+    elif kv_dtype == torch.float8_e4m3fn:
+        if qkv_dtype != torch.bfloat16:
+            raise ValueError("mixed BF16/FP8 KV requires a bfloat16 query")
+        quant_mode = 2  # mixed: bf16 Q + fp8 KV
+    else:
+        quant_mode = 0
     if cu_seqlens_k_new is not None or max_seqlen_k_new:
         raise ValueError("Ascend 950 does not support append-KV (cu_seqlens_k_new)")
     if cache_leftpad is not None:
@@ -618,6 +693,172 @@ def get_scheduler_metadata(
         window_size[1],
         quant_mode,
     )
+    if quant_mode == 2:
+        # Mixed BF16/FP8 KV: the AICPU tiling decides whether the paired Q-head
+        # pipeline is used, and the forward launch must select the same kernel.
+        # The paired pipeline needs full 128-row Q tiles, i.e. at least one
+        # active Q tile per head (activeQ/Q_TILE_CEIL >= 1). Short-query shapes
+        # (decode / MTP: max_seqlen_q < 128) can never satisfy that, so they are
+        # resolved on the host without touching the device. Longer queries read
+        # the bit back once (outside graph capture, current-stream sync only).
+        if max_seqlen_q < 128:
+            scheduler_metadata.paired_prefill = False
+        else:
+            try:
+                flags = int(flash_attn_npu_3_950.flash_attn_metadata_flags(scheduler_metadata))
+                scheduler_metadata.paired_prefill = bool(flags & 1)
+            except (AttributeError, RuntimeError):
+                pass
+    return scheduler_metadata
+
+
+def flash_attn_with_kvcache_lean(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens,
+    page_table,
+    cu_seqlens_q=None,
+    max_seqlen_q=None,
+    scheduler_metadata=None,
+    k_descale=None,
+    v_descale=None,
+    softmax_scale=None,
+    causal=True,
+    window_size=(-1, -1),
+    softcap=0.0,
+    return_softmax_lse=False,
+):
+    """Minimal-overhead inference entry for steady-state paged decoding.
+
+    Same math as :func:`flash_attn_with_kvcache`, but it skips the general
+    wrapper's layout probing, argument normalization and eager-dispatch checks,
+    and it calls the kernel binding directly. Use it in a hot decode loop where
+    the shapes are fixed and the tensors are already contiguous.
+
+    Contract (caller must guarantee):
+      * paged KV cache (`page_table` given), all tensors contiguous;
+      * ``scheduler_metadata`` produced by :func:`get_scheduler_metadata`
+        (and by :func:`prepare_fd_metadata` when FlashDecode should be used);
+      * no append-KV, no rotary, no explicit ``num_splits``.
+    """
+    if scheduler_metadata is None:
+        raise ValueError("flash_attn_with_kvcache_lean requires scheduler_metadata")
+    if page_table is None:
+        raise ValueError("flash_attn_with_kvcache_lean requires a paged cache (page_table)")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    layout = _LAYOUT_TND if cu_seqlens_q is not None else _LAYOUT_BSND
+    out, lse, *_ = flash_attn_npu_3_950.fwd(
+        q,
+        k_cache,
+        v_cache,
+        None,
+        None,
+        None,
+        None,
+        cu_seqlens_q,
+        None,
+        None,
+        None,
+        cache_seqlens,
+        max_seqlen_q,
+        None,
+        page_table,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        0,
+        softcap,
+        True,
+        scheduler_metadata,
+        0,
+        None,
+        0,
+        return_softmax_lse,
+        layout,
+        getattr(scheduler_metadata, "paired_prefill", None),
+        getattr(scheduler_metadata, "fd_active_cores", None),
+        getattr(scheduler_metadata, "fd_workspace_bytes", None),
+    )
+    if return_softmax_lse:
+        return out, lse
+    return out
+
+
+def prepare_fd_metadata(
+    scheduler_metadata: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap: float = 0.0,
+    return_softmax_lse: bool = True,
+    layout: Optional[int] = None,
+    num_splits: int = 0,
+):
+    """Make a scheduler_metadata usable for FlashDecode shapes inside NPUGraph.
+
+    FlashDecode's launch core count and workspace size follow the per-batch
+    sequence lengths, so they cannot be derived by the per-call host launch.
+    This runs the regular host tiling **once** (it reads the sequence lengths
+    back to the host, hence must stay outside graph capture), uploads that
+    tiling into ``scheduler_metadata`` and caches the launch shape on it.
+
+    Call it right after :func:`get_scheduler_metadata`; afterwards
+    ``flash_attn_with_kvcache(..., scheduler_metadata=md)`` keeps the
+    FlashDecode pipeline inside eager execution and NPUGraph replay. The
+    metadata snapshot stays tied to the ``cache_seqlens`` values used here:
+    regenerate both when the KV lengths change.
+    """
+    if scheduler_metadata is None:
+        raise ValueError("prepare_fd_metadata requires scheduler_metadata")
+    if layout is None:
+        layout = _LAYOUT_TND if cu_seqlens_q is not None else _LAYOUT_BSND
+    page_table = _maybe_contiguous(page_table)
+    cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
+    seqused_q = _maybe_contiguous(seqused_q)
+    cache_seqlens = _maybe_contiguous(cache_seqlens)
+    if max_seqlen_q is None:
+        max_seqlen_q = q.shape[2] if layout == _LAYOUT_BNSD else q.shape[1]
+    hints = flash_attn_npu_3_950.flash_attn_prepare_fd_metadata(
+        scheduler_metadata,
+        q,
+        k,
+        v,
+        page_table,
+        cu_seqlens_q,
+        seqused_q,
+        cache_seqlens,
+        int(max_seqlen_q),
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        return_softmax_lse,
+        layout,
+        num_splits,
+    )
+    scheduler_metadata.fd_active_cores = int(hints[0].item())
+    scheduler_metadata.fd_workspace_bytes = int(hints[1].item())
+    scheduler_metadata.flash_decode = bool(hints[2].item())
     return scheduler_metadata
 
 
@@ -1229,7 +1470,12 @@ def flash_attn_with_kvcache(
     )
     empty_query = cu_seqlens_q is not None and q.shape[0] == 0 and max_seqlen_q == 0
     mixed_kv = q.dtype == torch.bfloat16 and k_cache.dtype == torch.float8_e4m3fn
-    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query or mixed_kv
+    use_host_tiling = (
+        num_splits > 1
+        or auto_fd_candidate
+        or empty_query
+        or (mixed_kv and scheduler_metadata is None)
+    )
     if scheduler_metadata is None and not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:

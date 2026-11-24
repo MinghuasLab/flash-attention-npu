@@ -40,6 +40,8 @@ elif is_ascend950():
         flash_attn_varlen_func as flash_attn_varlen_func,
         flash_attn_with_kvcache as flash_attn_with_kvcache,
         get_scheduler_metadata as get_scheduler_metadata,
+        flash_attn_with_kvcache_lean as flash_attn_with_kvcache_lean,
+        prepare_fd_metadata as prepare_fd_metadata,
     )
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")
