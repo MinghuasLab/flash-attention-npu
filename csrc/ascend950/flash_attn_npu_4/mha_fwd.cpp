@@ -8,7 +8,9 @@
 // ✅ return_softmax_lse
 // ✅ SWA / window_size (host normalize + MASK_SWA dispatch)
 // ✅ num_splits (FlashDecode for paged KV + TND)
-// ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
+// ✅ learnable_sink (dense BF16, [N] FP32, seeded online-softmax state)
+// ✅ pse (dense BF16 only, [B,N,1,S_kv], pse_type=1: (QK^T+pse)*scale)
+// ❌ pack_gqa, min_seqlen_k, gather_kv_indices
 // ✅ softcap (tanh, folded into the online-softmax epilogue)
 
 #include <algorithm>
@@ -52,7 +54,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 std::optional<bool> pack_gqa_, std::optional<at::Tensor> learnable_sink_,
                                 bool return_lse, std::optional<at::Tensor> scheduler_metadata_, int64_t layout,
                                 std::optional<at::Tensor> q_descale_, std::optional<at::Tensor> k_descale_,
-                                std::optional<at::Tensor> v_descale_)
+                                std::optional<at::Tensor> v_descale_, std::optional<at::Tensor> pse_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -87,7 +89,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // ============================================================
     TORCH_CHECK(!min_seqlen_k_.has_value(), "950 backend (v4) does not support min_seqlen_k");
     TORCH_CHECK(!gather_kv_indices_.has_value(), "950 backend (v4) does not support gather_kv_indices");
-    TORCH_CHECK(!learnable_sink_.has_value(), "950 backend (v4) does not support learnable_sink");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v4) requires num_splits in [0, ", blockDim, "]");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "950 backend (v4) does not support pack_gqa");
@@ -243,6 +244,45 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
 
     TORCH_CHECK(quantMode == 0 || (head_size_q == 128 && head_size_v == 128),
                 "950 V4 FP8 requires Q/K/V head dimensions of 128");
+
+    // ============================================================
+    // learnable_sink / pse: dense BF16 forward only (TASK §2-§3)
+    // ============================================================
+    const bool has_sink = learnable_sink_.has_value();
+    const bool has_pse = pse_.has_value();
+    if (has_sink) {
+        const at::Tensor& sink = learnable_sink_.value();
+        TORCH_CHECK(!paged_KV && !is_varlen_q && !is_varlen_kv,
+                    "950 backend (v4) learnable_sink requires dense (non-paged, non-varlen) inputs");
+        TORCH_CHECK(is_bf16, "950 backend (v4) learnable_sink requires BF16 Q/K/V inputs");
+        TORCH_CHECK(quantMode == 0, "950 backend (v4) learnable_sink does not support FP8 inputs");
+        TORCH_CHECK(num_splits <= 1, "950 backend (v4) learnable_sink requires num_splits <= 1");
+        TORCH_CHECK(!d512_heads, "950 backend (v4) learnable_sink does not support D512 heads");
+        TORCH_CHECK(sink.device() == q.device(), "learnable_sink must be on the same device as query");
+        TORCH_CHECK(sink.scalar_type() == at::kFloat, "learnable_sink must have dtype float32");
+        TORCH_CHECK(sink.dim() == 1 && sink.size(0) == static_cast<int64_t>(num_heads),
+                    "learnable_sink must be a rank-1 tensor with num_heads (", num_heads, ") elements");
+        TORCH_CHECK(sink.is_contiguous(), "learnable_sink must be contiguous");
+    }
+    if (has_pse) {
+        const at::Tensor& pse = pse_.value();
+        TORCH_CHECK(!paged_KV && !is_varlen_q && !is_varlen_kv && layout_enum != FwdLayout::TND,
+                    "950 backend (v4) pse requires dense BSND/BNSD inputs (no paged/varlen/TND)");
+        TORCH_CHECK(is_bf16, "950 backend (v4) pse requires BF16 Q/K/V inputs");
+        TORCH_CHECK(quantMode == 0, "950 backend (v4) pse does not support FP8 inputs");
+        TORCH_CHECK(softcap == 0.0f, "950 backend (v4) pse does not support softcap > 0");
+        TORCH_CHECK(num_splits <= 1, "950 backend (v4) pse requires num_splits <= 1");
+        TORCH_CHECK(!d512_heads, "950 backend (v4) pse does not support D512 heads");
+        TORCH_CHECK(num_heads == num_heads_k,
+                    "950 backend (v4) pse currently supports MHAs only (num_heads == num_heads_k)");
+        TORCH_CHECK(pse.device() == q.device(), "pse must be on the same device as query");
+        TORCH_CHECK(pse.scalar_type() == at::kBFloat16, "pse must have dtype bfloat16");
+        TORCH_CHECK(pse.dim() == 4 && pse.size(0) == batch_size && pse.size(1) == static_cast<int64_t>(num_heads) &&
+                        pse.size(2) == 1 && pse.size(3) == kv_seqlen_allocated,
+                    "pse must have shape [B, N, 1, S_kv] = [", batch_size, ", ", num_heads, ", 1, ",
+                    kv_seqlen_allocated, "]");
+        TORCH_CHECK(pse.is_contiguous(), "pse must be contiguous");
+    }
     uint8_t* qDescale = nullptr;
     uint8_t* kDescale = nullptr;
     uint8_t* vDescale = nullptr;
@@ -376,6 +416,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         metadataBaseTaskUpperBound <= (blockDim == 0 ? 0U : ((3U * blockDim - 1U) / 10U));
     const bool flashDecodeEnabled =
         scheduler_metadata_.has_value() ? metadataFlashDecodeCandidate : tilingData.flashDecodeFlag != 0U;
+    TORCH_CHECK(!(flashDecodeEnabled && (has_pse || has_sink)),
+                "950 backend (v4) pse/learnable_sink do not support FlashDecode (num_splits > 1)");
 
     // Metadata and non-FD calls retain the conservative workspace allocation.
     // Host-tiled FD calls use the exact partial O/LSE workspace size.
@@ -538,6 +580,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
+    auto pseDev = has_pse ? static_cast<uint8_t*>(pse_.value().data_ptr()) : nullptr;
+    auto sinkDev = has_sink ? static_cast<uint8_t*>(learnable_sink_.value().data_ptr()) : nullptr;
+    const uint64_t pseHeadStride = has_pse ? static_cast<uint64_t>(pse_.value().size(3)) : 0U;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
@@ -545,8 +590,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
-    const bool enableDN =
-        !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
+    const bool enableDN = !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) &&
+                          (head_size_v <= 256) && !has_pse && !has_sink;
     const uint32_t launchBlockDim = scheduler_metadata_.has_value()
                                         ? (flashDecodeEnabled ? metadataFdCoreCapacity : blockDim)
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
@@ -563,9 +608,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                          static_cast<uint64_t>(paged_KV ? v.stride(1) : 0),
                          static_cast<uint64_t>(paged_KV ? k.stride(2) : 0),
                          static_cast<uint64_t>(paged_KV ? v.stride(2) : 0),
-                         static_cast<uint64_t>(layout_enum == FwdLayout::TND ? q.size(0) : batch_size * seqlen_q)};
+                         static_cast<uint64_t>(layout_enum == FwdLayout::TND ? q.size(0) : batch_size * seqlen_q),
+                         pseHeadStride};
     fwdArgs.kv_bnbd = paged_KV && quantMode == 0 && k.stride(1) == head_size_q &&
                       k.stride(2) == static_cast<int64_t>(page_block_size) * head_size_q;
+    fwdArgs.pse_device = pseDev;
+    fwdArgs.sink_device = sinkDev;
+    fwdArgs.has_pse = has_pse;
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

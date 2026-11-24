@@ -41,6 +41,7 @@ struct FwdStorageParams {
     uint64_t keyHeadStride;
     uint64_t valueHeadStride;
     uint64_t totalQTokens;
+    uint64_t pseHeadStride; // contiguous pse [B,N,1,S_kv]: plane width S_kv (0 when absent)
 };
 
 struct FAIKernelParams {
@@ -68,6 +69,9 @@ struct FAIKernelParams {
     // BSND / TND, whose layout is the compile-time Format template parameter.
     int64_t kvSeqlenAllocated;
     FwdStorageParams storage{};
+    // Optional dense-forward inputs; nullptr disables the feature.
+    GM_ADDR pse = nullptr;
+    GM_ADDR sink = nullptr;
 
     // Methods
     __aicore__ inline FAIKernelParams() {}
