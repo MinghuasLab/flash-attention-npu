@@ -60,6 +60,9 @@ struct FAMetadataArgs {
     uint32_t hasSequsedQ;
     uint32_t quantMode;
     int64_t windowSizeLeft, windowSizeRight;
+    // Auto-scheduled FP16/BF16 forward also writes its private runtime data.
+    uint64_t runtimeAddr;
+    FAInferRuntimeData runtime;
 };
 
 // CPU-computed launch payload. AICPU writes only this small, private runtime

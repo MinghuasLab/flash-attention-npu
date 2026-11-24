@@ -58,24 +58,7 @@ def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages)
     torch.testing.assert_close(lse.reshape(512), expected_lse, rtol=0, atol=1e-6)
 
 
-@pytest.fixture
-def capture_950_scheduler_metadata(monkeypatch):
-    from flash_attn_npu_4 import flash_attn_npu_interface_950 as api
-
-    metadata = []
-    get_metadata = api.get_scheduler_metadata
-
-    def record_metadata(*args, **kwargs):
-        tiling = get_metadata(*args, **kwargs)
-        metadata.append(tiling)
-        return tiling
-
-    monkeypatch.setattr(api, "get_scheduler_metadata", record_metadata)
-    return metadata
-
-
-def _assert_950_flashdecode_metadata(metadata):
-    (tiling,) = metadata
+def _assert_950_flashdecode_metadata(tiling):
     # Ascend950 FAInferStaticTilingData uint32 fields: FD flag, combine tasks, partial tasks.
     tiling_words = tiling.cpu().view(torch.int32)
     assert tiling_words[591].item() == 1
@@ -92,9 +75,7 @@ def _assert_950_flashdecode_metadata(metadata):
         (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True),
     ],
 )
-def test_950_d512_dense_auto_flashdecode(
-    dtype, q_shape, kv_shape, disable_scheduler_metadata, capture_950_scheduler_metadata
-):
+def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape, disable_scheduler_metadata):
     query = make_random_tensor(q_shape, dtype, device="npu")
     key = make_random_tensor(kv_shape, dtype, device="npu")
     value = make_random_tensor(kv_shape, dtype, device="npu")
@@ -108,10 +89,22 @@ def test_950_d512_dense_auto_flashdecode(
         return_lse=True,
         disable_scheduler_metadata=disable_scheduler_metadata,
     )
-    if disable_scheduler_metadata:
-        assert not capture_950_scheduler_metadata
-    else:
-        _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+    if not disable_scheduler_metadata:
+        metadata = get_scheduler_metadata(
+            max_seqlen_q=q_shape[1],
+            max_seqlen_k=kv_shape[1],
+            nheads=q_shape[2],
+            nheads_kv=kv_shape[2],
+            headdim=q_shape[-1],
+            num_splits=0,
+            seqused_k=_int32_npu([kv_shape[1]] * q_shape[0]),
+        )
+        _assert_950_flashdecode_metadata(metadata)
+        explicit_out, explicit_lse = flash_attn_func(
+            query, key, value, num_splits=0, softmax_scale=scale, return_lse=True, scheduler_metadata=metadata
+        )
+        torch.testing.assert_close(out, explicit_out, rtol=0, atol=0)
+        torch.testing.assert_close(lse, explicit_lse, rtol=0, atol=0)
 
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
         query.cpu(), key.cpu(), value.cpu(), scale, None, dtype
@@ -122,17 +115,14 @@ def test_950_d512_dense_auto_flashdecode(
 
 @pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 paged FlashDecode")
-def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
+def test_950_d512_paged_auto_flashdecode_varlen():
     dtype = torch.bfloat16
     q_offsets, kv_lengths = [0, 2, 3], [4097, 2049]
     page_size, heads, kv_heads, head_size = 512, 16, 4, 512
     q = make_random_tensor((q_offsets[-1], heads, head_size), dtype, device="npu")
     k, v, page_table = _make_paged_cache(2, max(kv_lengths), kv_heads, head_size, page_size, dtype)
     scale = head_size**-0.5
-    out, lse, *_ = flash_attn_varlen_func(
-        q,
-        k,
-        v,
+    kwargs = dict(
         cu_seqlens_q=_int32_npu(q_offsets),
         max_seqlen_q=2,
         max_seqlen_k=max(kv_lengths),
@@ -142,7 +132,21 @@ def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
         softmax_scale=scale,
         return_lse=True,
     )
-    _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+    out, lse, *_ = flash_attn_varlen_func(q, k, v, **kwargs)
+    metadata = get_scheduler_metadata(
+        max_seqlen_q=kwargs["max_seqlen_q"],
+        max_seqlen_k=kwargs["max_seqlen_k"],
+        nheads=heads,
+        nheads_kv=kv_heads,
+        headdim=head_size,
+        num_splits=0,
+        cu_seqlens_q=kwargs["cu_seqlens_q"],
+        seqused_k=kwargs["seqused_k"],
+    )
+    _assert_950_flashdecode_metadata(metadata)
+    explicit_out, explicit_lse, *_ = flash_attn_varlen_func(q, k, v, scheduler_metadata=metadata, **kwargs)
+    torch.testing.assert_close(out, explicit_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse, explicit_lse, rtol=0, atol=0)
     keys, values = gather_paged_kv_batch(
         k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
     )
@@ -192,6 +196,55 @@ def test_950_scheduler_metadata_matches_signature():
         "_arch",
         "qkv_dtype",
     ]
+
+
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only native metadata contract")
+def test_950_scheduler_metadata_kv_length_contract():
+    import flash_attn_npu_4_950
+
+    args = dict(
+        max_seqlen_q=2, max_seqlen_k=4096, nheads=16, nheads_kv=4, headdim=512, num_splits=0
+    )
+    lengths = _int32_npu([4096, 4096])
+    prefix = _int32_npu([0, 4096, 8192])
+    expected = get_scheduler_metadata(**args, seqused_k=lengths)
+    assert torch.equal(expected, get_scheduler_metadata(**args, cu_seqlens_k=prefix))
+
+    def native_metadata(cache_seqlens=None, **kwargs):
+        return flash_attn_npu_4_950.get_scheduler_metadata(
+            2, 2, 4096, 16, 4, 512, 512, cache_seqlens, None, False, -1, -1, 0, None, 0, None, 0, **kwargs
+        )
+
+    strided_lengths = _int32_npu([4096, 0, 4096, 0])[::2]
+    strided_prefix = _int32_npu([0, 0, 4096, 0, 8192])[::2]
+    assert torch.equal(expected, native_metadata(lengths))
+    assert torch.equal(expected, native_metadata(strided_lengths))
+    assert torch.equal(expected, native_metadata(cu_seqlens_k=prefix))
+    assert torch.equal(expected, native_metadata(cu_seqlens_k=strided_prefix))
+    short_prefix = _int32_npu([0, 16, 32])
+    assert not torch.equal(expected, native_metadata(cu_seqlens_k=short_prefix))
+    assert torch.equal(expected, native_metadata(lengths, cu_seqlens_k=short_prefix))
+    assert torch.equal(expected, get_scheduler_metadata(**args, seqused_k=lengths, cu_seqlens_k=short_prefix))
+    with pytest.raises(RuntimeError, match=r"cache_seqlens must be int32 \[batch\]"):
+        native_metadata(prefix)
+    with pytest.raises(RuntimeError, match=r"cu_seqlens_k must be int32 \[batch \+ 1\]"):
+        native_metadata(cu_seqlens_k=lengths)
+    with pytest.raises(RuntimeError, match="cache_seqlens or cu_seqlens_k is required"):
+        native_metadata()
+
+    cu_q = _int32_npu([0, 2, 4])
+    q = torch.zeros((4, 2, 64), dtype=torch.bfloat16, device="npu")
+    with pytest.raises(RuntimeError, match="seqused_k must contain one KV length per batch"):
+        flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_q,
+            seqused_k=cu_q,
+            max_seqlen_q=2,
+            max_seqlen_k=2,
+        )
 
 
 @pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
@@ -807,21 +860,24 @@ def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
 
 @pytest.fixture
 def metadata_spy(monkeypatch):
-    """Spy on get_scheduler_metadata to prove the training interfaces route
-    through the AICPU scheduler-metadata path internally (official flash-attn
-    only exposes scheduler_metadata on flash_attn_with_kvcache)."""
+    """Record requests for automatic AICPU scheduler metadata."""
     if "Ascend950" in _device_name:
         from flash_attn_npu_4 import flash_attn_npu_interface_950 as interface
+
+        target, name = interface.flash_attn_npu_4_950, "fwd"
     else:
         from flash_attn_npu_4 import flash_attn_npu_interface as interface
+
+        target, name = interface, "get_scheduler_metadata"
     calls = []
-    original = interface.get_scheduler_metadata
+    original = getattr(target, name)
 
     def _spy(*args, **kwargs):
-        calls.append((args, kwargs))
+        if name == "get_scheduler_metadata" or kwargs.get("build_scheduler_metadata"):
+            calls.append((args, kwargs))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
+    monkeypatch.setattr(target, name, _spy)
     return calls
 
 

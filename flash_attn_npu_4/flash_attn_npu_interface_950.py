@@ -174,7 +174,7 @@ def _get_scheduler_metadata_op(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor],
     cu_seqlens_q: Optional[torch.Tensor],
     causal: bool,
     window_size_left: int,
@@ -184,6 +184,7 @@ def _get_scheduler_metadata_op(
     sm_margin: int,
     seqused_q: Optional[torch.Tensor] = None,
     quant_mode: int = 0,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Keep the raw pybind call behind a torch.library op.  Calling a pybind
     # function directly from a torch.compile graph is treated as an opaque
@@ -206,6 +207,7 @@ def _get_scheduler_metadata_op(
         sm_margin,
         seqused_q,
         quant_mode,
+        cu_seqlens_k=cu_seqlens_k,
     )
 
 
@@ -218,7 +220,7 @@ def _get_scheduler_metadata_fake(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor],
     cu_seqlens_q: Optional[torch.Tensor],
     causal: bool,
     window_size_left: int,
@@ -228,14 +230,18 @@ def _get_scheduler_metadata_fake(
     sm_margin: int,
     seqused_q: Optional[torch.Tensor] = None,
     quant_mode: int = 0,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # The metadata is an opaque byte buffer during tracing.  Ascend950 FA4
     # serializes one fixed-size FAInferStaticTilingData object, so returning
     # a static shape lets Dynamo keep the custom op in the graph.
+    kv_lengths = cache_seqlens if cache_seqlens is not None else cu_seqlens_k
+    if kv_lengths is None:
+        raise ValueError("cache_seqlens or cu_seqlens_k is required")
     return torch.empty(
         (_SCHEDULER_METADATA_TILING_BYTES,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=kv_lengths.device,
     )
 
 
@@ -280,16 +286,14 @@ def get_scheduler_metadata(
         raise ValueError("Ascend 950 FA4 does not accept _arch")
     if cu_seqlens_q is not None:
         cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
-    if cu_seqlens_k is not None:
-        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
     if seqused_q is not None:
         seqused_q = _maybe_contiguous(seqused_q)
-    if seqused_k is None:
-        if cu_seqlens_k is None:
-            raise ValueError("seqused_k or cu_seqlens_k is required")
-        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    seqused_k = _maybe_contiguous(seqused_k)
-    batch_size = seqused_k.numel()
+    if seqused_k is not None:
+        batch_size = seqused_k.numel()
+    elif cu_seqlens_k is not None:
+        batch_size = cu_seqlens_k.numel() - 1
+    else:
+        raise ValueError("seqused_k or cu_seqlens_k is required")
     if cu_seqlens_q is not None and cu_seqlens_q.numel() != batch_size + 1:
         raise ValueError("cu_seqlens_q batch size does not match seqused_k")
     if seqused_q is not None and seqused_q.numel() != batch_size:
@@ -320,6 +324,7 @@ def get_scheduler_metadata(
         0,
         seqused_q,
         int(qkv_dtype == torch.float8_e4m3fn),
+        cu_seqlens_k=cu_seqlens_k,
     )
 
 
@@ -355,6 +360,7 @@ def _flash_attn_forward(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    build_scheduler_metadata: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if qv is not None:
         raise NotImplementedError("Ascend950 FA4 forward does not support qv")
@@ -395,6 +401,7 @@ def _flash_attn_forward(
         q_descale,
         k_descale,
         v_descale,
+        build_scheduler_metadata=build_scheduler_metadata,
     )
 
     if out_accum is None:
@@ -666,11 +673,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
-        # below come from the pre-detection shapes; BNSD only re-views the same storage.
-        batch_size, seqlen_q, nheads, headdim = q.shape
-        seqlen_k, nheads_kv = k.shape[1], k.shape[2]
-        headdim_v = v.shape[-1]
+        batch_size, seqlen_k = q.shape[0], k.shape[1]
 
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
 
@@ -680,26 +683,6 @@ class FlashAttnFunc(torch.autograd.Function):
             dtype=torch.int32,
             device=q.device,
         )
-
-        # Precompute the scheduler metadata, including FlashDecode schedules
-        # when eligible, on the AICPU so the forward launch needs no
-        # device->host->device round trip.
-        if scheduler_metadata is None and not disable_scheduler_metadata:
-            scheduler_metadata = get_scheduler_metadata(
-                max_seqlen_q=seqlen_q,
-                max_seqlen_k=seqlen_k,
-                nheads=nheads,
-                nheads_kv=nheads_kv,
-                headdim=headdim,
-                num_splits=num_splits,
-                headdim_v=headdim_v,
-                pack_gqa=pack_gqa,
-                causal=causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                seqused_k=seqused_k,
-                qkv_dtype=q.dtype,
-            )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,
@@ -730,6 +713,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            scheduler_metadata is None and not disable_scheduler_metadata,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -871,23 +855,17 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        if seqused_k is None and cu_seqlens_k is not None:
-            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        if seqused_q is None and cu_seqlens_q is not None:
-            seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-
         if seqused_k is not None and isinstance(seqused_k, int):
             batch_size = cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
             seqused_k = torch.full((batch_size,), seqused_k, dtype=torch.int32, device=k.device)
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
 
-        # Precompute the scheduler metadata, including FlashDecode schedules
-        # when eligible, on the AICPU so the forward launch needs no
-        # device->host->device round trip.
-        kv_seqlens = seqused_k
-        if kv_seqlens is None and cu_seqlens_k is not None:
-            kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        build_scheduler_metadata = (
+            scheduler_metadata is None
+            and not disable_scheduler_metadata
+            and (seqused_k is not None or cu_seqlens_k is not None)
+        )
         # The forward launch normalizes the SWA window against max_seqlen_k. A
         # declared bound can be looser than the actual lengths (paged KV: the
         # page capacity), so when the caller does not pin it, use the actual
@@ -895,34 +873,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # a finite window that covers the real lengths but not the capacity
         # fails to collapse and produces the wrong mask.
         fwd_max_seqlen_k = max_seqlen_k
-        if scheduler_metadata is None and not disable_scheduler_metadata and kv_seqlens is not None:
-            kv_seqlens = _maybe_contiguous(kv_seqlens)
-            if max_seqlen_q is None:
-                metadata_max_seqlen_q = q.shape[0] if q.dim() == 3 else q.shape[1]
-            else:
-                metadata_max_seqlen_q = max_seqlen_q
-            if max_seqlen_k is None:
-                metadata_max_seqlen_k = int(kv_seqlens.max().item())
-                fwd_max_seqlen_k = metadata_max_seqlen_k
-            else:
-                metadata_max_seqlen_k = max_seqlen_k
-            scheduler_metadata = get_scheduler_metadata(
-                max_seqlen_q=metadata_max_seqlen_q,
-                max_seqlen_k=metadata_max_seqlen_k,
-                nheads=q.shape[1] if q.dim() == 3 else q.shape[2],
-                nheads_kv=k.shape[1] if k.dim() == 3 else k.shape[2],
-                headdim=q.shape[-1],
-                num_splits=num_splits,
-                headdim_v=v.shape[-1],
-                pack_gqa=pack_gqa,
-                causal=causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                seqused_k=kv_seqlens,
-                seqused_q=seqused_q,
-                cu_seqlens_q=cu_seqlens_q,
-                qkv_dtype=q.dtype,
-            )
+        if build_scheduler_metadata and max_seqlen_k is None:
+            kv_seqlens = seqused_k
+            if kv_seqlens is None:
+                kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            fwd_max_seqlen_k = int(kv_seqlens.max().item())
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
             q,
@@ -953,6 +908,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            build_scheduler_metadata,
         )
 
         ctx.save_for_backward(
@@ -1347,6 +1303,7 @@ def _flash_attn_forward_fake(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    build_scheduler_metadata: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
     is_varlen_q = cu_seqlens_q is not None

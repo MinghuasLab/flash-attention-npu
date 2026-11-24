@@ -22,7 +22,7 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
-                                           const std::optional<at::Tensor>& seqused_q)
+                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime)
 {
     auto metadata = at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))},
                               cache_seqlens.options().dtype(at::kByte));
@@ -43,20 +43,30 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     if (seqused_q.has_value()) {
         c10_npu::NPUCachingAllocator::recordStream(seqused_q->storage().data_ptr(), current);
     }
+    if (runtime.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(runtime.storage().data_ptr(), current);
+    }
     return metadata;
 }
 
 at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k, int64_t num_heads_q,
-                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
+                                  int64_t num_heads_kv, int64_t headdim, int64_t headdim_v,
+                                  std::optional<at::Tensor> cache_seqlens,
                                   std::optional<at::Tensor> cu_seqlens_q = std::nullopt, bool causal = false,
                                   int64_t window_left = -1, int64_t window_right = -1, int64_t num_splits = 0,
                                   std::optional<bool> pack_gqa = std::nullopt, int64_t = 0,
-                                  std::optional<at::Tensor> seqused_q = std::nullopt, uint32_t quantMode = 0)
+                                  std::optional<at::Tensor> seqused_q = std::nullopt, uint32_t quantMode = 0,
+                                  std::optional<at::Tensor> cu_seqlens_k = std::nullopt)
 {
-    const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
-    TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be on NPU");
-    TORCH_CHECK(cache_seqlens.dtype() == at::kInt && cache_seqlens.dim() == 1 && cache_seqlens.numel() == batch_size,
-                "cache_seqlens must be int32 [batch]");
+    const bool use_cache_seqlens = cache_seqlens.has_value();
+    TORCH_CHECK(use_cache_seqlens || cu_seqlens_k.has_value(), "cache_seqlens or cu_seqlens_k is required");
+    auto& kv_lengths = use_cache_seqlens ? *cache_seqlens : *cu_seqlens_k;
+    const c10::OptionalDeviceGuard device_guard(device_of(kv_lengths));
+    TORCH_CHECK(kv_lengths.device().type() == at::kPrivateUse1,
+                use_cache_seqlens ? "cache_seqlens must be on NPU" : "cu_seqlens_k must be on NPU");
+    const int64_t kv_batch_size = use_cache_seqlens ? kv_lengths.numel() : kv_lengths.numel() - 1;
+    TORCH_CHECK(kv_lengths.dtype() == at::kInt && kv_lengths.dim() == 1 && kv_batch_size == batch_size,
+                use_cache_seqlens ? "cache_seqlens must be int32 [batch]" : "cu_seqlens_k must be int32 [batch + 1]");
     TORCH_CHECK(batch_size > 0 && num_heads_q > 0 && num_heads_kv > 0 && num_heads_q % num_heads_kv == 0,
                 "invalid batch or head dimensions");
     TORCH_CHECK(!pack_gqa.has_value() || !pack_gqa.value(), "pack_gqa is not supported on Ascend 950 FA4");
@@ -66,25 +76,26 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     const bool is_varlen_q = cu_seqlens_q.has_value();
     if (is_varlen_q) {
         auto cq = cu_seqlens_q.value();
-        TORCH_CHECK(cq.device() == cache_seqlens.device() && cq.dtype() == at::kInt && cq.is_contiguous() &&
+        TORCH_CHECK(cq.device() == kv_lengths.device() && cq.dtype() == at::kInt && cq.is_contiguous() &&
                         cq.numel() == batch_size + 1,
                     "invalid cu_seqlens_q");
     }
     if (seqused_q.has_value()) {
         const auto& sq = seqused_q.value();
-        TORCH_CHECK(sq.device() == cache_seqlens.device() && sq.dtype() == at::kInt && sq.is_contiguous() &&
+        TORCH_CHECK(sq.device() == kv_lengths.device() && sq.dtype() == at::kInt && sq.is_contiguous() &&
                         sq.dim() == 1 && sq.numel() == batch_size,
                     "seqused_q must be a contiguous int32 tensor of shape [batch] on NPU");
     }
     TORCH_CHECK(quantMode == 0 || quantMode == 1, "unsupported quantization mode");
     TORCH_CHECK(quantMode != 1 || (headdim == 128 && headdim_v == 128),
                 "950 V4 FP8 requires Q/K/V head dimensions of 128");
+    kv_lengths = kv_lengths.contiguous();
     FAMetadataArgs args{};
     args.quantMode = quantMode;
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q->data_ptr()) : 0;
     args.seqlensQAddr = seqused_q.has_value() ? reinterpret_cast<uint64_t>(seqused_q->data_ptr()) : 0;
     args.hasSequsedQ = seqused_q.has_value() ? 1u : 0u;
-    args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
+    args.seqlensKAddr = reinterpret_cast<uint64_t>(kv_lengths.data_ptr());
     args.batch = batch_size;
     args.numHeads = num_heads_q;
     args.numHeadsK = num_heads_kv;
@@ -93,6 +104,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.maxQSeqlen = max_seqlen_q;
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q;
+    args.isVarlenKv = !use_cache_seqlens;
     args.numSplits = num_splits;
     bool normalized_causal = false;
     bool local = false;
@@ -101,7 +113,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.maskType = normalized_causal ? 1 : (local ? 2 : 0);
     args.windowSizeLeft = window_left;
     args.windowSizeRight = window_right;
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, seqused_q);
+    return GetSchedulerMetadataImpl(args, kv_lengths, cu_seqlens_q, seqused_q);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +326,21 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 PYBIND11_MODULE(flash_attn_npu_4_950, m)
 {
     m.doc() = "FlashAttention v4 — Ascend 950 backend";
-    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
+    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)", py::arg("q"), py::arg("k"), py::arg("v"),
+          py::arg("qv"), py::arg("out"), py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"), py::arg("seqused_q"),
+          py::arg("seqused_k"), py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("min_seqlen_k"),
+          py::arg("page_table"), py::arg("gather_kv_indices"), py::arg("softmax_scale"), py::arg("causal"),
+          py::arg("window_size_left"), py::arg("window_size_right"), py::arg("softcap"), py::arg("num_splits"),
+          py::arg("pack_gqa"), py::arg("learnable_sink"), py::arg("return_lse"), py::arg("scheduler_metadata"),
+          py::arg("layout"), py::arg("q_descale"), py::arg("k_descale"), py::arg("v_descale"),
+          py::arg("build_scheduler_metadata") = false);
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
-    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata");
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata",
+          py::arg("batch_size"), py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("num_heads_q"),
+          py::arg("num_heads_kv"), py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"),
+          py::arg("cu_seqlens_q"), py::arg("causal"), py::arg("window_size_left"), py::arg("window_size_right"),
+          py::arg("num_splits"), py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("seqused_q"),
+          py::arg("quant_mode"), py::arg("cu_seqlens_k") = py::none());
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
           py::arg("cu_seqlens") = py::none(), py::arg("seqused") = py::none(),

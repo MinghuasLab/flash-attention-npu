@@ -425,6 +425,9 @@ __global__ __aicpu__ uint32_t WriteFARuntime(void* args)
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 {
     auto* metadataArgs = reinterpret_cast<FAMetadataArgs*>(args);
+    if (metadataArgs->runtimeAddr != 0) {
+        *reinterpret_cast<FAInferRuntimeData*>(metadataArgs->runtimeAddr) = metadataArgs->runtime;
+    }
     auto* tilingData =
         reinterpret_cast<FAInferStaticTilingData*>(metadataArgs->metaOutAddr + fa_metadata::TilingOffset(false));
     auto* cuSeqlensQ = reinterpret_cast<const int32_t*>(metadataArgs->cuSeqlensQAddr);
@@ -516,9 +519,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
         metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
     const bool pagedFdCandidate =
         metadataArgs->isVarlen != 0 && metadataArgs->numSplits != 1 && metadataArgs->maskType != 2;
-    // Metadata has no physical layout tag. The forward host checks BSND before using this schedule.
-    const bool denseFdCandidate = metadataArgs->isVarlen == 0 && metadataArgs->isVarlenKv == 0 &&
-                                  metadataArgs->numSplits == 0 && metadataArgs->maskType == 0 && maxQSeqlen > 0 &&
+    // KV lengths can arrive as prefixes regardless of storage. The forward
+    // host checks for dense BSND before using this schedule.
+    const bool denseFdCandidate = metadataArgs->isVarlen == 0 && metadataArgs->numSplits == 0 &&
+                                  metadataArgs->maskType == 0 && maxQSeqlen > 0 &&
                                   fa950_plan::IsD512(metadataArgs->embeddingSize, metadataArgs->embeddingSizeV);
     const bool isFlashDecodeCandidate = (pagedFdCandidate || denseFdCandidate) && maxQSeqlen <= 16 &&
                                         maxQSeqlen * groupSizeForFlashDecode <= 128 && maxKvSeqlen >= 1024;

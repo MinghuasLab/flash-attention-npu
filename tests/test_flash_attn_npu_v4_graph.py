@@ -64,6 +64,40 @@ def test_d512_flash_attn_varlen_graph():
     _check_varlen_graph(False, 512, 1024)
 
 
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950 automatic metadata")
+def test_950_graph_auto_metadata_from_prefixes():
+    query = make_random_tensor((12, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    key = make_random_tensor((16, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    value = make_random_tensor(key.shape, DATA_TYPE, device="npu")
+    cu_q = torch.tensor([0, 5, 12], dtype=torch.int32, device="npu")
+    cu_k = torch.tensor([0, 8, 16], dtype=torch.int32, device="npu")
+
+    def run():
+        return flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=7,
+            max_seqlen_k=8,
+            causal=True,
+            return_lse=True,
+        )[:2]
+
+    expected, expected_lse = run()
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output, lse = run()
+    graph.replay()
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(lse, expected_lse)
+
+
 def _check_varlen_graph(is_causal, head_size, page_size):
     scale = head_size**-0.5
     query = make_random_tensor((Q_SEQLEN, NUM_HEADS, head_size), DATA_TYPE, device="npu")
