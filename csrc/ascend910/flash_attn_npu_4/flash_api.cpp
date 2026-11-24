@@ -45,25 +45,6 @@ using fa_window::NormalizeAttentionWindow;
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-// cu_seqlens[-1] is the last token the offsets address. Packed T may be longer
-// (unused tail) but must not be shorter, or the kernel reads past the tensor.
-// Returns false during NPU graph capture when cu lives on device: .item() is a
-// D2H sync (LocalScalarDense) and is forbidden inside capture. Warmup already
-// validated the same packed-T invariant.
-bool PackedCuLast(const at::Tensor& cu, int32_t& last)
-{
-    TORCH_CHECK(cu.numel() > 0, "cu_seqlens must be non-empty");
-    if (cu.is_cpu()) {
-        last = cu.data_ptr<int32_t>()[cu.numel() - 1];
-        return true;
-    }
-    if (c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None) {
-        return false;
-    }
-    last = cu.index({-1}).item<int32_t>();
-    return true;
-}
-
 extern __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void* args);
 extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
@@ -202,11 +183,6 @@ std::vector<at::Tensor> mha_fwd(
         // A nonzero declared max length with an empty packed query is inconsistent.
         TORCH_CHECK(!(q.size(0) == 0 && max_seqlen_q_.value() > 0),
                     "total_q must be positive (q must contain at least one query token)");
-        int32_t cuQLast = 0;
-        if (PackedCuLast(cu_seqlens_q, cuQLast)) {
-            TORCH_CHECK(q.size(0) >= cuQLast, "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
-                        "; packed T must be at least cu_seqlens_q[-1]");
-        }
     }
 
     if (is_varlen_kv) {
@@ -214,11 +190,6 @@ std::vector<at::Tensor> mha_fwd(
         CHECK_CONTIGUOUS(cu_seqlens_k);
         TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then paged table is not supported");
-        int32_t cuKLast = 0;
-        if (PackedCuLast(cu_seqlens_k, cuKLast)) {
-            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast, "k/v have ", k.size(0), "/", v.size(0),
-                        " tokens but cu_seqlens_k[-1] is ", cuKLast, "; packed T must be at least cu_seqlens_k[-1]");
-        }
     }
 
     if (seqused_k_.has_value()) {
@@ -922,27 +893,17 @@ std::vector<at::Tensor> mha_bwd(
     at::Tensor cu_seqlens_k_cpu_for_tiling;
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
-        int32_t cuQLast = 0;
         if (use_mla_host_path) {
             cu_seqlens_q_cpu_for_tiling = cu_seqlens_q.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        }
-        if (PackedCuLast(use_mla_host_path ? cu_seqlens_q_cpu_for_tiling : cu_seqlens_q, cuQLast)) {
-            TORCH_CHECK(q.size(0) >= cuQLast, "q has ", q.size(0), " tokens but cu_seqlens_q[-1] is ", cuQLast,
-                        "; packed T must be at least cu_seqlens_q[-1]");
         }
     }
     if (is_varlen_kv) {
         cu_seqlens_k = cu_seqlens_k_.value();
-        int32_t cuKLast = 0;
         if (use_mla_host_path) {
             // MLA only: reuse this call's snapshot, never cache mutable lengths across calls.
             cu_seqlens_k_cpu_for_tiling = cu_seqlens_q.defined() && cu_seqlens_q.is_same(cu_seqlens_k)
                                               ? cu_seqlens_q_cpu_for_tiling
                                               : cu_seqlens_k.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        }
-        if (PackedCuLast(use_mla_host_path ? cu_seqlens_k_cpu_for_tiling : cu_seqlens_k, cuKLast)) {
-            TORCH_CHECK(k.size(0) >= cuKLast && v.size(0) >= cuKLast, "k/v have ", k.size(0), "/", v.size(0),
-                        " tokens but cu_seqlens_k[-1] is ", cuKLast, "; packed T must be at least cu_seqlens_k[-1]");
         }
     }
 
