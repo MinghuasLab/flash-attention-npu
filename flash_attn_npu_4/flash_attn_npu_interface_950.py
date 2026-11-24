@@ -741,9 +741,6 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
-        dlse = args[0] if ctx.return_lse and len(args) > 0 else None
-        if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
-            dlse = None
         win_l, win_r = ctx.window_size
         if win_l is not None and win_l < 0:
             win_l = None
@@ -776,7 +773,6 @@ class FlashAttnFunc(torch.autograd.Function):
             aux_tensors=ctx.aux_tensors,
             aux_scalars=ctx.aux_scalars,
             block_sparse_tensors=ctx.block_sparse_tensors,
-            dlse=dlse,
             qv=ctx.qv,
             page_table=None,
             gather_kv_indices=ctx.gather_kv_indices,
@@ -951,9 +947,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = (
             ctx.saved_tensors
         )
-        dlse = args[0] if ctx.return_lse and len(args) > 0 else None
-        if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
-            dlse = None
         win_l, win_r = ctx.window_size
         if win_l is not None and win_l < 0:
             win_l = None
@@ -986,7 +979,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=ctx.aux_tensors,
             aux_scalars=ctx.aux_scalars,
             block_sparse_tensors=ctx.block_sparse_tensors,
-            dlse=dlse,
             qv=ctx.qv,
             page_table=ctx.page_table,
             gather_kv_indices=ctx.gather_kv_indices,
