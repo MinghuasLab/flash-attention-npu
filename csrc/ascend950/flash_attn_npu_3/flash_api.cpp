@@ -3,7 +3,6 @@
 // Pybind entrypoint for `flash_attn_npu_3_950` — the Ascend 950 backend
 // for FlashAttention v3.
 
-
 #include <torch/extension.h>
 
 #include "mha_fwd.cpp"

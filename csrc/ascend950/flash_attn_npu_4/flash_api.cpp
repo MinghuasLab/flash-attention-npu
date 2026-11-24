@@ -3,7 +3,6 @@
 // Pybind entrypoint for `flash_attn_npu_4_950` — the Ascend 950 backend
 // for FlashAttention v4.
 
-
 #include <torch/extension.h>
 #include <cmath>
 #include <cstring>
@@ -24,8 +23,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
                                            const std::optional<at::Tensor>& cu_seqlens_q,
                                            const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime)
 {
-    auto metadata = at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))},
-                              cache_seqlens.options().dtype(at::kByte));
+    auto metadata =
+        at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))}, cache_seqlens.options().dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(metadata.data_ptr());
     const auto current = c10_npu::getCurrentNPUStream();
     const auto current_handle = current.stream(false);
@@ -335,12 +334,12 @@ PYBIND11_MODULE(flash_attn_npu_4_950, m)
           py::arg("layout"), py::arg("q_descale"), py::arg("k_descale"), py::arg("v_descale"),
           py::arg("build_scheduler_metadata") = false);
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
-    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata",
-          py::arg("batch_size"), py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("num_heads_q"),
-          py::arg("num_heads_kv"), py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"),
-          py::arg("cu_seqlens_q"), py::arg("causal"), py::arg("window_size_left"), py::arg("window_size_right"),
-          py::arg("num_splits"), py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("seqused_q"),
-          py::arg("quant_mode"), py::arg("cu_seqlens_k") = py::none());
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata", py::arg("batch_size"),
+          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("num_heads_q"), py::arg("num_heads_kv"),
+          py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"), py::arg("cu_seqlens_q"),
+          py::arg("causal"), py::arg("window_size_left"), py::arg("window_size_right"), py::arg("num_splits"),
+          py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("seqused_q"), py::arg("quant_mode"),
+          py::arg("cu_seqlens_k") = py::none());
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
           py::arg("cu_seqlens") = py::none(), py::arg("seqused") = py::none(),

@@ -101,7 +101,13 @@ def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape, disable_sched
         )
         _assert_950_flashdecode_metadata(metadata)
         explicit_out, explicit_lse = flash_attn_func(
-            query, key, value, num_splits=0, softmax_scale=scale, return_lse=True, scheduler_metadata=metadata
+            query,
+            key,
+            value,
+            num_splits=0,
+            softmax_scale=scale,
+            return_lse=True,
+            scheduler_metadata=metadata,
         )
         torch.testing.assert_close(out, explicit_out, rtol=0, atol=0)
         torch.testing.assert_close(lse, explicit_lse, rtol=0, atol=0)
@@ -144,7 +150,9 @@ def test_950_d512_paged_auto_flashdecode_varlen():
         seqused_k=kwargs["seqused_k"],
     )
     _assert_950_flashdecode_metadata(metadata)
-    explicit_out, explicit_lse, *_ = flash_attn_varlen_func(q, k, v, scheduler_metadata=metadata, **kwargs)
+    explicit_out, explicit_lse, *_ = flash_attn_varlen_func(
+        q, k, v, scheduler_metadata=metadata, **kwargs
+    )
     torch.testing.assert_close(out, explicit_out, rtol=0, atol=0)
     torch.testing.assert_close(lse, explicit_lse, rtol=0, atol=0)
     keys, values = gather_paged_kv_batch(
@@ -198,7 +206,9 @@ def test_950_scheduler_metadata_matches_signature():
     ]
 
 
-@pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only native metadata contract")
+@pytest.mark.skipif(
+    "Ascend950" not in _device_name, reason="Ascend950-only native metadata contract"
+)
 def test_950_scheduler_metadata_kv_length_contract():
     import flash_attn_npu_4_950
 
@@ -212,7 +222,24 @@ def test_950_scheduler_metadata_kv_length_contract():
 
     def native_metadata(cache_seqlens=None, **kwargs):
         return flash_attn_npu_4_950.get_scheduler_metadata(
-            2, 2, 4096, 16, 4, 512, 512, cache_seqlens, None, False, -1, -1, 0, None, 0, None, 0, **kwargs
+            2,
+            2,
+            4096,
+            16,
+            4,
+            512,
+            512,
+            cache_seqlens,
+            None,
+            False,
+            -1,
+            -1,
+            0,
+            None,
+            0,
+            None,
+            0,
+            **kwargs,
         )
 
     strided_lengths = _int32_npu([4096, 0, 4096, 0])[::2]
@@ -224,7 +251,9 @@ def test_950_scheduler_metadata_kv_length_contract():
     short_prefix = _int32_npu([0, 16, 32])
     assert not torch.equal(expected, native_metadata(cu_seqlens_k=short_prefix))
     assert torch.equal(expected, native_metadata(lengths, cu_seqlens_k=short_prefix))
-    assert torch.equal(expected, get_scheduler_metadata(**args, seqused_k=lengths, cu_seqlens_k=short_prefix))
+    assert torch.equal(
+        expected, get_scheduler_metadata(**args, seqused_k=lengths, cu_seqlens_k=short_prefix)
+    )
     with pytest.raises(RuntimeError, match=r"cache_seqlens must be int32 \[batch\]"):
         native_metadata(prefix)
     with pytest.raises(RuntimeError, match=r"cu_seqlens_k must be int32 \[batch \+ 1\]"):

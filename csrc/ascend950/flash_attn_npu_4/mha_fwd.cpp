@@ -37,9 +37,8 @@
 extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
-                                          const std::optional<at::Tensor>& cu_seqlens_q,
-                                          const std::optional<at::Tensor>& seqused_q,
-                                          const at::Tensor& runtime = {});
+                                           const std::optional<at::Tensor>& cu_seqlens_q,
+                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime = {});
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
@@ -400,9 +399,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
-    auto workspace =
-        at::empty({static_cast<int64_t>(use_scheduler_metadata ? WS_FLOOR : tilingData.workSpaceSize)},
-                  at::device(at::kPrivateUse1).dtype(at::kByte));
+    auto workspace = at::empty({static_cast<int64_t>(use_scheduler_metadata ? WS_FLOOR : tilingData.workSpaceSize)},
+                               at::device(at::kPrivateUse1).dtype(at::kByte));
 
     at::Tensor softmaxlse;
     if (return_lse && is_varlen_q) {
@@ -551,9 +549,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
     FwdLaunchArgs fwdArgs{
-        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,  return_lse,    is_softcap, launchBlockDim,
-        aclStream, qDev,     kDev,          vDev,         maskDev,   blockTableDev, oDev,       lseDev,
-        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,     tilDev,        runtimeDev, kv_seqlen_allocated,
+        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,     return_lse,    is_softcap, launchBlockDim,
+        aclStream, qDev,     kDev,          vDev,         maskDev,      blockTableDev, oDev,       lseDev,
+        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,        tilDev,        runtimeDev, kv_seqlen_allocated,
         quantMode, qDescale, kDescale,      vDescale,     launchRuntime};
     fwdArgs.storage =
         FwdStorageParams{static_cast<uint64_t>(paged_KV ? k.stride(0) : 0),

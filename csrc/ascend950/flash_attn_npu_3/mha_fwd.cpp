@@ -136,8 +136,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, paged table is not supported");
     }
-    TORCH_CHECK(seqused_k_.has_value() || is_varlen_kv,
-                "950 backend (v3) requires seqused_k or cu_seqlens_k");
+    TORCH_CHECK(seqused_k_.has_value() || is_varlen_kv, "950 backend (v3) requires seqused_k or cu_seqlens_k");
     if (seqused_k_.has_value()) {
         seqlens_k = *seqused_k_;
         CHECK_CONTIGUOUS(seqlens_k);
