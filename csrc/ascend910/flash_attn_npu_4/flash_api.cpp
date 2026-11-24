@@ -1038,9 +1038,8 @@ std::vector<at::Tensor> mha_bwd(
     }
     TORCH_CHECK(!deterministic || (!seqused_q_.has_value() && !seqused_k_.has_value()),
                 "mha_bwd: seqused_q/seqused_k with deterministic is not supported yet");
-    // 确定性反向的workspace累加路径未覆盖D=512的K向切段，headdim > 256时禁止开启
-    TORCH_CHECK(!(deterministic && q_headdim > 256),
-                "mha_bwd: deterministic backward does not support headdim > 256");
+    // Deterministic workspace accumulation does not cover D=512 K-tiling; disallow headdim > 256 when enabled.
+    TORCH_CHECK(!(deterministic && q_headdim > 256), "mha_bwd: deterministic backward does not support headdim > 256");
     TORCH_CHECK(!is_varlen_q || max_seqlen_q_.has_value(), "max_seqlen_q must be provided in varlen bwd.");
     TORCH_CHECK(!is_varlen_q || max_seqlen_k_.has_value(), "max_seqlen_k must be provided in varlen bwd.");
     int64_t max_seqlen_q = is_varlen_q ? max_seqlen_q_.value() : qsizes[1];

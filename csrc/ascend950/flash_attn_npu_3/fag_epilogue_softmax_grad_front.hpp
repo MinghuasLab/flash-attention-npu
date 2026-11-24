@@ -47,6 +47,9 @@ class FagSoftmaxGradFront {
     {
         const uint32_t tileRows = GetTileRows(tiling_->vHeadDim);
         const uint32_t realD = static_cast<uint32_t>(tiling_->vHeadDim);
+        // Actual UB row pitch: DataCopyPad packs rows tightly (dstStride = 0),
+        // aligning each row only to 32B, i.e. RoundUp(realD, 16) elements.
+        // Do NOT use GetMaxAlignedD() here; that is the slot allocation pitch.
         const uint32_t alignedD = (realD + 15U) / 16U * 16U;
         const uint64_t totalRows = tiling_->totalQ * tiling_->qHeadNum;
         if (vectorCoreNum == 0U)
@@ -96,17 +99,31 @@ class FagSoftmaxGradFront {
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
             if (realD > 256U) {
-                SoftmaxGradFrontLargeD(
-                    reinterpret_cast<__ubuf__ DataType *>(doutUb_[slot].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ DataType *>(outUb_[slot].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ float *>(deltaUb_[slot].GetPhyAddr()),
-                    rows, realD, alignedD);
+                const uint32_t fullChunkCount = realD / 128U;
+                const uint32_t tailElements = realD % 128U;
+                if (tailElements == 0U) {
+                    SoftmaxGradFrontLargeD<false>(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                                                  reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                                                  reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), rows,
+                                                  fullChunkCount, 0U, alignedD);
+                } else {
+                    SoftmaxGradFrontLargeD<true>(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                                                 reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                                                 reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), rows,
+                                                 fullChunkCount, tailElements, alignedD);
+                }
             } else {
-                SoftmaxGradFrontVF(
-                    reinterpret_cast<__ubuf__ DataType *>(doutUb_[slot].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ DataType *>(outUb_[slot].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ float *>(deltaUb_[slot].GetPhyAddr()),
-                    rows, realD, alignedD);
+                if (realD > 128U) {
+                    SoftmaxGradFrontVF<true>(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                                             reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                                             reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), rows,
+                                             realD, alignedD);
+                } else {
+                    SoftmaxGradFrontVF<false>(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                                              reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                                              reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), rows,
+                                              realD, alignedD);
+                }
             }
             AscendC::PipeBarrier<PIPE_V>();
 
@@ -136,6 +153,7 @@ class FagSoftmaxGradFront {
         return FagUbLayout::DeltaAlignedD(vHeadDim);
     }
 
+    template <bool HAS_SECOND_CHUNK>
     __simd_vf__ inline static void SoftmaxGradFrontVF(__ubuf__ DataType* dout, __ubuf__ DataType* out,
                                                       __ubuf__ float* delta, uint32_t rows, uint32_t realD,
                                                       uint32_t rowStride)
@@ -155,7 +173,10 @@ class FagSoftmaxGradFront {
                                                    AscendC::RoundMode::UNKNOWN};
 
         for (uint16_t row = 0; row < static_cast<uint16_t>(rows); ++row) {
-            const uint32_t firstValid = realD < 128U ? realD : 128U;
+            uint32_t firstValid = realD;
+            if constexpr (HAS_SECOND_CHUNK) {
+                firstValid = 128U;
+            }
             uint32_t firstPairs = (firstValid + 1U) / 2U;
             uint32_t firstOdd = firstValid / 2U;
             MaskReg firstPairMask = UpdateMask<float>(firstPairs);
@@ -173,7 +194,7 @@ class FagSoftmaxGradFront {
             Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(reduced0, productSum, firstPairMask);
 
             Duplicate(reduced1, 0.0F);
-            if (realD > 128U) {
+            if constexpr (HAS_SECOND_CHUNK) {
                 const uint32_t secondValid = realD - 128U;
                 uint32_t secondPairs = (secondValid + 1U) / 2U;
                 uint32_t secondOdd = secondValid / 2U;
@@ -196,38 +217,38 @@ class FagSoftmaxGradFront {
         StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(delta, storeState, 0);
     }
 
-    // D>256 variant: retain the original two-chunk function above untouched and
-    // accumulate any number of 128-column chunks into one scalar per row.
-    __simd_vf__ inline static void SoftmaxGradFrontLargeD(
-        __ubuf__ DataType *dout,
-        __ubuf__ DataType *out,
-        __ubuf__ float *delta,
-        uint32_t rows,
-        uint32_t realD,
-        uint32_t rowStride)
+    // D>256 variant: accumulate full 128-column chunks and an optional tail.
+    template <bool HAS_TAIL>
+    __simd_vf__ inline static void SoftmaxGradFrontLargeD(__ubuf__ DataType* dout, __ubuf__ DataType* out,
+                                                          __ubuf__ float* delta, uint32_t rows, uint32_t fullChunkCount,
+                                                          uint32_t tailElements, uint32_t rowStride)
     {
         using namespace AscendC::MicroAPI;
-        RegTensor<DataType> doutPacked, outPacked;
-        RegTensor<float> doutEven, doutOdd, outEven, outOdd;
-        RegTensor<float> productEven, productOdd, productSum;
-        RegTensor<float> chunkReduced, reduced;
+        RegTensor<DataType> doutPacked;
+        RegTensor<DataType> outPacked;
+        RegTensor<float> doutEven;
+        RegTensor<float> doutOdd;
+        RegTensor<float> outEven;
+        RegTensor<float> outOdd;
+        RegTensor<float> productEven;
+        RegTensor<float> productOdd;
+        RegTensor<float> productSum;
+        RegTensor<float> chunkReduced;
+        RegTensor<float> reduced;
         UnalignReg storeState;
         MaskReg packedMask = CreateMask<DataType, MaskPattern::ALL>();
         MaskReg fullFp32Mask = CreateMask<float, MaskPattern::ALL>();
-        constexpr static CastTrait b16ToFp32Even = {
-            RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
-            AscendC::RoundMode::UNKNOWN};
-        constexpr static CastTrait b16ToFp32Odd = {
-            RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
-            AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait b16ToFp32Even = {RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                                    AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait b16ToFp32Odd = {RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                                   AscendC::RoundMode::UNKNOWN};
 
         for (uint16_t row = 0; row < static_cast<uint16_t>(rows); ++row) {
             Duplicate(reduced, 0.0F);
-            for (uint32_t dOff = 0; dOff < realD; dOff += 128U) {
-                const uint32_t remaining = realD - dOff;
-                const uint32_t valid = remaining < 128U ? remaining : 128U;
-                uint32_t pairs = (valid + 1U) / 2U;
-                uint32_t odd = valid / 2U;
+            for (uint32_t chunk = 0; chunk < fullChunkCount; ++chunk) {
+                const uint32_t dOff = chunk * 128U;
+                uint32_t pairs = (128U + 1U) / 2U;
+                uint32_t odd = 128U / 2U;
                 MaskReg pairMask = UpdateMask<float>(pairs);
                 MaskReg oddMask = UpdateMask<float>(odd);
 
@@ -240,15 +261,31 @@ class FagSoftmaxGradFront {
                 Mul(productEven, doutEven, outEven, pairMask);
                 Mul(productOdd, doutOdd, outOdd, oddMask);
                 Add(productSum, productEven, productOdd, pairMask);
-                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(
-                    chunkReduced, productSum, pairMask);
+                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(chunkReduced, productSum, pairMask);
                 Add(reduced, reduced, chunkReduced, fullFp32Mask);
             }
-            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(
-                delta, reduced, storeState, 1);
+            if constexpr (HAS_TAIL) {
+                const uint32_t tailOffset = fullChunkCount * 128U;
+                // UpdateMask takes uint32_t& and decrements it; must stay non-const.
+                uint32_t pairs = (tailElements + 1U) / 2U;
+                uint32_t odd = tailElements / 2U;
+                MaskReg pairMask = UpdateMask<float>(pairs);
+                MaskReg oddMask = UpdateMask<float>(odd);
+                LoadAlign(doutPacked, dout + row * rowStride + tailOffset);
+                LoadAlign(outPacked, out + row * rowStride + tailOffset);
+                Cast<float, DataType, b16ToFp32Even>(doutEven, doutPacked, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(doutOdd, doutPacked, packedMask);
+                Cast<float, DataType, b16ToFp32Even>(outEven, outPacked, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(outOdd, outPacked, packedMask);
+                Mul(productEven, doutEven, outEven, pairMask);
+                Mul(productOdd, doutOdd, outOdd, oddMask);
+                Add(productSum, productEven, productOdd, pairMask);
+                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(chunkReduced, productSum, pairMask);
+                Add(reduced, reduced, chunkReduced, fullFp32Mask);
+            }
+            StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(delta, reduced, storeState, 1);
         }
-        StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(
-            delta, storeState, 0);
+        StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(delta, storeState, 0);
     }
 
     const __gm__ TilingData* tiling_ = nullptr;
