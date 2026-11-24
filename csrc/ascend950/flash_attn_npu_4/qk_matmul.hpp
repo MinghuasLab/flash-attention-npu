@@ -302,7 +302,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                       uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink,
                                       uint32_t globalWindowSize, uint32_t localWindowSize, uint32_t qSBlockSize,
                                       uint32_t qNBlockSize, Arch::CrossCoreFlag qkReadyFlag,
-                                      uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages)
+                                      uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages, bool useUnitFlag = false, bool fixedShape = false)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -470,6 +470,53 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+            if constexpr (std::is_same_v<ElementC, float> && !PAGED_CACHE_FLAG_ && !NZ_LAYOUT_FLAG_) {
+                if (fixedShape && rowNum == 128U && embed == 256U && l0TileNAct == 128U && nL0LoopNum == 1U) {
+                    constexpr uint32_t M = 128U;
+                    constexpr uint32_t N = 128U;
+                    constexpr uint32_t K = 128U;
+                    auto aLayout = tla::MakeLayout<ElementA, LayoutTagL0A>(M, K);
+                    auto bLayout = tla::MakeLayout<ElementB, LayoutTagL0B>(K, N);
+                    auto c = GetTile(l0CTensorTla, tla::MakeCoord(0U, 0U), tla::MakeShape(M, N));
+#pragma unroll
+                    for (uint32_t stage = 0; stage < 2U; ++stage) {
+                        const uint32_t aSlot = (prefixSumL0AStages + stage) & 1U;
+                        const uint32_t bSlot = (prefixSumL0BStages + stage) & 1U;
+                        const uint32_t bEvent = bSlot + 2U;
+                        auto a = tla::MakeTensor(l0ATensor[aSlot], aLayout, Arch::PositionL0A{});
+                        auto b = tla::MakeTensor(l0BTensor[bSlot], bLayout, Arch::PositionL0B{});
+                        auto qTile = GetTile(l1ATensorTla, tla::MakeCoord(0U, stage * K), tla::MakeShape(M, K));
+                        auto kTile = GetTile(l1BTensorTla, tla::MakeCoord(stage * K, 0U), tla::MakeShape(K, N));
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(aSlot);
+                        copyL1ToL0A(a, qTile);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(aSlot);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(bEvent);
+                        if (stage == 0U) AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+                        copyL1ToL0B(b, kTile);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(bEvent);
+                        if (stage == 1U) AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(aSlot);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(bEvent);
+                        if (!useUnitFlag && stage == 0U) {
+                            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                        }
+                        tileMmad(c, a, b, M, N, K, stage == 0U,
+                                 useUnitFlag ? (stage == 0U ? 0b10 : 0b11) : 0U);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(aSlot);
+                        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(bEvent);
+                    }
+                    WaitCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);
+                    if (!useUnitFlag) {
+                        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+                        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+                    }
+                    auto destination = GetTile(ubCTensor, tla::MakeCoord(0U, 0U), tla::MakeShape(M, N));
+                    copyL0CToDst(destination, l0CTensorTla, useUnitFlag ? 0b11 : 0U);
+                    if (!useUnitFlag) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+                    SetCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);
+                    return;
+                }
+            }
             for (uint32_t mL0Itr = 0; mL0Itr < mL0LoopNum; mL0Itr++) {
                 uint32_t l0TileMAct = (mL0Itr == mL0LoopNum - 1) ? (rowNum - mL0Itr * L0_TILE_M) : L0_TILE_M;
                 // different m chunks will be concated in the same piece of l0C buffer
@@ -514,11 +561,11 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     uint32_t l0TileMAligned = RoundUp(l0TileMAct, 16);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
-                    if (mL0Itr == 0 && kL0Itr == 0) {
+                    if (!useUnitFlag && mL0Itr == 0 && kL0Itr == 0) {
                         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
                     }
                     tileMmad(l0CTensorTlaTile, l0ATensorTla, l0BTensorTla, l0TileMAligned, l0TileNAct, l0TileKAct,
-                             initMmad);
+                             initMmad, useUnitFlag ? (kL0Itr+1U == kL0LoopNum ? 0b11 : 0b10) : 0U);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                 }
@@ -528,8 +575,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 // reverse crossCoreSync, do fixPipe only after ubCTensor is fully released
                 WaitCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);
             }
-            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
-            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+            if (!useUnitFlag) {
+                AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+                AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
+            }
             // 需要kernel传输ubCTensor的时候确保其shape的m，n是满足32B（8个32位元素）对齐的
             // rounded up by 8 and splited in half to each AIV
             // valid rows in AIV0: [0, mFixPAligned8 / 2 - 1]
@@ -552,9 +601,9 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
                 auto ubCTensorTlaTile = GetTile(ubCTensor, tla::MakeCoord(0, nL0Itr * L0_TILE_N),
                                                 tla::MakeShape(mFixPAligned8, nFixPAligned8));
-                copyL0CToDst(ubCTensorTlaTile, l0CTensorTla);
+                copyL0CToDst(ubCTensorTlaTile, l0CTensorTla, useUnitFlag ? 0b11 : 0U);
             }
-            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
+            if (!useUnitFlag) AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
         }
         // crossCoreSync after all fixPipe move
         SetCrossCoreSync<4, PIPE_FIX>(qkReadyFlag);

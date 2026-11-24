@@ -633,6 +633,15 @@ class FAIKernel950 {
             auto gmOLayoutTla = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, oShapeCol);
             auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO], gmOLayoutTla, Arch::PositionGM{});
 #endif
+#ifdef __DAV_CUBE__
+            constexpr bool supportsWindowPipeline =
+                qFormat == Format::BNSD && maskCategory == MaskCategory::MASK_SWA &&
+                kvcacheType == CacheMode::normalCache && cacheLayout == CacheLayout::nd && !IsDN &&
+                std::is_same_v<ElementQ, bfloat16_t>;
+            // Scheduler metadata opts in to the measured QK and PV schedule.
+            const bool useWindowPipeline = supportsWindowPipeline && !d512 && !flashDecodeFlag_ &&
+                                           faiTilingData->padding3 == 0xf9507600U;
+#endif
             for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; ++kvSTileRelIdx) {
                 const uint32_t kvSTileIdx = kvSplitStart + kvSTileRelIdx;
                 const uint32_t pipelineTileSeq =
@@ -670,7 +679,7 @@ class FAIKernel950 {
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
-                                    prefixSumL0BStages);
+                                    prefixSumL0BStages, useWindowPipeline && rowNum == 128U, useWindowPipeline);
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -823,7 +832,8 @@ class FAIKernel950 {
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     blockMmadPV(gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset], actualBlockShapePV,
                                 blockSize_, kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
-                                0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, d512);
+                                0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, d512,
+                                useWindowPipeline);
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);

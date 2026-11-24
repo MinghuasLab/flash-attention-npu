@@ -247,7 +247,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                uint32_t kvSeqlenTriDown, uint32_t kvHeads, uint32_t kvNumTokens, uint32_t kvSBaseTile,
                uint32_t isShrink, uint32_t globalWindowSize, uint32_t localWindowSize,
                Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag, uint64_t prefixSumL0AStages,
-               uint64_t prefixSumL0BStages, bool d512PieceDelivery = false)
+               uint64_t prefixSumL0BStages, bool d512PieceDelivery = false, bool reuseWindowBuffers = false)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -260,6 +260,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t curBaseTileSize = actualOriShape[2];
         uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
 
+        const bool twoWidthTiles = !ENABLE_DN_ && !FULL_QUANT_FP8 && !d512PieceDelivery &&
+                                   rowNum == 128U && embed == 256U && curBaseTileSize == 128U;
+        const bool reuseP = twoWidthTiles && reuseWindowBuffers;
+        const bool separateL0C = reuseP;
         uint32_t l1BBufId = pipelineTileSeq % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 3;
         uint32_t l1ABufId = pipelineTileSeq % l1ABufNum;
@@ -437,7 +441,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
             // l0C nbuffer chunked only in n loop
             uint32_t l0CLoopCounter = pipelineTileSeq;
-            uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
+            uint32_t l0CBufId = separateL0C ? nL0Itr : l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId + 2;
             auto l0CLayoutTla = tla::MakeLayoutL0C(rowNum, l0TileNPhysical);
             auto l0CTensorTla = tla::MakeTensor(l0CTensor[l0CBufId], l0CLayoutTla, Arch::PositionL0C{});
@@ -479,6 +483,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileMAct, l0TileKPhysical);
                     auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
 
+                    if (!reuseP || nL0Itr == 0U) {
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
                     if constexpr (!ENABLE_DN_ || FULL_QUANT_FP8) {
                         copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
@@ -494,14 +499,15 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                         AscendC::LoadData(l0ATensor[l0ABufId], l1ATensorTla.data(), loadData2DParamsA);
                     }
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                    }
                     // reverse crossCoreSync for P
-                    if ((mL0Itr == mL0LoopNum - 1) && (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
+                    if ((mL0Itr == mL0LoopNum - 1) && (reuseP ? nL0Itr == 0U : nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
                         SetCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
                     }
 
                     bool initMmad = (kL0Itr == 0);
                     uint32_t l0TileMAligned = RoundUp(l0TileMAct, 16);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
+                    if (!reuseP || nL0Itr == 0U) AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
 
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
 
@@ -510,7 +516,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     }
                     tileMmad(l0CTensorTlaTile, l0ATensorTla, l0BTensorTla, l0TileMAligned, l0TileNAct, l0TileKAct,
                              initMmad);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
+                    if (!reuseP || nL0Itr + 1U == nL0LoopNum) AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventId);
                 }
             }
