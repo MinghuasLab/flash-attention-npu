@@ -355,6 +355,7 @@ def _flash_attn_forward(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    pse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if qv is not None:
         raise NotImplementedError("Ascend950 FA4 forward does not support qv")
@@ -395,6 +396,7 @@ def _flash_attn_forward(
         q_descale,
         k_descale,
         v_descale,
+        pse,
     )
 
     if out_accum is None:
@@ -641,6 +643,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softmax_scale=None,
         causal=False,
         window_size=(-1, -1),
+        pse=None,
         learnable_sink=None,
         softcap=0.0,
         num_splits=1,
@@ -730,6 +733,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            pse,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -742,6 +746,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.pack_gqa = pack_gqa
         ctx.qv = qv
         ctx.gather_kv_indices = gather_kv_indices
+        ctx.pse = pse
         ctx.learnable_sink = learnable_sink
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
@@ -756,6 +761,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        assert ctx.pse is None, "flash_attn_npu_v4 950 bwd does not support pse"
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dlse = args[0] if ctx.return_lse and len(args) > 0 else None
         if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
@@ -807,6 +813,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # softmax_scale
             None,  # causal
             None,  # window_size
+            None,  # pse
             None,  # learnable_sink
             None,  # softcap
             None,  # num_splits
@@ -1127,6 +1134,7 @@ def flash_attn_func(
     softmax_scale=None,
     causal: bool = False,
     window_size=(-1, -1),
+    pse=None,
     learnable_sink=None,
     softcap=0.0,
     num_splits=1,
@@ -1167,6 +1175,8 @@ def flash_attn_func(
     ):
         if isinstance(scales, TensorwiseScales):
             raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
+        if pse is not None:
+            raise NotImplementedError("FA4 Flex attention does not support pse")
         return _catlass_utils.attention(
             q,
             k,
@@ -1212,6 +1222,7 @@ def flash_attn_func(
         softmax_scale,
         causal,
         window_size,
+        pse,
         learnable_sink,
         softcap,
         num_splits,
@@ -1347,6 +1358,7 @@ def _flash_attn_forward_fake(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    pse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
     is_varlen_q = cu_seqlens_q is not None
@@ -1417,6 +1429,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     causal: bool = False,
     window_size=(-1, -1),
+    pse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
     softcap=0.0,
     num_splits=0,
@@ -1455,6 +1468,8 @@ def flash_attn_varlen_func(
     ):
         if isinstance(scales, TensorwiseScales):
             raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
+        if pse is not None:
+            raise NotImplementedError("FA4 Flex attention does not support pse")
         return _catlass_utils.attention(
             q,
             k,
@@ -1498,6 +1513,8 @@ def flash_attn_varlen_func(
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
         if any(t is not None and t.requires_grad for t in (q, k, v)):
             raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
+    if pse is not None:
+        raise NotImplementedError("Ascend950 FA4 varlen forward does not support pse")
     return FlashAttnVarlenFunc.apply(
         q,
         k,

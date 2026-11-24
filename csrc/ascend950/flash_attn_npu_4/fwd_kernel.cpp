@@ -239,7 +239,8 @@ class FAIKernel950 {
         const bool d512 = fa950_plan::IsD512(embed_, embedV_) && qBaseTile_ == Q_M_TILE_MAX;
 #ifdef __DAV_VEC__
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_, !d512);
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_, !d512, params.pse,
+                                                    params.sink);
         EpilogueRescaleO epilogueRescaleO(resource, ubPlan, flashDecodeFlag_ == 0U);
         // Plan-based buffers only for plans that carry a dedicated LSE scratch
         // (D512); every legacy plan keeps the established fixed offsets.
@@ -427,6 +428,17 @@ class FAIKernel950 {
             kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
             qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
             qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
+#ifdef __DAV_VEC__
+            if (params.sink != nullptr) {
+                epilogueOnlineSoftmax.SetTaskSinkHead(qNStartIdx);
+            }
+            if (params.pse != nullptr) {
+                const uint64_t pseBase =
+                    static_cast<uint64_t>(curBatch) * static_cast<uint64_t>(qHeads_) * params.storage.pseHeadStride +
+                    static_cast<uint64_t>(qNStartIdx) * params.storage.pseHeadStride;
+                epilogueOnlineSoftmax.SetTaskPseBase(static_cast<int64_t>(pseBase));
+            }
+#endif
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
@@ -549,9 +561,14 @@ class FAIKernel950 {
             }
             if (emptySpan) {
 #ifdef __DAV_VEC__
-                initOutputs.template operator()<LseMode>(gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize,
-                                                         lseHeadStride, embedV_, static_cast<uint32_t>(strideO),
-                                                         static_cast<uint32_t>(oHeadStride));
+                AscendC::GlobalTensor<float> gSinkEmpty;
+                if (params.sink != nullptr) {
+                    gSinkEmpty.SetGlobalBuffer((__gm__ float*)params.sink);
+                }
+                initOutputs.template operator()<LseMode>(
+                    gO[gmOffsetO], gLse[lseOffset], qSBlockSize, qNBlockSize, lseHeadStride, embedV_,
+                    static_cast<uint32_t>(strideO), static_cast<uint32_t>(oHeadStride), params.sink != nullptr,
+                    gSinkEmpty, qNStartIdx);
 #endif
                 continue;
             }
@@ -682,7 +699,7 @@ class FAIKernel950 {
                             } else {
                                 epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
                                                       l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
+                                                      qNBlockSize, static_cast<uint32_t>(kvSTileIdx * kvBaseTile_));
                             }
                         } else {
                             auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
@@ -700,7 +717,7 @@ class FAIKernel950 {
                             } else {
                                 epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
                                                       l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
+                                                      qNBlockSize, static_cast<uint32_t>(kvSTileIdx * kvBaseTile_));
                             }
                         }
                     } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
@@ -741,7 +758,7 @@ class FAIKernel950 {
                             } else {
                                 epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
                                                       l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
+                                                      qNBlockSize, static_cast<uint32_t>(kvSTileIdx * kvBaseTile_));
                             }
                         } else {
                             auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
@@ -755,16 +772,19 @@ class FAIKernel950 {
                             } else {
                                 epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
                                                       l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize,
-                                                      qNBlockSize);
+                                                      qNBlockSize, static_cast<uint32_t>(kvSTileIdx * kvBaseTile_));
                             }
                         }
                     } else {
+                        const uint32_t pseColStart = static_cast<uint32_t>(kvSTileIdx * kvBaseTile_);
                         if constexpr (IsDN) {
                             epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, 1, qSBlockSize, qNBlockSize);
+                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, 1, qSBlockSize, qNBlockSize,
+                                                  pseColStart);
                         } else {
                             epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, (kvSTileRelIdx == 0), ubSBufId,
-                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize);
+                                                  l1PBufId, qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize,
+                                                  pseColStart);
                         }
                     }
 #endif
@@ -912,6 +932,8 @@ class FAIKernel950 {
         // mask
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID5);
+        // pse tile copy (WAR gate)
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
         // rescale
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
@@ -975,6 +997,7 @@ class FAIKernel950 {
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID5);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
@@ -1057,11 +1080,11 @@ class FAIKernel950 {
 };
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
-          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool HasPse>
 CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling, int64_t kvSeqlenAllocated,
-                            FwdStorageParams storage)
+                            FwdStorageParams storage, GM_ADDR pse, GM_ADDR sink)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1097,7 +1120,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK,
                                                   ElementS, void, TileCopyQK>;
     // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
-    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap>;
+    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap, HasPse>;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
     using SType = Gemm::GemmType<ElementS, LayoutS>;
@@ -1124,16 +1147,18 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
     FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
                            seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
+    params.pse = pse;
+    params.sink = sink;
     Kernel faInfer;
     faInfer(params);
 }
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
-          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool HasPse>
 CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling,
-                              int64_t kvSeqlenAllocated, FwdStorageParams storage)
+                              int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR pse, GM_ADDR sink)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1162,7 +1187,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
     using BlockMmadQK = Gemm::Block::BlockMmadTla<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementK, ElementQ,
                                                   ElementS, void, TileCopyQK>;
     // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
-    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap>;
+    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmaxT<HasSoftcap, HasPse>;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<ArchTag, ElementMask, ElementP, LayoutMask, LayoutPDummy>;
     using PType = Gemm::GemmType<ElementP, LayoutPDummy>;
     using SType = Gemm::GemmType<ElementS, LayoutS>;
@@ -1189,6 +1214,8 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
     FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
                            seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
+    params.pse = pse;
+    params.sink = sink;
     Kernel faInfer;
     faInfer(params);
 }

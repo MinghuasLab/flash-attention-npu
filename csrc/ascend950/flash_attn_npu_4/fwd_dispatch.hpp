@@ -39,6 +39,9 @@ struct FwdLaunchArgs {
     FAInferRuntimeData fp8_runtime{};
     FwdStorageParams storage{};
     bool kv_bnbd = false;
+    uint8_t* pse_device = nullptr;  // dense BF16 [B,N,1,S_kv]; nullptr when absent
+    uint8_t* sink_device = nullptr; // dense FP32 [N]; nullptr when absent
+    bool has_pse = false;           // compile-time PSE kernel selection
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

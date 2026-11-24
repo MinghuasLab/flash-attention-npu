@@ -19,6 +19,10 @@ constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, mask, lse, total;
+    // PSE staging (BF16 128 lanes at pse, FP32 128 lanes at pse+256). It is
+    // placed after the plan's tail (which holds RescaleO's 32B reduction
+    // scratch at `total`), so no existing buffer offset moves.
+    uint32_t pse;
     uint32_t sBytes, pBytes, loBytes, goBytes, lseBytes, otmpStages;
     // P UB slots: the legacy plan keeps two slots rotating with the Score
     // slot; the D512 plan keeps a single slot with a fixed copy event.
@@ -53,6 +57,7 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlanD512()
     u.mask = 0U;
     u.lse = u.gl + 64U * 4U;      // 247808
     u.total = u.lse + u.lseBytes; // 248064
+    u.pse = u.total + 256U;       // skip RescaleO's redUbTensor at `total`
     return u;
 }
 
@@ -80,6 +85,7 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.mask = u.gl + 64U * 4U;
     u.lse = 0U;
     u.total = u.mask + 2U * 64U * 128U;
+    u.pse = u.total + 256U; // skip RescaleO's redUbTensor at `total`
     return u;
 }
 
@@ -112,6 +118,7 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.gl = u.ll + 256U;
     u.mask = u.gl + 256U;
     u.total = u.mask + 16384U;
+    u.pse = u.total + 256U; // skip RescaleO's redUbTensor at `total`
     return u;
 }
 
@@ -170,6 +177,9 @@ static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
 static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
+// PSE staging (256B BF16 + 512B FP32) sits after the plan tail.
+static_assert(MakeUbPlanD512().pse + 768U <= UB_CAPACITY, "D512 PSE UB capacity");
+static_assert(MakeUbPlan(256, 1).pse + 768U <= UB_CAPACITY, "D256 PSE UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan
 

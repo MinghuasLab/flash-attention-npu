@@ -19,10 +19,11 @@ namespace Catlass::Epilogue {
 // softcap / no-softcap kernel selection as a compile-time flag: the per-tile
 // tanh softcap is then either folded into the scale+max pass or compiled out
 // entirely. EpilogueFAOnlineSoftmax (catlass) stays the no-softcap spelling.
-template <bool HAS_SOFTCAP_>
+template <bool HAS_SOFTCAP_, bool HAS_PSE_ = false>
 struct EpilogueFAOnlineSoftmaxT {
     using ArchTag = Arch::Ascend950;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+    static constexpr bool HAS_PSE = HAS_PSE_;
 };
 
 template <bool HAS_SOFTCAP_, MaskCategory MASK_CATEGORY_>
