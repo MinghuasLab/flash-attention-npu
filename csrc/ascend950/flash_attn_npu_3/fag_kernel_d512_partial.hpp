@@ -184,7 +184,7 @@ class FlashAttentionScoreGrad950Partial {
         epilogueSoftmaxGradFront_.Init(resource, params.dout, params.out, params.workspace, params.tiling);
         epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
-        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping, params.dq, params.dk, params.dv);
+        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping, params.dq);
         epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
                                   vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
 #endif

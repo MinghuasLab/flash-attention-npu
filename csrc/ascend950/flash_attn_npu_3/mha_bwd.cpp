@@ -294,11 +294,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         tiling_device = fag_bwd_host::PrepareTnd(fag_info, input_strides, cu_q_device, cu_k_device, seqused_q_,
                                                  seqused_k_, k_sizes[0], v_sizes[0], workspace_size,
                                                  /*exactPackedLength=*/false);
+        stream = fag_bwd_host::ClearTndKvOutputs(fag_info, /*exactPackedLength=*/false, tiling_device, dk, dv);
+    } else {
+        // Flush queued PyTorch NPU work before the raw kernel launch.
+        stream = c10_npu::getCurrentNPUStream().stream(true);
     }
-
-    // Flush queued PyTorch NPU work (for example tiling, mask and cumulative
-    // lengths) before launching the raw mixed AIC/AIV kernel on the ACL stream.
-    stream = c10_npu::getCurrentNPUStream().stream(true);
 
     // The deterministic BN2S2 tiling trims idle cores for small shapes
     // (fag_tiling.cpp): every launched core pays the deterministic prologue

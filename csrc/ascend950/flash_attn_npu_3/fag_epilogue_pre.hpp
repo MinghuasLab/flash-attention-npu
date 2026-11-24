@@ -14,6 +14,7 @@
 
 #include "catlass/arch/resource.hpp"
 #include "fag_common.h"
+#include "fag_zero_gradient.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -30,8 +31,7 @@ class FagPre {
         workspace_ = workspace;
     }
 
-    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event, GM_ADDR dq,
-                                   GM_ADDR dk, GM_ADDR dv)
+    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event, GM_ADDR dq)
     {
         constexpr uint32_t tileElements = 20U * 1024U;
         AscendC::Duplicate(zeroUb_, 0.0F, tileElements);
@@ -57,9 +57,9 @@ class FagPre {
             ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
         }
         if (tiling_->layout == static_cast<uint32_t>(FAGTiling950::Layout::TND)) {
-            ClearGradient(dq, tiling_->clearDq.begin, tiling_->clearDq.count, vectorCoreId, vectorCoreNum);
-            ClearGradient(dk, tiling_->clearDk.begin, tiling_->clearDk.count, vectorCoreId, vectorCoreNum);
-            ClearGradient(dv, tiling_->clearDv.begin, tiling_->clearDv.count, vectorCoreId, vectorCoreNum);
+            const FAGTiling950::FAGGradClearRange range{tiling_->clearDq.begin, tiling_->clearDq.count};
+            FAGTiling950::ZeroGradient(dq, range, zeroUb_.template ReinterpretCast<uint16_t>(), vectorCoreId,
+                                       vectorCoreNum);
         }
         // readyCounter/doneCounter live at workspace_[0..15]. The non-det
         // tiler sets dqOffset=0 so ClearRegion already zeros that range;
@@ -102,32 +102,6 @@ class FagPre {
                 AscendC::DataCopyPad(dst[gmOffset + aligned], zeroUb_, copyParams);
             }
             done += current;
-        }
-    }
-
-    CATLASS_DEVICE void ClearGradient(GM_ADDR dst, uint64_t rangeBegin, uint64_t rangeCount, uint32_t vectorCoreId,
-                                      uint32_t vectorCoreNum)
-    {
-        if (rangeCount == 0 || vectorCoreNum == 0) {
-            return;
-        }
-        constexpr uint32_t elementsPerBlock = 32 / sizeof(uint16_t);
-        constexpr uint32_t tileElements = 20U * 1024U * sizeof(float) / sizeof(uint16_t);
-        const uint64_t perCore =
-            (rangeCount + vectorCoreNum * elementsPerBlock - 1) / (vectorCoreNum * elementsPerBlock) * elementsPerBlock;
-        const uint64_t begin = vectorCoreId * perCore;
-        if (begin >= rangeCount) {
-            return;
-        }
-        const uint64_t count = rangeCount - begin < perCore ? rangeCount - begin : perCore;
-        AscendC::GlobalTensor<uint16_t> gm;
-        gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(dst));
-        const auto zeros = zeroUb_.template ReinterpretCast<uint16_t>();
-        for (uint64_t offset = 0; offset < count; offset += tileElements) {
-            const uint64_t remaining = count - offset;
-            const uint32_t current = static_cast<uint32_t>(remaining < tileElements ? remaining : tileElements);
-            AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(current * sizeof(uint16_t)), 0, 0, 0};
-            AscendC::DataCopyPad(gm[rangeBegin + begin + offset], zeros, copy);
         }
     }
 

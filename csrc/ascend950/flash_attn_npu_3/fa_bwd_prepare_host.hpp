@@ -11,6 +11,7 @@
 
 #include "acl/acl.h"
 #include "fag_tiling_data.h"
+#include "fag_zero_gradient.hpp"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
@@ -19,13 +20,16 @@ extern __global__ __aicpu__ uint32_t PrepareFlashAttnBwd950(void* args);
 
 namespace fag_bwd_host {
 
+inline bool HasShortTndDkvOutput(const FAGTiling950::FAGInfo& info)
+{
+    return info.deterministic == 0 && info.qSeqlen <= 16 && info.qkHeadDim <= 128 && info.vHeadDim <= 128;
+}
+
 inline uint64_t TndWorkspaceCapacity(const FAGTiling950::FAGInfo& info)
 {
     using namespace FAGTiling950;
     using Wide = unsigned __int128;
-    const auto align = [](Wide bytes) {
-        return (bytes + GM_ALIGNMENT - 1) / GM_ALIGNMENT * GM_ALIGNMENT;
-    };
+    const auto align = [](Wide bytes) { return (bytes + GM_ALIGNMENT - 1) / GM_ALIGNMENT * GM_ALIGNMENT; };
     const Wide delta = static_cast<Wide>(info.totalQ) * info.qHeadNum * sizeof(float) * 2;
     Wide capacity = 0;
     if (info.deterministic != 0) {
@@ -44,9 +48,9 @@ inline uint64_t TndWorkspaceCapacity(const FAGTiling950::FAGInfo& info)
         capacity = static_cast<Wide>(info.totalQ) * info.qHeadNum * info.qkHeadDim * sizeof(float) + delta;
         // If the declared Q bound is short, both the actual-length and
         // empty-batch fallback plans cast dK/dV directly into the output.
-        if (info.qSeqlen > 16 || info.qkHeadDim > 128 || info.vHeadDim > 128) {
-            capacity += static_cast<Wide>(info.totalKv) * info.kvHeadNum *
-                        (info.qkHeadDim + info.vHeadDim) * sizeof(float);
+        if (!HasShortTndDkvOutput(info)) {
+            capacity +=
+                static_cast<Wide>(info.totalKv) * info.kvHeadNum * (info.qkHeadDim + info.vHeadDim) * sizeof(float);
         }
     }
     TORCH_CHECK(capacity > 0 && capacity <= static_cast<Wide>(std::numeric_limits<int64_t>::max()),
@@ -124,6 +128,71 @@ inline at::Tensor PrepareTnd(const FAGTiling950::FAGInfo& info, const FagInputSt
         record(usedKv.value());
     }
     return tiling;
+}
+
+__global__ __vector__ void ClearFlashAttnBwdKv950(GM_ADDR tiling, GM_ADDR dk, GM_ADDR dv)
+{
+#ifdef __DAV_VEC__
+    using namespace FAGTiling950;
+    const auto* plan = reinterpret_cast<const __gm__ FAGTilingData*>(tiling);
+    if (plan->planStatus != FAGPlanStatus::READY) {
+        return;
+    }
+    const FAGGradClearRange dkRange{plan->clearDk.begin, plan->clearDk.count};
+    const FAGGradClearRange dvRange{plan->clearDv.begin, plan->clearDv.count};
+    if (dkRange.count == 0 && dvRange.count == 0) {
+        return;
+    }
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> zeroBuffer;
+    pipe.InitBuffer(zeroBuffer, GRAD_ZERO_TILE_ELEMENTS * sizeof(uint16_t));
+    const auto zeros = zeroBuffer.Get<uint16_t>();
+    AscendC::Duplicate(zeros, uint16_t{0}, GRAD_ZERO_TILE_ELEMENTS);
+    const auto zeroReady = static_cast<event_t>(pipe.FetchEventID(AscendC::HardEvent::V_MTE3));
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(zeroReady);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(zeroReady);
+    const auto coreId = AscendC::GetBlockIdx();
+    const auto coreCount = AscendC::GetBlockNum();
+    ZeroGradient(dk, dkRange, zeros, coreId, coreCount);
+    ZeroGradient(dv, dvRange, zeros, coreId, coreCount);
+    AscendC::PipeBarrier<PIPE_MTE3>();
+#endif
+}
+
+inline aclrtStream ClearTndKvOutputs(const FAGTiling950::FAGInfo& info, bool exactPackedLength,
+                                     const at::Tensor& tiling, at::Tensor& dk, at::Tensor& dv)
+{
+    bool useDeviceRanges = false;
+    if (HasShortTndDkvOutput(info)) {
+        dk.zero_();
+        dv.zero_();
+    } else if (info.deterministic != 0) {
+        // FA3 can have packed tails. A left window can also leave columns without a task.
+        useDeviceRanges =
+            !exactPackedLength || (info.maskType == FAGTiling950::MaskType::BAND && info.window_size_left >= 0);
+    } else if (!exactPackedLength) {
+        // FA3 can select earlyDkvCast using actual lengths below the declared Q bound.
+        useDeviceRanges = info.qkHeadDim <= 128 && info.vHeadDim <= 128;
+        if (!useDeviceRanges) {
+            const auto firstTail = static_cast<int64_t>(info.totalKv);
+            if (dk.size(0) > firstTail) {
+                dk.slice(0, firstTail).zero_();
+            }
+            if (dv.size(0) > firstTail) {
+                dv.slice(0, firstTail).zero_();
+            }
+        }
+    }
+
+    const auto stream = c10_npu::getCurrentNPUStream().stream(true);
+    if (useDeviceRanges) {
+        // The current stream already waits for the device plan. The backward
+        // kernel is queued after this clear on the same stream.
+        ClearFlashAttnBwdKv950<<<info.aivNum, nullptr, stream>>>(static_cast<uint8_t*>(tiling.data_ptr()),
+                                                                 static_cast<uint8_t*>(dk.data_ptr()),
+                                                                 static_cast<uint8_t*>(dv.data_ptr()));
+    }
+    return stream;
 }
 
 } // namespace fag_bwd_host
