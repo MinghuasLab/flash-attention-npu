@@ -330,10 +330,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                     "Ascend950 v4 bwd: deterministic backward requires the BN2S2 "
                     "schedule for this shape");
     }
-    at::Tensor tiling_cpu =
-        at::empty({static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
+    at::Tensor tiling_cpu = at::empty({static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))},
+                                      at::device(at::kCPU).dtype(at::kByte).pinned_memory(true));
     std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &fag_tiling_data, sizeof(FAGTiling950::FAGTilingData));
-    at::Tensor tiling_device = tiling_cpu.to(at::Device(at::kPrivateUse1));
+    at::Tensor tiling_device = tiling_cpu.to(q.device(), at::kByte, /*non_blocking=*/true);
 
     // ============================================================
     // FAG workspace (device)
