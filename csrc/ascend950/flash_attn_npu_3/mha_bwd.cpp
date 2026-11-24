@@ -22,6 +22,7 @@
 #include "fag_bwd_d512_partial_host.hpp"
 #include "fa_bwd_mla_kernel.cpp"
 #include "tiling/platform/platform_ascendc.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
@@ -432,6 +433,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     if (has_attn_mask) {
         mask_npu_tensor = MakeDeviceTriuMask(/*dim=*/256);
         mask = ptr(mask_npu_tensor);
+        c10_npu::NPUCachingAllocator::recordStream(mask_npu_tensor.storage().data_ptr(), current_stream);
     }
 
     // Flush queued PyTorch NPU work (for example tiling, mask and cumulative

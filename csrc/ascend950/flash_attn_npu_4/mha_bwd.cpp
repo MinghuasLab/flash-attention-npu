@@ -20,6 +20,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "device_triu_mask.h"
 // Reuse Ascend950 v3 FAG kernels in place (same pattern as 910 v2 → v3).
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "../flash_attn_npu_3/fag_kernel.cpp"
@@ -27,6 +28,7 @@
 #include "../flash_attn_npu_3/fag_bwd_d512_partial_host.hpp"
 #include "../flash_attn_npu_3/fa_bwd_mla_kernel.cpp"
 #include "tiling/platform/platform_ascendc.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
@@ -385,13 +387,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         seq_used_k = ptr(seqused_k_.value());
     }
 
-    at::Tensor mask_cpu_tensor;
     at::Tensor mask_npu_tensor;
     uint8_t* mask = nullptr;
     if (has_attn_mask) {
-        mask_cpu_tensor =
-            at::triu(at::ones({256, 256}, at::device(c10::kCPU).dtype(at::kByte)), 1).to(at::Device(at::kPrivateUse1));
-        mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        mask_npu_tensor = MakeDeviceTriuMask<256>();
+        c10_npu::NPUCachingAllocator::recordStream(mask_npu_tensor.storage().data_ptr(), current_stream);
         mask = ptr(mask_npu_tensor);
     }
 

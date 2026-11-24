@@ -12,6 +12,7 @@
 
 // Initialize and synchronize only the device used by this caller.
 // Per-thread device caches avoid touching other workers' devices.
+template <int64_t Dim = 2048>
 inline at::Tensor MakeDeviceTriuMask()
 {
     const auto idx = c10_npu::getCurrentNPUStream().device_index();
@@ -21,9 +22,8 @@ inline at::Tensor MakeDeviceTriuMask()
         return found->second;
     }
     c10_npu::NPUGuard guard(idx);
-    constexpr int64_t dim = 2048;
     at::Tensor mask =
-        at::ones({dim, dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, idx)));
+        at::ones({Dim, Dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, idx)));
     mask.triu_(/*diagonal=*/1);
     c10_npu::getCurrentNPUStream().synchronize();
     return masks.emplace(idx, std::move(mask)).first->second;
