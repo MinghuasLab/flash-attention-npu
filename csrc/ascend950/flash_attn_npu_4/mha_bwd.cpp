@@ -39,6 +39,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                 bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap,
                                 bool deterministic, int64_t sm_margin, int64_t layout)
 {
+    TORCH_CHECK(q.device().type() == at::kPrivateUse1, "Ascend950 v4 bwd: q must be on NPU");
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     const bool is_varlen = cu_seqlens_q_.has_value();
