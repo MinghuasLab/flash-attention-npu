@@ -5,6 +5,7 @@
 #ifndef FAG_TILING_950_CPP_H
 #define FAG_TILING_950_CPP_H
 
+#include <cstring>
 #include "fag_common.h"
 #include "fag_ub_layout.hpp"
 #include "fag_cast_ub_plan.hpp"
@@ -209,6 +210,14 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         const CastUbPlan plan =
             PlanBn2s2CastUb(tiling.qTile, tiling.kvTile, info.qkHeadDim, info.vHeadDim, info.ubSize);
         tiling.bandEarlyDvRows = plan.chunkRows;
+        constexpr uint32_t windowPipelineSchedule = 269551368U;
+        constexpr uint32_t requiredUbBytes = 247U * 1024U;
+        const char* schedule = std::getenv("FAG950_EXPERIMENT_BAND_DRAIN");
+        if (schedule && std::strcmp(schedule, "269551368") == 0 && plan.chunkRows != 0 &&
+            info.qSeqlen == 4096U && info.aicNum == 32U && tiling.qTile == 128U &&
+            tiling.kvTile == 128U && info.ubSize >= requiredUbBytes) {
+            tiling.bandDrainSchedule = windowPipelineSchedule;
+        }
     }
 
     constexpr uint64_t L1_SIZE = 512 * 1024;

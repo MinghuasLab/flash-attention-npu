@@ -122,17 +122,26 @@ class FagPost {
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
-            if constexpr (!std::is_same_v<SrcElement, float>) {
-                AscendC::Cast(srcUb_[slot], dstUb_[slot].template ReinterpretCast<SrcElement>(),
-                              AscendC::RoundMode::CAST_NONE, current);
+            bool fused = false;
+            if constexpr (std::is_same_v<SrcElement, half> && ApplyScale) {
+                if (tiling_->bandEarlyDvRows && (tiling_->bandDrainSchedule & 268435456U) && current % 128U == 0) {
+                    ScaleHalfTile(reinterpret_cast<__ubuf__ DataType*>(dstUb_[slot].GetPhyAddr()), current, scale);
+                    fused = true;
+                }
+            }
+            if (!fused) {
+                if constexpr (!std::is_same_v<SrcElement, float>) {
+                    AscendC::Cast(srcUb_[slot], dstUb_[slot].template ReinterpretCast<SrcElement>(),
+                                  AscendC::RoundMode::CAST_NONE, current);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                if constexpr (ApplyScale) {
+                    AscendC::Muls(srcUb_[slot], srcUb_[slot], scale, current);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                AscendC::Cast(dstUb_[slot], srcUb_[slot], AscendC::RoundMode::CAST_RINT, current);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            if constexpr (ApplyScale) {
-                AscendC::Muls(srcUb_[slot], srcUb_[slot], scale, current);
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            AscendC::Cast(dstUb_[slot], srcUb_[slot], AscendC::RoundMode::CAST_RINT, current);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
             AscendC::DataCopyExtParams outputParams{1, static_cast<uint32_t>(current * sizeof(DataType)), 0, 0, 0};
@@ -140,6 +149,38 @@ class FagPost {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
             done += current;
             pingPongIdx = 1U - pingPongIdx;
+        }
+    }
+
+    __simd_vf__ static inline void ScaleHalfTile(__ubuf__ DataType* output, uint32_t count, float scale)
+    {
+        using namespace AscendC::MicroAPI;
+        constexpr static CastTrait evenToFloat{RegLayout::ZERO, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                        AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait oddToFloat{RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
+                                       AscendC::RoundMode::UNKNOWN};
+        constexpr static CastTrait floatToEven{RegLayout::ZERO, SatMode::NO_SAT, MaskMergeMode::ZEROING,
+                                        AscendC::RoundMode::CAST_RINT};
+        constexpr static CastTrait floatToOdd{RegLayout::ONE, SatMode::NO_SAT, MaskMergeMode::ZEROING,
+                                       AscendC::RoundMode::CAST_RINT};
+        auto pm = CreateMask<DataType, MaskPattern::ALL>();
+        auto hm = CreateMask<half, MaskPattern::ALL>();
+        auto fm = CreateMask<float, MaskPattern::ALL>();
+        auto input = reinterpret_cast<__ubuf__ half*>(output);
+        for (uint16_t idx = 0; idx < count / 128U; ++idx) {
+            RegTensor<half> packed;
+            RegTensor<float> even, odd;
+            RegTensor<DataType> first, second, result;
+            LoadAlign(packed, input + idx * 128U);
+            Cast<float, half, evenToFloat>(even, packed, hm);
+            Cast<float, half, oddToFloat>(odd, packed, hm);
+            Muls(even, even, scale, fm);
+            Muls(odd, odd, scale, fm);
+            Cast<DataType, float, floatToEven>(first, even, fm);
+            Cast<DataType, float, floatToOdd>(second, odd, fm);
+            Or(reinterpret_cast<RegTensor<uint16_t>&>(result), reinterpret_cast<RegTensor<uint16_t>&>(first),
+               reinterpret_cast<RegTensor<uint16_t>&>(second), pm);
+            StoreAlign(output + idx * 128U, result, pm);
         }
     }
 

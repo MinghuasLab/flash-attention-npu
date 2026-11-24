@@ -172,6 +172,7 @@ struct FAGTilingData {
     uint32_t dqSwizzle = 0;
     // Zero uses the standard workspace and schedule. Otherwise this is the dV cast chunk height.
     uint32_t bandEarlyDvRows = 0;
+    uint32_t bandDrainSchedule = 0;
     uint64_t workspaceSize = 0;
 };
 

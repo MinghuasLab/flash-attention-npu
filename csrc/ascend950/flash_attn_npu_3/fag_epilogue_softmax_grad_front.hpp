@@ -29,7 +29,7 @@ class FagSoftmaxGradFront {
         outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(out));
         deltaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace + tiling_->deltaOffset));
 
-        const uint32_t tileRows = GetTileRows(tiling_->vHeadDim);
+        const uint32_t tileRows = FrontPipeline() ? FrontTileRows() : GetTileRows(tiling_->vHeadDim);
         const uint32_t maxAlignedD = GetMaxAlignedD(tiling_->vHeadDim);
         const uint32_t doutBytes = tileRows * maxAlignedD * sizeof(DataType);
         const uint32_t slotBytes = 2U * doutBytes + tileRows * sizeof(float);
@@ -45,7 +45,7 @@ class FagSoftmaxGradFront {
                                    event_t mte3ToMte2Pong, event_t mte2ToVPing, event_t mte2ToVPong,
                                    event_t vToMte3Ping, event_t vToMte3Pong)
     {
-        const uint32_t tileRows = GetTileRows(tiling_->vHeadDim);
+        const uint32_t tileRows = FrontPipeline() ? FrontTileRows() : GetTileRows(tiling_->vHeadDim);
         const uint32_t realD = static_cast<uint32_t>(tiling_->vHeadDim);
         const uint32_t alignedD = (realD + 15U) / 16U * 16U;
         const uint64_t totalRows = tiling_->totalQ * tiling_->qHeadNum;
@@ -57,6 +57,11 @@ class FagSoftmaxGradFront {
             return;
         const uint64_t rangeCount = totalRows - rangeBegin < perCore ? totalRows - rangeBegin : perCore;
 
+        if (FrontPipeline()) {
+            RunContiguous(rangeBegin, rangeCount, mte3ToMte2Ping, mte3ToMte2Pong,
+                          mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            return;
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Ping);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Pong);
         uint64_t done = 0;
@@ -123,6 +128,82 @@ class FagSoftmaxGradFront {
     }
 
   private:
+    CATLASS_DEVICE bool FrontPipeline() const
+    {
+        return tiling_->bandEarlyDvRows && tiling_->vHeadDim == 256U &&
+               tiling_->ubSize >= 230272U && (tiling_->bandDrainSchedule & 512U) &&
+               tiling_->inputStrides.dout.sequence == 256U && tiling_->inputStrides.out.sequence == 256U;
+    }
+
+    CATLASS_DEVICE uint32_t FrontTileRows() const
+    {
+        return (tiling_->bandDrainSchedule & 4096U) ? 112U : 64U;
+    }
+
+    struct ContiguousTile {
+        uint64_t begin;
+        uint32_t rows;
+    };
+
+    CATLASS_DEVICE ContiguousTile LoadContiguous(uint32_t slot, uint64_t begin, uint64_t end,
+                                                event_t reusable, event_t loaded)
+    {
+        if (begin == end) return {begin, 0U};
+        const uint64_t plane = tiling_->qSeqlen;
+        const uint64_t head = begin / plane % tiling_->qHeadNum;
+        const uint64_t batch = begin / plane / tiling_->qHeadNum;
+        const uint64_t token = begin % plane;
+        const uint64_t planeCount = plane - token;
+        const uint64_t remaining = end - begin;
+        const uint32_t limit = FrontTileRows();
+        const uint32_t count = remaining < limit ? remaining : limit;
+        const uint32_t rows = planeCount < count ? planeCount : count;
+        const auto& ds = tiling_->inputStrides.dout;
+        const auto& os = tiling_->inputStrides.out;
+        constexpr uint64_t width = 256U;
+        const AscendC::DataCopyExtParams copy{1U, static_cast<uint32_t>(rows * width * sizeof(DataType)), 0, 0, 0};
+        const AscendC::DataCopyPadExtParams<DataType> pad{false, 0, 0, 0};
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(reusable);
+        AscendC::DataCopyPad(doutUb_[slot], doutGm_[batch * ds.batch + head * ds.head + token * width], copy, pad);
+        AscendC::DataCopyPad(outUb_[slot], outGm_[batch * os.batch + head * os.head + token * width], copy, pad);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(loaded);
+        return {begin, rows};
+    }
+
+    CATLASS_DEVICE void RunContiguous(uint64_t begin, uint64_t count, event_t reusePing, event_t reusePong,
+                                      event_t loadPing, event_t loadPong, event_t storePing, event_t storePong)
+    {
+        const event_t reuse[2] = {reusePing, reusePong};
+        const event_t load[2] = {loadPing, loadPong};
+        const event_t store[2] = {storePing, storePong};
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(reuse[0]);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(reuse[1]);
+        const uint64_t end = begin + count;
+        ContiguousTile tiles[2];
+        tiles[0] = LoadContiguous(0U, begin, end, reuse[0], load[0]);
+        uint64_t next = begin + tiles[0].rows;
+        tiles[1] = LoadContiguous(1U, next, end, reuse[1], load[1]);
+        next += tiles[1].rows;
+        uint32_t slot = 0;
+        while (tiles[slot].rows != 0U) {
+            const ContiguousTile tile = tiles[slot];
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(load[slot]);
+            SoftmaxGradFrontVF(reinterpret_cast<__ubuf__ DataType*>(doutUb_[slot].GetPhyAddr()),
+                               reinterpret_cast<__ubuf__ DataType*>(outUb_[slot].GetPhyAddr()),
+                               reinterpret_cast<__ubuf__ float*>(deltaUb_[slot].GetPhyAddr()), tile.rows, 256U, 256U);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(store[slot]);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(store[slot]);
+            const AscendC::DataCopyExtParams output{1U, static_cast<uint32_t>(tile.rows * sizeof(float)), 0, 0, 0};
+            AscendC::DataCopyPad(deltaGm_[tile.begin], deltaUb_[slot], output);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(reuse[slot]);
+            tiles[slot] = LoadContiguous(slot, next, end, reuse[slot], load[slot]);
+            next += tiles[slot].rows;
+            slot ^= 1U;
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(reuse[0]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(reuse[1]);
+    }
+
     CATLASS_DEVICE static uint32_t GetTileRows(uint64_t vHeadDim)
     {
         // Two slots must fit alongside the existing delta pipeline. D>256 uses
@@ -153,6 +234,39 @@ class FagSoftmaxGradFront {
                                                     AscendC::RoundMode::UNKNOWN};
         constexpr static CastTrait b16ToFp32Odd = {RegLayout::ONE, SatMode::UNKNOWN, MaskMergeMode::ZEROING,
                                                    AscendC::RoundMode::UNKNOWN};
+
+
+        if (realD == 256U) {
+            for (uint16_t row = 0; row < static_cast<uint16_t>(rows); ++row) {
+                LoadAlign(doutPacked0, dout);
+                LoadAlign(outPacked0, out);
+                LoadAlign(doutPacked1, dout + 128U);
+                LoadAlign(outPacked1, out + 128U);
+                Cast<float, DataType, b16ToFp32Even>(doutEven, doutPacked0, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(doutOdd, doutPacked0, packedMask);
+                Cast<float, DataType, b16ToFp32Even>(outEven, outPacked0, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(outOdd, outPacked0, packedMask);
+                Mul(productEven, doutEven, outEven, fullFp32Mask);
+                Mul(productOdd, doutOdd, outOdd, fullFp32Mask);
+                Add(productSum, productEven, productOdd, fullFp32Mask);
+                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(reduced0, productSum, fullFp32Mask);
+
+                Cast<float, DataType, b16ToFp32Even>(doutEven, doutPacked1, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(doutOdd, doutPacked1, packedMask);
+                Cast<float, DataType, b16ToFp32Even>(outEven, outPacked1, packedMask);
+                Cast<float, DataType, b16ToFp32Odd>(outOdd, outPacked1, packedMask);
+                Mul(productEven, doutEven, outEven, fullFp32Mask);
+                Mul(productOdd, doutOdd, outOdd, fullFp32Mask);
+                Add(productSum, productEven, productOdd, fullFp32Mask);
+                Reduce<ReduceType::SUM, float, float, MaskMergeMode::ZEROING>(reduced1, productSum, fullFp32Mask);
+                Add(reduced, reduced0, reduced1, fullFp32Mask);
+                StoreUnAlign<float, PostLiteral::POST_MODE_UPDATE>(delta, reduced, storeState, 1);
+                dout += rowStride;
+                out += rowStride;
+            }
+            StoreUnAlignPost<float, PostLiteral::POST_MODE_UPDATE>(delta, storeState, 0);
+            return;
+        }
 
         for (uint16_t row = 0; row < static_cast<uint16_t>(rows); ++row) {
             const uint32_t firstValid = realD < 128U ? realD : 128U;
