@@ -40,6 +40,11 @@ from benchmark_utils import (
     write_results,
     _load_kernels,
     _select_kernel,
+    query_l2_cache_info,
+    L2CacheEvictor,
+    wrap_with_l2_flush,
+    measure_event_pair,
+    L2_MIB,
 )
 
 MODULES = {"fa2": "flash_attn_npu", "fa3": "flash_attn_npu_3", "fa4": "flash_attn_npu_4"}
@@ -62,6 +67,12 @@ def parse_args():
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--repeat", type=int, default=3)
+    p.add_argument(
+        "--event-repeat",
+        type=int,
+        default=5,
+        help="Number of independent torch.npu.Event samples per backend",
+    )
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -89,9 +100,42 @@ def parse_args():
     p.add_argument("--commit-id", default=os.getenv("CI_BENCHMARK_COMMIT_SHA", ""))
     p.add_argument("--out", default="/tmp/fa_npu_benchmark.csv")
     p.add_argument("--json", default="/tmp/fa_npu_benchmark.json")
+    p.add_argument(
+        "--l2-flush-multiplier",
+        type=float,
+        default=2.0,
+        help="L2 eviction buffer size = L2 size * multiplier",
+    )
+    p.add_argument(
+        "--l2-cache-mb",
+        type=float,
+        default=None,
+        help="Override detected L2 size, in MiB",
+    )
+    # L2 Flush configuration
+    env_l2_flush = os.getenv("CI_BENCHMARK_L2_FLUSH", "true").strip().lower()
+
+    if env_l2_flush not in ("true", "false"):
+        p.error("CI_BENCHMARK_L2_FLUSH must be true or false")
+
+    p.add_argument(
+        "--l2-flush",
+        choices=["true", "false"],
+        default=env_l2_flush,
+        help="Enable or disable L2 cache eviction",
+    )
+
+    # Backward compatibility
+    p.add_argument(
+        "--no-l2-flush",
+        action="store_true",
+        help="Disable L2 cache eviction (legacy option)",
+    )
     args = p.parse_args()
-    if any(v <= 0 for v in (args.nheads, args.headdim, args.warmup, args.repeat)):
-        p.error("nheads, headdim, warmup, repeat must be positive")
+    if any(
+        v <= 0 for v in (args.nheads, args.headdim, args.warmup, args.repeat, args.event_repeat)
+    ):
+        p.error("nheads, headdim, warmup, repeat, event-repeat must be positive")
     if args.kv_heads <= 0 or args.nheads % args.kv_heads:
         p.error("--kv-heads must be positive and divide --nheads")
     if args.tnd_test_style and args.bsnd_test_style:
@@ -104,6 +148,11 @@ def parse_args():
         )
     if args.num_cases < 3:
         p.error("--num-cases must be at least 3")
+    if args.l2_flush_multiplier <= 1.0:
+        p.error("--l2-flush-multiplier must be > 1.0")
+
+    if args.l2_cache_mb is not None and args.l2_cache_mb <= 0:
+        p.error("--l2-cache-mb must be positive")
     return args
 
 
@@ -435,7 +484,17 @@ def _mark_case_exception(row, exc):
         traceback.print_exc()
 
 
-def _run_tnd_test_style(args, versions, device_name, commit, run_root, rows_out=None):
+def _run_tnd_test_style(
+    args,
+    versions,
+    device_name,
+    commit,
+    run_root,
+    *,
+    l2_evictor=None,
+    cache_metadata=None,
+    rows_out=None,
+):
     """Balanced varlen cases, crossed with requested causal and training modes.
 
     Each result measures the third FA+CANN invocation pair (two warmups),
@@ -518,10 +577,16 @@ def _run_tnd_test_style(args, versions, device_name, commit, run_root, rows_out=
                         "status": "ok",
                         "error": "",
                     }
+                    row.update(cache_metadata or {})
                     try:
                         if backend_error:
                             raise RuntimeError(backend_error)
                         data = _tnd_inputs(case["lengths"], device, mask)
+                        if mode == "fwd_bwd":
+                            grad = torch.randn_like(data["fa_qkv"][0])
+                            grad_base = grad
+                        else:
+                            grad = grad_base = None
 
                         def fa_call():
                             return backend_forward(backend, data, causal)
@@ -537,18 +602,31 @@ def _run_tnd_test_style(args, versions, device_name, commit, run_root, rows_out=
                             def base_step():
                                 step_forward(base_call)
                         else:
-                            # Same upstream gradient for FA and CANN, separate leaf tensors.
-                            grad = torch.randn(
-                                (case["total_tokens"], 24, 128),
-                                device=device,
-                                dtype=torch.bfloat16,
-                            )
+                            flush = l2_evictor.flush if l2_evictor is not None else None
 
                             def fa_step():
-                                step_fwd_bwd(fa_call, data["fa_qkv"], grad)
+                                step_fwd_bwd(
+                                    fa_call,
+                                    data["fa_qkv"],
+                                    grad,
+                                    before_fwd=flush,
+                                    before_bwd=flush,
+                                )
 
                             def base_step():
-                                step_fwd_bwd(base_call, data["base_qkv"], grad)
+                                step_fwd_bwd(
+                                    base_call,
+                                    data["base_qkv"],
+                                    grad_base,  # BSND 使用 grad_base
+                                    before_fwd=flush,
+                                    before_bwd=flush,
+                                )
+
+                        # FWD needs one outer flush. FWD+BWD flushes inside
+                        # step_fwd_bwd before Forward and Backward separately.
+                        if mode == "fwd":
+                            fa_step = wrap_with_l2_flush(fa_step, l2_evictor)
+                            base_step = wrap_with_l2_flush(base_step, l2_evictor)
 
                         slug = f"{version}_{mode}_c{int(causal)}_{case['label']}"
                         # 只对 Ascend 910B 启用 TND Profiler 有限重试
@@ -615,6 +693,22 @@ def _run_tnd_test_style(args, versions, device_name, commit, run_root, rows_out=
                             degrade_pct=(fa_ms / base_ms - 1.0) * 100 if base_ms > 0 else None,
                             speedup_fa_over_baseline=base_ms / fa_ms if fa_ms > 0 else None,
                         )
+                        # Run Event timing in a separate pass after Profiler so
+                        # Profiler instrumentation does not perturb Event samples.
+                        row.update(
+                            measure_event_pair(
+                                fa_call,
+                                base_call,
+                                mode=mode,
+                                fa_inputs=data["fa_qkv"],
+                                baseline_inputs=data["base_qkv"],
+                                fa_grad=grad,
+                                baseline_grad=grad_base,
+                                evictor=l2_evictor,
+                                warmup=args.warmup,
+                                repeat=args.event_repeat,
+                            )
+                        )
                     except NotImplementedError as exc:
                         row.update(status="unsupported", error=str(exc))
                     except Exception as exc:
@@ -624,20 +718,32 @@ def _run_tnd_test_style(args, versions, device_name, commit, run_root, rows_out=
                         f"[{row['status']}] {version} {mode} causal={causal} "
                         f"{case['label']} tokens={case['total_tokens']} "
                         f"fa_ms={row.get('fa_mean_ms')} "
-                        f"cann_ms={row.get('baseline_mean_ms')} {row['error']}",
+                        f"cann_ms={row.get('baseline_mean_ms')} "
+                        f"fa_event_ms={row.get('fa_event_mean_ms')} "
+                        f"cann_event_ms={row.get('baseline_event_mean_ms')} {row['error']}",
                         flush=True,
                     )
     if rows_out is not None:
         rows_out.extend(rows)
     else:
-        write_results(rows, args.out, args.json, vars(args))
+        write_results(rows, args.out, args.json, {**vars(args), **(cache_metadata or {})})
         print(f"CSV: {args.out}; JSON: {args.json}; profiles: {run_root}")
     if any(r["status"] == "error" for r in rows):
         return 1
     return 0 if any(r["status"] == "ok" for r in rows) else 2
 
 
-def _run_bsnd_test_style(args, versions, device_name, commit, run_root, rows_out=None):
+def _run_bsnd_test_style(
+    args,
+    versions,
+    device_name,
+    commit,
+    run_root,
+    *,
+    l2_evictor=None,
+    cache_metadata=None,
+    rows_out=None,
+):
     """Reference BSND test grid; CANN receives BNSD transposed inputs.
 
     Preserve the shared profile_pair single-session aggregate timing protocol.
@@ -682,6 +788,7 @@ def _run_bsnd_test_style(args, versions, device_name, commit, run_root, rows_out
                             "status": "ok",
                             "error": "",
                         }
+                        row.update(cache_metadata or {})
                         try:
                             skip_reason = _bsnd_precheck_oom(device_name, batch, seqlen, mode)
 
@@ -753,12 +860,31 @@ def _run_bsnd_test_style(args, versions, device_name, commit, run_root, rows_out
                                 def base_step():
                                     step_forward(base_call)
                             else:
+                                flush = l2_evictor.flush if l2_evictor is not None else None
 
                                 def fa_step():
-                                    step_fwd_bwd(fa_call, data["fa_qkv"], grad)
+                                    step_fwd_bwd(
+                                        fa_call,
+                                        data["fa_qkv"],
+                                        grad,
+                                        before_fwd=flush,
+                                        before_bwd=flush,
+                                    )
 
                                 def base_step():
-                                    step_fwd_bwd(base_call, data["base_qkv"], grad_base)
+                                    step_fwd_bwd(
+                                        base_call,
+                                        data["base_qkv"],
+                                        grad_base,  # BSND 使用 grad_base
+                                        before_fwd=flush,
+                                        before_bwd=flush,
+                                    )
+
+                            # FWD uses one outer Flush. FWD+BWD already Flushes
+                            # inside step_fwd_bwd before Forward and Backward.
+                            if mode == "fwd":
+                                fa_step = wrap_with_l2_flush(fa_step, l2_evictor)
+                                base_step = wrap_with_l2_flush(base_step, l2_evictor)
 
                             base_step()
                             torch.npu.synchronize()
@@ -844,6 +970,22 @@ def _run_bsnd_test_style(args, versions, device_name, commit, run_root, rows_out
                             for label, vals in (("fa", fa), ("baseline", base)):
                                 for field in ("mean_ms", "kernels", "kernels_per_iter"):
                                     row[f"{label}_{field}"] = vals[field]
+                            # Event timing is measured outside Profiler and excludes
+                            # the L2 eviction work from each timed operator interval.
+                            row.update(
+                                measure_event_pair(
+                                    fa_call,
+                                    base_call,
+                                    mode=mode,
+                                    fa_inputs=data["fa_qkv"],
+                                    baseline_inputs=data["base_qkv"],
+                                    fa_grad=grad,
+                                    baseline_grad=grad_base,
+                                    evictor=l2_evictor,
+                                    warmup=args.warmup,
+                                    repeat=args.event_repeat,
+                                )
+                            )
                         except NotImplementedError as exc:
                             row.update(status="unsupported", error=str(exc))
                         except Exception as exc:
@@ -852,13 +994,15 @@ def _run_bsnd_test_style(args, versions, device_name, commit, run_root, rows_out
                         print(
                             f"[{row['status']}] BSND {version} {mode} c={causal} "
                             f"B={batch} S={seqlen} FA={row.get('fa_mean_ms')} "
-                            f"CANN={row.get('baseline_mean_ms')} {row['error']}",
+                            f"CANN={row.get('baseline_mean_ms')} "
+                            f"FA_Event={row.get('fa_event_mean_ms')} "
+                            f"CANN_Event={row.get('baseline_event_mean_ms')} {row['error']}",
                             flush=True,
                         )
     if rows_out is not None:
         rows_out.extend(rows)
     else:
-        write_results(rows, args.out, args.json, vars(args))
+        write_results(rows, args.out, args.json, {**vars(args), **(cache_metadata or {})})
         print(f"CSV: {args.out}; JSON: {args.json}; profiles: {run_root}")
     return (
         1
@@ -871,6 +1015,42 @@ def main():
     args = parse_args()
     torch.npu.set_device(args.device)
     device_name = torch.npu.get_device_name(args.device)
+    # Query actual L2 size on the selected NPU, never infer from model name.
+    # Disabling eviction should remain usable even on older TorchNPU builds.
+    if args.no_l2_flush or args.l2_flush == "false":
+        l2_info = {
+            "device_name": device_name,
+            "l2_cache_bytes": None,
+            "l2_cache_mib": None,
+            "l2_cache_source": "not_queried_disabled",
+        }
+        flush_bytes = 0
+        l2_evictor = None
+    else:
+        l2_info = query_l2_cache_info(
+            args.device,
+            override_mb=args.l2_cache_mb,
+        )
+        flush_bytes = int(l2_info["l2_cache_bytes"] * args.l2_flush_multiplier)
+        l2_evictor = L2CacheEvictor(args.device, flush_bytes)
+
+    cache_metadata = {
+        **l2_info,
+        "l2_flush_enabled": l2_evictor is not None,
+        "l2_flush_multiplier": args.l2_flush_multiplier,
+        "l2_flush_bytes": flush_bytes,
+        "l2_flush_mib": round(flush_bytes / L2_MIB, 2),
+        "l2_flush_method": "buffer_sweep_sum" if l2_evictor else "disabled",
+    }
+    print(
+        f"[L2] device={device_name} "
+        f"cache={l2_info['l2_cache_mib']} MiB "
+        f"eviction_buffer={cache_metadata['l2_flush_mib']} MiB "
+        f"source={l2_info['l2_cache_source']} "
+        f"enabled={cache_metadata['l2_flush_enabled']}",
+        flush=True,
+    )
+
     commit = args.commit_id
     if not commit:
         try:
@@ -895,14 +1075,32 @@ def main():
 
     if do_bsnd:
         print("[benchmark] BSND reference: fixed B x S grid", flush=True)
-        _run_bsnd_test_style(args, versions, device_name, commit, run_root / "bsnd", rows_out=rows)
+        _run_bsnd_test_style(
+            args,
+            versions,
+            device_name,
+            commit,
+            run_root / "bsnd",
+            l2_evictor=l2_evictor,
+            cache_metadata=cache_metadata,
+            rows_out=rows,
+        )
     if do_tnd:
         print(
             f"[benchmark] TND reference: {args.num_cases} balanced random-varlen cases", flush=True
         )
-        _run_tnd_test_style(args, versions, device_name, commit, run_root / "tnd", rows_out=rows)
+        _run_tnd_test_style(
+            args,
+            versions,
+            device_name,
+            commit,
+            run_root / "tnd",
+            l2_evictor=l2_evictor,
+            cache_metadata=cache_metadata,
+            rows_out=rows,
+        )
 
-    write_results(rows, args.out, args.json, vars(args))
+    write_results(rows, args.out, args.json, {**vars(args), **cache_metadata})
     counts = {
         status: sum(r["status"] == status for r in rows)
         for status in (

@@ -12,6 +12,7 @@ name: NPU Benchmark
 #   causal=both|true|false
 #   ref=<branch|tag>  (commit_id 为空时使用)
 #   commit_id=<sha>   (优先级高于 ref)
+#   l2_flush=true|false (default: true)
 
 on:
   issue_comment:
@@ -115,6 +116,9 @@ jobs:
             causal="$(printf '%s\n' "$body" |
             grep -oE 'causal=(both|true|false)' | head -n1 | cut -d= -f2- || true)"
 
+            l2_flush="$(printf '%s\n' "$body" |
+            grep -oE 'l2_flush=(true|false)' | head -n1 | cut -d= -f2- || true)"
+
             ref="$(printf '%s\n' "$body" |
             grep -oE 'ref=[A-Za-z0-9._/-]+' | head -n1 | cut -d= -f2- || true)"
 
@@ -127,11 +131,7 @@ jobs:
             [ -n "$mode" ] || mode="all"
             [ -n "$causal" ] || causal="both"
             [ -n "$ref" ] || ref="refs/pull/${PR_NUMBER}/head"
-
-          else
-            echo "[ERROR] Unsupported event: $EVENT_NAME" >&2
-            exit 1
-          fi
+            [ -n "$l2_flush" ] || l2_flush="true"
 
           # ============================================================
           # 输出统一参数，供后续 Steps 使用
@@ -144,9 +144,10 @@ jobs:
           echo "causal=$causal" >> "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "commit_id=${commit_id:-}" >> "$GITHUB_OUTPUT"
+          echo "l2_flush=$l2_flush" >> "$GITHUB_OUTPUT"
 
-          printf '[benchmark] arch=%s fa_version=%s layout=%s mode=%s causal=%s ref=%s commit_id=%s\n' \
-          "$arch" "$fa_version" "$layout" "$mode" "$causal" "${ref:-<none>}" "${commit_id:-<none>}"
+          printf '[benchmark] arch=%s fa_version=%s layout=%s mode=%s causal=%s l2_flush=%s ref=%s commit_id=%s\n' \
+          "$arch" "$fa_version" "$layout" "$mode" "$causal" "$l2_flush" "${ref:-<none>}" "${commit_id:-<none>}"
       # ======================================================================
       # 1. 根据输入判断当前 matrix job 是否需要执行
       # ======================================================================
@@ -554,6 +555,7 @@ jobs:
           CI_BENCHMARK_MODE: ${{ steps.benchmark_inputs.outputs.mode }}
           CI_BENCHMARK_CAUSAL: ${{ steps.benchmark_inputs.outputs.causal }}
           CI_BENCHMARK_FA_VERSION_EXPLICIT: "true"
+          CI_BENCHMARK_L2_FLUSH: ${{ steps.benchmark_inputs.outputs.l2_flush }}
         run: |
           set -euo pipefail
 
