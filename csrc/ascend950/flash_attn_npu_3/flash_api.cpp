@@ -39,16 +39,12 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
 }
 
 at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t num_heads_q, int64_t num_heads_kv,
-                                  int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
+                                  int64_t headdim, int64_t headdim_v, std::optional<at::Tensor> cache_seqlens,
                                   std::optional<at::Tensor> seqlens_q, std::optional<at::Tensor> cu_seqlens_k,
                                   std::optional<int64_t> page_size, bool causal, bool hasSoftcap, int64_t num_splits,
                                   int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right,
-                                  int64_t quant_mode)
+                                  int64_t quant_mode, std::optional<at::Tensor> cu_seqlens_q)
 {
-    const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
-    TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
-    TORCH_CHECK(cache_seqlens.is_contiguous(), "cache_seqlens must be contiguous");
-    TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be an NPU tensor");
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
@@ -56,29 +52,37 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(quant_mode != 1 || (headdim == 128 && headdim_v == 128),
                 "950 V3 FP8 requires Q/K/V head dimensions of 128");
 
-    const bool is_varlen_q = seqlens_q.has_value();
-    const bool is_varlen_kv = cu_seqlens_k.has_value();
-    if (is_varlen_q) {
-        auto seqlens_q_t = seqlens_q.value();
-        TORCH_CHECK(seqlens_q_t.dtype() == torch::kInt32, "seqlens_q must have dtype int32");
-        TORCH_CHECK(seqlens_q_t.is_contiguous(), "seqlens_q must be contiguous");
-        TORCH_CHECK(seqlens_q_t.numel() == batch_size, "seqlens_q must have batch_size elements");
+    TORCH_CHECK(cache_seqlens.has_value() || cu_seqlens_k.has_value(), "cache_seqlens or cu_seqlens_k is required");
+    const bool kv_cumulative = !cache_seqlens.has_value();
+    const auto& kv_lengths = kv_cumulative ? *cu_seqlens_k : *cache_seqlens;
+    const c10::OptionalDeviceGuard device_guard(device_of(kv_lengths));
+    TORCH_CHECK(kv_lengths.dtype() == torch::kInt32, "KV lengths must have dtype int32");
+    TORCH_CHECK(kv_lengths.is_contiguous(), "KV lengths must be contiguous");
+    TORCH_CHECK(kv_lengths.device().type() == at::kPrivateUse1, "KV lengths must be an NPU tensor");
+    if (cache_seqlens.has_value()) {
+        TORCH_CHECK(cache_seqlens->numel() == batch_size, "cache_seqlens must have batch_size elements");
     }
-    if (is_varlen_kv) {
-        auto cu_k = cu_seqlens_k.value();
+    if (cu_seqlens_k.has_value()) {
+        const auto& cu_k = *cu_seqlens_k;
         TORCH_CHECK(cu_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(cu_k.is_contiguous(), "cu_seqlens_k must be contiguous");
         TORCH_CHECK(cu_k.numel() == batch_size + 1, "cu_seqlens_k must have batch_size+1 elements");
-    } else {
-        TORCH_CHECK(cache_seqlens.numel() == batch_size, "cache_seqlens must have batch_size elements");
+    }
+    const bool q_cumulative = !seqlens_q.has_value() && cu_seqlens_q.has_value();
+    const auto& q_lengths = q_cumulative ? cu_seqlens_q : seqlens_q;
+    if (q_lengths.has_value()) {
+        TORCH_CHECK(q_lengths->dtype() == torch::kInt32 && q_lengths->is_contiguous() &&
+                        q_lengths->device() == kv_lengths.device() &&
+                        q_lengths->numel() == batch_size + static_cast<int64_t>(q_cumulative),
+                    "query lengths must be contiguous int32 on the same NPU as the KV lengths");
     }
 
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
 
     FAMetadataArgs args{};
-    args.seqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(seqlens_q.value().data_ptr()) : 0;
-    args.cacheSeqlensAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
+    args.seqlensQAddr = q_lengths.has_value() ? reinterpret_cast<uint64_t>(q_lengths->data_ptr()) : 0;
+    args.cacheSeqlensAddr = reinterpret_cast<uint64_t>(kv_lengths.data_ptr());
     args.batch = static_cast<uint32_t>(batch_size);
     args.numHeads = static_cast<uint32_t>(num_heads_q);
     args.numHeadsK = static_cast<uint32_t>(num_heads_kv);
@@ -96,13 +100,13 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.windowSizeLeft = maskDer.window_left;
     args.windowSizeRight = maskDer.window_right;
     args.blockDim = blockDim;
-    args.isVarlen = is_varlen_q ? 1u : 0u;
-    args.isVarlenKv = is_varlen_kv ? 1u : 0u;
+    args.qCumulative = q_cumulative;
+    args.kvCumulative = kv_cumulative;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
     args.quantMode = quant_mode;
     // Schedule is scale/softcap independent; hasSoftcap is API parity only.
     (void)hasSoftcap;
-    return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);
+    return GetSchedulerMetadataImpl(args, kv_lengths, q_lengths);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +303,12 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
 {
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
-    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU",
+          py::arg("batch_size"), py::arg("max_seqlen_q"), py::arg("num_heads_q"), py::arg("num_heads_kv"),
+          py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"), py::arg("seqlens_q"),
+          py::arg("cu_seqlens_k"), py::arg("page_size"), py::arg("causal"), py::arg("has_softcap"),
+          py::arg("num_splits"), py::arg("max_seqlen_k"), py::arg("window_size_left"), py::arg("window_size_right"),
+          py::arg("quant_mode"), py::arg("cu_seqlens_q") = py::none());
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
