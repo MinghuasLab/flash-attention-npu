@@ -5,7 +5,6 @@
 
 
 #include <torch/extension.h>
-#include <unordered_map>
 
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
@@ -15,47 +14,26 @@
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
-#define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
-
-static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cacheSeqlens,
-                                           const std::optional<at::Tensor>& seqlensQ)
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
+                                           const std::optional<at::Tensor>& qLengths)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
-    at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    at::Tensor meta = at::empty({bytes}, kvLengths.options().dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
-    c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
-    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
-    aclrtStream curHandle = currentStream.stream(false);
-    aclrtStream aicpuHandle = aicpuStream.stream(false);
-
-    struct MetadataEvents {
-        aclrtEvent inputReady = nullptr;
-        aclrtEvent metadataDone = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
-    MetadataEvents& events = eventsByDevice[currentStream.device_index()];
-    if (events.inputReady == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
-        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
-    }
-
-    FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, aicpuHandle, inputReady = events.inputReady, metadataDone = events.metadataDone,
-                          metaArgs]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
-        ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
-        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+    const auto stream = c10_npu::getCurrentNPUStream();
+    const auto handle = stream.stream(false);
+    // The caller's stream orders both the length producers and the attention launch.
+    auto metadata_task = [handle, args]() mutable -> int {
+        ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
 
-    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
-    c10_npu::NPUCachingAllocator::recordStream(cacheSeqlens.storage().data_ptr(), aicpuStream);
-    if (seqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
+    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), stream);
+    c10_npu::NPUCachingAllocator::recordStream(kvLengths.storage().data_ptr(), stream);
+    if (qLengths.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(qLengths->storage().data_ptr(), stream);
     }
     return meta;
 }

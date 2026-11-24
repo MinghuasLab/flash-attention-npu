@@ -20,46 +20,29 @@
 #include "acl/acl.h"
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
-#define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
                                            const std::optional<at::Tensor>& seqused_q)
 {
     auto metadata = at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))},
-                              at::device(at::kPrivateUse1).dtype(at::kByte));
+                              cache_seqlens.options().dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(metadata.data_ptr());
-    auto current = c10_npu::getCurrentNPUStream();
-    auto aicpu = c10_npu::getNPUStreamFromPool();
-    aclrtStream current_handle = current.stream(false);
-    aclrtStream aicpu_handle = aicpu.stream(false);
-    struct MetadataEvents {
-        aclrtEvent input_ready = nullptr;
-        aclrtEvent done = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> events_by_device;
-    auto& events = events_by_device[current.device_index()];
-    if (events.input_ready == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.input_ready));
-        ACL_CHECK(aclrtCreateEvent(&events.done));
-    }
-    auto task = [current_handle, aicpu_handle, input_ready = events.input_ready, done = events.done,
-                 args]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(input_ready, current_handle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpu_handle, input_ready));
-        ComputeFAMetadata<<<1, nullptr, aicpu_handle>>>(&args, sizeof(args));
-        ACL_CHECK(aclrtRecordEvent(done, aicpu_handle));
-        ACL_CHECK(aclrtStreamWaitEvent(current_handle, done));
+    const auto current = c10_npu::getCurrentNPUStream();
+    const auto current_handle = current.stream(false);
+    // The calling stream orders the length producers, metadata write and forward consumer.
+    auto task = [current_handle, args]() mutable -> int {
+        ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", task);
-    c10_npu::NPUCachingAllocator::recordStream(metadata.storage().data_ptr(), aicpu);
-    c10_npu::NPUCachingAllocator::recordStream(cache_seqlens.storage().data_ptr(), aicpu);
+    c10_npu::NPUCachingAllocator::recordStream(metadata.storage().data_ptr(), current);
+    c10_npu::NPUCachingAllocator::recordStream(cache_seqlens.storage().data_ptr(), current);
     if (cu_seqlens_q.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cu_seqlens_q->storage().data_ptr(), aicpu);
+        c10_npu::NPUCachingAllocator::recordStream(cu_seqlens_q->storage().data_ptr(), current);
     }
     if (seqused_q.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqused_q->storage().data_ptr(), aicpu);
+        c10_npu::NPUCachingAllocator::recordStream(seqused_q->storage().data_ptr(), current);
     }
     return metadata;
 }
