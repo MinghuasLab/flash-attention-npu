@@ -64,6 +64,11 @@ CATLASS_GLOBAL void FlashAttentionV3BwdMla950(GM_ADDR dout, GM_ADDR q, GM_ADDR k
                                               GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
                                               GM_ADDR workspace, GM_ADDR tiling)
 {
+    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+        if (!IsFagPlanReady(tiling)) {
+            return;
+        }
+    }
     FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
                            cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     RunMlaBackward950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_SOFTCAP>(params);

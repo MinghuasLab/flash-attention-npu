@@ -428,16 +428,7 @@ class BishengBuildExt(build_ext):
             or os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
         )
 
-    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
-        """Compile fa_metadata.aicpu (host AICPU object) for the extensions
-        that carry the scheduler-metadata feature (910 v2/v3/v4 and 950 v3/v4). This
-        is a separate `bisheng -x aicpu` invocation (host CPU code
-        cross-compiled with hcc, not ASC device code); the resulting object is
-        linked into the extension alongside the ASC device objects. Returns the
-        .o path, or None if there is no aicpu source."""
-        ascend_home = os.getenv(
-            "ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend")
-        )
+    def _aicpu_sources(self, ext_name):
         aicpu_src_dirs = {
             "flash_attn_npu.flash_attn_npu": os.path.join(
                 this_dir, "csrc/ascend910", "flash_attn_npu"
@@ -453,34 +444,31 @@ class BishengBuildExt(build_ext):
         }
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:
-            return None
-        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
-        if not os.path.exists(aicpu_src):
-            return None
+            return []
+        sources = glob.glob(os.path.join(src_dir, "*.aicpu"))
+        if ext_name == "flash_attn_npu_4_950":
+            sources.extend(glob.glob(os.path.join(src_dir, "../flash_attn_npu_3/fa_bwd_prepare.aicpu")))
+        return sorted(sources)
+
+    def _build_aicpu_source(self, aicpu_src, ext_name):
+        """Cross-compile an AICPU translation unit separately from the ASC kernels."""
+        ascend_home = os.getenv(
+            "ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend")
+        )
+        src_dir = os.path.dirname(aicpu_src)
+        src_name = os.path.splitext(os.path.basename(aicpu_src))[0]
         aicpu_obj = os.path.join(
             self.build_temp,
-            # All extensions share the temporary directory. Keep the
-            # AICPU objects per extension; otherwise the later 950 build
-            # overwrites the object already queued for the earlier one.
-            f"fa_metadata_{ext_name.replace('.', '_')}.o",
+            f"{src_name}_{ext_name.replace('.', '_')}.o",
         )
-        # Incremental AICPU compilation must also track the local headers. In
-        # particular, fa_metadata.aicpu includes tilingdata.h and metadata
-        # helpers whose changes otherwise leave a stale object after a branch
-        # switch or stash re-apply.
+        # Tiling implementations are also included directly in AICPU sources.
         aicpu_stamp = aicpu_obj + ".inputs"
-        aicpu_inputs = [aicpu_src]
-        for name in (
-            "tilingdata.h",
-            "fa_metadata_args.h",
-            "fa_split.h",
-            "fused_task.h",
-            "fwd_resource_plan.h",
-            "fwd_tiling_policy.h",
-        ):
-            header = os.path.join(src_dir, name)
-            if os.path.exists(header):
-                aicpu_inputs.append(header)
+        aicpu_inputs = [aicpu_src, os.path.join(this_dir, "csrc", "fag_tensor_strides.h")]
+        arch_dir = os.path.dirname(src_dir)
+        dependency_dirs = [arch_dir, *glob.glob(os.path.join(arch_dir, "flash_attn_npu*"))]
+        for directory in dependency_dirs:
+            for pattern in ("include/*.h", "*.h", "*.hpp", "*tiling*.cpp"):
+                aicpu_inputs.extend(glob.glob(os.path.join(directory, pattern)))
         expected_signature = _inputs_signature(aicpu_inputs)
         try:
             with open(aicpu_stamp) as stamp:
@@ -608,15 +596,10 @@ class BishengBuildExt(build_ext):
                 ext_name, obj = fut.result()
                 objs_by_ext[ext_name].append(obj)
 
-        # AICPU metadata object for the extensions carrying the
-        # scheduler-metadata feature: compiled separately (host code,
-        # `bisheng -x aicpu`) and appended to each extension's link set. Built
-        # after the parallel ASC compiles, before linking.
+        aicpu_sources = {ext.name: self._aicpu_sources(ext.name) for ext in self.extensions}
         for ext in self.extensions:
-            ext_fullpath = self.get_ext_fullpath(ext.name)
-            aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
-            if aicpu_obj is not None:
-                objs_by_ext[ext.name].append(aicpu_obj)
+            for source in aicpu_sources[ext.name]:
+                objs_by_ext[ext.name].append(self._build_aicpu_source(source, ext.name))
 
         # Link each extension from its own object files (serial; link is cheap
         # relative to compile - measured ~1s/ext - so parallelizing would save
@@ -627,7 +610,7 @@ class BishengBuildExt(build_ext):
             ext_fullpath = self.get_ext_fullpath(ext.name)
             objs = objs_by_ext[ext.name]
             link_stamp = os.path.join(self.build_temp, ext.name + ".inputs")
-            link_inputs = [src for src in ext.sources]
+            link_inputs = [*ext.sources, *aicpu_sources[ext.name]]
             link_inputs.extend(
                 os.path.join(os.path.dirname(src), name)
                 for src in ext.sources

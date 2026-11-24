@@ -320,7 +320,7 @@ class FlashAttentionScoreGrad950 {
         epilogueDetAdd_.Init(resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen, params.workspace, params.tiling);
         epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
-        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
+        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping, params.dq, params.dk, params.dv);
         epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
                                   vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
 #endif
@@ -2069,13 +2069,7 @@ class FlashAttentionScoreGrad950 {
 
 template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP,
           bool SINGLE_VEC = false>
-// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
-// concurrent streams running other sync kernels can deadlock on core allocation.
-__schedmode__(1) CATLASS_GLOBAL
-    void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
-                                GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k, GM_ADDR seqUsedQ,
-                                GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
-                                GM_ADDR tiling)
+CATLASS_DEVICE void RunFlashAttentionV3Bwd950(const FAGKernelParams& params)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -2108,10 +2102,35 @@ __schedmode__(1) CATLASS_GLOBAL
     using FAGKernel950 =
         FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
                                    INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC>;
-    FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
-                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     FAGKernel950 fag;
     fag(params);
+}
+
+template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP,
+          bool SINGLE_VEC = false>
+// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
+// concurrent streams running other sync kernels can deadlock on core allocation.
+__schedmode__(1) CATLASS_GLOBAL
+    void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
+                                GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k, GM_ADDR seqUsedQ,
+                                GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace,
+                                GM_ADDR tiling)
+{
+    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+        if (!IsFagPlanReady(tiling)) {
+            return;
+        }
+    }
+    FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
+                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
+    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND && !IS_DETERMINISTIC && !SINGLE_VEC) {
+        const auto* plan = reinterpret_cast<const __gm__ FAGTiling950::FAGTilingData*>(tiling);
+        if (plan->shortQ != 0 || plan->shortBiDir != 0) {
+            RunFlashAttentionV3Bwd950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP, true>(params);
+            return;
+        }
+    }
+    RunFlashAttentionV3Bwd950<DataType, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC>(params);
 }
 
 #endif // FAG_KERNEL_950_CPP_H

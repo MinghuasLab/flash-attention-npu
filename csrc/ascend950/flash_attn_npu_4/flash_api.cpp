@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 
 #include "device_triu_mask.h"
@@ -73,8 +74,12 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be on NPU");
-    TORCH_CHECK(cache_seqlens.dtype() == at::kInt && cache_seqlens.dim() == 1 && cache_seqlens.numel() == batch_size,
-                "cache_seqlens must be int32 [batch]");
+    TORCH_CHECK(cache_seqlens.dtype() == at::kInt && cache_seqlens.dim() == 1 && cache_seqlens.numel() == batch_size &&
+                    cache_seqlens.is_contiguous(),
+                "cache_seqlens must be contiguous int32 [batch]");
+    TORCH_CHECK(max_seqlen_q >= 0 && max_seqlen_q <= std::numeric_limits<int32_t>::max() &&
+                    max_seqlen_k >= 0 && max_seqlen_k <= std::numeric_limits<int32_t>::max(),
+                "max_seqlen_q and max_seqlen_k must fit in nonnegative int32");
     TORCH_CHECK(batch_size > 0 && num_heads_q > 0 && num_heads_kv > 0 && num_heads_q % num_heads_kv == 0,
                 "invalid batch or head dimensions");
     TORCH_CHECK(!pack_gqa.has_value() || !pack_gqa.value(), "pack_gqa is not supported on Ascend 950 FA4");
@@ -89,6 +94,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                     "invalid cu_seqlens_q");
     }
     if (seqused_q.has_value()) {
+        TORCH_CHECK(is_varlen_q, "seqused_q requires cu_seqlens_q");
         const auto& sq = seqused_q.value();
         TORCH_CHECK(sq.device() == cache_seqlens.device() && sq.dtype() == at::kInt && sq.is_contiguous() &&
                         sq.dim() == 1 && sq.numel() == batch_size,
@@ -109,6 +115,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.embeddingSize = headdim;
     args.embeddingSizeV = headdim_v;
     args.maxQSeqlen = max_seqlen_q;
+    args.maxKvSeqlen = max_seqlen_k;
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q;
     args.numSplits = num_splits;
@@ -332,7 +339,15 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 PYBIND11_MODULE(flash_attn_npu_4_950, m)
 {
     m.doc() = "FlashAttention v4 — Ascend 950 backend";
-    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
+    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("q_v"), py::arg("out"),
+          py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"), py::arg("seqused_q"), py::arg("seqused_k"),
+          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("min_seqlen_k"), py::arg("page_table"),
+          py::arg("gather_kv_indices"), py::arg("softmax_scale"), py::arg("is_causal"), py::arg("window_size_left"),
+          py::arg("window_size_right"), py::arg("softcap"), py::arg("num_splits"), py::arg("pack_gqa"),
+          py::arg("learnable_sink"), py::arg("return_lse"), py::arg("scheduler_metadata"), py::arg("layout"),
+          py::arg("q_descale"), py::arg("k_descale"), py::arg("v_descale"),
+          py::arg("disable_scheduler_metadata") = false, py::arg("infer_max_seqlen_k") = false);
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata");
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),

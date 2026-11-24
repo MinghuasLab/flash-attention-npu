@@ -1,0 +1,20 @@
+// Copyright (c) 2026, Minghua Shen.
+#include "aicpu_api.h"
+#include "fa_fwd_prepare_plan.h"
+
+__global__ __aicpu__ uint32_t PrepareFlashAttnFwd950V4(void* rawArgs)
+{
+    const auto& args = *reinterpret_cast<const FA4FwdPrepareArgs*>(rawArgs);
+    auto& execution = *reinterpret_cast<FA4FwdExecution*>(args.execution);
+    execution.status = static_cast<uint32_t>(FA4FwdStatus::Pending);
+    FA4FwdStatus status = FA4FwdStatus::InvalidSchedule;
+    try {
+        status = fa4_fwd_plan::Prepare(args, execution);
+    } catch (...) {
+        status = FA4FwdStatus::InvalidSchedule;
+    }
+    AscendC::DataStoreBarrier();
+    execution.status = static_cast<uint32_t>(status);
+    AscendC::DataStoreBarrier();
+    return status == FA4FwdStatus::Valid ? 0U : static_cast<uint32_t>(status);
+}

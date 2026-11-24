@@ -184,7 +184,7 @@ class FlashAttentionScoreGrad950Partial {
         epilogueSoftmaxGradFront_.Init(resource, params.dout, params.out, params.workspace, params.tiling);
         epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
-        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
+        epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping, params.dq, params.dk, params.dv);
         epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
                                   vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
 #endif
@@ -766,6 +766,11 @@ __schedmode__(1) CATLASS_GLOBAL
                                        GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
                                        GM_ADDR workspace, GM_ADDR tiling)
 {
+    if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+        if (!IsFagPlanReady(tiling)) {
+            return;
+        }
+    }
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
     using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<128>, tla::Int<128>>;

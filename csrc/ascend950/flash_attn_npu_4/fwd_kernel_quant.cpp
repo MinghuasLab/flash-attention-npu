@@ -120,7 +120,7 @@ class FAIKernel950 {
     {
         __gm__ const FAInferStaticTilingData* faiTilingData =
             reinterpret_cast<__gm__ const FAInferStaticTilingData*>(params.tiling);
-        const auto& runtime = params.fp8Runtime;
+        const auto& runtime = *reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
         AscendC::GlobalTensor<ElementQ> gQ;
         gQ.SetGlobalBuffer((__gm__ ElementQ*)params.q);
         AscendC::GlobalTensor<ElementK> gK;
@@ -275,6 +275,8 @@ class FAIKernel950 {
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvPhysicalSeqlen =
                 static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
+        } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+            kvPhysicalSeqlen = params.kvSeqlenAllocated;
         }
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
@@ -284,13 +286,17 @@ class FAIKernel950 {
         int32_t fdFirstKvTileStart = -1;
         int32_t fdLastKvTileEnd = -1;
         if (flashDecodeFlag_ != 0U) {
-            fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
-            fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
-            fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
-            fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
-            taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
-            taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
-            taskStep = 1U;
+            if (coreIdx < faiTilingData->fdActiveCoreNum) {
+                fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
+                fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
+                fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
+                fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
+                taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
+                taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+                taskStep = 1U;
+            } else {
+                taskBegin = taskEnd;
+            }
         }
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
@@ -327,6 +333,8 @@ class FAIKernel950 {
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
                                                             gActualKvseqlen.GetValue(curBatch));
+                } else if constexpr (kvFormat == Format::BSND && kvcacheType == CacheMode::normalCache) {
+                    kvPhysicalSeqlen = params.kvSeqlenAllocated;
                 }
                 uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
@@ -856,13 +864,7 @@ class FAIKernel950 {
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
-// concurrent streams running other sync kernels can deadlock on core allocation.
-__schedmode__(1) CATLASS_GLOBAL
-    void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
-                        GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
-                        GM_ADDR workspace, GM_ADDR tiling, FAInferRuntimeData runtime, GM_ADDR qDescale,
-                        GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated)
+__aicore__ inline void RunFAInferDnQuant(const FAIKernelParams& params)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -911,14 +913,45 @@ __schedmode__(1) CATLASS_GLOBAL
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, LseMode>;
-    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,   seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      nullptr,       kvSeqlenAllocated};
-    params.fp8Runtime = runtime;
+    Kernel faInfer;
+    faInfer(params);
+}
+
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool AdaptiveMask>
+// All launched cores participate in FlashDecode's inter-core synchronization.
+__schedmode__(1) CATLASS_GLOBAL
+    void FAInferDnQuant(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                        GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                        GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling, GM_ADDR qDescale,
+                        GM_ADDR kDescale, GM_ADDR vDescale, int64_t kvSeqlenAllocated)
+{
+    if (!CheckForwardExecution(runtimeTiling)) {
+        return;
+    }
+    FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, seqUsedQ,
+                           seqUsedKv, o, lse, workspace, tiling, runtimeTiling, kvSeqlenAllocated};
     params.qDescale = qDescale;
     params.kDescale = kDescale;
     params.vDescale = vDescale;
-    Kernel faInfer;
-    faInfer(params);
+    if constexpr (AdaptiveMask) {
+        const auto* runtime = reinterpret_cast<__gm__ const FAInferRuntimeData*>(runtimeTiling);
+        if (runtime->maskType == 2U) {
+            RunFAInferDnQuant<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::MASK_SWA,
+                              cacheLayout, LseMode, HasSoftcap>(params);
+            return;
+        }
+        if (runtime->maskType == 1U) {
+            RunFAInferDnQuant<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::MASK_CAUSAL,
+                              cacheLayout, LseMode, HasSoftcap>(params);
+            return;
+        }
+        RunFAInferDnQuant<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::NO_MASK,
+                          cacheLayout, LseMode, HasSoftcap>(params);
+    } else {
+        RunFAInferDnQuant<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory,
+                          cacheLayout, LseMode, HasSoftcap>(params);
+    }
 }
 
 } // namespace QuantFA

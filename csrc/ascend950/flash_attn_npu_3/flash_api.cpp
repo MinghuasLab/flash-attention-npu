@@ -71,8 +71,19 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
     TORCH_CHECK(cache_seqlens.is_contiguous(), "cache_seqlens must be contiguous");
     TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be an NPU tensor");
-    TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
+    constexpr int64_t maxInt32 = std::numeric_limits<int32_t>::max();
+    TORCH_CHECK(batch_size > 0 && batch_size <= maxInt32, "batch size must be positive and fit in int32");
+    TORCH_CHECK(cache_seqlens.dim() == 1 && cache_seqlens.numel() == batch_size,
+                "cache_seqlens must have batch_size elements in a rank-1 tensor");
+    TORCH_CHECK(num_heads_q > 0 && num_heads_kv > 0 && num_heads_q <= maxInt32 &&
+                    num_heads_q % num_heads_kv == 0, "KV heads must divide the positive query head count");
+    TORCH_CHECK(max_seqlen_q >= 0 && max_seqlen_q <= maxInt32 &&
+                    max_seqlen_k >= 0 && max_seqlen_k <= maxInt32, "maximum sequence lengths must fit in int32");
+    const auto supportedDim = [](int64_t dim) { return dim > 0 && dim <= 256; };
+    TORCH_CHECK((supportedDim(headdim) && supportedDim(headdim_v)) || (headdim == 512 && headdim_v == 512),
+                "query and value head dimensions are unsupported");
+    TORCH_CHECK(!page_size || *page_size == 128 || *page_size == 256 || *page_size == 512 || *page_size == 1024,
+                "unsupported page size");
     TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
     TORCH_CHECK(quant_mode == 0 || quant_mode == 1, "unsupported quantization mode");
     TORCH_CHECK(quant_mode != 1 || (headdim == 128 && headdim_v == 128),
@@ -84,15 +95,17 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
         auto seqlens_q_t = seqlens_q.value();
         TORCH_CHECK(seqlens_q_t.dtype() == torch::kInt32, "seqlens_q must have dtype int32");
         TORCH_CHECK(seqlens_q_t.is_contiguous(), "seqlens_q must be contiguous");
-        TORCH_CHECK(seqlens_q_t.numel() == batch_size, "seqlens_q must have batch_size elements");
+        TORCH_CHECK(seqlens_q_t.device() == cache_seqlens.device(), "seqlens_q must be on the cache device");
+        TORCH_CHECK(seqlens_q_t.dim() == 1 && seqlens_q_t.numel() == batch_size,
+                    "seqlens_q must have batch_size elements in a rank-1 tensor");
     }
     if (is_varlen_kv) {
         auto cu_k = cu_seqlens_k.value();
         TORCH_CHECK(cu_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(cu_k.is_contiguous(), "cu_seqlens_k must be contiguous");
-        TORCH_CHECK(cu_k.numel() == batch_size + 1, "cu_seqlens_k must have batch_size+1 elements");
-    } else {
-        TORCH_CHECK(cache_seqlens.numel() == batch_size, "cache_seqlens must have batch_size elements");
+        TORCH_CHECK(cu_k.device() == cache_seqlens.device(), "cu_seqlens_k must be on the cache device");
+        TORCH_CHECK(cu_k.dim() == 1 && cu_k.numel() == batch_size + 1,
+                    "cu_seqlens_k must have batch_size+1 elements in a rank-1 tensor");
     }
 
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
@@ -111,6 +124,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     const uint32_t maxNumBlocksPerBatch =
         page_size.has_value() ? ((static_cast<uint32_t>(max_seqlen_k) + ps - 1) / ps) : 0;
     args.maxQSeqlen = static_cast<uint32_t>(max_seqlen_q);
+    args.maxKvSeqlen = static_cast<uint32_t>(max_seqlen_k);
     // Match paged forward's mask selection using cache capacity.
     const int64_t maskKvBound = page_size.has_value() ? static_cast<int64_t>(maxNumBlocksPerBatch) * ps : max_seqlen_k;
     FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right, max_seqlen_q, maskKvBound);

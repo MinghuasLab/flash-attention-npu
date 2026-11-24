@@ -75,14 +75,8 @@ class FlashDecodeCombine950 {
     {
 #ifdef __DAV_VEC__
         __gm__ FAInferStaticTilingData* tiling = reinterpret_cast<__gm__ FAInferStaticTilingData*>(params.tiling);
-        uint32_t allowFlashDecode;
-        if constexpr (FULL_QUANT_FP8) {
-            allowFlashDecode = params.fp8Runtime.allowFlashDecode;
-        } else {
-            const auto* runtimeTiling = reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
-            allowFlashDecode = runtimeTiling->allowFlashDecode;
-        }
-        if (tiling->flashDecodeFlag == 0U || allowFlashDecode == 0U) {
+        const auto* runtimeTiling = reinterpret_cast<__gm__ const FAInferRuntimeData*>(params.runtimeTiling);
+        if (tiling->flashDecodeFlag == 0U || runtimeTiling->allowFlashDecode == 0U) {
             return;
         }
         constexpr uint32_t uniformMode = OutputLse ? FD_COMBINE_UNIFORM_WITH_LSE : FD_COMBINE_UNIFORM_NO_LSE;
@@ -208,7 +202,10 @@ class FlashDecodeCombine950 {
         __gm__ FAInferStaticTilingData* tiling = reinterpret_cast<__gm__ FAInferStaticTilingData*>(params.tiling);
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t aivIdx = AscendC::GetBlockIdx();
-        const uint32_t aivNum = AscendC::GetBlockNum() * subBlockNum;
+        const uint32_t aivNum = tiling->fdActiveCoreNum * subBlockNum;
+        if (aivIdx >= aivNum) {
+            return;
+        }
         const uint32_t rowTile = Min(MAX_ROW_TILE, Max(1U, CeilDiv(tiling->fdCombineRowNum, aivNum)));
 
         AscendC::GlobalTensor<float> partialLse;

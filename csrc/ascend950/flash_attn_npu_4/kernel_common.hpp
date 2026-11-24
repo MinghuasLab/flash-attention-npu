@@ -15,6 +15,7 @@
 
 #include "kernel_operator.h"
 #include "tilingdata.h"
+#include "fa_fwd_prepare.h"
 
 constexpr int32_t NUM1 = 1;
 constexpr int32_t NUM4 = 4;
@@ -63,7 +64,6 @@ struct FAIKernelParams {
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
     GM_ADDR vDescale = nullptr;
-    FAInferRuntimeData fp8Runtime{};
     // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
     // BSND / TND, whose layout is the compile-time Format template parameter.
     int64_t kvSeqlenAllocated;
@@ -83,6 +83,12 @@ struct FAIKernelParams {
           storage(storage_)
     {}
 };
+
+__aicore__ inline bool CheckForwardExecution(GM_ADDR executionAddr)
+{
+    const auto* execution = reinterpret_cast<__gm__ const FA4FwdExecution*>(executionAddr);
+    return execution->status == static_cast<uint32_t>(FA4FwdStatus::Valid);
+}
 
 enum class Format {
     TND = 0,

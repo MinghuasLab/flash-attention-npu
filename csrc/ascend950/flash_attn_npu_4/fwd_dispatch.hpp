@@ -36,9 +36,9 @@ struct FwdLaunchArgs {
     uint8_t* q_descale_device = nullptr;
     uint8_t* k_descale_device = nullptr;
     uint8_t* v_descale_device = nullptr;
-    FAInferRuntimeData fp8_runtime{};
+    bool adaptive_mask = false;
+    bool adaptive_dn = false;
     FwdStorageParams storage{};
-    bool kv_bnbd = false;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

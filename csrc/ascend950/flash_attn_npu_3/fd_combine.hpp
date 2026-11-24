@@ -184,7 +184,10 @@ class FlashDecodeCombine950 {
         __gm__ FAInferTilingData* tiling = reinterpret_cast<__gm__ FAInferTilingData*>(params.tiling);
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t aivIdx = AscendC::GetBlockIdx();
-        const uint32_t aivNum = AscendC::GetBlockNum() * subBlockNum;
+        const uint32_t aivNum = tiling->fdActiveCoreNum * subBlockNum;
+        if (aivIdx >= aivNum) {
+            return;
+        }
         const uint32_t rowTile = Min(MAX_ROW_TILE, Max(1U, CeilDiv(tiling->fdCombineRowNum, aivNum)));
 
         AscendC::GlobalTensor<float> partialLse;

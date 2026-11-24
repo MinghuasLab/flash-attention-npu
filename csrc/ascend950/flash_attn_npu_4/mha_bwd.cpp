@@ -20,6 +20,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "../flash_attn_npu_3/fa_bwd_prepare_host.hpp"
 // Reuse Ascend950 v3 FAG kernels in place (same pattern as 910 v2 → v3).
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "../flash_attn_npu_3/fag_kernel.cpp"
@@ -92,7 +93,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(used_q.dim() == 1 && used_q.size(0) == batch_size,
                     "Ascend950 v4 bwd: seqused_q must be 1D of length B");
         TORCH_CHECK(used_q.is_contiguous(), "Ascend950 v4 bwd: seqused_q must be contiguous");
-        TORCH_CHECK(used_q.device().type() == at::kPrivateUse1, "Ascend950 v4 bwd: seqused_q must be on NPU");
+        TORCH_CHECK(used_q.device() == q.device(), "Ascend950 v4 bwd: seqused_q must be on NPU");
     }
     if (seqused_k_.has_value()) {
         const at::Tensor& used_k = seqused_k_.value();
@@ -100,7 +101,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         TORCH_CHECK(used_k.dim() == 1 && used_k.size(0) == batch_size,
                     "Ascend950 v4 bwd: seqused_k must be 1D of length B");
         TORCH_CHECK(used_k.is_contiguous(), "Ascend950 v4 bwd: seqused_k must be contiguous");
-        TORCH_CHECK(used_k.device().type() == at::kPrivateUse1, "Ascend950 v4 bwd: seqused_k must be on NPU");
+        TORCH_CHECK(used_k.device() == q.device(), "Ascend950 v4 bwd: seqused_k must be on NPU");
     }
     TORCH_CHECK(!deterministic || (!seqused_q_.has_value() && !seqused_k_.has_value()),
                 "Ascend950 v4 bwd: seqused_q/seqused_k with deterministic is not supported yet");
@@ -135,9 +136,20 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         softmax_lse = softmax_lse.contiguous();
     }
 
-    // ============================================================
-    // FAG tiling (host)
-    // ============================================================
+    if (is_varlen) {
+        TORCH_CHECK(v.size(1) == num_heads_kv && out.size(0) == q.size(0) && out.size(1) == num_heads &&
+                        dout.sizes() == out.sizes(),
+                    "mha_bwd: invalid packed k/v or out/dout shape");
+        TORCH_CHECK(dq.sizes() == q.sizes() && dk.sizes() == k.sizes() && dv.sizes() == v.sizes() &&
+                        dq.dtype() == q.dtype() && dk.dtype() == q.dtype() && dv.dtype() == q.dtype(),
+                    "mha_bwd: gradients must match q/k/v shapes and dtypes");
+        TORCH_CHECK(softmax_lse.dim() == 2 && softmax_lse.size(0) == num_heads && softmax_lse.size(1) == q.size(0) &&
+                        softmax_lse.scalar_type() == at::kFloat && softmax_lse.device() == q.device(),
+                    "mha_bwd: TND LSE must be float32 [Nq,Tq] on q device");
+        softmax_lse = softmax_lse.contiguous();
+    }
+
+    // Static shape, stride and layout validation.
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(-1) == 1 && tensor.device() == q.device(),
                     "mha_bwd: inputs require contiguous D and the same device");
@@ -201,184 +213,66 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
-    // Pull TND cumulative lengths to host for ABI/shape validation.  The
-    // arch35 tiler uses totalQ/totalKv from the actual packed tensors rather
-    // than carrying host-only sequence vectors in its device tiling ABI.
-    at::Tensor cu_q_cpu;
-    at::Tensor cu_k_cpu;
-    std::vector<int64_t> actual_seq_q;
-    std::vector<int64_t> actual_seq_kv;
+    at::Tensor cu_q_device;
+    at::Tensor cu_k_device;
     if (is_varlen) {
         const at::Tensor& cu_q_tensor = cu_seqlens_q_.value();
         const at::Tensor& cu_k_tensor = cu_seqlens_k_.value();
-        TORCH_CHECK(cu_q_tensor.dim() == 1 && cu_k_tensor.dim() == 1 && cu_q_tensor.size(0) == batch_size + 1 &&
-                        cu_k_tensor.size(0) == batch_size + 1,
+        TORCH_CHECK(cu_q_tensor.dim() == 1 && cu_k_tensor.dim() == 1 && cu_k_tensor.size(0) == batch_size + 1,
                     "Ascend950 v4 bwd: cu_seqlens must be 1D tensors of length B + 1");
-        TORCH_CHECK(cu_q_tensor.dtype() == at::kInt && cu_k_tensor.dtype() == at::kInt,
+        TORCH_CHECK(cu_q_tensor.scalar_type() == at::kInt && cu_k_tensor.scalar_type() == at::kInt,
                     "Ascend950 v4 bwd: cu_seqlens must have dtype int32");
-        TORCH_CHECK(cu_q_tensor.device().type() == at::kPrivateUse1 && cu_k_tensor.device().type() == at::kPrivateUse1,
-                    "Ascend950 v4 bwd: cu_seqlens must be on NPU");
-        cu_q_cpu = cu_q_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        cu_k_cpu = cu_k_tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-        const int32_t* q_lengths = cu_q_cpu.data_ptr<int32_t>();
-        const int32_t* kv_lengths = cu_k_cpu.data_ptr<int32_t>();
-        TORCH_CHECK(q_lengths[0] == 0 && kv_lengths[0] == 0, "Ascend950 v4 bwd: cu_seqlens must start at zero");
-        actual_seq_q.resize(batch_size);
-        actual_seq_kv.resize(batch_size);
-        bool tndAllNonEmpty = batch_size > 0;
-        for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-            TORCH_CHECK(q_lengths[batch_idx + 1] >= q_lengths[batch_idx] &&
-                            kv_lengths[batch_idx + 1] >= kv_lengths[batch_idx],
-                        "Ascend950 v4 bwd: cu_seqlens must be nondecreasing");
-            TORCH_CHECK(q_lengths[batch_idx + 1] - q_lengths[batch_idx] <= q_seqlen &&
-                            kv_lengths[batch_idx + 1] - kv_lengths[batch_idx] <= kv_seqlen,
-                        "Ascend950 v4 bwd: an actual sequence length exceeds max_seqlen");
-            actual_seq_q[batch_idx] = q_lengths[batch_idx + 1] - q_lengths[batch_idx];
-            actual_seq_kv[batch_idx] = kv_lengths[batch_idx + 1] - kv_lengths[batch_idx];
-            if (actual_seq_q[batch_idx] <= 0 || actual_seq_kv[batch_idx] <= 0) {
-                tndAllNonEmpty = false;
-            }
-        }
-        TORCH_CHECK(q_lengths[batch_size] == static_cast<int64_t>(fag_info.totalQ) &&
-                        kv_lengths[batch_size] == static_cast<int64_t>(fag_info.totalKv),
-                    "Ascend950 v4 bwd: final cu_seqlens values must match packed tensor lengths");
-        at::Tensor used_q_cpu =
-            seqused_q_.has_value() ? seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
-        at::Tensor used_k_cpu =
-            seqused_k_.has_value() ? seqused_k_->to(at::Device(at::kCPU)).to(at::kInt).contiguous() : at::Tensor();
-        const int32_t* used_q = used_q_cpu.defined() ? used_q_cpu.data_ptr<int32_t>() : nullptr;
-        const int32_t* used_kv = used_k_cpu.defined() ? used_k_cpu.data_ptr<int32_t>() : nullptr;
-        for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-            if (used_q != nullptr) {
-                TORCH_CHECK(used_q[batch_idx] >= 0 && used_q[batch_idx] <= actual_seq_q[batch_idx],
-                            "Ascend950 v4 bwd: seqused_q must lie within the allocated sequence length");
-            }
-            if (used_kv != nullptr) {
-                TORCH_CHECK(used_kv[batch_idx] >= 0 && used_kv[batch_idx] <= actual_seq_kv[batch_idx],
-                            "Ascend950 v4 bwd: seqused_k must lie within the allocated sequence length");
-            }
-        }
-        if (used_q != nullptr || used_kv != nullptr) {
-            // Used-based trailing trim; totalQ/totalKv stay region totals.
-            uint64_t tail_zero = 0;
-            for (int64_t i = batch_size - 1; i >= 1; --i) {
-                const bool q_empty = used_q != nullptr ? used_q[i] <= 0 : actual_seq_q[i] <= 0;
-                const bool kv_empty = used_kv != nullptr ? used_kv[i] <= 0 : actual_seq_kv[i] <= 0;
-                if (q_empty && kv_empty) {
-                    ++tail_zero;
-                } else {
-                    break;
-                }
-            }
-            fag_info.batch -= tail_zero;
-        }
-        // TND BN2S2: hand the per-batch lengths to the tiler, which
-        // serializes the round/area prefix table.  MHA needs the swizzle's
-        // intra-round uniqueness condition; GQA uses opst's flat partition.
-        // Causal TND reuses the dense schedule with the causal mask applied
-        // in the epilogue (masked blocks contribute exact zeros), same as
-        // the rectangular BSND causal path.
-        if (deterministic && tndAllNonEmpty &&
-            batch_size + 1 <= static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM)) {
-            fag_info.actualSeqQ = actual_seq_q.data();
-            fag_info.actualSeqKv = actual_seq_kv.data();
-            fag_info.detSchedule = static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2);
-        }
+        TORCH_CHECK(cu_q_tensor.device() == q.device() && cu_k_tensor.device() == q.device(),
+                    "Ascend950 v4 bwd: cu_seqlens must be on the query device");
+        cu_q_device = cu_q_tensor.contiguous();
+        cu_k_device = cu_k_tensor.contiguous();
     }
 
     uint64_t ub_size = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_size);
     fag_info.ubSize = ub_size;
 
-    // Deterministic shapes must map to the BN2S2 schedule; reject here so the
-    // error is precise and the legacy VecDTM layout is never reached.
-    TORCH_CHECK(!deterministic || fag_info.detSchedule == static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2),
-                "Ascend950 v4 bwd: deterministic backward requires the BN2S2 "
-                "schedule for this shape");
-
-    FAGTiling950::FAGTilingData fag_tiling_data{};
-    const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
-    TORCH_CHECK(tiling_status == 0, "Ascend950 v4 bwd: arch35 GetFAGTilingParam failed");
-    // Entire BAND-masked KV columns never reach the private-column cast.
-    if (is_local && fag_tiling_data.detPrivDkv != 0) {
-        bool hasEmptyKvColumns = !is_varlen && kv_seqlen - q_seqlen > fag_tiling_data.s1Token;
-        for (int64_t b = 0; is_varlen && b < batch_size && !hasEmptyKvColumns; ++b) {
-            hasEmptyKvColumns = actual_seq_kv[b] - actual_seq_q[b] > fag_tiling_data.s1Token;
-        }
-        if (hasEmptyKvColumns) {
-            dk.zero_();
-            dv.zero_();
-        }
-    }
-    // earlyDkvCast Fixpipe-writes only the columns that run; untouched
-    // columns must stay exact zeros. Dense TND pitches are used for writes.
-    if (fag_tiling_data.earlyDkvCast != 0) {
-        dk.zero_();
-        dv.zero_();
-    }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
     }
-    auto tensor_strides = [is_varlen](const at::Tensor& tensor) {
-        return FagTensorStrides{is_varlen ? 0 : tensor.stride(0), tensor.stride(is_varlen ? 0 : 1),
-                                tensor.stride(is_varlen ? 1 : 2)};
+    const auto tensor_strides = [is_varlen](const at::Tensor& tensor) {
+        return FagTensorStrides{is_varlen ? 0 : tensor.stride(0), is_varlen ? tensor.stride(0) : tensor.stride(1),
+                                is_varlen ? tensor.stride(1) : tensor.stride(2)};
     };
-    fag_tiling_data.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
-                                    tensor_strides(dout), tensor_strides(out), 1};
-    // The old in-loop VecDTM deterministic fallback was replaced by the cube
-    // BN2S2 schedule.  Any deterministic shape the tiler cannot map to BN2S2
-    // must fail loudly instead of silently running a non-deterministic loop.
-    if (deterministic) {
-        TORCH_CHECK(fag_tiling_data.detSchedule == static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2),
-                    "Ascend950 v4 bwd: deterministic backward requires the BN2S2 "
-                    "schedule for this shape");
-    }
-    at::Tensor tiling_cpu =
-        at::empty({static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
-    std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &fag_tiling_data, sizeof(FAGTiling950::FAGTilingData));
-    at::Tensor tiling_device = tiling_cpu.to(at::Device(at::kPrivateUse1));
-
-    // ============================================================
-    // FAG workspace (device)
-    // ============================================================
-    const uint64_t workspace_size = static_cast<uint64_t>(fag_tiling_data.workspaceSize);
-    TORCH_CHECK(workspace_size > 0 && workspace_size <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
-                "Ascend950 v4 bwd: invalid workspace size from tiling");
-    TORCH_CHECK(workspace_size % sizeof(float) == 0 && fag_tiling_data.deltaOffset % sizeof(float) == 0,
-                "Ascend950 v4 bwd: FP32 workspace offsets must be aligned");
-    if (deterministic) {
-        if (fag_tiling_data.detPrivDkv != 0) {
-            TORCH_CHECK(fag_tiling_data.dqOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.dkPrivOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.dvPrivOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.dvPrivOffset < workspace_size,
-                        "Ascend950 v4 bwd: deterministic BN2S2 private workspace "
-                        "offsets must be 512B-aligned and inside the workspace");
-        } else {
-            TORCH_CHECK(fag_tiling_data.dqOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.dkOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.dvOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
-                            fag_tiling_data.deltaOffset < workspace_size,
-                        "Ascend950 v4 bwd: deterministic BN2S2 shared workspace "
-                        "offsets must be 512B-aligned and inside the workspace");
+    const FagInputStrides input_strides{tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
+                                        tensor_strides(dout), tensor_strides(out), 1};
+    FAGTiling950::FAGTilingData fag_tiling_data{};
+    at::Tensor tiling_device;
+    uint64_t workspace_size = 0;
+    if (is_varlen) {
+        workspace_size = fag_bwd_host::TndWorkspaceCapacity(fag_info);
+    } else {
+        // Dense tiling consumes only static tensor geometry.
+        TORCH_CHECK(!deterministic || fag_info.detSchedule == static_cast<uint32_t>(FAGTiling950::DetSchedule::BN2S2),
+                    "Ascend950 v4 bwd: deterministic backward requires the BN2S2 schedule for this shape");
+        TORCH_CHECK(FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data) == 0,
+                    "Ascend950 v4 bwd: arch35 GetFAGTilingParam failed");
+        if (is_local && fag_tiling_data.detPrivDkv != 0 && kv_seqlen - q_seqlen > fag_tiling_data.s1Token) {
+            dk.zero_();
+            dv.zero_();
         }
+        fag_tiling_data.inputStrides = input_strides;
+        auto tiling_cpu = at::empty({static_cast<int64_t>(sizeof(FAGTiling950::FAGTilingData))},
+                                    at::device(c10::kCPU).dtype(at::kByte));
+        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &fag_tiling_data, sizeof(fag_tiling_data));
+        tiling_device = tiling_cpu.to(q.device());
+        workspace_size = fag_tiling_data.workspaceSize;
+        TORCH_CHECK(workspace_size > 0 && workspace_size <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                    "Ascend950 v4 bwd: invalid workspace size from tiling");
     }
+    TORCH_CHECK(workspace_size % sizeof(float) == 0, "Ascend950 bwd: FP32 workspace size must be aligned");
     at::Tensor workspace = at::empty({static_cast<int64_t>(workspace_size / sizeof(float))},
                                      at::device(at::kPrivateUse1).dtype(at::kFloat));
 
     auto ptr = [](const at::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
-    // Arch35 FAG device ABI: cumulative lengths have B entries and do not
-    // include the leading zero.
-    at::Tensor cu_q_device;
-    at::Tensor cu_k_device;
-    uint8_t* cu_q = nullptr;
-    uint8_t* cu_k = nullptr;
-    if (is_varlen) {
-        cu_q_device = cu_seqlens_q_.value().slice(0, 1, cu_seqlens_q_.value().size(0)).contiguous();
-        cu_k_device = cu_seqlens_k_.value().slice(0, 1, cu_seqlens_k_.value().size(0)).contiguous();
-        cu_q = ptr(cu_q_device);
-        cu_k = ptr(cu_k_device);
-    }
+    // The kernels consume the B entries following the leading zero.
+    uint8_t* cu_q = is_varlen ? ptr(cu_q_device) + sizeof(int32_t) : nullptr;
+    uint8_t* cu_k = is_varlen ? ptr(cu_k_device) + sizeof(int32_t) : nullptr;
     uint8_t* seq_used_q = nullptr;
     uint8_t* seq_used_k = nullptr;
     if (seqused_q_.has_value()) {
@@ -398,6 +292,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         mask = ptr(mask_npu_tensor);
     }
 
+    if (is_varlen) {
+        tiling_device = fag_bwd_host::PrepareTnd(fag_info, input_strides, cu_q_device, cu_k_device, seqused_q_,
+                                                 seqused_k_, k_sizes[0], v_sizes[0], workspace_size,
+                                                 /*exactPackedLength=*/true);
+    }
+
     // Flush queued PyTorch NPU work (for example tiling, mask and cumulative
     // lengths) before launching the raw mixed AIC/AIV kernel on the ACL stream.
     stream = c10_npu::getCurrentNPUStream().stream(true);
@@ -414,7 +314,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // All other shapes (neither flag) stay on SPLIT_M dual-AIV.
     // Must match flash_attn_npu_3/mha_bwd.cpp: tiling sets shortQ but the
     // kernel only uses the matching CV sync protocol when SINGLE_VEC=true.
-    const bool launch_single_vec = (fag_tiling_data.shortQ != 0) || (fag_tiling_data.shortBiDir != 0);
+    const bool launch_single_vec = is_varlen ? (!deterministic && q_seqlen <= 16)
+                                             : (fag_tiling_data.shortQ != 0 || fag_tiling_data.shortBiDir != 0);
 
 #define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC)                    \
     FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP,     \
@@ -487,7 +388,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
-    if (fag_tiling_data.d512Partial != 0) {
+    if (qk_head_dim > 256 || v_head_dim > 256) {
         TORCH_CHECK(!deterministic, "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
             stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk, dv,

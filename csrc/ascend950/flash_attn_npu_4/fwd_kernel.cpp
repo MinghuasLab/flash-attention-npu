@@ -340,13 +340,17 @@ class FAIKernel950 {
         int32_t fdFirstKvTileStart = -1;
         int32_t fdLastKvTileEnd = -1;
         if (flashDecodeFlag_ != 0U) {
-            fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
-            fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
-            fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
-            fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
-            taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
-            taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
-            taskStep = 1U;
+            if (coreIdx < faiTilingData->fdActiveCoreNum) {
+                fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
+                fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
+                fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
+                fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
+                taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
+                taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+                taskStep = 1U;
+            } else {
+                taskBegin = taskEnd;
+            }
         }
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
@@ -1058,12 +1062,7 @@ class FAIKernel950 {
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
-// concurrent streams running other sync kernels can deadlock on core allocation.
-__schedmode__(1) CATLASS_GLOBAL
-    void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
-                 GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR workspace,
-                 GM_ADDR tiling, GM_ADDR runtimeTiling, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+__aicore__ inline void RunFAInfer(const FAIKernelParams& params)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1124,19 +1123,14 @@ __schedmode__(1) CATLASS_GLOBAL
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
-    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
     Kernel faInfer;
     faInfer(params);
 }
 
+
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-__schedmode__(1) CATLASS_GLOBAL
-    void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
-                   GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
-                   GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtimeTiling, int64_t kvSeqlenAllocated,
-                   FwdStorageParams storage)
+__aicore__ inline void RunFAInferDn(const FAIKernelParams& params)
 {
     using ArchTag = Arch::Ascend950;
     using ElementQ = InDtype;
@@ -1190,8 +1184,52 @@ __schedmode__(1) CATLASS_GLOBAL
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;
-    FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,    seqUsedQ,
-                           seqUsedKv, o, lse, workspace, tiling,      runtimeTiling, kvSeqlenAllocated, storage};
     Kernel faInfer;
     faInfer(params);
+}
+
+
+// Use the existing compile-time tile implementations for both fixed and
+// device-selected schedule variants.
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool UseDn,
+          bool AdaptiveMask, bool AdaptiveDn>
+__schedmode__(1) CATLASS_GLOBAL
+    void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                 GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR workspace,
+                 GM_ADDR tiling, GM_ADDR runtimeTiling, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+{
+    if (!CheckForwardExecution(runtimeTiling)) {
+        return;
+    }
+    const FAIKernelParams params{q,         k, v,   mask,      blockTables, actualQseqlen, actualKvseqlen,
+                                 seqUsedQ, seqUsedKv, o, lse, workspace, tiling, runtimeTiling, kvSeqlenAllocated, storage};
+    if constexpr (AdaptiveMask || AdaptiveDn) {
+        const auto* execution = reinterpret_cast<__gm__ const FA4FwdExecution*>(runtimeTiling);
+        if constexpr (AdaptiveMask) {
+            if (execution->runtime.maskType == 2U) {
+                RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::MASK_SWA,
+                           cacheLayout, LseMode, HasSoftcap>(params);
+                return;
+            }
+            if (execution->runtime.maskType == 1U) {
+                RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::MASK_CAUSAL,
+                           cacheLayout, LseMode, HasSoftcap>(params);
+                return;
+            }
+        }
+        if (execution->useDn != 0) {
+            RunFAInferDn<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::NO_MASK,
+                         cacheLayout, LseMode, HasSoftcap>(params);
+        } else {
+            RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, MaskCategory::NO_MASK,
+                       cacheLayout, LseMode, HasSoftcap>(params);
+        }
+    } else if constexpr (UseDn) {
+        RunFAInferDn<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory,
+                     cacheLayout, LseMode, HasSoftcap>(params);
+    } else {
+        RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory,
+                   cacheLayout, LseMode, HasSoftcap>(params);
+    }
 }
