@@ -17,7 +17,7 @@ namespace flash_attn::mla::Kernel {
 using namespace AscendC;
 template <typename InputT, bool HasKvLengths, bool IsTnd, bool MixedKv = false, bool HasUsed = false,
           bool HasStrides = false, bool IsPaged = false, bool IsCausal = false, bool IsWindow = false,
-          bool IsPartial = false, bool AbsolutePartialOffsets = false>
+          bool IsPartial = false, bool AbsolutePartialOffsets = false, bool HasSoftcap = true>
 class MlaTaskRing {
     static_assert(IsSameType<InputT, half>::value || IsSameType<InputT, bfloat16_t>::value,
                   "MLA dense only supports FP16 and BF16");
@@ -36,7 +36,7 @@ class MlaTaskRing {
                                bool kvIsTnd = IsTnd && !MixedKv, GM_ADDR pageTable = nullptr,
                                const MlaPagedCacheLayout* pagedLayout = nullptr,
                                MlaWindowKernelParams windowParams = {}, const MlaSplitKvKernelParams* partial = nullptr,
-                               float softcap = 0.0f, const MlaTaskLengths* fragmentLengths = nullptr)
+                               float softcap = 0.0f, const MlaTaskLengths* fragmentLengths = nullptr, uint64_t mask = 0)
     {
         params = schedule;
         taskLengths = fragmentLengths;
@@ -85,7 +85,7 @@ class MlaTaskRing {
             }
         }
         InitBlocks(scale, qc, qr, kv, kr, output, lse, workspace, pipe, ratio, layouts, kvIsTnd, pageTable, pagedLayout,
-                   partial, softcap);
+                   partial, softcap, nullptr, mask);
         FlashAttention();
         FreeBlocks();
     }
@@ -98,7 +98,8 @@ class MlaTaskRing {
     RunAuto(const MlaAutoSplitBsndSchedule& schedule, const Reader& read, MlaWindowKernelParams windowParams,
             float scale, GM_ADDR qc, GM_ADDR qr, GM_ADDR kv, GM_ADDR kr, GM_ADDR output, GM_ADDR lse, GM_ADDR workspace,
             TPipe* pipe, GM_ADDR spans, uint32_t totalQuery, const MlaBsndInputLayouts& layouts, bool kvIsTnd,
-            float softcap, GM_ADDR pageTable = nullptr, const MlaPagedCacheLayout* pagedLayout = nullptr)
+            float softcap, GM_ADDR pageTable = nullptr, const MlaPagedCacheLayout* pagedLayout = nullptr,
+            uint64_t mask = 0, MlaPartialOutputAlias outputAlias = {})
     {
         static_assert(IsPartial && (HasUsed || IsPaged));
         params = schedule.used.tiling;
@@ -114,23 +115,25 @@ class MlaTaskRing {
         if (core >= schedule.usedCoreNum)
             return;
         InitBlocks(scale, qc, qr, kv, kr, output, lse, workspace, pipe, ratio, &layouts, kvIsTnd, pageTable,
-                   pagedLayout, nullptr, softcap, &schedule);
+                   pagedLayout, nullptr, softcap, &schedule, mask, outputAlias);
 
-        const uint32_t prefix = auto_split_detail::Base<IsPaged>(params.batch) + kMlaNativePartitionWords;
-        const uint32_t firstBatch = core ? schedule.bEnd[core - 1] : 0;
-        const uint64_t first = ReadMetadataWide(read, prefix + 2 * firstBatch) + (core ? schedule.mEnd[core - 1] : 0);
-        const uint64_t end = ReadMetadataWide(read, prefix + 2 * schedule.bEnd[core]) + schedule.mEnd[core] +
-                             (schedule.nEnd[core] ? 1 : 0);
-        const uint64_t last = Min(end, schedule.groups);
+        MlaNativeAutoCursor cursor;
+        cursor.Init<IsPaged>(read, schedule, core);
         RunInfo tasks[kTaskCount];
         uint64_t created = 0, executed = 0;
         uint32_t previousBatch = UINT32_MAX;
-        for (uint64_t group = first; group < last; ++group) {
-            MlaAutoSplitBsndTask fragment{};
-            if (!AutoSplitBsndTask<IsPaged>(read, schedule, window, group, 0, fragment, core) || fragment.kind == 2)
-                continue;
+        MlaAutoSplitBsndTask fragment{};
+        while (cursor.Next(read, schedule, window, fragment)) {
             if (fragment.batch != previousBatch) {
-                LoadTaskLengths(fragment.batch);
+                actualQueryLength = cursor.queryLength;
+                actualKvLength = cursor.kvLength;
+                if constexpr (IsPaged) {
+                    if constexpr (IsTnd)
+                        queryStart = cursor.queryStart;
+                } else {
+                    queryStart = cursor.queryStart;
+                    kvStart = cursor.kvStart;
+                }
                 previousBatch = fragment.batch;
             }
             sStart = fragment.s2Begin;
@@ -147,13 +150,15 @@ class MlaTaskRing {
         while (ShouldExecuteTask(tasks))
             ExecuteTask(executed++, tasks);
         FreeBlocks();
+        if (!cursor.valid)
+            AscendC::Trap();
     }
 
   private:
     using RunInfo = Block::RunInfo;
     static constexpr uint32_t kTaskCount = 3;
     Block::MlaCube<InputT, IsTnd, HasStrides, IsPaged> cube;
-    Block::MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial> vector;
+    Block::MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap> vector;
     MlaDenseKernelSchedule params;
     MlaWindowKernelParams window;
     GlobalTensor<uint32_t> lengths;
@@ -168,7 +173,8 @@ class MlaTaskRing {
                                       GM_ADDR lse, GM_ADDR workspace, TPipe* pipe, uint32_t ratio,
                                       const MlaBsndInputLayouts* layouts, bool kvIsTnd, GM_ADDR pageTable,
                                       const MlaPagedCacheLayout* pagedLayout, const MlaSplitKvKernelParams* partial,
-                                      float softcap, const MlaAutoSplitBsndSchedule* automatic = nullptr)
+                                      float softcap, const MlaAutoSplitBsndSchedule* automatic = nullptr,
+                                      uint64_t mask = 0, MlaPartialOutputAlias outputAlias = {})
     {
         const uint64_t r1 = params.mm1ResSize, r2 = params.mm2ResSize;
         uint64_t offset = 0;
@@ -192,13 +198,21 @@ class MlaTaskRing {
             cube.AllocEventID();
         }
         if ASCEND_IS_AIV {
-            Block::VectorParams vectorParams{cubeParams, ratio, scale, softcap,
-                                             IsCausal || (IsWindow && window.kind != 0)};
+            Block::VectorParams vectorParams{
+                cubeParams, ratio, scale, HasSoftcap ? softcap : 0.0f, IsCausal || (IsWindow && window.kind != 0),
+                mask};
             vector.Init(vectorParams, output, lse);
             if constexpr (IsPartial) {
                 if (automatic) {
-                    vector.InitPartial(workspace + automatic->outOffset, workspace + automatic->sumOffset,
-                                       workspace + automatic->maxOffset, 0);
+                    const auto partialOut =
+                        outputAlias.out
+                            ? (GM_ADDR)outputAlias.out + uint64_t(core) * outputAlias.rows * 512 * sizeof(float)
+                            : workspace + automatic->outOffset;
+                    const auto partialLse =
+                        outputAlias.lse ? (GM_ADDR)outputAlias.lse + uint64_t(core) * outputAlias.rows * sizeof(float)
+                                        : nullptr;
+                    vector.InitPartial(partialOut, workspace + automatic->sumOffset, workspace + automatic->maxOffset,
+                                       0, outputAlias.out != 0, partialLse);
                 } else {
                     vector.InitPartial(workspace + partial->outOffsetBytes, workspace + partial->sumOffsetBytes,
                                        workspace + partial->maxOffsetBytes,
@@ -285,7 +299,7 @@ class MlaTaskRing {
         uint64_t tail = total - start;
         uint64_t count = tail < single ? tail : single;
         WaitFlag<HardEvent::MTE3_V>(event);
-        if (start < total && count > 0) {
+        if (lse != nullptr && start < total && count > 0) {
             matmul::InitOutput<float>(lseGm[start], count,
                                       (HasKvLengths && !((IsCausal || IsWindow) && params.sk == 0)) ? -float(1.0 / 0.0)
                                                                                                     : float(1.0 / 0.0));

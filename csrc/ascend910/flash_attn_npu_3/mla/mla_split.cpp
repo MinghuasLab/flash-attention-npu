@@ -12,6 +12,7 @@
 #include "mla_split.h"
 #include "cann_split_core.h"
 #include <algorithm>
+#include <cmath>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -20,6 +21,228 @@
 // Source references are retained in mla_split.h.
 namespace flash_attn::mla {
 namespace {
+// B1/Q1 packed MLA has one S1G row. Replay the source's batch/block
+// assignment and strict candidate ordering without dynamic split vectors.
+bool SingleQuerySplit(const MlaGqaConfig& c, const MlaUsedLengths& lengths, const MlaWindow& window,
+                      const MlaGqaResources& resources, const MlaGqaOptions& options, MlaNativeSplitKvSchedule& output)
+{
+    if (c.shape.batch != 1 || c.shape.query.maxLength != 1 || c.valueDim != 512 || c.kvHeads != 1 || !c.splitKv ||
+        !resources.packed || options.smMargin || window.kind != MlaWindowKind::None || lengths.sequences.size() != 1 ||
+        (c.mBase != 128 && c.mBase != 256) || c.nBase > 512)
+        return false;
+    const auto& sequence = lengths.sequences[0];
+    const uint32_t rows = resources.headsPerGroup;
+    if (sequence.queryLength != 1 || !sequence.kvLength || sequence.kvLength > kMlaMaxKvLength || rows > c.mBase)
+        return false;
+    const uint32_t blocks = (uint64_t(sequence.kvLength) + c.nBase - 1) / c.nBase;
+    const uint32_t rowTail = rows % c.mBase, kvTail = sequence.kvLength % c.nBase;
+    const auto costs = detail::CalcCostTable(c.mBase, c.nBase, rowTail, kvTail);
+    const auto rowKind = rowTail ? detail::TAIL_BLOCK : detail::NORMAL_BLOCK;
+    const int64_t normalCost = costs[rowKind][detail::NORMAL_BLOCK];
+    const int64_t lastCost = kvTail ? costs[rowKind][detail::TAIL_BLOCK] : normalCost;
+    const int64_t totalCost = (blocks - 1) * normalCost + lastCost;
+    const uint32_t maximum = std::min(resources.platform.aicNum, blocks);
+    const uint32_t minimum = std::min(uint32_t(std::sqrt(static_cast<float>(blocks) + 0.25f) + 0.5f), maximum);
+    MlaNativeSplitKvSchedule best{};
+    best.maxCost = INT64_MAX;
+    for (uint32_t cores = minimum; cores <= maximum; ++cores) {
+        MlaNativeSplitKvSchedule candidate{};
+        uint32_t cursor = 0;
+        int64_t remaining = totalCost;
+        for (uint32_t core = 0; core < cores && cursor < blocks; ++core) {
+            if (candidate.maxCost > best.maxCost)
+                break;
+            const int64_t limit = remaining / (cores - core);
+            int64_t cost = 0;
+            uint32_t assigned = 0;
+            // AssignByBatch and AssignByRow see the same remaining row.
+            if (detail::IsWithinTolerance(limit, lastCost / detail::FA_TOLERANCE_RATIO, remaining)) {
+                cost = remaining;
+                cursor = blocks;
+            } else {
+                // Like AssignByBlock, curCost is fixed for this invocation.
+                const int64_t curCost = cursor == blocks - 1 ? lastCost : normalCost;
+                while (detail::IsWithinTolerance(limit, curCost / detail::FA_TOLERANCE_RATIO, cost + curCost)) {
+                    cost += curCost;
+                    ++cursor;
+                    ++assigned;
+                }
+                if (!assigned) {
+                    cost = curCost;
+                    ++cursor;
+                }
+            }
+            candidate.usedCoreNum = core + 1;
+            candidate.bN2End[core] = cursor == blocks ? 1 : 0;
+            candidate.s2End[core] = cursor == blocks ? 0 : cursor;
+            candidate.fd.s2SplitStartIdxOfCore[core] = core;
+            candidate.maxCost = std::max(candidate.maxCost, cost);
+            remaining -= cost;
+        }
+        // Preserve SplitCore's first strictly better candidate, including ties.
+        if (cursor == blocks && candidate.maxCost < best.maxCost)
+            best = candidate;
+    }
+    best.totalCost = totalCost;
+    best.totalMBlocks = 1;
+    best.totalS2Blocks = blocks;
+    auto& fd = best.fd;
+    fd.gS1BaseSizeOfFd = 8;
+    if (best.usedCoreNum > 1) {
+        const uint32_t parts = (rows + 7) / 8;
+        fd.numOfFdHead = 1;
+        fd.maxS2SplitNum = best.usedCoreNum;
+        fd.s2SplitNumOfFdHead[0] = best.usedCoreNum;
+        fd.gS1SplitNumOfFdHead[0] = parts;
+        fd.gS1LastPartSizeOfFdHead[0] = rows - 8 * (parts - 1);
+        // SplitFD's single-head, equal-cost row parts. Keep its double
+        // threshold and half-part tolerance in the original operation order.
+        uint32_t remainingLoad = best.usedCoreNum * parts;
+        const uint32_t maximumVectors = std::min(parts, 2 * best.usedCoreNum);
+        double limit = double(remainingLoad) / double(maximumVectors);
+        int64_t load = 0;
+        uint32_t vector = 0;
+        for (uint32_t part = 0; part < parts; ++part) {
+            const double space = limit - double(load);
+            if (load > 0 && best.usedCoreNum > space * detail::FD_TOLERANCE_RATIO) {
+                fd.gS1IdxEndOfFdHeadSplit[vector++] = part - 1;
+                remainingLoad -= uint32_t(load);
+                limit = double(remainingLoad) / double(maximumVectors - vector);
+                load = 0;
+            }
+            load += best.usedCoreNum;
+        }
+        fd.gS1IdxEndOfFdHeadSplit[vector] = parts - 1;
+        fd.usedVecNumOfFd = vector + 1;
+    }
+    output = best;
+    return true;
+}
+
+// Equal, nonempty Q1 batches each contain one S1G row and equally priced S2
+// blocks. Keep the source's assignment/candidate/FD order with fixed arrays.
+bool UniformSingleQuerySplit(const MlaGqaConfig& c, const MlaUsedLengths& lengths, const MlaWindow& window,
+                             const MlaGqaResources& resources, const MlaGqaOptions& options,
+                             MlaNativeSplitKvSchedule& output)
+{
+    if (c.shape.batch < 2 || c.shape.batch > 64 || c.shape.query.maxLength != 1 || c.valueDim != 512 ||
+        c.kvHeads != 1 || !c.splitKv || !resources.packed || options.smMargin || window.kind != MlaWindowKind::None ||
+        lengths.sequences.size() != uint64_t(c.shape.batch) || (c.mBase != 128 && c.mBase != 256) || c.nBase > 512 ||
+        resources.headsPerGroup > c.mBase)
+        return false;
+    const uint32_t kvLength = lengths.sequences[0].kvLength;
+    if (!kvLength || kvLength % c.nBase)
+        return false;
+    for (const auto& sequence : lengths.sequences)
+        if (sequence.queryLength != 1 || sequence.kvLength != kvLength)
+            return false;
+    const uint32_t batch = c.shape.batch, blocks = kvLength / c.nBase, rows = resources.headsPerGroup;
+    const uint32_t rowTail = rows % c.mBase;
+    const auto costs = detail::CalcCostTable(c.mBase, c.nBase, rowTail, 0);
+    const int64_t blockCost = costs[rowTail ? detail::TAIL_BLOCK : detail::NORMAL_BLOCK][detail::NORMAL_BLOCK];
+    const uint32_t totalBlocks = batch * blocks; // Bounded by the caller's complete geometry check.
+    const int64_t totalCost = int64_t(totalBlocks) * blockCost;
+    const uint32_t maximum = std::min(resources.platform.aicNum, totalBlocks);
+    const uint32_t minimum = std::min(uint32_t(std::sqrt(static_cast<float>(totalBlocks) + 0.25f) + 0.5f), maximum);
+    MlaNativeSplitKvSchedule best{};
+    best.maxCost = INT64_MAX;
+    for (uint32_t cores = minimum; cores <= maximum; ++cores) {
+        MlaNativeSplitKvSchedule candidate{};
+        uint32_t b = 0, n = 0, kvParts = 1;
+        int64_t remaining = totalCost;
+        for (uint32_t core = 0; core < cores && b < batch; ++core) {
+            if (candidate.maxCost > best.maxCost)
+                break;
+            candidate.fd.s2SplitStartIdxOfCore[core] = kvParts - 1;
+            const int64_t limit = remaining / (cores - core);
+            int64_t cost = 0;
+            uint32_t assigned = 0;
+            // AssignByBatch consumes this row's remaining load. AssignByRow
+            // sees the same one-row batch and cannot pass after this fails.
+            while (b < batch && detail::IsWithinTolerance(limit, blockCost / detail::FA_TOLERANCE_RATIO,
+                                                          cost + int64_t(blocks - n) * blockCost)) {
+                cost += int64_t(blocks - n) * blockCost;
+                assigned += blocks - n;
+                ++b;
+                n = 0;
+            }
+            if (b < batch) {
+                // AssignByBlock keeps the current block price for its loop.
+                while (detail::IsWithinTolerance(limit, blockCost / detail::FA_TOLERANCE_RATIO, cost + blockCost)) {
+                    cost += blockCost;
+                    ++n;
+                    ++assigned;
+                }
+                if (!assigned) {
+                    cost = blockCost;
+                    if (++n == blocks) {
+                        n = 0;
+                        ++b;
+                    }
+                }
+            }
+            candidate.bN2End[core] = b;
+            candidate.s2End[core] = n;
+            candidate.usedCoreNum = core + 1;
+            candidate.maxCost = std::max(candidate.maxCost, cost);
+            remaining -= cost;
+            // RecordFDInfo is delayed until the previous core's partial row
+            // has ended. One core may finish it and begin a different row.
+            if (core && kvParts > 1 && b != candidate.bN2End[core - 1]) {
+                auto& fd = candidate.fd;
+                const uint32_t head = fd.numOfFdHead++;
+                fd.bN2IdxOfFdHead[head] = candidate.bN2End[core - 1];
+                fd.s2SplitNumOfFdHead[head] = kvParts;
+                fd.gS1SplitNumOfFdHead[head] = (rows + 7) / 8;
+                fd.gS1LastPartSizeOfFdHead[head] = rows - 8 * (fd.gS1SplitNumOfFdHead[head] - 1);
+                fd.maxS2SplitNum = std::max(fd.maxS2SplitNum, kvParts);
+                kvParts = 1;
+            }
+            if (n)
+                ++kvParts;
+        }
+        if (b == batch && candidate.maxCost < best.maxCost)
+            best = candidate;
+    }
+    best.totalCost = totalCost;
+    best.totalMBlocks = batch;
+    best.totalS2Blocks = totalBlocks;
+    auto& fd = best.fd;
+    fd.gS1BaseSizeOfFd = 8;
+    if (fd.numOfFdHead) {
+        uint32_t remainingLoad = 0, totalParts = 0;
+        for (uint32_t head = 0; head < fd.numOfFdHead; ++head) {
+            remainingLoad += fd.s2SplitNumOfFdHead[head] * fd.gS1SplitNumOfFdHead[head];
+            totalParts += fd.gS1SplitNumOfFdHead[head];
+        }
+        const uint32_t maximumVectors = std::min(totalParts, 2 * best.usedCoreNum);
+        double limit = double(remainingLoad) / double(maximumVectors);
+        int64_t load = 0;
+        uint32_t vector = 0, previousHead = 0, previousPart = 0;
+        for (uint32_t head = 0; head < fd.numOfFdHead; ++head) {
+            const uint32_t splits = fd.s2SplitNumOfFdHead[head];
+            for (uint32_t part = 0; part < fd.gS1SplitNumOfFdHead[head]; ++part) {
+                const double space = limit - double(load);
+                if (load > 0 && splits > space * detail::FD_TOLERANCE_RATIO) {
+                    fd.gS1IdxEndOfFdHead[vector] = previousHead;
+                    fd.gS1IdxEndOfFdHeadSplit[vector++] = previousPart;
+                    remainingLoad -= uint32_t(load);
+                    limit = double(remainingLoad) / double(maximumVectors - vector);
+                    load = 0;
+                }
+                load += splits;
+                previousHead = head;
+                previousPart = part;
+            }
+        }
+        fd.gS1IdxEndOfFdHead[vector] = previousHead;
+        fd.gS1IdxEndOfFdHeadSplit[vector] = previousPart;
+        fd.usedVecNumOfFd = vector + 1;
+    }
+    output = best;
+    return true;
+}
+
 bool TensorLayout(MlaAccumulatorTensor& tensor)
 {
     uint64_t stride = 1, elements = 1;
@@ -38,6 +261,60 @@ bool TensorLayout(MlaAccumulatorTensor& tensor)
     tensor.elements = elements;
     tensor.bytes = elements * sizeof(float);
     return true;
+}
+
+void WholeMEndpoints(const detail::SplitContext& context, detail::SplitResult& split)
+{
+    const auto& base = context.baseInfo;
+    const auto& blocks = context.splitInfo.s1GBaseNum;
+    const auto& costs = context.costInfo.bN2CostOfEachBatch;
+    std::vector<uint64_t> groupPrefix(base.bSize + 1);
+    std::vector<int64_t> costPrefix(base.bSize + 1);
+    for (uint32_t b = 0; b < base.bSize; ++b) {
+        groupPrefix[b + 1] = groupPrefix[b] + uint64_t(blocks[b]) * base.n2Size;
+        costPrefix[b + 1] = costPrefix[b] + costs[b] * base.n2Size;
+    }
+    detail::SplitResult whole{uint32_t(split.bN2End.size()), split.vecCubeRatio};
+    uint64_t previous = 0;
+    int64_t previousCost = 0;
+    for (uint32_t i = 0; i < split.usedCoreNum; ++i) {
+        uint32_t bn = split.bN2End[i], m = split.gS1End[i] + (split.s2End[i] != 0);
+        if (i + 1 == split.usedCoreNum) {
+            bn = base.bSize * base.n2Size;
+            m = 0;
+        }
+        while (bn < base.bSize * base.n2Size && m >= blocks[bn / base.n2Size]) {
+            const uint32_t b = bn / base.n2Size;
+            if (!blocks[b])
+                bn = (b + 1) * base.n2Size;
+            else {
+                m -= blocks[b];
+                ++bn;
+            }
+        }
+        const uint32_t b = bn / base.n2Size, head = bn % base.n2Size;
+        const uint64_t end = groupPrefix[b] + (b < base.bSize ? uint64_t(head) * blocks[b] + m : 0);
+        if (end <= previous && groupPrefix.back())
+            continue;
+        int64_t cost = costPrefix[b];
+        if (b < base.bSize) {
+            cost += costs[b] * head;
+            detail::BatchCache batch{};
+            detail::CalcBatchCache(b, context, batch);
+            for (uint32_t row = 0; row < m; ++row) {
+                detail::S1GCache block{};
+                detail::CalcS1GCache(row, context, batch, block);
+                cost += block.s1GCost;
+            }
+        }
+        const uint32_t core = whole.usedCoreNum++;
+        whole.bN2End[core] = bn;
+        whole.gS1End[core] = m;
+        whole.maxCost = std::max(whole.maxCost, cost - previousCost);
+        previous = end;
+        previousCost = cost;
+    }
+    split = std::move(whole);
 }
 } // namespace
 
@@ -161,6 +438,13 @@ MlaScheduleStatus BuildGqaSchedule(const MlaGqaConfig& c, const MlaUsedLengths& 
                 return MlaScheduleStatus::FieldOverflow;
             tiles += count * base.n2Size;
         }
+        if (SingleQuerySplit(c, lengths, normalizedWindow, resources, options, native) ||
+            UniformSingleQuerySplit(c, lengths, normalizedWindow, resources, options, native)) {
+            output = native;
+            return MlaScheduleStatus::Success;
+        }
+        base.actualSeqS1Size.reserve(lengths.sequences.size());
+        base.actualSeqS2Size.reserve(lengths.sequences.size());
         uint64_t totalGroups = 0;
         for (const auto& s : lengths.sequences) {
             base.actualSeqS1Size.push_back(s.queryLength);
@@ -178,6 +462,10 @@ MlaScheduleStatus BuildGqaSchedule(const MlaGqaConfig& c, const MlaUsedLengths& 
             detail::CalcCostInfo(context);
             detail::SplitResult n{resources.platform.aicNum, 2};
             detail::SplitCore(resources.platform.aicNum, context, n);
+            // FA3's explicit one-split mode keeps complete M blocks. Preserve
+            // CANN's cost-balanced traversal instead of assigning equal indices.
+            if (!c.splitKv)
+                WholeMEndpoints(context, n);
             native.usedCoreNum = n.usedCoreNum;
             native.maxCost = n.maxCost;
             native.totalCost = context.costInfo.totalCost;

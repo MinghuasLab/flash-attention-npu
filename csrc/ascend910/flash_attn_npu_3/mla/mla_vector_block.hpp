@@ -14,21 +14,23 @@
 #pragma once
 #include "mla_cube_block.hpp"
 #include "mla_vector_ops_tile.hpp"
+#include "mla_mask_tile.hpp"
 #include "lib/matmul_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 namespace flash_attn::mla::Block {
 struct VectorParams : CubeParams {
     static constexpr uint32_t BUFFER_SIZE_BYTE_32K = 32768, BUFFER_SIZE_BYTE_8K = 8192;
     static constexpr uint32_t BUFFER_SIZE_BYTE_4K = 4096, BUFFER_SIZE_BYTE_1K = 1024;
-    static constexpr bool softmaxLseFlag = true;
     uint32_t subBlockNum;
     float scaleValue;
     float softcap = 0.0f;
     bool attenMaskFlag = false;
+    uint64_t mask = 0;
 };
 constexpr SoftmaxConfig FIA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC = {false, 0, 0, SoftmaxMode::SOFTMAX_OUTPUT_WITHOUT_BRC};
 
-template <typename InputT, bool IsTnd = false, bool IsCausal = false, bool IsWindow = false, bool IsPartial = false>
+template <typename InputT, bool IsTnd = false, bool IsCausal = false, bool IsWindow = false, bool IsPartial = false,
+          bool HasSoftcap = true>
 class MlaVector {
   public:
     using T = float;
@@ -42,16 +44,21 @@ class MlaVector {
     __aicore__ inline void Init(VectorParams params, GM_ADDR output, GM_ADDR lse)
     {
         constInfo = params;
+        writeLse = lse != nullptr;
         attentionOutGm.SetGlobalBuffer((__gm__ InputT*)output);
         softmaxLseGm.SetGlobalBuffer((__gm__ float*)lse);
     }
     // Source ComputeLogSumExpAndCopyToGm/Bmm2FDDataCopyOut, with a checked
     // slot supplied by the independent Kernel rather than CalcAccumOffset.
-    __aicore__ inline void InitPartial(GM_ADDR out, GM_ADDR sum, GM_ADDR maximum, uint64_t rowOffset)
+    __aicore__ inline void InitPartial(GM_ADDR out, GM_ADDR sum, GM_ADDR maximum, uint64_t rowOffset,
+                                       bool singleFragmentOutput = false, GM_ADDR publicLse = nullptr)
     {
+        partialOutputIsSingleFragment = singleFragmentOutput;
+        publishPartialLse = publicLse != nullptr;
         partialOut.SetGlobalBuffer((__gm__ float*)out + rowOffset * 512);
         partialSum.SetGlobalBuffer((__gm__ float*)sum + rowOffset * 8);
         partialMax.SetGlobalBuffer((__gm__ float*)maximum + rowOffset * 8);
+        publicPartialLse.SetGlobalBuffer((__gm__ float*)publicLse);
     }
     __aicore__ inline void CopyPartialStats(const RunInfo& info, const MSplitInfo& split);
     __aicore__ inline void CopyPartialOut(const RunInfo& info, LocalTensor<T>& out, uint32_t row, uint32_t count);
@@ -95,7 +102,10 @@ class MlaVector {
     uint32_t pingpongFlag = 0;
     GlobalTensor<float> mm1ResGm, mm2ResGm, vec2ResGm, softmaxLseGm;
     GlobalTensor<InputT> vec1ResGm, attentionOutGm;
-    GlobalTensor<float> partialOut, partialSum, partialMax;
+    GlobalTensor<float> partialOut, partialSum, partialMax, publicPartialLse;
+    bool partialOutputIsSingleFragment = false;
+    bool publishPartialLse = false;
+    bool writeLse = false;
     GlobalTensor<int32_t> mm2ResInt32Gm;
     static constexpr uint64_t SYNC_INPUT_BUF1_FLAG = 2, SYNC_INPUT_BUF1_PONG_FLAG = 3;
     static constexpr uint64_t SYNC_INPUT_BUF2_FLAG = 4, SYNC_INPUT_BUF2_PONG_FLAG = 5;
@@ -114,8 +124,8 @@ class MlaVector {
     LocalTensor<T> nValueUb, cofValueUb, aMlaSumUb, softmaxMaxUb, softmaxExpUb, softmaxSumUb;
     LocalTensor<T> softmaxMaxDefaultUb, softmaxSumDefaultUb;
 };
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::InitBuffers(TPipe* pipe)
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::InitBuffers(TPipe* pipe)
 {
     // queue
     pipe->InitBuffer(inputBuff1, VectorParams::BUFFER_SIZE_BYTE_32K * 2); // 2:pingpong
@@ -158,8 +168,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     Duplicate(softmaxSumDefaultUb, FLOAT_ZERO, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::InitVec1GlobalTensor(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::InitVec1GlobalTensor(
     GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm, GlobalTensor<int32_t> mm2ResInt32Gm)
 {
     this->mm1ResGm = mm1ResGm;
@@ -167,17 +177,16 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     this->mm2ResInt32Gm = mm2ResInt32Gm;
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::InitVec2GlobalTensor(GlobalTensor<UPDATE_T> vec2ResGm,
-                                                                              GlobalTensor<MM2_OUT_T> mm2ResGm)
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::InitVec2GlobalTensor(
+    GlobalTensor<UPDATE_T> vec2ResGm, GlobalTensor<MM2_OUT_T> mm2ResGm)
 {
     this->vec2ResGm = vec2ResGm;
     this->mm2ResGm = mm2ResGm;
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::AllocEventID()
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::AllocEventID()
 {
     SetFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG);
     SetFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_PONG_FLAG);
@@ -187,8 +196,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::FreeEventID()
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::FreeEventID()
 {
     CrossCoreWaitFlag(constInfo.syncC2V1);
     WaitFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG);
@@ -199,8 +208,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::SoftmaxFlashV2Compute(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::SoftmaxFlashV2Compute(
     const RunInfo& info, const MSplitInfo& mSplitInfo, LocalTensor<T>& mmResUb, LocalTensor<uint8_t>& softmaxTmpUb,
     uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
 {
@@ -226,8 +235,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
         softmaxExpUb[softmaxOutOffset], inSumTensor, inMaxTensor, softmaxTmpUb, newTiling, srcShape);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::AmlaVecCompute(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::AmlaVecCompute(
     const RunInfo& info, const MSplitInfo& mSplitInfo, LocalTensor<T>& mmResUb, LocalTensor<uint8_t>& softmaxTmpUb,
     uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
 {
@@ -304,8 +313,12 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     // Zero scale gives exact uniform weights. The source epsilon would
     // perturb their sum across KV blocks and flip output midpoint rounding.
     // Keep the original aMLA correction for nonuniform scores and cap=0.
-    const T epsilon = constInfo.softcap != 0.0f && constInfo.scaleValue == 0.0f ? FLOAT_ZERO : (T)0.000001;
-    Adds(epsUb, epsUb, epsilon, calCount);
+    if constexpr (HasSoftcap) {
+        const T epsilon = constInfo.softcap != 0.0f && constInfo.scaleValue == 0.0f ? FLOAT_ZERO : (T)0.000001;
+        Adds(epsUb, epsUb, epsilon, calCount);
+    } else {
+        Adds(epsUb, epsUb, (T)(0.000001), calCount);
+    }
     AscendC::PipeBarrier<PIPE_V>();
     Add(nUpdateTmp, nUpdateTmp, epsUb, calCount);
     AscendC::PipeBarrier<PIPE_V>();
@@ -323,8 +336,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::DealBmm1ResBaseBlock(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::DealBmm1ResBaseBlock(
     const RunInfo& info, const MSplitInfo& mSplitInfo, uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount,
     uint32_t actualColumnCount)
 {
@@ -340,19 +353,19 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     WaitFlag<AscendC::HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
 
     Muls(mmResUb, mmResUb, constInfo.scaleValue, dealRowCount * columnCount);
-    Tile::Softcap(mmResUb, tmpBuff1.Get<uint8_t>(), computeSize, constInfo.softcap);
+    if constexpr (HasSoftcap)
+        Tile::Softcap(mmResUb, tmpBuff1.Get<uint8_t>(), computeSize, constInfo.softcap);
 
     AscendC::PipeBarrier<PIPE_V>();
     if constexpr (IsCausal || IsWindow) {
         if (constInfo.attenMaskFlag) {
             const uint32_t row = info.gS1Idx + mSplitInfo.nBufferStartM + mSplitInfo.vecStartM + startRow;
-            if constexpr (IsWindow) {
-                Tile::WindowMask(mmResUb, row, dealRowCount, constInfo.gSize, info.preToken, info.nextToken,
-                                 info.s2BatchOffset, columnCount, actualColumnCount);
-            } else {
-                Tile::CausalMask(mmResUb, row, dealRowCount, constInfo.gSize, info.nextToken, info.s2BatchOffset,
-                                 columnCount, actualColumnCount);
-            }
+            const int64_t pre = IsWindow ? info.preToken : INT32_MAX;
+            if (Tile::NeedsWindowMask(row, dealRowCount, constInfo.gSize, pre, info.nextToken, info.s2BatchOffset,
+                                      actualColumnCount))
+                Tile::WindowMask(mmResUb, inputBuff2.Get<uint8_t>(), tmpBuff1.Get<uint8_t>(), constInfo.mask, row,
+                                 dealRowCount, constInfo.gSize, pre, info.nextToken, info.s2BatchOffset, columnCount,
+                                 actualColumnCount);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
@@ -369,32 +382,35 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
 
     Cast(tmpMMResCastTensor, mmResUb, AscendC::RoundMode::CAST_ROUND, computeSize);
-    if (constInfo.softcap != 0.0f) {
-        // Normalize the actual input-dtype P consumed by the Cube. Using its
-        // pre-cast sum amplifies weight-rounding bias for nearly constant V.
-        AscendC::PipeBarrier<PIPE_V>();
-        Cast(mmResUb, tmpMMResCastTensor, AscendC::RoundMode::CAST_NONE, computeSize);
-        AscendC::PipeBarrier<PIPE_V>();
-        const uint32_t base = mSplitInfo.nBufferStartM / 2 + startRow;
-        const uint32_t current = (info.loop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + base;
-        LocalTensor<T> sum = aMlaSumUb[current];
-        Tile::RowSum(sum, mmResUb, dealRowCount, columnCount, actualColumnCount);
-        if (!info.isFirstSInnerLoop) {
-            const uint32_t previous =
-                ((info.loop - 1) % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + base;
-            LocalTensor<T> scaledSum = tmpBuff1.Get<T>();
-            LocalTensor<uint8_t> nonzero = attenMaskTmpBuff.Get<uint8_t>();
+    if constexpr (HasSoftcap) {
+        if (constInfo.softcap != 0.0f) {
+            // Normalize the actual input-dtype P consumed by the Cube. Using its
+            // pre-cast sum amplifies weight-rounding bias for nearly constant V.
             AscendC::PipeBarrier<PIPE_V>();
-            CompareScalar(nonzero, aMlaSumUb[previous], FLOAT_ZERO, CMPMODE::NE, (dealRowCount + 63) / 64 * 64);
+            Cast(mmResUb, tmpMMResCastTensor, AscendC::RoundMode::CAST_NONE, computeSize);
             AscendC::PipeBarrier<PIPE_V>();
-            Add(scaledSum.template ReinterpretCast<int32_t>(), aMlaSumUb[previous].template ReinterpretCast<int32_t>(),
-                outputBuff2.Get<int32_t>()[startRow], dealRowCount);
+            const uint32_t base = mSplitInfo.nBufferStartM / 2 + startRow;
+            const uint32_t current = (info.loop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + base;
+            LocalTensor<T> sum = aMlaSumUb[current];
+            Tile::RowSum(sum, mmResUb, dealRowCount, columnCount, actualColumnCount);
+            if (!info.isFirstSInnerLoop) {
+                const uint32_t previous =
+                    ((info.loop - 1) % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + base;
+                LocalTensor<T> scaledSum = tmpBuff1.Get<T>();
+                LocalTensor<uint8_t> nonzero = attenMaskTmpBuff.Get<uint8_t>();
+                AscendC::PipeBarrier<PIPE_V>();
+                CompareScalar(nonzero, aMlaSumUb[previous], FLOAT_ZERO, CMPMODE::NE, (dealRowCount + 63) / 64 * 64);
+                AscendC::PipeBarrier<PIPE_V>();
+                Add(scaledSum.template ReinterpretCast<int32_t>(),
+                    aMlaSumUb[previous].template ReinterpretCast<int32_t>(), outputBuff2.Get<int32_t>()[startRow],
+                    dealRowCount);
+                AscendC::PipeBarrier<PIPE_V>();
+                Select(scaledSum, nonzero, scaledSum, FLOAT_ZERO, SELMODE::VSEL_TENSOR_SCALAR_MODE, dealRowCount);
+                AscendC::PipeBarrier<PIPE_V>();
+                Add(sum, sum, scaledSum, dealRowCount);
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            Select(scaledSum, nonzero, scaledSum, FLOAT_ZERO, SELMODE::VSEL_TENSOR_SCALAR_MODE, dealRowCount);
-            AscendC::PipeBarrier<PIPE_V>();
-            Add(sum, sum, scaledSum, dealRowCount);
         }
-        AscendC::PipeBarrier<PIPE_V>();
     }
     SetFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG + pingpongFlag);
 
@@ -404,10 +420,10 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
 __aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessAmlaNupdate(const RunInfo& info,
-                                                                            const MSplitInfo& mSplitInfo)
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessAmlaNupdate(const RunInfo& info,
+                                                                                        const MSplitInfo& mSplitInfo)
 {
     if (mSplitInfo.vecDealM == 0) {
         return;
@@ -470,10 +486,10 @@ MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessAmlaNupdate(cons
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
 __aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec1SingleBuf(const RunInfo& info,
-                                                                              const MSplitInfo& mSplitInfo)
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessVec1SingleBuf(const RunInfo& info,
+                                                                                          const MSplitInfo& mSplitInfo)
 {
     if (mSplitInfo.vecDealM == 0) {
         return;
@@ -502,8 +518,9 @@ MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec1SingleBuf(co
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec1L(const RunInfo& info)
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessVec1L(const RunInfo& info)
 {
     uint32_t nBufferLoopTimes = (info.actMBaseSize + constInfo.nBufferMBaseSize - 1) / constInfo.nBufferMBaseSize;
     uint32_t nBufferTail = info.actMBaseSize - (nBufferLoopTimes - 1) * constInfo.nBufferMBaseSize;
@@ -540,7 +557,7 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
             LocalTensor maxTensor = softmaxMaxUb[outIdx * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(COMPUTE_T)];
             if (IsPartial && info.isFd) {
                 CopyPartialStats(info, mSplitInfo);
-            } else if (constInfo.softmaxLseFlag) {
+            } else if (writeLse) {
                 if (mSplitInfo.vecDealM == 0) {
                     continue;
                 }
@@ -587,10 +604,10 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
 __aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec2SingleBuf(const RunInfo& info,
-                                                                              const MSplitInfo& mSplitInfo)
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessVec2SingleBuf(const RunInfo& info,
+                                                                                          const MSplitInfo& mSplitInfo)
 {
     if (!info.isLastS2Loop) {
         return;
@@ -602,8 +619,9 @@ MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec2SingleBuf(co
     ProcessVec2Inner(info, mSplitInfo, 0, mSplitInfo.vecDealM);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec2L(const RunInfo& info)
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessVec2L(const RunInfo& info)
 {
     uint32_t nBufferLoopTimes = (info.actMBaseSize + constInfo.nBufferMBaseSize - 1) / constInfo.nBufferMBaseSize;
     uint32_t nBufferTail = info.actMBaseSize - (nBufferLoopTimes - 1) * constInfo.nBufferMBaseSize;
@@ -627,8 +645,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::ProcessVec2Inner(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::ProcessVec2Inner(
     const RunInfo& info, const MSplitInfo& mSplitInfo, uint32_t mStartRow, uint32_t mDealSize)
 {
     uint32_t mSplitSize = BASE_BLOCK_MAX_ELEMENT_NUM / headDimAlign;
@@ -647,8 +665,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::Bmm2CastAndCopyOut(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::Bmm2CastAndCopyOut(
     const RunInfo& info, const MSplitInfo& mSplitInfo, LocalTensor<T>& bmm2ResUb, uint32_t wsMStart, uint32_t startRow,
     uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
 {
@@ -665,10 +683,14 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
     if constexpr (IsSameType<OUT_T, bfloat16_t>::value) { // bf16 采取四舍六入五成双模式
         Cast(tmpBmm2ResCastTensor, bmm2ResUb, AscendC::RoundMode::CAST_RINT, dealRowCount * columnCount);
-    } else if (constInfo.softcap != 0.0f) {
+    } else if constexpr (HasSoftcap) {
         // Softcap has no source oracle. Match the mathematical output's
         // ties-to-even cast; retain the pinned source's rounding when off.
-        Cast(tmpBmm2ResCastTensor, bmm2ResUb, AscendC::RoundMode::CAST_RINT, dealRowCount * columnCount);
+        if (constInfo.softcap != 0.0f) {
+            Cast(tmpBmm2ResCastTensor, bmm2ResUb, AscendC::RoundMode::CAST_RINT, dealRowCount * columnCount);
+        } else {
+            Cast(tmpBmm2ResCastTensor, bmm2ResUb, AscendC::RoundMode::CAST_ROUND, dealRowCount * columnCount);
+        }
     } else {
         Cast(tmpBmm2ResCastTensor, bmm2ResUb, AscendC::RoundMode::CAST_ROUND, dealRowCount * columnCount);
     }
@@ -679,8 +701,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::DealBmm2ResBaseBlock(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::DealBmm2ResBaseBlock(
     const RunInfo& info, const MSplitInfo& mSplitInfo, uint32_t startRow, uint32_t dealRowCount, uint32_t columnCount,
     uint32_t actualColumnCount)
 {
@@ -726,8 +748,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::Bmm2DataCopyOutTrans(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::Bmm2DataCopyOutTrans(
     const RunInfo& info, LocalTensor<OUT_T>& attenOutUb, uint32_t wsMStart, uint32_t dealRowCount, uint32_t columnCount,
     uint32_t actualColumnCount)
 {
@@ -763,8 +785,8 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::CopySoftmaxLseToGmByLayout(
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::CopySoftmaxLseToGmByLayout(
     const RunInfo& info, LocalTensor<T>& lseSrc, uint32_t mOffset, const MSplitInfo& mSplitInfo)
 {
     if (mSplitInfo.vecDealM == 0) {
@@ -811,9 +833,10 @@ __aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::
     }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
 __aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::CopyPartialStats(const RunInfo& info, const MSplitInfo& split)
+MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::CopyPartialStats(const RunInfo& info,
+                                                                                      const MSplitInfo& split)
 {
     if (split.vecDealM == 0) {
         return;
@@ -834,20 +857,35 @@ MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::CopyPartialStats(const 
     WaitFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
     DataCopy(partialMax[offset], tmp, split.vecDealM * 8);
     SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    if (publishPartialLse) {
+        // P and nUpdate readiness have already been signaled by Vec1. This
+        // single-query specialization publishes each compact head statistic
+        // once, instead of recomputing all eight broadcasts in FlashDecode.
+        // The existing output buffer's final DMA is drained by FreeEventID.
+        WaitFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        Log(tmp, softmaxSumUb[base], split.vecDealM);
+        PipeBarrier<PIPE_V>();
+        Add(tmp, tmp, softmaxMaxUb[base], split.vecDealM);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        WaitFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        const uint32_t row = split.nBufferStartM + split.vecStartM;
+        DataCopyPad(publicPartialLse[row], tmp, DataCopyExtParams{1, split.vecDealM * uint32_t(sizeof(T)), 0, 0, 0});
+        SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    }
 }
 
-template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial>
-__aicore__ inline void
-MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial>::CopyPartialOut(const RunInfo& info, LocalTensor<T>& out,
-                                                                        uint32_t row, uint32_t count)
+template <typename InputT, bool IsTnd, bool IsCausal, bool IsWindow, bool IsPartial, bool HasSoftcap>
+__aicore__ inline void MlaVector<InputT, IsTnd, IsCausal, IsWindow, IsPartial, HasSoftcap>::CopyPartialOut(
+    const RunInfo& info, LocalTensor<T>& out, uint32_t row, uint32_t count)
 {
     LocalTensor<T> tmp = outputBuff1.Get<T>();
     WaitFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
     DataCopy(tmp, out, count * 512);
     SetFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
     WaitFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-    DataCopyPad(partialOut[(info.partialRow + row) * 512], tmp,
-                DataCopyExtParams{uint16_t(count), 512 * sizeof(T), 0, 0, 0});
+    const uint64_t outRow = (partialOutputIsSingleFragment ? 0 : info.partialRow) + row;
+    DataCopyPad(partialOut[outRow * 512], tmp, DataCopyExtParams{uint16_t(count), 512 * sizeof(T), 0, 0, 0});
     SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
 }
 

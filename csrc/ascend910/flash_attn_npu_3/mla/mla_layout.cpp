@@ -4,13 +4,11 @@
  */
 
 #include "mla_layout.h"
-#include <algorithm>
 namespace flash_attn::mla {
 
-namespace {
-template <uint64_t elementBytes>
-MlaLayoutStatus BuildLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output)
+MlaLayoutStatus BuildBsndTensorLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output)
 {
+    constexpr uint64_t elementBytes = 2;
     if (view.sizes[0] < 0 || view.sizes[1] < 0 || view.sizes[2] <= 0 ||
         (view.sizes[3] != 64 && view.sizes[3] != 128 && view.sizes[3] != 192 && view.sizes[3] != 512)) {
         return MlaLayoutStatus::InvalidShape;
@@ -48,17 +46,6 @@ MlaLayoutStatus BuildLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& 
     }
     output = layout;
     return MlaLayoutStatus::Success;
-}
-} // namespace
-
-MlaLayoutStatus BuildBsndTensorLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output)
-{
-    return BuildLayout<2>(view, output);
-}
-
-MlaLayoutStatus BuildInt8BsndTensorLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output)
-{
-    return BuildLayout<1>(view, output);
 }
 
 MlaLayoutStatus BuildTndTensorLayout(const MlaTndTensorView& view, MlaTndTensorLayout& output)
@@ -126,14 +113,9 @@ MlaLayoutStatus BuildPageTableLayout(const MlaPageTableView& table, MlaPagedCach
 
 } // namespace
 
-namespace {
-template <bool Int8>
-MlaLayoutStatus BuildCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k, const MlaBsndTensorView& v,
-                                 MlaPagedCacheLayout& output, bool prefill)
+MlaLayoutStatus BuildPagedCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k,
+                                      const MlaBsndTensorView& v, MlaPagedCacheLayout& output, bool prefill)
 {
-    if (Int8 && (prefill || k.sizes[1] != 128)) {
-        return MlaLayoutStatus::InvalidShape;
-    }
     if (k.sizes[0] < 0 || uint64_t(k.sizes[0]) > uint64_t(INT32_MAX) + 1 || k.sizes[1] < 16 || k.sizes[1] > 1024 ||
         k.sizes[1] % 16 != 0 || (prefill ? k.sizes[2] <= 0 : k.sizes[2] != 1) || k.sizes[3] != (prefill ? 192 : 64) ||
         v.sizes[0] != k.sizes[0] || v.sizes[1] != k.sizes[1] || v.sizes[2] != k.sizes[2] ||
@@ -155,25 +137,12 @@ MlaLayoutStatus BuildCacheLayout(const MlaPageTableView& table, const MlaBsndTen
     if (status != MlaLayoutStatus::Success) {
         return status;
     }
-    status = Int8 ? BuildInt8BsndTensorLayout(v, layout.v) : BuildBsndTensorLayout(v, layout.v);
+    status = BuildBsndTensorLayout(v, layout.v);
     if (status != MlaLayoutStatus::Success) {
         return status;
     }
     output = layout;
     return MlaLayoutStatus::Success;
-}
-} // namespace
-
-MlaLayoutStatus BuildPagedCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k,
-                                      const MlaBsndTensorView& v, MlaPagedCacheLayout& output, bool prefill)
-{
-    return BuildCacheLayout<false>(table, k, v, output, prefill);
-}
-
-MlaLayoutStatus BuildInt8PagedCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k,
-                                          const MlaBsndTensorView& v, MlaPagedCacheLayout& output)
-{
-    return BuildCacheLayout<true>(table, k, v, output, false);
 }
 
 } // namespace flash_attn::mla

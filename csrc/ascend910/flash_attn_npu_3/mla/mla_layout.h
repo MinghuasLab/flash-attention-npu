@@ -54,10 +54,6 @@ enum class MlaLayoutStatus {
 // Failure leaves output unchanged.
 MlaLayoutStatus BuildBsndTensorLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output);
 
-// INT8 content uses the same element-stride contract with one-byte storage.
-// Keep the existing two-byte entry and ABI for all accepted nonquant paths.
-MlaLayoutStatus BuildInt8BsndTensorLayout(const MlaBsndTensorView& view, MlaBsndTensorLayout& output);
-
 } // namespace flash_attn::mla
 
 // FA3 input-view adapter for compressed and prefill MLA (FP16/BF16).
@@ -123,10 +119,6 @@ struct MlaPagedCacheLayout {
 // device and sequence geometry. Failure leaves output unchanged.
 MlaLayoutStatus BuildPagedCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k,
                                       const MlaBsndTensorView& v, MlaPagedCacheLayout& output, bool prefill = false);
-
-// BF16 RoPE K and INT8 shared content KV, page=128 and Hkv=1 only.
-MlaLayoutStatus BuildInt8PagedCacheLayout(const MlaPageTableView& table, const MlaBsndTensorView& k,
-                                          const MlaBsndTensorView& v, MlaPagedCacheLayout& output);
 
 // One page-contained segment resolved by the device Copy tile.
 struct MlaPagedCopySegment {

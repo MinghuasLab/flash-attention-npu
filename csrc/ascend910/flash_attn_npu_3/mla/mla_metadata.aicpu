@@ -54,22 +54,20 @@ __global__ __aicpu__ uint32_t ComputeMlaMetadata(void* args)
     if (!args)
         return 1;
     const auto& a = *static_cast<const MlaRecordArgs*>(args);
-    if (a.context.dtype == uint32_t(MlaMetadataDtype::Int8)) {
-        const bool ok = PrepareInt8Metadata(a);
-        AscendC::DataStoreBarrier();
-        return ok ? 0 : 1;
-    }
-    const bool ok = !a.generate || BuildNonquantMetadata(a);
+    bool ok;
     if (a.checked) {
         MlaCheckedAutoSplitSchedule checked;
+        bool generatedReady = false;
+        ok = !a.generate || BuildMlaMetadata(a, &checked.schedule, generatedReady);
         MlaLayout layout{};
         if (MlaRecordLayout(a.context, layout))
-            checked.blockDim = layout.cores;
+            checked.blockDim = MlaStaticLaunchCores(a.context);
         checked.dtype = a.context.dtype;
         if (ok)
-            checked.status = CheckRecord(a, checked.schedule);
+            checked.status = generatedReady ? MlaMetadataReadStatus::Success : CheckRecord(a, checked.schedule);
         std::memcpy(reinterpret_cast<void*>(a.checked), &checked, sizeof(checked));
-    }
+    } else
+        ok = !a.generate || BuildMlaMetadata(a);
     AscendC::DataStoreBarrier();
     return ok ? 0 : 1;
 }

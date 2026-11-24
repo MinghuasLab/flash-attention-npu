@@ -6,8 +6,8 @@
 // Derived from CANN ops-transformer ca18aee610729ca5270a44e2d84c751bc687fbf0,
 // attention/common/op_host/split_core.cpp.
 // Changes: private namespace/include guard, removed framework logging, and
-// declaration-order initialization and reuse of prepared split contexts.
-// Scheduling formulas and traversal are unchanged; adapters expose the supported branches.
+// declaration-order initialization, reuse of prepared split contexts, and
+// nonempty FD vector partitioning. Adapters expose the supported branches.
 
 /*!
  * \file split_core.cpp
@@ -646,7 +646,7 @@ void SplitFD(SplitResult& result)
         for (uint32_t gS1SplitIdx = 0; gS1SplitIdx < result.fdRes.gS1SplitNumOfFdHead[i]; gS1SplitIdx++) {
             double remainSpace = loadThrOfVector - static_cast<double>(loadOfCurVector); // 计算当前vector剩余负载空间
             // 判断是否放在当前vector的标准是剩余空间是否能容纳一半当前归约块
-            if (fDKVSplitNum > remainSpace * FD_TOLERANCE_RATIO) {
+            if (loadOfCurVector > 0 && fDKVSplitNum > remainSpace * FD_TOLERANCE_RATIO) {
                 result.fdRes.gS1IdxEndOfFdHead[curCoreIndex] = preTmpFDIndexEndOfFdHead;
                 result.fdRes.gS1IdxEndOfFdHeadSplit[curCoreIndex] = preTmpFDIndexEndOfFdHeadSplit;
                 curCoreIndex += 1U;

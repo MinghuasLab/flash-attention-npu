@@ -63,6 +63,7 @@ struct MlaGqaConfig {
     MlaUsedShape shape;
     int64_t kvHeads, valueDim, mBase, nBase;
     int64_t pageSize = 0; // PA uses logical rectangular KV spans; page lookup remains separate.
+    bool splitKv = true;
 };
 
 // Lengths are parsed once by the common metadata producer. Packed and

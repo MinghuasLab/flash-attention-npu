@@ -23,10 +23,10 @@ __aicore__ inline bool LoadMla(const MlaLaunchArgs& a, MlaReader& read, MlaLayou
     const auto& t = s.used.tiling;
     l.m = t.mBaseSize;
     l.n = t.s2BaseSize;
-    l.cores = t.blockDim;
+    l.cores = AscendC::GetBlockNum();
     l.g = c.packed ? c.heads / c.kvHeads : 1;
-    l.headGroups = c.heads / l.g;
-    l.capacity = c.splits ? c.splits : l.cores;
+    l.headGroups = c.packed ? c.kvHeads : c.heads;
+    l.capacity = c.splits ? c.splits : t.blockDim;
     l.groups = s.groups;
     l.outOffset = s.outOffset;
     l.sumOffset = s.sumOffset;
@@ -52,13 +52,16 @@ __aicore__ inline void InitializeMla(uint64_t address, uint64_t count, T value)
     }
 }
 template <typename DType>
-__aicore__ inline void InitializeMlaOutputs(const MlaLaunchArgs& a)
+__aicore__ inline void InitializeMlaOutputs(const MlaLaunchArgs& a, bool initializeOutput = true,
+                                           bool initializeLse = true)
 {
     if ASCEND_IS_AIV {
         const auto& c = a.context;
         const uint64_t rows = (MlaTnd(c) ? uint64_t(c.totalQ) : uint64_t(c.batch) * c.sq) * c.heads;
-        InitializeMla<DType>(a.out, rows * c.valueDim, DType(0));
-        InitializeMla<float>(a.lse, rows, !c.pageSize && MlaEmptyKv(c) ? float(1.0 / 0.0) : -float(1.0 / 0.0));
+        if (initializeOutput)
+            InitializeMla<DType>(a.out, rows * c.valueDim, DType(0));
+        if (initializeLse)
+            InitializeMla<float>(a.lse, rows, !c.pageSize && MlaEmptyKv(c) ? float(1.0 / 0.0) : -float(1.0 / 0.0));
         // FA3 leaves partial O undefined wherever partial LSE is -inf.
         if (c.splits != 1)
             InitializeMla<float>(a.accumLse, rows * (c.splits ? c.splits : 26), -float(1.0 / 0.0));

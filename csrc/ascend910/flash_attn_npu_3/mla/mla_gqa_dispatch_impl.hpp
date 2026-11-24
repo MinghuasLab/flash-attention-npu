@@ -14,7 +14,7 @@
 #include "mla_prefill_kernel.hpp"
 #include "mla_split_kv_merge_block.hpp"
 namespace flash_attn::mla {
-template <typename DType, bool IsTnd, bool Paged>
+template <typename DType, bool IsTnd, bool Paged, bool HasSoftcap = true>
 __aicore__ inline void GqaCompressed(const MlaLaunchArgs& a, const MlaLayout& l, const MlaAutoSplitBsndTask& t,
                                      const MlaReader& read, uint32_t core, uint64_t row)
 {
@@ -41,10 +41,10 @@ __aicore__ inline void GqaCompressed(const MlaLaunchArgs& a, const MlaLayout& l,
     MlaTaskLengths lengths{read(32 + 8 * b), read(32 + 8 * b + 6), read(32 + 8 * b + 7),
                            ReadMetadataWide(read, 32 + 8 * b + 2)};
     AscendC::TPipe pipe;
-    Kernel::MlaGqaPartial<DType, IsTnd, Paged> op;
+    Kernel::MlaGqaPartial<DType, IsTnd, Paged, HasSoftcap> op;
     op.RunFragment(schedule, p, lengths, a.scale, (GM_ADDR)a.qv + uint64_t(head) * a.inputs.qv.headStride * 2,
                    (GM_ADDR)a.q + uint64_t(head) * a.inputs.q.headStride * 2, (GM_ADDR)a.v, (GM_ADDR)a.k,
-                   (GM_ADDR)a.workspace, &pipe, a.inputs, c.layout == 1, a.cache, a.softcap);
+                   (GM_ADDR)a.workspace, &pipe, a.inputs, c.layout == 1, a.cache, a.softcap, a.mask);
 }
 template <typename DType, bool Brc, bool Paged>
 __aicore__ inline void GqaPrefill(const MlaLaunchArgs& a, const MlaLayout& l, const MlaAutoSplitBsndTask& t,
@@ -61,7 +61,8 @@ __aicore__ inline void GqaPrefill(const MlaLaunchArgs& a, const MlaLayout& l, co
     const uint64_t vStart = c.layout == 1 ? uint64_t(read(32 + 8 * b + 2)) * in.v.rowStride
                             : Paged       ? 0
                                           : uint64_t(b) * in.v.batchStride;
-    MlaPrefillParams p{1, c.sq, c.sk, l.g, 1, l.m, l.n, l.cores, a.scale, c.window, in.q, in.k, in.v, a.softcap};
+    MlaPrefillParams p{1,       c.sq,     c.sk, l.g,  1,    l.m,       l.n,   l.cores,
+                       a.scale, c.window, in.q, in.k, in.v, a.softcap, a.mask};
     MlaPrefillTask task{
         0, 0, t.rowBegin, t.rowEnd - t.rowBegin, read(32 + 8 * b + 6), read(32 + 8 * b + 7), t.s2Begin, t.s2End};
     auto cache = a.cache;
@@ -81,7 +82,7 @@ __aicore__ inline void GqaMerge(const MlaLaunchArgs& a, const MlaLayout& l, cons
                                 uint64_t row, uint32_t begin, uint32_t count)
 {
     AscendC::TPipe pipe;
-    Block::MlaSplitKvMerge<DType, Accumulator, IsTnd, Dim, true> op;
+    Block::MlaSplitKvMerge<DType, Accumulator, IsTnd, Dim, true, false, true> op;
     op.Init(p, (GM_ADDR)a.workspace + l.outOffset + row * Dim * 4, (GM_ADDR)a.workspace + l.sumOffset + row * 8 * 4,
             (GM_ADDR)a.workspace + l.maxOffset + row * 8 * 4, (GM_ADDR)a.out, (GM_ADDR)a.lse, (GM_ADDR)a.accum,
             (GM_ADDR)a.accumLse, &pipe, a.softcap);
@@ -92,7 +93,7 @@ __aicore__ inline void GqaMerge(const MlaLaunchArgs& a, const MlaLayout& l, cons
 #endif
 namespace flash_attn::mla {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-template <typename DType>
+template <typename DType, bool HasSoftcap = true>
 __aicore__ inline void RunGqaAttention(const MlaLaunchArgs& a, const MlaReader& read, const MlaLayout& l,
                                        const MlaAutoSplitBsndSchedule& s)
 {
@@ -101,7 +102,13 @@ __aicore__ inline void RunGqaAttention(const MlaLaunchArgs& a, const MlaReader& 
         core /= AscendC::GetSubBlockNum();
     const auto& c = a.context;
     const uint32_t slots = MlaTaskSlots(c, s);
-    for (uint64_t index = core; index < s.groups * slots; index += l.cores) {
+    uint64_t first = core, last = s.groups * slots, step = l.cores;
+    if (c.splits == 1) {
+        if (!MlaOwnedGroups(read, c, s, core, first, last))
+            return;
+        step = 1;
+    }
+    for (uint64_t index = first; index < last; index += step) {
         const uint64_t group = index / slots;
         const uint32_t split = index % slots;
         MlaAutoSplitBsndTask t{};
@@ -111,13 +118,13 @@ __aicore__ inline void RunGqaAttention(const MlaLaunchArgs& a, const MlaReader& 
         if (c.valueDim == 512) {
             if (MlaTnd(c)) {
                 if (c.pageSize)
-                    GqaCompressed<DType, true, true>(a, l, t, read, core, row);
+                    GqaCompressed<DType, true, true, HasSoftcap>(a, l, t, read, core, row);
                 else
-                    GqaCompressed<DType, true, false>(a, l, t, read, core, row);
+                    GqaCompressed<DType, true, false, HasSoftcap>(a, l, t, read, core, row);
             } else if (c.pageSize)
-                GqaCompressed<DType, false, true>(a, l, t, read, core, row);
+                GqaCompressed<DType, false, true, HasSoftcap>(a, l, t, read, core, row);
             else
-                GqaCompressed<DType, false, false>(a, l, t, read, core, row);
+                GqaCompressed<DType, false, false, HasSoftcap>(a, l, t, read, core, row);
         } else if (l.m <= 128) {
             if (c.pageSize)
                 GqaPrefill<DType, true, true>(a, l, t, read, core, row);
@@ -204,27 +211,27 @@ __aicore__ inline void RunGqaMerge(const MlaLaunchArgs& a, const MlaReader& read
     }
 }
 #endif
-template <typename DType>
+template <typename DType, bool HasSoftcap = true>
 __global__ __aicore__ __mix__(1, 2) void GqaAttention(MlaLaunchArgs a)
 {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
     MlaReader read;
     MlaLayout l{};
-    MlaAutoSplitBsndSchedule s{};
+    MlaAutoSplitBsndSchedule s;
     // Every core validates before initialization, events or synchronization.
     if (!LoadMla<DType>(a, read, l, s))
         return;
     AscendC::SetSyncBaseAddr(a.ffts);
     {
         AscendC::TPipe pipe;
-        InitializeMlaOutputs<DType>(a);
+        InitializeMlaOutputs<DType>(a, a.context.window.kind || MlaNeedsOutputInit(read, a.context, s));
     }
     if (MlaEmptyKv(a.context))
         return;
     if ASCEND_IS_AIV {
         AscendC::SyncAll();
     }
-    RunGqaAttention<DType>(a, read, l, s);
+    RunGqaAttention<DType, HasSoftcap>(a, read, l, s);
     if ASCEND_IS_AIV {
         // Match source FiaKernelNonQuantMla::FlashDecode: all vector cores
         // join after partial writeback, including cores with no attention task.
@@ -239,7 +246,10 @@ aclError LaunchGrouped(const MlaLaunchArgs& a)
 {
     const uint32_t cores = a.context.physicalCores - a.context.margin;
     MlaBatchLaunchScope launch;
-    GqaAttention<DType><<<cores, nullptr, a.stream>>>(a);
+    if (a.softcap != 0.0f)
+        GqaAttention<DType, true><<<cores, nullptr, a.stream>>>(a);
+    else
+        GqaAttention<DType, false><<<cores, nullptr, a.stream>>>(a);
     return launch.Result();
 }
 } // namespace flash_attn::mla

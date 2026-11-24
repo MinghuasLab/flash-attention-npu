@@ -11,7 +11,7 @@
 #include "mla_prefill_vector_block.hpp"
 namespace flash_attn::mla::Kernel {
 using namespace AscendC;
-template <typename InputT, bool Brc, bool Partial, bool Paged = false>
+template <typename InputT, bool Brc, bool Partial, bool Paged = false, bool HasSoftcap = true>
 class MlaPrefill {
   public:
     __aicore__ inline void Run(const MlaPrefillParams& p, const MlaPrefillTask& t, uint32_t core, GM_ADDR q, GM_ADDR k,
@@ -40,12 +40,13 @@ class MlaPrefill {
     {
         s2BaseSize = p.nBase;
         const uint64_t r1 = uint64_t(p.mBase) * Tile::Align(p.nBase, 32), r2 = uint64_t(p.mBase) * 128;
+        const uint32_t cores = GetBlockNum();
         GlobalTensor<float> qk, pv, previous;
         GlobalTensor<InputT> prob;
         qk.SetGlobalBuffer((__gm__ float*)(workspace + core * 2 * r1 * 4));
-        prob.SetGlobalBuffer((__gm__ InputT*)(workspace + p.cores * 2 * r1 * 4 + core * 2 * r1 * 2));
-        pv.SetGlobalBuffer((__gm__ float*)(workspace + p.cores * 2 * r1 * 6 + core * 2 * r2 * 4));
-        previous.SetGlobalBuffer((__gm__ float*)(workspace + p.cores * (2 * r1 * 6 + 2 * r2 * 4) + core * 2 * r2 * 4));
+        prob.SetGlobalBuffer((__gm__ InputT*)(workspace + cores * 2 * r1 * 4 + core * 2 * r1 * 2));
+        pv.SetGlobalBuffer((__gm__ float*)(workspace + cores * 2 * r1 * 6 + core * 2 * r2 * 4));
+        previous.SetGlobalBuffer((__gm__ float*)(workspace + cores * (2 * r1 * 6 + 2 * r2 * 4) + core * 2 * r2 * 4));
         if ASCEND_IS_AIC {
             cube.Init(p, pipe, q, k, v, cache);
             cube.InitMm1GlobalTensor(qk);
@@ -69,7 +70,6 @@ class MlaPrefill {
         const uint32_t count = t.end - t.begin;
         for (uint32_t s2 = 0; s2 < count; ++s2) {
             auto& now = ring[loop % 3];
-            now = {};
             now.context = context;
             now.loop = loop;
             now.bIdx = t.batch;
@@ -153,15 +153,16 @@ class MlaPrefill {
                 const uint32_t flat = t.rowStart + r, h = t.kvHead * g + flat % g;
                 DataCopy(o[((uint64_t(t.batch) * p.sq + flat / g) * p.heads + h) * 128], zero.ReinterpretCast<InputT>(),
                          128);
-                DataCopyPad(sl[(uint64_t(t.batch) * p.heads + h) * p.sq + flat / g], neg,
-                            DataCopyExtParams{1, 4, 0, 0, 0});
+                if (lse != nullptr)
+                    DataCopyPad(sl[(uint64_t(t.batch) * p.heads + h) * p.sq + flat / g], neg,
+                                DataCopyExtParams{1, 4, 0, 0, 0});
             }
         }
         SetFlag<HardEvent::MTE3_V>(0);
         WaitFlag<HardEvent::MTE3_V>(0);
     }
     Block::MlaPrefillCube<InputT, Paged> cube;
-    Block::MlaPrefillVector<InputT, Brc, Partial> vector;
+    Block::MlaPrefillVector<InputT, Brc, Partial, HasSoftcap> vector;
     Block::PrefillInfo ring[3]{};
     uint64_t loop = 0;
     uint32_t s2BaseSize = 0;

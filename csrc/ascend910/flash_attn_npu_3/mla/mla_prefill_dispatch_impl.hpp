@@ -15,29 +15,17 @@
 #endif
 namespace flash_attn::mla {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-template <typename DType, bool Brc, bool Partial, bool Paged>
-__aicore__ inline void RunPrefillImpl(const MlaLaunchArgs& a, const MlaReader& read, const MlaAutoSplitBsndSchedule& s,
+template <typename DType, bool Brc, bool Partial, bool Paged, bool HasSoftcap, typename Reader>
+__aicore__ inline void RunPrefillImpl(const MlaLaunchArgs& a, const Reader& read, const MlaAutoSplitBsndSchedule& s,
                                       const MlaLayout& l, uint32_t core, AscendC::TPipe* pipe)
 {
     const auto& c = a.context;
-    const bool autoSplit = c.splits == 0;
-    uint64_t first = core, last = s.groups * l.capacity;
-    if (autoSplit) {
-        if (core >= s.usedCoreNum)
-            return;
-        const MlaPartitionView<MlaReader> view{read, c, l};
-        const uint32_t prefix = auto_split_detail::Base(s.used.tiling.batch) + kMlaNativePartitionWords;
-        const uint32_t b = core ? s.bEnd[core - 1] : 0;
-        first = ReadMetadataWide(view, prefix + 2 * b) + (core ? s.mEnd[core - 1] : 0);
-        last = ReadMetadataWide(view, prefix + 2 * s.bEnd[core]) + s.mEnd[core] + (s.nEnd[core] ? 1 : 0);
-        if (last > s.groups)
-            last = s.groups;
-    }
-    if (first >= last)
+    uint64_t first = 0, last = 0;
+    if (!MlaOwnedGroups(read, c, s, core, first, last))
         return;
-    Kernel::MlaPrefill<DType, Brc, Partial, Paged> kernel;
-    MlaPrefillParams params{c.batch, c.sq,    c.sk,     c.heads,    c.kvHeads,  l.m,        l.n,
-                            l.cores, a.scale, c.window, a.inputs.q, a.inputs.k, a.inputs.v, a.softcap};
+    Kernel::MlaPrefill<DType, Brc, Partial, Paged, HasSoftcap> kernel;
+    MlaPrefillParams params{c.batch, c.sq,     c.sk,       c.heads,    c.kvHeads,  l.m,       l.n,   l.cores,
+                            a.scale, c.window, a.inputs.q, a.inputs.k, a.inputs.v, a.softcap, a.mask};
     if (MlaTnd(c)) {
         params.batch = 1;
         params.sq = c.totalQ;
@@ -45,28 +33,43 @@ __aicore__ inline void RunPrefillImpl(const MlaLaunchArgs& a, const MlaReader& r
     kernel.Init(params, core, (GM_ADDR)a.q, (GM_ADDR)a.k, (GM_ADDR)a.v, (GM_ADDR)a.out, (GM_ADDR)a.lse,
                 (GM_ADDR)a.workspace, (GM_ADDR)a.workspace + l.outOffset, (GM_ADDR)a.workspace + l.sumOffset,
                 (GM_ADDR)a.workspace + l.maxOffset, pipe, &a.cache);
-    for (uint64_t index = first; index < last; index += autoSplit ? 1 : l.cores) {
-        const uint64_t group = autoSplit ? index : index / l.capacity;
-        const uint32_t split = autoSplit ? 0 : index % l.capacity;
+    using Cursor = std::conditional_t<Partial, MlaNativeAutoCursor, MlaWholeMCursor>;
+    Cursor cursor;
+    const MlaPartitionView<Reader> view{read, c, l};
+    if constexpr (Partial)
+        cursor.template Init<Paged>(view, s, core, l.headGroups);
+    else
+        cursor.Init(l, s, core, first, last);
+    for (uint64_t group = first; group < last; ++group) {
         MlaAutoSplitBsndTask t{};
-        if (!MlaTask(read, c, l, s, group, split, t, autoSplit ? core : UINT32_MAX) || t.s2Begin == t.s2End)
+        if constexpr (Partial) {
+            if (!cursor.Next(view, s, c.window, t))
+                break;
+            group = t.group;
+        } else if (!cursor.Next(read, c, l, s, t)) {
+            AscendC::Trap();
+            return;
+        }
+        if (t.s2Begin == t.s2End)
             continue;
-        const uint32_t b = t.batch / c.kvHeads;
+        const uint32_t b = cursor.taskBatch;
         Block::PrefillTaskContext context{};
-        context.task = {MlaTnd(c) ? 0U : b,
-                        t.batch % c.kvHeads,
-                        t.rowBegin,
-                        t.rowEnd - t.rowBegin,
-                        read((MlaSequenceWord(b) + 6)),
-                        read((MlaSequenceWord(b) + 6) + 1),
-                        t.s2Begin,
-                        t.s2End};
+        context.task = {MlaTnd(c) ? 0U : b, cursor.taskHead, t.rowBegin, t.rowEnd - t.rowBegin,
+                        cursor.queryLength, cursor.kvLength, t.s2Begin,  t.s2End};
         context.cacheBatch = b;
-        context.partial = t.splitCount > 1;
-        context.partialRow = (group * l.capacity + t.split) * l.m;
+        if constexpr (Partial) {
+            context.partial = t.splitCount > 1;
+            if (context.partial) {
+                if (t.fdHead >= s.fdHeads || t.split >= t.splitCount || t.slot >= s.partialPrefix[t.fdHead + 1]) {
+                    cursor.valid = false;
+                    break;
+                }
+                context.partialRow = t.slot * l.m;
+            }
+        }
         if (MlaTnd(c)) {
-            const uint64_t qStart = read(MlaSequenceWord(b));
-            const uint64_t kStart = read(MlaSequenceWord(b) + 2);
+            const uint64_t qStart = cursor.queryStart;
+            const uint64_t kStart = cursor.kvStart;
             context.qOffset = qStart * a.inputs.q.rowStride;
             if constexpr (!Paged) {
                 context.kOffset = c.layout == 1 ? kStart * a.inputs.k.rowStride : uint64_t(b) * a.inputs.k.batchStride;
@@ -78,11 +81,95 @@ __aicore__ inline void RunPrefillImpl(const MlaLaunchArgs& a, const MlaReader& r
         kernel.RunTask(context);
     }
     kernel.Finish();
+    if constexpr (Partial)
+        if (!cursor.valid)
+            AscendC::Trap();
+}
+
+// Only the one physical sequence and its whole-M prefixes are read by the
+// direct task cursor. This adapter has no GM metadata or mutable tensor cache.
+struct MlaStaticPrefillReader {
+    uint32_t queryLength, kvLength, heads, mBlocks;
+
+    __aicore__ inline uint32_t operator()(uint64_t word) const
+    {
+        constexpr uint32_t sequence = kMlaRecordHeaderWords;
+        constexpr uint32_t prefix = sequence + kMlaSequenceWords + kMlaNativePartitionWords;
+        if (word >= sequence && word < sequence + kMlaSequenceWords) {
+            const uint32_t field = word - sequence;
+            return field == 4 || field == 6 ? queryLength : field == 5 || field == 7 ? kvLength : 0;
+        }
+        if (word >= prefix && word < prefix + 2ULL * (uint64_t(heads) + 1)) {
+            const uint64_t value = ((word - prefix) / 2) * mBlocks;
+            return (word - prefix) % 2 ? uint32_t(value >> 32) : uint32_t(value);
+        }
+        AscendC::Trap();
+        return 0;
+    }
+};
+
+__aicore__ inline bool LoadStaticPrefill(const MlaLaunchArgs& a, MlaStaticPrefillReader& read, MlaLayout& l,
+                                         MlaAutoSplitBsndSchedule& s)
+{
+    const auto& c = a.context;
+    const auto& plan = a.staticPrefill;
+    if (!a.cuQuery || !a.cuKv || a.cuQuery % 4 || a.cuKv % 4 || !plan.usedCoreNum ||
+        plan.usedCoreNum > AscendC::GetBlockNum()) {
+        AscendC::Trap();
+        return false;
+    }
+    AscendC::GlobalTensor<uint32_t> query, kv;
+    query.SetGlobalBuffer((__gm__ uint32_t*)a.cuQuery);
+    kv.SetGlobalBuffer((__gm__ uint32_t*)a.cuKv);
+    // Every AIC and AIV validates the mutable prefixes before output stores,
+    // event allocation or waits. A failing vector can never strand its cube.
+    const uint32_t qBegin = query.GetValue(0), qEnd = query.GetValue(1);
+    const uint32_t kBegin = kv.GetValue(0), kEnd = kv.GetValue(1);
+    if ((qBegin | kBegin | (qEnd ^ c.totalQ) | (kEnd ^ c.totalK)) != 0) {
+        AscendC::Trap();
+        return false;
+    }
+    l = plan.layout;
+    l.cores = AscendC::GetBlockNum();
+    const uint32_t blocks = (uint64_t(c.totalQ) + l.m - 1) / l.m;
+    read = {c.totalQ, c.totalK, c.heads, blocks};
+    s = {};
+    s.aicNum = plan.layout.cores;
+    s.usedCoreNum = plan.usedCoreNum;
+    s.groups = uint64_t(c.heads) * blocks;
+    l.groups = s.groups;
+    s.used.query = {1, {c.totalQ, 0}, c.sq};
+    s.used.kv = {1, {c.totalK, 0}, c.sk};
+    auto& t = s.used.tiling;
+    t.batch = c.heads;
+    t.sq = c.sq;
+    t.sk = c.sk;
+    t.heads = 1;
+    t.mBaseSize = l.m;
+    t.s2BaseSize = l.n;
+    t.usedCoreNum = s.usedCoreNum;
+    t.blockDim = plan.layout.cores;
+    t.cvRatio = 2;
+    const uint64_t rows = ((uint64_t(c.totalQ) < l.m ? c.totalQ : l.m) + 15) / 16 * 16;
+    t.mm1ResSize = rows * ((l.n + 31) / 32 * 32);
+    t.mm2ResSize = rows * 512;
+    for (uint32_t core = 0; core < 26; ++core) {
+        s.bEnd[core] = t.bN2End[core] = plan.bEnd[core];
+        s.mEnd[core] = t.gS1End[core] = plan.mEnd[core];
+    }
+    s.outOffset = l.outOffset;
+    s.sumOffset = l.sumOffset;
+    s.maxOffset = l.maxOffset;
+    s.bytes = l.bytes;
+    return true;
 }
 template <typename DType, bool IsTnd>
-__aicore__ inline void PrefillMerge(const MlaLaunchArgs& a, const MlaSplitKvMergeParams& p, const MlaLayout& l,
+using PrefillFdMerge = Block::MlaSplitKvMerge<DType, true, IsTnd, 128, true, false, false, MlaAutoSplitKvMergeParams>;
+
+template <typename DType, bool IsTnd>
+__aicore__ inline void PrefillMerge(const MlaLaunchArgs& a, const MlaAutoSplitKvMergeParams& p, const MlaLayout& l,
                                     uint64_t row, uint32_t begin, uint32_t end,
-                                    Block::MlaSplitKvMerge<DType, true, IsTnd, 128>& merge)
+                                    PrefillFdMerge<DType, IsTnd>& merge)
 {
     merge.Bind(p, (GM_ADDR)a.workspace + l.outOffset + row * 128 * 4, (GM_ADDR)a.workspace + l.sumOffset + row * 8 * 4,
                (GM_ADDR)a.workspace + l.maxOffset + row * 8 * 4, (GM_ADDR)a.out, (GM_ADDR)a.lse, (GM_ADDR)a.accum,
@@ -93,50 +180,55 @@ __aicore__ inline void PrefillMerge(const MlaLaunchArgs& a, const MlaSplitKvMerg
 template <typename DType, bool IsTnd>
 __aicore__ inline void
 MergePrefillRows(const MlaLaunchArgs& a, const MlaReader& read, const MlaAutoSplitBsndSchedule& s, const MlaLayout& l,
-                 uint64_t group, uint32_t begin, uint32_t end, Block::MlaSplitKvMerge<DType, true, IsTnd, 128>& merge)
+                 const MlaAutoSplitBsndMerge& fragment, uint32_t begin, uint32_t end,
+                 PrefillFdMerge<DType, IsTnd>& merge)
 {
     const auto& c = a.context;
-    MlaAutoSplitBsndTask t{};
-    if (!MlaTask(read, c, l, s, group, 0, t)) {
-        AscendC::Trap();
+    const MlaPartitionView<MlaReader> view{read, c, l};
+    MlaAutoSplitBsndTask geometry{};
+    geometry.batch = fragment.batch;
+    geometry.m = fragment.m;
+    auto_split_detail::Geometry<false>(view, s, c.window, geometry);
+    const uint32_t rows = geometry.rowEnd - geometry.rowBegin;
+    if (begin >= rows)
         return;
-    }
-    if (begin >= t.rowEnd - t.rowBegin)
-        return;
-    MlaSplitKvMergeParams p{};
+    MlaAutoSplitKvMergeParams p{};
     p.batch = c.batch;
     p.sq = c.sq;
     p.heads = c.heads / c.kvHeads;
-    p.batchIndex = t.batch / c.kvHeads;
+    p.batchIndex = fragment.batch / c.kvHeads;
     p.kvHeads = c.kvHeads;
-    p.kvHead = t.batch % c.kvHeads;
-    p.rowStart = t.rowBegin;
-    p.rows = t.rowEnd - t.rowBegin;
+    p.kvHead = fragment.batch % c.kvHeads;
+    p.rowStart = geometry.rowBegin;
+    p.rows = rows;
     p.mBase = l.m;
-    p.splits = t.splitCount;
+    p.splits = fragment.splitCount;
     p.queryLength = read((MlaSequenceWord(p.batchIndex) + 6));
     p.kvLength = read((MlaSequenceWord(p.batchIndex) + 6) + 1);
     p.maskKind = c.window.kind;
     p.left = c.window.left;
     p.right = c.window.right;
-    const MlaPartitionView<MlaReader> view{read, c, l};
-    auto geometry = t;
-    auto_split_detail::Geometry<false>(view, s, c.window, geometry);
-    if (auto_split_detail::Parts(s, geometry, UINT32_MAX, nullptr, p.begin, p.end) != p.splits) {
+    if (p.splits < 2 || p.splits > p.kSplitCapacity) {
         AscendC::Trap();
         return;
     }
-    for (uint32_t split = 0; split < p.splits; ++split) {
-        const uint32_t first = p.begin[split] * l.n, last = p.end[split] * l.n;
-        p.begin[split] = p.kvLength < first ? p.kvLength : first;
-        p.end[split] = p.kvLength < last ? p.kvLength : last;
+    if (p.maskKind) {
+        if (auto_split_detail::Parts(s, geometry, UINT32_MAX, nullptr, p.begin, p.end, p.kSplitCapacity) != p.splits) {
+            AscendC::Trap();
+            return;
+        }
+        for (uint32_t split = 0; split < p.splits; ++split) {
+            const uint32_t first = p.begin[split] * l.n, last = p.end[split] * l.n;
+            p.begin[split] = p.kvLength < first ? p.kvLength : first;
+            p.end[split] = p.kvLength < last ? p.kvLength : last;
+        }
     }
-    const uint64_t row = group * l.capacity * l.m;
+    const uint64_t row = fragment.firstSlot * l.m;
     end = end < p.rows ? end : p.rows;
     if constexpr (IsTnd) {
         p.batch = 1;
         p.sq = c.totalQ;
-        p.batchIndex = read(MlaSequenceWord(t.batch / c.kvHeads));
+        p.batchIndex = read(MlaSequenceWord(p.batchIndex));
     }
     PrefillMerge<DType, IsTnd>(a, p, l, row, begin, end, merge);
 }
@@ -152,8 +244,8 @@ __aicore__ inline void MergePrefillOutputsImpl(const MlaLaunchArgs& a, const Mla
         return;
     }
     pipe->Reset();
-    Block::MlaSplitKvMerge<DType, true, IsTnd, 128> merge;
-    merge.InitBuffers(pipe);
+    PrefillFdMerge<DType, IsTnd> merge;
+    merge.InitBuffers(pipe, a.accumLse != 0);
     AscendC::ICachePreLoad(2);
     AscendC::SyncAll();
     // The native tail assigns only FD groups to vectors. Direct S1G
@@ -175,12 +267,12 @@ __aicore__ inline void MergePrefillOutputsImpl(const MlaLaunchArgs& a, const Mla
             AscendC::Trap();
             return;
         }
-        MergePrefillRows<DType, IsTnd>(a, read, s, l, r.group, part * 8, parts * 8, merge);
+        MergePrefillRows<DType, IsTnd>(a, read, s, l, r, part * 8, parts * 8, merge);
     }
     merge.Finish();
 }
 #endif
-template <typename DType, bool Brc, bool Partial, bool Paged, bool IsTnd>
+template <typename DType, bool Brc, bool Partial, bool Paged, bool IsTnd, bool HasSoftcap>
 __global__ __aicore__ __mix__(1, 2) void PrefillAttention(MlaLaunchArgs a)
 {
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
@@ -191,24 +283,57 @@ __global__ __aicore__ __mix__(1, 2) void PrefillAttention(MlaLaunchArgs a)
         return;
     AscendC::SetSyncBaseAddr(a.ffts);
     AscendC::TPipe pipe;
-    InitializeMlaOutputs<DType>(a);
+    if ASCEND_IS_AIV {
+        // Direct, non-paged tasks write every O and LSE row when the
+        // validated lengths and causal window leave no allocation holes.
+        const bool directRows = !s.fdHeads && !Paged && a.context.window.kind <= 1 &&
+                                !MlaNeedsOutputInit<true>(read, a.context, s);
+        if (directRows) {
+            // Inactive public partial LSE slots still carry the -inf sentinel.
+            if (a.accumLse)
+                InitializeMlaOutputs<DType>(a, false, false);
+        } else {
+            InitializeMlaOutputs<DType>(a, MlaNeedsOutputInit(read, a.context, s));
+            if (a.context.splits <= 1 && s.groups && !MlaEmptyKv(a.context))
+                AscendC::SyncAll();
+        }
+    }
     if (!s.groups || MlaEmptyKv(a.context))
         return;
+    uint32_t core = AscendC::GetBlockIdx();
     if ASCEND_IS_AIV {
-        // Direct output must wait for all vector cores, including idle ones.
-        if (a.context.splits <= 1)
-            AscendC::SyncAll();
+        core /= AscendC::GetSubBlockNum();
+    }
+    RunPrefillImpl<DType, Brc, Partial, Paged, HasSoftcap>(a, read, s, l, core, &pipe);
+    if ASCEND_IS_AIV {
+        if constexpr (Partial) {
+            if (s.fdHeads)
+                MergePrefillOutputsImpl<DType, IsTnd>(a, read, s, l, &pipe);
+        }
+    }
+#endif
+}
+template <typename DType>
+__global__ __aicore__ __mix__(1, 2) void StaticPrefillAttention(MlaLaunchArgs a)
+{
+#if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
+    MlaStaticPrefillReader read;
+    MlaAutoSplitBsndSchedule s;
+    MlaLayout l{};
+    if (!LoadStaticPrefill(a, read, l, s))
+        return;
+    AscendC::SetSyncBaseAddr(a.ffts);
+    AscendC::TPipe pipe;
+    if ASCEND_IS_AIV {
+        InitializeMlaOutputs<DType>(a, MlaNeedsOutputInit(read, a.context, s));
+        AscendC::SyncAll();
     }
     uint32_t core = AscendC::GetBlockIdx();
     if ASCEND_IS_AIV {
         core /= AscendC::GetSubBlockNum();
     }
-    RunPrefillImpl<DType, Brc, Partial, Paged>(a, read, s, l, core, &pipe);
-    if ASCEND_IS_AIV {
-        if constexpr (Partial) {
-            MergePrefillOutputsImpl<DType, IsTnd>(a, read, s, l, &pipe);
-        }
-    }
+    // TND prefill has N <= 512 and M == 512, so its source Brc is false.
+    RunPrefillImpl<DType, false, false, false, false>(a, read, s, l, core, &pipe);
 #endif
 }
 // Resolve device specialization on host, as in fwd_dispatch_impl.hpp.
@@ -230,11 +355,19 @@ aclError LaunchPrefill(const MlaLaunchArgs& a)
     if (!MlaRecordLayout(a.context, l))
         return ACL_ERROR_INVALID_PARAM;
     MlaBatchLaunchScope launch;
+    const uint32_t cores = MlaStaticLaunchCores(a.context);
+    if (a.staticPrefill.usedCoreNum) {
+        StaticPrefillAttention<DType><<<cores, nullptr, a.stream>>>(a);
+        return launch.Result();
+    }
     MLA_PREFILL_BOOL_SWITCH(l.m <= 128, Brc, {
         MLA_PREFILL_BOOL_SWITCH(a.context.splits != 1, Partial, {
             MLA_PREFILL_BOOL_SWITCH(a.context.pageSize != 0, Paged, {
                 MLA_PREFILL_BOOL_SWITCH(MlaTnd(a.context), IsTnd, {
-                    PrefillAttention<DType, Brc, Partial, Paged, IsTnd><<<l.cores, nullptr, a.stream>>>(a);
+                    MLA_PREFILL_BOOL_SWITCH(a.softcap != 0.0f, HasSoftcap, {
+                        PrefillAttention<DType, Brc, Partial, Paged, IsTnd, HasSoftcap>
+                            <<<cores, nullptr, a.stream>>>(a);
+                    });
                 });
             });
         });

@@ -18,8 +18,7 @@
 namespace flash_attn::mla {
 enum class MlaMetadataDtype : uint32_t {
     Fp16 = 1,
-    Bf16 = 2,
-    Int8 = 3
+    Bf16 = 2
 };
 struct MlaMetadataWide {
     uint32_t low, high;
@@ -48,6 +47,33 @@ struct MlaContext {
     MlaWindowKernelParams window;
     uint64_t workspaceBytes = 0;
 };
+// A private launch bound; the public record and workspace keep the original
+// physical-minus-margin capacity. Each reduced case selects the persistent
+// dispatcher independently of output pointers, softcap and metadata values.
+MLA_METADATA_INLINE uint32_t MlaStaticLaunchCores(const MlaContext& c)
+{
+    if (!c.physicalCores || c.physicalCores > kMlaMaxAic || c.margin >= c.physicalCores)
+        return 0;
+    const uint32_t available = c.physicalCores - c.margin;
+    // A nonzero margin can select Grouped depending on the public partial
+    // pointers. Leave that route and its task stride unchanged.
+    if (c.margin)
+        return available;
+    if (c.valueDim == 512 && c.batch == 1 && c.sq == 1 && c.heads == 128 && c.kvHeads == 1 && c.packed &&
+        c.splits == 0 && c.sk <= 8192 && ((c.layout == 0 && c.pageSize == 0) || (c.layout == 3 && c.pageSize == 128))) {
+        // One M block; short/used KV lengths cannot exceed this many S2s.
+        const uint32_t tiles = c.sk ? (c.sk + 511) / 512 : 1;
+        return tiles < available ? tiles : available;
+    }
+    if (c.valueDim == 128 && c.batch == 1 && c.heads == c.kvHeads && (c.heads == 32 || c.heads == 128) &&
+        c.splits == 1 && c.layout == 1 && !c.pageSize && c.sq && c.sq <= 512 && c.sk && c.sk <= 512) {
+        // Each head has one equal-cost tile. SplitCore retains the first
+        // candidate reaching the optimal peak, including when more cores tie.
+        const uint32_t perCore = (c.heads + available - 1) / available;
+        return (c.heads + perCore - 1) / perCore;
+    }
+    return available;
+}
 struct MlaLayout {
     uint32_t words = 0, m = 0, n = 0, cores = 0, headGroups = 0, g = 0, capacity = 0;
     uint64_t groups = 0, scratch = 0, outOffset = 0, sumOffset = 0, maxOffset = 0, bytes = 0;
@@ -58,7 +84,7 @@ struct MlaRecordHeader {
     uint32_t words, dtype, status, batch, sq, sk, heads, kvHeads, splits, physicalCores, margin, packed, layout, totalQ,
         totalK;
     uint32_t pageSize, usedFlags, valueDim, hasSoftcap, mask, left, right, m, n, cores, headGroups;
-    uint32_t queryCapacity, kvCapacity, algorithm, reserved[3];
+    uint32_t queryCapacity, kvCapacity, reserved[4];
 };
 static_assert(sizeof(MlaRecordHeader) == 32 * sizeof(uint32_t));
 struct MlaNativePartition {
@@ -186,8 +212,8 @@ MLA_METADATA_INLINE bool MlaRecordLayout(const MlaContext& c, MlaLayout& l, uint
                                                (c.valueDim == 512 ? 16ULL * r.m : 0));
         }
         r.outOffset = (r.scratch + 31) / 32 * 32;
-        const uint64_t rows =
-            MlaNativeCompressed(c) && !c.splits ? 2ULL * available * r.m : r.groups * r.capacity * r.m;
+        const bool nativeAuto = !c.splits && !c.margin && (c.packed || c.heads == c.kvHeads);
+        const uint64_t rows = nativeAuto ? 2ULL * available * r.m : r.groups * r.capacity * r.m;
         if (rows > (uint64_t(INT64_MAX) - r.outOffset) / ((c.valueDim + 16) * 4))
             return false;
         r.sumOffset = r.outOffset + rows * c.valueDim * 4;
@@ -230,8 +256,7 @@ MLA_METADATA_INLINE MlaRecordHeader MlaHeader(const MlaContext& c, const MlaLayo
             l.headGroups,
             qCapacity,
             kCapacity,
-            0,
-            {0, 0, 0}};
+            {0, 0, 0, 0}};
 }
 struct MlaRecordArgs {
     MlaContext context;
@@ -241,7 +266,6 @@ struct MlaRecordArgs {
     MlaPagedCacheInputs cache{};
     bool generate = true;
 };
-bool BuildNonquantMetadata(const MlaRecordArgs&);
-bool PrepareInt8Metadata(const MlaRecordArgs&);
+bool BuildMlaMetadata(const MlaRecordArgs&);
 } // namespace flash_attn::mla
 #undef MLA_METADATA_INLINE

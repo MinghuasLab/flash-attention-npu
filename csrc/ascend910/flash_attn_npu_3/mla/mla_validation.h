@@ -89,7 +89,8 @@ inline bool FitsDenseShape(int64_t batch, int64_t sq, int64_t heads, int64_t sk)
 }
 
 inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-                                 const std::optional<at::Tensor>& qv, bool varlenQ, bool varlenK, bool pagedKV)
+                                 const std::optional<at::Tensor>& qv, bool varlenQ, bool varlenK, bool pagedKV,
+                                 MlaBsndInputLayouts* outputs = nullptr)
 {
     // Keep ordinary layout and malformed-query validation in the upstream path.
     if (!qv.has_value() && ((varlenQ && q.dim() != 3) || (q.dim() > 0 && v.dim() > 0 && q.size(-1) == v.size(-1)))) {
@@ -101,10 +102,8 @@ inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const
     TORCH_CHECK(q.size(-1) == k.size(-1), "FlashAttention: q and k head dimensions must match");
 
     TORCH_CHECK(!pagedKV || !varlenK, "MLA: page_table and cu_seqlens_k cannot be combined");
-    const bool int8 = qv && (qv->scalar_type() == at::kChar || v.scalar_type() == at::kChar);
     TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
                 "MLA: inputs must have FP16 or BF16 dtype");
-    TORCH_CHECK(!int8 || q.scalar_type() == at::kBFloat16, "MLA INT8: RoPE inputs must have BF16 dtype");
     TORCH_CHECK((q.device().type() == at::kPrivateUse1 || q.is_meta()), "MLA: inputs must be NPU tensors");
     auto checkTensor = [&q](const at::Tensor& t, at::ScalarType dtype) {
         TORCH_CHECK(t.scalar_type() == dtype, "MLA: unexpected input dtype");
@@ -113,7 +112,7 @@ inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const
     };
     checkTensor(q, q.scalar_type());
     checkTensor(k, q.scalar_type());
-    checkTensor(v, int8 ? at::kChar : q.scalar_type());
+    checkTensor(v, q.scalar_type());
     for (int64_t axis = 0; axis < k.dim() - 1; ++axis) {
         TORCH_CHECK(k.size(axis) == v.size(axis), "MLA: k/v shapes must match except for head dimension");
     }
@@ -122,7 +121,7 @@ inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const
     TORCH_CHECK(headsQ > 0 && headsKV > 0 && headsQ % headsKV == 0,
                 "MLA: positive KV head count must divide query head count");
     if (qv.has_value()) {
-        checkTensor(*qv, int8 ? at::kChar : q.scalar_type());
+        checkTensor(*qv, q.scalar_type());
         TORCH_CHECK(qv->dim() == q.dim(), "MLA: qv shape must match q with the value head dimension");
         for (int64_t axis = 0; axis < q.dim() - 1; ++axis) {
             TORCH_CHECK(qv->size(axis) == q.size(axis), "MLA: qv shape must match q with the value head dimension");
@@ -136,8 +135,8 @@ inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const
         TORCH_CHECK(varlenQ || FitsDenseShape(q.size(0), q.size(1), headsQ, pagedKV ? 0 : k.size(1)),
                     "MLA compressed forward is not implemented yet outside B>=0, nonnegative S1G within address/field "
                     "bounds, 0<=Sk<=16384");
-        for (const auto& t : {q, k, v, *qv}) {
-            TORCH_CHECK(!t.requires_grad(), "MLA compressed forward is not implemented yet for gradients");
+        for (const auto* t : {&q, &k, &v, &*qv}) {
+            TORCH_CHECK(!t->requires_grad(), "MLA compressed forward is not implemented yet for gradients");
         }
         return true;
     }
@@ -147,13 +146,15 @@ inline bool CheckForwardBoundary(const at::Tensor& q, const at::Tensor& k, const
     TORCH_CHECK(pagedKV || varlenQ || q.size(0) == k.size(0), "MLA: dense batch sizes must match");
     TORCH_CHECK(varlenQ || FitsDenseShape(q.size(0), q.size(1), headsQ, pagedKV ? 0 : k.size(1)),
                 "MLA: prefill BSND shape bounds exceeded");
-    for (const auto& t : {q, k, v}) {
+    const auto checkLayout = [](const at::Tensor& t) {
         TORCH_CHECK(!t.requires_grad(), "MLA prefill forward is not implemented yet for gradients");
-        if (t.dim() == 3)
-            CheckTndTensorLayout(t);
-        else
-            CheckBsndTensorLayout(t);
-    }
+        return t.dim() == 3 ? CheckTndTensorLayout(t) : CheckBsndTensorLayout(t);
+    };
+    // Expanded descriptors belong to this invocation; compressed validation
+    // remains in Forward after its prefix/page checks.
+    const MlaBsndInputLayouts layouts{checkLayout(q), {}, checkLayout(k), checkLayout(v)};
+    if (outputs)
+        *outputs = layouts;
     return true;
 }
 

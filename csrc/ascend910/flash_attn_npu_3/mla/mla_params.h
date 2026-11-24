@@ -38,6 +38,7 @@ struct MlaPrefillParams {
     MlaWindowKernelParams window;
     MlaBsndTensorLayout q, k, v;
     float softcap = 0.0f;
+    uint64_t mask = 0;
 };
 // A validated fragment of one S1G block for one KV head. The caller owns
 // partitioning and bounds; begin/end are S2 tile indices, rows exclude padding.
@@ -66,22 +67,35 @@ struct MlaTaskLengths {
     uint32_t queryStart, queryLength, kvLength;
     uint64_t kvStart;
 };
+// A single-Q FD group writes partial O to contiguous per-core slots in
+// the workspace or in public FP32 partial O. Sum/max keep the native M stride.
+// When requested, compact public LSE is written before FD synchronization.
+struct MlaPartialOutputAlias {
+    uint64_t out = 0;
+    uint32_t rows = 0;
+    uint64_t lse = 0;
+};
 } // namespace flash_attn::mla
 
 // Independent BSND FD launch data; not a production metadata record.
 namespace flash_attn::mla {
-struct MlaSplitKvMergeParams {
+template <uint32_t SplitCapacity>
+struct MlaSplitKvMergeParamsFor {
+    static constexpr uint32_t kSplitCapacity = SplitCapacity;
     uint32_t batch, sq, heads, batchIndex, rowStart, rows, mBase, splits;
     uint32_t kvLength, maskKind;
     int64_t left, right;
     // Logical KV intervals, clipped to KV <=16384. uint16 keeps the by-value
     // launch record below the 1536-byte compiler/runtime parameter limit.
-    uint16_t begin[256], end[256];
+    uint16_t begin[SplitCapacity], end[SplitCapacity];
     // TND specialization uses batch=1, sq=totalQ, batchIndex=allocation token.
     // Production Q-used controls mask geometry; sq remains allocation stride.
     // Independent components leave this zero and use sq (zero-Q has no task).
     uint32_t queryLength = 0;
     // HeadDim=128 BSND specialization: heads is the per-KV-head group size.
     uint32_t kvHeads = 1, kvHead = 0;
+    uint32_t partialOutStride = 0;
 };
+using MlaSplitKvMergeParams = MlaSplitKvMergeParamsFor<256>;
+using MlaAutoSplitKvMergeParams = MlaSplitKvMergeParamsFor<MlaDenseKernelSchedule::kEndpointCapacity>;
 } // namespace flash_attn::mla

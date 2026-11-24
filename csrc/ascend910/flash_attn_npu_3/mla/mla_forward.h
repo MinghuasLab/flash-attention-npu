@@ -20,7 +20,7 @@ TryForward(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const 
            const std::optional<at::Tensor>& v_descale_, std::optional<double> softmax_scale_, bool is_causal,
            int64_t window_size_left, int64_t window_size_right, int64_t attention_chunk, double softcap_option,
            bool is_rotary_interleaved, const std::optional<at::Tensor>& scheduler_metadata_, int64_t num_splits,
-           std::optional<bool> pack_gqa_, int64_t sm_margin, int64_t layout);
+           std::optional<bool> pack_gqa_, int64_t sm_margin, int64_t layout, bool returnLse, bool outputOnly = false);
 
 at::Tensor SchedulerMetadata(int64_t batch, int64_t sq, int64_t sk, int64_t heads, int64_t kvHeads, int64_t dim,
                              int64_t valueDim, at::ScalarType dtype, const at::Tensor& lengths,

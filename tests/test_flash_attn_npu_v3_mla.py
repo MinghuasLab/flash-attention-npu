@@ -4,6 +4,7 @@
 """Public MLA forward tests. Run with pytest, like test_flash_attn_npu_v3.py."""
 
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import inspect
 import math
@@ -140,7 +141,7 @@ def _view(tensor, kind):
     shape = list(tensor.shape)
     if kind == "broadcast":
         return tensor.narrow(0, 0, 1).expand_as(tensor)
-    axis = -1 if kind == "scale-head" else -2 if kind == "head-gap" and tensor.ndim >= 3 else 0
+    axis = -2 if kind == "head-gap" and tensor.ndim >= 3 else 0
     shape[axis] = 2 * shape[axis] + 2
     fill = float("nan") if tensor.is_floating_point() else 117
     storage = torch.full(shape, fill, dtype=tensor.dtype, device=tensor.device)
@@ -808,6 +809,143 @@ def test_mla_auto_partial_outputs(dtype, representation, layout, query, keys, sp
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("layout", CACHE_LAYOUTS)
+@pytest.mark.parametrize("heads", [16, 32, 128])
+@pytest.mark.parametrize("margin", [0, 1])
+def test_mla_decode_partial_storage(dtype, layout, heads, margin):
+    # The public FP32 O may also be the FD input. Check every partition
+    # independently, including a short KV tail and offset input storage.
+    keys = 4 * 512 + 17
+    case = _make_case(
+        layout,
+        "compressed",
+        dtype,
+        q=(1,),
+        k=(keys,),
+        heads=heads,
+        splits=0,
+        pack=True,
+        margin=margin,
+        page=128,
+        view="offset",
+    )
+    record = _metadata(case)
+    outputs = _call(case, record)
+    _check(case, outputs)
+    words = record.cpu().tolist()
+    # Native exclusive endpoints describe this sole batch/head/M group's
+    # KV intervals. They supply the independent per-partition oracle bounds.
+    native = 32 + 8
+    used = words[native + 3]
+    nbase = words[23]
+    assert words[native + 4 + 3 * 26] == 1
+    assert used > 1
+    partial = outputs[2].cpu().reshape(26, heads, 512)
+    partial_lse = outputs[3].cpu().reshape(26, heads)
+    assert partial_lse[:used].isfinite().all()
+    assert torch.isneginf(partial_lse[used:]).all()
+    begin = 0
+    for split in range(used):
+        batch = words[native + 4 + split]
+        block = words[native + 4 + 26 + split]
+        end = keys if batch or block else min(keys, words[native + 4 + 2 * 26 + split] * nbase)
+        assert begin < end <= keys
+        raw = {
+            name: value[:, :1] if name in ("q", "qv") else value[:, begin:end]
+            for name, value in case["raw"].items()
+        }
+        references = [
+            _attention_reference(raw["q"], raw["k"], raw["v"], raw["qv"], case["options"], upcast)
+            for upcast in (True, False)
+        ]
+        assert_fa_close(
+            partial[split],
+            references[0][0][0, 0],
+            references[1][0][0, 0],
+            name=f"MLA partial O {split}",
+        )
+        torch.testing.assert_close(
+            partial_lse[split], references[0][1][0, :, 0], rtol=2e-5, atol=2e-5
+        )
+        begin = end
+    assert begin == keys
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("layout", CACHE_LAYOUTS)
+@pytest.mark.parametrize(
+    "keys,cap,window",
+    [(0, 0.0, (-1, -1)), (1, 0.0, (-1, -1)), (2065, 0.5, (-1, -1)), (2065, 0.0, (7, 0))],
+    ids=["empty", "no-fd", "softcap", "window"],
+)
+def test_mla_decode_partial_storage_fallback(dtype, layout, keys, cap, window):
+    case = _make_case(
+        layout,
+        "compressed",
+        dtype,
+        q=(1,),
+        k=(keys,),
+        heads=32,
+        splits=0,
+        pack=True,
+        margin=1,
+        page=128,
+        cap=cap,
+        window=window,
+    )
+    _check(case, _call(case, _metadata(case)))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "representation,layout,heads,query,keys,splits",
+    [
+        ("compressed", "bsnd", 128, 1, 8192, 0),
+        ("compressed", "paged_bsnd", 128, 1, 8192, 0),
+        ("prefill", "bsnd", 8, 128, 128, 0),
+        ("prefill", "tnd", 8, 128, 128, 0),
+        ("prefill", "tnd", 32, 128, 128, 1),
+        ("prefill", "tnd", 128, 512, 512, 1),
+    ],
+)
+def test_mla_launch_used_lengths(dtype, causal, representation, layout, heads, query, keys, splits):
+    # Allocation bounds select the launch grid while device lengths select
+    # the active cores. Exercise both full and smaller/empty native schedules.
+    if representation == "compressed":
+        spans = [(query, keys), (query, 513), (query, 1), (query, 0)]
+    elif layout == "tnd":
+        spans = [(query, keys), (query // 2 + 1, keys - 1), (1, 0), (0, keys)]
+    else:
+        spans = [(query, keys), (query, keys - 1), (query, 1), (query, 0)]
+    case = _make_case(
+        layout,
+        representation,
+        dtype,
+        q=(query,),
+        k=(keys,),
+        used_q=(query,) if layout == "tnd" else None,
+        used_k=(keys,),
+        heads=heads,
+        kv_heads=heads,
+        splits=splits,
+        page=128,
+        causal=causal,
+    )
+    for used_q, used_k in spans:
+        case["lengths"].fill_(used_k)
+        if case["used_q"] is not None:
+            case["used_q"].fill_(used_q)
+        case["qused"], case["kused"] = [used_q], [used_k]
+        record = _metadata(case)
+        outputs = _call(case, record)
+        _check(case, outputs)
+        if splits == 0:
+            # The O-only path skips public partials and must preserve final O.
+            torch.testing.assert_close(_call(case, record, lse=False), outputs[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("representation", REPRESENTATIONS)
 @pytest.mark.parametrize("splits", [0, 1, 3])
 def test_mla_varlen_allocation_used(dtype, representation, splits):
@@ -964,6 +1102,120 @@ def test_mla_prefill_gqa(dtype, heads, kv_heads, layout):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
+@pytest.mark.parametrize("splits", [0, 1])
+@pytest.mark.parametrize(
+    "query,keys,causal,window",
+    [(17, 32, True, (-1, -1)), (33, 16, True, (-1, -1)), (17, 32, False, (2, 1))],
+)
+def test_mla_prefill_mask_head_repeats(dtype, layout, splits, query, keys, causal, window):
+    # With N=32, one vector sub-block contains 256 rows. A 259-head
+    # group covers both the 255-repeat boundary and a partial head group.
+    case = _make_case(
+        layout,
+        "prefill",
+        dtype,
+        q=(query,),
+        k=(keys,),
+        heads=259,
+        kv_heads=1,
+        splits=splits,
+        causal=causal,
+        window=window,
+    )
+    _check(case, _call(case))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_mla_prefill_single_split_balance(dtype):
+    query, heads = 2048, 128
+    lengths = torch.tensor([query], device="npu", dtype=torch.int32)
+    words = (
+        fa3.get_scheduler_metadata(
+            1,
+            query,
+            query,
+            heads,
+            heads,
+            192,
+            lengths,
+            qkv_dtype=dtype,
+            headdim_v=128,
+            causal=True,
+            num_splits=1,
+        )
+        .cpu()
+        .tolist()
+    )
+    m, n, cores = words[22:25]
+    blocks = math.ceil(query / m)
+    partition = 32 + 8
+    used = words[partition + 3]
+    work, previous = [], 0
+    for core in range(used):
+        batch_head = words[partition + 4 + core]
+        row_block = words[partition + 4 + 26 + core]
+        assert words[partition + 4 + 52 + core] == 0  # Complete Q blocks, no KV splitting.
+        end = batch_head * blocks + row_block
+        work.append(
+            sum(
+                math.ceil(min(query, (group % blocks + 1) * m) / n)
+                for group in range(previous, end)
+            )
+        )
+        previous = end
+    assert previous == heads * blocks
+    assert 0 < used <= cores
+    # Rounding a cost-balanced endpoint to a complete Q block may add one
+    # block's work. Round-robin causal ownership exceeds this bound badly.
+    assert max(work) <= math.ceil(sum(work) / used) + math.ceil(query / n)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("lse", [False, True], ids=["out_only", "with_lse"])
+def test_mla_mask_graph_thread_lifetime(dtype, lse):
+    if not hasattr(torch.npu, "NPUGraph"):
+        pytest.skip("NPU graph capture is unavailable")
+    case = _make_case("func", "prefill", dtype, q=(17,), k=(32,), causal=True)
+    expected = _call(case, lse=lse)
+    ready = torch.npu.Event()
+    ready.record()
+    device = torch.npu.current_device()
+
+    def capture():
+        torch.npu.set_device(device)
+        stream = torch.npu.Stream()
+        with torch.npu.stream(stream):
+            stream.wait_event(ready)
+            _call(case, lse=lse)  # Warm this worker's mask cache before capture.
+            stream.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph, stream=stream):
+                outputs = _call(case, lse=lse)
+            graph.replay()
+            stream.synchronize()
+        return graph, outputs, stream
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        graph, outputs, stream = executor.submit(capture).result()
+    # The worker and its thread-local mask cache no longer exist. Encourage
+    # reuse of any released 4 MiB allocation before replaying on this thread.
+    gc.collect()
+    with torch.npu.stream(stream):
+        pressure = [torch.zeros((2048, 2048), dtype=torch.uint8, device="npu") for _ in range(16)]
+    stream.synchronize()
+    graph.replay()
+    torch.npu.synchronize()
+    _equal(outputs, expected)
+    case["t"]["v"].add_(0.125)
+    expected = _call(case, lse=lse)
+    graph.replay()
+    torch.npu.synchronize()
+    _equal(outputs, expected)
+    del pressure
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
 @pytest.mark.parametrize("representation", REPRESENTATIONS)
 @pytest.mark.parametrize("layout", ["paged_bsnd", "paged_tnd"])
 # Minimum, non-power-of-two, standard and large pages, each with a partial tail.
@@ -1057,629 +1309,29 @@ def test_mla_stream_lifetime(dtype, representation, layout, splits):
     del pressure
 
 
-# (name, layout, query allocation, heads, KV used lengths, causal)
-# The fixed-source migration probes are retired. These are public shape/length
-# boundaries, including direct/FD and the BSND/TND trailing-empty regressions.
-INT8_CASES = [
-    ("decode-min", "bsnd", (1,), 1, (1,), False),
-    ("decode-h2-tail", "bsnd", (1,), 2, (127,), False),
-    ("decode-h4-page", "bsnd", (1,), 4, (128,), False),
-    ("decode-h8-page-tail", "bsnd", (1,), 8, (129,), False),
-    ("decode-h16", "bsnd", (1,), 16, (512,), False),
-    ("decode-h32", "bsnd", (1,), 32, (512,), False),
-    ("decode-h64-fd", "bsnd", (1,), 64, (4097,), False),
-    ("decode-h128", "bsnd", (1,), 128, (129,), False),
-    ("bsnd-two-query", "bsnd", (2, 2), 8, (129, 127), True),
-    ("bsnd-four-query", "bsnd", (4,), 32, (512,), True),
-    ("bsnd-sixteen-query", "bsnd", (16,), 128, (512,), True),
-    ("tnd-single-query", "tnd", (1, 1), 16, (127, 129), False),
-    ("tnd-ragged", "tnd", (2, 4, 1), 8, (129, 512, 127), True),
-    ("tnd-sixteen-query", "tnd", (16, 2), 64, (4097, 129), True),
-    ("bsnd-q32", "bsnd", (32,), 128, (512,), True),
-    ("tnd-q32", "tnd", (32,), 8, (512,), True),
-    ("bsnd-fd-balance", "bsnd", (4,), 8, (4097,), True),
-    ("decode-empty-kv", "bsnd", (1,), 4, (0,), False),
-    ("tnd-empty-q", "tnd", (0, 2), 8, (127, 129), True),
-    ("tnd-partial-tail", "tnd", (1, 0, 2), 1, (0, 129, 127), True),
-    ("bsnd-causal-empty-rows", "bsnd", (4,), 8, (2,), True),
-    ("tnd-empty-kv", "tnd", (2, 1), 8, (0, 129), True),
-    ("bsnd-mtp-fd", "bsnd", (2,), 128, (4097,), True),
-    ("tnd-fast-fd", "tnd", (4,), 8, (4097,), True),
-    ("decode-auto-tail", "bsnd", (1, 1, 1), 8, (129, 0, 0), False),
-    ("causal-auto-tail", "bsnd", (2, 2, 2), 8, (129, 0, 0), True),
-    ("decode-long-tail", "bsnd", (1, 1, 1), 8, (16385, 0, 0), False),
-    ("causal-long-tail", "bsnd", (2, 2, 2), 8, (16385, 0, 0), True),
-    ("tnd-disjoint", "tnd", (0, 2, 1), 8, (129, 0, 0), True),
-    ("tnd-tail", "tnd", (2, 0, 1), 8, (129, 0, 0), True),
-    ("tnd-long-tail", "tnd", (2, 0, 1), 8, (16385, 0, 0), True),
-]
-
-
-def _make_int8_case(
-    layout="bsnd",
-    *,
-    q=(2, 2),
-    k=(129, 127),
-    heads=8,
-    causal=True,
-    splits=0,
-    view="contiguous",
-    pattern="uniform",
-):
-    batch = len(q)
-    qshape = (sum(q), heads) if layout == "tnd" else (batch, max(q, default=0), heads)
-    capacity = max(1, math.ceil(max(k, default=0) / 128))
-    pages = batch * capacity
-    raw = dict(
-        qv=torch.randint(-127, 128, (*qshape, 512), dtype=torch.int8),
-        q=torch.randn(*qshape, 64).to(torch.bfloat16),
-        v=torch.randint(-127, 128, (pages, 128, 1, 512), dtype=torch.int8),
-        k=torch.randn(pages, 128, 1, 64).to(torch.bfloat16),
-        qs=torch.rand(*qshape) * 0.015 + 0.005,
-        ks=torch.tensor([0.0125]),
-        vs=torch.tensor([0.0175]),
-        table=torch.arange(pages - 1, -1, -1, dtype=torch.int32).reshape(batch, capacity),
-    )
-    if pattern == "uniform":
-        raw["q"].zero_()
-        raw["qv"].zero_()
-    elif pattern == "constant":
-        # Equal keys make P quantization exact. Nonzero, distinct query/head
-        # scales still affect LSE, including the source's RoPE scaling rule.
-        raw["v"].copy_(torch.tensor([-8, -1, 1, 8], dtype=torch.int8).repeat(128))
-        raw["k"].fill_(0.25)
-        raw["q"].fill_(0.125)
-        raw["qv"].copy_(torch.tensor([-2, -1, 1, 2], dtype=torch.int8).repeat(128))
-        raw["qs"].copy_(torch.linspace(-0.02, 0.02, math.prod(qshape)).reshape(qshape))
-        raw["ks"].fill_(0.125)
-        raw["vs"].fill_(0.0625)
-    elif pattern != "random":
-        raise ValueError(pattern)
-    device = {}
-    for name, value in raw.items():
-        kind = view
-        if view == "query-gap":
-            kind = "head-gap" if name in ("q", "qv") else "contiguous"
-        elif view == "scale-gap":
-            kind = "scale-head" if name == "qs" else "contiguous"
-        elif view == "allocation-gap":
-            kind = "offset" if name in ("q", "qv", "qs") else "contiguous"
-        elif view == "page-gap":
-            kind = "offset" if name in ("k", "v") else "contiguous"
-        elif view == "table-gap":
-            kind = "offset" if name == "table" else "contiguous"
-        elif view in ("row-gap", "wide-row") and name in ("k", "v"):
-            dim = value.shape[-1]
-            stride = dim + 32 if view == "row-gap" else 65536
-            size = max(0, pages - 1) * (128 * stride + 32) + 127 * stride + dim + 32
-            storage = torch.full((size,), 117, dtype=value.dtype, device="npu")
-            target = torch.as_strided(storage, value.shape, (128 * stride + 32, stride, dim, 1), 32)
-            target.copy_(value)
-            device[name] = target
-            continue
-        elif view in ("row-gap", "wide-row"):
-            kind = "contiguous"
-        elif view == "broadcast":
-            kind = "broadcast" if name in ("k", "v") else "contiguous"
-        device[name] = _view(value.to("npu"), kind)
-        if kind == "broadcast":
-            raw[name] = _view(value, kind)
-    args = dict(
-        q=device["q"],
-        qv=device["qv"],
-        k_cache=device["k"],
-        v_cache=device["v"],
-        page_table=device["table"],
-        q_descale=device["qs"],
-        k_descale=device["ks"],
-        v_descale=device["vs"],
-        cache_seqlens=torch.tensor(k, dtype=torch.int32, device="npu"),
-        cu_seqlens_q=make_cu_seqlens(q).to("npu") if layout == "tnd" else None,
-        max_seqlen_q=max(q, default=0) if layout == "tnd" else None,
-        causal=causal,
-        num_splits=splits,
-    )
-    return dict(
-        layout=layout, q=list(q), k=list(k), heads=heads, raw=raw, args=args, pattern=pattern
-    )
-
-
-def _int8_metadata(case):
-    args = case["args"]
-    return fa3.get_scheduler_metadata(
-        len(case["q"]),
-        max(case["q"], default=0),
-        args["page_table"].shape[1] * 128,
-        case["heads"],
-        1,
-        64,
-        args["cache_seqlens"],
-        qkv_dtype=torch.int8,
-        headdim_v=512,
-        page_size=128,
-        cu_seqlens_q=args["cu_seqlens_q"],
-        causal=args["causal"],
-        num_splits=args["num_splits"],
-    )
-
-
-def _int8_call(case, record=None, *, lse=True, **extra):
-    return fa3.flash_attn_with_kvcache(
-        **dict(case["args"], **extra), scheduler_metadata=record, return_softmax_lse=lse
-    )
-
-
-def _int8_check(case, outputs):
-    # Arbitrary dynamic-P quantization has documented fixed-source math limits.
-    # The numerical E2Es use uniform logits/equal keys, where the independent
-    # FP64/FP32 equations remain valid without a compiled source oracle.
-    assert case["pattern"] in ("uniform", "constant")
-    offset = 0
-    tnd = case["layout"] == "tnd"
-    out, lse = (value.cpu() for value in outputs[:2])
-    assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
-    assert out.shape == case["args"]["qv"].shape
-    raw = case["raw"]
-    for b, (nq, nk) in enumerate(zip(case["q"], case["k"])):
-        selection = slice(offset, offset + nq) if tnd else b
-        offset += nq
-        actual = out[selection]
-        logs = lse[:, selection].T if tnd else lse[b].T
-        if nk == 0:
-            assert actual.count_nonzero() == 0
-            assert torch.isneginf(logs).all()
-            continue
-        if nq == 0:
-            continue
-        refs = []
-        pages = raw["table"][b].long()
-        for dtype in (torch.float64, torch.float32):
-            q = raw["q"][selection].to(dtype).flatten(0, 1)
-            qv = raw["qv"][selection].to(dtype).flatten(0, 1)
-            k = raw["k"][pages].reshape(-1, 64)[:nk].to(dtype)
-            v = raw["v"][pages].reshape(-1, 512)[:nk].to(dtype)
-            # Fixed CANN applies Q/K scales to the combined content/RoPE score.
-            scores = (qv @ v.T + q @ k.T) * raw["qs"][selection].to(dtype).reshape(-1, 1)
-            scores *= raw["ks"].to(dtype) * (576**-0.5)
-            if case["args"]["causal"] and nq > 1:
-                allowed = (
-                    torch.arange(nk)[None, :]
-                    <= torch.arange(nq).repeat_interleave(case["heads"])[:, None] + nk - nq
-                )
-                scores.masked_fill_(~allowed, -torch.inf)
-            valid = torch.isfinite(scores).any(-1)
-            expected = torch.zeros(nq * case["heads"], 512, dtype=dtype)
-            expected_lse = torch.full((nq * case["heads"],), -torch.inf, dtype=dtype)
-            if valid.any():
-                weights = (scores[valid] - scores[valid].amax(-1, keepdim=True)).exp()
-                expected[valid] = (weights @ (v * raw["vs"].to(dtype))) / weights.sum(
-                    -1, keepdim=True
-                )
-                expected_lse[valid] = scores[valid].logsumexp(-1)
-            refs.append(
-                (
-                    expected.reshape(nq, case["heads"], 512).to(torch.bfloat16),
-                    expected_lse.reshape(nq, case["heads"]).float(),
-                )
-            )
-        assert_fa_close(actual, refs[0][0], refs[1][0], name="INT8 MLA out")
-        assert_fa_close(logs, refs[0][1], refs[1][1], name="INT8 MLA LSE")
-    _check_partials(outputs, case["args"]["num_splits"], tnd)
-
-
-@pytest.mark.parametrize("splits", [0, 1])
-@pytest.mark.parametrize(
-    "layout,q,heads,k,causal", [pytest.param(*row[1:], id=row[0]) for row in INT8_CASES]
-)
-def test_mla_int8_forward(splits, layout, q, heads, k, causal):
-    case = _make_int8_case(layout, q=q, k=k, heads=heads, causal=causal, splits=splits)
-    outputs = _int8_call(case, _int8_metadata(case))
-    _int8_check(case, outputs)
-    _equal(outputs, _int8_call(case))
-    _equal(_int8_call(case, lse=False), outputs[0])
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize(
-    "view",
-    [
-        "query-gap",
-        "scale-gap",
-        "allocation-gap",
-        "page-gap",
-        "row-gap",
-        "wide-row",
-        "broadcast",
-        "table-gap",
-    ],
-)
-def test_mla_int8_views(layout, view):
-    case = _make_int8_case(layout, q=(2, 2) if layout == "bsnd" else (2, 4), view=view)
-    _int8_check(case, _int8_call(case, _int8_metadata(case)))
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("scale", ["qs", "ks", "vs", "head-scale"])
-def test_mla_int8_scales(layout, scale):
-    case = _make_int8_case(layout, pattern="constant", view="scale-gap")
-    record = _int8_metadata(case)
-    assert record.untyped_storage().data_ptr() != _int8_metadata(case).untyped_storage().data_ptr()
-    _int8_check(case, _int8_call(case, record))
-    name = dict(qs="q_descale", ks="k_descale", vs="v_descale", **{"head-scale": "q_descale"})[
-        scale
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_mla_dense_schedule_stream_switch(dtype):
+    cases = [
+        _make_case("func", "compressed", dtype, q=(3,), k=(513,), splits=0, causal=True),
+        _make_case("func", "compressed", dtype, q=(3,), k=(513,), splits=0, causal=True),
+        _make_case("func", "prefill", dtype, q=(17,), k=(32,), splits=1, causal=True),
     ]
-    raw = "qs" if scale == "head-scale" else scale
-    if scale == "head-scale":
-        case["raw"][raw].mul_(-2)
-        case["args"][name].mul_(-2)
-    else:
-        case["raw"][raw].zero_()
-        case["args"][name].zero_()
-    _int8_check(case, _int8_call(case, record))
-    _equal(_int8_call(case, record), _int8_call(case))
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("form", ["none", "integer", "clone", "offset"])
-def test_mla_int8_length_and_record_forms(layout, form):
-    case = _make_int8_case(layout, q=(1, 1), k=(128, 128), causal=False)
-    record = _int8_metadata(case)
-    expected = _int8_call(case, record)
-    _int8_check(case, expected)
-    if form in ("none", "integer"):
-        result = _int8_call(case, record, cache_seqlens=None if form == "none" else 128)
-    elif form == "clone":
-        result = _int8_call(case, record.clone())
-    else:
-        storage = torch.empty(record.numel() + 8, dtype=record.dtype, device=record.device)
-        storage[4:-4].copy_(record)
-        result = _int8_call(case, storage[4:-4])
-    _equal(result, expected)
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-def test_mla_int8_failed_metadata_can_be_copied(layout):
-    # Invalid device lengths publish a failure record. Generation and copying
-    # stay usable; consumption rejects the failure status before attention.
-    case = _make_int8_case(layout)
-    case["args"]["cache_seqlens"][0] = -1
-    record = _int8_metadata(case)
-    copied = record.clone()
-    torch.npu.synchronize()
-    assert record.dtype == copied.dtype == torch.int32
-    assert record.shape == copied.shape and copied.device == case["args"]["q"].device
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("empty", ["query", "batch", "pool"])
-def test_mla_int8_empty(layout, empty):
-    case = _make_int8_case(
-        layout,
-        q=() if empty == "batch" else (0, 0) if empty == "query" else (2, 2),
-        k=() if empty == "batch" else (0, 0) if empty == "pool" else (129, 127),
-    )
-    if empty == "pool":
-        case["args"]["k_cache"] = case["args"]["k_cache"][:0]
-        case["args"]["v_cache"] = case["args"]["v_cache"][:0]
-    outputs = _int8_call(case)
-    _int8_check(case, outputs)
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("lse", [False, True])
-@pytest.mark.parametrize("metadata", [False, True], ids=["implicit", "generated"])
-def test_mla_int8_fake_compile(layout, lse, metadata):
-    case = _make_int8_case(layout, pattern="constant")
-    _int8_check(case, _int8_call(case))
-    args = dict(case["args"], return_softmax_lse=lse)
-
-    def forward(**kwargs):
-        if metadata:
-            kwargs["scheduler_metadata"] = _int8_metadata(dict(case, args=kwargs))
-        return fa3.flash_attn_with_kvcache(**kwargs)
-
-    expected = forward(**args)
-    metadata_shape = _int8_metadata(case).shape
-    with FakeTensorMode() as mode:
-        fake = {
-            key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-            for key, value in args.items()
-        }
-        result = forward(**fake)
-        actuals, refs = (result, expected) if lse else ((result,), (expected,))
-        for a, b in zip(actuals, refs):
-            assert (a.shape, a.stride(), a.dtype, a.device) == (
-                b.shape,
-                b.stride(),
-                b.dtype,
-                b.device,
-            )
-        fake_case = dict(
-            case,
-            args={
-                key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-                for key, value in case["args"].items()
-            },
-        )
-        assert _int8_metadata(fake_case).shape == metadata_shape
-    torch._dynamo.reset()
-    compiled = torch.compile(forward, backend="eager", fullgraph=True, dynamic=False)
-    _equal(compiled(**args), expected)
-    args["v_descale"].mul_(2)
-    _equal(compiled(**args), forward(**args))
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-def test_mla_int8_stream_lifetime(layout):
-    case = _make_int8_case(layout, view="query-gap")
-    record = _int8_metadata(case)
-    expected = _int8_call(case, record)
-    _int8_check(case, expected)
     ready = torch.npu.Event()
     ready.record()
-    work = []
-    for _ in range(3):
-        stream = torch.npu.Stream()
+    first, second = torch.npu.Stream(), torch.npu.Stream()
+    retained = []
+    for stream in (first, second, first):
         with torch.npu.stream(stream):
             stream.wait_event(ready)
-            work.append((stream, _int8_call(case, record)))
-    del case, record
-    gc.collect()
-    pressure = [torch.empty(262144, device="npu") for _ in range(4)]
-    for stream, result in work:
-        stream.synchronize()
-        _equal(result, expected)
-    assert len({result[0].data_ptr() for _, result in work}) == 3
-    del pressure
-
-
-INT8_INVALID = [
-    "missing-scale",
-    "missing-key-scale",
-    "missing-value-scale",
-    "rope-dtype",
-    "content-dtype",
-    "scale-dtype",
-    "scale-shape",
-    "key-scale-shape",
-    "value-scale-shape",
-    "fp8-scale-shape",
-    "q-scale-cpu",
-    "k-scale-cpu",
-    "v-scale-cpu",
-    "q-scale-grad",
-    "k-scale-grad",
-    "v-scale-grad",
-    "page-size",
-    "heads",
-    "query-limit",
-    "noncausal",
-    "split",
-    "softcap",
-    "window",
-    "pack",
-    "margin",
-    "append",
-    "rotary",
-    "grad",
-    "metadata-size",
-    "length-dtype",
-    "q-last-stride",
-    "prefix",
-]
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
-@pytest.mark.parametrize("fault", INT8_INVALID)
-def test_mla_int8_rejections(layout, fake, fault):
-    case = _make_int8_case(layout)
-    args = dict(case["args"])
-    if fault == "missing-scale":
-        args["q_descale"] = None
-    elif fault == "missing-key-scale":
-        args["k_descale"] = None
-    elif fault == "missing-value-scale":
-        args["v_descale"] = None
-    elif fault == "rope-dtype":
-        args["q"] = args["q"].half()
-    elif fault == "content-dtype":
-        args["qv"] = args["qv"].bfloat16()
-    elif fault == "scale-dtype":
-        args["q_descale"] = args["q_descale"].bfloat16()
-    elif fault == "scale-shape":
-        args["q_descale"] = args["q_descale"][..., :1]
-    elif fault == "key-scale-shape":
-        args["k_descale"] = args["k_descale"].expand(2)
-    elif fault == "value-scale-shape":
-        args["v_descale"] = args["v_descale"].expand(2)
-    elif fault == "fp8-scale-shape":
-        args["q_descale"] = torch.ones(len(case["q"]), 1, device="npu")
-    elif fault.endswith("-scale-cpu"):
-        name = fault[0] + "_descale"
-        args[name] = args[name].cpu()
-    elif fault.endswith("-scale-grad"):
-        args[fault[0] + "_descale"].requires_grad_(True)
-    elif fault == "page-size":
-        args["k_cache"], args["v_cache"] = args["k_cache"][:, :64], args["v_cache"][:, :64]
-    elif fault == "heads":
-        for key in ("q", "qv"):
-            args[key] = args[key][..., :3, :]
-        args["q_descale"] = args["q_descale"][..., :3]
-    elif fault == "query-limit":
-        if layout == "tnd":
-            args["max_seqlen_q"] = 33
-        else:
-            for key in ("q", "qv", "q_descale"):
-                shape = list(args[key].shape)
-                shape[1] = 33
-                args[key] = torch.empty(shape, dtype=args[key].dtype, device="npu")
-    elif fault == "noncausal":
-        args["causal"] = False
-    elif fault in ("split", "softcap", "window", "pack", "margin"):
-        name, value = dict(
-            split=("num_splits", 2),
-            softcap=("softcap", 2),
-            window=("window_size", (64, 0)),
-            pack=("pack_gqa", False),
-            margin=("sm_margin", 1),
-        )[fault]
-        args[name] = value
-    elif fault == "append":
-        args["k"] = args["k_cache"]
-    elif fault == "rotary":
-        args["rotary_cos"] = args["q"]
-    elif fault == "grad":
-        args["q"].requires_grad_(True)
-    elif fault == "metadata-size":
-        args["scheduler_metadata"] = _int8_metadata(case)[:-1]
-    elif fault == "length-dtype":
-        args["cache_seqlens"] = args["cache_seqlens"].long()
-    elif fault == "q-last-stride":
-        q = args["q"]
-        storage = torch.empty((*q.shape[:-1], 2 * q.shape[-1]), dtype=q.dtype, device=q.device)
-        args["q"] = storage[..., ::2].copy_(q)
-    elif fault == "prefix":
-        args["cu_seqlens_q"] = (
-            None if layout == "tnd" else torch.tensor([0, 2, 4], dtype=torch.int32, device="npu")
-        )
-    with FakeTensorMode() if fake else nullcontext() as mode:
-        if fake:
-            args = {
-                key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-                for key, value in args.items()
-            }
-        match = "q rank must match" if fault == "prefix" else "MLA"
-        with pytest.raises(RuntimeError, match=match):
-            fa3.flash_attn_with_kvcache(**args)
-
-
-@pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
-@pytest.mark.parametrize(
-    "fault", ["missing-max", "prefix-dtype", "prefix-shape", "prefix-stride", "nonpaged"]
-)
-def test_mla_int8_tnd_rejections(fake, fault):
-    case = _make_int8_case("tnd")
-    args = dict(case["args"])
-    if fault == "missing-max":
-        args["max_seqlen_q"] = None
-    elif fault == "prefix-dtype":
-        args["cu_seqlens_q"] = args["cu_seqlens_q"].long()
-    elif fault == "prefix-shape":
-        args["cu_seqlens_q"] = args["cu_seqlens_q"][:-1]
-    elif fault == "prefix-stride":
-        args["cu_seqlens_q"] = torch.zeros(6, dtype=torch.int32, device="npu")[::2]
-    else:
-        args["page_table"] = None
-    with FakeTensorMode() if fake else nullcontext() as mode:
-        if fake:
-            args = {
-                key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-                for key, value in args.items()
-            }
-        with pytest.raises(RuntimeError, match="MLA"):
-            fa3.flash_attn_with_kvcache(**args)
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("fault", ["missing-scale", "q", "q_descale", "k_descale", "v_descale"])
-def test_mla_int8_compile_rejection(layout, fault):
-    case = _make_int8_case(layout)
-    if fault == "missing-scale":
-        case["args"]["q_descale"] = None
-    else:
-        case["args"][fault].requires_grad_(True)
-    match = "MLA INT8.*descale" if fault == "missing-scale" else "grad"
-    with pytest.raises(RuntimeError, match=match):
-        _int8_call(case)
-    torch._dynamo.reset()
-    compiled = torch.compile(lambda: _int8_call(case), backend="eager", fullgraph=True)
-    if fault != "missing-scale":
-        case["args"][fault].requires_grad_(False)
-        compiled()
-        case["args"][fault].requires_grad_(True)
-    with pytest.raises(RuntimeError, match=match):
-        compiled()
-
-
-@pytest.mark.parametrize("name", ["q_descale", "k_descale", "v_descale"])
-def test_mla_int8_fake_scale_device(name):
-    case = _make_int8_case()
-    with FakeTensorMode() as mode:
-        args = {
-            key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-            for key, value in case["args"].items()
-        }
-        args[name] = torch.empty(args[name].shape, device="npu:1")
-        with pytest.raises(RuntimeError, match="same NPU device"):
-            fa3.flash_attn_with_kvcache(**args)
-
-
-@pytest.mark.parametrize("layout", ["bsnd", "tnd"])
-@pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
-def test_mla_int8_empty_accumulators_default_dtype(layout, fake):
-    case = _make_int8_case(layout, splits=1)
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        with FakeTensorMode() if fake else nullcontext() as mode:
-            if fake:
-                case["args"] = {
-                    key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
-                    for key, value in case["args"].items()
-                }
-            out, lse, *empty = _int8_call(case)
-            assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
-            for tensor in empty:
-                assert tensor.shape == (0,) and tensor.dtype == torch.float64
-                assert tensor.device == case["args"]["q"].device
-    finally:
-        torch.set_default_dtype(previous)
-
-
-@pytest.mark.parametrize("layout", ["func", "tnd", "paged_bsnd"])
-@pytest.mark.parametrize(
-    "name", ["mla_q_scale", "mla_k_scale", "mla_v_scale", "return_accumulators"]
-)
-def test_mla_nonstandard_parameters_rejected(layout, name):
-    case = _make_case(layout)
-    with pytest.raises(TypeError, match=name):
-        _call(case, **{name: None})
-
-
-@pytest.mark.parametrize("layout", ["func", "tnd", "paged_bsnd", "paged_tnd"])
-@pytest.mark.parametrize("mixed", [False, True], ids=["int8", "mixed-int8"])
-@pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
-def test_mla_int8_unconfigured_rejected(layout, mixed, fake):
-    case = _make_case(layout, dtype=torch.bfloat16)
-    for name in ("qv", "v") if mixed else ("q", "k", "v", "qv"):
-        case["t"][name] = case["t"][name].to(torch.int8)
-    with FakeTensorMode(allow_non_fake_inputs=True) if fake else nullcontext():
-        with pytest.raises(RuntimeError, match="MLA"):
-            _call(case)
-        if layout in CACHE_LAYOUTS:
-            with pytest.raises(RuntimeError, match="MLA INT8"):
-                fa3.get_scheduler_metadata(
-                    len(case["q"]),
-                    case["sq"],
-                    case["sk"],
-                    case["t"]["q"].shape[-2],
-                    1,
-                    64,
-                    case["lengths"],
-                    qkv_dtype=torch.int8,
-                    headdim_v=512,
-                )
-
-
-@pytest.mark.parametrize("layout", ["func", "tnd", "paged_bsnd", "paged_tnd"])
-def test_mla_int8_unconfigured_compile_rejected(layout):
-    case = _make_case(layout, dtype=torch.bfloat16)
-    case["t"]["qv"] = case["t"]["qv"].to(torch.int8)
-    case["t"]["v"] = case["t"]["v"].to(torch.int8)
-    torch._dynamo.reset()
-    with pytest.raises(RuntimeError, match="MLA"):
-        torch.compile(lambda: _call(case), backend="eager", fullgraph=True)()
+            for _ in range(4):
+                for case in cases:
+                    _call(case, lse=False)
+            retained.extend((case, _call(case)) for case in cases)
+    torch.npu.empty_cache()
+    first.synchronize()
+    second.synchronize()
+    for case, output in retained:
+        _check(case, output)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
@@ -1754,6 +1406,8 @@ def test_mla_invalid_inputs(dtype, fake, fault):
 
 INVALID_OPTIONS = [
     ("attention_chunk", 1),
+    ("attention_chunk", 0.0),
+    ("rotary_interleaved", "invalid"),
     ("num_splits", -1),
     ("num_splits", 257),
     ("pack_gqa", "invalid"),
@@ -1781,11 +1435,14 @@ INVALID_OPTIONS = [
     + [
         ("func", "attention_chunk", 1),
         ("tnd", "attention_chunk", 1),
+        ("func", "attention_chunk", 0.0),
+        ("tnd", "attention_chunk", 0.0),
         ("func", "q_descale", 1),
         ("tnd", "q_descale", 1),
     ],
 )
-def test_mla_unsupported_options(representation, layout, fake, name, value):
+@pytest.mark.parametrize("lse", [False, True], ids=["out_only", "with_lse"])
+def test_mla_unsupported_options(representation, layout, fake, name, value, lse):
     case = _make_case(layout, representation)
     with FakeTensorMode() if fake else nullcontext() as mode:
         if fake:
@@ -1795,7 +1452,7 @@ def test_mla_unsupported_options(representation, layout, fake, name, value):
             }
             case["t"] = {key: mode.from_tensor(value) for key, value in case["t"].items()}
         with pytest.raises(RuntimeError):
-            _call(case, **{name: value})
+            _call(case, lse=lse, **{name: value})
 
 
 @pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
@@ -1847,7 +1504,8 @@ def test_mla_cache_update_rejected(layout, fake, name):
     + [("prefill", name) for name in ("q", "k", "v")],
 )
 @pytest.mark.parametrize("inference", [False, True])
-def test_mla_grad_rejected(execution, layout, representation, name, inference):
+@pytest.mark.parametrize("lse", [False, True], ids=["out_only", "with_lse"])
+def test_mla_grad_rejected(execution, layout, representation, name, inference, lse):
     # requires_grad rejection is dtype-independent, including inference mode.
     case = _make_case(layout, representation)
     case["t"][name].requires_grad_(True)
@@ -1862,14 +1520,14 @@ def test_mla_grad_rejected(execution, layout, representation, name, inference):
             if execution == "compile":
                 torch._dynamo.reset()
                 case["t"][name].requires_grad_(False)
-                compiled = torch.compile(lambda: _call(case), backend="eager", fullgraph=True)
+                compiled = torch.compile(lambda: _call(case, lse=lse), backend="eager", fullgraph=True)
                 compiled()
                 case["t"][name].requires_grad_(True)
             with pytest.raises(RuntimeError, match="grad"):
                 if execution == "compile":
                     compiled()
                 else:
-                    _call(case)
+                    _call(case, lse=lse)
 
 
 @pytest.mark.parametrize("layout", CACHE_LAYOUTS)
@@ -1973,7 +1631,7 @@ def test_mla_default_options(representation, layout):
     _equal(torch.compile(lambda: _call(case), backend="eager", fullgraph=True)(), expected)
 
 
-@pytest.mark.parametrize("representation", ["compressed", "prefill", "int8"])
+@pytest.mark.parametrize("representation", REPRESENTATIONS)
 @pytest.mark.parametrize("fake", [False, True], ids=["real", "fake"])
 @pytest.mark.parametrize(
     "fault",
@@ -2007,7 +1665,7 @@ def test_mla_metadata_input_rejections(representation, fake, fault):
         num_heads_kv=1,
         headdim=192 if representation == "prefill" else 64,
         headdim_v=128 if representation == "prefill" else 512,
-        qkv_dtype=torch.int8 if representation == "int8" else torch.bfloat16,
+        qkv_dtype=torch.bfloat16,
         cache_seqlens=torch.full((2,), 128, dtype=torch.int32, device="npu"),
         cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device="npu"),
         page_size=128,
@@ -2061,3 +1719,45 @@ def test_mla_prefill_bnsd_storage(dtype, layout):
         assert not tensor.is_contiguous()
         case["t"][name] = tensor
     _check(case, _call(case))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_mla_varlen_unbalanced_fd_vectors(dtype):
+    cores = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    case = _make_case(
+        "tnd",
+        "prefill",
+        dtype,
+        q=(33, 7, 17, 257, 0, 3),
+        k=(8192,) * 6,
+        used_q=(6, 5, 4, 68, 0, 3),
+        used_k=(863, 5071, 1424, 981, 534, 0),
+        heads=1,
+        kv_heads=1,
+        splits=0,
+        causal=True,
+        pack=False,
+        margin=max(0, cores - 13),
+    )
+    _check(case, _call(case))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp16", "bf16"])
+def test_mla_kvcache_unbalanced_fd_vectors(dtype):
+    cores = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    case = _make_case(
+        "mixed",
+        "prefill",
+        dtype,
+        q=(6, 5, 4, 68, 0, 3),
+        k=(8192,) * 6,
+        used_k=(863, 5071, 1424, 981, 534, 0),
+        heads=1,
+        kv_heads=1,
+        splits=0,
+        causal=True,
+        pack=False,
+        margin=max(0, cores - 13),
+    )
+    _check(case, _call(case))
+    _check(case, _call(case, _metadata(case)))

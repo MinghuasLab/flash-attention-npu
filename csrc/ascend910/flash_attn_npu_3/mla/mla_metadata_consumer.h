@@ -91,12 +91,11 @@ MLA_METADATA_INLINE bool ValidPagedMetadataAddress(uint64_t address, uint64_t co
 }
 
 // Validate the full physical view, including pages unused by this invocation.
-// Default Hkv=1 preserves compressed MLA; prefill passes its actual KV heads.
 // Singleton/empty strides stay unused.
 MLA_METADATA_INLINE bool ValidPagedCacheTensor(const MlaBsndTensorLayout& x, const MlaPagedMetadataArray& buffer,
-                                               uint64_t pages, uint64_t pageSize, uint64_t dim, uint64_t heads = 1,
-                                               uint32_t bytes = 2)
+                                               uint64_t pages, uint64_t pageSize, uint64_t dim, uint64_t heads = 1)
 {
+    constexpr uint32_t bytes = 2;
     if (!heads || !pageSize || x.batchStride > INT64_MAX || x.rowStride > INT64_MAX || x.headStride > INT64_MAX ||
         !ValidPagedMetadataAddress(buffer.address, buffer.count, bytes)) {
         return false;
@@ -120,9 +119,8 @@ MLA_METADATA_INLINE bool ValidPagedCacheTensor(const MlaBsndTensorLayout& x, con
 }
 
 MLA_METADATA_INLINE MlaMetadataReadStatus CheckPagedCacheDescriptor(const MlaContext& c,
-                                                                    const MlaPagedCacheInputs& input,
-                                                                    uint64_t heads = 1, uint64_t keyDim = 64,
-                                                                    uint64_t valueDim = 512)
+                                                                    const MlaPagedCacheInputs& input, uint64_t heads,
+                                                                    uint64_t keyDim, uint64_t valueDim)
 {
     using Status = MlaMetadataReadStatus;
     const auto& p = input.layout;
@@ -145,8 +143,7 @@ MLA_METADATA_INLINE MlaMetadataReadStatus CheckPagedCacheDescriptor(const MlaCon
         return Status::InvalidPageTable;
     }
     if (!ValidPagedCacheTensor(p.k, input.k, p.physicalPages, p.pageSize, keyDim, heads) ||
-        !ValidPagedCacheTensor(p.v, input.v, p.physicalPages, p.pageSize, valueDim, heads,
-                               c.dtype == uint32_t(MlaMetadataDtype::Int8) ? 1 : 2)) {
+        !ValidPagedCacheTensor(p.v, input.v, p.physicalPages, p.pageSize, valueDim, heads)) {
         return Status::InvalidBuffer;
     }
     return Status::Success;
@@ -169,10 +166,10 @@ struct alignas(64) MlaCheckedAutoSplitSchedule {
 static_assert(std::is_trivially_copyable_v<MlaCheckedAutoSplitSchedule>);
 static_assert(sizeof(MlaCheckedAutoSplitSchedule) % 64 == 0);
 #if defined(__NPU_ARCH__) && __NPU_ARCH__ == 2201
-template <typename Checked, typename Schedule>
-__aicore__ inline bool LoadCheckedSchedule(uint64_t address, uint32_t dtype, Schedule& schedule,
-                                           uint32_t* mode = nullptr)
+__aicore__ inline bool LoadCheckedAutoSplitSchedule(uint64_t address, uint32_t dtype,
+                                                    MlaAutoSplitBsndSchedule& schedule)
 {
+    using Checked = MlaCheckedAutoSplitSchedule;
     if (!address || address % alignof(Checked) || address > UINT64_MAX - sizeof(Checked)) {
         AscendC::Trap();
         return false;
@@ -195,18 +192,12 @@ __aicore__ inline bool LoadCheckedSchedule(uint64_t address, uint32_t dtype, Sch
     const uint32_t status = header[0], blockDim = header[1], actualDtype = header[2];
     pipe_barrier(PIPE_ALL);
     if (status != uint32_t(MlaMetadataReadStatus::Success) || blockDim != AscendC::GetBlockNum() ||
-        actualDtype != dtype) {
+        actualDtype != dtype || !schedule.usedCoreNum || schedule.usedCoreNum > blockDim ||
+        schedule.vectors > 2 * blockDim) {
         AscendC::Trap();
         return false;
     }
-    if (mode)
-        *mode = header[3];
     return true;
-}
-__aicore__ inline bool LoadCheckedAutoSplitSchedule(uint64_t address, uint32_t dtype,
-                                                    MlaAutoSplitBsndSchedule& schedule)
-{
-    return LoadCheckedSchedule<MlaCheckedAutoSplitSchedule>(address, dtype, schedule);
 }
 #endif
 struct MlaAutoSplitBsndTask {
@@ -268,7 +259,8 @@ MLA_METADATA_INLINE void Geometry(const Reader& read, const MlaAutoSplitBsndSche
 // this M's visible interval; do not uniformly divide by maxSplits.
 MLA_METADATA_INLINE uint32_t Parts(const MlaAutoSplitBsndSchedule& s, MlaAutoSplitBsndTask& t,
                                    uint32_t owner = UINT32_MAX, uint32_t* ownerSplit = nullptr,
-                                   uint16_t* begin = nullptr, uint16_t* end = nullptr)
+                                   uint16_t* begin = nullptr, uint16_t* end = nullptr,
+                                   uint32_t capacity = UINT32_MAX)
 {
     const uint32_t start = t.s2Begin, stop = t.s2End;
     if (start >= stop)
@@ -297,6 +289,8 @@ MLA_METADATA_INLINE uint32_t Parts(const MlaAutoSplitBsndSchedule& s, MlaAutoSpl
     }
     const uint32_t last = lo < s.usedCoreNum ? lo + 1 : lo;
     const uint32_t count = last - first;
+    if (begin && count > capacity)
+        return 0;
     if (ownerSplit && owner >= first && owner < last)
         *ownerSplit = owner - first;
     if (!begin && t.split >= count)
@@ -330,7 +324,7 @@ MLA_METADATA_INLINE void Offsets(const MlaAutoSplitBsndSchedule& s, uint64_t row
 }
 } // namespace auto_split_detail
 
-template <typename Reader>
+template <bool SingleGroupFastPath = false, typename Reader>
 MLA_METADATA_INLINE MlaMetadataReadStatus ReadAutoSplitPartitions(const Reader& read, const MlaUsedMetadataContext& c,
                                                                   const MlaWindowKernelParams& w,
                                                                   const MlaUsedKernelSchedule& used,
@@ -375,6 +369,7 @@ MLA_METADATA_INLINE MlaMetadataReadStatus ReadAutoSplitPartitions(const Reader& 
         }
     }
     s.groups = prefix;
+    const bool singleUnmaskedGroup = SingleGroupFastPath && live && c.batch == 1 && s.groups == 1 && !w.kind;
     for (uint32_t core = 0; core < 26; ++core) {
         const uint32_t b = read(base + kMlaNativeBEnd + core), m = read(base + kMlaNativeMEnd + core),
                        n = read(base + kMlaNativeNEnd + core);
@@ -386,19 +381,26 @@ MLA_METADATA_INLINE MlaMetadataReadStatus ReadAutoSplitPartitions(const Reader& 
         if (b > c.batch || (b == c.batch && (m || n)))
             return Status::InvalidEndpoints;
         if (b < c.batch) {
-            const uint64_t rows = uint64_t(QueryLength<false>(read, b)) * a.heads;
-            const uint32_t count = empty ? 0 : (rows + a.mBaseSize - 1) / a.mBaseSize;
+            uint32_t count = 1;
+            if (!singleUnmaskedGroup) {
+                const uint64_t rows = uint64_t(QueryLength<false>(read, b)) * a.heads;
+                count = empty ? 0 : (rows + a.mBaseSize - 1) / a.mBaseSize;
+            }
             if (m >= (count ? count : 1) || (!count && n))
                 return Status::InvalidEndpoints;
             if (n) {
-                MlaAutoSplitBsndTask t{};
-                t.batch = b;
-                t.m = m;
-                Geometry<false>(read, s, w, t);
+                uint32_t endTile = lastN + 1;
+                if (!singleUnmaskedGroup) {
+                    MlaAutoSplitBsndTask t{};
+                    t.batch = b;
+                    t.m = m;
+                    Geometry<false>(read, s, w, t);
+                    endTile = t.s2End;
+                }
                 // Native cost partitioning can stop at/before the first
                 // visible tile of a local window. That empty prefix belongs
                 // to neither an FD fragment nor persistent storage.
-                if (n > t.s2End)
+                if (n > endTile)
                     return Status::InvalidEndpoints;
             }
         }
@@ -442,13 +444,18 @@ MLA_METADATA_INLINE MlaMetadataReadStatus ReadAutoSplitPartitions(const Reader& 
     if (heads != s.fdHeads || maxSplits != s.maxSplits || s.partialPrefix[heads] > uint64_t(2) * c.aicNum ||
         (heads == 0 ? s.vectors != 0 : s.vectors == 0))
         return Status::InvalidEndpoints;
+    // Parts has counted one nonempty slice per core for this sole group.
+    // Its inverse mapping is the core index, even for unequal slice lengths.
+    const bool oneSplitPerCore = singleUnmaskedGroup && heads == 1 && maxSplits == s.usedCoreNum;
     for (uint32_t i = 0; i < 26; ++i) {
         if (i >= heads && (read(base + kMlaNativeFdBatch + i) || read(base + kMlaNativeFdM + i) ||
                            read(base + kMlaNativeFdSplits + i) || read(base + kMlaNativeFdParts + i) ||
                            read(base + kMlaNativeFdLastRows + i)))
             return Status::InvalidEndpoints;
         uint32_t startSplit = 0;
-        if (i && i < s.usedCoreNum && s.nEnd[i - 1]) {
+        if (oneSplitPerCore && i < s.usedCoreNum) {
+            startSplit = i;
+        } else if (i && i < s.usedCoreNum && s.nEnd[i - 1]) {
             MlaAutoSplitBsndTask t{};
             t.batch = s.bEnd[i - 1];
             t.m = s.mEnd[i - 1];
@@ -578,7 +585,7 @@ struct MlaPartitionView {
         return read(MlaSequenceWord((i / 8) / layout.headGroups) + i % 8);
     }
 };
-template <typename Reader, typename Arrays>
+template <bool SingleGroupFastPath = false, typename Reader, typename Arrays>
 MLA_METADATA_INLINE MlaMetadataReadStatus ReadMlaMetadata(const Reader& read, const MlaContext& c, const Arrays& arrays,
                                                           MlaLayout& layout, MlaAutoSplitBsndSchedule& output)
 {
@@ -643,11 +650,22 @@ MLA_METADATA_INLINE MlaMetadataReadStatus ReadMlaMetadata(const Reader& read, co
     logical.query.maxLength = c.sq;
     logical.kv.maxLength = c.sk;
     MlaAutoSplitBsndSchedule s{};
-    status = ReadAutoSplitPartitions(MlaPartitionView<Reader>{read, c, l}, logical, c.window, used, s);
+    status = ReadAutoSplitPartitions<SingleGroupFastPath>(MlaPartitionView<Reader>{read, c, l}, logical, c.window, used,
+                                                         s);
     if (status != S::Success)
         return status;
+    if (c.splits == 1) {
+        if (s.fdHeads || s.maxSplits || s.vectors)
+            return S::InvalidEndpoints;
+        for (uint32_t core = 0; core < s.usedCoreNum; ++core)
+            if (s.nEnd[core])
+                return S::InvalidEndpoints;
+    }
     if (s.groups > l.groups)
         return S::InvalidPrefixes;
+    const uint32_t launchCores = MlaStaticLaunchCores(c);
+    if (!launchCores || s.usedCoreNum > launchCores || s.vectors > 2 * launchCores)
+        return S::InvalidTiling;
     s.outOffset = l.outOffset;
     s.sumOffset = l.sumOffset;
     s.maxOffset = l.maxOffset;
@@ -708,6 +726,278 @@ MLA_METADATA_INLINE void SplitBsndFragment(uint32_t q, uint32_t k, uint32_t head
     begin = begin > stop ? stop : begin;
     end = begin + width > stop ? stop : begin + width;
 }
+
+template <bool AllowBsnd = false, typename Reader>
+MLA_METADATA_INLINE bool MlaNeedsOutputInit(const Reader& read, const MlaContext& c, const MlaAutoSplitBsndSchedule& s)
+{
+    // Match the source's normal TND fast path. Empty/unused rows still need
+    // defined O, and masked FD fragments retain conservative initialization.
+    if ((!AllowBsnd && !MlaTnd(c)) || MlaEmptyKv(c) || (s.fdHeads && c.window.kind))
+        return true;
+    for (uint32_t b = 0; b < c.batch; ++b) {
+        const uint32_t word = MlaSequenceWord(b);
+        const uint32_t q = read(word + 6), k = read(word + 7);
+        if (q != read(word + 4) || !k)
+            return true;
+        const int64_t delta = int64_t(k) - q;
+        if (c.window.kind == 1 && delta < 0)
+            return true;
+        if (c.window.kind == 2 && delta + c.window.right < 0)
+            return true;
+    }
+    return false;
+}
+
+template <typename Reader>
+MLA_METADATA_INLINE bool MlaOwnedGroups(const Reader& read, const MlaContext& c, const MlaAutoSplitBsndSchedule& s,
+                                        uint32_t core, uint64_t& first, uint64_t& last)
+{
+    if (core >= s.usedCoreNum)
+        return false;
+    const uint32_t prefix = MlaTail(c) + kMlaNativePartitionWords;
+    const uint32_t batch = core ? s.bEnd[core - 1] : 0;
+    first = ReadMetadataWide(read, prefix + 2 * batch) + (core ? s.mEnd[core - 1] : 0);
+    last = ReadMetadataWide(read, prefix + 2 * s.bEnd[core]) + s.mEnd[core] + (s.nEnd[core] != 0);
+    last = last < s.groups ? last : s.groups;
+    return first < last;
+}
+
+// A validated splits=1 record contains only complete M endpoints and no FD
+// state. Advance its physical-batch/head/M axes directly, like the source
+// kernel, without searching the prefix or core partitions for every M.
+struct MlaWholeMCursor {
+    uint64_t group = 0, last = 0, queryStart = 0, kvStart = 0;
+    uint32_t batch = 0, m = 0, head = 0, physicalBatch = 0, core = 0;
+    uint32_t queryLength = 0, kvLength = 0, mBlocks = 0, taskBatch = 0, taskHead = 0;
+    bool lengthsLoaded = false;
+
+    MLA_METADATA_INLINE void Init(const MlaLayout& l, const MlaAutoSplitBsndSchedule& s, uint32_t owner, uint64_t first,
+                                  uint64_t end)
+    {
+        group = first;
+        last = end;
+        core = owner;
+        batch = owner ? s.bEnd[owner - 1] : 0;
+        m = owner ? s.mEnd[owner - 1] : 0;
+        physicalBatch = batch / l.headGroups;
+        head = batch % l.headGroups;
+        lengthsLoaded = false;
+    }
+
+    struct Lengths {
+        uint32_t q, k;
+        MLA_METADATA_INLINE uint32_t operator()(uint32_t word) const
+        {
+            return word % 8 == 6 ? q : k;
+        }
+    };
+
+    template <typename Reader>
+    MLA_METADATA_INLINE bool Next(const Reader& read, const MlaContext& c, const MlaLayout& l,
+                                  const MlaAutoSplitBsndSchedule& s, MlaAutoSplitBsndTask& output)
+    {
+        if (group >= last)
+            return false;
+        while (physicalBatch < c.batch) {
+            if (!lengthsLoaded) {
+                const uint32_t word = MlaSequenceWord(physicalBatch);
+                queryLength = read(word + 6);
+                kvLength = read(word + 7);
+                mBlocks = (uint64_t(queryLength) * l.g + l.m - 1) / l.m;
+                queryStart = MlaTnd(c) ? ReadMetadataWide(read, word) : 0;
+                kvStart = c.layout == 1 ? ReadMetadataWide(read, word + 2) : 0;
+                lengthsLoaded = true;
+            }
+            if (mBlocks)
+                break;
+            // Empty Q contributes no M groups, including all virtual heads.
+            batch += l.headGroups - head;
+            head = m = 0;
+            ++physicalBatch;
+            lengthsLoaded = false;
+        }
+        if (physicalBatch == c.batch)
+            return false;
+
+        MlaAutoSplitBsndTask t{};
+        t.group = group;
+        t.slot = UINT64_MAX;
+        t.fdHead = UINT32_MAX;
+        t.batch = batch;
+        t.m = m;
+        t.splitCount = 1;
+        auto_split_detail::Geometry<false>(Lengths{queryLength, kvLength}, s, c.window, t);
+        const bool empty = t.s2Begin == t.s2End;
+        t.kind = empty ? 2 : 0;
+        t.owner = empty ? group % s.aicNum : core;
+        output = t;
+        // Snapshot the task axes before advancing to the next physical batch.
+        taskBatch = physicalBatch;
+        taskHead = head;
+
+        ++group;
+        if (++m == mBlocks) {
+            m = 0;
+            ++batch;
+            if (++head == l.headGroups) {
+                head = 0;
+                ++physicalBatch;
+                lengthsLoaded = false;
+            }
+        }
+        return true;
+    }
+};
+
+// Source bN2/M/S2 traversal over a validated native partition. Each result is
+// one visible owner fragment; the task ring enumerates its contiguous S2s.
+struct MlaNativeAutoCursor {
+    uint64_t group = 0, last = 0, queryStart = 0, kvStart = 0;
+    uint32_t batch = 0, m = 0, head = 0, physicalBatch = 0, core = 0, headGroups = 1;
+    uint32_t firstBatch = 0, firstM = 0, firstN = 0, finalBatch = 0, finalM = 0, finalN = 0;
+    uint32_t base = 0, firstSplit = 0, queryLength = 0, kvLength = 0, mBlocks = 0;
+    uint32_t taskBatch = 0, taskHead = 0;
+    uint32_t fd = 0, fdBatch = 0, fdM = 0, fdSplits = 0;
+    bool lengthsLoaded = false, fdLoaded = false, valid = true;
+
+    template <bool IsPaged = false, typename Reader>
+    MLA_METADATA_INLINE void Init(const Reader& read, const MlaAutoSplitBsndSchedule& s, uint32_t owner,
+                                  uint32_t physicalHeadGroups = 1)
+    {
+        core = owner;
+        headGroups = physicalHeadGroups;
+        base = auto_split_detail::Base<IsPaged>(s.used.tiling.batch);
+        firstBatch = owner ? s.bEnd[owner - 1] : 0;
+        firstM = owner ? s.mEnd[owner - 1] : 0;
+        firstN = owner ? s.nEnd[owner - 1] : 0;
+        finalBatch = s.bEnd[owner];
+        finalM = s.mEnd[owner];
+        finalN = s.nEnd[owner];
+        batch = firstBatch;
+        m = firstM;
+        physicalBatch = batch / headGroups;
+        head = batch % headGroups;
+        const uint32_t prefix = base + kMlaNativePartitionWords;
+        group = ReadMetadataWide(read, prefix + 2 * firstBatch) + firstM;
+        last = ReadMetadataWide(read, prefix + 2 * finalBatch) + finalM + (finalN != 0);
+        last = last < s.groups ? last : s.groups;
+        firstSplit = read(base + kMlaNativeCoreSplitStart + owner);
+        lengthsLoaded = fdLoaded = false;
+        fd = 0;
+        valid = true;
+    }
+
+    struct Lengths {
+        uint32_t q, k;
+        MLA_METADATA_INLINE uint32_t operator()(uint32_t word) const
+        {
+            return word % 8 == 6 ? q : k;
+        }
+    };
+
+    MLA_METADATA_INLINE void AdvanceBatch()
+    {
+        m = 0;
+        ++batch;
+        if (++head == headGroups) {
+            head = 0;
+            ++physicalBatch;
+            lengthsLoaded = false;
+        }
+    }
+
+    MLA_METADATA_INLINE void AdvanceM()
+    {
+        ++group;
+        if (++m == mBlocks)
+            AdvanceBatch();
+    }
+
+    template <typename Reader>
+    MLA_METADATA_INLINE bool Next(const Reader& read, const MlaAutoSplitBsndSchedule& s,
+                                  const MlaWindowKernelParams& window, MlaAutoSplitBsndTask& output)
+    {
+        const auto& a = s.used.tiling;
+        while (group < last && batch < a.batch) {
+            if (!lengthsLoaded) {
+                const uint32_t word = 8 * batch;
+                queryLength = read(word + 6);
+                kvLength = read(word + 7);
+                queryStart = ReadMetadataWide(read, word);
+                kvStart = ReadMetadataWide(read, word + 2);
+                mBlocks = (uint64_t(queryLength) * a.heads + a.mBaseSize - 1) / a.mBaseSize;
+                lengthsLoaded = true;
+            }
+            if (!mBlocks) {
+                // Empty Q contributes no M groups for any virtual head.
+                batch += headGroups - head;
+                head = m = 0;
+                ++physicalBatch;
+                lengthsLoaded = false;
+                continue;
+            }
+            if (!kvLength) {
+                group += mBlocks - m;
+                AdvanceBatch();
+                continue;
+            }
+            MlaAutoSplitBsndTask t{};
+            t.group = group;
+            t.slot = UINT64_MAX;
+            t.fdHead = UINT32_MAX;
+            t.batch = batch;
+            t.m = m;
+            t.owner = core;
+            t.splitCount = 1;
+            auto_split_detail::Geometry<false>(Lengths{queryLength, kvLength}, s, window, t);
+            const uint32_t visibleBegin = t.s2Begin, visibleEnd = t.s2End;
+            const bool first = batch == firstBatch && m == firstM;
+            if (first && t.s2Begin < firstN)
+                t.s2Begin = firstN;
+            if (batch == finalBatch && m == finalM && t.s2End > finalN)
+                t.s2End = finalN;
+            if (t.s2Begin >= t.s2End) {
+                AdvanceM();
+                continue;
+            }
+            if (t.s2Begin > visibleBegin || t.s2End < visibleEnd) {
+                // Native FD heads are sorted. Load each entry once while the
+                // owned axes advance, instead of rescanning the list per M.
+                while (fd < s.fdHeads) {
+                    if (!fdLoaded) {
+                        fdBatch = read(base + kMlaNativeFdBatch + fd);
+                        fdM = read(base + kMlaNativeFdM + fd);
+                        fdSplits = read(base + kMlaNativeFdSplits + fd);
+                        fdLoaded = true;
+                    }
+                    if (fdBatch > batch || (fdBatch == batch && fdM >= m))
+                        break;
+                    ++fd;
+                    fdLoaded = false;
+                }
+                if (fd == s.fdHeads || fdBatch != batch || fdM != m) {
+                    valid = false;
+                    return false;
+                }
+                t.kind = 1;
+                t.fdHead = fd;
+                t.split = first ? firstSplit : 0;
+                t.splitCount = fdSplits;
+                t.slot = s.partialPrefix[fd] + t.split;
+                auto_split_detail::Offsets(s, t.slot * a.mBaseSize, t.outOffset, t.sumOffset, t.maxOffset);
+            }
+            const uint32_t begin = t.s2Begin * a.s2BaseSize, end = t.s2End * a.s2BaseSize;
+            t.kvBegin = t.kvBegin > begin ? t.kvBegin : begin;
+            t.kvEnd = t.kvEnd < end ? t.kvEnd : end;
+            taskBatch = physicalBatch;
+            taskHead = head;
+            output = t;
+            AdvanceM();
+            return true;
+        }
+        return false;
+    }
+};
 
 template <typename Reader>
 MLA_METADATA_INLINE bool MlaTask(const Reader& read, const MlaContext& c, const MlaLayout& l,

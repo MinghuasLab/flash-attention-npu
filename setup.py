@@ -322,7 +322,10 @@ class BishengBuildExt(build_ext):
         ]
         if ext_name == "flash_attn_npu_3.flash_attn_npu_3":
             # Scope is thread-local and active only around MLA's ASC launch.
-            link_flags.append("-Wl,--wrap=aclrtLaunchKernelWithHostArgs")
+            link_flags += [
+                "-Wl,--wrap=aclrtLaunchKernelWithHostArgs",
+                "-Wl,--wrap=aclrtLaunchKernelWithArgsArray",
+            ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
         # to enter ASC/device-compile mode (without it, kernel_operator.h and the
@@ -509,6 +512,17 @@ class BishengBuildExt(build_ext):
             mla_device = ext_name == "flash_attn_npu_3.flash_attn_npu_3" and os.path.basename(
                 src
             ).startswith("mla_dispatch_")
+            if mla_device:
+                # Match FIA's explicit synchronization policy for the migrated
+                # kernels. Keep these flags local to their translation units.
+                compile_common = [
+                    *compile_common,
+                    "--cce-auto-sync=off",
+                    "-mllvm",
+                    "-cce-vf-remove-membar=false",
+                    "-mllvm",
+                    "-cce-aicore-hoist-movemask=false",
+                ]
             device_depfile = obj + ".device.d"
             device_fresh = not mla_device or (
                 os.path.exists(device_depfile)
@@ -549,7 +563,9 @@ class BishengBuildExt(build_ext):
                 raise
 
         # One shared pool across all extensions so the heaviest TUs compile
-        # concurrently regardless of which extension owns them.
+        # concurrently regardless of which extension owns them. TUs per extension
+        # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
+        # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
         max_workers = min(len(tasks), os.cpu_count() or 1)
         objs_by_ext = {ext.name: [] for ext in self.extensions}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -678,12 +694,11 @@ src_ascend910_v3 += glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True
 )
 # MLA numerical instantiations are generated with the ordinary v3 dispatch.
-# These are host adapters/schedulers plus the mixed-dtype INT8 implementation.
+# These are the host adapters and schedulers.
 src_ascend910_v3 += [
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3/mla", name)
     for name in (
         "mla_forward.cpp",
-        "mla_dispatch_int8.cpp",
         "mla_layout.cpp",
         "mla_dispatch.cpp",
         "mla_tiling.cpp",

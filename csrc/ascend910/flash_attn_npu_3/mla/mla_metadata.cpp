@@ -6,7 +6,6 @@
 // Allocation snapshots and CANN SplitCore are shared by every MLA layout.
 #include "mla_metadata.h"
 #include "mla_split.h"
-#include "mla_int8_schedule.h"
 #include "mla_metadata_consumer.h"
 #include <algorithm>
 #include <cstring>
@@ -14,8 +13,111 @@
 #include <vector>
 
 namespace flash_attn::mla {
-bool BuildNonquantMetadata(const MlaRecordArgs& a)
+namespace {
+// The producer already owns the parsed allocation/used lengths and the source
+// SplitCore result. Rebind those values without serializing and decoding them
+// a second time. Noncanonical contexts retain the external-record reader.
+bool TryGeneratedSchedule(const MlaRecordArgs& a, const MlaContext& c, const MlaLayout& l,
+                          const MlaUsedLengths& lengths, const MlaNativeSplitKvSchedule& native,
+                          const MlaWindowConfig& window, uint32_t queryCapacity, uint64_t groups,
+                          MlaAutoSplitBsndSchedule& output)
 {
+    MlaWindow normalized{};
+    if (a.inferTotalQ || NormalizeWindow(window, normalized) != MlaCausalStatus::Success ||
+        uint32_t(normalized.kind) != c.window.kind || normalized.left != c.window.left ||
+        normalized.right != c.window.right || l.bytes > c.workspaceBytes || groups > l.groups)
+        return false;
+    const auto& fd = native.fd;
+    const uint32_t launchCores = MlaStaticLaunchCores(c);
+    if (!launchCores || !native.usedCoreNum || native.usedCoreNum > launchCores || native.usedCoreNum > l.cores ||
+        fd.numOfFdHead > l.cores || fd.maxS2SplitNum > l.cores || fd.usedVecNumOfFd > 2 * native.usedCoreNum ||
+        fd.usedVecNumOfFd > 2 * launchCores)
+        return false;
+    if (c.splits == 1) {
+        if (fd.numOfFdHead || fd.maxS2SplitNum || fd.usedVecNumOfFd)
+            return false;
+        for (uint32_t core = 0; core < native.usedCoreNum; ++core)
+            if (native.s2End[core])
+                return false;
+    }
+    MlaAutoSplitBsndSchedule s{};
+    s.aicNum = l.cores;
+    s.usedCoreNum = native.usedCoreNum;
+    s.fdHeads = fd.numOfFdHead;
+    s.maxSplits = fd.maxS2SplitNum;
+    s.vectors = fd.usedVecNumOfFd;
+    s.groups = groups;
+    uint32_t maximum = 0;
+    for (uint32_t head = 0; head < s.fdHeads; ++head) {
+        const uint32_t count = fd.s2SplitNumOfFdHead[head];
+        if (count < 2)
+            return false;
+        maximum = count > maximum ? count : maximum;
+        s.partialPrefix[head + 1] = s.partialPrefix[head] + count;
+    }
+    if (maximum != s.maxSplits || s.partialPrefix[s.fdHeads] > uint64_t(2) * l.cores ||
+        (s.fdHeads == 0 ? s.vectors != 0 : s.vectors == 0))
+        return false;
+
+    auto& used = s.used;
+    const uint64_t totalQ = MlaTnd(c) ? c.totalQ : uint64_t(c.batch) * c.sq;
+    const uint64_t totalK = c.layout == 1 ? c.totalK : uint64_t(c.batch) * c.sk;
+    used.query = {uint32_t(MlaTnd(c)), {uint32_t(totalQ), uint32_t(totalQ >> 32)}, c.sq};
+    used.kv = {uint32_t(c.layout == 1), {uint32_t(totalK), uint32_t(totalK >> 32)}, c.sk};
+    used.usedFlags = c.usedFlags;
+    auto& t = used.tiling;
+    t.batch = c.batch * l.headGroups;
+    t.sq = c.sq;
+    t.sk = c.sk ? c.sk : 1;
+    t.heads = l.g;
+    t.mBaseSize = l.m;
+    t.s2BaseSize = l.n;
+    t.usedCoreNum = s.usedCoreNum;
+    t.blockDim = l.cores;
+    t.cvRatio = 2;
+    const uint64_t rows = ((uint64_t(queryCapacity) * l.g < l.m ? uint64_t(queryCapacity) * l.g : l.m) + 15) / 16 * 16;
+    t.mm1ResSize = rows * ((l.n + 31) / 32 * 32);
+    t.mm2ResSize = rows * 512;
+    for (uint32_t core = 0; core < 26; ++core) {
+        s.bEnd[core] = t.bN2End[core] = native.bN2End[core];
+        s.mEnd[core] = t.gS1End[core] = native.gS1End[core];
+        s.nEnd[core] = t.s2End[core] = native.s2End[core];
+    }
+    s.outOffset = l.outOffset;
+    s.sumOffset = l.sumOffset;
+    s.maxOffset = l.maxOffset;
+    s.bytes = l.bytes;
+
+    // Run after the record write, preserving the reader's ordering even if a
+    // caller's page table aliases the output storage. Never skip the full
+    // descriptor or active-page checks on a newly generated record.
+    if (c.pageSize) {
+        if (CheckPagedCacheDescriptor(c, a.cache, c.kvHeads, c.valueDim == 512 ? 64 : 192, c.valueDim) !=
+            MlaMetadataReadStatus::Success)
+            return false;
+        const auto* pages = reinterpret_cast<const int32_t*>(a.cache.table.address);
+        for (uint32_t b = 0; b < c.batch; ++b) {
+            const uint32_t length = lengths.sequences[b].kvLength;
+            if (length > c.sk)
+                return false;
+            for (uint32_t i = 0; i < (length + c.pageSize - 1) / c.pageSize; ++i) {
+                const int32_t id = pages[uint64_t(b) * a.cache.layout.tableRowStride + i];
+                if (id < 0 || uint64_t(id) >= a.cache.layout.physicalPages)
+                    return false;
+            }
+        }
+    }
+    output = s;
+    return true;
+}
+} // namespace
+
+// Private overload for the AICPU entry, included in that translation unit.
+// ready is published only after generation and every additional check pass;
+// failures leave the checked schedule untouched for the original reader.
+bool BuildMlaMetadata(const MlaRecordArgs& a, MlaAutoSplitBsndSchedule* generated, bool& ready)
+{
+    ready = false;
     auto c = a.context;
     MlaLayout l{};
     if (!MlaRecordLayout(c, l) || !a.output || a.output % 4 || a.words != l.words ||
@@ -84,28 +186,16 @@ bool BuildNonquantMetadata(const MlaRecordArgs& a)
         const MlaWindowConfig window{c.sq, c.sk, c.window.kind == 1 ? -1 : c.window.left,
                                      c.window.kind == 1 ? -1 : c.window.right, c.window.kind == 1};
         MlaNativeSplitKvSchedule native{};
-        if (MlaNativeCompressed(c) && c.splits == 1) {
-            std::vector<MlaCausalSequence> sequences;
-            sequences.reserve(c.batch);
-            for (const auto& s : lengths.sequences)
-                sequences.push_back({s.queryLength, s.kvLength});
-            MlaCausalSchedule whole{};
-            if (BuildWindowSchedule({sequences, l.g, l.m, l.n, c.physicalCores, 2}, window, whole) !=
-                MlaCausalStatus::Success)
-                return true;
-            native.usedCoreNum = whole.usedCoreNum;
-            native.bN2End = whole.bN2End;
-            native.gS1End = whole.gS1End;
-            native.s2End = whole.s2End;
-        } else {
-            if (BuildGqaSchedule({shape, c.kvHeads, c.valueDim, l.m, l.n, c.pageSize}, lengths, window,
-                                 {c.packed, c.margin}, physical, native) != MlaScheduleStatus::Success)
-                return true;
-        }
-        std::vector<uint32_t> result(l.words, 0);
-        const auto header = MlaHeader(c, l, queryCapacity, kvCapacity);
-        std::memcpy(result.data(), &header, sizeof(header));
-        auto* tail = result.data() + MlaTail(c);
+        const bool wholeM = c.splits == 1;
+        if (BuildGqaSchedule({shape, c.kvHeads, c.valueDim, l.m, l.n, c.pageSize, !wholeM}, lengths, window,
+                             {c.packed, c.margin}, physical, native) != MlaScheduleStatus::Success)
+            return true;
+        // All fallible allocations have completed. The destination was
+        // cleared above; publish success after writing the complete record.
+        auto header = MlaHeader(c, l, queryCapacity, kvCapacity);
+        header.status = 1;
+        std::memcpy(out, &header, sizeof(header));
+        auto* tail = out + MlaTail(c);
         auto* prefix = tail + kMlaNativePartitionWords;
         uint64_t groups = 0;
         for (uint32_t b = 0; b < c.batch; ++b) {
@@ -114,7 +204,7 @@ bool BuildNonquantMetadata(const MlaRecordArgs& a)
                                      uint32_t(s.kvStart),    uint32_t(s.kvStart >> 32),
                                      s.queryCapacity,        s.kvCapacity,
                                      s.queryLength,          s.kvLength};
-            std::copy(span, span + 8, result.begin() + MlaSequenceWord(b));
+            std::copy(span, span + 8, out + MlaSequenceWord(b));
             const uint64_t count = (uint64_t(s.queryLength) * l.g + l.m - 1) / l.m;
             for (uint32_t h = 0; h < l.headGroups; ++h) {
                 groups += count;
@@ -147,94 +237,16 @@ bool BuildNonquantMetadata(const MlaRecordArgs& a)
         MLA_COPY_FIELD(vectorPartEnd, gS1IdxEndOfFdHeadSplit);
 #undef MLA_COPY_FIELD
         std::memcpy(tail, &partition, sizeof(partition));
-        std::copy(result.begin(), result.end(), out);
+        out[2] = 0;
+        if (generated)
+            ready = TryGeneratedSchedule(a, c, l, lengths, native, window, queryCapacity, groups, *generated);
     } catch (const std::bad_alloc&) {
     }
     return true;
 }
-bool PrepareInt8Metadata(const MlaRecordArgs& a)
+bool BuildMlaMetadata(const MlaRecordArgs& a)
 {
-    using namespace Int8;
-    const auto& c = a.context;
-    const bool tnd = MlaTnd(c);
-    Config config{c.batch, c.sq, c.heads, c.sk, c.physicalCores, c.splits, uint32_t(c.window.kind == 1), 0};
-    CheckedSchedule checked{};
-    checked.blockDim = c.physicalCores;
-    const auto* lengths = reinterpret_cast<const int32_t*>(a.usedKv);
-    const auto* prefix = reinterpret_cast<const int32_t*>(a.cuQuery);
-    auto length = [&](uint32_t b) -> int64_t { return lengths ? lengths[b] : c.sk; };
-    auto query = [&](uint32_t b) -> int64_t { return prefix[b]; };
-    const uint64_t words = uint64_t(kFixedWords) + 8ULL * c.batch;
-    bool valid = Valid(config) && c.kvHeads == 1 && c.valueDim == 512 && c.pageSize == 128 &&
-                 c.layout == (tnd ? 4U : 3U) && !a.cuKv && !a.usedQuery &&
-                 (!a.output || (ValidUsedMetadataAddress(a.output, words) && a.words == words)) &&
-                 (!tnd || (prefix && ValidUsedMetadataAddress(a.cuQuery, uint64_t(c.batch) + 1))) &&
-                 (!lengths || ValidUsedMetadataAddress(a.usedKv, c.batch));
-    if (!valid)
-        return false; // Unsafe descriptors cannot publish a record.
-    valid = tnd ? ScheduleTnd(config, length, query, a.inferTotalQ ? int64_t(-1) : int64_t(c.totalQ), checked.schedule,
-                              checked.mode)
-                : Schedule(config, length, checked.schedule, checked.mode);
-    const auto& p = checked.schedule;
-    if (valid && a.checked) {
-        valid = CheckPagedCacheDescriptor(c, a.cache, 1, 64, 512) == MlaMetadataReadStatus::Success;
-        const auto* table = reinterpret_cast<const int32_t*>(a.cache.table.address);
-        for (uint32_t b = 0; valid && b < c.batch; ++b)
-            for (uint32_t page = 0; page < Div(uint32_t(length(b)), 128); ++page) {
-                const int32_t id = table[uint64_t(b) * a.cache.layout.tableRowStride + page];
-                if (id < 0 || uint64_t(id) >= a.cache.layout.physicalPages) {
-                    valid = false;
-                    break;
-                }
-            }
-    }
-    if (valid && a.output) {
-        MlaLayout layout{};
-        layout.words = words;
-        layout.cores = c.physicalCores;
-        layout.headGroups = 1;
-        layout.m = p.increFlashAttentionSingleCoreParams.s1SplitSize * c.heads;
-        layout.n = p.increFlashAttentionSingleCoreParams.singleProcessSInnerSize;
-        auto actual = c;
-        actual.totalQ = tnd ? uint32_t(query(c.batch)) : 0;
-        actual.packed = c.heads > 1;
-        actual.usedFlags = 2;
-        auto header = MlaHeader(actual, layout, p.baseParams.qSeqSize, c.sk);
-        header.algorithm = checked.mode;
-        auto* output = reinterpret_cast<uint32_t*>(a.output);
-        auto word = [&](uint32_t i, uint32_t expected) {
-            if (a.generate)
-                output[i] = expected;
-            else if (output[i] != expected)
-                valid = false;
-        };
-        const auto* h = reinterpret_cast<const uint32_t*>(&header);
-        for (uint32_t i = 0; i < 32; ++i)
-            word(i, h[i]);
-        for (uint32_t b = 0; b < c.batch; ++b) {
-            const uint64_t start = tnd ? query(b) : uint64_t(b) * c.sq, kv = uint64_t(b) * c.sk;
-            const uint32_t capacity = tnd ? query(b + 1) - query(b) : c.sq;
-            const uint32_t span[] = {
-                uint32_t(start), uint32_t(start >> 32), uint32_t(kv), uint32_t(kv >> 32), capacity, c.sk,
-                capacity,        uint32_t(length(b))};
-            for (uint32_t i = 0; i < 8; ++i)
-                word(MlaSequenceWord(b) + i, span[i]);
-        }
-        const auto* params = reinterpret_cast<const uint32_t*>(&p);
-        for (uint32_t i = 0; i < sizeof(p) / 4; ++i)
-            word(MlaTail(c) + i, params[i]);
-    } else if (a.generate && a.output) {
-        auto* output = reinterpret_cast<uint32_t*>(a.output);
-        std::fill(output, output + words, 0);
-        output[0] = words;
-        output[1] = 3;
-        output[2] = 1;
-    }
-    checked.status = valid ? 0 : 1;
-    if (a.checked)
-        std::memcpy(reinterpret_cast<void*>(a.checked), &checked, sizeof(checked));
-    // A readable failure record is part of the producer contract. The
-    // invocation-local checked status makes consumption fail before output.
-    return true;
+    bool ready = false;
+    return BuildMlaMetadata(a, nullptr, ready);
 }
 } // namespace flash_attn::mla
