@@ -28,12 +28,13 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_>
-class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_,
-                    TileCopy_> {
+template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_, bool HAS_PSE_>
+class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_, HAS_PSE_>, OutputType_, Gemm::GemmType<float, LayoutS_>,
+                    MaskType_, TileCopy_> {
   public:
-    using DispatchPolicy = EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_, HAS_PSE_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
+    static constexpr bool HAS_PSE = HAS_PSE_;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = float;
     using ElementMask = typename MaskType_::Element;
@@ -109,13 +110,23 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
     template <class Resource>
     __aicore__ inline BlockEpilogue(Resource& resource, const fa950_plan::UbPlan& ub, float scale, float softcap,
-                                    bool useRescaleThreshold)
+                                    bool useRescaleThreshold, GM_ADDR pse = nullptr, GM_ADDR sink = nullptr)
         : useRescaleThreshold_(useRescaleThreshold)
     {
         subBlockIdx_ = AscendC::GetSubBlockIdx();
         scaleValue = scale;
         softcapValue = softcap;
         pStages_ = ub.pStages;
+        if (sink != nullptr) {
+            gSink_.SetGlobalBuffer((__gm__ float*)sink);
+            hasSink_ = true;
+        }
+        if (pse != nullptr) {
+            gPse_.SetGlobalBuffer((__gm__ bfloat16_t*)pse);
+            hasPse_ = true;
+            pseBf16UbTensor_ = resource.ubBuf.template GetBufferByByte<bfloat16_t>(ub.pse);
+            pseF32UbTensor_ = resource.ubBuf.template GetBufferByByte<float>(ub.pse + 256U);
+        }
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(ub.s);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(ub.p);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
@@ -164,10 +175,32 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         }
     }
 
+    // Convert the per-tile BF16 pse slice (<=128 values) to logical-order FP32.
+    template <typename ElementPse>
+    __simd_vf__ static inline void ConvertPseToF32(__ubuf__ ElementPse* src, __ubuf__ float* dst, uint32_t n)
+    {
+        using namespace AscendC::MicroAPI;
+        RegTensor<ElementPse> raw;
+        RegTensor<ElementPse> even;
+        RegTensor<ElementPse> odd;
+        RegTensor<float> vals;
+        MaskReg pregAllB16 = CreateMask<ElementPse, MaskPattern::ALL>();
+        MaskReg pregAll = CreateMask<float, MaskPattern::ALL>();
+        constexpr static CastTrait castZero = {RegLayout::ZERO, SatMode::SAT, MaskMergeMode::ZEROING,
+                                               AscendC::RoundMode::CAST_ROUND};
+        for (uint32_t off = 0; off < n; off += FLOAT_REP_SIZE) {
+            LoadAlign(raw, src + off);
+            Interleave(even, odd, raw, raw);
+            Cast<float, ElementPse, castZero>(vals, even, pregAllB16);
+            StoreAlign<float, StoreDist::DIST_NORM_B32>(dst + off, vals, pregAll);
+        }
+    }
+
     template <class TensorP>
     __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
                                       uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
-                                      Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize)
+                                      Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize,
+                                      uint32_t kvSStartIdx = 0)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -193,6 +226,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
+        // Start the pse GM->UB copy before the QK wait so MTE2 overlaps the cube.
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(6);
+            AscendC::DataCopyPad(pseBf16UbTensor_, gPse_[pseBase_ + static_cast<int64_t>(kvSStartIdx)],
+                                 AscendC::DataCopyExtParams(1, static_cast<uint32_t>(n * sizeof(bfloat16_t)), 0, 0, 0),
+                                 AscendC::DataCopyPadExtParams<bfloat16_t>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(6);
+        }
         // D512 keeps one P UB slot with a fixed copy event; the legacy path
         // rotates P with the Score slot. Score slots keep rotating either way.
         uint32_t pSlot = pStages_ == 1U ? 0U : ubSBufId;
@@ -209,26 +250,35 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pCopyEventId);
+        __ubuf__ float* pseF32Addr = nullptr;
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(6);
+            pseF32Addr = (__ubuf__ float*)pseF32UbTensor_.GetPhyAddr();
+            ConvertPseToF32((__ubuf__ bfloat16_t*)pseBf16UbTensor_.GetPhyAddr(), pseF32Addr, n);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         if (isFirstKvSTile) {
-            if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
-                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+            if (hasSink_) {
+                // Seeded first tile: gm_old = sink, gl_old = 1, update path.
+                if (n > 64) {
+                    ComputeScaleAndMax<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,true,sinkValue_,pseF32Addr);
+                } else {
+                    ComputeScaleAndMax64<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,true,sinkValue_,pseF32Addr);
+                }
+            } else if (n > 64) {
+                ComputeScaleAndMax<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,true,0.0f,pseF32Addr);
             } else {
-                ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
-                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                ComputeScaleAndMax64<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,true,0.0f,pseF32Addr);
             }
         } else {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound, useRescaleThreshold_);
+                ComputeScaleAndMax<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,useRescaleThreshold_,0.0f,pseF32Addr);
             } else {
-                ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound, useRescaleThreshold_);
+                ComputeScaleAndMax64<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,useRescaleThreshold_,0.0f,pseF32Addr);
             }
+        }
+        if (hasPse_) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(6);
         }
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -245,9 +295,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pCopyEventId);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
-        if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+        if (isFirstKvSTile) {
+            if (hasSink_) {
+                UpdateExpSumAndExpMax<ElementInput, true>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr,
+                                                          nowMaxAddr, mLoops, tailM, sinkValue_);
+            }
+        } else {
+            UpdateExpSumAndExpMax<ElementInput, false>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr,
+                                                       mLoops, tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -342,9 +397,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(P_COPY_EVENT);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
-        if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+        if (isFirstKvSTile) {
+            if (hasSink_) {
+                UpdateExpSumAndExpMax<ElementInput, true>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr,
+                                                          nowMaxAddr, mLoops, tailM, sinkValue_);
+            }
+        } else {
+            UpdateExpSumAndExpMax<ElementInput, false>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr,
+                                                       mLoops, tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -500,6 +560,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(6);
+            AscendC::DataCopyPad(pseBf16UbTensor_, gPse_[pseBase_ + static_cast<int64_t>(kvSStartIdx)],
+                                 AscendC::DataCopyExtParams(1, static_cast<uint32_t>(n * sizeof(bfloat16_t)), 0, 0, 0),
+                                 AscendC::DataCopyPadExtParams<bfloat16_t>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(6);
+        }
 
         // calc mask shift in gm
         uint32_t gmOffsetMaskRow = 0;
@@ -566,26 +633,34 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        __ubuf__ float* pseF32Addr = nullptr;
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(6);
+            pseF32Addr = (__ubuf__ float*)pseF32UbTensor_.GetPhyAddr();
+            ConvertPseToF32((__ubuf__ bfloat16_t*)pseBf16UbTensor_.GetPhyAddr(), pseF32Addr, n);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         if (isFirstKvSTile) {
-            if (n > 64) {
-                ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops,
-                    tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+            if (hasSink_) {
+                if (n > 64) {
+                    ComputeScaleAndMaxMask<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                } else {
+                    ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                }
+            } else if (n > 64) {
+                ComputeScaleAndMaxMask<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
             } else {
-                ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops,
-                    tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
             }
         } else {
             if (n > 64) {
-                ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                    tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                ComputeScaleAndMaxMask<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
             } else {
-                ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                    tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
             }
+        }
+        if (hasPse_) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(6);
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(4);
@@ -602,9 +677,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         // crossCoreSync after PIPE_MTE1 move
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
-        if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+        if (isFirstKvSTile) {
+            if (hasSink_) {
+                UpdateExpSumAndExpMax<ElementInput, true>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr,
+                                                          nowMaxAddr, mLoops, tailM, sinkValue_);
+            }
+        } else {
+            UpdateExpSumAndExpMax<ElementInput, false>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr,
+                                                       mLoops, tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -642,6 +722,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int16_t mLoops = AscendC::CeilDivision(m, vlSize) - 1;
         uint32_t tailM = (m - 1) % vlSize + 1;
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(6);
+            AscendC::DataCopyPad(pseBf16UbTensor_, gPse_[pseBase_ + static_cast<int64_t>(kvSStartIdx)],
+                                 AscendC::DataCopyExtParams(1, static_cast<uint32_t>(n * sizeof(bfloat16_t)), 0, 0, 0),
+                                 AscendC::DataCopyPadExtParams<bfloat16_t>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(6);
+        }
 
         uint32_t gmOffsetMaskRowPre = 0;
         uint32_t gmOffsetMaskColumnPre = 0;
@@ -761,72 +848,76 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(5);
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        __ubuf__ float* pseF32Addr = nullptr;
+        if (hasPse_) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(6);
+            pseF32Addr = (__ubuf__ float*)pseF32UbTensor_.GetPhyAddr();
+            ConvertPseToF32((__ubuf__ bfloat16_t*)pseBf16UbTensor_.GetPhyAddr(), pseF32Addr, n);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         if (doTriUPreMask && doTriUNextMask) {
             if (isFirstKvSTile) {
-                if (n > 64) {
-                    ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr,
-                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                if (hasSink_) {
+                    if (n > 64) {
+                        ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    } else {
+                        ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    }
+                } else if (n > 64) {
+                    ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr,
-                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             } else {
                 if (n > 64) {
-                    ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr,
-                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskPreNext<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr,
-                        maskNextUbAddr, m, nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskPreNext64<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,maskNextUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             }
         } else if (doTriUPreMask) {
             if (isFirstKvSTile) {
-                if (n > 64) {
-                    ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
-                        nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                if (hasSink_) {
+                    if (n > 64) {
+                        ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    } else {
+                        ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    }
+                } else if (n > 64) {
+                    ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
-                        nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             } else {
                 if (n > 64) {
-                    ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                        tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskInvert<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                        tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMaskInvert64<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             }
         } else {
             if (isFirstKvSTile) {
-                if (n > 64) {
-                    ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
-                        nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                if (hasSink_) {
+                    if (n > 64) {
+                        ComputeScaleAndMaxMask<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    } else {
+                        ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true, true, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,sinkValue_,pseF32Addr);
+                    }
+                } else if (n > 64) {
+                    ComputeScaleAndMaxMask<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                        sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m,
-                        nLoops, tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false, false, HAS_PSE>(sAddr,lastMaxAddr,lastMaxStartAddr,lastMaxStartAddr,pAddr,lastSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             } else {
                 if (n > 64) {
-                    ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                        tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMask<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 } else {
-                    ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                        sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops,
-                        tailN, nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true, false, HAS_PSE>(sAddr,nowMaxAddr,nowMaxStartAddr,lastMaxStartAddr,pAddr,nowSumAddr,maskUbAddr,m,nLoops,tailN,nPadding,scaleValue,softcapValue,128,blockStride,nRound,0.0f,pseF32Addr);
                 }
             }
+        }
+        if (hasPse_) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(6);
         }
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -846,12 +937,29 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
-        if (!isFirstKvSTile) {
-            UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM);
+        if (isFirstKvSTile) {
+            if (hasSink_) {
+                UpdateExpSumAndExpMax<ElementInput, true>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr,
+                                                          nowMaxAddr, mLoops, tailM, sinkValue_);
+            }
+        } else {
+            UpdateExpSumAndExpMax<ElementInput, false>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr,
+                                                       mLoops, tailM);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
+
+    // Per-task sinks/pse: head index fixes the [N] sink entry and the
+    // [B,N,1,S_kv] pse plane; the value/base are consumed by the next tiles.
+    __aicore__ inline void SetTaskSinkHead(uint32_t qNStartIdx)
+    {
+        qNStartIdx_ = qNStartIdx;
+        if (hasSink_) {
+            sinkValue_ = gSink_.GetValue(qNStartIdx);
+        }
+    }
+
+    __aicore__ inline void SetTaskPseBase(int64_t base) { pseBase_ = base; }
 
   private:
     ElementInput scaleValue;
@@ -871,6 +979,16 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<ElementInput> llUbTensor;
     uint32_t subBlockIdx_;
     uint32_t pStages_ = fa950_plan::SCORE_STAGES;
+    // Learnable sink / pse state (dense BF16 forward only).
+    AscendC::GlobalTensor<float> gSink_;
+    AscendC::GlobalTensor<bfloat16_t> gPse_;
+    AscendC::LocalTensor<bfloat16_t> pseBf16UbTensor_;
+    AscendC::LocalTensor<float> pseF32UbTensor_;
+    ElementInput sinkValue_{0};
+    int64_t pseBase_{0};
+    uint32_t qNStartIdx_{0};
+    bool hasSink_{false};
+    bool hasPse_{false};
 
     enum class MAligendTileNum {
         Zero = 0,
@@ -882,12 +1000,12 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
     // Position-based causal softmax. qRow is the per-head row offset of this AIV;
     // advancing it with wraparound preserves fused GQA without a mask tensor.
-    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxPositions(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* LastMaxUbStart,
         __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t m, uint32_t tailN, ElementInput dScale,
         ElementInput dSoftcap, uint32_t blockStride, int32_t qTileCenterStart, uint32_t kvSStartIdx, uint32_t qRow,
-        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight)
+        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         constexpr uint16_t S2BaseSize = 128;
@@ -1027,12 +1145,12 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool IsSwa, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxPositions64(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* LastMaxUbStart,
         __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb, uint16_t m, uint32_t tailN, ElementInput dScale,
         ElementInput dSoftcap, uint32_t blockStride, int32_t qTileCenterStart, uint32_t kvSStartIdx, uint32_t qRow,
-        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight)
+        uint32_t qSBlockSize, int32_t windowLeft, int32_t windowRight, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         constexpr uint16_t S2BaseSize = 128;
@@ -1085,6 +1203,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                LoadAlign(pseVreg0, pseUb);
+                Add(srcVreg, srcVreg, pseVreg0, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
@@ -1163,13 +1286,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                        uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
                        ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride,
-                       bool useRescaleThreshold = true)
+                       bool useRescaleThreshold = true, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1217,6 +1340,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                RegTensor<float> pseVreg1;
+                LoadAlign(pseVreg0, pseUb);
+                LoadAlign(pseVreg1, pseUb + FLOAT_REP_SIZE);
+                Add(srcVreg, srcVreg, pseVreg0, pregFull);
+                Add(srcVreg_unroll, srcVreg_unroll, pseVreg1, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
@@ -1237,9 +1368,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (useRescaleThreshold && m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (useRescaleThreshold && m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1280,13 +1415,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void
     ComputeScaleAndMax64(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                          __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                          uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
                          ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride,
-                         bool useRescaleThreshold = true)
+                         bool useRescaleThreshold = true, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1333,6 +1468,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                LoadAlign(pseVreg0, pseUb);
+                Add(srcVreg, srcVreg, pseVreg0, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
@@ -1347,9 +1487,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (useRescaleThreshold && m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (useRescaleThreshold && m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1383,13 +1527,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void
     ComputeScaleAndMaxMask(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                            __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                            __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding,
                            ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride,
-                           uint32_t repeatStride)
+                           uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1450,7 +1594,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
-
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                RegTensor<float> pseVreg1;
+                LoadAlign(pseVreg0, pseUb);
+                LoadAlign(pseVreg1, pseUb + FLOAT_REP_SIZE);
+                Add(srcVreg, srcVreg, pseVreg0, pregFull);
+                Add(srcVreg_unroll, srcVreg_unroll, pseVreg1, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
@@ -1486,9 +1637,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1530,12 +1685,12 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
         __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
         __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding,
-        ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+        ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1578,6 +1733,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                RegTensor<float> pseVreg1;
+                LoadAlign(pseVreg0, pseUb);
+                LoadAlign(pseVreg1, pseUb + FLOAT_REP_SIZE);
+                Add(srcVreg, srcVreg, pseVreg0, pregFull);
+                Add(srcVreg_unroll, srcVreg_unroll, pseVreg1, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
@@ -1606,9 +1769,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1647,13 +1814,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
         __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
         __ubuf__ ElementMask* maskPreUb, __ubuf__ ElementMask* maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
         uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride,
-        uint32_t repeatStride)
+        uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1696,6 +1863,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
             LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                RegTensor<float> pseVreg1;
+                LoadAlign(pseVreg0, pseUb);
+                LoadAlign(pseVreg1, pseUb + FLOAT_REP_SIZE);
+                Add(srcVreg, srcVreg, pseVreg0, pregFull);
+                Add(srcVreg_unroll, srcVreg_unroll, pseVreg1, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregFull);
             Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
@@ -1733,9 +1908,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1774,13 +1953,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void
     ComputeScaleAndMaxMask64(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                              __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                              __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
                              uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize,
-                             uint32_t blockStride, uint32_t repeatStride)
+                             uint32_t blockStride, uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1832,6 +2011,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                LoadAlign(pseVreg0, pseUb);
+                Add(srcVreg, srcVreg, pseVreg0, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
@@ -1851,9 +2035,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1887,12 +2075,12 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskInvert64(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
         __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
         __ubuf__ ElementMask* maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding,
-        ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+        ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -1925,6 +2113,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                LoadAlign(pseVreg0, pseUb);
+                Add(srcVreg, srcVreg, pseVreg0, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
@@ -1944,9 +2137,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -1978,13 +2175,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                                                                   expSumUreg, 0);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool SEED = false, bool HAS_PSE = false>
     __simd_vf__ static inline void ComputeScaleAndMaxMaskPreNext64(
         __ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
         __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
         __ubuf__ ElementMask* maskPreUb, __ubuf__ ElementMask* maskNextUb, uint16_t m, uint16_t nLoops, uint32_t tailN,
         uint32_t nPadding, ElementInput dScale, ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride,
-        uint32_t repeatStride)
+        uint32_t repeatStride, ElementInput dSink = 0, __ubuf__ float* pseUb = nullptr)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -2017,6 +2214,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Duplicate(minVreg, MIN_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            if constexpr (HAS_PSE) {
+                RegTensor<float> pseVreg0;
+                LoadAlign(pseVreg0, pseUb);
+                Add(srcVreg, srcVreg, pseVreg0, pregTailN);
+            }
             Muls(srcVreg, srcVreg, dScale, pregTailN);
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregTailN, dSoftcap);
@@ -2041,9 +2243,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         if constexpr (isUpdate) {
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
             LoadAlign(maxSrcVreg, newMaxUbStart);
-            LoadAlign(maxTmpVreg, LastMaxUbStart);
-            if (m >= SM_ROW_MAX_ELEM_NUM) {
-                Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+            if constexpr (SEED) {
+                Duplicate(maxTmpVreg, dSink, pregFull);
+            } else {
+                LoadAlign(maxTmpVreg, LastMaxUbStart);
+                if (m >= SM_ROW_MAX_ELEM_NUM) {
+                    Adds(maxSrcVreg, maxSrcVreg, -rescaleThreshold, pregFull);
+                }
             }
             Max(maxSrcVreg, maxSrcVreg, maxTmpVreg, pregFull);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(newMaxUbStart, maxSrcVreg, pregFull);
@@ -2417,10 +2623,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         StoreAlign<float, StoreDist::DIST_NORM_B32>(sumUb + mLoops * FLOAT_REP_SIZE, brcExpSumFloatVreg, pregTailM);
     }
 
-    template <typename ElementS>
+    template <typename ElementS, bool SEED = false>
     __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float* sumUb, __ubuf__ float* expMaxUb,
                                                          __ubuf__ float* maxUb, __ubuf__ ElementS* expSumUb,
-                                                         __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM)
+                                                         __ubuf__ ElementS* nowMaxUb, uint16_t mLoops, uint32_t tailM,
+                                                         ElementInput dSink = 0)
     {
         using namespace AscendC::MicroAPI;
 
@@ -2446,13 +2653,21 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
         MaskReg pregTailM = UpdateMask<float>(tailM);
         MaskReg pregNowMaxFull = CreateMask<ElementS, MaskPattern::ALL>();
-        LoadAlign(lastMaxVreg, maxUb);
+        if constexpr (SEED) {
+            Duplicate(lastMaxVreg, dSink, pregFull);
+        } else {
+            LoadAlign(lastMaxVreg, maxUb);
+        }
         LoadAlign(nowMaxTmpVreg, nowMaxUb);
         FusedExpSub(expMaxVreg, lastMaxVreg, nowMaxTmpVreg, pregFull);
         StoreAlign<float, StoreDist::DIST_NORM_B32>(expMaxUb, expMaxVreg, pregFull);
         StoreAlign<float, StoreDist::DIST_NORM_B32>(maxUb, nowMaxTmpVreg, pregFull);
 
-        LoadAlign(lastExpSumVreg, sumUb);
+        if constexpr (SEED) {
+            Duplicate(lastExpSumVreg, 1.0f, pregFull);
+        } else {
+            LoadAlign(lastExpSumVreg, sumUb);
+        }
         LoadAlign(brcExpSumTmpVreg, expSumUb);
         Mul(updateExpSumVreg, expMaxVreg, lastExpSumVreg, pregFull);
         Add(updateExpSumVreg, updateExpSumVreg, brcExpSumTmpVreg, pregFull);

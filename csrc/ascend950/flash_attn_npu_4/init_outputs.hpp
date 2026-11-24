@@ -66,7 +66,9 @@ class InitOutputs950 {
     template <bool LseMode>
     __aicore__ inline void operator()(AscendC::GlobalTensor<ElementO> gOutput, AscendC::GlobalTensor<float> gLse,
                                       uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t lseHeadStride,
-                                      uint32_t embedV, uint32_t outputStride, uint32_t oHeadStride)
+                                      uint32_t embedV, uint32_t outputStride, uint32_t oHeadStride,
+                                      bool hasSink = false, AscendC::GlobalTensor<float> gSink = {},
+                                      uint32_t qNStartIdx = 0U)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -113,17 +115,43 @@ class InitOutputs950 {
         if constexpr (LseMode) {
             uint32_t qSThisSubBlock = qNBlockSize == 1U ? rowCount : qSBlockSize;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
-            AscendC::Duplicate(lseUbTensor, std::numeric_limits<float>::infinity(), qSThisSubBlock);
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-            if (qNBlockSize == 1U) {
-                AscendC::DataCopyPad(gLse[rowStart], lseUbTensor,
-                                     AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
-            } else {
-                for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
-                    // Every head reuses the same contiguous +inf rows.
-                    AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor,
+            if (hasSink) {
+                // Empty span with learnable sink: lse = sink[h] instead of +inf
+                // (TASK §3.3). O is already zero.
+                if (qNBlockSize == 1U) {
+                    float sinkVal = gSink.GetValue(qNStartIdx);
+                    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                    AscendC::Duplicate(lseUbTensor, sinkVal, qSThisSubBlock);
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                    AscendC::DataCopyPad(gLse[rowStart], lseUbTensor,
                                          AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+                } else {
+                    for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
+                        float sinkVal = gSink.GetValue(qNStartIdx + qNStart + qNIdx);
+                        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                        AscendC::Duplicate(lseUbTensor, sinkVal, qSThisSubBlock);
+                        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                        AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor,
+                                             AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+                    }
+                }
+            } else {
+                AscendC::Duplicate(lseUbTensor, std::numeric_limits<float>::infinity(), qSThisSubBlock);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+                if (qNBlockSize == 1U) {
+                    AscendC::DataCopyPad(gLse[rowStart], lseUbTensor,
+                                         AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+                } else {
+                    for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
+                        // Every head reuses the same contiguous +inf rows.
+                        AscendC::DataCopyPad(gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor,
+                                             AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+                    }
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);

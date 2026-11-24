@@ -355,6 +355,7 @@ def _flash_attn_forward(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    pse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if qv is not None:
         raise NotImplementedError("Ascend950 FA4 forward does not support qv")
@@ -395,6 +396,7 @@ def _flash_attn_forward(
         q_descale,
         k_descale,
         v_descale,
+        pse,
     )
 
     if out_accum is None:
@@ -678,6 +680,7 @@ class FlashAttnFunc(torch.autograd.Function):
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        pse=None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -691,7 +694,8 @@ class FlashAttnFunc(torch.autograd.Function):
         seqlen_k, nheads_kv = k.shape[1], k.shape[2]
         headdim_v = v.shape[-1]
 
-        layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
+        backward_qkv = (q, k, v)
+        layout, q, k, v, _ = _detect_layout(q, k, v, None, None)
 
         seqused_k = torch.full(
             (batch_size,),
@@ -749,9 +753,10 @@ class FlashAttnFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale,
+            pse,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(*backward_qkv, out, softmax_lse, pse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -761,7 +766,6 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.pack_gqa = pack_gqa
         ctx.qv = qv
         ctx.gather_kv_indices = gather_kv_indices
-        ctx.learnable_sink = learnable_sink
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
@@ -775,7 +779,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, pse, learnable_sink = ctx.saved_tensors
         dlse = args[0] if ctx.return_lse and len(args) > 0 else None
         if dlse is not None and torch.is_tensor(dlse) and float(dlse.detach().abs().sum()) == 0.0:
             dlse = None
@@ -785,6 +789,9 @@ class FlashAttnFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
+        if dlse is not None and (pse is not None or learnable_sink is not None):
+            raise NotImplementedError("Ascend950 FA4 backward with pse or sink does not support LSE gradients")
+        dsink = torch.empty_like(learnable_sink) if learnable_sink is not None and learnable_sink.requires_grad else None
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
@@ -815,9 +822,11 @@ class FlashAttnFunc(torch.autograd.Function):
             qv=ctx.qv,
             page_table=None,
             gather_kv_indices=ctx.gather_kv_indices,
-            learnable_sink=ctx.learnable_sink,
+            learnable_sink=learnable_sink,
+            pse=pse,
+            dsink=dsink,
         )
-        return (
+        gradients = (
             dq,
             dk,
             dv,
@@ -826,7 +835,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # softmax_scale
             None,  # causal
             None,  # window_size
-            None,  # learnable_sink
+            dsink,  # learnable_sink
             None,  # softcap
             None,  # num_splits
             None,  # pack_gqa
@@ -841,7 +850,12 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # scheduler_metadata
             None,  # disable_scheduler_metadata
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
+            None,  # pse
         )
+        return gradients[:len(ctx.needs_input_grad)]
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1163,6 +1177,8 @@ def flash_attn_func(
     disable_scheduler_metadata: bool = False,
     config: None = None,
     scales: TensorwiseScales | BlockScales | None = None,
+    *,
+    pse: Optional[torch.Tensor] = None,
 ):
     """Attention with optional FP8 dequantization scales.
 
@@ -1170,6 +1186,8 @@ def flash_attn_func(
     BlockScales uses MXFP8 group32 DSL attention. None keeps existing dispatch.
     ``config`` is reserved; only ``None`` is supported.
     """
+    if pse is not None and pse.requires_grad and torch.is_grad_enabled():
+        raise NotImplementedError("Ascend950 FA4 does not support gradients for pse")
     if config is not None:
         raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
     if scales is not None and not isinstance(scales, TensorwiseScales):
@@ -1186,6 +1204,8 @@ def flash_attn_func(
     ):
         if isinstance(scales, TensorwiseScales):
             raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
+        if pse is not None:
+            raise NotImplementedError("FA4 Flex attention does not support pse")
         return _catlass_utils.attention(
             q,
             k,
@@ -1246,7 +1266,8 @@ def flash_attn_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
-        *((scales.q, scales.k, scales.v) if isinstance(scales, TensorwiseScales) else ()),
+        *((scales.q, scales.k, scales.v) if isinstance(scales, TensorwiseScales) else (None, None, None)),
+        pse,
     )
 
 
@@ -1366,6 +1387,7 @@ def _flash_attn_forward_fake(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    pse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
     is_varlen_q = cu_seqlens_q is not None
@@ -1452,6 +1474,8 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     config: None = None,
     scales: TensorwiseScales | BlockScales | None = None,
+    *,
+    pse: Optional[torch.Tensor] = None,
 ):
     """Attention with optional FP8 dequantization scales.
 
@@ -1474,6 +1498,8 @@ def flash_attn_varlen_func(
     ):
         if isinstance(scales, TensorwiseScales):
             raise NotImplementedError("FA4 Flex attention does not support TensorwiseScales")
+        if pse is not None:
+            raise NotImplementedError("FA4 Flex attention does not support pse")
         return _catlass_utils.attention(
             q,
             k,
@@ -1517,6 +1543,8 @@ def flash_attn_varlen_func(
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
         if any(t is not None and t.requires_grad for t in (q, k, v)):
             raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
+    if pse is not None:
+        raise NotImplementedError("Ascend950 FA4 varlen forward does not support pse")
     return FlashAttnVarlenFunc.apply(
         q,
         k,

@@ -462,3 +462,47 @@ def test_window_backward_with_pse_and_sink(version, use_pse, use_sink, batch, he
     actual = tuple(x.transpose(1, 2) for x in (dq, dk, dv)) + ((dsink,) if use_sink else ())
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got.float().cpu(), want, atol=0.006, rtol=0.006)
+
+
+@pytest.mark.skipif(not IS_950, reason="FA4 PSE and sink require Ascend 950")
+@pytest.mark.parametrize("bnsd_storage", [False, True])
+@pytest.mark.parametrize("use_pse,use_sink", [(True, False), (False, True), (True, True)])
+def test_fa4_window_forward_backward_with_pse_and_sink(bnsd_storage, use_pse, use_sink):
+    from flash_attn_npu_4 import flash_attn_func
+
+    torch.manual_seed(17)
+    batch, heads, tokens, dim = 2, 4, 259, 64
+    scale = dim ** -0.5
+    q, k, v, dy = [torch.rand(batch, heads, tokens, dim).bfloat16() for _ in range(4)]
+    qr, kr, vr = (x.float().requires_grad_() for x in (q, k, v))
+    pse = torch.rand(batch, heads, 1, tokens).bfloat16() if use_pse else None
+    sink = torch.linspace(-0.5, 0.25, heads, requires_grad=True) if use_sink else None
+
+    scores = qr @ kr.mT
+    if use_pse:
+        scores = scores + pse.float()
+    distance = torch.arange(tokens)[:, None] - torch.arange(tokens)
+    scores = (scores * scale).masked_fill((distance < 0) | (distance > 127), -torch.inf)
+    normalizer = scores
+    if use_sink:
+        sink_scores = sink.view(1, heads, 1, 1).expand(batch, heads, tokens, 1)
+        normalizer = torch.cat((scores, sink_scores), dim=-1)
+    lse_ref = normalizer.logsumexp(-1)
+    out_ref = (scores - lse_ref.unsqueeze(-1)).exp() @ vr
+    grads_ref = torch.autograd.grad(out_ref, (qr, kr, vr) + ((sink,) if use_sink else ()), dy.float())
+
+    def to_npu(x):
+        if bnsd_storage:
+            return x.npu().transpose(1, 2)
+        return x.transpose(1, 2).contiguous().npu()
+
+    qb, kb, vb = (to_npu(x).requires_grad_() for x in (q, k, v))
+    sink_npu = sink.detach().npu().requires_grad_() if use_sink else None
+    out, lse = flash_attn_func(
+        qb, kb, vb, softmax_scale=scale, window_size=(127, 0), num_splits=1,
+        pse=pse.npu() if use_pse else None, learnable_sink=sink_npu, return_lse=True,
+    )
+    grads = torch.autograd.grad(out, (qb, kb, vb) + ((sink_npu,) if use_sink else ()), to_npu(dy))
+    actual = (out.transpose(1, 2), lse, *(g.transpose(1, 2) for g in grads[:3]), *grads[3:])
+    for got, want in zip(actual, (out_ref, lse_ref, *grads_ref)):
+        torch.testing.assert_close(got.float().cpu(), want, atol=0.006, rtol=0.006)
