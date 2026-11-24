@@ -119,6 +119,7 @@ struct FAMetadataArgs {
     uint32_t isVarlenKv;
     uint32_t pagedKV;
     uint32_t quantMode;
+    uint32_t softcapActive; // 1 when the caller supplies softcap > 0 (disables the paired prefill wave)
 };
 
 #endif

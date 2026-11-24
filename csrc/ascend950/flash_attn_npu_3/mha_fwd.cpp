@@ -11,7 +11,6 @@
 // ✅ scheduler_metadata for non-FD execution
 // ❌ pack_gqa, leftpad_k
 
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -40,20 +39,23 @@
 using flash_attn_npu_950_v3::fill_inference_context;
 using flash_attn_npu_950_v3::SeqlenScratch;
 
-std::vector<at::Tensor>
-mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_new_, std::optional<at::Tensor> v_new_,
-        std::optional<at::Tensor> q_v_, std::optional<at::Tensor> out_, std::optional<at::Tensor> cu_seqlens_q_,
-        std::optional<at::Tensor> cu_seqlens_k_, std::optional<at::Tensor> cu_seqlens_k_new_,
-        std::optional<at::Tensor> seqused_q_, std::optional<at::Tensor> seqused_k_,
-        std::optional<int64_t> max_seqlen_q_, std::optional<int64_t> max_seqlen_k_,
-        std::optional<at::Tensor> page_table_, std::optional<at::Tensor> kv_batch_idx_,
-        std::optional<at::Tensor> leftpad_k_, std::optional<at::Tensor> rotary_cos_,
-        std::optional<at::Tensor> rotary_sin_, std::optional<at::Tensor> seqlens_rotary_,
-        std::optional<at::Tensor> q_descale_, std::optional<at::Tensor> k_descale_,
-        std::optional<at::Tensor> v_descale_, std::optional<float> softmax_scale_, bool is_causal,
-        int64_t window_size_left, int64_t window_size_right, int64_t attention_chunk, float softcap,
-        bool is_rotary_interleaved, std::optional<at::Tensor> scheduler_metadata_, int64_t num_splits,
-        std::optional<bool> pack_gqa_, int64_t sm_margin, bool return_softmax_lse, int64_t layout)
+std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_new_,
+                                std::optional<at::Tensor> v_new_, std::optional<at::Tensor> q_v_,
+                                std::optional<at::Tensor> out_, std::optional<at::Tensor> cu_seqlens_q_,
+                                std::optional<at::Tensor> cu_seqlens_k_, std::optional<at::Tensor> cu_seqlens_k_new_,
+                                std::optional<at::Tensor> seqused_q_, std::optional<at::Tensor> seqused_k_,
+                                std::optional<int64_t> max_seqlen_q_, std::optional<int64_t> max_seqlen_k_,
+                                std::optional<at::Tensor> page_table_, std::optional<at::Tensor> kv_batch_idx_,
+                                std::optional<at::Tensor> leftpad_k_, std::optional<at::Tensor> rotary_cos_,
+                                std::optional<at::Tensor> rotary_sin_, std::optional<at::Tensor> seqlens_rotary_,
+                                std::optional<at::Tensor> q_descale_, std::optional<at::Tensor> k_descale_,
+                                std::optional<at::Tensor> v_descale_, std::optional<float> softmax_scale_,
+                                bool is_causal, int64_t window_size_left, int64_t window_size_right,
+                                int64_t attention_chunk, float softcap, bool is_rotary_interleaved,
+                                std::optional<at::Tensor> scheduler_metadata_, int64_t num_splits,
+                                std::optional<bool> pack_gqa_, int64_t sm_margin, bool return_softmax_lse,
+                                int64_t layout, std::optional<bool> paired_prefill_,
+                                std::optional<int64_t> fd_active_cores_, std::optional<int64_t> fd_workspace_bytes_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -273,7 +275,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                     "mixed BF16/FP8 KV currently requires paged cache, page size 128 and Dqk=Dv=192");
         TORCH_CHECK(!q_descale_ && k_descale_ && v_descale_,
                     "mixed BF16/FP8 KV requires separate per-token K/V descales and no Q descale");
-        TORCH_CHECK(!scheduler_metadata_, "mixed BF16/FP8 KV currently requires host tiling");
     }
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
@@ -284,8 +285,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(scale->device() == q.device() && scale->scalar_type() == at::kFloat,
                     "descale must be FP32 on the query device");
         if (mixedKv) {
-            TORCH_CHECK(scale->dim() == 3 && scale->size(0) == num_blocks &&
-                        scale->size(1) == page_block_size && scale->size(2) == num_heads_k,
+            TORCH_CHECK(scale->dim() == 3 && scale->size(0) == num_blocks && scale->size(1) == page_block_size &&
+                            scale->size(2) == num_heads_k,
                         "mixed KV descale must have shape [num_blocks, page_size, num_kv_heads]");
         } else {
             TORCH_CHECK(scale->dim() == 2 && scale->size(0) == batch_size && scale->size(1) == num_heads_k,
@@ -344,6 +345,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     bool flashDecodeEnabled = false;
     bool singleQueryWindow = false;
     uint32_t launchBlockDim = blockDim;
+    uint64_t fdWorkspaceBytes = 0;
 
     if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
@@ -379,6 +381,21 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
+        // FlashDecode needs a launch shape (core count + workspace size) that is
+        // fixed for the whole metadata lifetime. The host tiling for those
+        // shapes is produced once by flash_attn_prepare_fd_metadata and cached
+        // on the metadata tensor, so capture stays free of host tiling and D2H.
+        // Single-token right-aligned window decode uses a dedicated kernel. The
+        // decision only needs launch inputs: with max_seqlen_q == 1 the AICPU
+        // tiling yields qBaseTile = 64 and qL1BufNum = 1, so the host-side
+        // predicate below is equivalent to the tiled one.
+        singleQueryWindow = mixedKv && is_local && !is_softcap && seqlen_q == 1 && !seqused_q_.has_value() &&
+                            window_size_left >= page_block_size - 1 && window_size_right == 0;
+        if (fd_active_cores_.has_value() && fd_active_cores_.value() > 0) {
+            flashDecodeEnabled = true;
+            launchBlockDim = static_cast<uint32_t>(fd_active_cores_.value());
+            fdWorkspaceBytes = static_cast<uint64_t>(std::max<int64_t>(fd_workspace_bytes_.value_or(0), 0));
+        }
         if (hasMask && quantMode != 1) {
             mask_npu_tensor = MakeDeviceTriuMask();
             maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
@@ -443,9 +460,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             }
             max_q_seqlen = std::max(max_q_seqlen, q_len);
         }
-        const bool fd_shape_supported =
-            !is_local && paged_KV && (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
-            fd_q_lengths_supported && max_q_seqlen <= 16 && max_active_kv_seqlen >= 1024;
+        const bool fd_shape_supported = !is_local && paged_KV &&
+                                        (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
+                                        fd_q_lengths_supported && max_q_seqlen <= 16 && max_active_kv_seqlen >= 1024;
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
@@ -504,13 +521,16 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     } else if (return_softmax_lse) {
         softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    if (return_softmax_lse) {
+    // The attention kernels overwrite every LSE row they own, so the inf
+    // initialization is only needed for shapes where some rows stay untouched:
+    // the FlashDecode partial-merge path and rows capped by seqused_q.
+    if (return_softmax_lse && (flashDecodeEnabled || seqused_q_.has_value())) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
     at::Tensor workspace;
     if (flashDecodeEnabled) {
-        workspace =
-            at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        const uint64_t wsBytes = fdWorkspaceBytes != 0U ? fdWorkspaceBytes : tilingData.workSpaceSize;
+        workspace = at::empty({static_cast<int64_t>(wsBytes)}, at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================
@@ -602,8 +622,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
-        mixedKv && tilingData.qL1BufNum == 2U};
-    auto launch_fa_infer = [singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
+        mixedKv && paired_prefill_.value_or(tilingData.qL1BufNum == 2U)};
+    auto launch_fa_infer = [singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_,
+                            v_descale_]() -> int {
         if (singleQueryWindow) {
             launch_single_query_window(fwdArgs);
         } else {

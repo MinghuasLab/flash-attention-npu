@@ -27,8 +27,7 @@ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
     return (b == 0) ? 0 : (a + b - 1) / b;
 }
 
-inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
-                            bool restrictMergedRowsForLargeD)
+inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize, bool restrictMergedRowsForLargeD)
 {
     // Must match kernel GetQNBlockTile (S/N combined axis): several Q heads are
     // merged into one task. Using a per-head task count here overcounts
@@ -36,8 +35,7 @@ inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
     // the last batch, causing out-of-bounds GM access (507015).
     constexpr uint32_t Q_M_TILE_MAX = 128;
     constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
-    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
-        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX : (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
     if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
         constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
         uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
@@ -50,20 +48,20 @@ inline uint32_t QNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
     }
     return tile < 1U ? 1U : tile;
 }
-}  // namespace
+} // namespace
 
-__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+__global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
 {
-    FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
+    FAMetadataArgs* metaArgs = reinterpret_cast<FAMetadataArgs*>(args);
     const bool hasMask = metaArgs->maskType != 0;
-    FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
-        metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
+    FAInferTilingData* tilingData =
+        reinterpret_cast<FAInferTilingData*>(metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
     // metaOutAddr points to raw device memory, so C++ member initializers are
     // not executed. Clear the complete structure to keep newly added fields
     // (including Flash Decoding flags and schedules) disabled by default.
     std::memset(tilingData, 0, sizeof(FAInferTilingData));
-    const int32_t *seqlensQ = reinterpret_cast<const int32_t *>(metaArgs->seqlensQAddr);
-    const int32_t *cacheSeqlens = reinterpret_cast<const int32_t *>(metaArgs->cacheSeqlensAddr);
+    const int32_t* seqlensQ = reinterpret_cast<const int32_t*>(metaArgs->seqlensQAddr);
+    const int32_t* cacheSeqlens = reinterpret_cast<const int32_t*>(metaArgs->cacheSeqlensAddr);
 
     tilingData->batch = metaArgs->batch;
     tilingData->numHeads = metaArgs->numHeads;
@@ -84,22 +82,42 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     // max_seqlen_q is a loose bound. The task grouping and UB policy must agree.
     uint32_t actualMaxQ = metaArgs->maxQSeqlen;
     uint64_t fullQ128Tasks = 0;
+    bool fullQueryTileInEachBatch = true;
     if (seqlensQ != nullptr)
         actualMaxQ = 0;
     for (uint32_t b = 0; b < metaArgs->batch; ++b) {
         const uint32_t len = seqlensQ ? static_cast<uint32_t>(seqlensQ[b]) : metaArgs->maxQSeqlen;
         actualMaxQ = len > actualMaxQ ? len : actualMaxQ;
-        const uint32_t activeQ = fa950_plan::ActiveQueryRows(len, cacheSeqlens[b], metaArgs->maskType != 0U,
-                                                           metaArgs->windowSizeRight);
+        fullQueryTileInEachBatch = fullQueryTileInEachBatch && len >= Q_TILE_CEIL;
+        const uint32_t activeQ =
+            fa950_plan::ActiveQueryRows(len, cacheSeqlens[b], metaArgs->maskType != 0U, metaArgs->windowSizeRight);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * metaArgs->numHeads;
     }
-    const uint32_t qBaseTile = fa950_plan::SelectQueryTile(metaArgs->embeddingSize, metaArgs->embeddingSizeV,
-        actualMaxQ, fullQ128Tasks, metaArgs->blockDim, metaArgs->maskType == 4U,
-        metaArgs->windowSizeLeft, metaArgs->windowSizeRight);
-    const uint32_t embeddingSizeAligned16 =
-        (metaArgs->embeddingSize + 15U) / 16U * 16U;
-    const uint32_t embeddingSizeVAligned16 =
-        (metaArgs->embeddingSizeV + 15U) / 16U * 16U;
+    uint32_t qBaseTile = fa950_plan::SelectQueryTile(metaArgs->embeddingSize, metaArgs->embeddingSizeV, actualMaxQ,
+                                                     fullQ128Tasks, metaArgs->blockDim, metaArgs->maskType == 4U,
+                                                     metaArgs->windowSizeLeft, metaArgs->windowSizeRight);
+    const uint32_t embeddingSizeAligned16 = (metaArgs->embeddingSize + 15U) / 16U * 16U;
+    const uint32_t embeddingSizeVAligned16 = (metaArgs->embeddingSizeV + 15U) / 16U * 16U;
+
+    // Mixed BF16/FP8 KV: mirror the host tiling's paired-prefill and small-MTP
+    // tile policy, otherwise the metadata path loses the paired pipeline.
+    const uint32_t groupSizeTiles = metaArgs->numHeads / metaArgs->numHeadsK;
+    const bool hasPairedWave = metaArgs->quantMode == 2U && fullQueryTileInEachBatch && (groupSizeTiles % 2U == 0U) &&
+                               fullQ128Tasks >= 2ULL * metaArgs->blockDim;
+    const bool pairedWindow = metaArgs->maskType == 4U && metaArgs->windowSizeRight == 0 &&
+                              metaArgs->windowSizeLeft >= 0 &&
+                              (metaArgs->softcapActive == 0U || metaArgs->windowSizeLeft >= 511);
+    const bool pairedFull = metaArgs->maskType != 4U && metaArgs->pagedKV != 0U && metaArgs->softcapActive == 0U &&
+                            metaArgs->embeddingSize == 192U && metaArgs->embeddingSizeV == 192U;
+    if (hasPairedWave && (pairedWindow || pairedFull)) {
+        qBaseTile = fa950_plan::QueryTile(metaArgs->embeddingSize, metaArgs->embeddingSizeV, metaArgs->maxQSeqlen);
+    }
+    if (metaArgs->quantMode == 2U && metaArgs->maxQSeqlen >= 5U && metaArgs->maxQSeqlen <= 8U &&
+        groupSizeTiles == 16U &&
+        !(metaArgs->maskType == 4U &&
+          static_cast<uint64_t>(metaArgs->batch) * metaArgs->numHeadsK * 2U <= metaArgs->blockDim)) {
+        qBaseTile = 128U;
+    }
 
     tilingData->innerPrec = 0;
     tilingData->actSeqAval = 0;
@@ -114,7 +132,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->pvL1TileN = embeddingSizeVAligned16;
     tilingData->pvL1TileKLeft = tilingData->kvBaseTile;
     tilingData->pvL1TileKRight = tilingData->kvBaseTile;
-    tilingData->qL1BufNum = 1;
+    tilingData->qL1BufNum = (hasPairedWave && qBaseTile == Q_TILE_CEIL) ? 2U : 1U;
     tilingData->kL1BufNum = 2;
     tilingData->vL1BufNum = 2;
     tilingData->pL1BufNum = 3;
@@ -126,8 +144,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metaArgs->numHeads / metaArgs->numHeadsK;
-    int32_t *kvCum = reinterpret_cast<int32_t *>(
-        metaArgs->metaOutAddr + fa_metadata::KvSeqlenOffset(hasMask));
+    int32_t* kvCum = reinterpret_cast<int32_t*>(metaArgs->metaOutAddr + fa_metadata::KvSeqlenOffset(hasMask));
     kvCum[0] = 0;
     uint32_t kvCumSum = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
@@ -144,8 +161,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         }
         kvCumSum += kvSeqlen;
         kvCum[batchIdx + 1] = static_cast<int32_t>(kvCumSum);
-        const uint32_t curQNBlockTile = QNBlockTile(
-            qSeqlen, groupSize, qBaseTile < Q_TILE_CEIL);
+        const uint32_t curQNBlockTile = QNBlockTile(qSeqlen, groupSize, qBaseTile < Q_TILE_CEIL);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qBaseTile);
