@@ -7,7 +7,6 @@
 #include <torch/extension.h>
 #include <cmath>
 #include <cstring>
-#include <unordered_map>
 
 #include "device_triu_mask.h"
 #include "fa_metadata_args.h"

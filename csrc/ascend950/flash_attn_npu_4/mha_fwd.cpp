@@ -444,39 +444,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             runtime.windowSizeLeft = window_size_left;
             runtime.windowSizeRight = window_size_right;
             runtime.allowFlashDecode = flashDecodeEnabled;
-            auto aicpu = c10_npu::getNPUStreamFromPool();
-            if (aicpu.stream(false) == aclStream) {
-                aicpu = c10_npu::getNPUStreamFromPool();
-            }
-            const auto aicpuStream = aicpu.stream(false);
-            TORCH_CHECK(aicpuStream != aclStream, "AICPU tiling merge requires a separate stream");
-            struct MergeEvents {
-                aclrtEvent input_ready = nullptr;
-                aclrtEvent done = nullptr;
-            };
-            // Separate event pairs prevent different caller streams from reusing
-            // one another's capture dependencies.
-            static thread_local std::unordered_map<aclrtStream, MergeEvents> events_by_stream;
-            auto& events = events_by_stream[aclStream];
-            if (events.input_ready == nullptr) {
-                constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
-                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.input_ready, event_flags) == ACL_SUCCESS,
-                            "create merge input event failed");
-                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
-                            "create merge completion event failed");
-            }
-            auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
-                                  done = events.done]() mutable -> int {
-                TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
-                TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS,
-                            "wait for merge input failed");
-                WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
-                TORCH_CHECK(aclrtRecordEvent(done, aicpuStream) == ACL_SUCCESS, "record merge completion event failed");
-                TORCH_CHECK(aclrtStreamWaitEvent(aclStream, done) == ACL_SUCCESS, "wait for tiling merge failed");
+            auto write_runtime = [runtimeArgs, aclStream]() mutable -> int {
+                WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs));
                 return 0;
             };
             at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
-            c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(), aicpu);
+            c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(),
+                                                       c10_npu::getCurrentNPUStream());
         }
         c10_npu::NPUCachingAllocator::recordStream(tiling_dev.storage().data_ptr(), c10_npu::getCurrentNPUStream());
     } else {
