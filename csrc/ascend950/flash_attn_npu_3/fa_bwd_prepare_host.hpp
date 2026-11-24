@@ -91,9 +91,9 @@ inline at::Tensor PrepareTnd(const FAGTiling950::FAGInfo& info, const FagInputSt
     auto& events = streamEvents[currentHandle];
     if (events.inputReady == nullptr) {
         constexpr auto flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
-        TORCH_CHECK(aclrtCreateEventWithFlag(&events.inputReady, flags) == ACL_SUCCESS,
+        TORCH_CHECK(aclrtCreateEventExWithFlag(&events.inputReady, flags) == ACL_SUCCESS,
                     "Ascend950 bwd: failed to create AICPU input event");
-        if (aclrtCreateEventWithFlag(&events.planReady, flags) != ACL_SUCCESS) {
+        if (aclrtCreateEventExWithFlag(&events.planReady, flags) != ACL_SUCCESS) {
             aclrtDestroyEvent(events.inputReady);
             events.inputReady = nullptr;
             TORCH_CHECK(false, "Ascend950 bwd: failed to create AICPU completion event");
