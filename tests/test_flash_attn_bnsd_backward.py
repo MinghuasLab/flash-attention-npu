@@ -413,3 +413,52 @@ def test_bnsd_backward_distinct_value_dim_950(version):
         torch.testing.assert_close(
             actual.transpose(1, 2).cpu().double(), ref, atol=0.003, rtol=0.003
         )
+
+
+@pytest.mark.skipif(not IS_950, reason="PSE and sink backward require Ascend 950")
+@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize(
+    "use_pse,use_sink,batch,heads,kv_heads,tokens",
+    [(True, False, 1, 2, 2, 256), (False, True, 1, 2, 2, 256), (True, True, 2, 4, 2, 259)],
+)
+def test_window_backward_with_pse_and_sink(version, use_pse, use_sink, batch, heads, kv_heads, tokens):
+    module = importlib.import_module(f"flash_attn_npu_{version}.flash_attn_npu_interface_950")
+
+    torch.manual_seed(17)
+    dim = 64
+    scale = dim ** -0.5
+    q, k, v, dy = [torch.rand(batch, n, tokens, dim).bfloat16().float() for n in (heads, kv_heads, kv_heads, heads)]
+    q, k, v = (x.requires_grad_() for x in (q, k, v))
+    pse = torch.rand(batch, heads, 1, tokens).bfloat16() if use_pse else None
+    sink = torch.linspace(-0.5, 0.25, heads, requires_grad=True) if use_sink else None
+
+    groups = heads // kv_heads
+    scores = q @ k.repeat_interleave(groups, dim=1).mT
+    if pse is not None:
+        scores = scores + pse.float()
+    distance = torch.arange(tokens)[:, None] - torch.arange(tokens)
+    scores = (scores * scale).masked_fill((distance < 0) | (distance > 127), -torch.inf)
+    normalizer = scores
+    if sink is not None:
+        sink_scores = sink.view(1, heads, 1, 1).expand(batch, heads, tokens, 1)
+        normalizer = torch.cat((scores, sink_scores), dim=-1)
+    lse = normalizer.logsumexp(-1)
+    out = (scores - lse.unsqueeze(-1)).exp() @ v.repeat_interleave(groups, dim=1)
+    expected = torch.autograd.grad(out, (q, k, v) + ((sink,) if use_sink else ()), dy)
+
+    qb, kb, vb, db, ob = [x.detach().bfloat16().npu().transpose(1, 2) for x in (q, k, v, dy, out)]
+    assert module._detect_layout(qb, kb, vb, None, None)[0] == module._LAYOUT_BNSD
+    dq, dk, dv = (torch.empty(x.shape, dtype=x.dtype, device=x.device) for x in (qb, kb, vb))
+    dsink = torch.empty(heads, device=qb.device, dtype=torch.float32) if use_sink else None
+    kwargs = dict(
+        dq=dq, dk=dk, dv=dv, softmax_scale=scale, window_size_left=127, window_size_right=0,
+        pse=pse.npu() if use_pse else None, dsink=dsink,
+    )
+    sink_npu = sink.detach().npu() if use_sink else None
+    if version == 3:
+        module._flash_attn_backward(db, qb, kb, vb, ob, lse.detach().npu(), sink=sink_npu, **kwargs)
+    else:
+        module._flash_attn_backward(qb, kb, vb, ob, db, lse.detach().npu(), learnable_sink=sink_npu, **kwargs)
+    actual = tuple(x.transpose(1, 2) for x in (dq, dk, dv)) + ((dsink,) if use_sink else ())
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got.float().cpu(), want, atol=0.006, rtol=0.006)

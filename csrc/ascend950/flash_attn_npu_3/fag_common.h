@@ -249,6 +249,9 @@ struct FAGKernelParams {
     GM_ADDR dv;
     GM_ADDR workspace;
     GM_ADDR tiling;
+    GM_ADDR pse = nullptr;
+    GM_ADDR sink = nullptr;
+    GM_ADDR dsink = nullptr;
 
     CATLASS_DEVICE
     FAGKernelParams() = default;

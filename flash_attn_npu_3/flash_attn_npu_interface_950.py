@@ -359,7 +359,7 @@ def _flash_attn_forward_fake(
 
 @_torch_custom_op_wrapper(
     "flash_attn_npu_3_950_C::_flash_attn_backward",
-    mutates_args=("dq", "dk", "dv"),
+    mutates_args=("dq", "dk", "dv", "dsink"),
     device_types="npu",
 )
 def _flash_attn_backward(
@@ -385,7 +385,17 @@ def _flash_attn_backward(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
+    pse: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Compute gradients from the supplied forward output and log-sum-exp.
+
+    For fixed-length attention, `pse` is a per-key bias of shape [B, Hq, 1, Sk]
+    added before scaling (CANN pse_type=1). The forward output and LSE must
+    already account for this bias and for the optional FP32 [Hq] sink.
+    Pass the FP32 [Hq] `dsink` output buffer to request a sink gradient.
+    """
     # Same storage detection as forward; retain logical BSND shapes for host/output.
     if cu_seqlens_q is not None:
         layout = _LAYOUT_TND
@@ -419,6 +429,7 @@ def _flash_attn_backward(
         dq_kernel = torch.zeros(q.shape, dtype=q.dtype, device=q.device)
         dk_kernel = torch.zeros(k.shape, dtype=k.dtype, device=k.device)
         dv_kernel = torch.zeros(v.shape, dtype=v.dtype, device=v.device)
+    extra = (pse, sink, dsink) if any(x is not None for x in (pse, sink, dsink)) else ()
     _, _, _, softmax_d = flash_attn_npu_3_950.bwd(
         dout,
         q,
@@ -443,6 +454,7 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
         layout,
+        *extra,
     )
     if pad_heads:
         if dq is not None:
@@ -479,6 +491,9 @@ def _flash_attn_backward_fake(
     softcap=0.0,
     deterministic=False,
     sm_margin=0,
+    pse=None,
+    sink=None,
+    dsink=None,
 ):
     del (
         dout,

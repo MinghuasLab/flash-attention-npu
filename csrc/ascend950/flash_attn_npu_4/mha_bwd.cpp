@@ -36,7 +36,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                 std::optional<at::Tensor> seqused_k_, std::optional<int64_t> max_seqlen_q_,
                                 std::optional<int64_t> max_seqlen_k_, std::optional<double> softmax_scale_,
                                 bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap,
-                                bool deterministic, int64_t sm_margin, int64_t layout)
+                                bool deterministic, int64_t sm_margin, int64_t layout,
+                                std::optional<at::Tensor> pse_, std::optional<at::Tensor> sink_,
+                                std::optional<at::Tensor> dsink_)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
@@ -84,6 +86,28 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     const bool is_mla = (qk_head_dim == 192 && v_head_dim == 128);
     TORCH_CHECK(!is_mla || !deterministic,
                 "Ascend950 v4 bwd: deterministic backward is not supported for Q/K=192 and V=128");
+
+    TORCH_CHECK(!dsink_.has_value() || sink_.has_value(), "mha_bwd: dsink requires sink");
+    if (pse_.has_value() || sink_.has_value()) {
+        TORCH_CHECK(!is_varlen && !is_mla && qk_head_dim <= 256 && v_head_dim <= 256 && softcap == 0.0,
+                    "mha_bwd: PSE and sink require fixed-length non-MLA attention without softcap, head dimensions <= 256");
+    }
+    at::Tensor pse_fp32;
+    if (pse_.has_value()) {
+        const auto& pse = *pse_;
+        TORCH_CHECK(pse.sizes() == at::IntArrayRef({batch_size, num_heads, 1, kv_seqlen}) &&
+                        pse.device() == q.device() && (pse.scalar_type() == q.scalar_type() || pse.scalar_type() == at::kFloat),
+                    "mha_bwd: pse must be [B, Hq, 1, Sk], FP32 or query dtype, on the query device");
+        pse_fp32 = pse.to(at::kFloat).contiguous();
+    }
+    if (sink_.has_value()) {
+        const auto validSink = [&](const at::Tensor& tensor) {
+            return tensor.sizes() == at::IntArrayRef({num_heads}) && tensor.device() == q.device() &&
+                   tensor.scalar_type() == at::kFloat;
+        };
+        TORCH_CHECK(validSink(*sink_), "mha_bwd: sink must be FP32 [Hq] on the query device");
+        TORCH_CHECK(!dsink_.has_value() || (validSink(*dsink_) && dsink_->is_contiguous()), "mha_bwd: dsink must be contiguous FP32 [Hq] on the query device");
+    }
 
     TORCH_CHECK(batch_size > 0, "Ascend950 v4 bwd: batch size must be positive");
     if (seqused_q_.has_value()) {
@@ -172,6 +196,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         fag_info.window_size_right = window_size_right;
     }
     fag_info.deterministic = deterministic ? 1U : 0U;
+    fag_info.enableBand512 = q.dtype() == at::kBFloat16 && !seqused_q_.has_value() && !seqused_k_.has_value();
     // Deterministic accumulation strategy.  BN2S2 applies the arch35
     // column-private schedule when the shape is covered; the tiler rejects
     // any deterministic shape it cannot map, so there is no silent
@@ -363,10 +388,19 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                         "offsets must be 512B-aligned and inside the workspace");
         }
     }
-    at::Tensor workspace = at::empty({static_cast<int64_t>(workspace_size / sizeof(float))},
-                                     at::device(at::kPrivateUse1).dtype(at::kFloat));
+    // Each AIV accumulates into its own slot for each head. The device
+    // epilogue reduces these slots in a fixed order, including in DTM mode.
+    const uint64_t sink_workspace_elems = dsink_.has_value() ?
+        static_cast<uint64_t>(aiv_num) * static_cast<uint64_t>(num_heads) : 0U;
+    at::Tensor workspace = at::empty(
+        {static_cast<int64_t>(workspace_size / sizeof(float) + sink_workspace_elems)},
+        at::device(at::kPrivateUse1).dtype(at::kFloat));
 
     auto ptr = [](const at::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
+    at::Tensor sink_contiguous;
+    if (dsink_.has_value()) sink_contiguous = sink_->contiguous();
+    uint8_t* sink_ptr = sink_contiguous.defined() ? ptr(sink_contiguous) : nullptr;
+    uint8_t* dsink_ptr = dsink_.has_value() ? ptr(*dsink_) : nullptr;
     // Arch35 FAG device ABI: cumulative lengths have B entries and do not
     // include the leading zero.
     at::Tensor cu_q_device;
@@ -416,11 +450,20 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // kernel only uses the matching CV sync protocol when SINGLE_VEC=true.
     const bool launch_single_vec = (fag_tiling_data.shortQ != 0) || (fag_tiling_data.shortBiDir != 0);
 
+    if (pse_fp32.defined()) {
+        // LSE occupies only the first row-count floats of its padded UB slot.
+        const uint32_t aligned_rows = (fag_tiling_data.qTile + 15U) / 16U * 16U;
+        const uint32_t rows = launch_single_vec ? aligned_rows : aligned_rows / 2U;
+        TORCH_CHECK(rows >= 24U, "mha_bwd: PSE needs room for one extra KV row in the LSE buffer");
+    }
+    uint8_t* pse_ptr = pse_fp32.defined() ? ptr(pse_fp32) : nullptr;
+
+
 #define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC)                    \
     FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP,     \
                            SINGLE_VEC><<<launch_cores, nullptr, stream>>>(                                             \
         ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, cu_k, seq_used_q, seq_used_k,       \
-        ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device))
+        ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device), pse_ptr, sink_ptr, dsink_ptr)
 
 #define DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, SINGLE_VEC)                                                      \
     do {                                                                                                               \

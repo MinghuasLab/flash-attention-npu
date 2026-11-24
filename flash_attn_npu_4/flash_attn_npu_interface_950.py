@@ -407,7 +407,7 @@ def _flash_attn_forward(
 
 @_torch_custom_op_wrapper(
     "flash_attn_npu_4_950_C::_flash_attn_backward_op",
-    mutates_args=("dq", "dk", "dv"),
+    mutates_args=("dq", "dk", "dv", "dsink"),
     device_types="npu",
 )
 def _flash_attn_backward_op(
@@ -432,6 +432,9 @@ def _flash_attn_backward_op(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
+    pse: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Same storage detection as forward; retain logical BSND shapes for host/output.
     if cu_seqlens_q is not None:
@@ -441,6 +444,7 @@ def _flash_attn_backward_op(
 
     dout, q, k, v, out = [x.contiguous() if x.stride(-1) != 1 else x for x in (dout, q, k, v, out)]
     softmax_lse = softmax_lse.contiguous()
+    extra = (pse, sink, dsink) if any(x is not None for x in (pse, sink, dsink)) else ()
     _dq, _dk, _dv, softmax_d = flash_attn_npu_4_950.bwd(
         dout,
         q,
@@ -465,6 +469,7 @@ def _flash_attn_backward_op(
         deterministic,
         0,  # sm_margin
         layout,
+        *extra,
     )
     return softmax_d
 
@@ -479,6 +484,8 @@ def _flash_attn_backward_op_fake(
     softmax_lse: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
     dq: torch.Tensor,
@@ -490,8 +497,11 @@ def _flash_attn_backward_op_fake(
     window_size_right: int,
     softcap: float,
     deterministic: bool,
+    pse: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Metadata-only fake for V4 A2 backward_op. Returns softmax_d; mutates dq/dk/dv."""
+    """Return the softmax_d metadata for the Ascend 950 backward op."""
     is_varlen_q = cu_seqlens_q is not None
     if is_varlen_q:
         batch_size = cu_seqlens_q.shape[0] - 1
@@ -541,7 +551,14 @@ def _flash_attn_backward(
     gather_kv_indices: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
     pack_gqa: bool = False,
+    pse: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run backward with the supplied forward output and LSE.
+
+    For fixed-length attention, pse is the per-key bias before scaling.
+    Pass dsink to receive the FP32 gradient of learnable_sink in place.
+    """
     del dlse
 
     assert score_mod is None, "flash_attn_npu_v4 950 bwd does not support score_mod"
@@ -556,7 +573,6 @@ def _flash_attn_backward(
     assert qv is None, "flash_attn_npu_v4 950 bwd does not support qv"
     assert page_table is None, "flash_attn_npu_v4 950 bwd does not support page_table"
     assert gather_kv_indices is None, "flash_attn_npu_v4 950 bwd does not support gather_kv_indices"
-    assert learnable_sink is None, "flash_attn_npu_v4 950 bwd does not support learnable_sink"
 
     # Keep logical BSND/TND shapes, including views backed by BNSD storage.
     # Layout detection and strided input addressing are handled by the backend.
@@ -617,6 +633,9 @@ def _flash_attn_backward(
         _window_to_npu(window_size_right),
         softcap,
         deterministic,
+        pse,
+        learnable_sink,
+        dsink,
     )
     if pad_heads:
         dq.copy_(dq_kernel[..., :qk_head_dim])

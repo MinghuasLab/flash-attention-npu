@@ -28,6 +28,7 @@
 #include "fag_det_schedule.hpp"
 #include "fag_epilogue_post.hpp"
 #include "fag_epilogue_pre.hpp"
+#include "fag_epilogue_sink.hpp"
 #include "fag_block.h"
 #include "fag_mmad_sdp.hpp"
 #include "fag_mmad_dqkv.hpp"
@@ -329,23 +330,34 @@ class FlashAttentionScoreGrad950 {
         const uint32_t vectorBlockIdx = AscendC::GetBlockIdx();
         coreIdx = vectorBlockIdx / subBlockNum;
         subBlockIdx = vectorBlockIdx % subBlockNum;
-        epilogueScaledMaskSoftmax_.Init(resource, params.tiling);
+        epilogueScaledMaskSoftmax_.Init(resource, params.tiling, params.pse);
         epilogueSubMul_.Init(resource, params.workspace, params.tiling);
         epiloguePre_.Init(resource, params.workspace, params.tiling);
         epilogueSoftmaxGradFront_.Init(resource, params.dout, params.out, params.workspace, params.tiling);
         epilogueDetAdd_.Init(resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen, params.workspace, params.tiling);
         epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
+        if (params.dsink != nullptr) {
+            // The tail of the first LSE slot stays clear of both LSE and PSE.
+            const auto slots = FagUbLayout::MakePipelineSlots(qBlockSize_, SINGLE_VEC);
+            auto scratch = resource.ubBuf.template GetBufferByByte<float>(slots.p - 32U);
+            sinkGrad_.Init(resource, scratch, params.sink, params.dsink,
+                           params.workspace + tiling_->workspaceSize, vectorBlockIdx, vectorCoreNum, qHeadNum_);
+        }
         epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
         epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
                                   vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
 #endif
         AscendC::SyncAll<false>();
         RunTasks(coreIdx, subBlockIdx);
+#ifdef __DAV_VEC__
+        if (sinkGrad_.Enabled()) sinkGrad_.Drain();
+#endif
         AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
         epiloguePost_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
                       vWaitMte3Ping, vWaitMte3Pong);
+        if (sinkGrad_.Enabled()) sinkGrad_.Finish(vWaitMte2Ping, vWaitMte3Ping);
 #endif
     }
 
@@ -1954,6 +1966,11 @@ class FlashAttentionScoreGrad950 {
         const uint32_t subBlockRealS1 = subBlockIdx ? block.s1Extend - block.firstHalfRealS1 : block.firstHalfRealS1;
         if (subBlockRealS1 != 0U) {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
+            if (sinkGrad_.Enabled()) {
+                const uint64_t head = static_cast<uint64_t>(block.n2Idx) * groupNum_ + block.groupIdx;
+                sinkGrad_.Accumulate(ubMm1ResTensor[bufferId], ubMm2ResTensor[bufferId], lseUbTensor[bufferId],
+                                     subBlockRealS1, block.s2Extend, head, vToMte3Event);
+            }
             epilogueSubMul_(block, ubMm2ResTensor[bufferId], ubPTensor[bufferId], ubMm1ResTensor[bufferId],
                             ubDSTensor[bufferId], deltaUbTensor[bufferId], l1dSTensor[bufferId], mte2ToVEvent,
                             vToMte3Event, mte3ToVEvent, subBlockIdx);
@@ -1979,6 +1996,7 @@ class FlashAttentionScoreGrad950 {
         epilogueSoftmaxGradFront_;
     EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
     EpilogueSubMul epilogueSubMul_;
+    Catlass::Epilogue::Block::FagSinkGrad sinkGrad_;
     Catlass::Epilogue::Block::FagDeterministicAdd<DataType, Catlass::Arch::Ascend950, TilingData> epilogueDetAdd_;
     Catlass::Epilogue::Block::FagPost<DataType, Catlass::Arch::Ascend950, TilingData> epiloguePost_;
 #endif
@@ -2125,7 +2143,7 @@ template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, 
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
                                            GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
                                            GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
-                                           GM_ADDR workspace, GM_ADDR tiling)
+                                           GM_ADDR workspace, GM_ADDR tiling, GM_ADDR pse, GM_ADDR sink, GM_ADDR dsink)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -2160,6 +2178,9 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
                                    INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC>;
     FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
                            cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
+    params.pse = pse;
+    params.sink = sink;
+    params.dsink = dsink;
     FAGKernel950 fag;
     fag(params);
 }

@@ -333,7 +333,16 @@ PYBIND11_MODULE(flash_attn_npu_4_950, m)
 {
     m.doc() = "FlashAttention v4 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
-    m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
+    m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)",
+          pybind11::arg("dout"), pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("out"), pybind11::arg("softmax_lse"), pybind11::arg("dq"), pybind11::arg("dk"),
+          pybind11::arg("dv"), pybind11::arg("cu_seqlens_q"), pybind11::arg("cu_seqlens_k"),
+          pybind11::arg("seqused_q"), pybind11::arg("seqused_k"), pybind11::arg("max_seqlen_q"),
+          pybind11::arg("max_seqlen_k"), pybind11::arg("softmax_scale"), pybind11::arg("is_causal"),
+          pybind11::arg("window_size_left"), pybind11::arg("window_size_right"), pybind11::arg("softcap"),
+          pybind11::arg("deterministic"), pybind11::arg("sm_margin"), pybind11::arg("layout"),
+          pybind11::arg("pse") = pybind11::none(), pybind11::arg("sink") = pybind11::none(),
+          pybind11::arg("dsink") = pybind11::none());
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata");
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),

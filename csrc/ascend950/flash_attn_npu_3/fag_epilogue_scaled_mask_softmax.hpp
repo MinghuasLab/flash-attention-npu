@@ -42,9 +42,11 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
     BlockEpilogue() = default;
 
     CATLASS_DEVICE
-    void Init(Arch::Resource<ArchTag>& resource, GM_ADDR tiling)
+    void Init(Arch::Resource<ArchTag>& resource, GM_ADDR tiling, GM_ADDR pse = nullptr)
     {
         tiling_ = reinterpret_cast<const __gm__ TilingData*>(tiling);
+        hasPse_ = pse != nullptr;
+        if (hasPse_) pseGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(pse));
     }
 
     template <class TensorAttenMaskGm, class TensorAttenMaskUb, class TensorSoftmaxLseGm,
@@ -113,6 +115,13 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
         AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
         const auto lseGmOffset = softmaxLseGm.layout()(softmaxLseGm.coord());
         AscendC::DataCopyPad(lseUbTensor, softmaxLseGm.data()[lseGmOffset], copyParams, padParams);
+        const uint32_t pseUbOffset = (static_cast<uint32_t>(s1RealSize) + 7U) / 8U * 8U;
+        if (hasPse_) {
+            const uint64_t head = block.n2Idx * (tiling_->qHeadNum / tiling_->kvHeadNum) + block.groupIdx;
+            const uint64_t pseOffset = (block.batchIdx * tiling_->qHeadNum + head) * tiling_->kvSeqlen + block.s2Start;
+            AscendC::DataCopyExtParams pseCopy{1, static_cast<uint32_t>(block.s2Extend * sizeof(float)), 0, 0, 0};
+            AscendC::DataCopyPad(lseUbTensor[pseUbOffset], pseGm_[pseOffset], pseCopy, padParams);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
 
@@ -127,7 +136,8 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
             reinterpret_cast<__ubuf__ ElementS*>(ubMm1Tensor.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint8_t*>(attenMaskUbTensor.GetPhyAddr()),
             reinterpret_cast<__ubuf__ float*>(lseUbTensor.GetPhyAddr()), static_cast<uint16_t>(s1RealSize),
-            block.s2Extend, scaleValue, softcapValue);
+            block.s2Extend, scaleValue, softcapValue, hasPse_ ?
+                reinterpret_cast<__ubuf__ float*>(lseUbTensor.GetPhyAddr()) + pseUbOffset : nullptr);
         if constexpr (IS_SOFTCAP) {
             AscendC::PipeBarrier<PIPE_V>();
         }
@@ -165,7 +175,7 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
     template <bool HAS_ATTEN_MASK, bool HAS_SOFTCAP>
     __simd_vf__ static inline void MulsMaskSimpleSoftmax(__ubuf__ ElementP* dstUb, __ubuf__ ElementS* srcUb,
                                                          __ubuf__ uint8_t* maskUb, __ubuf__ float* lseUb, uint16_t m,
-                                                         uint32_t n, float scaleValue, float softcapValue)
+                                                         uint32_t n, float scaleValue, float softcapValue, __ubuf__ float* pseUb)
     {
         using namespace AscendC::MicroAPI;
 
@@ -206,12 +216,21 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
 
         const uint32_t nzBlockStride = m * NZ_C0_SIZE * sizeof(ElementP) / 32U + 1U;
 
+        RegTensor<float> pseFirst, pseSecond;
+        if (pseUb != nullptr) {
+            LoadAlign(pseFirst, pseUb);
+            LoadAlign(pseSecond, pseUb + FP32_PER_VREG);
+        }
         Duplicate(minVreg, MASKED_VALUE);
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign(srcVreg0, srcUb + i * S2_ROW_STRIDE);
             LoadAlign(srcVreg1, srcUb + i * S2_ROW_STRIDE + FP32_PER_VREG);
             LoadAlign<float, LoadDist::DIST_BRC_B32>(lseVreg, lseUb + i); // broadcast b32
 
+            if (pseUb != nullptr) {
+                Add(srcVreg0, srcVreg0, pseFirst, pregTail0);
+                Add(srcVreg1, srcVreg1, pseSecond, pregTail1);
+            }
             Muls(srcVreg0, srcVreg0, scaleValue, pregTail0);
             Muls(srcVreg1, srcVreg1, scaleValue, pregTail1);
 
@@ -368,6 +387,8 @@ class BlockEpilogue<EpilogueAscend950FAGScaledMaskSoftmax<INPUT_LAYOUT_, IS_ATTE
     static constexpr uint32_t FP32_PER_VREG = 64;
     static constexpr float MASKED_VALUE = -3.0e38f;
     static constexpr uint32_t NZ_C0_SIZE = 32U / sizeof(ElementP);
+    AscendC::GlobalTensor<float> pseGm_;
+    bool hasPse_ = false;
     const __gm__ TilingData* tiling_ = nullptr;
 };
 
