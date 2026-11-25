@@ -43,9 +43,7 @@ BWD_LAYOUTS = [
     ("bnsd", "BNSD", "BNSD"),
 ]
 
-PRELUDE = (
-    "// Copyright (c) 2026, Minghua Shen.\n"
-)
+PRELUDE = "// Copyright (c) 2026, Minghua Shen.\n"
 
 
 def _header(family_desc: str, layout_display: str) -> str:
@@ -102,6 +100,28 @@ class Kernel:
     content: str
 
 
+# MLA groups layout instantiations by implementation family and dtype. This
+# keeps parallel compilation without a separate macro-configured file per layout.
+MLA_FAMILIES = {
+    "auto_split": ("mla_auto_split_dispatch_impl.hpp", [("LaunchCompressed", "MlaLaunchArgs", "")]),
+    "prefill": ("mla_prefill_dispatch_impl.hpp", [("LaunchPrefill", "MlaLaunchArgs", "")]),
+    "gqa": ("mla_gqa_dispatch_impl.hpp", [("LaunchGrouped", "MlaLaunchArgs", "")]),
+}
+
+
+def mla_kernel(dtype: str, family: str, header: str, entries: list) -> Kernel:
+    ctype = DTYPE_MAP[dtype]
+    body = PRELUDE + (
+        "// Generated MLA template instantiations.\n"
+        f'#include "../mla/{header}"\n\n'
+        "namespace flash_attn::mla {\n"
+    )
+    for launch, arguments, options in entries:
+        body += f"template aclError {launch}<{ctype}{options}>(const {arguments}&);\n"
+    body += "} // namespace flash_attn::mla\n"
+    return Kernel("mla", dtype, family, f"mla_dispatch_{dtype}_{family}.cpp", body)
+
+
 def get_all_kernels() -> List[Kernel]:
     kernels: List[Kernel] = []
     for dtype in DTYPE_MAP:
@@ -109,6 +129,8 @@ def get_all_kernels() -> List[Kernel]:
             kernels.append(fwd_kernel(dtype, layout))
         for layout in BWD_LAYOUTS:
             kernels.append(bwd_kernel(dtype, layout))
+        for family, (header, entries) in MLA_FAMILIES.items():
+            kernels.append(mla_kernel(dtype, family, header, entries))
     return kernels
 
 

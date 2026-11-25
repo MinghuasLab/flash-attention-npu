@@ -7,6 +7,7 @@ import importlib.util
 import re
 import sys
 import sysconfig
+from pathlib import Path
 from packaging.version import parse
 import platform
 
@@ -207,7 +208,7 @@ def _get_hcc_cpp_include(hcc):
 
 
 def _cmdhash(compile_common):
-    """Stable hash of the per-extension compile flags (arch / -O / ABI / includes).
+    """Stable hash of the effective compile flags (arch / -O / ABI / includes).
     A change here means a stored .o was produced with different flags and must be
     rebuilt, even if no source/header mtime moved."""
     return hashlib.md5("\0".join(compile_common).encode("utf-8")).hexdigest()
@@ -381,6 +382,12 @@ class BishengBuildExt(build_ext):
             "-ltiling_api",
             "-lplatform",
         ]
+        if ext_name == "flash_attn_npu_3.flash_attn_npu_3":
+            # Scope is thread-local and active only around MLA's ASC launch.
+            link_flags += [
+                "-Wl,--wrap=aclrtLaunchKernelWithHostArgs",
+                "-Wl,--wrap=aclrtLaunchKernelWithArgsArray",
+            ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
         # to enter ASC/device-compile mode (without it, kernel_operator.h and the
@@ -428,7 +435,7 @@ class BishengBuildExt(build_ext):
             or os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
         )
 
-    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
+    def _build_aicpu_metadata(self, ext_fullpath, ext_name, source="fa_metadata.aicpu"):
         """Compile fa_metadata.aicpu (host AICPU object) for the extensions
         that carry the scheduler-metadata feature (910 v2/v3/v4 and 950 v3/v4). This
         is a separate `bisheng -x aicpu` invocation (host CPU code
@@ -454,7 +461,7 @@ class BishengBuildExt(build_ext):
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:
             return None
-        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
+        aicpu_src = os.path.join(src_dir, source)
         if not os.path.exists(aicpu_src):
             return None
         aicpu_obj = os.path.join(
@@ -462,7 +469,7 @@ class BishengBuildExt(build_ext):
             # All extensions share the temporary directory. Keep the
             # AICPU objects per extension; otherwise the later 950 build
             # overwrites the object already queued for the earlier one.
-            f"fa_metadata_{ext_name.replace('.', '_')}.o",
+            f"{Path(source).stem}_{ext_name.replace('.', '_')}.o",
         )
         # Incremental AICPU compilation must also track the local headers. In
         # particular, fa_metadata.aicpu includes tilingdata.h and metadata
@@ -481,6 +488,12 @@ class BishengBuildExt(build_ext):
             header = os.path.join(src_dir, name)
             if os.path.exists(header):
                 aicpu_inputs.append(header)
+        if source.startswith("mla/"):
+            # MLA AICPU includes the shared scheduler sources as well as headers.
+            mla_dir = Path(src_dir) / "mla"
+            aicpu_inputs.extend(mla_dir.glob("*.h"))
+            aicpu_inputs.extend(mla_dir.glob("*.cpp"))
+            aicpu_inputs.append(__file__)
         expected_signature = _inputs_signature(aicpu_inputs)
         try:
             with open(aicpu_stamp) as stamp:
@@ -568,7 +581,30 @@ class BishengBuildExt(build_ext):
             _compiler, compile_common, _la, _lf = toolchains[ext_name]
             depfile = obj + ".d"
             cmdhash_file = obj + ".cmdhash"
-            if not force and _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
+            mla_device = ext_name == "flash_attn_npu_3.flash_attn_npu_3" and os.path.basename(
+                src
+            ).startswith("mla_dispatch_")
+            if mla_device:
+                # Match FIA's explicit synchronization policy for the migrated
+                # kernels. Keep these flags local to their translation units.
+                compile_common = [
+                    *compile_common,
+                    "--cce-auto-sync=off",
+                    "-mllvm",
+                    "-cce-vf-remove-membar=false",
+                    "-mllvm",
+                    "-cce-aicore-hoist-movemask=false",
+                ]
+            device_depfile = obj + ".device.d"
+            device_fresh = not mla_device or (
+                os.path.exists(device_depfile)
+                and _obj_is_fresh(obj, src, device_depfile, cmdhash_file, compile_common)
+            )
+            if (
+                not force
+                and device_fresh
+                and _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common)
+            ):
                 print("[compile-skip]", ext_name, os.path.basename(src), "(obj up-to-date)")
                 return (ext_name, obj)
             cmd = [*compile_common, "-c", src, "-o", obj, "-MMD", "-MF", depfile]
@@ -578,6 +614,19 @@ class BishengBuildExt(build_ext):
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 if result.stdout:
                     print(result.stdout)
+                if mla_device:
+                    # Bisheng's final host pass overwrites -MMD and omits headers
+                    # under __NPU_ARCH__. Track the actual device include graph.
+                    deps_cmd = [
+                        *compile_common,
+                        "--offload-device-only",
+                        "-M",
+                        src,
+                        "-MF",
+                        device_depfile,
+                    ]
+                    print("[device-deps-cmd]", " ".join(deps_cmd))
+                    subprocess.run(deps_cmd, capture_output=True, text=True, check=True)
                 with open(cmdhash_file, "w") as f:
                     f.write(_cmdhash(compile_common))
                 return (ext_name, obj)
@@ -586,9 +635,7 @@ class BishengBuildExt(build_ext):
                 raise
 
         # One shared pool across all extensions so the heaviest TUs compile
-        # concurrently regardless of which extension owns them. TUs per extension
-        # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
-        # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
+        # concurrently regardless of which extension owns them.
         build_jobs = os.getenv("FLASH_ATTN_BUILD_JOBS")
         if build_jobs:
             try:
@@ -617,6 +664,11 @@ class BishengBuildExt(build_ext):
             aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
             if aicpu_obj is not None:
                 objs_by_ext[ext.name].append(aicpu_obj)
+            if ext.name == "flash_attn_npu_3.flash_attn_npu_3":
+                for source in ("mla/mla_metadata.aicpu",):
+                    objs_by_ext[ext.name].append(
+                        self._build_aicpu_metadata(ext_fullpath, ext.name, source)
+                    )
 
         # Link each extension from its own object files (serial; link is cheap
         # relative to compile - measured ~1s/ext - so parallelizing would save
@@ -728,6 +780,20 @@ src_ascend910_v3 = glob.glob(
 src_ascend910_v3 += glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True
 )
+# MLA numerical instantiations are generated with the ordinary v3 dispatch.
+# These are the host adapters and schedulers.
+src_ascend910_v3 += [
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3/mla", name)
+    for name in (
+        "mla_forward.cpp",
+        "mla_layout.cpp",
+        "mla_dispatch.cpp",
+        "mla_tiling.cpp",
+        "mla_split.cpp",
+        "cann_split_core.cpp",
+    )
+]
+
 # Standalone split-attention combine (fwd_combine) kernel. Kept in its own
 # translation unit so the Vector-only kernel does not land in flash_api.cpp.
 src_ascend910_v3 += glob.glob(
@@ -747,7 +813,8 @@ src_ascend950_v3 += glob.glob(
 )
 # Isolated D>256 128x256 partial-resident bwd kernel (compile-isolated from fag_kernel.cpp).
 src_ascend950_v3 += glob.glob(
-    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"), recursive=True
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"),
+    recursive=True,
 )
 src_ascend910_v4 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True
