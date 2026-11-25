@@ -96,37 +96,21 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
     c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
-    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
     aclrtStream curHandle = currentStream.stream(false);
-    aclrtStream aicpuHandle = aicpuStream.stream(false);
 
-    struct MetadataEvents {
-        aclrtEvent inputReady = nullptr;
-        aclrtEvent metadataDone = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
-    MetadataEvents& events = eventsByDevice[currentStream.device_index()];
-    if (events.inputReady == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
-        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
-    }
-
+    // Submit on the caller's stream so metadata is ordered relative to inputs and
+    // same-stream consumers. Cross-stream consumers require an explicit dependency.
     FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, aicpuHandle, inputReady = events.inputReady, metadataDone = events.metadataDone,
-                          metaArgs]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
-        ComputeFAMetadataV3<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
-        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+    auto metadata_task = [curHandle, metaArgs]() mutable -> int {
+        ComputeFAMetadataV3<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
 
-    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
-    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
+    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), currentStream);
+    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), currentStream);
     if (seqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), aicpuStream);
+        c10_npu::NPUCachingAllocator::recordStream(seqlensQ->storage().data_ptr(), currentStream);
     }
     return meta;
 }
