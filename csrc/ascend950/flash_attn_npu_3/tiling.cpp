@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 #include "tilingdata.h"
@@ -562,7 +563,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 
 void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
 {
-    uint32_t totalTaskNum = 0;
+    uint64_t totalTaskNum = 0;
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
     for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
         uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
@@ -580,13 +581,16 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
         uint32_t curQNBlockNum = qNBlockNumPerGroup * faInfo_.kvHeads;
         uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
         uint32_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
-        if (batchIdx == 0) {
-            faTilingData.set_firstBatchTaskNum(curTaskNum);
-        }
+        const uint64_t curTaskNum = static_cast<uint64_t>(curQNBlockNum) * curQSBlockNum;
         totalTaskNum += curTaskNum;
+        if (totalTaskNum > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("FA3 forward task count exceeds uint32");
+        }
+        if (batchIdx == 0) {
+            faTilingData.set_firstBatchTaskNum(static_cast<uint32_t>(curTaskNum));
+        }
     }
-    faTilingData.set_totalTaskNum(totalTaskNum);
+    faTilingData.set_totalTaskNum(static_cast<uint32_t>(totalTaskNum));
 }
 BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)
 {

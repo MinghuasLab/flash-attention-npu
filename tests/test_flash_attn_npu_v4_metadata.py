@@ -8,6 +8,7 @@ import inspect
 _device_name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
 if "Ascend910" not in _device_name and "Ascend950" not in _device_name:
     pytest.skip("FA4 metadata tests require Ascend910 or Ascend950", allow_module_level=True)
+_EXPECTED_AUTOMATIC_METADATA_CALLS = int("Ascend910" in _device_name)
 
 from tests.common.attention_ref import ref_flash_attention_pair  # noqa: E402
 from tests.common.compare import assert_fa_close  # noqa: E402
@@ -58,24 +59,7 @@ def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages)
     torch.testing.assert_close(lse.reshape(512), expected_lse, rtol=0, atol=1e-6)
 
 
-@pytest.fixture
-def capture_950_scheduler_metadata(monkeypatch):
-    from flash_attn_npu_4 import flash_attn_npu_interface_950 as api
-
-    metadata = []
-    get_metadata = api.get_scheduler_metadata
-
-    def record_metadata(*args, **kwargs):
-        tiling = get_metadata(*args, **kwargs)
-        metadata.append(tiling)
-        return tiling
-
-    monkeypatch.setattr(api, "get_scheduler_metadata", record_metadata)
-    return metadata
-
-
-def _assert_950_flashdecode_metadata(metadata):
-    (tiling,) = metadata
+def _assert_950_flashdecode_metadata(tiling):
     # Ascend950 FAInferStaticTilingData uint32 fields: FD flag, combine tasks, partial tasks.
     tiling_words = tiling.cpu().view(torch.int32)
     assert tiling_words[591].item() == 1
@@ -93,7 +77,7 @@ def _assert_950_flashdecode_metadata(metadata):
     ],
 )
 def test_950_d512_dense_auto_flashdecode(
-    dtype, q_shape, kv_shape, disable_scheduler_metadata, capture_950_scheduler_metadata
+    dtype, q_shape, kv_shape, disable_scheduler_metadata, metadata_spy
 ):
     query = make_random_tensor(q_shape, dtype, device="npu")
     key = make_random_tensor(kv_shape, dtype, device="npu")
@@ -108,10 +92,19 @@ def test_950_d512_dense_auto_flashdecode(
         return_lse=True,
         disable_scheduler_metadata=disable_scheduler_metadata,
     )
-    if disable_scheduler_metadata:
-        assert not capture_950_scheduler_metadata
-    else:
-        _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+    assert not metadata_spy
+    if not disable_scheduler_metadata:
+        metadata = get_scheduler_metadata(
+            max_seqlen_q=q_shape[1],
+            max_seqlen_k=kv_shape[1],
+            nheads=q_shape[2],
+            nheads_kv=kv_shape[2],
+            headdim=q_shape[-1],
+            num_splits=0,
+            seqused_k=torch.full((q_shape[0],), kv_shape[1], dtype=torch.int32, device=query.device),
+            qkv_dtype=dtype,
+        )
+        _assert_950_flashdecode_metadata(metadata)
 
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
         query.cpu(), key.cpu(), value.cpu(), scale, None, dtype
@@ -122,27 +115,41 @@ def test_950_d512_dense_auto_flashdecode(
 
 @pytest.mark.golden_api("flash_attn_varlen_func")
 @pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 paged FlashDecode")
-def test_950_d512_paged_auto_flashdecode_varlen(capture_950_scheduler_metadata):
+def test_950_d512_paged_auto_flashdecode_varlen(metadata_spy):
     dtype = torch.bfloat16
     q_offsets, kv_lengths = [0, 2, 3], [4097, 2049]
     page_size, heads, kv_heads, head_size = 512, 16, 4, 512
     q = make_random_tensor((q_offsets[-1], heads, head_size), dtype, device="npu")
     k, v, page_table = _make_paged_cache(2, max(kv_lengths), kv_heads, head_size, page_size, dtype)
+    cu_seqlens_q = _int32_npu(q_offsets)
+    seqused_k = _int32_npu(kv_lengths)
     scale = head_size**-0.5
     out, lse, *_ = flash_attn_varlen_func(
         q,
         k,
         v,
-        cu_seqlens_q=_int32_npu(q_offsets),
+        cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=2,
         max_seqlen_k=max(kv_lengths),
-        seqused_k=_int32_npu(kv_lengths),
+        seqused_k=seqused_k,
         page_table=page_table,
         num_splits=0,
         softmax_scale=scale,
         return_lse=True,
     )
-    _assert_950_flashdecode_metadata(capture_950_scheduler_metadata)
+    assert not metadata_spy
+    metadata = get_scheduler_metadata(
+        max_seqlen_q=2,
+        max_seqlen_k=max(kv_lengths),
+        nheads=heads,
+        nheads_kv=kv_heads,
+        headdim=head_size,
+        num_splits=0,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        qkv_dtype=dtype,
+    )
+    _assert_950_flashdecode_metadata(metadata)
     keys, values = gather_paged_kv_batch(
         k.cpu(), v.cpu(), page_table.cpu(), max(kv_lengths), page_size
     )
@@ -807,9 +814,7 @@ def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
 
 @pytest.fixture
 def metadata_spy(monkeypatch):
-    """Spy on get_scheduler_metadata to prove the training interfaces route
-    through the AICPU scheduler-metadata path internally (official flash-attn
-    only exposes scheduler_metadata on flash_attn_with_kvcache)."""
+    """Count Python metadata calls made by the public forward interfaces."""
     if "Ascend950" in _device_name:
         from flash_attn_npu_4 import flash_attn_npu_interface_950 as interface
     else:
@@ -860,7 +865,7 @@ def test_flash_attn_func_metadata_bsnd(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -932,7 +937,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
         window_size=WINDOW_SIZE,
         num_splits=1,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     if add_unused_qkv:
         output_eager = flash_attn_varlen_func(
@@ -951,7 +956,7 @@ def test_flash_attn_varlen_func_metadata_tnd(
             num_splits=1,
             disable_scheduler_metadata=True,
         )
-        assert len(metadata_spy) == 1
+        assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     # Physical offsets come from allocated lengths; compare only used prefixes.
     for batch_idx in range(batch_size):
@@ -1257,7 +1262,7 @@ def test_flash_attn_func_metadata_swa(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1317,7 +1322,7 @@ def test_flash_attn_func_metadata_softcap_scale(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1379,7 +1384,7 @@ def test_flash_attn_varlen_func_metadata_swa(
         window_size=window_size,
         num_splits=1,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _EXPECTED_AUTOMATIC_METADATA_CALLS
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()

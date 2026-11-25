@@ -1,0 +1,182 @@
+// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+
+#include "aicpu_api.h"
+#include "fa_fwd_prepare.h"
+#include "fa_metadata_args.h"
+#include "tiling.cpp"
+
+#include <limits>
+
+namespace fa3_fwd {
+namespace {
+
+bool ValidOffsets(const int32_t* cu, uint32_t batch, int64_t capacity)
+{
+    return cu == nullptr || (cu[0] == 0 && cu[batch] >= 0 && cu[batch] <= capacity);
+}
+
+bool ValidPages(const int32_t* pageTable, const PrepareArgs& args, uint32_t batchIndex, int64_t kvLength)
+{
+    const uint64_t pages = (kvLength + args.pageSize - 1U) / args.pageSize;
+    if (pages > args.pagesPerRow) {
+        return false;
+    }
+    const auto* row = pageTable + static_cast<uint64_t>(batchIndex) * args.pagesPerRow;
+    for (uint64_t i = 0; i < pages; ++i) {
+        if (row[i] < 0 || static_cast<uint32_t>(row[i]) >= args.pageCount) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Public metadata remains a compatibility input. Rebuild the runtime plan from
+// this invocation's lengths so mutable inputs cannot select stale addresses.
+bool CompatibleMetadata(const PrepareArgs& args, const FAInferTilingData& tiling, const int32_t* kvScratch)
+{
+    if (args.suppliedMetadata == 0) {
+        return true;
+    }
+    const auto* bytes = reinterpret_cast<const uint8_t*>(args.suppliedMetadata);
+    FAInferTilingData old;
+    std::memcpy(&old, bytes, sizeof(old));
+    if (old.batch != tiling.batch || old.numHeads != tiling.numHeads || old.kvHeads != tiling.kvHeads ||
+        old.embeddingSize != tiling.embeddingSize || old.embeddingSizeV != tiling.embeddingSizeV ||
+        old.quantMode != tiling.quantMode || old.blockSize != tiling.blockSize ||
+        old.maxQSeqlen != tiling.maxQSeqlen || old.maxKvSeqlen != tiling.maxKvSeqlen) {
+        return false;
+    }
+    const auto readPrefix = [bytes](uint32_t b) {
+        int32_t value;
+        std::memcpy(&value, bytes + sizeof(FAInferTilingData) + uint64_t(b) * sizeof(value), sizeof(value));
+        return value;
+    };
+    int64_t cumulative = 0;
+    if (readPrefix(0) != 0) {
+        return false;
+    }
+    for (uint32_t b = 0; b < args.batch; ++b) {
+        cumulative = args.layout == FwdLayout::TND && args.pageCount == 0
+                         ? kvScratch[b + 1]
+                         : cumulative + kvScratch[b];
+        if (readPrefix(b + 1) != cumulative) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t Prepare(const PrepareArgs& args, Plan& plan)
+{
+    const auto* cuQ = reinterpret_cast<const int32_t*>(args.cuQ);
+    const auto* cuKv = reinterpret_cast<const int32_t*>(args.cuKv);
+    const auto* usedQ = reinterpret_cast<const int32_t*>(args.usedQ);
+    const auto* usedKv = reinterpret_cast<const int32_t*>(args.usedKv);
+    const auto* pageTable = reinterpret_cast<const int32_t*>(args.pageTable);
+    auto* qScratch = reinterpret_cast<int32_t*>(args.plan + QScratchOffset());
+    auto* kvScratch = reinterpret_cast<int32_t*>(args.plan + KvScratchOffset(args.batch));
+    if (!ValidOffsets(cuQ, args.batch, args.qCapacity) || !ValidOffsets(cuKv, args.batch, args.kvCapacity)) {
+        return PLAN_INVALID_SEQUENCE;
+    }
+
+    const bool tnd = args.layout == FwdLayout::TND;
+    const bool paged = pageTable != nullptr;
+    const bool packedKv = tnd && !paged;
+    qScratch[0] = 0;
+    kvScratch[0] = 0;
+    int64_t qSum = 0;
+    int64_t kvSum = 0;
+    int64_t maxQ = 0;
+    int64_t minQ = args.maxQ;
+    int64_t maxKv = 0;
+    for (uint32_t b = 0; b < args.batch; ++b) {
+        const int64_t qRegion = tnd ? static_cast<int64_t>(cuQ[b + 1]) - cuQ[b] : args.maxQ;
+        const int64_t kvRegion = cuKv == nullptr ? args.kvCapacity : static_cast<int64_t>(cuKv[b + 1]) - cuKv[b];
+        const int64_t qLength = usedQ == nullptr ? qRegion : usedQ[b];
+        const int64_t kvLength = usedKv == nullptr ? kvRegion : usedKv[b];
+        if (qLength < 0 || qLength > qRegion || qLength > args.maxQ ||
+            kvLength < 0 || kvLength > kvRegion || (args.maxKv >= 0 && kvLength > args.maxKv)) {
+            return PLAN_INVALID_SEQUENCE;
+        }
+        if (paged && !ValidPages(pageTable, args, b, kvLength)) {
+            return PLAN_INVALID_PAGE;
+        }
+        qSum += qLength;
+        kvSum += kvLength;
+        if ((tnd && qSum > std::numeric_limits<int32_t>::max()) ||
+            (packedKv && (kvSum > args.kvCapacity || kvSum > std::numeric_limits<int32_t>::max()))) {
+            return PLAN_INVALID_SEQUENCE;
+        }
+        if (tnd) {
+            qScratch[b + 1] = static_cast<int32_t>(qSum);
+        } else {
+            qScratch[b] = static_cast<int32_t>(qLength);
+        }
+        if (packedKv) {
+            kvScratch[b + 1] = static_cast<int32_t>(kvSum);
+        } else {
+            kvScratch[b] = static_cast<int32_t>(kvLength);
+        }
+        maxQ = std::max(maxQ, qLength);
+        minQ = std::min(minQ, qLength);
+        maxKv = std::max(maxKv, kvLength);
+    }
+    const int64_t maskKvBound = args.maxKv < 0 ? maxKv : args.maxKv;
+    const auto mask = DeriveFwdMask(args.causal, args.windowLeft, args.windowRight, args.maxQ, maskKvBound);
+    optiling::FAInferContext context;
+    context.batch = args.batch;
+    context.numHeads = args.numHeads;
+    context.kvHeads = args.numKvHeads;
+    context.embeddingSize = args.headDim;
+    context.embeddingSizeV = args.headDimV;
+    context.numBlocks = args.pageCount;
+    context.blockSize = args.pageSize;
+    context.maxNumBlocksPerBatch = args.pagesPerRow;
+    context.maxQSeqlen = maxQ;
+    context.maxKvSeqlen = maxKv;
+    context.qSeqlenList = qScratch;
+    context.kvSeqlenList = kvScratch;
+    context.layout = args.layout;
+    context.pagedCacheFlag = paged;
+    context.dataType = args.quantized ? optiling::DataType::FP8 : optiling::DataType::FP16;
+    context.maskType = mask.is_local ? optiling::MaskType::MASK_BAND
+                                   : (mask.is_causal ? optiling::MaskType::MASK_SPEC : optiling::MaskType::NO_MASK);
+    context.windowSizeLeft = mask.is_local ? mask.window_left : 0;
+    context.windowSizeRight = mask.is_local ? mask.window_right : 0;
+    context.flashDecodeFlag = args.allowFd && !mask.is_local && minQ > 0 && maxQ <= 16 && maxKv >= 1024;
+    context.numSplits = args.numSplits;
+
+    plan.tiling = {};
+    optiling::FAInferTiling tiler(context);
+    tiler.SetCoreNum(args.blockDim);
+    tiler.DoTiling(plan.tiling);
+    plan.tiling.maskType = mask.maskType;
+    if (!CompatibleMetadata(args, plan.tiling, kvScratch)) {
+        return PLAN_INVALID_METADATA;
+    }
+    if (plan.tiling.flashDecodeFlag != 0 && plan.tiling.fdWorkspaceEnd > args.workspaceBytes) {
+        return PLAN_INVALID_WORKSPACE;
+    }
+    return PLAN_VALID;
+}
+} // namespace
+} // namespace fa3_fwd
+
+__global__ __aicpu__ uint32_t PrepareFlashAttnFwd950V3(void* args)
+{
+    const auto& input = *reinterpret_cast<const fa3_fwd::PrepareArgs*>(args);
+    auto& plan = *reinterpret_cast<fa3_fwd::Plan*>(input.plan);
+    plan.status = fa3_fwd::PLAN_INVALID_SEQUENCE;
+    AscendC::DataStoreBarrier();
+    uint32_t status = fa3_fwd::PLAN_INVALID_SCHEDULE;
+    try {
+        status = fa3_fwd::Prepare(input, plan);
+    } catch (...) {
+        // The shared scheduler can reject an unsupported FD partition.
+        status = fa3_fwd::PLAN_INVALID_SCHEDULE;
+    }
+    AscendC::DataStoreBarrier();
+    plan.status = status;
+    AscendC::DataStoreBarrier();
+    return status;
+}

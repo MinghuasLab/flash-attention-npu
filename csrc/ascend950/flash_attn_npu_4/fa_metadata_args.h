@@ -56,16 +56,11 @@ struct FAMetadataArgs {
     uint64_t cuSeqlensQAddr, seqlensQAddr, seqlensKAddr, metaOutAddr;
     uint32_t batch, numHeads, numHeadsK, embeddingSize, embeddingSizeV;
     uint32_t maxQSeqlen;
+    uint32_t maxKvSeqlen;
     uint32_t maskType, blockDim, isVarlen, isVarlenKv, numSplits;
     uint32_t hasSequsedQ;
     uint32_t quantMode;
     int64_t windowSizeLeft, windowSizeRight;
 };
 
-// CPU-computed launch payload. AICPU writes only this small, private runtime
-// buffer; reusable static metadata is neither read nor modified.
-struct FARuntimeArgs {
-    uint64_t runtimeAddr;
-    FAInferRuntimeData runtime;
-};
 #endif

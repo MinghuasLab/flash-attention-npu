@@ -421,17 +421,17 @@ def metadata_spy(monkeypatch):
 
 @pytest.fixture
 def metadata_spy_950(monkeypatch):
-    """Ascend 950 版本的 metadata_spy：950 走 flash_attn_npu_interface_950。"""
+    """Count explicit Python metadata calls made through the 950 wrapper."""
     from flash_attn_npu_3 import flash_attn_npu_interface_950 as interface
 
     calls = []
-    original = interface._get_scheduler_metadata_op
+    original = interface.get_scheduler_metadata
 
     def _spy(*args, **kwargs):
         calls.append((args, kwargs))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(interface, "_get_scheduler_metadata_op", _spy)
+    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
     return calls
 
 
@@ -1496,7 +1496,7 @@ def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_
         window_size=WINDOW_SIZE,
         num_splits=1,
     )
-    assert len(metadata_spy_950) == 1
+    assert not metadata_spy_950
 
     _assert_tnd_matches_ref(
         output_npu,
@@ -1751,13 +1751,13 @@ def test_flash_attn_with_kvcache_metadata_matches_tnd_3d_nonpaged():
 
 
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_flash_attn_kvcache_metadata_950_short_kv_swa():
+def test_flash_attn_kvcache_metadata_950_short_kv_swa(metadata_spy_950):
     q = torch.zeros((1, 1, 1, 64), dtype=torch.float16, device="npu")
     k = torch.zeros((1, 128, 1, 64), dtype=q.dtype, device=q.device)
     v = torch.zeros_like(k)
     v[:, :2] = 1
 
-    # On 950, None auto-generates metadata using the actual KV length (2).
+    # Native forward prepares its schedule from the actual KV length (2).
     out, lse, *_ = flash_attn_with_kvcache(
         q,
         k,
@@ -1771,6 +1771,7 @@ def test_flash_attn_kvcache_metadata_950_short_kv_swa():
         scheduler_metadata=None,
         return_softmax_lse=True,
     )
+    assert not metadata_spy_950
     # Q=K=0 gives equal scores: O=(1+1)/2 and LSE=log(exp(0)+exp(0)).
     torch.testing.assert_close(out.cpu(), torch.ones_like(out.cpu()), rtol=0, atol=0)
     torch.testing.assert_close(

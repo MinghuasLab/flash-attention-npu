@@ -1,0 +1,118 @@
+// Copyright (c) 2026 Huawei Technologies Co., Ltd.
+
+#include "aicpu_api.h"
+#include "fag_tiling.cpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace {
+
+using namespace FAGTiling950;
+
+FAGGradClearRange ClearFrom(uint64_t firstToken, uint64_t total, uint64_t rowWidth)
+{
+    return {firstToken * rowWidth, (total - firstToken) * rowWidth};
+}
+
+FAGPlanStatus PrepareTnd(const FagPrepareArgs& args, FAGTilingData& tiling)
+{
+    FAGInfo info = args.info;
+    const auto* cuQ = reinterpret_cast<const int32_t*>(args.cuQAddr);
+    const auto* cuKv = reinterpret_cast<const int32_t*>(args.cuKvAddr);
+    const auto* usedQ = reinterpret_cast<const int32_t*>(args.usedQAddr);
+    const auto* usedKv = reinterpret_cast<const int32_t*>(args.usedKvAddr);
+    if (cuQ == nullptr || cuKv == nullptr || info.batch == 0 || cuQ[0] != 0 || cuKv[0] != 0) {
+        return FAGPlanStatus::INVALID_LENGTH;
+    }
+    if (info.deterministic != 0 && info.batch >= TND_SWIZZLE_PREFIX_NUM) {
+        return FAGPlanStatus::UNSUPPORTED_TILING;
+    }
+
+    const bool useLengths = args.exactPackedLength == 0 || info.deterministic != 0;
+    std::vector<int64_t> lengthsQ(useLengths ? info.batch : 0);
+    std::vector<int64_t> lengthsKv(useLengths ? info.batch : 0);
+    bool allNonEmpty = true;
+    bool hasEmptyKvColumns = false;
+    uint64_t effectiveBatch = 1;
+    for (uint64_t b = 0; b < info.batch; ++b) {
+        const int64_t qLength = static_cast<int64_t>(cuQ[b + 1]) - cuQ[b];
+        const int64_t kvLength = static_cast<int64_t>(cuKv[b + 1]) - cuKv[b];
+        if (qLength < 0 || kvLength < 0 || static_cast<uint64_t>(qLength) > info.qSeqlen ||
+            static_cast<uint64_t>(kvLength) > info.kvSeqlen) {
+            return FAGPlanStatus::INVALID_LENGTH;
+        }
+        const int64_t usedQLength = usedQ == nullptr ? qLength : usedQ[b];
+        const int64_t usedKvLength = usedKv == nullptr ? kvLength : usedKv[b];
+        if (usedQLength < 0 || usedQLength > qLength || usedKvLength < 0 || usedKvLength > kvLength) {
+            return FAGPlanStatus::INVALID_LENGTH;
+        }
+        if (useLengths) {
+            lengthsQ[b] = qLength;
+            lengthsKv[b] = kvLength;
+        }
+        allNonEmpty = allNonEmpty && qLength > 0 && kvLength > 0;
+        hasEmptyKvColumns = hasEmptyKvColumns || kvLength - qLength >
+            (info.window_size_left < 0 ? INT32_MAX : info.window_size_left);
+        if (usedQLength > 0 || usedKvLength > 0) {
+            effectiveBatch = b + 1;
+        }
+    }
+    const auto qEnd = static_cast<uint64_t>(cuQ[info.batch]);
+    const auto kvEnd = static_cast<uint64_t>(cuKv[info.batch]);
+    if (qEnd > info.totalQ || kvEnd > info.totalKv || kvEnd > args.totalK || kvEnd > args.totalV ||
+        (args.exactPackedLength != 0 && (qEnd != info.totalQ || kvEnd != args.totalK || kvEnd != args.totalV))) {
+        return FAGPlanStatus::INVALID_LENGTH;
+    }
+    if (usedQ != nullptr || usedKv != nullptr) {
+        info.batch = effectiveBatch;
+    }
+    if (useLengths && allNonEmpty) {
+        info.actualSeqQ = lengthsQ.data();
+        info.actualSeqKv = lengthsKv.data();
+    }
+    if (info.deterministic != 0) {
+        if (!allNonEmpty) {
+            return FAGPlanStatus::UNSUPPORTED_TILING;
+        }
+        info.detSchedule = static_cast<uint32_t>(DetSchedule::BN2S2);
+    }
+    if (GetFAGTilingParam(info, tiling) != 0 || tiling.workspaceSize > args.workspaceCapacity ||
+        tiling.usedCoreNum != info.aicNum) {
+        return FAGPlanStatus::UNSUPPORTED_TILING;
+    }
+    tiling.inputStrides = args.inputStrides;
+    const bool band = info.maskType == MaskType::BAND;
+    if (band && tiling.dqPostAbsorb != 0) {
+        tiling.clearDq = ClearFrom(0, info.totalQ, info.qHeadNum * info.qkHeadDim);
+    } else if (info.deterministic != 0) {
+        tiling.clearDq = ClearFrom(qEnd, info.totalQ, info.qHeadNum * info.qkHeadDim);
+    }
+    const bool clearKv = tiling.earlyDkvCast != 0 || (band && tiling.detPrivDkv != 0 && hasEmptyKvColumns);
+    const uint64_t kvGradEnd = clearKv ? 0 : (info.deterministic != 0 ? kvEnd : info.totalKv);
+    tiling.clearDk = ClearFrom(kvGradEnd, args.totalK, info.kvHeadNum * info.qkHeadDim);
+    tiling.clearDv = ClearFrom(kvGradEnd, args.totalV, info.kvHeadNum * info.vHeadDim);
+    return FAGPlanStatus::READY;
+}
+
+} // namespace
+
+__global__ __aicpu__ uint32_t PrepareFlashAttnBwd950(void* opaque)
+{
+    using namespace FAGTiling950;
+    const auto& args = *static_cast<const FagPrepareArgs*>(opaque);
+    auto& output = *reinterpret_cast<FAGTilingData*>(args.tilingAddr);
+    // Publish failure before reading any user tensors, including on graph replay.
+    output.planStatus = FAGPlanStatus::INVALID_LENGTH;
+    AscendC::DataStoreBarrier();
+
+    FAGTilingData tiling{};
+    const FAGPlanStatus status = PrepareTnd(args, tiling);
+    if (status == FAGPlanStatus::READY) {
+        output = tiling;
+    } else {
+        output.planStatus = status;
+    }
+    AscendC::DataStoreBarrier();
+    return static_cast<uint32_t>(status);
+}

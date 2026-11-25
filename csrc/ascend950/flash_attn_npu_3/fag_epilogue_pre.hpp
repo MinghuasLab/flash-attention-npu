@@ -14,6 +14,7 @@
 
 #include "catlass/arch/resource.hpp"
 #include "fag_common.h"
+#include "fag_zero_gradient.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -30,7 +31,7 @@ class FagPre {
         workspace_ = workspace;
     }
 
-    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event)
+    CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event, GM_ADDR dq)
     {
         constexpr uint32_t tileElements = 20U * 1024U;
         AscendC::Duplicate(zeroUb_, 0.0F, tileElements);
@@ -54,6 +55,11 @@ class FagPre {
         if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0) {
             ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
             ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+        }
+        if (tiling_->layout == static_cast<uint32_t>(FAGTiling950::Layout::TND)) {
+            const FAGTiling950::FAGGradClearRange range{tiling_->clearDq.begin, tiling_->clearDq.count};
+            FAGTiling950::ZeroGradient(dq, range, zeroUb_.template ReinterpretCast<uint16_t>(), vectorCoreId,
+                                       vectorCoreNum);
         }
         // readyCounter/doneCounter live at workspace_[0..15]. The non-det
         // tiler sets dqOffset=0 so ClearRegion already zeros that range;

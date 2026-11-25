@@ -615,8 +615,9 @@ def get_scheduler_metadata(
     The signature matches the upstream flash-attention FA3
     ``get_scheduler_metadata`` and the 910 V3 implementation. The returned NPU
     byte tensor can be passed to ``flash_attn_with_kvcache`` through its
-    ``scheduler_metadata`` argument to avoid per-call host tiling and H2D/D2H
-    copies.
+    ``scheduler_metadata`` argument. Native forward validates the supplied
+    metadata against the device sequence lengths when preparing its runtime
+    plan. Forward also supports preparing the runtime plan directly.
 
     The schedule is independent of ``has_softcap`` and of the numerical
     ``softmax_scale`` / softcap value: those are supplied by each forward call
@@ -683,18 +684,6 @@ def _training_forward(
     k_descale=None,
     v_descale=None,
 ):
-    if seqused_k is None:
-        if cu_seqlens_q is None:
-            kv_seqlen = k.shape[2] if layout == _LAYOUT_BNSD else k.shape[1]
-            seqused_k = torch.full(
-                (q.shape[0],),
-                kv_seqlen,
-                dtype=torch.int32,
-                device=k.device,
-            )
-        else:
-            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-
     return _flash_attn_forward(
         q,
         k,
@@ -772,32 +761,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
         quant_mode = 1 if q.dtype == torch.float8_e4m3fn else 0
 
-        # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
-        # below come from the pre-detection shapes; BNSD only re-views the same storage.
-        batch_size, seqlen_q, num_heads_q, headdim = q.shape
-        seqlen_k, num_heads_kv = k.shape[1], k.shape[2]
-        headdim_v = v.shape[3]
-
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
-        if scheduler_metadata is None:
-            meta_cache_seqlens = torch.full(
-                (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
-            )
-            scheduler_metadata = get_scheduler_metadata(
-                batch_size=batch_size,
-                max_seqlen_q=seqlen_q,
-                max_seqlen_k=seqlen_k,
-                num_heads_q=num_heads_q,
-                num_heads_kv=num_heads_kv,
-                headdim=headdim,
-                headdim_v=headdim_v,
-                cache_seqlens=meta_cache_seqlens,
-                qkv_dtype=q.dtype,
-                causal=causal,
-                window_size=window_size,
-                has_softcap=softcap > 0.0,
-                num_splits=num_splits,
-            )
 
         out, softmax_lse, _, _ = _training_forward(
             q,
@@ -908,38 +872,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         _validate_varlen_query(q, cu_seqlens_q)
         # The packed varlen query (cu_seqlens_q present) is always TND, never BNSD.
         layout = _LAYOUT_TND
-        if scheduler_metadata is None:
-            meta_seqused_k = (
-                seqused_k
-                if seqused_k is not None
-                else _maybe_contiguous(cu_seqlens_k[1:] - cu_seqlens_k[:-1])
-            )
-            meta_seqlens_q = (
-                seqused_q
-                if seqused_q is not None
-                else _maybe_contiguous(cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-            )
-            # Internal scheduler takes the used lengths; the public helper takes cu_seqlens_q.
-            scheduler_metadata = _get_scheduler_metadata_op(
-                cu_seqlens_q.numel() - 1,
-                max_seqlen_q,
-                q.shape[1],
-                k.shape[1],
-                q.shape[2],
-                v.shape[2],
-                meta_seqused_k,
-                meta_seqlens_q,
-                None,  # cu_seqlens_k
-                None,  # page_size
-                causal,
-                softcap > 0.0,
-                num_splits,
-                max_seqlen_k,
-                window_size[0],
-                window_size[1],
-                quant_mode,
-            )
-
         out, softmax_lse, _, _ = _training_forward(
             q,
             k,
@@ -1242,89 +1174,16 @@ def flash_attn_with_kvcache(
     if cu_seqlens_q is not None:
         layout, out_transposed = _LAYOUT_TND, False
     else:
-        # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
-        # below come from the pre-detection shapes; BNSD only re-views the same storage.
-        bsnd_batch, bsnd_seqlen_q, bsnd_heads_q, bsnd_headdim = q.shape
-        bsnd_seqlen_k, bsnd_heads_kv = k_cache.shape[1], k_cache.shape[2]
-        bsnd_headdim_v = v_cache.shape[-1]
         layout, q, k_cache, v_cache, out_transposed = _detect_layout(
             q, k_cache, v_cache, page_table, None
         )
 
-    # FlashDecode schedules depend on the runtime KV lengths and are produced
-    # by the host tiler.  Keep the upstream metadata path for normal FA, but
-    # do not pre-build metadata for explicit FD or for the narrow auto-FD
-    # candidate shape.
-    auto_fd_candidate = (
-        num_splits == 0
-        and page_table is not None
-        and cu_seqlens_q is not None
-        and max_seqlen_q is not None
-        and max_seqlen_q <= 16
-    )
-    empty_query = cu_seqlens_q is not None and q.shape[0] == 0 and max_seqlen_q == 0
-    use_host_tiling = num_splits > 1 or auto_fd_candidate or empty_query
-    if scheduler_metadata is None and not use_host_tiling:
-        if cu_seqlens_q is not None:
-            if max_seqlen_q is None:
-                raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
-            batch_size = cu_seqlens_q.numel() - 1
-            num_heads_q = q.shape[1]
-            headdim = q.shape[2]
-            headdim_v = v_cache.shape[-1]
-            kv_heads = k_cache.shape[1] if k_cache.dim() == 3 else k_cache.shape[2]
-            max_q = max_seqlen_q
-        else:
-            batch_size = bsnd_batch
-            num_heads_q = bsnd_heads_q
-            headdim = bsnd_headdim
-            headdim_v = bsnd_headdim_v
-            kv_heads = bsnd_heads_kv
-            max_q = bsnd_seqlen_q
-        if page_table is not None:
-            page_size = k_cache.shape[1]
-            max_blocks = page_table.shape[1]
-        else:
-            page_size = None
-            max_blocks = None
-        if cache_seqlens is not None:
-            max_seqlen_k_bound = int(cache_seqlens.max().item())
-            # BNSD gives every head a max_q_seqlen-wide KV plane, so the per-batch KV
-            # lengths must fit the allocated sequence dim. The host tiler enforces the
-            # same invariant on the non-metadata path.
-            if out_transposed and max_seqlen_k_bound > bsnd_seqlen_k:
-                raise ValueError(
-                    "flash_attn_npu_3_950: BNSD KV sequence dimension "
-                    f"({bsnd_seqlen_k}) is too small to cover the actual KV length "
-                    f"({max_seqlen_k_bound})"
-                )
-        elif page_table is not None:
-            max_seqlen_k_bound = max_blocks * page_size
-        elif cu_seqlens_q is not None:
-            max_seqlen_k_bound = k_cache.shape[0]  # TND 3D non-paged fallback
-        else:
-            max_seqlen_k_bound = bsnd_seqlen_k
-        scheduler_metadata = get_scheduler_metadata(
-            batch_size=batch_size,
-            max_seqlen_q=max_q,
-            max_seqlen_k=max_seqlen_k_bound,
-            num_heads_q=num_heads_q,
-            num_heads_kv=kv_heads,
-            headdim=headdim,
-            headdim_v=headdim_v,
-            cache_seqlens=cache_seqlens,
-            qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_seqlens_q,
-            page_size=page_size,
-            causal=causal,
-            window_size=window_size,
-            has_softcap=softcap > 0.0,
-            num_splits=num_splits,
-        )
+    if cu_seqlens_q is not None and max_seqlen_q is None:
+        raise ValueError("max_seqlen_q must be provided when cu_seqlens_q is provided")
+
     forward = _flash_attn_forward
     if (
-        scheduler_metadata is not None
-        and q.dtype in (torch.float16, torch.bfloat16)
+        q.dtype in (torch.float16, torch.bfloat16)
         and _can_use_eager_forward(
             (
                 q,
