@@ -67,8 +67,8 @@ def _window_to_npu(window_size: Optional[int]) -> int:
 
 
 def _transposed_bnsd_view(t):
-    """``t.transpose(1, 2)`` if ``t`` is a contiguous BNSD tensor seen as BSND, else ``None``."""
-    if t is None or t.dim() != 4 or t.is_contiguous():
+    """``t.transpose(1, 2)`` if ``t`` is packed BNSD storage seen as a BSND view, else ``None``."""
+    if t is None or t.dim() != 4:
         return None
     _, n1, _, n3 = t.shape
     if t.stride(3) == 1 and t.stride(1) == n3 and t.stride(2) == n1 * n3:
