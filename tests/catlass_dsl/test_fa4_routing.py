@@ -156,8 +156,11 @@ def test_tensorwise_descales_reach_native_forward(monkeypatch, entry, missing):
     result = entry(q, k, k, scales=fa4.TensorwiseScales(*values), return_lse=True)
     assert result[0] is out
     assert len(result) == (2 if entry is flash_attn_func else 4)
-    for actual, expected in zip(backend.call_args.args[-3:], values):
-        assert actual is expected
+    call = backend.call_args
+    signature = inspect.signature(legacy._flash_attn_forward_fake)
+    forwarded = signature.bind(*call.args, **call.kwargs).arguments
+    for name, expected in zip(("q_descale", "k_descale", "v_descale"), values, strict=True):
+        assert forwarded[name] is expected
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
