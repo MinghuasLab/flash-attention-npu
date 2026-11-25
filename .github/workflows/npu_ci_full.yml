@@ -21,6 +21,7 @@ on:
           - test_flash_attn_npu_v4.py
           - test_flash_attn_npu_v3_metadata.py
           - test_flash_attn_npu_v3_graph.py
+          - test_flash_attn_npu_v3_mla.py
       test_filter:
         description: "pytest -k 过滤表达式 (留空跑全量, 如 test_fa_fwd_custom_ops)"
         required: false

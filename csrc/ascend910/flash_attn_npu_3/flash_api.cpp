@@ -40,6 +40,7 @@ using fa_window::NormalizeAttentionWindow;
 #include "fa_split.h"
 #include "fwd_dispatch.hpp"
 #include "bwd_dispatch.hpp"
+#include "mla/mla_forward.h"
 #include "combine_dispatch.hpp"
 #include <cmath>
 
@@ -159,12 +160,21 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor> q_descale_,      // (b, h_k), not (b, h)
     std::optional<at::Tensor> k_descale_,      // (b, h_k)
     std::optional<at::Tensor> v_descale_,      // (b, h_k)
-    std::optional<float> softmax_scale_, bool is_causal, int64_t window_size_left, int64_t window_size_right,
-    int64_t attention_chunk, float softcap,
+    std::optional<double> softmax_scale_, bool is_causal, int64_t window_size_left, int64_t window_size_right,
+    int64_t attention_chunk, double softcap_option,
     bool is_rotary_interleaved, // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor> scheduler_metadata_, // (b + 1)
-    int64_t num_splits, std::optional<bool> pack_gqa_, int64_t sm_margin, int64_t layout)
+    int64_t num_splits, std::optional<bool> pack_gqa_, int64_t sm_margin, int64_t layout, bool mla_return_lse)
 {
+    if (auto result = flash_attn::mla::TryForward(
+            q, k, v, k_new_, v_new_, q_v_, out_, cu_seqlens_q_, cu_seqlens_k_, cu_seqlens_k_new_, seqused_q_,
+            seqused_k_, max_seqlen_q_, max_seqlen_k_, page_table_, kv_batch_idx_, leftpad_k_, rotary_cos_, rotary_sin_,
+            seqlens_rotary_, q_descale_, k_descale_, v_descale_, softmax_scale_, is_causal, window_size_left,
+            window_size_right, attention_chunk, softcap_option, is_rotary_interleaved, scheduler_metadata_, num_splits,
+            pack_gqa_, sm_margin, layout, mla_return_lse)) {
+        return std::move(*result);
+    }
+    const float softcap = static_cast<float>(softcap_option);
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto hostStart = std::chrono::steady_clock::now();
 
@@ -810,6 +820,15 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                                   int64_t window_size_right, int64_t attention_chunk, bool has_softcap,
                                   int64_t num_splits, std::optional<bool> pack_gqa, int64_t sm_margin)
 {
+    if (headdim != headdim_v) {
+        TORCH_CHECK(!cu_seqlens_k && !cu_seqlens_k_new && !cache_leftpad && max_seqlen_k_new == 0 &&
+                        attention_chunk == 0,
+                    "MLA: metadata append, leftpad and attention_chunk are unsupported");
+        return flash_attn::mla::SchedulerMetadata(
+            batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+            pybind11::cast<at::ScalarType>(qkv_dtype), cache_seqlens, seqlens_q, page_size, window_size_left,
+            window_size_right, causal, has_softcap, num_splits, pack_gqa, sm_margin);
+    }
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     const bool is_varlen_q = seqlens_q.has_value();
     void* seqlensQDev = nullptr;
@@ -1469,7 +1488,15 @@ PYBIND11_MODULE(flash_attn_npu_3, m)
     m.doc() = "FlashAttention";
     m.def("_clear_device_mask_cache", &ClearDeviceTriuMaskCache);
     py::module_::import("atexit").attr("register")(m.attr("_clear_device_mask_cache"));
-    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache");
+    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_new"),
+          py::arg("v_new"), py::arg("qv"), py::arg("out"), py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"),
+          py::arg("cu_seqlens_k_new"), py::arg("seqused_q"), py::arg("seqused_k"), py::arg("max_seqlen_q"),
+          py::arg("max_seqlen_k"), py::arg("page_table"), py::arg("kv_batch_idx"), py::arg("leftpad_k"),
+          py::arg("rotary_cos"), py::arg("rotary_sin"), py::arg("seqlens_rotary"), py::arg("q_descale"),
+          py::arg("k_descale"), py::arg("v_descale"), py::arg("softmax_scale"), py::arg("causal"),
+          py::arg("window_size_left"), py::arg("window_size_right"), py::arg("attention_chunk"), py::arg("softcap"),
+          py::arg("rotary_interleaved"), py::arg("scheduler_metadata"), py::arg("num_splits"), py::arg("pack_gqa"),
+          py::arg("sm_margin"), py::arg("layout"), py::arg("mla_return_lse") = true);
     m.def("bwd", &mha_bwd, "Backward pass", py::arg("dout"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
           py::arg("softmax_lse"), py::arg("dq"), py::arg("dk"), py::arg("dv"), py::arg("cu_seqlens_q"),
           py::arg("cu_seqlens_k"), py::arg("seqused_q"), py::arg("seqused_k"), py::arg("max_seqlen_q"),
