@@ -26,6 +26,7 @@ import csv
 import json
 import math
 import re
+import statistics
 from pathlib import Path
 from typing import Callable, Any
 
@@ -36,6 +37,84 @@ from torch_npu.profiler.profiler import analyse
 AUX_PATTERN = re.compile(r"(?:^|[_./])(Fill|ReduceSum|Cast)(?:$|[_./])", re.I)
 DEFAULT_FA_PATTERN = r"SplitFuse|FAInfer|FAG"
 DEFAULT_BASE_PATTERN = r"FlashAttention"
+
+L2_MIB = 1024**2
+
+
+class L2CacheEvictor:
+    """
+    Evict cached data by scanning a device buffer
+    larger than the detected L2 cache.
+    """
+
+    def __init__(self, device_index: int, flush_bytes: int):
+        if flush_bytes <= 0:
+            raise ValueError("flush_bytes must be positive")
+        self.device = f"npu:{device_index}"
+        # Use FP32: better supported for NPU ReduceSum than uint8->int64.
+        # Round up the allocation to at least flush_bytes bytes.
+        numel = (flush_bytes + 3) // 4
+        self.buffer = torch.empty(numel, dtype=torch.float32, device=self.device)
+        self.buffer.fill_(1)
+        self.sink = None
+        torch.npu.synchronize()
+
+    @torch.no_grad()
+    def flush(self):
+        # Cache eviction by streaming over a large input buffer; this is NOT
+        # a guaranteed hardware cache invalidate.
+        self.sink = self.buffer.sum()
+        torch.npu.synchronize()
+
+
+def query_l2_cache_info(device_index: int, override_mb=None):
+    """
+    Query the current NPU's L2 cache size.
+
+    Priority:
+      1. Explicit CLI override
+      2. torch.npu.get_device_properties().L2_cache_size
+    """
+    props = torch.npu.get_device_properties(device_index)
+
+    device_name = props.name
+
+    if override_mb is not None:
+        if override_mb <= 0:
+            raise ValueError("--l2-cache-mb must be positive")
+
+        l2_cache_bytes = int(override_mb * L2_MIB)
+        source = "cli_override"
+
+    else:
+        l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
+
+        if l2_cache_bytes <= 0:
+            raise RuntimeError(
+                f"Cannot detect L2 cache size for {device_name}. "
+                "Please provide --l2-cache-mb explicitly."
+            )
+
+        source = "torch.npu.get_device_properties"
+
+    return {
+        "device_name": device_name,
+        "l2_cache_bytes": l2_cache_bytes,
+        "l2_cache_mib": round(l2_cache_bytes / L2_MIB, 2),
+        "l2_cache_source": source,
+    }
+
+
+def wrap_with_l2_flush(step, evictor):
+
+    if evictor is None:
+        return step
+
+    def wrapped():
+        evictor.flush()
+        return step()
+
+    return wrapped
 
 
 def clear_grads(tensors):
@@ -52,14 +131,165 @@ def step_forward(fn: Callable[[], torch.Tensor]) -> None:
         raise TypeError(f"backend returned non-tensor: {type(out)!r}")
 
 
-def step_fwd_bwd(fn: Callable[[], torch.Tensor], inputs, grad: torch.Tensor) -> None:
+def step_fwd_bwd(
+    fn,
+    inputs,
+    grad,
+    *,
+    before_fwd=None,
+    before_bwd=None,
+):
     clear_grads(inputs)
+
+    # L2 Flush before Forward
+    if before_fwd is not None:
+        before_fwd()
+
     out = fn()
+
     if isinstance(out, (tuple, list)):
         out = out[0]
+
     if not isinstance(out, torch.Tensor) or not out.requires_grad:
         raise NotImplementedError("backend forward output does not support autograd")
+
+    # L2 Flush before Backward
+    if before_bwd is not None:
+        before_bwd()
+
     out.backward(grad)
+
+
+def _event_step(fn, inputs, grad, mode, evictor, start_event, end_event):
+    """One torch.npu.Event measurement; L2 flush is outside timed intervals."""
+
+    def flush_l2():
+        if evictor is not None:
+            evictor.flush()
+
+    def unwrap_output(out, require_grad=False):
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"backend returned non-tensor: {type(out)!r}")
+        if require_grad and not out.requires_grad:
+            raise NotImplementedError("backend forward output does not support autograd")
+        return out
+
+    if mode == "fwd":
+        flush_l2()
+        start_event.record()
+        out = fn()
+        end_event.record()
+        end_event.synchronize()
+        fwd_ms = start_event.elapsed_time(end_event)
+        unwrap_output(out)
+        return {"fwd_ms": fwd_ms, "bwd_ms": None, "total_ms": fwd_ms}
+
+    if mode != "fwd_bwd":
+        raise ValueError(f"unsupported Event timing mode: {mode!r}")
+
+    clear_grads(inputs)
+    flush_l2()
+    start_event.record()
+    out = fn()
+    end_event.record()
+    end_event.synchronize()
+    fwd_ms = start_event.elapsed_time(end_event)
+    out = unwrap_output(out, require_grad=True)
+
+    # User-requested cold-cache protocol: flush once more before Backward.
+    flush_l2()
+    start_event.record()
+    out.backward(grad)
+    end_event.record()
+    end_event.synchronize()
+    bwd_ms = start_event.elapsed_time(end_event)
+    return {"fwd_ms": fwd_ms, "bwd_ms": bwd_ms, "total_ms": fwd_ms + bwd_ms}
+
+
+def measure_event_pair(
+    fa_fn,
+    baseline_fn,
+    *,
+    mode,
+    fa_inputs,
+    baseline_inputs,
+    fa_grad,
+    baseline_grad,
+    evictor,
+    warmup: int,
+    repeat: int,
+):
+    """Measure FA and CANN separately with NPU Events, alternating sample order.
+
+    Event intervals contain the operator's queued device work; L2 eviction,
+    input-grad clearing, and host synchronization are outside timed intervals.
+    For FWD+BWD, forward and backward Event durations are summed per sample.
+    """
+    if warmup < 0 or repeat < 1:
+        raise ValueError("Event warmup must be >= 0 and repeat must be >= 1")
+
+    fa_start = torch.npu.Event(enable_timing=True)
+    fa_end = torch.npu.Event(enable_timing=True)
+    base_start = torch.npu.Event(enable_timing=True)
+    base_end = torch.npu.Event(enable_timing=True)
+
+    def fa_event_step():
+        return _event_step(fa_fn, fa_inputs, fa_grad, mode, evictor, fa_start, fa_end)
+
+    def baseline_event_step():
+        return _event_step(
+            baseline_fn, baseline_inputs, baseline_grad, mode, evictor, base_start, base_end
+        )
+
+    for _ in range(warmup):
+        fa_event_step()
+        baseline_event_step()
+    torch.npu.synchronize()
+
+    fa_samples = []
+    baseline_samples = []
+    for index in range(repeat):
+        if index % 2 == 0:
+            fa_sample = fa_event_step()
+            baseline_sample = baseline_event_step()
+        else:
+            baseline_sample = baseline_event_step()
+            fa_sample = fa_event_step()
+        fa_samples.append(fa_sample)
+        baseline_samples.append(baseline_sample)
+
+    def summarize(samples, prefix):
+        totals = [item["total_ms"] for item in samples]
+        fwd = [item["fwd_ms"] for item in samples]
+        bwd = [item["bwd_ms"] for item in samples if item["bwd_ms"] is not None]
+        out = {
+            f"{prefix}_event_mean_ms": statistics.mean(totals),
+            f"{prefix}_event_median_ms": statistics.median(totals),
+            f"{prefix}_event_min_ms": min(totals),
+            f"{prefix}_event_max_ms": max(totals),
+            f"{prefix}_event_std_ms": statistics.pstdev(totals),
+            f"{prefix}_event_fwd_mean_ms": statistics.mean(fwd),
+            f"{prefix}_event_fwd_median_ms": statistics.median(fwd),
+            f"{prefix}_event_bwd_mean_ms": statistics.mean(bwd) if bwd else None,
+            f"{prefix}_event_bwd_median_ms": statistics.median(bwd) if bwd else None,
+        }
+        return out
+
+    result = {**summarize(fa_samples, "fa"), **summarize(baseline_samples, "baseline")}
+    fa_mean = result["fa_event_mean_ms"]
+    baseline_mean = result["baseline_event_mean_ms"]
+    result.update(
+        event_delta_ms=fa_mean - baseline_mean,
+        event_speedup_fa_over_baseline=(baseline_mean / fa_mean if fa_mean > 0 else None),
+        event_warmup=warmup,
+        event_repeat=repeat,
+        event_timing_scope="npu_event_operator_elapsed_excluding_l2_flush; fwd_bwd_is_sum_of_two_events",
+        event_l2_flush_excluded=True,
+        event_status="ok",
+    )
+    return result
 
 
 def build_profiler(root: Path, warmup: int, repeat: int):

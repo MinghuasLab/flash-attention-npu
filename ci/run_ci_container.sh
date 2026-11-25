@@ -487,6 +487,7 @@ container=$GOLDEN_CACHE_DIR"
     -e CI_BENCHMARK_LAYOUT="$CI_BENCHMARK_LAYOUT" \
     -e CI_BENCHMARK_MODE="$CI_BENCHMARK_MODE" \
     -e CI_BENCHMARK_CAUSAL="$CI_BENCHMARK_CAUSAL" \
+    -e CI_BENCHMARK_L2_FLUSH="${CI_BENCHMARK_L2_FLUSH:-true}"\
     \
     -e CI_MODE="$CI_MODE" \
     -e CI_RUN_EXAMPLE_ST="$CI_RUN_EXAMPLE_ST" \
@@ -652,8 +653,11 @@ task=$CI_TASK"
 
     log \
       "benchmark config: \
-fa_version=$CI_BENCHMARK_FA_VERSION \
-layout=$CI_BENCHMARK_LAYOUT"
+    fa_version=$CI_BENCHMARK_FA_VERSION \
+    layout=$CI_BENCHMARK_LAYOUT \
+    mode=$CI_BENCHMARK_MODE \
+    causal=$CI_BENCHMARK_CAUSAL \
+    l2_flush=${CI_BENCHMARK_L2_FLUSH:-true}"
 
   else
 
