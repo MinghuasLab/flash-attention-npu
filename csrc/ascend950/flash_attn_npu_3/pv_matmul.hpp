@@ -250,9 +250,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                uint32_t isShrink, uint32_t globalWindowSize, uint32_t localWindowSize,
                Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag, uint64_t prefixSumL0AStages,
                uint64_t prefixSumL0BStages, bool d512PieceDelivery = false, uint32_t pL1Offset = 0U,
-               uint32_t rowOffset = 0U, uint32_t totalRows = 0U, bool firstSegment = true,
-               bool lastSegment = true, uint32_t segIdx = 0U, uint32_t segTotal = 1U,
-               bool waitSoftmaxReady = true, bool releaseSoftmax = true)
+               uint32_t rowOffset = 0U, uint32_t totalRows = 0U, bool firstSegment = true, bool lastSegment = true,
+               uint32_t segIdx = 0U, uint32_t segTotal = 1U, bool waitSoftmaxReady = true, bool releaseSoftmax = true)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;

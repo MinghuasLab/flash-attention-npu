@@ -108,16 +108,18 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         lsUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
-        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
+        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(0);
+        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(0);
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
-        lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LM_UB_TENSOR_OFFSET);
+        lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(0);
         llUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(LL_UB_TENSOR_OFFSET);
         skipUbTensor = resource.ubBuf.template GetBufferByByte<float>(SKIP_UB_TENSOR_OFFSET);
+        // Slots keep their own element size (lm is ElementInput, gm/gl float),
+        // so their byte pitches differ; store absolute byte offsets.
         for (uint32_t i = 0; i < fa950_stats::STATS_TASK_STAGES; ++i) {
-            lmSlots_[i] = lmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
-            gmSlots_[i] = gmUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
-            glSlots_[i] = glUbTensor[i * fa950_stats::STATS_SLOT_ELEM_NUM];
+            lmSlotByteOff_[i] = LM_UB_TENSOR_OFFSET + i * fa950_stats::STATS_SLOT_ELEM_NUM * sizeof(ElementInput);
+            gmSlotByteOff_[i] = GM_UB_TENSOR_OFFSET + i * fa950_stats::STATS_SLOT_BYTES;
+            glSlotByteOff_[i] = GL_UB_TENSOR_OFFSET + i * fa950_stats::STATS_SLOT_BYTES;
         }
         SetStatsSlot(0U);
     }
@@ -138,15 +140,19 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(ub.ll);
         // The resource-aware plan reserves only one statistics slot inside
-        // its packed layout. Keep the other in-flight tasks in its UB tail.
-        lmSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
-        gmSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
-        glSlots_[0] = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        // its packed layout. Keep the other in-flight tasks in its UB tail,
+        // selected through byte offsets from the UB base (see the member docs).
+        lmUbTensor = resource.ubBuf.template GetBufferByByte<ElementInput>(0);
+        gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(0);
+        glUbTensor = resource.ubBuf.template GetBufferByByte<float>(0);
+        lmSlotByteOff_[0] = ub.lm;
+        gmSlotByteOff_[0] = ub.gm;
+        glSlotByteOff_[0] = ub.gl;
         for (uint32_t i = 1; i < fa950_stats::STATS_TASK_STAGES; ++i) {
             uint32_t off = ub.total + (i - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES;
-            lmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off);
-            gmSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + fa950_stats::STATS_SLOT_BYTES);
-            glSlots_[i] = resource.ubBuf.template GetBufferByByte<float>(off + 2U * fa950_stats::STATS_SLOT_BYTES);
+            lmSlotByteOff_[i] = off;
+            gmSlotByteOff_[i] = off + fa950_stats::STATS_SLOT_BYTES;
+            glSlotByteOff_[i] = off + 2U * fa950_stats::STATS_SLOT_BYTES;
         }
         SetStatsSlot(0U);
         // Share the UB tail with rescale: the three extra task statistics slots
@@ -155,12 +161,14 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             ub.total + (fa950_stats::STATS_TASK_STAGES - 1U) * 3U * fa950_stats::STATS_SLOT_BYTES);
     }
 
-    // Use the statistics of the task that owns the current tile.
+    // Use the statistics of the task that owns the current tile. Only the byte
+    // offsets move: the UB layout keeps slot 0 in the packed plan and slots
+    // 1..3 in the tail.
     __aicore__ inline void SetStatsSlot(uint32_t slot)
     {
-        lmUbTensor = lmSlots_[slot];
-        gmUbTensor = gmSlots_[slot];
-        glUbTensor = glSlots_[slot];
+        lmByteOff_ = lmSlotByteOff_[slot];
+        gmByteOff_ = gmSlotByteOff_[slot];
+        glByteOff_ = glSlotByteOff_[slot];
     }
 
     uint32_t segmentRows_ = 0U;
@@ -266,11 +274,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         uint32_t pCopyEventId = pStages_ == 1U ? 3U : ubSBufId + 2U;
         __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[pSlot * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)GlAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)LmAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)LmAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
         __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
@@ -315,7 +323,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         SetCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         if (!isFirstKvSTile) {
             UpdateExpSumAndExpMax<ElementInput>(lastSumAddr, expMaxUbAddr, lastMaxAddr, nowSumAddr, nowMaxAddr, mLoops,
-                                                tailM, expSkipUbAddr);
+                                                tailM, expSkipUbAddr, trackRescale);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -328,11 +336,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     // per-token center sequence. Window bounds are normalized to the effective
     // lengths by the caller. This operator only runs with a single-slot P plan.
     template <bool IsSwa = false, class TensorP>
-    __aicore__ inline void RunPositionalD512(TensorP& l1PTensorTla, GemmCoord actualBlockShape,
-                                              uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-                                              Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-                                              int32_t qTileCenterStart, uint32_t kvSStartIdx, uint32_t qSBlockSize,
-                                              uint32_t qNBlockSize, int32_t windowLeft = 0, int32_t windowRight = 0)
+    __aicore__ inline void RunPositionalD512(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+                                             uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+                                             Arch::CrossCoreFlag softmaxReadyFlag, int32_t qTileCenterStart,
+                                             uint32_t kvSStartIdx, uint32_t qSBlockSize, uint32_t qNBlockSize,
+                                             int32_t windowLeft = 0, int32_t windowRight = 0)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -363,10 +371,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         constexpr uint32_t P_COPY_EVENT = 3U;
         __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[P_SLOT * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)GlAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)LmAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
         __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
@@ -450,11 +458,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         uint32_t nPadding = (tailN + BLOCK_SIZE_IN_BYTE - 1) / BLOCK_SIZE_IN_BYTE * BLOCK_SIZE_IN_BYTE;
         __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)GlAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)LmAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)LmAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
         __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
@@ -598,11 +606,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         __ubuf__ ElementOutput* pAddr = (__ubuf__ ElementOutput*)lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput* sAddr = (__ubuf__ ElementInput*)lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
-        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)gmUbTensor.GetPhyAddr();
-        __ubuf__ float* lastSumAddr = (__ubuf__ float*)glUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
-        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)lmUbTensor.GetPhyAddr();
+        __ubuf__ float* lastMaxAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastMaxStartAddr = (__ubuf__ float*)GmAddr();
+        __ubuf__ float* lastSumAddr = (__ubuf__ float*)GlAddr();
+        __ubuf__ ElementInput* nowMaxAddr = (__ubuf__ float*)LmAddr();
+        __ubuf__ ElementInput* nowMaxStartAddr = (__ubuf__ float*)LmAddr();
         __ubuf__ ElementInput* nowSumAddr = (__ubuf__ float*)llUbTensor.GetPhyAddr();
         __ubuf__ float* expSkipUbAddr = (__ubuf__ float*)skipUbTensor[l1PBufId * SKIP_UB_SLOT_ELEM_NUM].GetPhyAddr();
         __ubuf__ float* expMaxUbAddr = (__ubuf__ float*)dmUbTensor[l1PBufId * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
@@ -631,13 +639,13 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             if (n > 64) {
                 ComputeScaleAndMaxCausalPos<ElementInput, ElementOutput, true, IsSwa>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound, positionalThreshold, qTileCenterStart, kvSStartIdx,
-                    qRow, qSBlockSize, windowLeft, windowRight);
+                    scaleValue, softcapValue, 128, blockStride, nRound, positionalThreshold, qTileCenterStart,
+                    kvSStartIdx, qRow, qSBlockSize, windowLeft, windowRight);
             } else {
                 ComputeScaleAndMaxCausalPos64<ElementInput, ElementOutput, true, IsSwa>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound, positionalThreshold, qTileCenterStart, kvSStartIdx,
-                    qRow, qSBlockSize, windowLeft, windowRight);
+                    scaleValue, softcapValue, 128, blockStride, nRound, positionalThreshold, qTileCenterStart,
+                    kvSStartIdx, qRow, qSBlockSize, windowLeft, windowRight);
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -677,9 +685,30 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<ElementInput> lmUbTensor;
     AscendC::LocalTensor<ElementInput> llUbTensor;
-    AscendC::LocalTensor<ElementInput> lmSlots_[fa950_stats::STATS_TASK_STAGES];
-    AscendC::LocalTensor<float> gmSlots_[fa950_stats::STATS_TASK_STAGES];
-    AscendC::LocalTensor<float> glSlots_[fa950_stats::STATS_TASK_STAGES];
+    // Byte offsets of the per-task statistics slots relative to the UB base of
+    // each group. Keeping plain offsets (instead of an array of LocalTensor
+    // objects) lets SetStatsSlot stay three integer stores: selecting a slot by
+    // copying whole tensors made the AIV scalar path re-materialise three 96 B
+    // descriptors per KV tile, which showed up as a forward-kernel regression.
+    uint32_t lmSlotByteOff_[fa950_stats::STATS_TASK_STAGES];
+    uint32_t gmSlotByteOff_[fa950_stats::STATS_TASK_STAGES];
+    uint32_t glSlotByteOff_[fa950_stats::STATS_TASK_STAGES];
+    uint32_t lmByteOff_ = 0U;
+    uint32_t gmByteOff_ = 0U;
+    uint32_t glByteOff_ = 0U;
+
+    __aicore__ inline uint64_t LmAddr()
+    {
+        return lmUbTensor.GetPhyAddr() + lmByteOff_;
+    }
+    __aicore__ inline uint64_t GmAddr()
+    {
+        return gmUbTensor.GetPhyAddr() + gmByteOff_;
+    }
+    __aicore__ inline uint64_t GlAddr()
+    {
+        return glUbTensor.GetPhyAddr() + glByteOff_;
+    }
     AscendC::LocalTensor<float> skipUbTensor;
     uint32_t subBlockIdx_;
     uint32_t pStages_ = fa950_plan::SCORE_STAGES;

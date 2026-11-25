@@ -126,9 +126,12 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     uint32_t kvCumSum = 0;
     // Short-KV flag must be identical to the host tiling and the AICore view, so
     // it is resolved once from the global max KV length before the task loop.
+    // Varlen KV arrives as prefixes (kvCumulative), so the short-KV decision must
+    // go through readLength like the task loop below; reading the prefixes
+    // directly reports the accumulated total and desyncs the AICore task count.
     uint32_t preMaxKv = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-        const uint32_t kvSeqlen = static_cast<uint32_t>(cacheSeqlens[batchIdx]);
+        const uint32_t kvSeqlen = readLength(cacheSeqlens, batchIdx, metaArgs->kvCumulative);
         if (kvSeqlen > preMaxKv) {
             preMaxKv = kvSeqlen;
         }
@@ -151,8 +154,11 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         // Cross-group tail fusion needs the masked kernel: the unmasked path runs
         // the DN variant, which does not implement KV segments. Keeping the
         // condition mask-only also keeps it identical to the AICore's view.
+        // The Q layout is fixed only when the caller supplied no per-batch Q
+        // lengths; that is the same condition the pre-prefix API called
+        // isVarlen == 0 (see flash_api.cpp: seqlensQAddr == 0).
         const auto shape = fa950_task::MakeShape(qSeqlen, metaArgs->numHeads, metaArgs->numHeadsK,
-            qBaseTile, metaArgs->batch, metaArgs->blockDim, metaArgs->isVarlen == 0U,
+            qBaseTile, metaArgs->batch, metaArgs->blockDim, seqlensQ == nullptr,
             metaArgs->quantMode != 0U, metaArgs->maskType != 0U,
             tinyKvFusion);
         const uint32_t curTaskNum = shape.totalTasks;

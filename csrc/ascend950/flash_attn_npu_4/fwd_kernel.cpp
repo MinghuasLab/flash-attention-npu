@@ -195,6 +195,13 @@ class FAIKernel950 {
         //tiling data
 
         batch_ = faiTilingData->batch;
+        // Packed TND LSE is laid out as [H, total packed Q tokens] and the total
+        // is cu_seqlens_q[batch], i.e. fixed for the whole launch. Read that GM
+        // scalar once here: doing it per task put a scalar GM load on the AIV
+        // critical path of every QK/PV tile.
+        if constexpr (qFormat == Format::TND) {
+            lseHeadStrideTnd_ = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+        }
         qHeads_ = faiTilingData->numHeads;
         kvHeads_ = faiTilingData->kvHeads;
         embed_ = faiTilingData->embeddingSize;
@@ -285,8 +292,7 @@ class FAIKernel950 {
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         // The skip producer and consumer must agree, including on D512.
         const bool trackRescale = flashDecodeFlag_ == 0U && faiTilingData->maxKvSeqlen > 4096U;
-        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_, !d512,
-                                                    trackRescale);
+        EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, ubPlan, scaleValue_, softcapValue_, !d512, trackRescale);
         EpilogueRescaleO epilogueRescaleO(resource, ubPlan, trackRescale);
         Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource, ubPlan);
 #endif
@@ -484,7 +490,11 @@ class FAIKernel950 {
                 lseOffset = static_cast<uint64_t>(curBatch) * qHeads_ * lseHeadStride +
                             static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
             } else if constexpr (qFormat == Format::TND) {
-                lseHeadStride = static_cast<uint32_t>(params.storage.totalQTokens);
+                // LSE is [H, total packed Q tokens]. Use the last cu_seqlens_q
+                // entry on device, just like the packed Q/O offsets above. The
+                // launch storage hint is not reliable for this LSE stride, and
+                // the value is launch-invariant, so it was read once in Init.
+                lseHeadStride = lseHeadStrideTnd_;
                 lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                             static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
             }
@@ -881,8 +891,8 @@ class FAIKernel950 {
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
                     // D512 LO stores one 128-column piece per FixPipe round.
-                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(
-                        pvDesc.rowNumRound, d512 ? 128U : embedVRound);
+                    auto ubOTmpLayoutTla =
+                        tla::MakeLayout<ElementOTmp, LayoutOTmp>(pvDesc.rowNumRound, d512 ? 128U : embedVRound);
                     auto ubOTmpTensorTla =
                         tla::MakeTensor(ubOTmpTensor[ubOTmpBufId], ubOTmpLayoutTla, Arch::PositionUB{});
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
@@ -935,27 +945,18 @@ class FAIKernel950 {
                         swaQSTileStart = static_cast<uint32_t>(pvDesc.qSTileStart);
                     }
                     auto gmOLayoutTlaNow = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, pvDesc.strideO);
-                    auto gmOTensorTlaNow =
-                        tla::MakeTensor(gO[pvDesc.gmOffsetO], gmOLayoutTlaNow, Arch::PositionGM{});
-                    // FD bypasses scalar Dm reduction; the D512 path consumes
-                    // four 128-column LO pieces while keeping its planned UB pitch.
-                    if (flashDecodeFlag_ != 0U) {
-                        epilogueRescaleO.template operator()<LseMode, false>(
-                            gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
-                            fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
-                            pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
-                            gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
-                            fdLseSubStride_, 1.0f, d512);
-                    } else {
-                        epilogueRescaleO.template operator()<LseMode, true>(
-                            gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                            (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
-                            fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
-                            pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
-                            gPartialO, gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_,
-                            fdLseSubStride_, 1.0f, d512);
-                    }
+                    auto gmOTensorTlaNow = tla::MakeTensor(gO[pvDesc.gmOffsetO], gmOLayoutTlaNow, Arch::PositionGM{});
+                    // One instantiation for both paths: CheckDm is a runtime flag so
+                    // the task loop keeps a single inlined rescale body (code size /
+                    // icache). FD bypasses the scalar Dm reduction, D512 consumes four
+                    // 128-column LO pieces while keeping its planned UB pitch.
+                    epilogueRescaleO.template operator()<LseMode>(
+                        gmOTensorTlaNow, gLse[pvDesc.lseOffset], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
+                        (kvSTileRelIdxNow == 0), (kvSTileRelIdxNow == pvDesc.kvSLoopCount - 1), pvReadyFlag, IsDN,
+                        fmRowsPerHead, pvDesc.qSBlockSize, pvDesc.qNBlockSize, pvDesc.lseHeadStride, pvDesc.strideO,
+                        pvDesc.oHeadStride, swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart, gPartialO,
+                        gPartialLse, pvDesc.writePartial && !IsDN, pvDesc.partialId, fdRowCapacity_, fdLseSubStride_,
+                        1.0f, d512, flashDecodeFlag_ == 0U);
 
 #endif
                     ++pvIssued;
@@ -1144,6 +1145,7 @@ class FAIKernel950 {
     Arch::ForwardResource950 resource;
 
     uint32_t batch_;
+    uint32_t lseHeadStrideTnd_ = 0U;
     uint32_t qHeads_;
     uint32_t kvHeads_;
     uint32_t embed_;
@@ -1193,6 +1195,7 @@ template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMo
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
 // SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
 // concurrent streams running other sync kernels can deadlock on core allocation.
+// (A/B: removing it changed nothing measurable, ~0.1%.)
 __schedmode__(1) CATLASS_GLOBAL
     void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                  GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR workspace,

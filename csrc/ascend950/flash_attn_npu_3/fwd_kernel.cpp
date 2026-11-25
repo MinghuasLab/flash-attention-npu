@@ -960,18 +960,18 @@ class FAIKernel950 {
                         // piece; segment-major delivery would overwrite unread rows.
                         for (uint32_t piece = 0U; piece < 4U; ++piece) {
                             for (uint32_t seg = 0U; seg < pvDesc.segmentCount; ++seg) {
-                                auto gmSegmentV = tla::MakeTensor(
-                                    gV[pvDesc.gmOffsetV + seg * pvDesc.vHeadStride + piece * 128U],
-                                    gmVLayoutTlaNow, Arch::PositionGM{});
+                                auto gmSegmentV =
+                                    tla::MakeTensor(gV[pvDesc.gmOffsetV + seg * pvDesc.vHeadStride + piece * 128U],
+                                                    gmVLayoutTlaNow, Arch::PositionGM{});
                                 GemmCoord segmentShape{pvDesc.segmentRows, 128U, pvDesc.kvSTileSizeAct};
-                                blockMmadPV(gmSegmentV, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], segmentShape,
-                                            blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_,
-                                            pvDesc.kvNumTokens, kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag,
-                                            l0AStagesIssued, l0BStagesIssued, true,
-                                            seg * RoundUp(pvDesc.segmentRows, 16U) * RoundUp(pvDesc.kvSTileSizeAct, 16U),
-                                            seg * pvDesc.segmentRows, pvDesc.rowNum, seg == 0U,
-                                            seg + 1U == pvDesc.segmentCount, seg, pvDesc.segmentCount,
-                                            piece == 0U, piece == 3U);
+                                blockMmadPV(
+                                    gmSegmentV, ubOTmpTensorTla, gBlockTable[pvDesc.blockBOffset], segmentShape,
+                                    blockSize_, pvDesc.kvSTileIdx, pipelineTileSeqNow, 0, kvHeads_, pvDesc.kvNumTokens,
+                                    kvBaseTile_, 0, 0, 0, softmaxReadyFlag, pvReadyFlag, l0AStagesIssued,
+                                    l0BStagesIssued, true,
+                                    seg * RoundUp(pvDesc.segmentRows, 16U) * RoundUp(pvDesc.kvSTileSizeAct, 16U),
+                                    seg * pvDesc.segmentRows, pvDesc.rowNum, seg == 0U, seg + 1U == pvDesc.segmentCount,
+                                    seg, pvDesc.segmentCount, piece == 0U, piece == 3U);
                                 l0AStagesIssued += pvL0ATotalStages_;
                                 l0BStagesIssued += pvL0BTotalStages_;
                             }

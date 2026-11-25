@@ -239,9 +239,10 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         } else {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
         }
-        if (embed == 512U && qNBlockSize == 1U) {
-            // D512 single head uses one strided [S, D] matrix; legacy
-            // dimensions retain the established multi-ND copy.
+        if (qNBlockSize == 1U) {
+            // A single head is one strided [S, D] matrix. Loading S separate
+            // one-row matrices adds ND2NZ overhead without changing the layout,
+            // so D128/D256/D512 all use the single strided copy.
 
             auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qSBlockSize, embed),
                                                 tla::MakeStride(tla::get<0>(gATensor.stride()), tla::Int<1>{}));

@@ -124,7 +124,8 @@ uint32_t FAInferTiling::GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
     if ((GetQSBlockTile(faInfo_.maxKvSeqlen) < Q_TILE_CEIL ||
-         (faInfo_.dataType == DataType::FP8 && faInfo_.embeddingSizeV > 128)) && qSeqlen != 0) {
+         (faInfo_.dataType == DataType::FP8 && faInfo_.embeddingSizeV > 128)) &&
+        qSeqlen != 0) {
         constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
         uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
         qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
@@ -566,7 +567,8 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
     const uint32_t maxBudget =
         faInfo_.dataType == DataType::FP8 || fa950_plan::IsD512(faInfo_.embeddingSize, faInfo_.embeddingSizeV)
-            ? 0U : fa950_task::HeadGroupBudget(faInfo_.batch, faInfo_.kvHeads, blockNum_);
+            ? 0U
+            : fa950_task::HeadGroupBudget(faInfo_.batch, faInfo_.kvHeads, blockNum_);
     const uint32_t budget =
         fa950_task::MultiTileBudget(maxBudget, groupSize, faInfo_.maxKvSeqlen > faTilingData.kvBaseTile);
     bool hasCrossHeadTasks = false;
@@ -581,10 +583,11 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
             fa950_task::MakeShape(qSeqlen, groupSize, faInfo_.kvHeads, faTilingData.qBaseTile, budget);
         hasCrossHeadTasks |= taskShape.headsPerTailTask > groupSize;
         // FP8 still uses the classic per-Q-tile grouping in fwd_kernel_quant.cpp.
-        const uint32_t batchTasks = faInfo_.dataType == DataType::FP8
-            ? (qSeqlen + faTilingData.qBaseTile - 1U) / faTilingData.qBaseTile * faInfo_.kvHeads *
-                  ((groupSize + GetQNBlockTile(qSeqlen, groupSize) - 1U) / GetQNBlockTile(qSeqlen, groupSize))
-            : taskShape.totalTasks;
+        const uint32_t batchTasks =
+            faInfo_.dataType == DataType::FP8
+                ? (qSeqlen + faTilingData.qBaseTile - 1U) / faTilingData.qBaseTile * faInfo_.kvHeads *
+                      ((groupSize + GetQNBlockTile(qSeqlen, groupSize) - 1U) / GetQNBlockTile(qSeqlen, groupSize))
+                : taskShape.totalTasks;
         if (batchIdx == 0) {
             faTilingData.set_firstBatchTaskNum(batchTasks);
         } else {
