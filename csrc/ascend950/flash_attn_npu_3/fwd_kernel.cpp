@@ -1017,7 +1017,16 @@ class FAIKernel950 {
                         uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
                         uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
                         bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
-                        if (doTriUMask) {
+                        const bool shortGroup = MixedKv && !PairedHeads && !IsDN &&
+                            (qSBlockSize == 4U || qSBlockSize == 8U) && kvSTileSizeAct > 64U;
+                        if (doTriUMask && shortGroup) {
+                            if constexpr (MixedKv && !PairedHeads && !IsDN) {
+                                const int32_t edge = static_cast<int32_t>(triUp + 1 - kvSStartIdx);
+                                epilogueOnlineSoftmax.template ApplyScoreTile<Epilogue::Block::ScoreBoundary::RepeatedUpper>(
+                                    l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
+                            }
+                        } else if (doTriUMask) {
                             if (paired) {
                                 // Finish prior NZ->L1 reads before MTE2 writes the mask.
                                 // The next VF writer follows this masked VF on PIPE_V.

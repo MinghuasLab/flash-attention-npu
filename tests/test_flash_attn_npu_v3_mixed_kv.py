@@ -32,6 +32,7 @@ def make_case(sq, sk, heads, batch=1):
     (5, 129, 2, 2, 1), (8, 385, 2, 1, 1), (65, 257, 2, 1, 1),
     (128, 512, 4, 1, 1), (129, 513, 1, 1, 1),
     (1, 4096, 4, 1, 8), (8, 4097, 2, 1, 4),
+    (8, 4161, 1, 1, 4),  # A 65-token tail crosses the 64-lane causal mask boundary.
     (1, 129, 8, 1, 1),  # Exercise the scale-loading fallback beyond TP1's four KV heads.
     # Compact S/P reaches its 16-row/AIV boundary at Sq=2. Exercise input-ring
     # wraparound, a partial final page, and task/split transitions together.
