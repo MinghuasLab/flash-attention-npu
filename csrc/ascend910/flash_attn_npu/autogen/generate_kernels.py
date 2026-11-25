@@ -183,7 +183,7 @@ def fag_kernel_variant(dtype_key: str, layout: tuple, headdim: int, softcap: int
         + "        });\n"
         + "        return 0;\n"
         + "    };\n"
-        + '    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag", fag_call);\n'
+        + '    fa_bridge::run_op_api_v2("ascendc_fag", fag_call);\n'
         + "}\n"
     )
     return Kernel(

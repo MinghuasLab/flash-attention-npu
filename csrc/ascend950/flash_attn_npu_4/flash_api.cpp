@@ -17,7 +17,9 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "acl/acl.h"
 
-extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
+// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// flash_api.cpp is a host TU and must not use ASC launch syntax.
+#include "../../fa_aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
@@ -30,7 +32,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     const auto current_handle = current.stream(false);
     // The calling stream orders the length producers, metadata write and forward consumer.
     auto task = [current_handle, args]() mutable -> int {
-        ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args));
+        fa_aicpu::fa_metadata_950_v4_launch(&args, sizeof(args), current_handle);
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", task);

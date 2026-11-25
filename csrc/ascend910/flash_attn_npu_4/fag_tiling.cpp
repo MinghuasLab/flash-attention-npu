@@ -191,9 +191,9 @@ void FillWorkSpaceTilingData(FAGTilingData& fagTilingData)
         int64_t value_dAlign = (fagTilingData.vHeadDim + FP16_BLOCK_NUMS - 1) / FP16_BLOCK_NUMS * FP16_BLOCK_NUMS;
         int64_t cvS2Inner = fagTilingData.s2CvInner;
         workspaceSize +=
-            AlignUp(fagTilingData.s1CvInner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
-        workspaceSize += AlignUp(cvS2Inner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
-        workspaceSize += AlignUp(cvS2Inner * value_dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+            ::AlignUp(fagTilingData.s1CvInner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+        workspaceSize += ::AlignUp(cvS2Inner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+        workspaceSize += ::AlignUp(cvS2Inner * value_dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
     }
 
     fagTilingData.workspaceSize = workspaceSize;

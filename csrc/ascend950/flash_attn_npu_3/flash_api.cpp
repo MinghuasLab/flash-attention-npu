@@ -11,7 +11,9 @@
 #include "combine_dispatch.hpp"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
-extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
+// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// flash_api.cpp is a host TU and must not use ASC launch syntax.
+#include "../../fa_aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
                                            const std::optional<at::Tensor>& qLengths)
@@ -24,7 +26,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     const auto handle = stream.stream(false);
     // The caller's stream orders both the length producers and the attention launch.
     auto metadata_task = [handle, args]() mutable -> int {
-        ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args));
+        fa_aicpu::fa_metadata_950_v3_launch(&args, sizeof(args), handle);
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);

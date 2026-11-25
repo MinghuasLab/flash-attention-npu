@@ -21,7 +21,12 @@
 
 #include <cstdint>
 #include "acl/acl.h"
+// Host TUs (flash_api.cpp) include this lightweight interface header too;
+// they get the GM_ADDR/__aicore__ vocabulary from csrc/host_compat.hpp
+// instead of the ASC-only kernel_operator.h.
+#if defined(__CCE__)
 #include <kernel_operator.h>
+#endif
 #include "kernel_common.hpp"
 
 struct FwdLaunchArgs {
@@ -61,15 +66,16 @@ struct FwdLaunchArgs {
 template <typename DType, KernelCommon::FaiKenel::inputLayout kLayout>
 void launch_fwd_dtype(const FwdLaunchArgs& a);
 
+// Dtype-agnostic entry (is_bf16 x layout selection happens device-side), defined
+// in fwd_dispatch_impl.hpp. Host TUs call this so they never name the ASC dtype
+// types (unavailable to the host frontend for torch >= 2.14 builds).
+void launch_fwd_dispatch(uint32_t layout, const FwdLaunchArgs& a);
+
 // Runtime entry: the input layout (TND / BSND / BNSD) is fixed at the call site,
 // then the matching dtype's launcher is selected. launch_fwd_dtype is explicitly
 // instantiated per (dtype, layout) in the autogen TUs.
 template <KernelCommon::FaiKenel::inputLayout kLayout>
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
-    if (a.is_bf16) {
-        launch_fwd_dtype<bfloat16_t, kLayout>(a);
-    } else {
-        launch_fwd_dtype<half, kLayout>(a);
-    }
+    launch_fwd_dispatch(static_cast<uint32_t>(kLayout), a);
 }

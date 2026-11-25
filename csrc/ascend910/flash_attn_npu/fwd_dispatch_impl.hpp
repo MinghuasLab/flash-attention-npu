@@ -45,3 +45,39 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
         }
     }
 }
+
+// Each autogen TU ends with the explicit instantiation definition of its own
+// (dtype, layout) pair. Declaring every pair extern here keeps
+// launch_fwd_dispatch() below from instantiating all six of them in every TU
+// that includes this header, which would undo the per-TU split.
+extern template void launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BNSD>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BNSD>(const FwdLaunchArgs& a);
+
+// Dtype/layout-agnostic host entry (declared in fwd_dispatch.hpp): the
+// is_bf16 x layout selection happens here, device-side, so host TUs never
+// name the ASC dtype types. gnu::used forces emission: no device TU calls
+// it directly, and host TUs only see the declaration.
+[[gnu::used]] inline void launch_fwd_dispatch(const FwdLaunchArgs& a)
+{
+    if (a.is_bf16) {
+        if (a.layout == KernelCommon::FaiKenel::inputLayout::TND) {
+            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::TND>(a);
+        } else if (a.layout == KernelCommon::FaiKenel::inputLayout::BNSD) {
+            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BNSD>(a);
+        } else {
+            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BSND>(a);
+        }
+    } else {
+        if (a.layout == KernelCommon::FaiKenel::inputLayout::TND) {
+            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::TND>(a);
+        } else if (a.layout == KernelCommon::FaiKenel::inputLayout::BNSD) {
+            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BNSD>(a);
+        } else {
+            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BSND>(a);
+        }
+    }
+}

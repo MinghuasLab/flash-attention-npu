@@ -22,9 +22,11 @@
 #include <cstring>
 #include <limits>
 
-// OpCommand: main wraps the varlen-bwd launch in an OpCommand context for aicpu
-// op tracking (RunOpApiV2("ascendc_fag", ...)); preserved through extraction.
-#include "torch_npu/csrc/framework/OpCommand.h"
+// The varlen-bwd launch is wrapped in an OpCommand context through the
+// host-implemented bridge below; this kernel-side header must stay free of
+// torch/torch_npu includes (the ASC frontend cannot parse torch >= 2.14's
+// C++20 headers).
+#include "../../op_command_bridge.hpp"
 
 // mha_varlen_bwd.cpp provides the FAG::FAGVarlenOpt kernel template, the FAG
 // namespace, and MaskType / InputLayout (via fag_common/common_header.h).
@@ -124,5 +126,25 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
 #endif
         return 0;
     };
-    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag", fag_varlen_opt_call);
+    fa_bridge::run_op_api_v2("ascendc_fag", fag_varlen_opt_call);
+}
+
+// Each autogen TU ends with the explicit instantiation definition of its own
+// dtype. Declaring both extern here keeps launch_varlen_bwd_dispatch() below from
+// instantiating the two of them in every TU that includes this header,
+// which would undo the per-TU split.
+extern template void launch_varlen_bwd_impl<bfloat16_t>(const VarlenBwdLaunchArgs& a);
+extern template void launch_varlen_bwd_impl<half>(const VarlenBwdLaunchArgs& a);
+
+// Dtype-agnostic host entry (declared in varlen_bwd_dispatch.hpp): the
+// is_bf16 selection happens here, device-side, so host TUs never name the
+// ASC dtype types. gnu::used forces emission (no device TU calls it
+// directly); references the per-dtype instantiations in the autogen TUs.
+[[gnu::used]] inline void launch_varlen_bwd_dispatch(const VarlenBwdLaunchArgs& a)
+{
+    if (a.is_bf16) {
+        launch_varlen_bwd_impl<bfloat16_t>(a);
+    } else {
+        launch_varlen_bwd_impl<half>(a);
+    }
 }

@@ -48,6 +48,9 @@ struct FwdLaunchArgs {
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a);
 
+// Explicit instantiations live in the ASC autogen TUs; host TUs must not
+// name the ASC dtype types, so hide the declarations from the host build.
+#if defined(__CCE__)
 extern template void launch_fwd_impl<float8_e4m3_t, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<float8_e4m3_t, Format::BSND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<float8_e4m3_t, Format::BNSD>(const FwdLaunchArgs& a);
@@ -57,37 +60,19 @@ extern template void launch_fwd_impl<bfloat16_t, Format::BNSD>(const FwdLaunchAr
 extern template void launch_fwd_impl<half, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
+#endif
+
+// Dtype/quant-agnostic entry, defined in fwd_dispatch_impl.hpp. Host TUs call
+// this so they never name the ASC dtype types (unavailable to the host frontend
+// that compiles flash_api.cpp / mha_fwd.cpp for torch >= 2.14).
+void launch_fwd_dispatch(const FwdLaunchArgs& a);
 
 // Runtime entry: kLayout is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
 // per (dtype, Format) in the autogen TUs.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
-    if (a.quant_mode == 1) {
-        if (a.layout == Format::TND) {
-            launch_fwd_impl<float8_e4m3_t, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<float8_e4m3_t, Format::BNSD>(a);
-        } else {
-            launch_fwd_impl<float8_e4m3_t, Format::BSND>(a);
-        }
-    } else if (a.is_bf16) {
-        if (a.layout == Format::TND) {
-            launch_fwd_impl<bfloat16_t, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<bfloat16_t, Format::BNSD>(a);
-        } else {
-            launch_fwd_impl<bfloat16_t, Format::BSND>(a);
-        }
-    } else {
-        if (a.layout == Format::TND) {
-            launch_fwd_impl<half, Format::TND>(a);
-        } else if (a.layout == Format::BNSD) {
-            launch_fwd_impl<half, Format::BNSD>(a);
-        } else {
-            launch_fwd_impl<half, Format::BSND>(a);
-        }
-    }
+    launch_fwd_dispatch(a);
 }
 
 #endif // FWD_DISPATCH_HPP

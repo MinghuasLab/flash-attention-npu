@@ -105,3 +105,40 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
 #undef FWD_MASK_SWITCH
 #undef FWD_BOOL_SWITCH
 #undef FWD_LAUNCH
+
+// Each autogen TU ends with the explicit instantiation definition of its own
+// (dtype, layout) pair. Declaring every pair extern here keeps
+// launch_fwd_dispatch() below from instantiating all six of them in every TU
+// that includes this header, which would undo the per-TU split.
+extern template void launch_fwd_dtype<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_dtype<bfloat16_t, KernelCommon::FaiKenel::inputLayout::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_dtype<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BNSD>(const FwdLaunchArgs& a);
+extern template void launch_fwd_dtype<half, KernelCommon::FaiKenel::inputLayout::BSND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_dtype<half, KernelCommon::FaiKenel::inputLayout::TND>(const FwdLaunchArgs& a);
+extern template void launch_fwd_dtype<half, KernelCommon::FaiKenel::inputLayout::BNSD>(const FwdLaunchArgs& a);
+
+// Dtype-agnostic host entry (declared in fwd_dispatch.hpp): the is_bf16 x
+// layout selection happens here, device-side, so host TUs never name the ASC
+// dtype types. References the per-(dtype, layout) instantiations spread
+// across the autogen TUs; resolved at link time.
+[[gnu::used]] inline void launch_fwd_dispatch(uint32_t layout, const FwdLaunchArgs& a)
+{
+    using Layout = KernelCommon::FaiKenel::inputLayout;
+    if (a.is_bf16) {
+        if (layout == static_cast<uint32_t>(Layout::BSND)) {
+            launch_fwd_dtype<bfloat16_t, Layout::BSND>(a);
+        } else if (layout == static_cast<uint32_t>(Layout::TND)) {
+            launch_fwd_dtype<bfloat16_t, Layout::TND>(a);
+        } else {
+            launch_fwd_dtype<bfloat16_t, Layout::BNSD>(a);
+        }
+    } else {
+        if (layout == static_cast<uint32_t>(Layout::BSND)) {
+            launch_fwd_dtype<half, Layout::BSND>(a);
+        } else if (layout == static_cast<uint32_t>(Layout::TND)) {
+            launch_fwd_dtype<half, Layout::TND>(a);
+        } else {
+            launch_fwd_dtype<half, Layout::BNSD>(a);
+        }
+    }
+}

@@ -15,7 +15,12 @@
 #include <string>
 #include <vector>
 
-#include "torch_npu/csrc/framework/OpCommand.h"
+// The FAGGeneral launch below enters the aicpu op-tracking context through
+// fa_bridge::run_op_api_v2(), which the host TU flash_api.cpp implements with
+// at_npu::native::OpCommand::RunOpApiV2. This kernel-side header must stay
+// free of torch/torch_npu includes: the ASC frontend cannot parse torch >= 2.14's
+// C++20 headers.
+#include "../../op_command_bridge.hpp"
 
 #include "fag_kernel.cpp"
 
@@ -108,9 +113,45 @@ void bwd_dispatch_run(const BwdLaunchArgs& a)
         });
         return 0;
     };
-    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag_general", launch_fag_general_kernel);
+    fa_bridge::run_op_api_v2("ascendc_fag_general", launch_fag_general_kernel);
 }
 
 #undef BWD_BOOL_SWITCH
 #undef BWD_LAUNCH_HD
 #undef BWD_KERNEL_LAUNCH
+
+// Each autogen TU ends with the explicit instantiation definition of its own
+// (dtype, layout) pair. Declaring every pair extern here keeps
+// launch_bwd_dispatch() below from instantiating all six of them in every TU
+// that includes this header, which would undo the per-TU split.
+extern template void bwd_dispatch_run<bfloat16_t, 0>(const BwdLaunchArgs& a);
+extern template void bwd_dispatch_run<bfloat16_t, 1>(const BwdLaunchArgs& a);
+extern template void bwd_dispatch_run<bfloat16_t, 2>(const BwdLaunchArgs& a);
+extern template void bwd_dispatch_run<half, 0>(const BwdLaunchArgs& a);
+extern template void bwd_dispatch_run<half, 1>(const BwdLaunchArgs& a);
+extern template void bwd_dispatch_run<half, 2>(const BwdLaunchArgs& a);
+
+// Dtype-agnostic host entry (declared in bwd_dispatch.hpp): is_bf16 x layout
+// selection happens here, device-side, so host TUs never name the ASC dtype
+// types. BSND=0 / TND=1 / BNSD=2 (fag_kernel_common.hpp). gnu::used forces
+// emission (no device TU calls it directly).
+[[gnu::used]] inline void launch_bwd_dispatch(uint32_t layout, const BwdLaunchArgs& a)
+{
+    if (a.is_bf16) {
+        if (layout == 0) {
+            bwd_dispatch_run<bfloat16_t, 0>(a);
+        } else if (layout == 1) {
+            bwd_dispatch_run<bfloat16_t, 1>(a);
+        } else {
+            bwd_dispatch_run<bfloat16_t, 2>(a);
+        }
+    } else {
+        if (layout == 0) {
+            bwd_dispatch_run<half, 0>(a);
+        } else if (layout == 1) {
+            bwd_dispatch_run<half, 1>(a);
+        } else {
+            bwd_dispatch_run<half, 2>(a);
+        }
+    }
+}

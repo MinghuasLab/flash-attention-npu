@@ -17,9 +17,12 @@
 
 // The layout enum (KernelCommon::FaiKenel::inputLayout) must be visible here so
 // FwdLaunchArgs can carry it and launch_fwd can dispatch on it. kernel_common.hpp
-// needs kernel_operator.h for __aicore__ / GM_ADDR, both of which the host TUs
-// already pull in, so this adds no new CATLASS/kernel-template cost.
+// needs kernel_operator.h for __aicore__ / GM_ADDR: kernel TUs take it from
+// kernel_operator.h, host TUs from csrc/host_compat.hpp, so this adds no new
+// CATLASS/kernel-template cost.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 #include "kernel_common.hpp"
 
 struct FwdLaunchArgs {
@@ -58,25 +61,14 @@ struct FwdLaunchArgs {
 template <typename DType, KernelCommon::FaiKenel::inputLayout kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a);
 
+// Dtype/layout-agnostic entry, defined in fwd_dispatch_impl.hpp. Host TUs
+// call this so they never name the ASC dtype types (unavailable to the host
+// frontend that compiles flash_api.cpp for torch >= 2.14).
+void launch_fwd_dispatch(const FwdLaunchArgs& a);
+
 // Runtime entry: pick the layout carried by a.layout, then the dtype, then dispatch
 // to the matching (dtype, layout) TU.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
-    if (a.is_bf16) {
-        if (a.layout == KernelCommon::FaiKenel::inputLayout::TND) {
-            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::TND>(a);
-        } else if (a.layout == KernelCommon::FaiKenel::inputLayout::BNSD) {
-            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BNSD>(a);
-        } else {
-            launch_fwd_impl<bfloat16_t, KernelCommon::FaiKenel::inputLayout::BSND>(a);
-        }
-    } else {
-        if (a.layout == KernelCommon::FaiKenel::inputLayout::TND) {
-            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::TND>(a);
-        } else if (a.layout == KernelCommon::FaiKenel::inputLayout::BNSD) {
-            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BNSD>(a);
-        } else {
-            launch_fwd_impl<half, KernelCommon::FaiKenel::inputLayout::BSND>(a);
-        }
-    }
+    launch_fwd_dispatch(a);
 }

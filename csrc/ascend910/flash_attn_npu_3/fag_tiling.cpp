@@ -190,10 +190,13 @@ void FillWorkSpaceTilingData(FAGTilingData& fagTilingData)
         int64_t dAlign = (fagTilingData.qkHeadDim + FP16_BLOCK_NUMS - 1) / FP16_BLOCK_NUMS * FP16_BLOCK_NUMS;
         int64_t value_dAlign = (fagTilingData.vHeadDim + FP16_BLOCK_NUMS - 1) / FP16_BLOCK_NUMS * FP16_BLOCK_NUMS;
         int64_t cvS2Inner = fagTilingData.s2CvInner;
+        // Qualify as ::AlignUp: with the host build's compat shim the
+        // KernelCommon::AlignUp overload (device-only in ASC builds) becomes
+        // host-visible too, which would make the unqualified call ambiguous.
         workspaceSize +=
-            AlignUp(fagTilingData.s1CvInner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
-        workspaceSize += AlignUp(cvS2Inner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
-        workspaceSize += AlignUp(cvS2Inner * value_dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+            ::AlignUp(fagTilingData.s1CvInner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+        workspaceSize += ::AlignUp(cvS2Inner * dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
+        workspaceSize += ::AlignUp(cvS2Inner * value_dAlign * FP32_BYTES * fagTilingData.aicNum * DB_NUM, GM_ALIGN);
     }
 
     fagTilingData.workspaceSize = workspaceSize;

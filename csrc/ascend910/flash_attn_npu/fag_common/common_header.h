@@ -16,7 +16,11 @@
 #include <limits>
 #include <type_traits>
 #include <cstdint>
+// Host TUs get GM_ADDR/__aicore__ vocabulary from csrc/host_compat.hpp
+// (force-included by the build); only the ASC frontend needs kernel_operator.h.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 
 #define SET_FLAG(trigger, waiter, e) AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
 #define WAIT_FLAG(trigger, waiter, e) AscendC::WaitFlag<AscendC::HardEvent::trigger##_##waiter>((e))

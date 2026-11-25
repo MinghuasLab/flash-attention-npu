@@ -23,7 +23,11 @@
 // Catlass namespace / CATLASS_DEVICE. Both were formerly pulled in transitively
 // by mha_fwd_kvcache.cpp, now compiled separately, so include
 // them explicitly here, before kernel_common.hpp.
+// Host build: kernel_operator.h is ASC-frontend-only; csrc/host_compat.hpp
+// (force-included) provides GM_ADDR and friends instead.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 #include "catlass/catlass.hpp"
 #include "kernel_common.hpp"
 #include "tiling/platform/platform_ascendc.h"
@@ -45,8 +49,20 @@ using fa_window::NormalizeAttentionWindow;
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-extern __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void* args);
-extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
+// The AICPU metadata / write-runtime kernels are launched from
+// fa_aicpu_launch.cpp (ASC TU); flash_api.cpp is a host TU and must not use
+// ASC launch syntax.
+#include "../../fa_aicpu_launch.hpp"
+
+// Host-side implementation of the torch-free OpCommand bridge declared in
+// csrc/op_command_bridge.hpp; the v4 backward dispatch TUs (ASC) call it.
+#include "../../op_command_bridge.hpp"
+namespace fa_bridge {
+void run_op_api_v2(const char* op_name, const std::function<int()>& func)
+{
+    at_npu::native::OpCommand::RunOpApiV2(op_name, func);
+}
+} // namespace fa_bridge
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
@@ -64,7 +80,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     // same-stream consumers. Cross-stream consumers require an explicit dependency.
     FAMetadataArgs metaArgs = args;
     auto metadata_task = [curHandle, metaArgs]() mutable -> int {
-        ComputeFAMetadataV4<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
+        fa_aicpu::fa_metadata_v4_launch(&metaArgs, sizeof(metaArgs), curHandle);
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -488,7 +504,7 @@ std::vector<at::Tensor> mha_fwd(
                                    runtimeDone = rtEvents.runtimeDone, fwdRuntimeArgs]() mutable -> int {
             ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
             ACL_CHECK(aclrtStreamWaitEvent(rtHandle, inputReady));
-            WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs));
+            fa_aicpu::fa_write_runtime_launch(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs), rtHandle);
             ACL_CHECK(aclrtRecordEvent(runtimeDone, rtHandle));
             ACL_CHECK(aclrtStreamWaitEvent(curHandle, runtimeDone));
             return 0;

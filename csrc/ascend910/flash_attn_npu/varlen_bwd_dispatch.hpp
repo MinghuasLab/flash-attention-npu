@@ -43,3 +43,8 @@ struct VarlenBwdLaunchArgs {
 // plus the dump variant). (Always TND layout, so no layout axis is generated.)
 template <typename DType>
 void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a);
+
+// Dtype-agnostic entry (is_bf16 selection happens device-side), defined in
+// varlen_bwd_dispatch_impl.hpp. Host TUs call this so they never name the ASC
+// dtype types (unavailable to the host frontend for torch >= 2.14 builds).
+void launch_varlen_bwd_dispatch(const VarlenBwdLaunchArgs& a);

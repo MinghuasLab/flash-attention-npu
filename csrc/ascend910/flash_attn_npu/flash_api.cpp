@@ -15,7 +15,11 @@
 // formerly pulled in transitively by mha_fwd_kvcache.cpp / mha_varlen_bwd.cpp,
 // which are now compiled as separate dispatch TUs, so include them explicitly
 // here, in this order.
+// Host build: kernel_operator.h is ASC-frontend-only; csrc/host_compat.hpp
+// (force-included) provides GM_ADDR and friends instead.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 #include "catlass/catlass.hpp"
 #include "kernel_common.hpp"
 // common_header.h defines TILING_PARA_NUM and the varlen-bwd tiling constants
@@ -72,7 +76,20 @@ AlibiSlopes set_params_alibi(const std::optional<at::Tensor>& alibi_slopes_, int
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-extern __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void* args);
+// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// flash_api.cpp is a host TU and must not use ASC launch syntax.
+#include "../../fa_aicpu_launch.hpp"
+
+// Host-side implementation of the torch-free OpCommand bridge declared in
+// csrc/op_command_bridge.hpp; the v2 backward / varlen dispatch TUs (ASC)
+// call it.
+#include "../../op_command_bridge.hpp"
+namespace fa_bridge {
+void run_op_api_v2(const char* op_name, const std::function<int()>& func)
+{
+    at_npu::native::OpCommand::RunOpApiV2(op_name, func);
+}
+} // namespace fa_bridge
 
 struct FwdMaskDerivation {
     bool is_causal;
@@ -113,7 +130,7 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
 
     FAMetadataArgs metaArgs = args;
     auto metadata_task = [curHandle, metaArgs]() mutable -> int {
-        ComputeFAMetadataV2<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
+        fa_aicpu::fa_metadata_v2_launch(&metaArgs, sizeof(metaArgs), curHandle);
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata_v2", metadata_task);
@@ -1455,11 +1472,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     vb_args.dvDevice = dvDevice;
     vb_args.workspaceDevice = workspaceDevice;
     vb_args.tilingDevice = tilingDevice;
-    if (vb_args.is_bf16) {
-        launch_varlen_bwd_impl<bfloat16_t>(vb_args);
-    } else {
-        launch_varlen_bwd_impl<half>(vb_args);
-    }
+    launch_varlen_bwd_dispatch(vb_args);
 
     auto opts = q.options();
     auto softmax_d = torch::empty({fagInfo.seqQShapeSize, nheads, max_seqlen_q}, opts.dtype(at::kFloat));
