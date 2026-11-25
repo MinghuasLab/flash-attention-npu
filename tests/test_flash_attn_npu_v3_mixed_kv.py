@@ -50,6 +50,7 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
     (1, 4097, 2, 2, 0, True, (511, 0)),       # The first visible token is inside a physical page.
     (1, 2048, 4, 1, 0, True, (511, 0)),       # Exact page boundaries.
     (8, 2049, 2, 1, 0, True, (511, 0)),       # Both ends fall inside a page.
+    (4, 2048, 1, 2, 0, True, (127, 0)),       # Each packed head repeats the four row masks on both edge pages.
     (8, 1027, 1, 2, 1, False, (17, 3)),       # Both masks on the same page.
     (193, 1025, 1, 1, 0, True, (511, 0)),      # One wave of individual Q128 heads, including a partial Q tile.
     (383, 1027, 1, 1, 0, True, (511, 0)),      # One paired wave, both SWA edges and a short final KV page.

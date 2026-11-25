@@ -28,7 +28,7 @@
 
 namespace Catlass::Epilogue::Block {
 
-enum class ScoreBoundary { None, Lower, Upper };
+enum class ScoreBoundary { None, Lower, Upper, RepeatedLower, RepeatedUpper };
 
 template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_>
 class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_,
@@ -223,7 +223,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false, Boundary>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
-                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero + static_cast<int32_t>(rowStart));
+                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero, rowStart, qSBlockSize - 1U);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
@@ -233,7 +233,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, true, Boundary>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero + static_cast<int32_t>(rowStart));
+                    scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero, rowStart, qSBlockSize - 1U);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
@@ -806,7 +806,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                        uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
-                       ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, int32_t firstBoundary)
+                       ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride,
+                       int32_t boundaryAtRowZero, uint32_t rowStart, uint32_t queryMask)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -861,13 +862,16 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                 ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
             }
             if constexpr (Boundary != ScoreBoundary::None) {
-                // In a single Q head the inclusive window shifts one column per row.
-                const int32_t edge = firstBoundary + static_cast<int32_t>(i);
+                // Packed heads repeat the same sequence of query positions.
+                constexpr bool repeated = Boundary == ScoreBoundary::RepeatedLower ||
+                                          Boundary == ScoreBoundary::RepeatedUpper;
+                const uint32_t row = rowStart + i;
+                const int32_t edge = boundaryAtRowZero + static_cast<int32_t>(repeated ? (row & queryMask) : row);
                 uint32_t first = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
                 uint32_t second = first > FLOAT_REP_SIZE ? first - FLOAT_REP_SIZE : 0U;
                 auto prefix0 = UpdateMask<float>(first);
                 auto prefix1 = UpdateMask<float>(second);
-                if constexpr (Boundary == ScoreBoundary::Lower) {
+                if constexpr (Boundary == ScoreBoundary::Lower || Boundary == ScoreBoundary::RepeatedLower) {
                     Select(srcVreg, minVreg, srcVreg, prefix0);
                     Select(srcVreg_unroll, minVreg, srcVreg_unroll, prefix1);
                 } else {

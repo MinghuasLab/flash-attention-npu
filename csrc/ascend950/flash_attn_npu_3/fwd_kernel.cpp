@@ -1062,21 +1062,26 @@ class FAIKernel950 {
                                           (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
                                           (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
                         }
-                        const bool singleEdge = PairedHeads && qNBlockSize == 1U && kvSTileSizeAct > 64U &&
-                                                doTriUPreMask != doTriUNextMask;
+                        const bool shortQueryGroup = MixedKv && !PairedHeads &&
+                            (qSBlockSize == 4U || qSBlockSize == 8U);
+                        const bool singleEdge = ((PairedHeads && qNBlockSize == 1U) || shortQueryGroup) &&
+                            kvSTileSizeAct > 64U && doTriUPreMask != doTriUNextMask;
                         if (singleEdge) {
-                            if constexpr (PairedHeads) {
+                            if constexpr (MixedKv) {
+                                using Boundary = Epilogue::Block::ScoreBoundary;
+                                constexpr auto lower = PairedHeads ? Boundary::Lower : Boundary::RepeatedLower;
+                                constexpr auto upper = PairedHeads ? Boundary::Upper : Boundary::RepeatedUpper;
                                 // Lower bound is inclusive; the upper boundary counts valid columns.
                                 const int64_t boundary = (doTriUPreMask ? windowSizeLeftStartLen :
                                     windowSizeRightStartLen + 1) - kvSStartIdxI;
                                 const int32_t edge = static_cast<int32_t>(AscendC::Std::min(int64_t{128},
                                     AscendC::Std::max(int64_t{-128}, boundary)));
                                 if (doTriUPreMask) {
-                                    epilogueOnlineSoftmax.template ApplyScoreTile<Epilogue::Block::ScoreBoundary::Lower>(
+                                    epilogueOnlineSoftmax.template ApplyScoreTile<lower>(
                                         l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, l1PBufId,
                                         qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                                 } else {
-                                    epilogueOnlineSoftmax.template ApplyScoreTile<Epilogue::Block::ScoreBoundary::Upper>(
+                                    epilogueOnlineSoftmax.template ApplyScoreTile<upper>(
                                         l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, l1PBufId,
                                         qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                                 }
