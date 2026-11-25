@@ -1470,7 +1470,10 @@ def test_flash_attn_kvcache_metadata_invalid_buffer_rejected(invalid, message):
         (torch.float16, True),
     ],
 )
-def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_spy_950):
+@pytest.mark.parametrize("use_explicit_lengths", [False, True])
+def test_flash_attn_varlen_func_metadata_matches(
+    data_type, is_causal, metadata_spy_950, use_explicit_lengths
+):
     batch, q_seqlen, kv_seqlen, heads, kv_heads, head = 2, 32, 64, 4, 2, 128
     total_q = batch * q_seqlen
     total_kv = batch * kv_seqlen
@@ -1481,6 +1484,8 @@ def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_
     kv_offsets = [0, kv_seqlen, kv_seqlen * 2]
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
+    seqused_q = _int32_npu([q_seqlen] * batch) if use_explicit_lengths else None
+    seqused_k = _int32_npu([kv_seqlen] * batch) if use_explicit_lengths else None
     scale = 1.0 / (head**0.5)
 
     output_npu = flash_attn_varlen_func(
@@ -1491,12 +1496,19 @@ def test_flash_attn_varlen_func_metadata_matches(data_type, is_causal, metadata_
         cu_seqlens_k,
         q_seqlen,
         kv_seqlen,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
         softmax_scale=scale,
         causal=is_causal,
         window_size=WINDOW_SIZE,
         num_splits=1,
     )
     assert len(metadata_spy_950) == 1
+    args, _ = metadata_spy_950[0]
+    assert args[6] is seqused_k
+    assert args[7] is seqused_q
+    assert args[8] is (None if use_explicit_lengths else cu_seqlens_k)
+    assert args[-1] is (None if use_explicit_lengths else cu_seqlens_q)
 
     _assert_tnd_matches_ref(
         output_npu,

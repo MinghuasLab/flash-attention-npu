@@ -36,6 +36,10 @@
 
 extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
+                                           const std::optional<at::Tensor>& cu_seqlens_q,
+                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime = {});
+
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 using flash_attn_npu_950_v4::fill_inference_context;
@@ -52,7 +56,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 std::optional<bool> pack_gqa_, std::optional<at::Tensor> learnable_sink_,
                                 bool return_lse, std::optional<at::Tensor> scheduler_metadata_, int64_t layout,
                                 std::optional<at::Tensor> q_descale_, std::optional<at::Tensor> k_descale_,
-                                std::optional<at::Tensor> v_descale_)
+                                std::optional<at::Tensor> v_descale_, bool build_scheduler_metadata)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -60,6 +64,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    const bool use_scheduler_metadata = build_scheduler_metadata || scheduler_metadata_.has_value();
+    TORCH_CHECK(!build_scheduler_metadata || !scheduler_metadata_.has_value(),
+                "cannot request both automatic and supplied scheduler metadata");
 
     // ============================================================
     // 1. dtype + stride sanity
@@ -116,22 +123,24 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
         CHECK_CONTIGUOUS(cu_seqlens_q);
-        TORCH_CHECK(cu_seqlens_q.device().type() == at::kPrivateUse1, "cu_seqlens_q must be on NPU");
+        TORCH_CHECK(cu_seqlens_q.device() == q.device(), "cu_seqlens_q must be on the query NPU device");
         TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+        TORCH_CHECK(cu_seqlens_q.dim() == 1, "cu_seqlens_q must be rank 1");
         TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
     }
     if (is_varlen_kv) {
         cu_seqlens_k = cu_seqlens_k_.value();
         CHECK_CONTIGUOUS(cu_seqlens_k);
-        TORCH_CHECK(cu_seqlens_k.device().type() == at::kPrivateUse1, "cu_seqlens_k must be on NPU");
+        TORCH_CHECK(cu_seqlens_k.device() == q.device(), "cu_seqlens_k must be on the query NPU device");
         TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+        TORCH_CHECK(cu_seqlens_k.dim() == 1, "cu_seqlens_k must be rank 1");
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, paged table is not supported");
     }
-    TORCH_CHECK(seqused_k_.has_value(), "950 backend (v4) requires seqused_k (per-batch KV seqlen) — the "
-                                        "Python wrapper passes cache_seqlens through this argument");
-    seqlens_k = seqused_k_.value();
+    TORCH_CHECK(seqused_k_.has_value() || is_varlen_kv,
+                "950 backend (v4) requires seqused_k when cu_seqlens_k is absent");
+    seqlens_k = seqused_k_.has_value() ? seqused_k_.value() : cu_seqlens_k;
     CHECK_CONTIGUOUS(seqlens_k);
-    TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1, "seqused_k must be on NPU");
+    TORCH_CHECK(seqlens_k.device() == q.device(), "KV lengths must be on the query NPU device");
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
     TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
     // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
@@ -141,7 +150,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         TORCH_CHECK(used_q.dtype() == torch::kInt32, "seqused_q must have dtype int32");
         TORCH_CHECK(used_q.dim() == 1, "seqused_q must be rank 1");
         CHECK_CONTIGUOUS(used_q);
-        TORCH_CHECK(used_q.device().type() == at::kPrivateUse1, "seqused_q must be on NPU");
+        TORCH_CHECK(used_q.device() == q.device(), "seqused_q must be on the query NPU device");
     }
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
 
@@ -219,8 +228,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const bool empty_query = is_varlen_q && q.size(0) == 0 && seqlen_q == 0;
     TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
                 "query sequence length and head count must be positive");
-    TORCH_CHECK(seqlens_k.numel() == batch_size || seqlens_k.numel() == batch_size + 1,
-                "seqused_k must contain per-batch lengths or batch_size + 1 cumulative offsets");
+    TORCH_CHECK(!is_varlen_kv || cu_seqlens_k.numel() == batch_size + 1,
+                "cu_seqlens_k must contain batch_size + 1 cumulative offsets");
+    TORCH_CHECK(!seqused_q_.has_value() || seqused_q_->numel() == batch_size,
+                "seqused_q must contain one Q length per batch");
+    TORCH_CHECK(!seqused_k_.has_value() || seqused_k_->numel() == batch_size,
+                "seqused_k must contain one KV length per batch");
+    const bool kv_is_cumulative = !seqused_k_.has_value();
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
     const bool d512_heads = head_size_q == 512 && head_size_v == 512;
     TORCH_CHECK((head_size_q >= 1 && head_size_q <= 256) || d512_heads,
@@ -306,7 +320,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const bool denseFdShape = d512_heads && layout_enum == FwdLayout::BSND && !paged_KV && !is_varlen_kv &&
                               !is_causal && !is_local && num_splits == 0 && seqlen_q > 0 && seqlen_q <= 16 &&
                               static_cast<uint64_t>(seqlen_q) * fdGroupSize <= 128;
-    if (!scheduler_metadata_.has_value()) {
+    if (!use_scheduler_metadata) {
         // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
         at::Tensor seqused_q_cpu;
         if (is_varlen_q) {
@@ -314,7 +328,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         }
         if (is_varlen_q && seqused_q_.has_value()) {
             seqused_q_cpu = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
-            TORCH_CHECK(seqused_q_cpu.numel() == batch_size, "seqused_q must contain one Q length per batch");
         }
         seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
         int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
@@ -328,7 +341,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                 q_used_ptr != nullptr
                     ? static_cast<int64_t>(q_used_ptr[batch_idx])
                     : (is_varlen_q ? static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] : seqlen_q);
-            const int64_t kv_len = kv_len_ptr[batch_idx];
+            const int64_t kv_len = kv_is_cumulative
+                                       ? static_cast<int64_t>(kv_len_ptr[batch_idx + 1]) - kv_len_ptr[batch_idx]
+                                       : kv_len_ptr[batch_idx];
             TORCH_CHECK(q_len > 0 && kv_len > 0, "950 backend (v4) requires positive Q and KV lengths");
             if (q_used_ptr != nullptr) {
                 TORCH_CHECK(q_len <= static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx],
@@ -361,9 +376,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // per-batch lengths on the host just to inspect the AICPU-written flag;
     // use the same declared-shape eligibility here and let the fused kernel
     // guard against a metadata schedule that was disabled by AICPU.
-    const int64_t metadataKvBound = max_seqlen_k_.value_or(
-        paged_KV ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
-                 : (layout_enum == FwdLayout::BNSD ? k.size(2) : (k.dim() == 4 ? k.size(1) : k.size(0))));
     const uint32_t metadataBaseTaskUpperBound =
         static_cast<uint32_t>(batch_size) * static_cast<uint32_t>(num_heads_k) * ((fdGroupSize + 4U - 1U) / 4U);
     const uint32_t metadataFdCoreCapacity = blockDim < MAX_FD_ACTIVE_CORE_NUM ? blockDim : MAX_FD_ACTIVE_CORE_NUM;
@@ -371,31 +383,32 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                       max_seqlen_q_.has_value() && max_seqlen_q_.value() <= 16 &&
                                       static_cast<uint64_t>(max_seqlen_q_.value()) * fdGroupSize <= 128;
     const bool metadataFlashDecodeCandidate =
-        scheduler_metadata_.has_value() && (denseFdShape || pagedMetadataFdShape) && metadataKvBound >= 1024 &&
+        use_scheduler_metadata && (denseFdShape || pagedMetadataFdShape) && declared_k >= 1024 &&
         metadataBaseTaskUpperBound < metadataFdCoreCapacity &&
         metadataBaseTaskUpperBound <= (blockDim == 0 ? 0U : ((3U * blockDim - 1U) / 10U));
     const bool flashDecodeEnabled =
-        scheduler_metadata_.has_value() ? metadataFlashDecodeCandidate : tilingData.flashDecodeFlag != 0U;
+        use_scheduler_metadata ? metadataFlashDecodeCandidate : tilingData.flashDecodeFlag != 0U;
 
     // Metadata and non-FD calls retain the conservative workspace allocation.
     // Host-tiled FD calls use the exact partial O/LSE workspace size.
     constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
-    if (!scheduler_metadata_.has_value() && !flashDecodeEnabled && tilingData.workSpaceSize < WS_FLOOR) {
+    if (!use_scheduler_metadata && !flashDecodeEnabled && tilingData.workSpaceSize < WS_FLOOR) {
         tilingData.workSpaceSize = WS_FLOOR;
     }
 
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
-    auto workspace =
-        at::empty({static_cast<int64_t>(scheduler_metadata_.has_value() ? WS_FLOOR : tilingData.workSpaceSize)},
-                  at::device(at::kPrivateUse1).dtype(at::kByte));
+    auto workspace = at::empty({static_cast<int64_t>(use_scheduler_metadata ? WS_FLOOR : tilingData.workSpaceSize)},
+                               at::device(at::kPrivateUse1).dtype(at::kByte));
 
-    at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    at::Tensor softmaxlse;
     if (return_lse && is_varlen_q) {
         softmaxlse = at::empty({num_heads, sizes[0]}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     } else if (return_lse) {
         softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    } else {
+        softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
     if (return_lse) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
@@ -406,21 +419,46 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // ============================================================
     at::Tensor tiling_dev;
     at::Tensor runtime_dev;
-    // FP8 follows V3's by-value per-call parameters; static metadata remains reusable.
-    FAInferRuntimeData fp8Runtime{};
-    if (quantMode == 1) {
-        fp8Runtime.numBlocks = num_blocks;
-        fp8Runtime.blockSize = page_block_size;
-        fp8Runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
-        fp8Runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
-        const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
-        fp8Runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
-        fp8Runtime.softcapValue = softcap;
-        fp8Runtime.windowSizeLeft = window_size_left;
-        fp8Runtime.windowSizeRight = window_size_right;
-        fp8Runtime.allowFlashDecode = flashDecodeEnabled;
+    FAInferRuntimeData launchRuntime{};
+    launchRuntime.numBlocks = num_blocks;
+    launchRuntime.blockSize = page_block_size;
+    launchRuntime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
+    launchRuntime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
+    const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
+    launchRuntime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
+    launchRuntime.softcapValue = softcap;
+    launchRuntime.windowSizeLeft = window_size_left;
+    launchRuntime.windowSizeRight = window_size_right;
+    launchRuntime.allowFlashDecode = flashDecodeEnabled;
+    if (use_scheduler_metadata && quantMode == 0) {
+        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
     }
-    if (scheduler_metadata_.has_value()) {
+    if (build_scheduler_metadata) {
+        FAMetadataArgs args{};
+        args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q.data_ptr()) : 0;
+        args.seqlensQAddr = seqused_q_.has_value() ? reinterpret_cast<uint64_t>(seqused_q_->data_ptr()) : 0;
+        args.seqlensKAddr = reinterpret_cast<uint64_t>(seqlens_k.data_ptr());
+        args.batch = batch_size;
+        args.numHeads = num_heads;
+        args.numHeadsK = num_heads_k;
+        args.embeddingSize = head_size_q;
+        args.embeddingSizeV = head_size_v;
+        args.maxQSeqlen = seqlen_q;
+        args.maskType = launchRuntime.maskType;
+        args.blockDim = blockDim;
+        args.isVarlen = is_varlen_q;
+        args.isVarlenKv = kv_is_cumulative;
+        args.numSplits = num_splits;
+        args.hasSequsedQ = seqused_q_.has_value();
+        args.quantMode = quantMode;
+        args.windowSizeLeft = window_size_left;
+        args.windowSizeRight = window_size_right;
+        if (runtime_dev.defined()) {
+            args.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
+            args.runtime = launchRuntime;
+        }
+        tiling_dev = GetSchedulerMetadataImpl(args, seqlens_k, cu_seqlens_q_, seqused_q_, runtime_dev);
+    } else if (scheduler_metadata_.has_value()) {
         const auto& metadata = scheduler_metadata_.value();
         TORCH_CHECK(metadata.device() == q.device() && metadata.dtype() == at::kByte && metadata.is_contiguous(),
                     "scheduler_metadata must be a contiguous NPU byte tensor");
@@ -430,53 +468,14 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         // runtime buffer, so different streams never overwrite shared metadata.
         tiling_dev = metadata;
         if (quantMode == 0) {
-            runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
-            FARuntimeArgs runtimeArgs{};
-            runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
-            auto& runtime = runtimeArgs.runtime;
-            runtime.numBlocks = num_blocks;
-            runtime.blockSize = page_block_size;
-            runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
-            runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
-            const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
-            runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
-            runtime.softcapValue = softcap;
-            runtime.windowSizeLeft = window_size_left;
-            runtime.windowSizeRight = window_size_right;
-            runtime.allowFlashDecode = flashDecodeEnabled;
-            auto aicpu = c10_npu::getNPUStreamFromPool();
-            if (aicpu.stream(false) == aclStream) {
-                aicpu = c10_npu::getNPUStreamFromPool();
-            }
-            const auto aicpuStream = aicpu.stream(false);
-            TORCH_CHECK(aicpuStream != aclStream, "AICPU tiling merge requires a separate stream");
-            struct MergeEvents {
-                aclrtEvent input_ready = nullptr;
-                aclrtEvent done = nullptr;
-            };
-            // Separate event pairs prevent different caller streams from reusing
-            // one another's capture dependencies.
-            static thread_local std::unordered_map<aclrtStream, MergeEvents> events_by_stream;
-            auto& events = events_by_stream[aclStream];
-            if (events.input_ready == nullptr) {
-                constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
-                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.input_ready, event_flags) == ACL_SUCCESS,
-                            "create merge input event failed");
-                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
-                            "create merge completion event failed");
-            }
-            auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
-                                  done = events.done]() mutable -> int {
-                TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
-                TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS,
-                            "wait for merge input failed");
-                WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
-                TORCH_CHECK(aclrtRecordEvent(done, aicpuStream) == ACL_SUCCESS, "record merge completion event failed");
-                TORCH_CHECK(aclrtStreamWaitEvent(aclStream, done) == ACL_SUCCESS, "wait for tiling merge failed");
+            FARuntimeArgs runtimeArgs{reinterpret_cast<uint64_t>(runtime_dev.data_ptr()), launchRuntime};
+            auto write_runtime = [runtimeArgs, aclStream]() mutable -> int {
+                WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs));
                 return 0;
             };
             at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
-            c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(), aicpu);
+            c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(),
+                                                       c10_npu::getCurrentNPUStream());
         }
         c10_npu::NPUCachingAllocator::recordStream(tiling_dev.storage().data_ptr(), c10_npu::getCurrentNPUStream());
     } else {
@@ -518,9 +517,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     at::Tensor kv_seq_i64;
     if (is_varlen_kv) {
         kv_seq_i64 = cu_seqlens_k;
-    } else if (seqlens_k.size(0) == batch_size + 1) {
-        kv_seq_i64 = seqlens_k;
-    } else if (seqlens_k.size(0) == batch_size && is_varlen_q && !paged_KV) {
+    } else if (is_varlen_q && !paged_KV) {
         at::Tensor cu_kv_cpu = at::empty({batch_size + 1}, at::device(c10::kCPU).dtype(at::kInt));
         auto seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
         const int32_t* p = seqlens_k_cpu.data_ptr<int32_t>();
@@ -547,15 +544,15 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
 
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
-    const uint32_t launchBlockDim = scheduler_metadata_.has_value()
+    const uint32_t launchBlockDim = use_scheduler_metadata
                                         ? (flashDecodeEnabled ? metadataFdCoreCapacity : blockDim)
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
     FwdLaunchArgs fwdArgs{
-        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,  return_lse,    is_softcap, launchBlockDim,
-        aclStream, qDev,     kDev,          vDev,         maskDev,   blockTableDev, oDev,       lseDev,
-        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,     tilDev,        runtimeDev, kv_seqlen_allocated,
-        quantMode, qDescale, kDescale,      vDescale,     fp8Runtime};
+        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,     return_lse,    is_softcap, launchBlockDim,
+        aclStream, qDev,     kDev,          vDev,         maskDev,      blockTableDev, oDev,       lseDev,
+        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,        tilDev,        runtimeDev, kv_seqlen_allocated,
+        quantMode, qDescale, kDescale,      vDescale,     launchRuntime};
     fwdArgs.storage =
         FwdStorageParams{static_cast<uint64_t>(paged_KV ? k.stride(0) : 0),
                          static_cast<uint64_t>(paged_KV ? v.stride(0) : 0),

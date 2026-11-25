@@ -64,6 +64,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     std::memset(tilingData, 0, sizeof(FAInferTilingData));
     const int32_t *seqlensQ = reinterpret_cast<const int32_t *>(metaArgs->seqlensQAddr);
     const int32_t *cacheSeqlens = reinterpret_cast<const int32_t *>(metaArgs->cacheSeqlensAddr);
+    const auto readLength = [](const int32_t *lengths, uint32_t batch, bool cumulative) {
+        const uint32_t value = static_cast<uint32_t>(lengths[batch]);
+        return cumulative ? static_cast<uint32_t>(lengths[batch + 1]) - value : value;
+    };
 
     tilingData->batch = metaArgs->batch;
     tilingData->numHeads = metaArgs->numHeads;
@@ -87,10 +91,12 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     if (seqlensQ != nullptr)
         actualMaxQ = 0;
     for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-        const uint32_t len = seqlensQ ? static_cast<uint32_t>(seqlensQ[b]) : metaArgs->maxQSeqlen;
+        const uint32_t len =
+            seqlensQ ? readLength(seqlensQ, b, metaArgs->qCumulative) : metaArgs->maxQSeqlen;
         actualMaxQ = len > actualMaxQ ? len : actualMaxQ;
-        const uint32_t activeQ = fa950_plan::ActiveQueryRows(len, cacheSeqlens[b], metaArgs->maskType != 0U,
-                                                           metaArgs->windowSizeRight);
+        const uint32_t kvLen = readLength(cacheSeqlens, b, metaArgs->kvCumulative);
+        const uint32_t activeQ =
+            fa950_plan::ActiveQueryRows(len, kvLen, metaArgs->maskType != 0U, metaArgs->windowSizeRight);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * metaArgs->numHeads;
     }
     const uint32_t qBaseTile = fa950_plan::SelectQueryTile(metaArgs->embeddingSize, metaArgs->embeddingSizeV,
@@ -140,9 +146,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (seqlensQ != nullptr) {
-            qSeqlen = static_cast<uint32_t>(seqlensQ[batchIdx]);
+            qSeqlen = readLength(seqlensQ, batchIdx, metaArgs->qCumulative);
         }
-        uint32_t kvSeqlen = static_cast<uint32_t>(cacheSeqlens[batchIdx]);
+        const uint32_t kvSeqlen = readLength(cacheSeqlens, batchIdx, metaArgs->kvCumulative);
         if (qSeqlen > maxQSeqlen) {
             maxQSeqlen = qSeqlen;
         }

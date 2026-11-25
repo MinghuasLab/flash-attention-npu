@@ -136,13 +136,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
         TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, paged table is not supported");
     }
-    TORCH_CHECK(seqused_k_.has_value(), "950 backend (v3) requires seqused_k (per-batch KV seqlen) — the "
-                                        "Python wrapper passes cache_seqlens through this argument");
-    seqlens_k = seqused_k_.value();
-    CHECK_CONTIGUOUS(seqlens_k);
-    TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1, "seqused_k must be on NPU");
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
-    TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    TORCH_CHECK(seqused_k_.has_value() || is_varlen_kv, "950 backend (v3) requires seqused_k or cu_seqlens_k");
+    if (seqused_k_.has_value()) {
+        seqlens_k = *seqused_k_;
+        CHECK_CONTIGUOUS(seqlens_k);
+        TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1, "seqused_k must be on NPU");
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
+    }
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     // seqused_q caps the *used* Q lengths; the packed region layout stays on cu.
     if (seqused_q_.has_value()) {
@@ -231,7 +232,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
                 "query sequence length and head count must be positive unless TND total_q=max_seqlen_q=0");
     TORCH_CHECK(!is_varlen_q || q.size(0) > 0 || empty_query, "total_q must be positive when max_seqlen_q is positive");
-    TORCH_CHECK(seqlens_k.numel() == batch_size, "seqused_k must contain one KV length per batch");
+    TORCH_CHECK(!seqlens_k.defined() || seqlens_k.numel() == batch_size,
+                "seqused_k must contain one KV length per batch");
     TORCH_CHECK(k.size(-1) == head_size_q, "query and key must have the same head dimension");
     // D512 opens only the exact Dq=Dk=Dv=512 profile; 257..511 and asymmetric
     // combinations remain rejected by the [1, 256] check.
@@ -384,7 +386,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             seqused_q_cpu = seqused_q_->to(at::Device(at::kCPU)).to(at::kInt).contiguous();
             TORCH_CHECK(seqused_q_cpu.numel() == batch_size, "seqused_q must contain one Q length per batch");
         }
-        at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
+        at::Tensor seqlens_k_cpu;
+        if (seqlens_k.defined()) {
+            seqlens_k_cpu = seqlens_k.to(at::kCPU);
+        } else {
+            // The host tiler consumes lengths. The metadata path passes prefixes straight to the kernel.
+            const auto cu_k_cpu = cu_seqlens_k.to(at::kCPU);
+            seqlens_k_cpu = cu_k_cpu.slice(0, 1) - cu_k_cpu.slice(0, 0, batch_size);
+        }
 
         // 6b. SWA / causal host normalize
         int32_t max_kv_seqlen = 0;

@@ -115,8 +115,8 @@ struct FAMetadataArgs {
     int64_t windowSizeLeft;
     int64_t windowSizeRight;
     uint32_t blockDim;
-    uint32_t isVarlen;
-    uint32_t isVarlenKv;
+    uint32_t qCumulative;
+    uint32_t kvCumulative;
     uint32_t pagedKV;
     uint32_t quantMode;
 };

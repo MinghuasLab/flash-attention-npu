@@ -524,7 +524,7 @@ def _get_scheduler_metadata_op(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor],
     seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     page_size: Optional[int],
@@ -535,6 +535,7 @@ def _get_scheduler_metadata_op(
     window_left: int,
     window_right: int,
     quant_mode: int = 0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return flash_attn_npu_3_950.get_scheduler_metadata(
         batch_size,
@@ -554,6 +555,7 @@ def _get_scheduler_metadata_op(
         window_left,
         window_right,
         quant_mode,
+        cu_seqlens_q,
     )
 
 
@@ -565,7 +567,7 @@ def _get_scheduler_metadata_fake(
     num_heads_kv: int,
     headdim: int,
     headdim_v: int,
-    cache_seqlens: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor],
     seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     page_size: Optional[int],
@@ -576,14 +578,18 @@ def _get_scheduler_metadata_fake(
     window_left: int,
     window_right: int,
     quant_mode: int = 0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     ctx = torch.library.get_ctx()
     metadata_size = ctx.new_dynamic_size()
+    kv_lengths = cache_seqlens if cache_seqlens is not None else cu_seqlens_k
+    if kv_lengths is None:
+        raise ValueError("cache_seqlens or cu_seqlens_k is required")
 
     return torch.empty(
         (metadata_size,),
         dtype=torch.uint8,
-        device=cache_seqlens.device,
+        device=kv_lengths.device,
     )
 
 
@@ -625,9 +631,7 @@ def get_scheduler_metadata(
     layout, causal / window flags or per-batch sequence lengths change.
     """
     cache_seqlens = _maybe_contiguous(cache_seqlens)
-    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1] if cu_seqlens_q is not None else None
-    if seqlens_q is not None:
-        seqlens_q = _maybe_contiguous(seqlens_q)
+    cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
     if headdim_v is None:
         headdim_v = headdim
     if qkv_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
@@ -649,7 +653,7 @@ def get_scheduler_metadata(
         headdim,
         headdim_v,
         cache_seqlens,
-        seqlens_q,
+        None,  # q lengths come from cu_seqlens_q
         None,  # kv lengths come from cache_seqlens
         page_size,
         causal,
@@ -659,6 +663,7 @@ def get_scheduler_metadata(
         window_size[0],
         window_size[1],
         quant_mode,
+        cu_seqlens_q,
     )
     return scheduler_metadata
 
@@ -683,17 +688,14 @@ def _training_forward(
     k_descale=None,
     v_descale=None,
 ):
-    if seqused_k is None:
-        if cu_seqlens_q is None:
-            kv_seqlen = k.shape[2] if layout == _LAYOUT_BNSD else k.shape[1]
-            seqused_k = torch.full(
-                (q.shape[0],),
-                kv_seqlen,
-                dtype=torch.int32,
-                device=k.device,
-            )
-        else:
-            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    if seqused_k is None and cu_seqlens_q is None:
+        kv_seqlen = k.shape[2] if layout == _LAYOUT_BNSD else k.shape[1]
+        seqused_k = torch.full(
+            (q.shape[0],),
+            kv_seqlen,
+            dtype=torch.int32,
+            device=k.device,
+        )
 
     return _flash_attn_forward(
         q,
@@ -905,21 +907,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
+        cu_seqlens_q = _maybe_contiguous(cu_seqlens_q)
+        cu_seqlens_k = _maybe_contiguous(cu_seqlens_k)
         _validate_varlen_query(q, cu_seqlens_q)
         # The packed varlen query (cu_seqlens_q present) is always TND, never BNSD.
         layout = _LAYOUT_TND
         if scheduler_metadata is None:
-            meta_seqused_k = (
-                seqused_k
-                if seqused_k is not None
-                else _maybe_contiguous(cu_seqlens_k[1:] - cu_seqlens_k[:-1])
-            )
-            meta_seqlens_q = (
-                seqused_q
-                if seqused_q is not None
-                else _maybe_contiguous(cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-            )
-            # Internal scheduler takes the used lengths; the public helper takes cu_seqlens_q.
             scheduler_metadata = _get_scheduler_metadata_op(
                 cu_seqlens_q.numel() - 1,
                 max_seqlen_q,
@@ -927,9 +920,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 k.shape[1],
                 q.shape[2],
                 v.shape[2],
-                meta_seqused_k,
-                meta_seqlens_q,
-                None,  # cu_seqlens_k
+                seqused_k,
+                seqused_q,
+                cu_seqlens_k if seqused_k is None else None,
                 None,  # page_size
                 causal,
                 softcap > 0.0,
@@ -938,6 +931,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 window_size[0],
                 window_size[1],
                 quant_mode,
+                cu_seqlens_q if seqused_q is None else None,
             )
 
         out, softmax_lse, _, _ = _training_forward(
