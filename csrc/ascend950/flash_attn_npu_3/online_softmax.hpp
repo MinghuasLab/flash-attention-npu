@@ -28,6 +28,8 @@
 
 namespace Catlass::Epilogue::Block {
 
+enum class ScoreBoundary { None, Lower, Upper };
+
 template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_>
 class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_,
                     TileCopy_> {
@@ -172,6 +174,15 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                                       uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
                                       Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
+        ApplyScoreTile<ScoreBoundary::None>(l1PTensorTla, actualBlockShape, isFirstKvSTile, ubSBufId, l1PBufId,
+                                           qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, 0);
+    }
+
+    template <ScoreBoundary Boundary, class TensorP>
+    __aicore__ inline void ApplyScoreTile(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
+                                      uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
+                                      Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize, int32_t boundaryAtRowZero)
+    {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
         uint32_t totalRows = qSBlockSize * qNBlockSize;
@@ -210,9 +221,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, false>(
+                ComputeScaleAndMax<ElementInput, ElementOutput, false, Boundary>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
-                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound);
+                    nPadding, scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero + static_cast<int32_t>(rowStart));
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
@@ -220,9 +231,9 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             }
         } else {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, true>(
+                ComputeScaleAndMax<ElementInput, ElementOutput, true, Boundary>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
-                    scaleValue, softcapValue, 128, blockStride, nRound);
+                    scaleValue, softcapValue, 128, blockStride, nRound, boundaryAtRowZero + static_cast<int32_t>(rowStart));
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
@@ -790,12 +801,12 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate>
+    template <typename ElementS, typename ElementP, bool isUpdate, ScoreBoundary Boundary>
     __simd_vf__ static inline void
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
                        uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale,
-                       ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+                       ElementInput dSoftcap, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, int32_t firstBoundary)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -848,6 +859,21 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
                 ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
+            }
+            if constexpr (Boundary != ScoreBoundary::None) {
+                // In a single Q head the inclusive window shifts one column per row.
+                const int32_t edge = firstBoundary + static_cast<int32_t>(i);
+                uint32_t first = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
+                uint32_t second = first > FLOAT_REP_SIZE ? first - FLOAT_REP_SIZE : 0U;
+                auto prefix0 = UpdateMask<float>(first);
+                auto prefix1 = UpdateMask<float>(second);
+                if constexpr (Boundary == ScoreBoundary::Lower) {
+                    Select(srcVreg, minVreg, srcVreg, prefix0);
+                    Select(srcVreg_unroll, minVreg, srcVreg_unroll, prefix1);
+                } else {
+                    Select(srcVreg, srcVreg, minVreg, prefix0);
+                    Select(srcVreg_unroll, srcVreg_unroll, minVreg, prefix1);
+                }
             }
             Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
             StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg, pregFull);

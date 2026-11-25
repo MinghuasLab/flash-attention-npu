@@ -118,8 +118,10 @@ public:
 private:
     friend class KvDequantBuffered;
     friend class KvDequantWhole;
+    friend class PairedDecodeKv;
     // Keep conversion and FP32 scaling in registers. Pair independent fragments
     // and deinterleave the even BF16 lanes before NZ stores.
+    template<uint32_t SrcStride = HEAD_DIM>
     __simd_vf__ static inline void DequantNz(__ubuf__ bfloat16_t* dst, __ubuf__ float8_e4m3_t* src,
                                             __ubuf__ float* scales, uint32_t validRows, uint32_t scaleStride, uint32_t nzRows = NZ_ROWS)
     {
@@ -149,11 +151,11 @@ private:
             LoadAlign<float, LoadDist::DIST_BRC_B32>(scale, scales + row * scaleStride);
             LoadAlign<float, LoadDist::DIST_BRC_B32>(scale_r1, scales + (row + 1U) * scaleStride);
             LoadAlign<uint8_t, LoadDist::DIST_UNPACK_B16>((RegTensor<uint8_t>&)fp8a,
-                (__ubuf__ uint8_t*)(src + row * HEAD_DIM));
+                (__ubuf__ uint8_t*)(src + row * SrcStride));
             LoadAlign<uint8_t, LoadDist::DIST_UNPACK_B16>((RegTensor<uint8_t>&)fp8a_r1,
-                (__ubuf__ uint8_t*)(src + (row + 1U) * HEAD_DIM));
-            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c, src + row * HEAD_DIM + 128U);
-            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c_r1, src + (row + 1U) * HEAD_DIM + 128U);
+                (__ubuf__ uint8_t*)(src + (row + 1U) * SrcStride));
+            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c, src + row * SrcStride + 128U);
+            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c_r1, src + (row + 1U) * SrcStride + 128U);
             Cast<float, float8_e4m3_t, toFloat>(fa, fp8a, full32);
             Cast<float, float8_e4m3_t, toFloat>(fa_r1, fp8a_r1, full32);
             Cast<float, float8_e4m3_t, toFloatOdd>(fb, fp8a, full32);
@@ -191,8 +193,8 @@ private:
         for (; row < activeRows; ++row) {
             LoadAlign<float, LoadDist::DIST_BRC_B32>(scale, scales + row * scaleStride);
             LoadAlign<uint8_t, LoadDist::DIST_UNPACK_B16>((RegTensor<uint8_t>&)fp8a,
-                (__ubuf__ uint8_t*)(src + row * HEAD_DIM));
-            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c, src + row * HEAD_DIM + 128U);
+                (__ubuf__ uint8_t*)(src + row * SrcStride));
+            LoadAlign<float8_e4m3_t, LoadDist::DIST_UNPACK4_B8>(fp8c, src + row * SrcStride + 128U);
             Cast<float, float8_e4m3_t, toFloat>(fa, fp8a, full32);
             Cast<float, float8_e4m3_t, toFloatOdd>(fb, fp8a, full32);
             Cast<float, float8_e4m3_t, toFloat>(fc, fp8c, full32);

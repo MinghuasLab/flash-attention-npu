@@ -1,13 +1,17 @@
 // Copyright (c) 2026, Minghua Shen.
 
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <queue>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 #include "tilingdata.h"
 #include "fwd_resource_plan.h"
@@ -25,6 +29,41 @@ const uint32_t PRELANCH_NUM = 3;
 const uint64_t ASCEND950_L1_SIZE = 512ULL * 1024ULL;
 const uint64_t RESCALE_OTMP_STAGE_SIZE = 32ULL * 1024ULL;
 const uint64_t FD_WORKSPACE_ALIGNMENT = 512ULL;
+
+// The automatic plan has one partial per KV head served by each of 32 core groups.
+// Each partial holds two aligned LSE vectors and 16 FP32 output rows.
+static constexpr size_t kPairedPlanOffset = (sizeof(FAInferTilingData) + 63U) / 64U * 64U;
+static constexpr uint32_t kPairedDecodePartials = 2U * MAX_FD_ACTIVE_CORE_NUM;
+static constexpr uint32_t kPairedDecodeOOffset = kPairedDecodePartials * 2U * 8U * sizeof(float);
+static constexpr uint32_t kPairedDecodeWorkspace = kPairedDecodeOOffset +
+    kPairedDecodePartials * 16U * 192U * sizeof(float);
+
+static bool CanPairDecode(const FAInferTilingData& t, int32_t activeKv)
+{
+    if (activeKv < 4096 || !t.flashDecodeFlag || t.batch != 1U || t.maxQSeqlen != 1U ||
+        (t.kvHeads != 2U && t.kvHeads != 4U) || t.numHeads != 16U * t.kvHeads ||
+        t.fdActiveCoreNum != MAX_FD_ACTIVE_CORE_NUM || t.fdBaseTaskNum != t.kvHeads ||
+        t.fdCombineTaskNum != t.kvHeads || t.fdRowCapacity != 16U || t.fdLseSubStride != 8U) {
+        return false;
+    }
+    for (uint32_t h = 0; h < t.kvHeads; ++h) {
+        if (t.fdCombineSchedules[h].baseTask != static_cast<int32_t>(h)) { return false; }
+    }
+    return true;
+}
+
+static void SetPairedDecodeRanges(FAInferTilingData& t)
+{
+    t.qL1BufNum = 2U;
+    const uint32_t splits = kPairedDecodePartials / t.kvHeads;
+    for (uint32_t h = 0; h < t.kvHeads; ++h) {
+        t.fdCombineSchedules[h].partialStart = h * splits;
+        t.fdCombineSchedules[h].partialCount = splits;
+    }
+    t.fdPartialTaskNum = t.fdPartialCapacity = kPairedDecodePartials;
+    t.fdPartialOOffset = kPairedDecodeOOffset;
+    t.workSpaceSize = t.fdWorkspaceEnd = kPairedDecodeWorkspace;
+}
 
 enum class MaskType : uint32_t {
     NO_MASK = 0,
@@ -357,6 +396,305 @@ void FillFdCombineCoreSchedules(FAInferTilingData& tiling)
         }
     }
 }
+// Order by load, then by core ID to preserve the first-minimum tie break.
+class LeastLoadedCore {
+    using Entry = std::pair<uint64_t, uint32_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue_;
+public:
+    explicit LeastLoadedCore(uint32_t cores)
+    {
+        for (uint32_t core = 0; core < cores; ++core) {
+            queue_.emplace(0U, core);
+        }
+    }
+
+    Entry Assign(uint64_t work)
+    {
+        auto entry = queue_.top();
+        queue_.pop();
+        entry.first += work;
+        queue_.push(entry);
+        return entry;
+    }
+};
+
+bool ScheduleLongestChunksFirst(const std::vector<uint64_t>& prefix, uint32_t cores, uint64_t previousMax,
+                                FAInferTilingData& tiling)
+{
+    const size_t tasks = prefix.size() - 1U;
+    uint32_t shift = 0U;
+    while (((tasks - 1U) >> shift) >= FD_CHUNK_CAPACITY) {
+        ++shift;
+    }
+    const size_t chunkSize = size_t{1} << shift;
+    const size_t chunks = 1U + ((tasks - 1U) >> shift);
+    std::vector<uint16_t> order(chunks);
+    std::vector<uint64_t> costs(chunks);
+    for (size_t i = 0; i < chunks; ++i) {
+        order[i] = static_cast<uint16_t>(i);
+        costs[i] = prefix[std::min(tasks, (i + 1U) * chunkSize)] - prefix[i * chunkSize];
+    }
+    std::stable_sort(order.begin(), order.end(), [&](uint16_t a, uint16_t b) { return costs[a] > costs[b]; });
+    LeastLoadedCore loads(cores);
+    std::vector<uint16_t> owners(chunks);
+    std::array<uint32_t, MAX_FD_ACTIVE_CORE_NUM> slots{};
+    for (uint16_t chunk : order) {
+        const auto [load, core] = loads.Assign(costs[chunk]);
+        if (load >= previousMax) {
+            return false;
+        }
+        owners[chunk] = static_cast<uint16_t>(core);
+        ++slots[core];
+    }
+
+    tiling.flashDecodeFlag = FD_WHOLE_TASK_INDEXED;
+    tiling.fdWholeTaskOrder.chunkShift = shift;
+    uint32_t begin = 0U;
+    for (uint32_t core = 0; core < cores; ++core) {
+        const uint32_t end = begin + slots[core];
+        tiling.fdDecodeSchedules[core] = {static_cast<int32_t>(begin), static_cast<int32_t>(end), 0, 0};
+        slots[core] = begin;
+        begin = end;
+    }
+    // Packed Q offsets advance forward. Visit original chunk IDs in order so
+    // each core's queue is already sorted when written to metadata.
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        tiling.fdWholeTaskOrder.chunkIds[slots[owners[chunk]]++] = static_cast<uint16_t>(chunk);
+    }
+    return true;
+}
+
+// For a full batch wave, move complete tasks between cores. Cutting a task at a
+// global tile offset changes its softmax reductions when requests are permuted.
+bool ScheduleWholeDecodeTasks(const std::vector<FdBaseTaskHost>& bases, uint32_t cores, FAInferTilingData& tiling)
+{
+    if (cores < 2U || bases.size() < cores) {
+        return false;
+    }
+    std::vector<uint64_t> prefix{0U};
+    prefix.reserve(bases.size() + 1U);
+    std::vector<uint64_t> roundRobin(cores);
+    bool uniform = true;
+    for (size_t i = 0; i < bases.size(); ++i) {
+        const uint64_t cost = static_cast<uint64_t>(bases[i].rowNum) * std::max(1U, bases[i].kvTiles);
+        prefix.push_back(prefix.back() + cost);
+        roundRobin[i % cores] += cost;
+        uniform &= cost == prefix[1];
+    }
+    const uint64_t longest = *std::max_element(roundRobin.begin(), roundRobin.end());
+    const uint64_t lowerBound = (prefix.back() + cores - 1U) / cores;
+    if (uniform || longest <= lowerBound) {
+        return false;
+    }
+
+    uint32_t begin = 0U;
+    uint64_t maxCost = 0U;
+    for (uint32_t core = 0; core < cores; ++core) {
+        const uint32_t last = static_cast<uint32_t>(bases.size()) - (cores - core - 1U);
+        const uint64_t target = prefix.back() * (core + 1U) / cores;
+        auto cut = std::lower_bound(prefix.begin() + begin + 1U, prefix.begin() + last, target);
+        uint32_t end = static_cast<uint32_t>(cut - prefix.begin());
+        if (end > begin + 1U && prefix[end] >= target && target - prefix[end - 1U] < prefix[end] - target) {
+            --end;
+        }
+        maxCost = std::max(maxCost, prefix[end] - prefix[begin]);
+        tiling.fdDecodeSchedules[core] = {static_cast<int32_t>(begin), static_cast<int32_t>(end),
+                                          0, static_cast<int32_t>(bases[end - 1U].kvTiles)};
+        begin = end;
+    }
+    const uint64_t best = std::min(maxCost, longest);
+    if (best > lowerBound && ScheduleLongestChunksFirst(prefix, cores, best, tiling)) {
+        return true;
+    }
+    return maxCost < longest;
+}
+
+// Identical request-local geometry gets the same split count. Reserve a physical
+// core for each segment so adjacent segments cannot coalesce differently after a permutation.
+void AssignBatchSplits(const std::vector<FdBaseTaskHost>& bases, uint32_t cores,
+                       uint32_t requested, std::vector<uint32_t>& counts)
+{
+    struct Group {
+        uint32_t first;
+        std::vector<uint32_t> tasks;
+    };
+    const auto geometry = [&](uint32_t i) {
+        const auto& b = bases[i];
+        return std::tie(b.kvTiles, b.rowNum, b.qRows, b.qStart, b.qHeadStart);
+    };
+    std::vector<Group> groups;
+    for (uint32_t i = 0; i < bases.size(); ++i) {
+        auto group = std::find_if(groups.begin(), groups.end(),
+                                  [&](const Group& g) { return geometry(g.first) == geometry(i); });
+        if (group == groups.end()) {
+            groups.push_back({i, {i}});
+        } else {
+            group->tasks.push_back(i);
+        }
+    }
+    uint32_t remaining = cores - static_cast<uint32_t>(bases.size());
+    while (remaining > 0U) {
+        const Group* best = nullptr;
+        uint64_t bestCost = 0U;
+        for (const auto& group : groups) {
+            const uint32_t i = group.first;
+            if (group.tasks.size() > remaining || counts[i] >= bases[i].kvTiles ||
+                (requested != 0U && counts[i] >= requested)) {
+                continue;
+            }
+            const uint64_t cost = static_cast<uint64_t>(bases[i].rowNum) * bases[i].kvTiles / counts[i];
+            if (!best || cost > bestCost || (cost == bestCost && geometry(i) > geometry(best->first))) {
+                best = &group;
+                bestCost = cost;
+            }
+        }
+        if (!best) {
+            break;
+        }
+        for (uint32_t i : best->tasks) {
+            ++counts[i];
+        }
+        remaining -= static_cast<uint32_t>(best->tasks.size());
+    }
+}
+
+// Compare canonical split counts on a permutation-independent set of KV spans.
+uint64_t PeakSegmentTiles(std::vector<uint32_t>& spans, uint32_t cores)
+{
+    std::sort(spans.begin(), spans.end(), std::greater<uint32_t>());
+    LeastLoadedCore loads(cores);
+    uint64_t peak = 0U;
+    for (uint32_t span : spans) {
+        peak = std::max(peak, loads.Assign(span).first);
+    }
+    return peak;
+}
+
+bool ScheduleSplitGrid(const FAInferContext& ctx, const std::vector<FdBaseTaskHost>& bases,
+                       uint32_t cores, FAInferTilingData& t)
+{
+    const size_t n = bases.size();
+    if (!ctx.mixedKvStorage || ctx.batch < 2 || ctx.numSplits || ctx.maxQSeqlen != 8 ||
+        ctx.embeddingSize != 192 || ctx.embeddingSizeV != 192 || ctx.softcapValue != 0 ||
+        cores < 2U || n <= cores / 2U || n != static_cast<size_t>(ctx.batch) * ctx.kvHeads ||
+        ctx.numHeads != 16 * ctx.kvHeads || n > UINT32_MAX / 8U) {
+        return false;
+    }
+    uint32_t minTiles = UINT32_MAX, maxTiles = 0U;
+    uint64_t total = 0U;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& task = bases[i];
+        if (task.qRows != 8U || task.rowNum != 128U || task.qStart != 0U ||
+            task.batchIdx != i / ctx.kvHeads || task.qHeadStart != (i % ctx.kvHeads) * 16U) {
+            return false;
+        }
+        minTiles = std::min(minTiles, task.kvTiles);
+        maxTiles = std::max(maxTiles, task.kvTiles);
+        total += task.kvTiles;
+    }
+    const bool uniform = minTiles == maxTiles;
+    if (minTiles < 2U || (!uniform && n * 2U > FD_CHUNK_CAPACITY) || (uniform && n % cores == 0U)) {
+        return false;
+    }
+    // At M=128,D=192, the measured cost of writing, rereading and merging
+    // six FP32 partial output tiles is roughly one KV tile on the busiest core.
+    constexpr uint64_t partialsPerTile = 6U;
+    constexpr uint64_t setupTiles = 4U;
+    std::vector<uint32_t> spans;
+    uint64_t best = 0U;
+    if (n < cores) {
+        std::vector<uint32_t> baseline(n, 1U);
+        AssignBatchSplits(bases, cores, 0U, baseline);
+        // There is at most one baseline segment per core.
+        uint32_t peak = 0U;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t parts = baseline[i];
+            peak = std::max(peak, 1U + (bases[i].kvTiles - 1U) / parts);
+            best += parts > 1U ? parts : 0U;
+        }
+        best += partialsPerTile * peak;
+    } else if (uniform) {
+        best = partialsPerTile * ((n + cores - 1U) / cores) * maxTiles;
+    } else {
+        spans.reserve(n);
+        for (const auto& base : bases) {
+            spans.push_back(base.kvTiles);
+        }
+        best = partialsPerTile * PeakSegmentTiles(spans, cores);
+    }
+    const uint64_t ideal = (total + cores - 1U) / cores;
+    uint32_t choice = 0U;
+    for (uint32_t r = 2U; r <= std::min(8U, minTiles); ++r) {
+        const uint64_t overhead = n * r + setupTiles * partialsPerTile;
+        if (partialsPerTile * ideal + overhead >= best || (!uniform && n * r > FD_CHUNK_CAPACITY)) {
+            break;
+        }
+        uint64_t peak;
+        if (uniform) {
+            // Every request repeats the same r segment lengths.
+            std::array<uint32_t, 8> widths{};
+            for (uint32_t j = 0; j < r; ++j) {
+                widths[j] = uint64_t(maxTiles) * (j + 1U) / r - uint64_t(maxTiles) * j / r;
+            }
+            std::array<uint64_t, MAX_FD_ACTIVE_CORE_NUM> loads{};
+            uint32_t core = 0U;
+            for (size_t i = 0; i < n; ++i) {
+                for (uint32_t j = 0; j < r; ++j) {
+                    loads[core] += widths[j];
+                    if (++core == cores) {
+                        core = 0U;
+                    }
+                }
+            }
+            peak = *std::max_element(loads.begin(), loads.begin() + cores);
+        } else {
+            spans.clear();
+            spans.reserve(n * r);
+            for (const auto& base : bases) {
+                // Only the multiset matters for longest-first prediction.
+                const uint32_t small = base.kvTiles / r;
+                const uint32_t extra = base.kvTiles % r;
+                spans.insert(spans.end(), r - extra, small);
+                spans.insert(spans.end(), extra, small + 1U);
+            }
+            peak = PeakSegmentTiles(spans, cores);
+        }
+        const uint64_t score = partialsPerTile * peak + overhead;
+        if (score < best) {
+            best = score;
+            choice = r;
+        }
+    }
+    if (choice == 0U) {
+        return false;
+    }
+    if (!uniform) {
+        std::vector<uint64_t> prefix{0U}, loads(cores);
+        for (const auto& base : bases) {
+            for (uint32_t j = 0; j < choice; ++j) {
+                const uint64_t tiles = uint64_t(base.kvTiles) * (j + 1U) / choice - uint64_t(base.kvTiles) * j / choice;
+                loads[(prefix.size() - 1U) % cores] += tiles;
+                prefix.push_back(prefix.back() + tiles);
+            }
+        }
+        ScheduleLongestChunksFirst(prefix, cores, *std::max_element(loads.begin(), loads.end()), t);
+    }
+    t.flashDecodeFlag = FD_UNIFORM_SPLIT_GRID;
+    t.fdActiveCoreNum = cores;
+    t.fdCombineTaskNum = static_cast<uint32_t>(n);
+    t.fdPartialCapacity = t.fdPartialTaskNum = t.fdCombineTaskNum * choice;
+    t.fdRowCapacity = 128U;
+    t.fdLseSubStride = t.fdRowCapacity / 2U;
+    t.fdCombineRowNum = t.fdRowCapacity * t.fdCombineTaskNum;
+    t.fdCombineUseUniform = FD_COMBINE_UNIFORM_NO_LSE | FD_COMBINE_UNIFORM_WITH_LSE;
+    t.fdPartialLseOffset = 0U;
+    t.fdPartialOOffset = AlignUpU64(uint64_t(t.fdPartialTaskNum) * 2U * t.fdLseSubStride * sizeof(float),
+                                    FD_WORKSPACE_ALIGNMENT);
+    t.workSpaceSize = t.fdWorkspaceEnd = t.fdPartialOOffset +
+        uint64_t(t.fdPartialTaskNum) * t.fdRowCapacity * ctx.embeddingSizeV * sizeof(float);
+    return true;
+}
+
 // For decode tasks with the same number of query rows, a KV tile is
 // the scheduling unit. Compare the normal round-robin critical path
 // with an even partition of all KV tiles, including unequal contexts.
@@ -449,19 +787,37 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
     }
 
     tiling.fdBaseTaskNum = static_cast<uint32_t>(bases.size());
+    if (ScheduleSplitGrid(faInfo_, bases, cfdMax, tiling)) {
+        return;
+    }
+    const bool mixedBatch = faInfo_.mixedKvStorage && faInfo_.batch > 1;
+    if (mixedBatch && cfdMax > 0U &&
+        (static_cast<uint32_t>(faInfo_.batch) >= cfdMax || bases.size() >= cfdMax)) {
+        if (!ScheduleWholeDecodeTasks(bases, cfdMax, tiling)) {
+            tiling.flashDecodeFlag = 0U;
+            return;
+        }
+        tiling.fdActiveCoreNum = cfdMax;
+        tiling.fdPartialCapacity = 0U;
+        tiling.fdCombineTaskNum = 0U;
+        tiling.workSpaceSize = 0U;
+        return;
+    }
     uint32_t activeCores = cfdMax;
-    if (bases.size() > bfdMax && ScheduleKvTail(faInfo_, bases, cfdMax, tiling)) {
+    if (!mixedBatch && bases.size() > bfdMax && ScheduleKvTail(faInfo_, bases, cfdMax, tiling)) {
         // At most cores-1 boundaries split a base. Each base needs one
         // partial per interior boundary plus one for its first core.
         tiling.fdPartialCapacity = 2U * (cfdMax - 1U);
     } else {
-        if (bases.empty() || bases.size() > bfdMax || cfdMax < 2U) {
+        if (bases.empty() || (!mixedBatch && bases.size() > bfdMax) || cfdMax < 2U) {
             tiling.flashDecodeFlag = 0U;
             return;
         }
 
         std::vector<uint32_t> splitCounts(bases.size(), 1U);
-        if (faInfo_.numSplits > 1U) {
+        if (mixedBatch) {
+            AssignBatchSplits(bases, cfdMax, faInfo_.numSplits, splitCounts);
+        } else if (faInfo_.numSplits > 1U) {
             for (uint32_t base = 0; base < bases.size(); ++base) {
                 // Empty KV still needs a task to initialize O and LSE.
                 splitCounts[base] = std::max(1U, std::min(faInfo_.numSplits, bases[base].kvTiles));
@@ -655,6 +1011,12 @@ BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)
 void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
 {
     uint64_t fullQ128Tasks = 0;
+    uint64_t windowTasks = 0;
+    const bool countWindowTasks = faInfo_.mixedKvStorage && faInfo_.pagedCacheFlag && !faInfo_.isTilingSink &&
+        !faInfo_.flashDecodeFlag && faInfo_.maskType == MaskType::MASK_BAND &&
+        faInfo_.windowSizeLeft == 511 && faInfo_.windowSizeRight == 0 && faInfo_.softcapValue == 0.0f &&
+        faInfo_.embeddingSize == 192 && faInfo_.embeddingSizeV == 192 && faInfo_.numHeads == 16 * faInfo_.kvHeads &&
+        faInfo_.maxQSeqlen >= Q_TILE_CEIL && uint64_t(faInfo_.batch) * faInfo_.numHeads <= 2ULL * blockNum_;
     bool fullQueryTileInEachBatch = true;
     for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
         const uint32_t qLen =
@@ -669,15 +1031,22 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                           : faInfo_.kvSeqlenList[b]);
         const uint32_t activeQ =
             fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
+        if (countWindowTasks) {
+            windowTasks += ((uint64_t(qLen) + Q_TILE_CEIL - 1U) / Q_TILE_CEIL) * faInfo_.numHeads;
+        }
         fullQueryTileInEachBatch &= qLen >= Q_TILE_CEIL;
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
                                              fullQ128Tasks, blockNum_, faInfo_.maskType == MaskType::MASK_BAND,
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
+    // A ragged last Q tile still occupies a processing slot. At exactly one
+    // wave use individual heads; above it a pair can avoid an entire second wave.
+    const bool oneWindowWave = fullQueryTileInEachBatch && windowTasks >= blockNum_ &&
+                               windowTasks <= 2ULL * blockNum_ && windowTasks != 0U;
     const bool hasPairedWave = faInfo_.mixedKvStorage && fullQueryTileInEachBatch &&
                                (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
-                               fullQ128Tasks >= 2ULL * blockNum_;
+                               (fullQ128Tasks >= 2ULL * blockNum_ || (oneWindowWave && windowTasks > blockNum_));
     const bool pairedWindow = faInfo_.maskType == MaskType::MASK_BAND &&
                               faInfo_.windowSizeRight == 0 && faInfo_.windowSizeLeft >= 0 &&
                               (faInfo_.softcapValue == 0.0f || faInfo_.windowSizeLeft >= 511);
@@ -686,7 +1055,7 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                             faInfo_.embeddingSize == 192 && faInfo_.embeddingSizeV == 192;
     // Each KV page serves both Q heads. Once every Cube can run a pair,
     // this reuse also pays off for narrow windows in the pipelined PV kernel.
-    if (hasPairedWave && (pairedWindow || pairedFull)) {
+    if (oneWindowWave || (hasPairedWave && (pairedWindow || pairedFull))) {
         qBaseTile_ = fa950_plan::QueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen);
     }
     // Full MTP amortizes KV conversion across all 16 GQA heads. For low-occupancy

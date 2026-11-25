@@ -51,6 +51,8 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
     (1, 2048, 4, 1, 0, True, (511, 0)),       # Exact page boundaries.
     (8, 2049, 2, 1, 0, True, (511, 0)),       # Both ends fall inside a page.
     (8, 1027, 1, 2, 1, False, (17, 3)),       # Both masks on the same page.
+    (193, 1025, 1, 1, 0, True, (511, 0)),      # One wave of individual Q128 heads, including a partial Q tile.
+    (383, 1027, 1, 1, 0, True, (511, 0)),      # One paired wave, both SWA edges and a short final KV page.
     (257, 515, 2, 1, 0, True, (63, 0)),        # One wave of paired heads, narrow window and unaligned pages.
     (513, 899, 4, 1, 1, True, (511, 0)),      # Paired heads, partial Q and KV tiles.
     (512, 769, 4, 1, 1, False, (287, 257)),   # Finite noncausal window.
@@ -240,3 +242,211 @@ def test_mixed_kv_head_major_pages(sq):
     out, lse, *_ = flash_attn_with_kvcache(query, head_major(k, 2), head_major(v, 3), **kwargs)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch,sq,kv_heads,window,packed", [
+    (1, 1, 1, (511, 0), True),
+    (1, 8, 2, (511, 0), False),
+    (1, 128, 4, (511, 0), True),
+    (1, 1, 1, (-1, -1), True),
+    (2, 1, 1, (-1, -1), True),
+])
+def test_mixed_kv_graph_cross_page(batch, sq, kv_heads, window, packed):
+    from flash_attn_npu_3 import copy_scheduler_metadata_, get_scheduler_metadata
+
+    torch.set_num_threads(4)
+    q, k, v, ks, vs, table = [x.npu() for x in make_case(sq, 2049, kv_heads, batch)]
+    cu = None
+    if packed:
+        q = q.flatten(0, 1)
+        cu = torch.arange(batch + 1, device="npu", dtype=torch.int32) * sq
+    lengths = torch.full((batch,), 2047, device="npu", dtype=torch.int32)
+
+    def prepare(out=None):
+        return get_scheduler_metadata(
+            batch, sq, 2176, kv_heads * 16, kv_heads, 192, lengths, cu_seqlens_q=cu,
+            page_size=128, causal=True, window_size=window, kv_dtype=torch.float8_e4m3fn, out=out,
+        )
+
+    def forward(md=None):
+        return flash_attn_with_kvcache(
+            q, k, v, cache_seqlens=lengths, k_descale=ks, v_descale=vs, scheduler_metadata=md,
+            page_table=table, cu_seqlens_q=cu, max_seqlen_q=sq, causal=True,
+            window_size=window, return_softmax_lse=True,
+        )[:2]
+
+    def capture(md):
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            outputs = forward(md)
+        return graph, outputs
+
+    def check(graph, outputs):
+        graph.replay()
+        reference = forward()
+        for actual, expected in zip(outputs, reference):
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+
+    md = prepare()
+    graph, outputs = capture(md)
+    check(graph, outputs)
+    lengths.fill_(2049)
+    if window == (-1, -1) and batch == 1:
+        with pytest.raises(ValueError, match="launch parameters changed"):
+            prepare(out=md)
+        new_md = prepare()
+        with pytest.raises(ValueError, match="launch parameters changed"):
+            copy_scheduler_metadata_(md, new_md)
+        new_graph, new_outputs = capture(new_md)
+        check(new_graph, new_outputs)
+    else:
+        if window == (-1, -1):
+            prepared = prepare()
+            assert copy_scheduler_metadata_(md, prepared) is md
+            with pytest.raises(ValueError, match="same device and configuration"):
+                copy_scheduler_metadata_(md, prepared.clone())
+        check(graph, outputs)
+    lengths.fill_(2047)
+    if window == (-1, -1) and batch == 2:
+        assert prepare(out=md) is md
+    check(graph, outputs)
+
+
+@pytest.mark.parametrize("splits", [0, 4])
+def test_mixed_kv_graph_packed_empty_request(splits):
+    from flash_attn_npu_3 import get_scheduler_metadata
+
+    q, k, v, ks, vs, table = [x.npu() for x in make_case(1, 2049, 1, 2)]
+    q = q[:1, 0].contiguous()
+    cu = torch.tensor([0, 0, 1], device="npu", dtype=torch.int32)
+    lengths = torch.tensor([0, 2049], device="npu", dtype=torch.int32)
+    md = get_scheduler_metadata(2, 1, 2176, 16, 1, 192, lengths, cu_seqlens_q=cu,
+                                page_size=128, kv_dtype=torch.float8_e4m3fn, num_splits=splits, causal=True)
+    kwargs = dict(cache_seqlens=lengths, cu_seqlens_q=cu, max_seqlen_q=1, page_table=table, causal=True,
+                  k_descale=ks, v_descale=vs, num_splits=splits, return_softmax_lse=True)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        outputs = flash_attn_with_kvcache(q, k, v, scheduler_metadata=md, **kwargs)[:2]
+    graph.replay()
+    reference = flash_attn_with_kvcache(q, k, v, **kwargs)[:2]
+    for actual, expected in zip(outputs, reference):
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("kv_heads,threshold", [(4, 16384), (2, 24576)])
+@pytest.mark.parametrize("head_major", [False, True])
+def test_mixed_kv_decode_graph_page_transition(kv_heads, threshold, head_major):
+    """One prepared plan supports BBND and strided pages, including live length growth."""
+    from flash_attn_npu_3 import copy_scheduler_metadata_, get_scheduler_metadata
+
+    q, k, v, ks, vs, table = make_case(1, threshold + 1, kv_heads)
+    # Give the new page appreciable weight even in a long context.
+    vs[table[0, -1].item(), 0] *= 1024
+
+    def cache(x):
+        if head_major:
+            return x.transpose(1, 2).contiguous().npu().transpose(1, 2)
+        return x.npu()
+
+    q, k, v = q[0].npu(), cache(k), cache(v)
+    lengths = torch.tensor([threshold - 1], device="npu", dtype=torch.int32)
+    cu = torch.tensor([0, 1], device="npu", dtype=torch.int32)
+    options = dict(cache_seqlens=lengths, cu_seqlens_q=cu, max_seqlen_q=1, page_table=table.npu(),
+                   k_descale=ks.npu(), v_descale=vs.npu(), causal=True, return_softmax_lse=True)
+
+    def plan():
+        return get_scheduler_metadata(1, 1, table.shape[1] * 128, 16 * kv_heads, kv_heads, 192, lengths,
+                                      cu_seqlens_q=cu, page_size=128, causal=True, kv_dtype=torch.float8_e4m3fn)
+
+    metadata = plan()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        out, lse, *_ = flash_attn_with_kvcache(q, k, v, scheduler_metadata=metadata, **options)
+    for sk in (threshold - 1, threshold + 1, threshold - 1):
+        lengths.fill_(sk)
+        copy_scheduler_metadata_(metadata, plan())
+        graph.replay()
+        ref, ref_lse, *_ = flash_attn_with_kvcache(q, k, v, **options)
+        torch.testing.assert_close(out.cpu(), ref.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(lse.cpu(), ref_lse.cpu(), atol=0, rtol=0)
+        if sk == threshold + 1:
+            assert not torch.equal(ref.cpu(), first)
+        else:
+            first = ref.cpu()
+
+
+def test_mixed_decode_graph_dispatch_change_preserves_plan():
+    from flash_attn_npu_3 import copy_scheduler_metadata_, get_scheduler_metadata
+
+    cu = torch.tensor([0, 1], device="npu", dtype=torch.int32)
+    lengths = torch.tensor([4095], device="npu", dtype=torch.int32)
+
+    def prepare():
+        return get_scheduler_metadata(1, 1, 4224, 64, 4, 192, lengths, cu_seqlens_q=cu,
+                                      page_size=128, causal=True, kv_dtype=torch.float8_e4m3fn)
+
+    short = prepare()
+    lengths.fill_(4097)
+    paired = prepare()
+    for dst, src in ((short, paired), (paired, short)):
+        before = dst.clone()
+        with pytest.raises(ValueError, match="launch parameters changed"):
+            copy_scheduler_metadata_(dst, src)
+        assert torch.equal(dst, before)
+
+
+@pytest.mark.parametrize("batch,sq,ragged_kv,ragged_q,window,splits", [
+    (150, 8, False, False, (-1, -1), 0), (150, 8, True, False, (-1, -1), 0),
+    (150, 8, True, True, (-1, -1), 0), (150, 8, True, True, (511, 0), 0),
+    (513, 1, True, False, (-1, -1), 0),  # Multi-task chunks, including a short final chunk.
+    (19, 8, False, False, (-1, -1), 0), (19, 8, True, False, (-1, -1), 0),
+    (34, 8, False, False, (-1, -1), 0),  # Multiple waves of numerical KV splits.
+    (16, 8, True, False, (-1, -1), 0),
+    (8, 8, True, False, (-1, -1), 8),  # More requested segments than cores.
+])
+def test_mixed_mtp_batch_permutation(batch, sq, ragged_kv, ragged_q, window, splits):
+    """Permuting complete requests must preserve every request's O and LSE bits."""
+    torch.set_num_threads(4)
+    sk = 16384
+    generator = torch.Generator().manual_seed(12137)
+    q = torch.randn(batch, sq, 16, 192, generator=generator).bfloat16()
+    # Distinct page tables over a shared physical KV pool also exercise scale lookup.
+    _, k, v, ks, vs, base_table = make_case(sq, sk, 1)
+    pages = torch.stack([base_table[0, torch.randperm(base_table.size(1), generator=generator)]
+                         for _ in range(batch)]).npu()
+    k, v, ks, vs = (x.npu() for x in (k, v, ks, vs))
+    lengths = torch.full((batch,), sk, dtype=torch.int32)
+    if ragged_kv:
+        lengths[::2] = 2049
+        lengths[1::5] = 8191
+    lengths = lengths.npu()
+    q_lengths = torch.arange(batch) % (sq + 1) if ragged_q else torch.full((batch,), sq)
+    offsets = [0, *q_lengths.cumsum(0).tolist()]
+    packed_q = torch.cat([request[:n] for request, n in zip(q, q_lengths.tolist())]).npu()
+
+    def evaluate(order, num_splits=splits):
+        indices = order.int().npu()
+        rows = torch.cat([torch.arange(offsets[i], offsets[i + 1]) for i in order.tolist()])
+        cu = torch.cat((torch.zeros(1, dtype=torch.int32), q_lengths[order].cumsum(0, dtype=torch.int32))).npu()
+        o, lse, *_ = flash_attn_with_kvcache(
+            packed_q.index_select(0, rows.int().npu()), k, v, k_descale=ks, v_descale=vs,
+            page_table=pages.index_select(0, indices), cache_seqlens=lengths.index_select(0, indices),
+            cu_seqlens_q=cu, max_seqlen_q=sq, causal=True, num_splits=num_splits, window_size=window, return_softmax_lse=True,
+        )
+        restore = rows.argsort()
+        return (o.cpu()[restore].contiguous().view(torch.int16),
+                lse.cpu()[:, restore].contiguous().view(torch.int32))
+
+    identity = torch.arange(batch)
+    reference = evaluate(identity)
+    if batch in (150, 513) and window == (-1, -1):
+        for actual, expected in zip(reference, evaluate(identity, num_splits=1)):
+            assert torch.equal(actual, expected)
+    for i in (1, 4, batch - 1):
+        rows = slice(offsets[i], offsets[i + 1])
+        _check_sequence(q[i, :q_lengths[i]], k.cpu(), v.cpu(), ks.cpu(), vs.cpu(), pages[i].cpu(),
+                        int(lengths[i]), True, reference[0][rows].view(torch.bfloat16).float(),
+                        reference[1][:, rows].view(torch.float32), window)
+    for order in (identity, identity.roll(1), torch.randperm(batch, generator=generator)):
+        for name, actual, expected in zip(("O", "LSE"), evaluate(order), reference):
+            assert torch.equal(actual, expected), f"{name}: {(actual != expected).sum().item()} changed elements"

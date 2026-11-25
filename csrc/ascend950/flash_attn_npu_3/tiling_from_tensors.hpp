@@ -79,8 +79,7 @@ inline std::vector<int32_t> cumulate_int32(const std::vector<int32_t>& per_batch
 }
 
 inline void
-fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, const at::Tensor& q, const at::Tensor& k,
-                       const at::Tensor& v,
+fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch,
                        const at::Tensor* cu_seqlens_q_cpu_int32, // nullable: !is_varlen_q
                        const at::Tensor* seqused_q_cpu_int32,    // nullable: *used* Q lengths, region cu when absent
                        const at::Tensor* seqused_k_cpu_int32,    // nullable: caller must pass per-batch seqlen

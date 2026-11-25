@@ -74,6 +74,7 @@ extern template void launch_mixed_swa_layout<Format::BSND>(const FwdLaunchArgs&)
 extern template void launch_mixed_swa_layout<Format::BNSD>(const FwdLaunchArgs&);
 
 void launch_single_query_window(const FwdLaunchArgs& a);
+void launch_paired_decode(const FwdLaunchArgs& a);
 
 // Runtime entry: kLayout is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated

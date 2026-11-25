@@ -198,18 +198,30 @@ class FlashDecodeCombine950 {
         const uint32_t totalQ = DenseQ ? tiling->maxQSeqlen : static_cast<uint32_t>(params.storage.totalQTokens);
         uint32_t workBase = 0U;
         for (uint32_t combineIdx = 0U; combineIdx < tiling->fdCombineTaskNum; ++combineIdx) {
-            const auto& info = tiling->fdCombineTaskInfo[combineIdx];
-            const uint32_t batchIdx = info.batchIdx;
-            const uint32_t qRows = info.qRows;
-            const uint32_t qStart = info.qStart;
-            const uint32_t qHeadStart = info.qHeadStart;
-            const uint32_t groupRows = info.rowNum;
+            uint32_t batchIdx, qRows, qStart, qHeadStart, groupRows, partialCount, firstPartial;
+            if (tiling->flashDecodeFlag == FD_UNIFORM_SPLIT_GRID) {
+                const uint32_t groupSize = tiling->numHeads / tiling->kvHeads;
+                batchIdx = combineIdx / tiling->kvHeads;
+                qRows = tiling->fdRowCapacity / groupSize;
+                qStart = 0U;
+                qHeadStart = (combineIdx % tiling->kvHeads) * groupSize;
+                groupRows = tiling->fdRowCapacity;
+                partialCount = tiling->fdPartialTaskNum / tiling->fdBaseTaskNum;
+                firstPartial = combineIdx * partialCount;
+            } else {
+                const auto& info = tiling->fdCombineTaskInfo[combineIdx];
+                batchIdx = info.batchIdx;
+                qRows = info.qRows;
+                qStart = info.qStart;
+                qHeadStart = info.qHeadStart;
+                groupRows = info.rowNum;
+                partialCount = tiling->fdCombineSchedules[combineIdx].partialCount;
+                firstPartial = tiling->fdCombineSchedules[combineIdx].partialStart;
+            }
             const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / subBlockNum);
             const uint32_t sub0Tiles = CeilDiv(sourceRowSplit, rowTile);
             const uint32_t tilesPerTask = sub0Tiles + CeilDiv(groupRows - sourceRowSplit, rowTile);
             const uint32_t qTokenBase = (DenseQ ? batchIdx * tiling->maxQSeqlen : static_cast<uint32_t>(actualQ.GetValue(batchIdx))) + qStart;
-            const uint32_t partialCount = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialCount);
-            const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
             const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
 
             // Round-robin row tiles across all AIVs, including both subblocks.

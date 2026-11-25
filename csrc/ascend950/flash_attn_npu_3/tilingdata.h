@@ -77,6 +77,18 @@ struct FdCombineCoreSchedule {
     uint32_t rowCount;
 };
 
+// Whole-task dispatch and partial-output combine never execute in the same plan.
+constexpr uint32_t FD_UNIFORM_SPLIT_GRID = 3U;
+constexpr uint32_t FD_WHOLE_TASK_INDEXED = 2U;
+constexpr uint32_t FD_CHUNK_CAPACITY =
+    (sizeof(FdCombineCoreSchedule) * MAX_FD_COMBINE_AIV_NUM - sizeof(uint32_t)) / sizeof(uint16_t);
+
+struct FdWholeTaskOrder {
+    uint32_t chunkShift;
+    uint16_t chunkIds[FD_CHUNK_CAPACITY];
+};
+static_assert(sizeof(FdWholeTaskOrder) == sizeof(FdCombineCoreSchedule) * MAX_FD_COMBINE_AIV_NUM);
+
 struct FAInferTilingData {
     uint32_t numHeads;
     uint32_t embeddingSize;
@@ -158,7 +170,10 @@ struct FAInferTilingData {
 
     // Append combine-only metadata to preserve all main-attention field offsets.
     FdCombineTaskInfo fdCombineTaskInfo[MAX_FD_COMBINE_TASK_NUM];
-    FdCombineCoreSchedule fdCombineCoreSchedules[MAX_FD_COMBINE_AIV_NUM];
+    union {
+        FdCombineCoreSchedule fdCombineCoreSchedules[MAX_FD_COMBINE_AIV_NUM];
+        FdWholeTaskOrder fdWholeTaskOrder;
+    };
 
     // Getter functions
     uint32_t get_numHeads() const

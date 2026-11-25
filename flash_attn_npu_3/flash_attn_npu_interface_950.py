@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch.utils import _python_dispatch
@@ -182,6 +182,7 @@ def _flash_attn_forward_impl(
     sm_margin: int,
     return_softmax_lse: bool,
     layout: int,
+    mixed_launch: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if cu_seqlens_q is not None:
         _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
@@ -239,6 +240,7 @@ def _flash_attn_forward_impl(
         sm_margin,
         return_softmax_lse,
         layout,
+        mixed_launch,
     )
 
     if out_accum is None:
@@ -313,6 +315,7 @@ def _flash_attn_forward_fake(
     sm_margin,
     return_softmax_lse,
     layout,
+    mixed_launch=None,
 ):
     is_varlen_q = cu_seqlens_q is not None
     if is_varlen_q:
@@ -545,6 +548,36 @@ def _get_scheduler_metadata_fake(
     )
 
 
+def _mixed_metadata_key(batch, max_q, heads, kv_heads, packed, causal, window, softcap, splits, capacity):
+    # A finite left window that spans the cache selects the full attention kernel.
+    left, right = window
+    if capacity > 0 and left >= capacity - 1:
+        left = -1
+    return (batch, max_q, heads, kv_heads, packed, causal, left, right, bool(softcap), splits)
+
+
+def _copy_mixed_tiling_(dst, src, launch):
+    if dst._mixed_launch != launch or dst.shape != src.shape:
+        raise ValueError("launch parameters changed; prepare new metadata and capture a matching graph")
+    if dst.dtype != src.dtype or not dst.is_contiguous() or not src.is_contiguous():
+        raise ValueError("mixed KV metadata buffers must have matching shape, dtype and contiguous storage")
+    return dst.copy_(src)
+
+
+def copy_scheduler_metadata_(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Install a prepared Ascend 950 mixed-KV plan in an existing graph's buffer.
+
+    Prepare src for the complete batch of sequence lengths that will be replayed.
+    Call on the replay stream after the previous use of dst. If src was prepared
+    on another stream, first wait for its preparation to complete. A change of
+    kernel, core count, or workspace requires a separately captured graph.
+    """
+    key = getattr(src, "_mixed_key", None)
+    if key is None or key != getattr(dst, "_mixed_key", None) or src.device != dst.device:
+        raise ValueError("source and destination must be mixed KV metadata for the same device and configuration")
+    return _copy_mixed_tiling_(dst, src, src._mixed_launch)
+
+
 def get_scheduler_metadata(
     batch_size,
     max_seqlen_q,
@@ -567,8 +600,11 @@ def get_scheduler_metadata(
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
+    *,
+    kv_dtype=None,
+    out=None,
 ):
-    """Precompute AICPU scheduler metadata (tiling + kvCum) on Ascend 950.
+    """Precompute scheduler metadata (tiling + kvCum) on Ascend 950.
 
     The signature matches the upstream flash-attention FA3
     ``get_scheduler_metadata`` and the 910 V3 implementation. The returned NPU
@@ -576,16 +612,20 @@ def get_scheduler_metadata(
     ``scheduler_metadata`` argument to avoid per-call host tiling and H2D/D2H
     copies.
 
-    The schedule is independent of ``has_softcap`` and of the numerical
-    ``softmax_scale`` / softcap value: those are supplied by each forward call
-    through its tiling, so a single metadata buffer can be reused across
-    different scale / softcap settings. Re-create it only when the shapes,
-    layout, causal / window flags or per-batch sequence lengths change.
+    For BF16 Q and FP8 KV, pass kv_dtype=torch.float8_e4m3fn. Prepare on
+    the capture thread, outside the graph. The mixed plan uses the eager host
+    tiler, including automatic FlashDecode and paired prefill. Scale values
+    are launch inputs; the presence of softcap affects the plan.
+
+    For FlashDecode, prepare for the new lengths before replay. Pass out=md
+    to update a plan in place on the replay stream. If its kernel, core count
+    or workspace requirement changes, this raises before overwriting md:
+    prepare a new plan without out and use a matching graph. If you already
+    have a plan for the new lengths, copy_scheduler_metadata_(md, plan)
+    updates the captured buffer directly on device. A SWA plan may
+    reuse live KV lengths while its query task schedule remains valid.
     """
     cache_seqlens = _maybe_contiguous(cache_seqlens)
-    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1] if cu_seqlens_q is not None else None
-    if seqlens_q is not None:
-        seqlens_q = _maybe_contiguous(seqlens_q)
     if headdim_v is None:
         headdim_v = headdim
     if qkv_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
@@ -599,6 +639,32 @@ def get_scheduler_metadata(
         raise ValueError("Ascend 950 does not support attention_chunk")
     if pack_gqa is not None and pack_gqa:
         raise ValueError("Ascend 950 does not support pack_gqa")
+    if kv_dtype is not None and kv_dtype != qkv_dtype:
+        if (qkv_dtype, kv_dtype) != (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("mixed KV requires BF16 Q and FP8 E4M3 KV")
+        if headdim != 192 or headdim_v != 192 or page_size != 128:
+            raise ValueError("mixed KV requires Dqk=Dv=192 and page_size=128")
+        capacity = (max_seqlen_k + page_size - 1) // page_size * page_size
+        key = _mixed_metadata_key(batch_size, max_seqlen_q, num_heads_q, num_heads_kv, cu_seqlens_q is not None,
+                                  causal, window_size, has_softcap, num_splits, capacity)
+        if out is not None and (out.device != cache_seqlens.device or
+                                getattr(out, "_mixed_key", None) != key):
+            raise ValueError("out must be mixed KV metadata for the same configuration")
+        host_plan, launch = flash_attn_npu_3_950.prepare_mixed_tiling(
+            cache_seqlens, cu_seqlens_q, batch_size, max_seqlen_q, capacity,
+            num_heads_q, num_heads_kv, causal, *window_size, has_softcap, num_splits,
+        )
+        if out is None:
+            md = host_plan.to(cache_seqlens.device)
+            md._mixed_key = key
+            md._mixed_launch = tuple(launch)
+            return md
+        return _copy_mixed_tiling_(out, host_plan, tuple(launch))
+    if out is not None:
+        raise ValueError("out is supported for mixed KV metadata only")
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1] if cu_seqlens_q is not None else None
+    if seqlens_q is not None:
+        seqlens_q = _maybe_contiguous(seqlens_q)
     scheduler_metadata = _get_scheduler_metadata_op(
         batch_size,
         max_seqlen_q,
@@ -1287,9 +1353,20 @@ def flash_attn_with_kvcache(
             has_softcap=softcap > 0.0,
             num_splits=num_splits,
         )
+    mixed_launch = None
+    if scheduler_metadata is not None and (mixed_kv or hasattr(scheduler_metadata, "_mixed_key")):
+        if not mixed_kv or page_table is None:
+            raise ValueError("mixed KV metadata requires a BF16 query and paged FP8 KV")
+        packed = cu_seqlens_q is not None
+        key = _mixed_metadata_key(page_table.shape[0], max_seqlen_q if packed else q.shape[1], q.shape[-2],
+                                  k_cache.shape[2], packed, causal, window_size, softcap > 0, num_splits,
+                                  page_table.shape[1] * k_cache.shape[1])
+        if getattr(scheduler_metadata, "_mixed_key", None) != key:
+            raise ValueError("provide mixed KV scheduler_metadata prepared for this configuration")
+        mixed_launch = list(scheduler_metadata._mixed_launch)
     forward = _flash_attn_forward
     if (
-        scheduler_metadata is not None
+        (scheduler_metadata is not None or mixed_kv)
         and q.dtype in (torch.float16, torch.bfloat16)
         and _can_use_eager_forward(
             (
@@ -1353,6 +1430,7 @@ def flash_attn_with_kvcache(
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
         layout=layout,
+        mixed_launch=mixed_launch,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 

@@ -13,6 +13,7 @@
 
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -40,6 +41,59 @@
 using flash_attn_npu_950_v3::fill_inference_context;
 using flash_attn_npu_950_v3::SeqlenScratch;
 
+static bool UseFlashDecode(int batch_size, int seqlen_q, const int32_t* q_cu_ptr, const int32_t* q_used_ptr,
+                           const int32_t* kv_len_ptr, bool mixedKv, bool is_local, bool paged_KV,
+                           FwdLayout layout_enum, int64_t num_splits)
+{
+    const bool is_varlen_q = q_cu_ptr != nullptr;
+    bool fd_q_lengths_supported = true;
+    int64_t max_active_kv_seqlen = 0;
+    int64_t max_q_seqlen = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        // *Used* Q length from seqused_q when provided; offsets stay on cu.
+        const int64_t q_len =
+            q_used_ptr != nullptr
+                ? static_cast<int64_t>(q_used_ptr[batch_idx])
+                : (is_varlen_q ? static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] : seqlen_q);
+        const int64_t kv_len = kv_len_ptr[batch_idx];
+        TORCH_CHECK(q_len >= 0 && kv_len >= 0, "950 backend (v3) requires non-negative Q and KV lengths");
+        if (q_used_ptr != nullptr) {
+            TORCH_CHECK(q_len <= static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx],
+                        "seqused_q must lie within the allocated sequence length");
+        }
+        // An empty packed sequence contributes no base tasks or output rows.
+        if (q_len > 0) {
+            max_active_kv_seqlen = std::max(max_active_kv_seqlen, kv_len);
+        } else if (!mixedKv || !is_varlen_q || q_used_ptr != nullptr) {
+            fd_q_lengths_supported = false;
+        }
+        max_q_seqlen = std::max(max_q_seqlen, q_len);
+    }
+    return num_splits != 1 &&
+        !is_local && paged_KV && (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
+        fd_q_lengths_supported && max_q_seqlen <= 16 && max_active_kv_seqlen >= 1024;
+}
+
+// These four values determine which kernel can replay a prepared plan and the
+// resources bound at capture. The device tiling also contains per-core ranges.
+static std::array<int64_t, 4> LaunchForTiling(const FAInferTilingData& tiling, uint32_t cores,
+                                             bool mixed, bool local, bool singleQueryCandidate)
+{
+    const bool paired = mixed && tiling.qL1BufNum == 2U;
+    const bool single = singleQueryCandidate && tiling.maxQSeqlen == 1 && tiling.qBaseTile <= 64U &&
+                        tiling.qL1BufNum == 1U;
+    if (tiling.flashDecodeFlag != 0U) {
+        // Whole tasks write final O/LSE directly, just like the regular launch.
+        const int64_t workspace = tiling.fdCombineTaskNum ? static_cast<int64_t>(tiling.workSpaceSize) : -1;
+        return {tiling.fdActiveCoreNum, workspace, paired, single};
+    }
+    if (mixed && local && tiling.totalTaskNum > 0U) {
+        const uint32_t tasks = (tiling.totalTaskNum - 1U) / (paired ? 2U : 1U) + 1U;
+        cores = std::min(cores, tasks);
+    }
+    return {cores, -1, paired, single};
+}
+
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_new_, std::optional<at::Tensor> v_new_,
         std::optional<at::Tensor> q_v_, std::optional<at::Tensor> out_, std::optional<at::Tensor> cu_seqlens_q_,
@@ -53,7 +107,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         std::optional<at::Tensor> v_descale_, std::optional<float> softmax_scale_, bool is_causal,
         int64_t window_size_left, int64_t window_size_right, int64_t attention_chunk, float softcap,
         bool is_rotary_interleaved, std::optional<at::Tensor> scheduler_metadata_, int64_t num_splits,
-        std::optional<bool> pack_gqa_, int64_t sm_margin, bool return_softmax_lse, int64_t layout)
+        std::optional<bool> pack_gqa_, int64_t sm_margin, bool return_softmax_lse, int64_t layout,
+        std::optional<std::array<int64_t, 4>> mixed_launch_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -93,7 +148,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
-    if (scheduler_metadata_.has_value()) {
+    if (scheduler_metadata_.has_value() && !mixedKv) {
         TORCH_CHECK(num_splits <= 1, "950 backend (v3) scheduler_metadata does not support "
                                      "explicit FlashDecode splits");
     }
@@ -268,12 +323,14 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     TORCH_CHECK(quantMode != 1 || (head_size_q == 128 && head_size_v == 128),
                 "950 V3 FP8 requires Q/K/V head dimensions of 128");
+    TORCH_CHECK(!mixed_launch_ || mixedKv, "mixed KV scheduler metadata requires BF16 Q and FP8 KV");
     if (mixedKv) {
         TORCH_CHECK(paged_KV && page_block_size == 128 && head_size_q == 192 && head_size_v == 192,
                     "mixed BF16/FP8 KV currently requires paged cache, page size 128 and Dqk=Dv=192");
         TORCH_CHECK(!q_descale_ && k_descale_ && v_descale_,
                     "mixed BF16/FP8 KV requires separate per-token K/V descales and no Q descale");
-        TORCH_CHECK(!scheduler_metadata_, "mixed BF16/FP8 KV currently requires host tiling");
+        TORCH_CHECK(scheduler_metadata_.has_value() == mixed_launch_.has_value(),
+                    "mixed KV requires scheduler_metadata prepared with kv_dtype=torch.float8_e4m3fn");
     }
     GM_ADDR qDescale = nullptr;
     GM_ADDR kDescale = nullptr;
@@ -341,15 +398,20 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor tiling_dev;
     at::Tensor mask_npu_tensor;
     bool is_local = false;
-    bool flashDecodeEnabled = false;
-    bool singleQueryWindow = false;
-    uint32_t launchBlockDim = blockDim;
+    // Metadata preparation has no cache tensors. Select the adjacent-head plan
+    // here, where the actual physical strides are available, for eager and graphs.
+    const bool pairedLayout = mixedKv && paged_KV && is_varlen_q && !seqused_q_ &&
+        q.size(0) == 1 && seqlen_q == 1 && batch_size == 1 && num_splits == 0 && !is_softcap &&
+        (num_heads_k == 2 || num_heads_k == 4) && num_heads == 16 * num_heads_k &&
+        q.is_contiguous() && k.is_contiguous() && v.is_contiguous();
+    bool pairedDecode = false;
+    std::array<int64_t, 4> launch{blockDim, -1, false, false};
 
     if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
         TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
         TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
-        TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1, "scheduler_metadata must be an NPU tensor");
+        TORCH_CHECK(schedMd.device() == q.device(), "scheduler_metadata must be on the query device");
         // Derive the mask axes from this call's arguments the same way
         // get_scheduler_metadata did when producing the buffer, so the
         // template selection matches the AICPU-written tiling. The compressed
@@ -373,15 +435,22 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != 0u;
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytesWithKv(hasMask, batch_size),
+        const bool hasPairedPlan = mixedKv && schedMd.nbytes() == optiling::kPairedPlanOffset + sizeof(FAInferTilingData);
+        TORCH_CHECK(hasPairedPlan || static_cast<uint64_t>(schedMd.nbytes()) ==
+                        (mixedKv ? sizeof(FAInferTilingData) : fa_metadata::MetadataBytesWithKv(hasMask, batch_size)),
                     "scheduler_metadata buffer size must exactly match this call's "
                     "causal/window-derived layout");
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        if (hasMask && quantMode != 1) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
+        if (mixed_launch_) {
+            launch = *mixed_launch_;
+            TORCH_CHECK(launch[0] > 0 && launch[0] <= blockDim && launch[1] >= -1, "invalid mixed KV launch");
+            if (hasPairedPlan && pairedLayout && !is_local && launch[0] == MAX_FD_ACTIVE_CORE_NUM && launch[1] >= 0) {
+                pairedDecode = true;
+                tilingDevice += optiling::kPairedPlanOffset;
+                launch[1] = optiling::kPairedDecodeWorkspace;
+            }
         }
     } else {
         at::Tensor cu_seqlen_q_cpu;
@@ -417,41 +486,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
 
-        bool fd_q_lengths_supported = true;
-        int64_t max_active_kv_seqlen = 0;
-        int64_t max_q_seqlen = 0;
-        const int32_t* q_cu_ptr = is_varlen_q ? cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
-        const int32_t* q_used_ptr = seqused_q_cpu.defined() ? seqused_q_cpu.data_ptr<int32_t>() : nullptr;
-        const int32_t* kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
-        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-            // *Used* Q length from seqused_q when provided; offsets stay on cu.
-            const int64_t q_len =
-                q_used_ptr != nullptr
-                    ? static_cast<int64_t>(q_used_ptr[batch_idx])
-                    : (is_varlen_q ? static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] : seqlen_q);
-            const int64_t kv_len = kv_len_ptr[batch_idx];
-            TORCH_CHECK(q_len >= 0 && kv_len >= 0, "950 backend (v3) requires non-negative Q and KV lengths");
-            if (q_used_ptr != nullptr) {
-                TORCH_CHECK(q_len <= static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx],
-                            "seqused_q must lie within the allocated sequence length");
-            }
-            // An empty packed sequence contributes no base tasks or output rows.
-            if (q_len > 0) {
-                max_active_kv_seqlen = std::max(max_active_kv_seqlen, kv_len);
-            } else if (!mixedKv || !is_varlen_q || q_used_ptr != nullptr) {
-                fd_q_lengths_supported = false;
-            }
-            max_q_seqlen = std::max(max_q_seqlen, q_len);
-        }
-        const bool fd_shape_supported =
-            !is_local && paged_KV && (is_varlen_q || (mixedKv && layout_enum == FwdLayout::BSND)) &&
-            fd_q_lengths_supported && max_q_seqlen <= 16 && max_active_kv_seqlen >= 1024;
-        // The tiler applies the small-task gate after building the same merged
-        // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
-        // which would over-count GQA/MQA tasks and incorrectly disable FD.
-        const bool flash_decode = num_splits != 1 && fd_shape_supported;
-
-        fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+        fill_inference_context(ctx, scratch, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
                                seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu, paged_KV,
                                page_block_size, num_blocks, max_num_blocks_per_seq, is_causal, is_local,
                                /* window_size_left= */ is_local ? window_size_left : 0,
@@ -460,7 +495,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
                                return_softmax_lse, layout_enum);
         ctx.mixedKvStorage = mixedKv;
-        ctx.flashDecodeFlag = flash_decode;
+        ctx.flashDecodeFlag = UseFlashDecode(batch_size, seqlen_q,
+                                             is_varlen_q ? cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr,
+                                             seqused_q_cpu.defined() ? seqused_q_cpu.data_ptr<int32_t>() : nullptr,
+                                             seqlens_k_cpu.data_ptr<int32_t>(), mixedKv, is_local, paged_KV, layout_enum,
+                                             num_splits);
         ctx.numSplits = static_cast<uint32_t>(num_splits);
 
         {
@@ -468,31 +507,28 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             tiler.SetCoreNum(blockDim);
             tiler.DoTiling(tilingData);
         }
-        flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
-        // In a one-token right-aligned window, every query head consumes the same key interval.
-        singleQueryWindow = mixedKv && is_local && !is_softcap && seqlen_q == 1 && max_q_seqlen == 1 &&
-                            window_size_left >= page_block_size - 1 && window_size_right == 0 &&
-                            tilingData.qBaseTile <= 64U && tilingData.qL1BufNum == 1U;
-        if (flashDecodeEnabled) {
-            launchBlockDim = tilingData.fdActiveCoreNum;
-        } else if (mixedKv && is_local && tilingData.totalTaskNum > 0U) {
-            // The SWA loop assigns at most one first task per (paired) core.
-            // Idle blocks still initialize tiling and cross-core flags.
-            const uint32_t tasksPerGroup = tilingData.qL1BufNum == 2U ? 2U : 1U;
-            const uint32_t tasks = (tilingData.totalTaskNum - 1U) / tasksPerGroup + 1U;
-            launchBlockDim = std::min(launchBlockDim, tasks);
-        }
+        launch = LaunchForTiling(tilingData, blockDim, mixedKv, is_local,
+                                 mixedKv && is_local && !is_softcap && seqlen_q == 1 &&
+                                 window_size_left >= page_block_size - 1 && window_size_right == 0);
 
+        if (pairedLayout && !is_local && optiling::CanPairDecode(tilingData, seqlens_k_cpu.data_ptr<int32_t>()[0])) {
+            optiling::SetPairedDecodeRanges(tilingData);
+            pairedDecode = true;
+            launch[1] = optiling::kPairedDecodeWorkspace;
+        }
         at::Tensor tiling_cpu =
             at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
         std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData, sizeof(FAInferTilingData));
         tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if ((is_causal || is_local) && quantMode != 1 && !singleQueryWindow) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-        }
+    }
+    const uint32_t launchBlockDim = static_cast<uint32_t>(launch[0]);
+    const bool flashDecodeEnabled = launch[1] >= 0;
+    const bool singleQueryWindow = launch[3] != 0;
+    if ((is_causal || is_local) && quantMode != 1 && !singleQueryWindow) {
+        mask_npu_tensor = MakeDeviceTriuMask();
+        maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
     // ============================================================
@@ -510,7 +546,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor workspace;
     if (flashDecodeEnabled) {
         workspace =
-            at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+            at::empty({launch[1]}, at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================
@@ -602,9 +638,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
-        mixedKv && tilingData.qL1BufNum == 2U};
-    auto launch_fa_infer = [singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
-        if (singleQueryWindow) {
+        launch[2] != 0};
+    auto launch_fa_infer = [pairedDecode, singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
+        if (pairedDecode) {
+            launch_paired_decode(fwdArgs);
+        } else if (singleQueryWindow) {
             launch_single_query_window(fwdArgs);
         } else {
             launch_fwd(fwdArgs);

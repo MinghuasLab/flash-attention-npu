@@ -35,6 +35,7 @@ if is_ascend910():
     )
 elif is_ascend950():
     from .flash_attn_npu_interface_950 import (
+        copy_scheduler_metadata_ as copy_scheduler_metadata_,
         flash_attn_combine as flash_attn_combine,
         flash_attn_func as flash_attn_func,
         flash_attn_varlen_func as flash_attn_varlen_func,
