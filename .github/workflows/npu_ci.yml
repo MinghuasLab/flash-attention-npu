@@ -253,7 +253,7 @@ jobs:
       CI_TEST_WORKERS: ${{ needs.prepare.outputs.workers }}
       FLASH_ATTN_BUILD_NPU: ${{ needs.prepare.outputs.build_npu }}
       CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
-      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '64' || '' }}
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
