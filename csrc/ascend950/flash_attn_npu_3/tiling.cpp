@@ -669,7 +669,9 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                           : faInfo_.kvSeqlenList[b]);
         const uint32_t activeQ =
             fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
-        fullQueryTileInEachBatch &= qLen >= Q_TILE_CEIL;
+        // Empty (padded) batches carry no work; they must not disable the
+        // paired wave for the batches that do.
+        fullQueryTileInEachBatch &= (qLen == 0U || qLen >= Q_TILE_CEIL);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,

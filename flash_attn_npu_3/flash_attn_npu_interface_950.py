@@ -704,7 +704,11 @@ def get_scheduler_metadata(
         if max_seqlen_q < 128:
             scheduler_metadata.paired_prefill = False
         else:
+            # The AICPU tiling write may still be pending host-side, so force a
+            # device sync once at metadata creation (outside graph capture)
+            # before reading the launch flag back.
             try:
+                torch.npu.synchronize()
                 flags = int(flash_attn_npu_3_950.flash_attn_metadata_flags(scheduler_metadata))
                 scheduler_metadata.paired_prefill = bool(flags & 1)
             except (AttributeError, RuntimeError):

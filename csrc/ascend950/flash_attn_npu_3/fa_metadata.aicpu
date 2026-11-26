@@ -88,7 +88,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     for (uint32_t b = 0; b < metaArgs->batch; ++b) {
         const uint32_t len = seqlensQ ? static_cast<uint32_t>(seqlensQ[b]) : metaArgs->maxQSeqlen;
         actualMaxQ = len > actualMaxQ ? len : actualMaxQ;
-        fullQueryTileInEachBatch = fullQueryTileInEachBatch && len >= Q_TILE_CEIL;
+        // Padded empty batches must not disable the paired wave.
+        fullQueryTileInEachBatch = fullQueryTileInEachBatch && (len == 0U || len >= Q_TILE_CEIL);
         const uint32_t activeQ =
             fa950_plan::ActiveQueryRows(len, cacheSeqlens[b], metaArgs->maskType != 0U, metaArgs->windowSizeRight);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * metaArgs->numHeads;

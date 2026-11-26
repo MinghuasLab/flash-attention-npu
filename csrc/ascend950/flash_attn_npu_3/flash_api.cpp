@@ -342,13 +342,20 @@ int64_t flash_attn_metadata_flags(const at::Tensor& scheduler_metadata)
     aclrtSynchronizeStream(aclStream);
     auto ret = readTiling();
     TORCH_CHECK(ret == ACL_SUCCESS, "flash_attn_metadata_flags: device-to-host copy failed");
-    // The tiling always sets qL1BufNum to 1 or 2; anything else means the read
-    // raced the AICPU write, in which case fall back to a device sync once.
-    if (tiling.qL1BufNum != 1U && tiling.qL1BufNum != 2U) {
+    // A pending AICPU write can still be in flight even after the stream wait
+    // (the AICPU runtime dispatches asynchronously), and a stale read is
+    // indistinguishable from a valid "unpaired" tiling. Validate the whole
+    // header instead and fall back to a device sync until it is initialized.
+    auto stale = [&]() {
+        return tiling.totalTaskNum == 0U || (tiling.qL1BufNum != 1U && tiling.qL1BufNum != 2U) ||
+               (tiling.qkL1TileN != 128U && tiling.qkL1TileN != 256U);
+    };
+    for (int attempt = 0; attempt < 3 && stale(); ++attempt) {
         aclrtSynchronizeDevice();
         ret = readTiling();
         TORCH_CHECK(ret == ACL_SUCCESS, "flash_attn_metadata_flags: device-to-host copy failed");
     }
+    TORCH_CHECK(!stale(), "flash_attn_metadata_flags: scheduler_metadata tiling is not initialized");
     int64_t flags = 0;
     if (tiling.qL1BufNum == 2U) {
         flags |= 1; // paired Q-head pipeline (kernel selected from this flag)
