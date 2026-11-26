@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from threading import RLock
+from time import perf_counter
 import warnings
 from typing import Any, TypeAlias
 
@@ -27,6 +28,30 @@ _COMPILATION_LOCK = RLock()
 
 def _force_recompile():
     return os.getenv("CATLASS_DSL_FORCE_RECOMPILE", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _time_operation(event, key, operation, *args):
+    path = os.getenv("FLASH_ATTENTION_CATLASS_DSL_CACHE_STATS_FILE")
+    if not path:
+        return operation(*args)
+    started = perf_counter()
+    succeeded = False
+    try:
+        result = operation(*args)
+        succeeded = True
+        return result
+    finally:
+        seconds = perf_counter() - started
+        status = event if succeeded else f"{event}_error"
+        family = key[0] if key and isinstance(key[0], str) else "other"
+        nodeid = os.getenv("PYTEST_CURRENT_TEST", "").rpartition(" (")[0]
+        nodeid = nodeid.replace("\t", " ").replace("\n", " ")
+        try:
+            with open(path, "a", encoding="utf-8") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                stream.write(f"{status}\t{os.getpid()}\t{family}\t{seconds:.6f}\t{nodeid}\n")
+        except OSError:
+            pass
 
 
 class JITCache(MutableMapping[CompileKeyType, CallableFunction]):
@@ -73,7 +98,7 @@ class JITCache(MutableMapping[CompileKeyType, CallableFunction]):
         with self._lock:
             if not _force_recompile() and key in self._cache:
                 return self._cache[key]
-            fn = compile_fn()
+            fn = _time_operation("compile", key, compile_fn)
             self._cache[key] = fn
             return fn
 
@@ -160,19 +185,19 @@ class JITPersistentCache(JITCache):
                 entry = directory / digest
                 if not forced and entry.exists():
                     try:
-                        fn = load_function(entry)
+                        fn = _time_operation("disk_load", key, load_function, entry)
                     except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError):
                         pass  # Truncated, incompatible, or corrupt artifact: rebuild.
                     else:
                         self._cache[key] = fn
                         return fn
                 # Compiler failures must propagate and never publish an entry.
-                fn = compile_fn()
+                fn = _time_operation("compile", key, compile_fn)
                 self._cache[key] = fn
                 temporary = None
                 try:
                     temporary = Path(tempfile.mkdtemp(prefix=f".{digest}.", dir=directory))
-                    export_function(fn, temporary)
+                    _time_operation("disk_export", key, export_function, fn, temporary)
                     if entry.exists():
                         shutil.rmtree(entry)
                     os.replace(temporary, entry)

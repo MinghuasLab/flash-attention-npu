@@ -2,6 +2,8 @@
 
 """Shared fixtures for CATLASS DSL tests."""
 
+import os
+
 import pytest
 import torch
 
@@ -40,6 +42,22 @@ def _seed_per_case(request, monkeypatch):
     monkeypatch.setattr(get_or_compute_golden, "_ci_timing_state", state, raising=False)
     yield
     request.node.user_properties.append(("ci_timing", finish(state, nodeid)))
+
+
+@pytest.fixture
+def cpu_graph_threads():
+    """Cap intra-op threads for CPU graph tests and restore the worker's pool."""
+    limit = int(os.environ.get("CI_GRAPH_CPU_THREADS") or "0")
+    previous = torch.get_num_threads()
+    if not 0 < limit < previous:
+        yield
+        return
+
+    torch.set_num_threads(limit)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 @pytest.fixture(scope="module")

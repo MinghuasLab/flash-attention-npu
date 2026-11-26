@@ -48,7 +48,7 @@ SCORE_BWD = Mod(_score_bwd, torch_ref=lambda g, s, b, h, q, k, i, a, c: g * c[0]
 
 
 @pytest.fixture
-def cpu_runtime(monkeypatch):
+def cpu_runtime(monkeypatch, cpu_graph_threads):
     """Use real validation/configuration with a clearly substituted CPU kernel."""
     validate = interface._validate
 

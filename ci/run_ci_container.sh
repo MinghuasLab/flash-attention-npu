@@ -66,6 +66,13 @@
 #   GOLDEN_CACHE_EVICT_INTERVAL_SECONDS
 #       默认 60, 清理扫描最短间隔
 #
+#   FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED / CI_CATLASS_DSL_CACHE_SCOPE
+#       Opt in to a runner-local CATLASS artifact cache in test containers.
+#       The scope is stable across reruns of the same PR or manual workflow.
+#   CI_GRAPH_CPU_THREADS     Optional intra-op cap for the CPU graph fixture.
+#   CI_TEST_GROUP_COLLECT    Use one collection probe per FlashAttention group.
+#   CI_DET_BWD_TIMING        Record deterministic backward test phase timings.
+#
 #   PROXY_CONFIG_FILE
 #       默认 $GOLDEN_CACHE_HOST_DIR/proxy.conf
 #
@@ -114,6 +121,25 @@ fi
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
+
+# Comment-triggered CI starts from the main-branch workflow and then checks
+# out the PR. Keep the 950 defaults in the entry point executed from the PR.
+if [[ "$CI_TASK" == "test" && "${CI_DOCKER_IMAGE##*:}" == 950-* ]]; then
+  : "${FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED=1}"
+  : "${CI_GRAPH_CPU_THREADS=4}"
+  : "${CI_TEST_GROUP_COLLECT=1}"
+  : "${CI_DET_BWD_TIMING=1}"
+  if [[ -z "${CI_CATLASS_DSL_CACHE_SCOPE:-}" && -n "${TARGET_SHA:-}" ]]; then
+    CI_CATLASS_DSL_CACHE_SCOPE="pr-head-$TARGET_SHA"
+    if [[ -r "${GITHUB_EVENT_PATH:-}" ]]; then
+      ci_pr_number="$(jq -r '.issue.number // .inputs.pr_number // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+      if [[ "$ci_pr_number" =~ ^[0-9]+$ ]]; then
+        CI_CATLASS_DSL_CACHE_SCOPE="pr-$ci_pr_number"
+      fi
+    fi
+  fi
+fi
+
 docker_cpu_args=()
 if [ -n "${CI_DOCKER_CPUS:-}" ]; then
   docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
@@ -466,6 +492,35 @@ container=$GOLDEN_CACHE_DIR"
     fi
 
   fi
+
+  local test_args=()
+  if [ "$CI_TASK" = "test" ]; then
+    test_args+=(
+      -e "CI_GRAPH_CPU_THREADS=${CI_GRAPH_CPU_THREADS:-}"
+      -e "CI_TEST_GROUP_COLLECT=${CI_TEST_GROUP_COLLECT:-0}"
+      -e "CI_DET_BWD_TIMING=${CI_DET_BWD_TIMING:-0}"
+    )
+    local jit_enabled="${FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED:-0}"
+    if [ "$jit_enabled" = "1" ]; then
+      local jit_root="/var/cache/flash-attention-npu/ci-data"
+      local jit_scope="${GITHUB_REPOSITORY:-local}/${CI_CATLASS_DSL_CACHE_SCOPE:-test}"
+      test_args+=(-e FLASH_ATTENTION_CATLASS_DSL_CACHE_STATS_FILE=/tmp/ci_test_logs/catlass_jit_events.tsv)
+      # Let the container create its cache namespace when the runner user
+      # can access the data directory but cannot create children in it.
+      if mkdir -p "$GOLDEN_CACHE_HOST_DIR" 2>/dev/null && [ -d "$GOLDEN_CACHE_HOST_DIR" ]; then
+        test_args+=(
+          -v "$GOLDEN_CACHE_HOST_DIR:$jit_root:rw"
+          -e "FLASH_ATTENTION_CATLASS_DSL_CACHE_DIR=$jit_root/catlass-dsl-jit/$jit_scope"
+        )
+        log "CATLASS JIT cache: $GOLDEN_CACHE_HOST_DIR/catlass-dsl-jit/$jit_scope"
+      else
+        jit_enabled=0
+        log "CATLASS JIT cache data directory unavailable; using process-local cache"
+      fi
+    fi
+    test_args+=(-e "FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED=$jit_enabled")
+  fi
+
   docker run --rm \
     "${docker_cpu_args[@]}" \
     --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
@@ -477,6 +532,7 @@ container=$GOLDEN_CACHE_DIR"
     -v "$CI_TEST_LOG_DIR_HOST:/tmp/ci_test_logs" \
     "${golden_mount_args[@]}" \
     "${mount_args[@]}" \
+    "${test_args[@]}" \
     \
     -e ASCEND_RT_VISIBLE_DEVICES="$device_id" \
     \

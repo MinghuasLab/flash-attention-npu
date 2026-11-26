@@ -20,6 +20,8 @@
 #   CI_RANDOM_SEED              采样 seed (默认 0, 可复现)
 #   CI_TEST_DIRECT_FILE         指定文件时只跑该文件; 指定目录时同样按文件扫描
 #   CI_TEST_DIRECT_FILTER       直接模式的 -k 过滤
+#   CI_TEST_GROUP_COLLECT       1=每个 FlashAttention 版本组收集一次, 出错时逐文件定位
+#   CI_DET_BWD_TIMING           1=输出 FA3/FA4 确定性反向用例分项耗时
 #   CI_CONTAINER_DEVICE         容器内逻辑设备号 (默认 0)
 #   GOLDEN_CACHE_MODE/DIR       golden reference cache mode and container path
 #   GOLDEN_CACHE_STATS_FILE     xdist-safe tab-separated cache event output
@@ -40,6 +42,13 @@ LOG_DIR="${CI_TEST_LOG_DIR:-/tmp/ci_test_logs}"
 RUN_LOG_DIR="$LOG_DIR/logs"
 SLOW_CASES_FILE="$LOG_DIR/slow_cases.csv"
 mkdir -p "$LOG_DIR" "$RUN_LOG_DIR"
+if [ -n "${FLASH_ATTENTION_CATLASS_DSL_CACHE_STATS_FILE:-}" ]; then
+  : > "$FLASH_ATTENTION_CATLASS_DSL_CACHE_STATS_FILE"
+fi
+if [ "${CI_DET_BWD_TIMING:-0}" = "1" ]; then
+  export CI_DET_BWD_TIMING_FILE="$LOG_DIR/det_bwd_timing.jsonl"
+  : > "$CI_DET_BWD_TIMING_FILE"
+fi
 printf 'nodeid,duration_s,verdict,rand,h2d,pack,cache,index,postprocess,forward,backward,ref,golden,compare,other,events\n' > "$SLOW_CASES_FILE"
 TEST_PHASE_START="$(date +%s)"
 export GOLDEN_CACHE_STATS_FILE="${GOLDEN_CACHE_STATS_FILE:-$LOG_DIR/golden_cache_events.tsv}"
@@ -139,14 +148,18 @@ timing_total() {
 
 # top 3 nonzero phases from timing string
 timing_top_phases() {
-  printf '%s\n' $1 | sed 's/s$//' \
+  local phases=()
+  read -r -a phases <<< "$1"
+  printf '%s\n' "${phases[@]}" | sed 's/s$//' \
     | awk -F= '$1 != "total" && $2+0 > 0 {printf "%s=%.1fs\n", $1, $2}' \
     | sort -t= -k2 -rn | head -3 | awk '{printf "%s%s", sep, $0; sep = " "}'
 }
 
 # csv tail for one timing summary, 12 phase seconds then quoted event tags
 timing_csv_fields() {
-  printf '%s\n' $1 \
+  local phases=()
+  read -r -a phases <<< "$1"
+  printf '%s\n' "${phases[@]}" \
     | awk -F= 'BEGIN{split("rand h2d pack cache index postprocess forward backward ref golden compare other", o, " ")}
         NF < 2 {next}
         $2 ~ /^[0-9]+(\.[0-9]+)?s?$/ {v[$1] = $2 + 0; next}
@@ -214,7 +227,8 @@ run_pytest() {
   export CI_PROGRESS_FILE="$progress_file"
   (
     local total=0 done=0 passed=0 failed=0 skipped=0 events_seen=0 last_line=0
-    local started_at="$(date +%s)" running="" running_since=0
+    local started_at running="" running_since=0
+    started_at="$(date +%s)"
     local last_progress=$(( $(date +%s) - 20 ))
     local kind value duration encoded details nodeid timing dur_s
     local log_total log_pass log_fail log_skip now
@@ -284,11 +298,11 @@ run_pytest() {
           if [ "${OVERALL_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
             local overall_done=$(( ${OVERALL_BASE:-0} + done ))
             local pct=$(( overall_done * 100 / OVERALL_TOTAL ))
-            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) | "
+            local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
+            overall_seg="overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | "
           fi
-          local overall_fail=$(( ${CUM_F_FAIL:-0} + failed ))
           printf '[progress] %sgroup %s/%s %s: %s/%s | %ss\n' \
-            "overall $overall_done/$OVERALL_TOTAL (${pct}%) fail=$overall_fail | " \
+            "$overall_seg" \
             "${FILE_IDX:-?}" "${FILE_TOT:-1}" "${short##*/}" \
             "$done" "$total" "$((now - started_at))"
           if [ -n "$running" ]; then
@@ -339,17 +353,26 @@ pytest_log_name() {
   printf '%s\n' "${rel//\//_}.log"
 }
 
+collect_group() {
+  local manifest="$1" collect_log="$2" rc=0
+  shift 2
+  rm -f -- "$manifest"
+  CI_COLLECT_MANIFEST="$manifest" CI_PROGRESS_FILE="" \
+    python3 -m pytest --collect-only -q -p ci.pytest_ci_reporter "$@" >"$collect_log" 2>&1 || rc=$?
+  [[ "$rc" == 0 || "$rc" == 5 ]] && [ -f "$manifest" ]
+}
+
 file_is_runnable() {
   local file="$1" collect_log="$2" rc=0
   shift 2
   # shellcheck disable=SC2086
   python3 -m pytest "$file" --collect-only -q "$@" >"$collect_log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
+    return 2
+  fi
   COLLECTED_COUNT="$(grep -c '::' "$collect_log" 2>/dev/null || true)"
   if grep -q '::' "$collect_log"; then
     return 0
-  fi
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; then
-    return 2
   fi
   return 1
 }
@@ -370,8 +393,6 @@ run_pytest_scanned() {
   # Group files by imported flash_attn version to avoid aicpu fold
   local common_files=() v2_files=() v3_files=() v4_files=()
   local skipped_files=() collect_failed_files=()
-  local runnable_common=() runnable_v2=() runnable_v3=() runnable_v4=()
-  local common_count=0 v2_count=0 v3_count=0 v4_count=0
 
   for file in "${files[@]}"; do
     local has_v2=0 has_v3=0 has_v4=0
@@ -392,11 +413,12 @@ run_pytest_scanned() {
     fi
   done
 
-  # Probe collect-only per group, count total cases
+  # Collect the same test groups that will be passed to xdist.
   local group_names=()
   local group_files_str=()
   local group_counts=()
   local group_runnable=()
+  local collect_started=$SECONDS
 
   for gname in common v2 v3 v4; do
     local gfiles=""
@@ -412,23 +434,44 @@ run_pytest_scanned() {
     group_counts+=(0)
     local gi=$(( ${#group_names[@]} - 1 ))
     local gtotal=0
-    for file in $gfiles; do
-      collect_log="$RUN_LOG_DIR/collect_$(pytest_log_name "$file")"
-      probe_rc=0
-      # shellcheck disable=SC2086
-      file_is_runnable "$file" "$collect_log" $SAMPLE_ARG "$@" || probe_rc=$?
-      case "$probe_rc" in
-        0) gtotal=$((gtotal + COLLECTED_COUNT)) ;;
-        2)
-          collect_failed_files+=("$file")
-          log "collect failed: $file"
-          tail -n 20 "$collect_log" 2>/dev/null | sed 's/^/    /'
-          echo "[COLLECT-FAILED] $file" >> "$FAILED_FILE"
-          ;;
-        *) skipped_files+=("$file") ;;
-      esac
-    done
-    group_counts[$gi]=$gtotal
+    local manifest="$RUN_LOG_DIR/collect_${gname}_group.tsv"
+    local group_log="$RUN_LOG_DIR/collect_${gname}_group.log"
+    # shellcheck disable=SC2086
+    if [ "${CI_TEST_GROUP_COLLECT:-0}" = "1" ] && collect_group "$manifest" "$group_log" $gfiles $SAMPLE_ARG "$@"; then
+      local -A collected=()
+      local collected_path
+      while IFS=$'\t' read -r collected_path _; do
+        collected["$collected_path"]=1
+        gtotal=$((gtotal + 1))
+      done < "$manifest"
+      for file in $gfiles; do
+        collected_path="$(realpath -- "$file")"
+        if [ -z "${collected[$collected_path]:-}" ]; then
+          skipped_files+=("$file")
+        fi
+      done
+    else
+      if [ "${CI_TEST_GROUP_COLLECT:-0}" = "1" ]; then
+        log "collect $gname group failed; probing individual files ($group_log)"
+      fi
+      for file in $gfiles; do
+        collect_log="$RUN_LOG_DIR/collect_$(pytest_log_name "$file")"
+        probe_rc=0
+        # shellcheck disable=SC2086
+        file_is_runnable "$file" "$collect_log" $SAMPLE_ARG "$@" || probe_rc=$?
+        case "$probe_rc" in
+          0) gtotal=$((gtotal + COLLECTED_COUNT)) ;;
+          2)
+            collect_failed_files+=("$file")
+            log "collect failed: $file"
+            tail -n 20 "$collect_log" 2>/dev/null | sed 's/^/    /'
+            echo "[COLLECT-FAILED] $file" >> "$FAILED_FILE"
+            ;;
+          *) skipped_files+=("$file") ;;
+        esac
+      done
+    fi
+    group_counts[gi]=$gtotal
     if [ "$gtotal" -gt 0 ]; then
       group_runnable+=("$gi")
     fi
@@ -444,6 +487,7 @@ run_pytest_scanned() {
   TOTAL_FILES_DISC=${#files[@]}
 
   log "groups: common=${#common_files[@]} v2=${#v2_files[@]} v3=${#v3_files[@]} v4=${#v4_files[@]} skip=${#skipped_files[@]}"
+  log "collection elapsed: $((SECONDS - collect_started))s"
 
   if [ "${#group_runnable[@]}" -eq 0 ]; then
     return
@@ -451,7 +495,7 @@ run_pytest_scanned() {
 
   local overall_total=0
   for gi in "${group_runnable[@]}"; do
-    overall_total=$((overall_total + group_counts[$gi]))
+    overall_total=$((overall_total + group_counts[gi]))
   done
 
   local group_idx=0 group_tot=${#group_runnable[@]}

@@ -2,10 +2,14 @@
 """
 小算子 FlashAttention 反向标杆（传入 FA 前向 out/lse，仅算反传）。
 
-供 test_flash_attn_npu_v2_bwd.py / test_flash_attn_npu_v3_bwd.py 使用。
+供 Ascend950 FA3 / FA4 确定性反向矩阵使用。
 """
 
+import os
+
 import torch
+
+from tests.common.golden_cache import get_or_compute_golden, register_retry
 
 
 def broadcast_kv_single(num_heads, num_kv_heads, kv_tensor, dtype):
@@ -63,9 +67,7 @@ def _resolve_atten_mask(q, k, atten_mask, is_causal, window_size_left, window_si
         return atten_mask
     seq_q = q.shape[2]
     seq_k = k.shape[2]
-    return make_window_atten_mask(
-        seq_q, seq_k, is_causal, window_size_left, window_size_right
-    )
+    return make_window_atten_mask(seq_q, seq_k, is_causal, window_size_left, window_size_right)
 
 
 def tsoftmax_grad(dp, softmax_res):
@@ -92,13 +94,11 @@ def sum_gqa_grad(dk_or_dv, nheads, nheads_k, batch, seq_k, headdim):
     if nheads == nheads_k:
         return dk_or_dv
     g = nheads // nheads_k
-    return (
-        torch.sum(
-            dk_or_dv.reshape(batch, nheads_k, g, seq_k, headdim),
-            dim=2,
-            keepdim=True,
-        ).reshape(batch, nheads_k, seq_k, headdim)
-    )
+    return torch.sum(
+        dk_or_dv.reshape(batch, nheads_k, g, seq_k, headdim),
+        dim=2,
+        keepdim=True,
+    ).reshape(batch, nheads_k, seq_k, headdim)
 
 
 def softmax_res_from_fa_lse_bsnd(
@@ -351,3 +351,111 @@ def golden_tnd_bwd_from_fwd(
         )
 
     return dq_golden, dk_golden, dv_golden
+
+
+def torch_ref_fwd_bsnd(q, k, v, scale, causal, window_size_left, window_size_right):
+    """torch 小算子参考前向（CPU fp32）。q:(B,Sq,Hq,D) k/v:(B,Sk,Hkv,D)。
+
+    返回 out:(B,Sq,Hq,D) 同 q dtype, lse:(B,Hq,Sq) fp32（自然对数）。
+    """
+    qb = q.detach().cpu().permute(0, 2, 1, 3).float()
+    kb = k.detach().cpu().permute(0, 2, 1, 3).float()
+    vb = v.detach().cpu().permute(0, 2, 1, 3).float()
+    hq, hkv = qb.shape[1], kb.shape[1]
+    if hq != hkv:
+        g = hq // hkv
+        kb = kb.repeat_interleave(g, dim=1)
+        vb = vb.repeat_interleave(g, dim=1)
+    sq, sk = qb.shape[2], kb.shape[2]
+    s = torch.matmul(qb, kb.transpose(-1, -2)) * scale
+    mask = make_window_atten_mask(sq, sk, causal, window_size_left, window_size_right)
+    if mask.dim() > 0:
+        s = s.masked_fill(mask.bool(), float("-inf"))
+    lse = torch.logsumexp(s, dim=-1)  # (B,Hq,Sq) fp32
+    p = torch.softmax(s, dim=-1)
+    o = torch.matmul(p, vb)  # (B,Hq,Sq,D)
+    out = o.permute(0, 2, 1, 3).to(q.dtype)
+    if mask.dim() > 0:
+        fully_masked = mask.bool().all(dim=-1)
+        out[:, fully_masked] = 0
+        lse[:, :, fully_masked] = torch.inf
+    return out.to(q.device), lse.to(q.device)
+
+
+def torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal, window_size_left, window_size_right):
+    """varlen 参考前向：逐 batch 切片复用 BSND 逻辑。
+
+    返回 out:(total_q,Hq,D), lse:(Hq,total_q) fp32。
+    """
+    outs, lses = [], []
+    for i in range(len(cu_q) - 1):
+        qi = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0)
+        ki = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
+        vi = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
+        oi, li = torch_ref_fwd_bsnd(qi, ki, vi, scale, causal, window_size_left, window_size_right)
+        outs.append(oi.squeeze(0))
+        lses.append(li.squeeze(0))
+    return torch.cat(outs, dim=0), torch.cat(lses, dim=1)
+
+
+def cached_det_reference(
+    q,
+    k,
+    v,
+    dout,
+    *,
+    scale,
+    causal,
+    window,
+    softcap,
+    dropout_p,
+    gtype,
+    cu_q=None,
+    cu_k=None,
+    retry_on_mismatch=False,
+):
+    """Cache CPU out/LSE and gradients for the native deterministic backward tests."""
+    names = ("out", "lse", "dq", "dk", "dv")
+    fwd_args = (scale, causal, *window)
+    bwd_args = (scale, softcap, dropout_p, causal, *window)
+    hq, hkv = q.shape[-2], k.shape[-2]
+
+    def compute():
+        if cu_q is None:
+            out, lse = torch_ref_fwd_bsnd(q, k, v, *fwd_args)
+            grads = golden_bsnd_bwd_from_fwd(
+                q, k, v, dout, out, lse, hq, hkv, *bwd_args, gtype=gtype
+            )
+        else:
+            out, lse = torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, *fwd_args)
+            seqlens_q = [end - start for start, end in zip(cu_q, cu_q[1:])]
+            seqlens_k = [end - start for start, end in zip(cu_k, cu_k[1:])]
+            grads = golden_tnd_bwd_from_fwd(
+                q, k, v, dout, out, lse, hq, hkv, seqlens_q, seqlens_k, *bwd_args, gtype=gtype
+            )
+        return dict(zip(names, (out, lse, *grads)))
+
+    cache_args = dict(
+        nodeid=os.environ.get("GOLDEN_CACHE_NODEID", "standalone"),
+        api_name="det_backward.bsnd" if cu_q is None else "det_backward.varlen",
+        metadata={
+            "scale": scale,
+            "causal": causal,
+            "window": window,
+            "softcap": softcap,
+            "dropout_p": dropout_p,
+            "gtype": gtype,
+            "cpu_threads": torch.get_num_threads(),
+            "default_dtype": torch.get_default_dtype(),
+            "matmul_precision": torch.get_float32_matmul_precision(),
+        },
+        inputs=(q, k, v, dout, cu_q, cu_k),
+        compute_fn=compute,
+        expected_keys=names,
+        source_files=(__file__,),
+    )
+    values, status = get_or_compute_golden(**cache_args, return_status=True)
+    if retry_on_mismatch and status == "hit":
+        gradients = {name: values[name] for name in names[2:]}
+        register_retry(gradients, lambda: get_or_compute_golden(**cache_args, force_refresh=True))
+    return values["out"], values["lse"], tuple(values[name] for name in names[2:])

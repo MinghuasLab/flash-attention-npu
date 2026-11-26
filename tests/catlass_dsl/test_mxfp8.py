@@ -34,7 +34,7 @@ from flash_attn_npu_4.catlass_dsl import (
     simt,
 )
 from flash_attn_npu_4.catlass_dsl.block_sparsity import BlockSparseTensorsTorch
-from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
+from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache
 from flash_attn_npu_4.catlass_dsl.kernels.flash_fwd_mxfp8_arch35 import (
     _mx_fill_ready,
     _mx_fill_scales,
@@ -473,7 +473,7 @@ def test_mxfp8_custom_op_schema_and_fake(cpu_mxfp8_runtime):
 @pytest.fixture
 def isolated_compile_cache(monkeypatch):
     """Keep compile-count/policy checks from evicting unrelated warm kernels."""
-    cache = get_jit_cache()
+    cache = JITCache()
     monkeypatch.setattr(runtime, "compile_cache", cache)
     yield cache
     cache.clear()
@@ -554,7 +554,7 @@ def test_unified_plan_preserves_pipeline_and_repair_selection(
     if masked:
         config["mask_mod"] = builtin.causal()
     compiler = Mock(side_effect=lambda *args: SimpleNamespace())
-    monkeypatch.setattr(runtime, "compile_cache", get_jit_cache())
+    monkeypatch.setattr(runtime, "compile_cache", JITCache())
     monkeypatch.setattr(runtime, "_compile_mxfp8", compiler)
     monkeypatch.setattr(runtime, "_cores", lambda device: 28)
     monkeypatch.setattr(
@@ -585,7 +585,7 @@ def test_output_cache_policy_depends_on_capacity_and_working_set():
 
 @pytest.fixture
 def mocked_launch(monkeypatch):
-    cache = get_jit_cache()
+    cache = JITCache()
 
     compiler, launcher = Mock(side_effect=lambda *args: SimpleNamespace()), Mock()
     monkeypatch.setattr(runtime, "compile_cache", cache)
@@ -756,7 +756,7 @@ def test_exact_auxiliary_plan_omits_guards_and_restores_them_on_fallback(monkeyp
             raise NotImplementedError("unsupported cached callback")
         return SimpleNamespace()
 
-    monkeypatch.setattr(runtime, "compile_cache", get_jit_cache())
+    monkeypatch.setattr(runtime, "compile_cache", JITCache())
     monkeypatch.setattr(runtime, "_compile_mxfp8", compiler)
     monkeypatch.setattr(runtime, "_cores", lambda device: 28)
     monkeypatch.setattr(

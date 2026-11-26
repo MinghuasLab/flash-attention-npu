@@ -10,12 +10,12 @@ from unittest.mock import Mock, call
 import pytest
 
 from flash_attn_npu_4.catlass_dsl import runtime
-from flash_attn_npu_4.catlass_dsl.cache_utils import get_jit_cache
+from flash_attn_npu_4.catlass_dsl.cache_utils import JITCache
 
 
 def test_cache_reuse_eviction_and_isolation():
-    cache = get_jit_cache()
-    other = get_jit_cache()
+    cache = JITCache()
+    other = JITCache()
     key = ("attention", "npu:0", "fp16")
     first, second = Mock(), Mock()
     compile_fn = Mock(side_effect=[first, second])
@@ -40,7 +40,7 @@ def test_cache_reuse_eviction_and_isolation():
     "error", [RuntimeError("compile failed"), KeyError("compiler lookup failed")]
 )
 def test_failed_compilation_can_be_retried(error):
-    cache = get_jit_cache()
+    cache = JITCache()
     key = ("attention",)
     executor = Mock()
     compile_fn = Mock(side_effect=[error, executor])
@@ -53,7 +53,7 @@ def test_failed_compilation_can_be_retried(error):
 
 
 def test_concurrent_misses_compile_once():
-    cache = get_jit_cache()
+    cache = JITCache()
     executor = Mock()
     ready = Barrier(5)
     compiling, release = Event(), Event()
@@ -81,7 +81,7 @@ def test_concurrent_misses_compile_once():
 
 
 def test_clear_waits_for_inflight_compilation():
-    cache = get_jit_cache()
+    cache = JITCache()
     compiling, clearing, release = Event(), Event(), Event()
 
     def compile_kernel():
@@ -110,7 +110,7 @@ def test_clear_waits_for_inflight_compilation():
 
 @pytest.mark.parametrize("aux_index", [6, 15], ids=["mask", "attention"])
 def test_runtime_binds_samples_only_on_miss(monkeypatch, aux_index):
-    cache = get_jit_cache()
+    cache = JITCache()
     monkeypatch.setattr(runtime, "compile_cache", cache)
     first, second = Mock(), Mock()
     backend = SimpleNamespace(compile=Mock(side_effect=[first, second]))

@@ -4,12 +4,33 @@
 
 import pytest
 import torch
-from .test_utils import DTYPES, check, check_attention, make_inputs, oracle
+from .test_utils import DTYPES, _cached_attention, check, check_attention, make_inputs, oracle
 
 from flash_attn_npu_4.catlass_dsl import flash_attn_func, flash_attn_varlen_func, runtime
 
 pytestmark = pytest.mark.npu
 ENTRIES = (flash_attn_func, flash_attn_varlen_func)
+
+
+def _ones_gradient_golden(cpu, views, *, cu=None, mask=None):
+    def compute():
+        out, lse = oracle(views, cu_q=cu, cu_k=cu, mask_mod=mask)
+        grads = torch.autograd.grad((out, lse), cpu, (torch.ones_like(out), torch.ones_like(lse)))
+        return out, lse, *grads
+
+    # Gradients are taken with respect to the backing tensors. Their values
+    # and the view geometry both affect the result for slices and broadcasts.
+    view_layouts = tuple((t.shape, t.stride(), t.storage_offset()) for t in views)
+    return _cached_attention(
+        "catlass_dsl.forward_backward",
+        ("out", "lse", "dq", "dk", "dv"),
+        compute,
+        cpu,
+        cu,
+        cu,
+        {"mask_mod": mask, "view_layouts": view_layouts},
+        loss="ones",
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -102,11 +123,8 @@ def test_npu_noncontiguous_gradients(device, packed, kind, dtype):
     kwargs = dict(cu_seqlens_q=cu.to(device), cu_seqlens_k=cu.to(device)) if packed else {}
     entry = flash_attn_varlen_func if packed else flash_attn_func
     out, lse = entry(*qkv, **kwargs, return_lse=True)
-    wanted, el = oracle(refs, cu_q=cu, cu_k=cu)
+    wanted, el, *expected = _ones_gradient_golden(cpu, refs, cu=cu)
     grads = torch.autograd.grad((out, lse), inputs, (torch.ones_like(out), torch.ones_like(lse)))
-    expected = torch.autograd.grad(
-        (wanted, el), cpu, (torch.ones_like(wanted), torch.ones_like(el))
-    )
     for a, b in zip((out, lse, *grads), (wanted, el, *expected)):
         check(a, b)
 
@@ -127,11 +145,8 @@ def test_npu_negative_windows(device, dtype, window):
         )
 
     out, lse = flash_attn_func(*inputs, window_size=window, return_lse=True)
-    wanted, el = oracle(cpu, mask_mod=mask)
+    wanted, el, *expected = _ones_gradient_golden(cpu, cpu, mask=mask)
     grads = torch.autograd.grad((out, lse), inputs, (torch.ones_like(out), torch.ones_like(lse)))
-    expected = torch.autograd.grad(
-        (wanted, el), cpu, (torch.ones_like(wanted), torch.ones_like(el))
-    )
     for a, b in zip((out, lse, *grads), (wanted, el, *expected)):
         check(a, b)
 
@@ -150,8 +165,21 @@ def test_npu_lse_tangent_rebinding_and_unused(device, entry):
         out, lse = entry(*inputs, return_lse=True)
         tangent = torch.full_like(lse, weight)
         actual = torch.autograd.grad(lse, inputs, tangent)
-        _, el = oracle(cpu)
-        expected = torch.autograd.grad(el, cpu, torch.full_like(el, weight))
+
+        def compute():
+            _, el = oracle(cpu)
+            return torch.autograd.grad(el, cpu, torch.full_like(el, weight))
+
+        expected = _cached_attention(
+            "catlass_dsl.lse_backward",
+            ("dq", "dk", "dv"),
+            compute,
+            cpu,
+            None,
+            None,
+            {},
+            loss=weight,
+        )
         for a, b in zip(actual, expected):
             check(a, b)
         if cached is not None:

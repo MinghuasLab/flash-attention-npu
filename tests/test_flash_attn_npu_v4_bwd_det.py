@@ -51,9 +51,7 @@ if "Ascend950" not in (torch_npu.npu.get_device_name() if torch_npu.npu.device_c
     pytest.skip("flash_attn_npu_4 950 backward tests require Ascend950", allow_module_level=True)
 
 from flash_attn_npu_4.flash_attn_npu_interface_950 import _flash_attn_backward
-from tests.fa_small_op_golden import (
-    golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd, make_window_atten_mask,
-)
+from tests.fa_small_op_golden import cached_det_reference
 
 INPUT_LIMIT = 2.0
 DTYPE = torch.bfloat16
@@ -211,54 +209,7 @@ def _is_ascend950():
 
 def rand_inputs(shape, seed):
     g = torch.Generator().manual_seed(seed)
-    return (INPUT_LIMIT * (torch.rand(shape, generator=g) - 0.5)).to(DTYPE).to(DEVICE)
-
-
-def torch_ref_fwd_bsnd(q, k, v, scale, causal, window_size_left, window_size_right):
-    """torch 小算子参考前向（CPU fp32）。q:(B,Sq,Hq,D) k/v:(B,Sk,Hkv,D)。
-
-    返回 out:(B,Sq,Hq,D) 同 q dtype, lse:(B,Hq,Sq) fp32（自然对数）。
-    """
-    qb = q.detach().cpu().permute(0, 2, 1, 3).float()
-    kb = k.detach().cpu().permute(0, 2, 1, 3).float()
-    vb = v.detach().cpu().permute(0, 2, 1, 3).float()
-    hq, hkv = qb.shape[1], kb.shape[1]
-    if hq != hkv:
-        g = hq // hkv
-        kb = kb.repeat_interleave(g, dim=1)
-        vb = vb.repeat_interleave(g, dim=1)
-    sq, sk = qb.shape[2], kb.shape[2]
-    s = torch.matmul(qb, kb.transpose(-1, -2)) * scale
-    mask = make_window_atten_mask(sq, sk, causal, window_size_left, window_size_right)
-    if mask.dim() > 0:
-        s = s.masked_fill(mask.bool(), float("-inf"))
-    lse = torch.logsumexp(s, dim=-1)  # (B,Hq,Sq) fp32
-    p = torch.softmax(s, dim=-1)
-    o = torch.matmul(p, vb)  # (B,Hq,Sq,D)
-    out = o.permute(0, 2, 1, 3).to(q.dtype)
-    if mask.dim() > 0:
-        fully_masked = mask.bool().all(dim=-1)
-        out[:, fully_masked] = 0
-        lse[:, :, fully_masked] = torch.inf
-    return out.to(q.device), lse.to(q.device)
-
-
-def torch_ref_fwd_tnd(q, k, v, cu_q, cu_k, scale, causal, window_size_left, window_size_right):
-    """varlen 参考前向：逐 batch 切片复用 BSND 逻辑。
-
-    返回 out:(total_q,Hq,D), lse:(Hq,total_q) fp32。
-    """
-    outs, lses = [], []
-    for i in range(len(cu_q) - 1):
-        qi = q[cu_q[i] : cu_q[i + 1]].unsqueeze(0)
-        ki = k[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
-        vi = v[cu_k[i] : cu_k[i + 1]].unsqueeze(0)
-        oi, li = torch_ref_fwd_bsnd(
-            qi, ki, vi, scale, causal, window_size_left, window_size_right
-        )
-        outs.append(oi.squeeze(0))
-        lses.append(li.squeeze(0))
-    return torch.cat(outs, dim=0), torch.cat(lses, dim=1)
+    return (INPUT_LIMIT * (torch.rand(shape, generator=g) - 0.5)).to(DTYPE)
 
 
 def run_bwd_bsnd(q, k, v, dout, out, lse, scale, causal, det, window_size_left, window_size_right):
@@ -284,7 +235,23 @@ def run_bwd_bsnd(q, k, v, dout, out, lse, scale, causal, det, window_size_left, 
     return dq, dk, dv
 
 
-def run_bwd_varlen(q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det, window_size_left, window_size_right):
+def run_bwd_varlen(
+    q,
+    k,
+    v,
+    dout,
+    out,
+    lse,
+    cu_q_t,
+    cu_k_t,
+    max_sq,
+    max_sk,
+    scale,
+    causal,
+    det,
+    window_size_left,
+    window_size_right,
+):
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
         q,
@@ -315,12 +282,11 @@ def max_diff(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
-def _check_case(name, run_bwd, golden_fn):
+def _check_case(name, run_bwd, golden):
     """golden 对齐 + det 逐位一致 + det/nd 互一致；不满足即断言失败。
 
-    run_bwd(det) -> (dq,dk,dv); golden_fn() -> (dq,dk,dv)。
+    run_bwd(det) 和 golden 均提供 (dq, dk, dv)。
     """
-    golden = golden_fn()
     grads = {"det": run_bwd(True), "nd": run_bwd(False)}
 
     for tag, grad in grads.items():
@@ -363,29 +329,44 @@ def _check_case(name, run_bwd, golden_fn):
     ids=[c[0] for c in BSND_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large, window_size_left, window_size_right):
+def test_fa_bwd_det_bsnd(
+    name, bsz, sq, sk, hq, hkv, hd, causal, large, window_size_left, window_size_right
+):
     scale = hd ** (-0.5)
     q = rand_inputs((bsz, sq, hq, hd), 42)
     k = rand_inputs((bsz, sk, hkv, hd), 43)
     v = rand_inputs((bsz, sk, hkv, hd), 44)
     dout = rand_inputs((bsz, sq, hq, hd), 45)
-    out, lse = torch_ref_fwd_bsnd(
-        q, k, v, scale, causal, window_size_left, window_size_right
+    out, lse, golden = cached_det_reference(
+        q,
+        k,
+        v,
+        dout,
+        scale=scale,
+        causal=causal,
+        window=(window_size_left, window_size_right),
+        softcap=SOFTCAP,
+        dropout_p=DROPOUT_P,
+        gtype=GTYPE,
     )
+    q, k, v, dout, out, lse = (tensor.to(DEVICE) for tensor in (q, k, v, dout, out, lse))
 
     def run_bwd(det):
         return run_bwd_bsnd(
-            q, k, v, dout, out, lse, scale, causal, det,
-            window_size_left, window_size_right,
+            q,
+            k,
+            v,
+            dout,
+            out,
+            lse,
+            scale,
+            causal,
+            det,
+            window_size_left,
+            window_size_right,
         )
 
-    def golden_fn():
-        return golden_bsnd_bwd_from_fwd(
-            q, k, v, dout, out, lse, hq, hkv, scale, SOFTCAP, DROPOUT_P, causal,
-            window_size_left, window_size_right, gtype=GTYPE
-        )
-
-    _check_case(name, run_bwd, golden_fn)
+    _check_case(name, run_bwd, golden)
 
 
 @pytest.mark.parametrize(
@@ -394,7 +375,9 @@ def test_fa_bwd_det_bsnd(name, bsz, sq, sk, hq, hkv, hd, causal, large, window_s
     ids=[c[0] for c in VARLEN_CASES],
 )
 @pytest.mark.skipif(not _is_ascend950(), reason="Ascend950 only")
-def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large, window_size_left, window_size_right):
+def test_fa_bwd_det_varlen(
+    name, cu_q, cu_k, hq, hkv, hd, causal, large, window_size_left, window_size_right
+):
     scale = hd ** (-0.5)
     total_q, total_k = cu_q[-1], cu_k[-1]
     q = rand_inputs((total_q, hq, hd), 42)
@@ -405,37 +388,39 @@ def test_fa_bwd_det_varlen(name, cu_q, cu_k, hq, hkv, hd, causal, large, window_
     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=DEVICE)
     max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1))
     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1))
-    out, lse = torch_ref_fwd_tnd(
-        q, k, v, cu_q, cu_k, scale, causal, window_size_left, window_size_right
+    out, lse, golden = cached_det_reference(
+        q,
+        k,
+        v,
+        dout,
+        scale=scale,
+        causal=causal,
+        window=(window_size_left, window_size_right),
+        softcap=SOFTCAP,
+        dropout_p=DROPOUT_P,
+        gtype=GTYPE,
+        cu_q=cu_q,
+        cu_k=cu_k,
     )
+    q, k, v, dout, out, lse = (tensor.to(DEVICE) for tensor in (q, k, v, dout, out, lse))
 
     def run_bwd(det):
         return run_bwd_varlen(
-            q, k, v, dout, out, lse, cu_q_t, cu_k_t, max_sq, max_sk, scale, causal, det,
-            window_size_left, window_size_right,
-        )
-
-    def golden_fn():
-        seqlens_q = [cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1)]
-        seqlens_k = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
-        return golden_tnd_bwd_from_fwd(
             q,
             k,
             v,
             dout,
             out,
             lse,
-            hq,
-            hkv,
-            seqlens_q,
-            seqlens_k,
+            cu_q_t,
+            cu_k_t,
+            max_sq,
+            max_sk,
             scale,
-            SOFTCAP,
-            DROPOUT_P,
             causal,
+            det,
             window_size_left,
             window_size_right,
-            gtype=GTYPE,
         )
 
-    _check_case(name, run_bwd, golden_fn)
+    _check_case(name, run_bwd, golden)

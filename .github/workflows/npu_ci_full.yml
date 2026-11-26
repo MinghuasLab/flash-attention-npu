@@ -94,6 +94,11 @@ jobs:
       GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
       GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
       GOLDEN_CACHE_MODE: cache
+      FLASH_ATTENTION_CATLASS_DSL_CACHE_ENABLED: ${{ matrix.arch_label == 'x86_64-950' && '1' || '0' }}
+      CI_CATLASS_DSL_CACHE_SCOPE: full
+      CI_GRAPH_CPU_THREADS: ${{ matrix.arch_label == 'x86_64-950' && '4' || '' }}
+      CI_TEST_GROUP_COLLECT: ${{ matrix.arch_label == 'x86_64-950' && '1' || '0' }}
+      CI_DET_BWD_TIMING: ${{ matrix.arch_label == 'x86_64-950' && '1' || '0' }}
     steps:
       - name: Check arch match
         id: arch

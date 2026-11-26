@@ -3,6 +3,7 @@
 """FA3/FA4 direct backward tests. No repository forward kernel is called."""
 
 import importlib
+import os
 
 import pytest
 
@@ -85,8 +86,35 @@ def _backward(
 
 
 def _reference(q, k, v, dout, causal=False, softcap=0.0, window=(-1, -1)):
+    from tests.common.golden_cache import get_or_compute_golden
+
+    inputs = tuple(x.detach().cpu() for x in (q, k, v, dout))
+    names = ("out", "lse", "dq", "dk", "dv")
+
+    def compute():
+        out, lse, grads = _compute_reference(*inputs, causal, softcap, window)
+        return dict(zip(names, (out, lse, *grads)))
+
+    values = get_or_compute_golden(
+        nodeid=os.environ.get("GOLDEN_CACHE_NODEID", "standalone"),
+        api_name="direct_backward.bnsd",
+        metadata={
+            "causal": causal,
+            "softcap": softcap,
+            "window": window,
+            "cpu_threads": torch.get_num_threads(),
+        },
+        inputs=inputs,
+        compute_fn=compute,
+        expected_keys=names,
+        source_files=(__file__,),
+    )
+    return values["out"], values["lse"], tuple(values[name] for name in names[2:])
+
+
+def _compute_reference(q, k, v, dout, causal, softcap, window):
     """CPU float64 reference from the actual quantized inputs, including GQA."""
-    q, k, v = [x.detach().cpu().double().requires_grad_() for x in (q, k, v)]
+    q, k, v = [x.double().requires_grad_() for x in (q, k, v)]
     group = q.shape[1] // k.shape[1]
     kk = k.repeat_interleave(group, dim=1)
     vv = v.repeat_interleave(group, dim=1)
@@ -106,7 +134,7 @@ def _reference(q, k, v, dout, causal=False, softcap=0.0, window=(-1, -1)):
     score = score.masked_fill(~visible, float("-inf"))
     lse = score.logsumexp(-1)
     out = score.softmax(-1) @ vv
-    grads = torch.autograd.grad(out, (q, k, v), dout.cpu().double())
+    grads = torch.autograd.grad(out, (q, k, v), dout.double())
     return out.detach(), lse.detach(), grads
 
 
