@@ -535,6 +535,25 @@ class FAIKernel950 {
             int64_t gmOffsetV = 0;
             int64_t gmOffsetO = 0;
             int64_t qSOffset = qSTileIdx * qBaseTile_;
+            constexpr bool alignWindow = MixedKv && PairedHeads && maskCategory == MaskCategory::MASK_SWA &&
+                kvcacheType == CacheMode::pagedCache && kvcacheShape == PageShape::BnBsND;
+            uint32_t windowQueryShift = 0U;
+            if constexpr (alignWindow) {
+                if (qBaseTile_ == 128U && kvBaseTile_ == 128U && blockSize_ == 128U && embed_ == 192U &&
+                    embedV_ == 192U && qSeqlen > 256 && windowSizeLeft_ == 511 && windowSizeRight_ == 0 &&
+                    kvSeqlen >= qSeqlen + 511) {
+                    const uint32_t skew = static_cast<uint32_t>(kvSeqlen - qSeqlen) % 128U;
+                    const uint32_t tail = (static_cast<uint32_t>(qSeqlen) - 1U) % 128U + 1U;
+                    // At offsets 1..126 an interior Q tile touches six KV pages.
+                    // Absorb the offset into the existing tail to visit five instead.
+                    if (skew < 127U && tail + skew <= 128U) {
+                        windowQueryShift = skew;
+                        if (qSTileIdx != 0U) {
+                            qSOffset -= skew;
+                        }
+                    }
+                }
+            }
             gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * qHeadStride;
             gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * oHeadStride;
             uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
@@ -566,6 +585,13 @@ class FAIKernel950 {
             }
             uint32_t qsBlockNum = (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
             uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
+            if constexpr (alignWindow) {
+                if (qSTileIdx == 0U) {
+                    qSBlockSize -= windowQueryShift;
+                } else if (qSTileIdx + 1U == qsBlockNum) {
+                    qSBlockSize += windowQueryShift;
+                }
+            }
             uint32_t rowNum = qSBlockSize * qNBlockSize;
             uint32_t rowNumRound = 0;
             if constexpr (IsDN) {
@@ -588,7 +614,7 @@ class FAIKernel950 {
             bool notNextMask = true;
             int32_t delStartRow = 0;
             int32_t delEndRow = static_cast<int32_t>(qSeqlen);
-            const int32_t qSTileStart = static_cast<int32_t>(qSTileIdx * qBaseTile_);
+            const int32_t qSTileStart = alignWindow ? static_cast<int32_t>(qSOffset) : static_cast<int32_t>(qSTileIdx * qBaseTile_);
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                 int64_t causalKvEnd = static_cast<int64_t>(qSTileIdx + 1U) * qBaseTile_ + kvSeqlen - qSeqlen;
                 if (causalKvEnd < 0) {
@@ -602,7 +628,7 @@ class FAIKernel950 {
                 const int64_t qLength = static_cast<int64_t>(qSeqlen);
                 const int64_t kvLength = static_cast<int64_t>(kvSeqlen);
                 const int64_t seqDiff = kvLength - qLength;
-                const int64_t qBlockBase = static_cast<int64_t>(qSTileIdx) * qBaseTile_;
+                const int64_t qBlockBase = alignWindow ? qSOffset : static_cast<int64_t>(qSTileIdx) * qBaseTile_;
                 notPreMask = windowSizeLeft_ < 0 || windowSizeLeft_ >= kvLength - 1;
                 notNextMask = windowSizeRight_ < 0 || windowSizeRight_ >= qLength - 1;
                 if (!notPreMask) {

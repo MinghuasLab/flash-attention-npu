@@ -56,6 +56,8 @@ def test_mixed_kv(sq, sk, heads, batch, splits, causal, layout):
     (193, 1025, 1, 1, 0, True, (511, 0)),      # One wave of individual Q128 heads, including a partial Q tile.
     (383, 1027, 1, 1, 0, True, (511, 0)),      # One paired wave, both SWA edges and a short final KV page.
     (257, 515, 2, 1, 0, True, (63, 0)),        # One wave of paired heads, narrow window and unaligned pages.
+    (513, 4099, 2, 1, 0, True, (511, 0)),      # A short Q tail can absorb the KV page offset.
+    (513, 4223, 2, 1, 0, True, (511, 0)),      # Shifting by 126 leaves two rows in the first Q tile.
     (513, 899, 4, 1, 1, True, (511, 0)),      # Paired heads, partial Q and KV tiles.
     (512, 769, 4, 1, 1, False, (287, 257)),   # Finite noncausal window.
     (513, 193, 4, 1, 1, True, (511, 0)),      # Fully masked prefix followed by valid rows.
@@ -250,6 +252,7 @@ def test_mixed_kv_head_major_pages(sq):
     (1, 1, 1, (511, 0), True),
     (1, 8, 2, (511, 0), False),
     (1, 128, 4, (511, 0), True),
+    (1, 505, 2, (511, 0), True),  # A replay moves the interior Q boundary back across a KV page.
     (1, 1, 1, (-1, -1), True),
     (2, 1, 1, (-1, -1), True),
 ])
