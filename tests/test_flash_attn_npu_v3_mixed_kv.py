@@ -250,28 +250,29 @@ def test_mixed_kv_head_major_pages(sq):
     torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("batch,sq,kv_heads,window,packed", [
-    (1, 1, 1, (511, 0), True),
-    (1, 8, 2, (511, 0), False),
-    (1, 128, 4, (511, 0), True),
-    (1, 505, 2, (511, 0), True),  # A replay moves the interior Q boundary back across a KV page.
-    (1, 1, 1, (-1, -1), True),
-    (2, 1, 1, (-1, -1), True),
+@pytest.mark.parametrize("batch,sq,kv_heads,window,packed,old_sk,new_sk,recapture", [
+    (1, 1, 1, (511, 0), True, 2047, 2049, False),
+    (1, 8, 2, (511, 0), False, 2047, 2049, False),
+    (1, 128, 4, (511, 0), True, 2047, 2049, False),
+    (1, 505, 2, (511, 0), True, 2047, 2049, False),  # Interior Q boundary moves across a page.
+    (1, 1, 1, (-1, -1), True, 2047, 2049, False),
+    (1, 1, 1, (-1, -1), True, 6144, 6145, True),    # The split count and workspace grow.
+    (2, 1, 1, (-1, -1), True, 2047, 2049, False),
 ])
-def test_mixed_kv_graph_cross_page(batch, sq, kv_heads, window, packed):
+def test_mixed_kv_graph_cross_page(batch, sq, kv_heads, window, packed, old_sk, new_sk, recapture):
     from flash_attn_npu_3 import copy_scheduler_metadata_, get_scheduler_metadata
 
     torch.set_num_threads(4)
-    q, k, v, ks, vs, table = [x.npu() for x in make_case(sq, 2049, kv_heads, batch)]
+    q, k, v, ks, vs, table = [x.npu() for x in make_case(sq, new_sk, kv_heads, batch)]
     cu = None
     if packed:
         q = q.flatten(0, 1)
         cu = torch.arange(batch + 1, device="npu", dtype=torch.int32) * sq
-    lengths = torch.full((batch,), 2047, device="npu", dtype=torch.int32)
+    lengths = torch.full((batch,), old_sk, device="npu", dtype=torch.int32)
 
     def prepare(out=None):
         return get_scheduler_metadata(
-            batch, sq, 2176, kv_heads * 16, kv_heads, 192, lengths, cu_seqlens_q=cu,
+            batch, sq, new_sk, kv_heads * 16, kv_heads, 192, lengths, cu_seqlens_q=cu,
             page_size=128, causal=True, window_size=window, kv_dtype=torch.float8_e4m3fn, out=out,
         )
 
@@ -297,8 +298,8 @@ def test_mixed_kv_graph_cross_page(batch, sq, kv_heads, window, packed):
     md = prepare()
     graph, outputs = capture(md)
     check(graph, outputs)
-    lengths.fill_(2049)
-    if window == (-1, -1) and batch == 1:
+    lengths.fill_(new_sk)
+    if recapture:
         with pytest.raises(ValueError, match="launch parameters changed"):
             prepare(out=md)
         new_md = prepare()
@@ -313,8 +314,8 @@ def test_mixed_kv_graph_cross_page(batch, sq, kv_heads, window, packed):
             with pytest.raises(ValueError, match="same device and configuration"):
                 copy_scheduler_metadata_(md, prepared.clone())
         check(graph, outputs)
-    lengths.fill_(2047)
-    if window == (-1, -1) and batch == 2:
+    lengths.fill_(old_sk)
+    if window == (-1, -1) and not recapture:
         assert prepare(out=md) is md
     check(graph, outputs)
 

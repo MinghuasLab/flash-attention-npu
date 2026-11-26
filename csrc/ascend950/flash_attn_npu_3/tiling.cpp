@@ -822,6 +822,15 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
                 // Empty KV still needs a task to initialize O and LSE.
                 splitCounts[base] = std::max(1U, std::min(faInfo_.numSplits, bases[base].kvTiles));
             }
+        } else if (faInfo_.mixedKvStorage && faInfo_.batch == 1 && faInfo_.maxQSeqlen == 1 &&
+                   faInfo_.kvHeads == 1 && groupSize == 16U && bases.size() == 1U &&
+                   faInfo_.layout == FwdLayout::TND && faInfo_.softcapValue == 0.0f) {
+            // At M=16, each split writes a complete FP32 O tile for the merge.
+            // Allow four pages per core, in groups of four cores, with at least
+            // twelve independent page streams when the context permits.
+            const uint32_t pages = bases.front().kvTiles;
+            const uint32_t streams = std::max(12U, 4U * ((pages + 15U) / 16U));
+            splitCounts.front() = std::max(1U, std::min({pages, streams, cfdMax}));
         } else {
             uint32_t totalSegments = static_cast<uint32_t>(bases.size());
             while (totalSegments < cfdMax) {
