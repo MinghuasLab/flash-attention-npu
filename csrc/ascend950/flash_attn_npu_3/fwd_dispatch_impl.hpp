@@ -133,10 +133,15 @@ void launch_paired_prefill_layout(const FwdLaunchArgs& a)
     using DType = bfloat16_t;
     constexpr auto kCacheLayout = CacheLayout::nd;
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
-        FWD_MASK_SWITCH(a.mask_category, MaskCat, {
-            FWD_MIXED_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCat, CacheMode::pagedCache,
+        if (a.reuse_window_pages) {
+            FWD_MIXED_KERNEL_LAUNCH(FAInferResidentWindow, MaskCategory::MASK_SWA, CacheMode::pagedCache,
                                     PageShape::BnBsND, LseMode, false, true);
-        });
+        } else {
+            FWD_MASK_SWITCH(a.mask_category, MaskCat, {
+                FWD_MIXED_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCat, CacheMode::pagedCache,
+                                        PageShape::BnBsND, LseMode, false, true);
+            });
+        }
     });
 }
 

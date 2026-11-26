@@ -41,6 +41,7 @@ struct FwdLaunchArgs {
     uint8_t* v_descale_device = nullptr;
     FwdStorageParams storage;
     bool paired_query_heads = false;
+    bool reuse_window_pages = false;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and

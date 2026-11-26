@@ -55,7 +55,7 @@ static constexpr uint32_t UB_S_BUF_STAGES = 2;
 
 template <class BlockMmadQK, class EpilogueOnlineSoftmax, class BlockMmadPV, class EpilogueRescaleO, Format qFormat,
           Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape, MaskCategory maskCategory,
-          CacheLayout cacheLayout, bool IsDN, bool LseMode, bool MixedKv = false, bool PairedHeads = false, bool SingleQueryWindow = false, bool PairedKv = false>
+          CacheLayout cacheLayout, bool IsDN, bool LseMode, bool MixedKv = false, bool PairedHeads = false, bool SingleQueryWindow = false, bool PairedKv = false, bool ReuseWindowPages = false>
 class FAIKernel950 {
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
@@ -400,6 +400,12 @@ class FAIKernel950 {
             taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
             taskStep = 1U;
         }
+#ifdef __DAV_VEC__
+        uint32_t residentBatch = ~0U;
+        uint32_t residentHead = ~0U;
+        uint32_t residentPage0 = ~0U;
+        uint32_t residentPage1 = ~0U;
+#endif
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
@@ -723,6 +729,32 @@ class FAIKernel950 {
             }
             const uint32_t pageCount = kvSplitEnd - kvSplitStart;
             // In each pair, operations 2*i and 2*i+1 consume the same K/V page.
+#ifdef __DAV_VEC__
+            uint32_t reuseMask = 0U;
+            if constexpr (ReuseWindowPages) {
+                static_assert(alignWindow, "Resident pages require paired paged window attention");
+                if (blockSize_ == 128U && kvBaseTile_ == 128U && kvSplitEnd > kvSplitStart) {
+                    // Only complete NZ pages have the same row stride as a later full-page consumer.
+                    const uint32_t fullEnd = noSkipKvS / 128U;
+                    if (residentBatch == curBatch && residentHead == kvHeadIdx) {
+                        if (kvSplitStart < fullEnd && residentPage0 == kvSplitStart) {
+                            reuseMask |= 1U;
+                        }
+                        if (kvSplitStart + 1U < fullEnd && residentPage1 == kvSplitStart + 1U) {
+                            reuseMask |= 2U;
+                        }
+                    }
+                    residentBatch = curBatch;
+                    residentHead = kvHeadIdx;
+                    const uint32_t last = kvSplitEnd - 1U;
+                    const uint32_t lastFull = last < fullEnd ? last : ~0U;
+                    const uint32_t prior = last > kvSplitStart ? last - 1U : ~0U;
+                    const bool odd = (last - kvSplitStart) % 2U != 0U;
+                    residentPage0 = odd ? prior : lastFull;
+                    residentPage1 = odd ? lastFull : prior;
+                }
+            }
+#endif
             const uint32_t headCount = paired ? 2U : 1U;
             const uint32_t kvSLoopCount = headCount * pageCount;
             if (kvSLoopCount == 0U) {
@@ -860,7 +892,7 @@ class FAIKernel950 {
                     const auto pageStride = keyLane ? params.storage.keyPageStride : params.storage.valuePageStride;
                     const auto tokenStride = keyLane ? params.storage.keyTokenStride : params.storage.valueTokenStride;
                     const auto headStride = keyLane ? params.storage.keyHeadStride : params.storage.valueHeadStride;
-                    if (kvSTileRelIdx == 0U) {
+                    if (kvSTileRelIdx == 0U && (reuseMask & 1U) == 0U) {
                         const uint32_t rows = kvSplitStart + 1U == kvSLoopNum ? noSkipKvS - kvSplitStart * 128U : 128U;
                         halfDequant.Prefetch(cache, scales, gBlockTable[blockBOffset], kvHeadIdx, kvHeads_,
                             pageStride, tokenStride, headStride, kvSplitStart, rows, kvSlot);
@@ -881,9 +913,22 @@ class FAIKernel950 {
                             + bank * qkL1TileKRight_ * qkL1TileN_ * 2U;
                         const uint32_t vOffset = pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
                             + bank * pvL1TileKRight_ * pvL1TileN_ * 2U;
-                        halfDequant.Produce(resource, rows, keyLane ? kOffset : vOffset,
-                            (keyLane ? 7U : 9U) + bank, kvSlot, firstHalf, endHalf);
-                        if (endHalf == 2U && page + 1U < kvSplitEnd) {
+                        const uint32_t flag = (keyLane ? 7U : 9U) + bank;
+                        const bool resident = page - kvSplitStart < 2U && ((reuseMask >> bank) & 1U);
+                        if (resident) {
+                            // Publish the existing operand after both Cube readers release its bank.
+                            if (firstHalf == 0U) {
+                                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(flag);
+                            }
+                            if (endHalf == 2U) {
+                                AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(flag);
+                            }
+                        } else {
+                            halfDequant.Produce(resource, rows, keyLane ? kOffset : vOffset,
+                                flag, kvSlot, firstHalf, endHalf);
+                        }
+                        if (endHalf == 2U && page + 1U < kvSplitEnd &&
+                            !(page == kvSplitStart && (reuseMask & 2U))) {
                             const uint32_t next = page + 1U;
                             const uint32_t nextRows = next + 1U == kvSLoopNum ? noSkipKvS - next * 128U : 128U;
                             halfDequant.Prefetch(cache, scales, gBlockTable[blockBOffset], kvHeadIdx, kvHeads_,
@@ -1431,7 +1476,7 @@ class FAIKernel950 {
 };
 
 template <bool PipelineColumns, class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
-          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false, bool SingleQueryWindow = false, bool PairedKv = false>
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false, bool SingleQueryWindow = false, bool PairedKv = false, bool ReuseWindowPages = false>
 __aicore__ inline void RunFAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
@@ -1496,7 +1541,7 @@ __aicore__ inline void RunFAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask,
                                                             ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
-                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode, MixedKv, PairedHeads, SingleQueryWindow, PairedKv>;
+                                kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode, MixedKv, PairedHeads, SingleQueryWindow, PairedKv, ReuseWindowPages>;
     FAIKernelParams params{q,
                            k,
                            v,
@@ -1544,6 +1589,19 @@ CATLASS_GLOBAL void FAInferPairedPrefill(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADD
 {
     RunFAInfer<true, InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout,
                LseMode, HasSoftcap, MixedKv, PairedHeads>(
+        q, k, v, mask, blockTables, o, lse, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace,
+        tiling, scaleValue, softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage, kDescale, vDescale);
+}
+
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap, bool MixedKv = false, bool PairedHeads = false>
+CATLASS_GLOBAL void FAInferResidentWindow(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                            GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                            GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
+                            uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
+{
+    RunFAInfer<true, InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout,
+               LseMode, HasSoftcap, MixedKv, PairedHeads, false, false, true>(
         q, k, v, mask, blockTables, o, lse, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace,
         tiling, scaleValue, softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage, kDescale, vDescale);
 }

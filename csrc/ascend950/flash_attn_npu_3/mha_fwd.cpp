@@ -602,6 +602,10 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
     const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;
+    // At GQA16, TP2/TP4 can revisit complete pages in the same L1 bank across Q tiles.
+    const bool reuseWindowPages = mixedKv && launch[2] && is_local && !is_softcap &&
+        window_size_left == 511 && (is_causal || window_size_right == 0) &&
+        num_heads_k <= 2 && num_heads == 16 * num_heads_k && k.is_contiguous() && v.is_contiguous();
     const FwdLaunchArgs fwdArgs{
         is_bf16,
         fmt,
@@ -638,7 +642,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
-        launch[2] != 0};
+        launch[2] != 0, reuseWindowPages};
     auto launch_fa_infer = [pairedDecode, singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
         if (pairedDecode) {
             launch_paired_decode(fwdArgs);
