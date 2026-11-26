@@ -852,7 +852,8 @@ src_ascend950_v3 += glob.glob(
 )
 # Isolated D>256 128x256 partial-resident bwd kernel (compile-isolated from fag_kernel.cpp).
 src_ascend950_v3 += glob.glob(
-    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"), recursive=True
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"),
+    recursive=True,
 )
 src_ascend910_v4 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True

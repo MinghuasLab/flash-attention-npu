@@ -59,9 +59,7 @@ FAG_HEADDIMS = [64, 128, 192, 256, 512]
 
 BOOL_TOKEN = {0: "false", 1: "true"}
 
-PRELUDE = (
-    "// Copyright (c) 2026, Minghua Shen.\n"
-)
+PRELUDE = "// Copyright (c) 2026, Minghua Shen.\n"
 
 
 def _feature_suffix(*features: tuple) -> str:
