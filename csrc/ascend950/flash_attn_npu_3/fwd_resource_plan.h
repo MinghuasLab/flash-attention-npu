@@ -27,6 +27,11 @@ constexpr uint32_t SCORE_STAGES = 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
+constexpr uint32_t STATS_TASK_STAGES = 4;
+constexpr uint32_t STATS_SLOT_ELEM_NUM = 64;
+constexpr uint32_t STATS_SLOT_BYTES = STATS_SLOT_ELEM_NUM * 4U;
+constexpr uint32_t STATS_BYTES = STATS_TASK_STAGES * STATS_SLOT_BYTES;
+
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, mask, lse, total;
     uint32_t sBytes, pBytes, loBytes, goBytes, lseBytes, otmpStages;
@@ -36,8 +41,8 @@ struct UbPlan {
 };
 
 // Exact D512 profile (Dq=Dk=Dv=512, Q tile 128). Score keeps two slots and the
-// DM ring keeps three slots for the in-task PRE_LAUNCH=2 pipeline; P UB, LO and
-// K/V L1 slots are single. LO holds one 64x128 FP32 column piece of the PV
+// DM ring keeps three slots for PRE_LAUNCH=2; LM/GM/GL each keep four
+// cross-task statistics slots. P UB, LO and K/V L1 slots are single. LO holds one 64x128 FP32 column piece of the PV
 // result; GO holds the full 64x512 FP32 accumulator. No mask handle exists:
 // D512 causal/SWA masking is positional. LSE scratch is a dedicated 256 B
 // buffer used only by the restricted single-head fast path.
@@ -56,13 +61,15 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlanD512()
     u.lo = u.p + u.pBytes;             // 82176
     u.go = u.lo + u.loBytes;           // 114944
     u.lm = u.go + u.goBytes;           // 246016
-    u.gm = u.lm + 64U * 4U;            // 246272
-    u.dm = u.gm + 64U * 4U;            // 246528
-    u.ll = u.dm + P_STAGES * 64U * 4U; // 247296
-    u.gl = u.ll + 64U * 4U;            // 247552
+    u.gm = u.lm + STATS_BYTES;         // 247040
+    u.dm = u.gm + STATS_BYTES;         // 248064
+    u.ll = u.dm + P_STAGES * 64U * 4U; // 248832
+    u.gl = u.ll + 64U * 4U;            // 249088
     u.mask = 0U;
-    u.lse = u.gl + 64U * 4U;      // 247808
-    u.total = u.lse + u.lseBytes; // 248064
+    u.lse = u.gl + STATS_BYTES;   // 250112
+    u.total = u.lse + u.lseBytes; // 250368
+    // Four LM/GM/GL slots allow a later task to run softmax while the
+    // previous task's delayed PV is still consuming its statistics.
     return u;
 }
 
@@ -83,11 +90,11 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.lo = u.p + SCORE_STAGES * u.pBytes;
     u.go = u.lo + otmpStages * u.loBytes;
     u.lm = u.go + u.loBytes;
-    u.gm = u.lm + 64U * 4U;
-    u.dm = u.gm + 64U * 4U;
+    u.gm = u.lm + STATS_BYTES;
+    u.dm = u.gm + STATS_BYTES;
     u.ll = u.dm + P_STAGES * 64U * 4U;
     u.gl = u.ll + 64U * 4U;
-    u.mask = u.gl + 64U * 4U;
+    u.mask = u.gl + STATS_BYTES;
     u.lse = 0U;
     u.total = u.mask + 2U * 64U * 128U;
     return u;
@@ -116,11 +123,11 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.lo = 128U * 1024U;
     u.go = 192U * 1024U;
     u.lm = 224U * 1024U;
-    u.gm = u.lm + 256U;
-    u.dm = u.gm + 256U;
+    u.gm = u.lm + STATS_BYTES;
+    u.dm = u.gm + STATS_BYTES;
     u.ll = u.dm + 768U;
     u.gl = u.ll + 256U;
-    u.mask = u.gl + 256U;
+    u.mask = u.gl + STATS_BYTES;
     u.total = u.mask + 16384U;
     return u;
 }
@@ -168,17 +175,17 @@ FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, 
 }
 
 static_assert(MakeUbPlanD512().s == 0U && MakeUbPlanD512().p == 65536U && MakeUbPlanD512().lo == 82176U &&
-                  MakeUbPlanD512().go == 114944U && MakeUbPlanD512().lm == 246016U && MakeUbPlanD512().dm == 246528U &&
-                  MakeUbPlanD512().gl == 247552U && MakeUbPlanD512().lse == 247808U &&
-                  MakeUbPlanD512().total == 248064U,
+                  MakeUbPlanD512().go == 114944U && MakeUbPlanD512().lm == 246016U && MakeUbPlanD512().dm == 248064U &&
+                  MakeUbPlanD512().gl == 249088U && MakeUbPlanD512().lse == 250112U &&
+                  MakeUbPlanD512().total == 250368U,
               "D512 UB offsets");
 static_assert(MakeUbPlanD512().total <= UB_CAPACITY, "D512 UB capacity");
 static_assert(MakeUbPlanD512().loBytes == 32768U && MakeUbPlanD512().goBytes == 131072U, "D512 LO/GO capacities");
 static_assert(MakeUbPlanD512().pStages == 1U && MakeUbPlanD512().otmpStages == 1U, "D512 single-slot stages");
 static_assert(D512L1Bytes() == 491520U && D512L1Bytes() <= L1_CAPACITY, "D512 L1 capacity");
-static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
-static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
-static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
+static_assert(MakeUbPlan(160, 2).total == 242176U, "D160 dual-buffer layout");
+static_assert(MakeUbPlan(192, 1).total == 217600U, "D192 single-buffer layout");
+static_assert(MakeUbPlan(256, 1).total == 250368U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan

@@ -167,6 +167,7 @@ class FAIKernel950 {
         // tiling data
 
         batch_ = faiTilingData->batch;
+        qL1BufNum_ = faiTilingData->qL1BufNum == 2U ? 2U : 1U;
         qHeads_ = faiTilingData->numHeads;
         kvHeads_ = faiTilingData->kvHeads;
         firstBatchTaskNum_ = faiTilingData->firstBatchTaskNum;
@@ -293,6 +294,7 @@ class FAIKernel950 {
             taskStep = 1U;
         }
         uint32_t pipelineTileBase = 0U;
+        uint32_t taskSeq = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
         for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
@@ -491,6 +493,9 @@ class FAIKernel950 {
                 }
             }
             const uint32_t kvSLoopCount = kvSplitEnd - kvSplitStart;
+            if (kvSLoopCount == 0U) {
+                continue;
+            }
 
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
@@ -499,8 +504,9 @@ class FAIKernel950 {
             auto gmQLayoutTla = tla::MakeLayout<ElementQ, LayoutQ>(qShapeCol, qBaseTile_);
             auto gmQTensorTla = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTla, Arch::PositionGM{});
 
+            const Gemm::Block::QueryL1Slot qSlot{taskSeq & (qL1BufNum_ - 1U)};
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
-            blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+            blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride, qSlot);
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
                 kShapeRow = numBlocks_ * blockSize_;
@@ -545,9 +551,9 @@ class FAIKernel950 {
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK, blockSize_,
                                 kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0, qSBlockSize,
-                                qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                                qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages, qSlot);
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
                     }
 #endif
                     uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
@@ -620,6 +626,7 @@ class FAIKernel950 {
 #endif
                 }
             }
+            ++taskSeq;
             pipelineTileBase += kvSLoopCount;
             pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0ATotalStages_ + pvL0ATotalStages_);
             pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
@@ -646,6 +653,9 @@ class FAIKernel950 {
         // same core sync between pipes
         // Query
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         // Key
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
@@ -709,6 +719,9 @@ class FAIKernel950 {
 #ifdef __DAV_CUBE__
         // same core sync between pipes
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
@@ -836,7 +849,7 @@ class FAIKernel950 {
     static constexpr uint32_t pvL1TileN_ = embedV_;
     static constexpr uint32_t pvL1TileKLeft_ = kvBaseTile_;
     static constexpr uint32_t pvL1TileKRight_ = kvBaseTile_;
-    static constexpr uint32_t qL1BufNum_ = 1;
+    uint32_t qL1BufNum_;
     static constexpr uint32_t kL1BufNum_ = 2;
     static constexpr uint32_t vL1BufNum_ = 2;
     static constexpr uint32_t pL1BufNum_ = 3;

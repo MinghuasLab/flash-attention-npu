@@ -1689,3 +1689,32 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     assert_fa_close(out_meta, golden_out_ref, golden_out_pt, softcap=softcap, name="meta_out")
     assert_fa_close(lse_host, golden_lse_ref, golden_lse_pt, softcap=softcap, name="host_lse")
     assert_fa_close(lse_meta, golden_lse_ref, golden_lse_pt, softcap=softcap, name="meta_lse")
+
+
+def test_950_flashdecode_with_empty_batches_matches_active_sequence():
+    if "Ascend950" not in _device_name:
+        pytest.skip("Ascend950 FlashDecode task scheduling")
+
+    torch.manual_seed(17)
+    heads, dim, q_len, k_len = 4, 128, 3, 2048
+    q, k, v = [
+        (torch.randn(length, heads, dim) * 0.4).to(dtype=torch.bfloat16, device="npu")
+        for length in (q_len, k_len, k_len)
+    ]
+    # The third sequence is active. Normal forward can group its four KV
+    # heads, whereas the split-KV combiner owns one base task per head.
+    cu_q = torch.tensor([0] * 3 + [q_len] * 62, dtype=torch.int32, device="npu")
+    used_k = torch.tensor([0, 0, k_len] + [0] * 61, dtype=torch.int32, device="npu")
+    page = torch.arange(k_len // 128, dtype=torch.int32, device="npu").repeat(64, 1)
+    k = k.reshape(-1, 128, heads, dim)
+    v = v.reshape_as(k)
+    args = dict(max_seqlen_q=q_len, max_seqlen_k=k_len, num_splits=2, return_lse=True)
+    actual_o, actual_lse, *_ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_q, seqused_k=used_k, page_table=page, **args
+    )
+    single_q = torch.tensor([0, q_len], dtype=torch.int32, device="npu")
+    expected_o, expected_lse, *_ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=single_q, seqused_k=used_k[2:3], page_table=page[2:3], **args
+    )
+    torch.testing.assert_close(actual_o, expected_o, rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)

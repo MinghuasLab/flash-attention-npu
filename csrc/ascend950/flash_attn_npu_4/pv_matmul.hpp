@@ -20,6 +20,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
+#include "fused_task.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -28,6 +29,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
+#include "fused_copy.hpp"
 
 ////////////////////////////////////////////////////////////////////
 #ifndef KERNEL_COMMON
@@ -240,14 +242,17 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::DataCopy(l1BTile.data()[dstOffset], gBTile.data()[srcOffset], repeatParams);
     }
 
-    template <class TensorB, class TensorC>
+    // Segmented == false compiles to the plain single-tile PV pipeline.
+    template <bool Segmented = false, class TensorB, class TensorC>
     __aicore__ inline void
     operator()(TensorB& gBTensor, TensorC& ubCTensor, AscendC::GlobalTensor<int32_t> gBlockTable,
                GemmCoord actualOriShape, uint32_t blockSize, uint32_t kvSTileIdx, uint32_t pipelineTileSeq,
                uint32_t kvSeqlenTriDown, uint32_t kvHeads, uint32_t kvNumTokens, uint32_t kvSBaseTile,
                uint32_t isShrink, uint32_t globalWindowSize, uint32_t localWindowSize,
                Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag, uint64_t prefixSumL0AStages,
-               uint64_t prefixSumL0BStages, bool d512PieceDelivery = false)
+               uint64_t prefixSumL0BStages, bool d512PieceDelivery = false, uint32_t pL1Offset = 0U,
+               uint32_t rowOffset = 0U, uint32_t totalRows = 0U, bool firstSegment = true, bool lastSegment = true,
+               uint32_t segIdx = 0U, uint32_t segTotal = 1U)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -259,8 +264,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[2];
         uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
-
-        uint32_t l1BBufId = pipelineTileSeq % l1BBufNum;
+        // Rotate V buffers across segments without changing the single-tile path.
+        uint32_t l1BBufId = Segmented ? (pipelineTileSeq * segTotal + segIdx) % l1BBufNum : pipelineTileSeq % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 3;
         uint32_t l1ABufId = pipelineTileSeq % l1ABufNum;
 
@@ -272,7 +277,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             pKvStride = RoundUp(curBaseTileSize, 2 * C0_ELEMS);
         }
         auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, pKvStride);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[l1ABufId], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[l1ABufId][pL1Offset], l1ALayoutTla, Arch::PositionL1{});
         // load V full base tile to L1 before crossCoreSync
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
 
@@ -421,11 +426,19 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         // fwd crossCoreSync from online sm to pv
-        WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+        if (Segmented) {
+            if (firstSegment) {
+                WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+            }
+        } else {
+            WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+        }
         // P full base tile already on L1
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
+        constexpr bool singleTile = std::is_same_v<ElementA, half> || std::is_same_v<ElementA, bfloat16_t>;
+        static_assert(!singleTile || (L0_TILE_M >= fa950_task::MAX_Q_ROWS && L0_TILE_K >= fa950_task::KV_TILE));
+        const uint32_t mL0LoopNum = singleTile ? 1U : CeilDiv(rowNum, L0_TILE_M);
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
-        uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
+        const uint32_t kL0LoopNum = singleTile ? 1U : CeilDiv(curBaseTileSize, L0_TILE_K);
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
@@ -496,7 +509,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
                     // reverse crossCoreSync for P
                     if ((mL0Itr == mL0LoopNum - 1) && (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
-                        SetCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+                        if (!Segmented || lastSegment) {
+                            SetCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
+                        }
                     }
 
                     bool initMmad = (kL0Itr == 0);
@@ -515,10 +530,9 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 }
             }
             // fixpipe
-            if (nL0Itr == 0 || d512PieceDelivery) {
-                // reverse crossCoreSync, do fixPipe only after ubCTensor is fully released.
-                // D512 delivers every 128-column piece into the single LO slot,
-                // so each piece waits for its own free before the FixPipe.
+            // D512 reuses one LO slot per 128-column piece; segmented PV
+            // waits only before the first segment's first FixPipe.
+            if (d512PieceDelivery || ((!Segmented || firstSegment) && nL0Itr == 0)) {
                 WaitCrossCoreSync<4, PIPE_FIX>(pvReadyFlag);
             }
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
@@ -527,7 +541,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             // rounded up by 8 and splited in half to each AIV
             // valid rows in AIV0: [0, mFixPAligned8 / 2 - 1]
             // valid rows in AIV1: [mFixPAligned8 / 2, rowNum - 1]
-            if constexpr (!ENABLE_DN_) {
+            if constexpr (Segmented) {
+                CopyFusedSegmentToUB(ubCTensor, l0CTensorTla, rowOffset, rowNum, totalRows, nL0Itr * L0_TILE_N,
+                                     l0TileNPhysical);
+            } else if constexpr (!ENABLE_DN_) {
                 uint32_t mFixPAligned8 = RoundUp(rowNum, 8);
                 // D512 LO column offset is always 0; legacy buffers append
                 // pieces side by side in one embedV-wide LO.
@@ -551,7 +568,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             }
         }
         // crossCoreSync after all fixPipe move
-        if (!d512PieceDelivery) {
+        if (!d512PieceDelivery && (!Segmented || lastSegment)) {
             SetCrossCoreSync<4, PIPE_FIX>(pvReadyFlag);
         }
     }

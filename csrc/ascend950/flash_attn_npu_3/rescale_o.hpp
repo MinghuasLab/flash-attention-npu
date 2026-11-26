@@ -70,10 +70,16 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(GO_UB_TENSOR_OFFSET);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(GO_UB_TENSOR_OFFSET);
-        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
-        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
-        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
+        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
+        for (uint32_t i = 0; i < fa950_plan::STATS_TASK_STAGES; ++i) {
+            lmSlotByteOff_[i] = LM_UB_TENSOR_OFFSET + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            gmSlotByteOff_[i] = GM_UB_TENSOR_OFFSET + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            glSlotByteOff_[i] = GL_UB_TENSOR_OFFSET + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+        }
+        SetStatsSlot(0U);
     }
 
     __aicore__ inline BlockEpilogue(Arch::Resource<ArchTag>& resource, const UBufTileHelper& ub)
@@ -84,10 +90,16 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.goStartOffset);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(ub.goStartOffset);
-        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lmStartOffset);
-        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
-        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
+        for (uint32_t i = 0; i < fa950_plan::STATS_TASK_STAGES; ++i) {
+            lmSlotByteOff_[i] = ub.lmStartOffset + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            gmSlotByteOff_[i] = ub.gmStartOffset + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            glSlotByteOff_[i] = ub.glStartOffset + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+        }
+        SetStatsSlot(0U);
     }
 
     template <class Resource>
@@ -99,14 +111,30 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.go);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(ub.go);
-        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lm);
-        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
-        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(0);
         if (ub.lseBytes != 0U) {
             lseOutUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lse);
             hasLseScratch_ = true;
         }
+        for (uint32_t i = 0; i < fa950_plan::STATS_TASK_STAGES; ++i) {
+            lmSlotByteOff_[i] = ub.lm + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            gmSlotByteOff_[i] = ub.gm + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+            glSlotByteOff_[i] = ub.gl + i * fa950_plan::STATS_SLOT_ELEM_NUM * sizeof(float);
+        }
+        SetStatsSlot(0U);
+    }
+
+    // Read the statistics of the task that produced this delayed PV tile.
+    // Three integer stores; the LocalTensor objects stay at the UB base so the
+    // AIV scalar path does not copy 96 B descriptors per KV tile.
+    __aicore__ inline void SetStatsSlot(uint32_t slot)
+    {
+        lmByteOff_ = lmSlotByteOff_[slot];
+        gmByteOff_ = gmSlotByteOff_[slot];
+        glByteOff_ = glSlotByteOff_[slot];
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -193,7 +221,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
 
         __ubuf__ ElementOTmp* goUb = (__ubuf__ ElementOTmp*)goUbTensor32.GetPhyAddr();
         __ubuf__ ElementOTmp* loUb = (__ubuf__ ElementOTmp*)loUbTensor[ubOTmpBufId].GetPhyAddr();
-        __ubuf__ ElementOTmp* glUb = (__ubuf__ ElementOTmp*)glUbTensor32.GetPhyAddr();
+        __ubuf__ ElementOTmp* glUb = (__ubuf__ ElementOTmp*)GlAddr();
         __ubuf__ ElementOTmp* dmUb =
             (__ubuf__ ElementOTmp*)dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
 
@@ -224,8 +252,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         if (isLastKvSTile) {
             AscendC::PipeBarrier<PIPE_V>();
             if (writePartial) {
-                ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
-                           (__ubuf__ float*)lmUbTensor32.GetPhyAddr(), rowNumCurSubCore);
+                ComputeLse((__ubuf__ float*)GlAddr(), (__ubuf__ float*)GmAddr(), (__ubuf__ float*)LmAddr(),
+                           rowNumCurSubCore);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -241,7 +269,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
                 const uint64_t partialLseRow = (static_cast<uint64_t>(partialId) * 2U + subBlockIdx) * fdLseSubStride;
                 AscendC::DataCopyPad(
-                    gPartialLse[partialLseRow], lmUbTensor32,
+                    gPartialLse[partialLseRow], lmUbTensor32[lmByteOff_ / sizeof(float)],
                     AscendC::DataCopyExtParams(1, static_cast<uint32_t>(rowNumCurSubCore * sizeof(float)), 0, 0, 0));
                 // LM is also the next base task's online-softmax max buffer.
                 // Protect this DMA read before returning to that softmax;
@@ -358,7 +386,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         constexpr uint32_t LO_COLS = 128U;
         __ubuf__ ElementOTmp* goUb = (__ubuf__ ElementOTmp*)goUbTensor32.GetPhyAddr();
         __ubuf__ ElementOTmp* loUb = (__ubuf__ ElementOTmp*)loUbTensor[0].GetPhyAddr();
-        __ubuf__ ElementOTmp* glUb = (__ubuf__ ElementOTmp*)glUbTensor32.GetPhyAddr();
+        __ubuf__ ElementOTmp* glUb = (__ubuf__ ElementOTmp*)GlAddr();
         __ubuf__ ElementOTmp* dmUb =
             (__ubuf__ ElementOTmp*)dmUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
 
@@ -396,8 +424,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             AscendC::PipeBarrier<PIPE_V>();
         }
         if (writePartial) {
-            ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
-                       (__ubuf__ float*)lmUbTensor32.GetPhyAddr(), rowNumCurSubCore);
+            ComputeLse((__ubuf__ float*)GlAddr(), (__ubuf__ float*)GmAddr(), (__ubuf__ float*)LmAddr(),
+                       rowNumCurSubCore);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -412,7 +440,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
             const uint64_t partialLseRow = (static_cast<uint64_t>(partialId) * 2U + subBlockIdx) * fdLseSubStride;
             AscendC::DataCopyPad(
-                gPartialLse[partialLseRow], lmUbTensor32,
+                gPartialLse[partialLseRow], lmUbTensor32[lmByteOff_ / sizeof(float)],
                 AscendC::DataCopyExtParams(1, static_cast<uint32_t>(rowNumCurSubCore * sizeof(float)), 0, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
@@ -532,7 +560,7 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
             // The dedicated 256-byte scratch keeps LSE independent of the
             // preceding O DMA: no wait for MTE3_V(4) and no GO aliasing.
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
-            ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
+            ComputeLse((__ubuf__ float*)GlAddr(), (__ubuf__ float*)GmAddr(),
                        (__ubuf__ float*)lseOutUbTensor32.GetPhyAddr(), rowCount);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
@@ -543,15 +571,14 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::PipeBarrier<PIPE_V>();
-        ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
-                   (__ubuf__ float*)lmUbTensor32.GetPhyAddr(), rowCount);
+        ComputeLse((__ubuf__ float*)GlAddr(), (__ubuf__ float*)GmAddr(), (__ubuf__ float*)LmAddr(), rowCount);
         AscendC::PipeBarrier<PIPE_V>();
         // Brcb expands each scalar LSE into one contiguous 32-byte block.
         // That block-aligned source is required by DataCopyPad for its 4-byte
         // strided GM stores.
         AscendC::Brcb(goUbTensor32.template ReinterpretCast<uint32_t>(),
-                      lmUbTensor32.template ReinterpretCast<uint32_t>(), CeilDiv(rowCount, FLOAT_BLOCK_SIZE),
-                      AscendC::BrcbRepeatParams(1, 8));
+                      lmUbTensor32[lmByteOff_ / sizeof(float)].template ReinterpretCast<uint32_t>(),
+                      CeilDiv(rowCount, FLOAT_BLOCK_SIZE), AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
         if (fullyMaskedRowsPerHead != 0U) {
             if (qNBlockSize == 1U) {
@@ -1040,6 +1067,26 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> lmUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor32;
     AscendC::LocalTensor<float> lseOutUbTensor32;
+    // Per-task statistics slots as byte offsets from the UB base tensors.
+    uint32_t lmSlotByteOff_[fa950_plan::STATS_TASK_STAGES];
+    uint32_t gmSlotByteOff_[fa950_plan::STATS_TASK_STAGES];
+    uint32_t glSlotByteOff_[fa950_plan::STATS_TASK_STAGES];
+    uint32_t lmByteOff_ = 0U;
+    uint32_t gmByteOff_ = 0U;
+    uint32_t glByteOff_ = 0U;
+
+    __aicore__ inline uint64_t LmAddr()
+    {
+        return lmUbTensor32.GetPhyAddr() + lmByteOff_;
+    }
+    __aicore__ inline uint64_t GmAddr()
+    {
+        return gmUbTensor32.GetPhyAddr() + gmByteOff_;
+    }
+    __aicore__ inline uint64_t GlAddr()
+    {
+        return glUbTensor32.GetPhyAddr() + glByteOff_;
+    }
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 

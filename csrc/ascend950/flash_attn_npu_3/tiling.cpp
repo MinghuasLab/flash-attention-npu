@@ -180,7 +180,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.quantMode = quantMode;
     auto embeddingSizeAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
-    auto qkL1TileM_ = Q_TILE_CEIL;
+    auto qkL1TileM_ = qBaseTile_;
     auto qkL1TileKLeft_ = embeddingSizeAligned16_;
     auto qL1BufNum_ = 1;
     // K矩阵开启2buf，D按128分割，S2按256分割
@@ -193,7 +193,7 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     auto pvL1TileKLeft_ = kvBaseTile_;
     auto vL1BufNum_ = 2;
     // P矩阵在950上会常驻L1，由于基块的prelaunch为2，因此最好有3 buf，以免基块间流水阻塞
-    auto pvL1TileM_ = Q_TILE_CEIL;
+    auto pvL1TileM_ = qBaseTile_;
     auto pvL1TileKRight_ = kvBaseTile_;
     auto pL1BufNum_ = 3;
 
@@ -563,6 +563,7 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
 {
     uint32_t totalTaskNum = 0;
+    faTilingData.fusedCrossGroup = 0U;
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
     for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
         uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
@@ -575,12 +576,12 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
                 kvSeqlen = *(faInfo_.kvSeqlenList + batchIdx + 1) - prevKvSeqlenSum;
             }
         }
-        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
-        uint32_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint32_t curQNBlockNum = qNBlockNumPerGroup * faInfo_.kvHeads;
-        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
-        uint32_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const auto shape =
+            fa950_task::MakeShape(qSeqlen, faInfo_.numHeads, faInfo_.kvHeads, qBaseTile_, faInfo_.batch, blockNum_,
+                                  faInfo_.layout != FwdLayout::TND, faInfo_.dataType == DataType::FP8,
+                                  faInfo_.maskType != MaskType::NO_MASK, faInfo_.maxKvSeqlen <= BASE_KV_SIZE);
+        const uint32_t curTaskNum = shape.totalTasks;
+        faTilingData.fusedCrossGroup |= shape.tailRows && shape.tailHeadTile > groupSize;
         if (batchIdx == 0) {
             faTilingData.set_firstBatchTaskNum(curTaskNum);
         }

@@ -486,9 +486,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     } else if (return_softmax_lse) {
         softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    if (return_softmax_lse) {
-        softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    }
     at::Tensor workspace;
     if (flashDecodeEnabled) {
         workspace =

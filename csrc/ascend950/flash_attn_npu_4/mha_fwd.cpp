@@ -200,7 +200,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         seqlen_q = static_cast<int>(sizes[2]);
     }
 
-    int64_t kv_seqlen_allocated = 0;
+    int64_t kv_seqlen_allocated = !paged_KV && k.dim() == 4 ? k.size(1) : 0;
     if (layout_enum == FwdLayout::BNSD) {
         // BNSD requires Q, K and V to share the same rank-4 (B, H, S, D) layout.
         TORCH_CHECK(!paged_KV && !is_varlen_kv && k.dim() == 4 && v.dim() == 4,
@@ -410,9 +410,6 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     } else {
         softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    if (return_lse) {
-        softmaxlse.fill_(std::numeric_limits<float>::infinity());
-    }
 
     // ============================================================
     // 9. Static scheduling and per-call execution data have separate device ABIs.
@@ -535,12 +532,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
+    // Causal and SWA visibility are derived from Q/K positions in UB;
+    // neither the D512 nor the standard path needs a device-side mask.
     uint8_t* maskDev = nullptr;
-    at::Tensor mask_npu_tensor;
-    if ((is_causal || is_local) && quantMode == 0 && !d512_heads) {
-        mask_npu_tensor = MakeDeviceTriuMask();
-        maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-    }
 
     const bool enableDN =
         !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
