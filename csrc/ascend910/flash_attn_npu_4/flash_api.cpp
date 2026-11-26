@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
+#include "../../profiling/fa_profile.hpp"
 #include <torch/extension.h>
 #include "../attention_window.h"
 
@@ -50,8 +51,9 @@ extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
-                                           const std::optional<at::Tensor>& seqlensQ)
+                                           const std::optional<at::Tensor>& seqlensQ, Writer&& write)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(false));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -63,8 +65,11 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     // Submit on the caller's stream so metadata is ordered relative to inputs and
     // same-stream consumers. Cross-stream consumers require an explicit dependency.
     FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, metaArgs]() mutable -> int {
-        ComputeFAMetadataV4<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
+    fa_profile::TensorInfo profile("910/FA4/ComputeFAMetadataV4",
+                                   {{"seqused_k", &seqlensK}, {"seqlens_q", fa_profile::Tensor(seqlensQ)}}, {&meta},
+                                   write);
+    auto metadata_task = [curHandle, metaArgs, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadataV4<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -484,11 +489,17 @@ std::vector<at::Tensor> mha_fwd(
             ACL_CHECK(aclrtCreateEventExWithFlag(&rtEvents.runtimeDone, event_flags));
         }
 
+        fa_profile::TensorInfo runtimeProfile(
+            "910/FA4/WriteFARuntime", {}, {&runtime_gpu_tensor}, [&](std::ostream& fields) {
+                fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+                fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+            });
         auto write_runtime_task = [curHandle = aclStream, rtHandle, inputReady = rtEvents.inputReady,
-                                   runtimeDone = rtEvents.runtimeDone, fwdRuntimeArgs]() mutable -> int {
+                                   runtimeDone = rtEvents.runtimeDone, fwdRuntimeArgs,
+                                   profile = std::move(runtimeProfile)]() mutable -> int {
             ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
             ACL_CHECK(aclrtStreamWaitEvent(rtHandle, inputReady));
-            WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs));
+            profile([&] { WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs)); });
             ACL_CHECK(aclrtRecordEvent(runtimeDone, rtHandle));
             ACL_CHECK(aclrtStreamWaitEvent(curHandle, runtimeDone));
             return 0;
@@ -719,15 +730,44 @@ std::vector<at::Tensor> mha_fwd(
     // from reading uninitialized tiling on the first call in a fresh process.
     // seqlenk_gpu_tensor is captured by value to keep it alive for the deferred
     // task (the lambda outlives the local tensor scope).
-    auto launch_fa_infer = [fwd_args, seqlenk_gpu_tensor, learnable_sink_hold]() -> int {
-        (void)learnable_sink_hold;
-        if (fwd_args.layout == FaiKenel::inputLayout::TND) {
-            launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
-        } else if (fwd_args.layout == FaiKenel::inputLayout::BNSD) {
-            launch_fwd<FaiKenel::inputLayout::BNSD>(fwd_args);
-        } else {
-            launch_fwd<FaiKenel::inputLayout::BSND>(fwd_args);
-        }
+    fa_profile::TensorInfo profile(
+        "910/FA4/FAInfer",
+        {{"q", &q},
+         {"k", &k},
+         {"v", &v},
+         {nullptr, &mask_gpu_tensor},
+         {"page_table", &block_table},
+         {"cu_seqlens_q", is_varlen_q ? &seqlenq_gpu_tensor : nullptr, "q_seq"},
+         {is_varlen_kv ? "cu_seqlens_k" : (seqused_k_ ? "seqused_k" : nullptr), &seqlenk_gpu_tensor, "kv_seq"},
+         {"seqused_q", fa_profile::Tensor(seqused_q_)},
+         {"seqused_k", is_varlen_kv ? fa_profile::Tensor(seqused_k_) : nullptr},
+         {"qv", has_q_v ? fa_profile::Tensor(q_v_) : nullptr},
+         {"learnable_sink", &learnable_sink_hold},
+         {"scheduler_metadata", use_explicit_metadata ? fa_profile::Tensor(scheduler_metadata_) : nullptr}},
+        {&out, &softmaxlse}, [&](std::ostream& fields) {
+            fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+            fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+            if (is_varlen_q && max_seqlen_q_) {
+                fields << " max_seqlen_q=" << *max_seqlen_q_;
+            }
+            if (max_seqlen_k_) {
+                fields << " max_seqlen_k=" << *max_seqlen_k_;
+            }
+            if (paged_KV && is_varlen_q && !mlaDecodeGemvShape) {
+                fields << " num_splits=" << num_splits;
+            }
+        });
+    auto launch_fa_infer = [fwd_args, seqlenk_gpu_tensor, learnable_sink_hold, profile = std::move(profile)]() -> int {
+        profile([&] {
+            (void)learnable_sink_hold;
+            if (fwd_args.layout == FaiKenel::inputLayout::TND) {
+                launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
+            } else if (fwd_args.layout == FaiKenel::inputLayout::BNSD) {
+                launch_fwd<FaiKenel::inputLayout::BNSD>(fwd_args);
+            } else {
+                launch_fwd<FaiKenel::inputLayout::BSND>(fwd_args);
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -793,8 +833,14 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlenKv = 0U; // cache_seqlens is always per-batch (python-normalized)
     args.numSplits = static_cast<uint32_t>(num_splits);
     args.isLocal = is_local_meta ? 1U : 0U;
+    const auto write = [&](std::ostream& fields) {
+        fields << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k << " nheads=" << num_heads_q
+               << " nheads_kv=" << num_heads_kv << " headdim=" << headdim << " headdim_v=" << headdim_v
+               << " causal=" << causal << " window_size_left=" << window_left << " window_size_right=" << window_right
+               << " num_splits=" << num_splits;
+    };
     return GetSchedulerMetadataImpl(args, cache_seqlens,
-                                    seqlens_q.defined() ? std::optional<at::Tensor>(seqlens_q) : std::nullopt);
+                                    seqlens_q.defined() ? std::optional<at::Tensor>(seqlens_q) : std::nullopt, write);
 }
 
 std::vector<at::Tensor> mha_bwd(
@@ -1181,6 +1227,10 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.dvDevice = dvDevice;
     bwd_args.workspaceDevice = workspaceDevice;
     bwd_args.tilingDevice = tilingDevice;
+    bwd_args.profile =
+        fa_profile::ShareTensors({&dout, &q, &k, &v, &out, &mask_gpu_tensor, &softmax_lse, &seqlenq_gpu_tensor,
+                                  &seqlenk_gpu_tensor, fa_profile::Tensor(seqused_q_), fa_profile::Tensor(seqused_k_)},
+                                 {&dq, &dk, &dv});
     // Keep v3/v4 on the same CATLASS backward route.
     if (is_varlen_q) {
         launch_bwd<TND>(bwd_args);
@@ -1392,14 +1442,18 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
     const bool is_fp16 = (out_type == at::kHalf);
     const bool is_bf16 = (out_type == at::kBFloat16);
-    auto launch_combine = [args, is_fp16, is_bf16]() -> int {
-        if (is_fp16) {
-            launch_combine_fp16(args);
-        } else if (is_bf16) {
-            launch_combine_bf16(args);
-        } else {
-            launch_combine_fp32(args);
-        }
+    fa_profile::TensorInfo profile({&out_partial, &lse_partial, fa_profile::Tensor(virtual_batch_idx)},
+                                   {&out, return_lse ? &lse_out : nullptr});
+    auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
+        profile([&] {
+            if (is_fp16) {
+                launch_combine_fp16(args);
+            } else if (is_bf16) {
+                launch_combine_bf16(args);
+            } else {
+                launch_combine_fp32(args);
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_combine", launch_combine);
@@ -1408,6 +1462,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
 PYBIND11_MODULE(flash_attn_npu_4, m)
 {
+    fa_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention";
     m.def("_clear_device_mask_cache", &ClearDeviceTriuMaskCache);
     py::module_::import("atexit").attr("register")(m.attr("_clear_device_mask_cache"));
@@ -1418,7 +1473,11 @@ PYBIND11_MODULE(flash_attn_npu_4, m)
           py::arg("max_seqlen_k"), py::arg("softmax_scale"), py::arg("is_causal"), py::arg("window_size_left"),
           py::arg("window_size_right"), py::arg("softcap"), py::arg("deterministic"), py::arg("sm_margin"),
           py::arg("layout"), py::arg("original_qk_gt_v") = false);
-    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
+    m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU",
+          py::arg("batch_size"), py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("num_heads_q"),
+          py::arg("num_heads_kv"), py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"),
+          py::arg("cu_seqlens_q"), py::arg("causal"), py::arg("window_left"), py::arg("window_right"),
+          py::arg("num_splits"), py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("seqused_q"));
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
           py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
           py::arg("cu_seqlens") = py::none(), py::arg("seqused") = py::none(),

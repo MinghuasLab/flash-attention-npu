@@ -19,9 +19,11 @@
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
-                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime)
+                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime,
+                                           const char* kv_name, Writer&& write)
 {
     auto metadata =
         at::empty({static_cast<int64_t>(fa_metadata::MetadataBytes(false))}, cache_seqlens.options().dtype(at::kByte));
@@ -29,8 +31,13 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     const auto current = c10_npu::getCurrentNPUStream();
     const auto current_handle = current.stream(false);
     // The calling stream orders the length producers, metadata write and forward consumer.
-    auto task = [current_handle, args]() mutable -> int {
-        ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args));
+    fa_profile::TensorInfo profile("950/FA4/ComputeFAMetadata",
+                                   {{kv_name, &cache_seqlens},
+                                    {"cu_seqlens_q", fa_profile::Tensor(cu_seqlens_q)},
+                                    {"seqused_q", fa_profile::Tensor(seqused_q)}},
+                                   {&metadata, &runtime}, write);
+    auto task = [current_handle, args, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", task);
@@ -112,7 +119,15 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.maskType = normalized_causal ? 1 : (local ? 2 : 0);
     args.windowSizeLeft = window_left;
     args.windowSizeRight = window_right;
-    return GetSchedulerMetadataImpl(args, kv_lengths, cu_seqlens_q, seqused_q);
+    const auto write = [&](std::ostream& fields) {
+        fields << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k << " nheads=" << num_heads_q
+               << " nheads_kv=" << num_heads_kv << " headdim=" << headdim << " headdim_v=" << headdim_v
+               << " causal=" << causal << " window_size_left=" << window_left << " window_size_right=" << window_right
+               << " num_splits=" << num_splits;
+        fields << " quant_mode=" << args.quantMode;
+    };
+    return GetSchedulerMetadataImpl(args, kv_lengths, cu_seqlens_q, seqused_q, {},
+                                    use_cache_seqlens ? "seqused_k" : "cu_seqlens_k", write);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,14 +323,18 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
     const bool is_fp16 = (out_type == at::kHalf);
     const bool is_bf16 = (out_type == at::kBFloat16);
-    auto launch_combine = [args, is_fp16, is_bf16]() -> int {
-        if (is_fp16) {
-            launch_combine_fp16(args);
-        } else if (is_bf16) {
-            launch_combine_bf16(args);
-        } else {
-            launch_combine_fp32(args);
-        }
+    fa_profile::TensorInfo profile({&out_partial, &lse_partial, fa_profile::Tensor(virtual_batch_idx)},
+                                   {&out, return_lse ? &lse_out : nullptr});
+    auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
+        profile([&] {
+            if (is_fp16) {
+                launch_combine_fp16(args);
+            } else if (is_bf16) {
+                launch_combine_bf16(args);
+            } else {
+                launch_combine_fp32(args);
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_combine", launch_combine);
@@ -324,6 +343,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
 PYBIND11_MODULE(flash_attn_npu_4_950, m)
 {
+    fa_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention v4 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)", py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("qv"), py::arg("out"), py::arg("cu_seqlens_q"), py::arg("cu_seqlens_k"), py::arg("seqused_q"),

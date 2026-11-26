@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
+#include "../../profiling/fa_profile.hpp"
 #include <torch/extension.h>
 #include "../attention_window.h"
 
@@ -101,8 +102,9 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
 
 // Submit on the caller's stream so metadata is ordered relative to inputs and
 // same-stream consumers. Cross-stream consumers require an explicit dependency.
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
-                                           const std::optional<at::Tensor>& cuSeqlensQ)
+                                           const std::optional<at::Tensor>& cuSeqlensQ, Writer&& write)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -112,8 +114,11 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     aclrtStream curHandle = currentStream.stream(false);
 
     FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, metaArgs]() mutable -> int {
-        ComputeFAMetadataV2<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
+    fa_profile::TensorInfo profile("910/FA2/ComputeFAMetadataV2",
+                                   {{"cache_seqlens", &seqlensK}, {"cu_seqlens_q", fa_profile::Tensor(cuSeqlensQ)}},
+                                   {&meta}, write);
+    auto metadata_task = [curHandle, metaArgs, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadataV2<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata_v2", metadata_task);
@@ -620,8 +625,26 @@ std::vector<at::Tensor> mha_fwd_kvcache(
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
-    auto launch_fa_infer = [fwd_args]() -> int {
-        launch_fwd(fwd_args);
+    fa_profile::TensorInfo profile("910/FA2/fwd_kvcache",
+                                   {{"q", &q},
+                                    {"k_cache", &kcache},
+                                    {"v_cache", &vcache},
+                                    {nullptr, &mask_gpu_tensor},
+                                    {"block_table", &block_table},
+                                    {seqlens_k_ ? "cache_seqlens" : nullptr, &seqlens_k},
+                                    {"k", appendKV ? fa_profile::Tensor(k_) : nullptr},
+                                    {"v", appendKV ? fa_profile::Tensor(v_) : nullptr},
+                                    {"alibi_slopes", fa_profile::Tensor(alibi_slopes_)},
+                                    {"scheduler_metadata", fa_profile::Tensor(scheduler_metadata_)}},
+                                   {&out, &softmaxlse}, [&](std::ostream& fields) {
+                                       fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+                                       fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+                                       if (paged_KV) {
+                                           fields << " num_splits=" << num_splits;
+                                       }
+                                   });
+    auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
+        profile([&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -890,8 +913,21 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
-    auto launch_fa_infer = [fwd_args]() -> int {
-        launch_fwd(fwd_args);
+    fa_profile::TensorInfo profile("910/FA2/fwd",
+                                   {{"q", &q},
+                                    {"k", &k},
+                                    {"v", &v},
+                                    {nullptr, &mask_gpu_tensor},
+                                    {"alibi_slopes", fa_profile::Tensor(alibi_slopes_)},
+                                    {nullptr, &drop_mask_npu_tensor},
+                                    {"scheduler_metadata", fa_profile::Tensor(scheduler_metadata_)}},
+                                   {&out, &softmaxlse}, [&](std::ostream& fields) {
+                                       fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+                                       fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+                                       fields << " dropout_p=" << p_dropout << " return_attn_probs=" << return_softmax;
+                                   });
+    auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
+        profile([&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -1219,8 +1255,27 @@ std::vector<at::Tensor> mha_varlen_fwd(
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
     fwd_args.alibiSlopesDevice = alibi.ptr;
-    auto launch_fa_infer = [fwd_args]() -> int {
-        launch_fwd(fwd_args);
+    fa_profile::TensorInfo profile(
+        "910/FA2/varlen_fwd",
+        {{"q", &q},
+         {"k", &k},
+         {"v", &v},
+         {nullptr, &mask_gpu_tensor},
+         {"block_table", &block_table},
+         {"cu_seqlens_q", &cu_seqlens_q},
+         {paged_KV && seqused_k_ ? "seqused_k" : "cu_seqlens_k", paged_KV ? &seqlens_k : &cu_seqlens_k,
+          paged_KV && !seqused_k_ ? "seqlens_k" : nullptr},
+         {"alibi_slopes", fa_profile::Tensor(alibi_slopes_)},
+         {nullptr, &drop_mask_npu_tensor},
+         {"scheduler_metadata", fa_profile::Tensor(scheduler_metadata_)}},
+        {&out, &softmaxlse}, [&](std::ostream& fields) {
+            fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+            fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+            fields << " dropout_p=" << p_dropout << " return_attn_probs=" << return_softmax
+                   << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k;
+        });
+    auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
+        profile([&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -1335,7 +1390,7 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
         return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q,
                                   max_seqlen_k, scale, softcap, local_is_causal, local_window_size_left,
                                   local_window_size_right, deterministic, p_dropout, rng_state, alibi.ptr,
-                                  alibi.batchStride);
+                                  alibi.batchStride, fa_profile::Tensor(alibi_slopes_));
     }
 
     // tiling args set
@@ -1455,6 +1510,10 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     vb_args.dvDevice = dvDevice;
     vb_args.workspaceDevice = workspaceDevice;
     vb_args.tilingDevice = tilingDevice;
+    vb_args.profile =
+        fa_profile::ShareTensors({&dout, &q, &k, &v, &out, &mask_gpu_tensor, &softmax_lse, &seqlenq_gpu_tensor,
+                                  &seqlenk_gpu_tensor, fa_profile::Tensor(alibi_slopes_)},
+                                 {&dq, &dk, &dv});
     if (vb_args.is_bf16) {
         launch_varlen_bwd_impl<bfloat16_t>(vb_args);
     } else {
@@ -1545,7 +1604,7 @@ mha_bwd(const at::Tensor& dout,                   // batch_size x seqlen_q x num
     AlibiSlopes alibi = set_params_alibi(alibi_slopes_, qsizes[0], qsizes[2]);
     return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, std::nullopt, std::nullopt, qsizes[1],
                               ksizes[1], scale, softcap, is_causal, window_size_left, window_size_right, deterministic,
-                              p_dropout, rng_state, alibi.ptr, alibi.batchStride);
+                              p_dropout, rng_state, alibi.ptr, alibi.batchStride, fa_profile::Tensor(alibi_slopes_));
 }
 
 at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_k, int64_t num_heads_q,
@@ -1606,11 +1665,23 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.scaleValue = scaleValue;
     args.softcapValue = static_cast<float>(softcap);
     args.alibiSlopesBatchStride = alibi_slopes_batch_stride;
-    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
+    const auto write = [&](std::ostream& fields) {
+        fields << " batch_size=" << batch_size << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k
+               << " num_heads_q=" << num_heads_q << " num_heads_kv=" << num_heads_kv << " headdim=" << headdim
+               << " headdim_v=" << headdim_v << " num_splits=" << num_splits;
+        fa_profile::Window(fields, causal, window_size_left, window_size_right);
+        if (page_size) {
+            fields << " page_size=" << *page_size;
+        }
+        fields << " softmax_scale=" << softmax_scale.value_or(1.0 / std::sqrt(static_cast<double>(headdim)))
+               << " softcap=" << softcap;
+    };
+    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q, write);
 }
 
 PYBIND11_MODULE(flash_attn_npu, m)
 {
+    fa_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("bwd", &mha_bwd, "Backward pass");

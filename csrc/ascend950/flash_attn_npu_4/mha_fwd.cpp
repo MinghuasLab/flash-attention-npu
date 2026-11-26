@@ -22,6 +22,7 @@
 #include <c10/core/Device.h>
 #include <torch/extension.h>
 
+#include "../../profiling/fa_profile.hpp"
 #include "acl/acl.h"
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
@@ -36,9 +37,11 @@
 
 extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
-                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime = {});
+                                           const std::optional<at::Tensor>& seqused_q, const at::Tensor& runtime,
+                                           const char* kv_name, Writer&& write);
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
@@ -427,6 +430,16 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     launchRuntime.windowSizeLeft = window_size_left;
     launchRuntime.windowSizeRight = window_size_right;
     launchRuntime.allowFlashDecode = flashDecodeEnabled;
+    const auto write_forward = [&](std::ostream& fields) {
+        fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+        fields << " softmax_scale=" << scale << " softcap=" << softcap << " num_splits=" << num_splits;
+        if (max_seqlen_q_) {
+            fields << " max_seqlen_q=" << *max_seqlen_q_;
+        }
+        if (max_seqlen_k_) {
+            fields << " max_seqlen_k=" << *max_seqlen_k_;
+        }
+    };
     if (use_scheduler_metadata && quantMode == 0) {
         runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
     }
@@ -454,7 +467,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             args.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
             args.runtime = launchRuntime;
         }
-        tiling_dev = GetSchedulerMetadataImpl(args, seqlens_k, cu_seqlens_q_, seqused_q_, runtime_dev);
+        tiling_dev = GetSchedulerMetadataImpl(args, seqlens_k, cu_seqlens_q_, seqused_q_, runtime_dev,
+                                              kv_is_cumulative ? "cu_seqlens_k" : "seqused_k", write_forward);
     } else if (scheduler_metadata_.has_value()) {
         const auto& metadata = scheduler_metadata_.value();
         TORCH_CHECK(metadata.device() == q.device() && metadata.dtype() == at::kByte && metadata.is_contiguous(),
@@ -466,8 +480,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         tiling_dev = metadata;
         if (quantMode == 0) {
             FARuntimeArgs runtimeArgs{reinterpret_cast<uint64_t>(runtime_dev.data_ptr()), launchRuntime};
-            auto write_runtime = [runtimeArgs, aclStream]() mutable -> int {
-                WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs));
+            fa_profile::TensorInfo runtime_profile("950/FA4/WriteFARuntime", {}, {&runtime_dev}, write_forward);
+            auto write_runtime = [runtimeArgs, aclStream, profile = std::move(runtime_profile)]() mutable -> int {
+                profile([&] { WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs)); });
                 return 0;
             };
             at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
@@ -557,8 +572,25 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                          static_cast<uint64_t>(layout_enum == FwdLayout::TND ? q.size(0) : batch_size * seqlen_q)};
     fwdArgs.kv_bnbd = paged_KV && quantMode == 0 && k.stride(1) == head_size_q &&
                       k.stride(2) == static_cast<int64_t>(page_block_size) * head_size_q;
-    auto launch_fa_infer = [fwdArgs]() -> int {
-        launch_fwd(fwdArgs);
+    fa_profile::TensorInfo profile(quantMode == 1 ? "950/FA4/FAInferDnQuant" : "950/FA4/FAInfer",
+                                   {{"q", &q},
+                                    {"k", &k},
+                                    {"v", &v},
+                                    {"page_table", &page_table},
+                                    {"cu_seqlens_q", &cu_seqlens_q},
+                                    {"cu_seqlens_k", &cu_seqlens_k},
+                                    {"seqused_q", fa_profile::Tensor(seqused_q_)},
+                                    {"seqused_k", fa_profile::Tensor(seqused_k_)},
+                                    {"scheduler_metadata", fa_profile::Tensor(scheduler_metadata_)},
+                                    {"scales.q", fa_profile::Tensor(q_descale_), "q_descale"},
+                                    {"scales.k", fa_profile::Tensor(k_descale_), "k_descale"},
+                                    {"scales.v", fa_profile::Tensor(v_descale_), "v_descale"}},
+                                   {&out, return_lse ? &softmaxlse : nullptr}, [&](std::ostream& fields) {
+                                       write_forward(fields);
+                                       fields << " return_lse=" << return_lse;
+                                   });
+    auto launch_fa_infer = [fwdArgs, profile = std::move(profile)]() -> int {
+        profile([&] { launch_fwd(fwdArgs); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);

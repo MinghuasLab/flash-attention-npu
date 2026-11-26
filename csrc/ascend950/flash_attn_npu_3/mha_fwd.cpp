@@ -22,6 +22,7 @@
 #include <c10/core/Device.h>
 #include <torch/extension.h>
 
+#include "../../profiling/fa_profile.hpp"
 #include "acl/acl.h"
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
@@ -581,8 +582,35 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(1)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(1)) : 0U,
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U}};
-    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
-        launch_fwd(fwdArgs);
+    fa_profile::TensorInfo profile(quantMode == 1 ? "950/FA3/FAInferDnQuant" : "950/FA3/FAInfer",
+                                   {{"q", &q},
+                                    {"k", &k},
+                                    {"v", &v},
+                                    {nullptr, &mask_npu_tensor},
+                                    {"page_table", &page_table},
+                                    {"cu_seqlens_q", &cu_seqlens_q},
+                                    {"cu_seqlens_k", &cu_seqlens_k},
+                                    {"seqused_q", fa_profile::Tensor(seqused_q_)},
+                                    {"seqused_k", &seqlens_k},
+                                    {"scheduler_metadata", fa_profile::Tensor(scheduler_metadata_)},
+                                    {"q_descale", fa_profile::Tensor(q_descale_)},
+                                    {"k_descale", fa_profile::Tensor(k_descale_)},
+                                    {"v_descale", fa_profile::Tensor(v_descale_)}},
+                                   {&out, return_softmax_lse ? &softmaxlse : nullptr}, [&](std::ostream& fields) {
+                                       fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+                                       fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap
+                                              << " num_splits=" << num_splits;
+                                       if (max_seqlen_q_) {
+                                           fields << " max_seqlen_q=" << *max_seqlen_q_;
+                                       }
+                                       if (max_seqlen_k_) {
+                                           fields << " max_seqlen_k=" << *max_seqlen_k_;
+                                       }
+                                       fields << " return_softmax_lse=" << return_softmax_lse;
+                                   });
+    auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_,
+                            profile = std::move(profile)]() -> int {
+        profile([&] { launch_fwd(fwdArgs); });
         return 0;
     };
     // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can

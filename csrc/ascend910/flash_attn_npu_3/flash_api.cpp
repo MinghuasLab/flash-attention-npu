@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
+#include "../../profiling/fa_profile.hpp"
 #include <torch/extension.h>
 #include "../attention_window.h"
 
@@ -88,8 +89,9 @@ static bool IsMlaDecodeGemvShape(bool hasQv, int64_t numHeads, int64_t numHeadsK
            !pagedKv && !isLocal && !isCausal && (seqlenQ == 1);
 }
 
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
-                                           const std::optional<at::Tensor>& seqlensQ)
+                                           const std::optional<at::Tensor>& seqlensQ, Writer&& write)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
@@ -101,8 +103,11 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     // Submit on the caller's stream so metadata is ordered relative to inputs and
     // same-stream consumers. Cross-stream consumers require an explicit dependency.
     FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, metaArgs]() mutable -> int {
-        ComputeFAMetadataV3<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
+    fa_profile::TensorInfo profile(
+        "910/FA3/ComputeFAMetadataV3",
+        {{"cache_seqlens", &seqlensK}, {"cu_seqlens_q", fa_profile::Tensor(seqlensQ), "seqlens_q"}}, {&meta}, write);
+    auto metadata_task = [curHandle, metaArgs, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadataV3<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -767,18 +772,48 @@ std::vector<at::Tensor> mha_fwd(
         paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
         is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U,
     };
-    auto launch_fa_infer = [fwd_args, layout]() -> int {
-        switch (layout) {
-        case 0:
-            launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
-            break;
-        case 2:
-            launch_fwd<FaiKenel::inputLayout::BNSD>(fwd_args);
-            break;
-        default:
-            launch_fwd<FaiKenel::inputLayout::BSND>(fwd_args);
-            break;
-        }
+    fa_profile::TensorInfo profile(
+        "910/FA3/FAInfer",
+        {{"q", &q},
+         {"k", &k},
+         {"v", &v},
+         {nullptr, &mask_gpu_tensor},
+         {"page_table", &block_table},
+         {"cu_seqlens_q", is_varlen_q ? &seqlenq_gpu_tensor : nullptr, "q_seq"},
+         {is_varlen_kv ? "cu_seqlens_k" : (seqused_k_ ? "seqused_k" : nullptr), &seqlenk_gpu_tensor, "kv_seq"},
+         {"seqused_q", fa_profile::Tensor(seqused_q_)},
+         {"seqused_k", is_varlen_kv ? fa_profile::Tensor(seqused_k_) : nullptr},
+         {"qv", has_q_v ? fa_profile::Tensor(q_v_) : nullptr},
+         {"k_new", appendKV ? fa_profile::Tensor(k_new_) : nullptr},
+         {"v_new", appendKV ? fa_profile::Tensor(v_new_) : nullptr},
+         {"scheduler_metadata", !gemvShapeEarly ? fa_profile::Tensor(scheduler_metadata_) : nullptr}},
+        {&out, &softmaxlse}, [&](std::ostream& fields) {
+            fa_profile::Window(fields, is_causal, window_size_left, window_size_right);
+            fields << " softmax_scale=" << softmax_scale << " softcap=" << softcap;
+            if (is_varlen_q && max_seqlen_q_) {
+                fields << " max_seqlen_q=" << *max_seqlen_q_;
+            }
+            if (max_seqlen_k_) {
+                fields << " max_seqlen_k=" << *max_seqlen_k_;
+            }
+            if (paged_KV && !mlaDecodeGemv) {
+                fields << " num_splits=" << num_splits;
+            }
+        });
+    auto launch_fa_infer = [fwd_args, layout, profile = std::move(profile)]() -> int {
+        profile([&] {
+            switch (layout) {
+            case 0:
+                launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
+                break;
+            case 2:
+                launch_fwd<FaiKenel::inputLayout::BNSD>(fwd_args);
+                break;
+            default:
+                launch_fwd<FaiKenel::inputLayout::BSND>(fwd_args);
+                break;
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -837,7 +872,19 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     // Append-KV tiling fields: kvNewSeqlen = new length (uniform), kvCacheSeqlen = cache capacity.
     args.kvNewSeqlen = (max_seqlen_k_new > 0) ? static_cast<uint32_t>(max_seqlen_k_new) : 0U;
     args.kvCacheSeqlen = static_cast<uint32_t>(max_seqlen_k);
-    return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);
+    const auto write = [&](std::ostream& fields) {
+        fields << " batch_size=" << batch_size << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k
+               << " num_heads_q=" << num_heads_q << " num_heads_kv=" << num_heads_kv << " headdim=" << headdim
+               << " headdim_v=" << headdim_v << " num_splits=" << num_splits;
+        fa_profile::Window(fields, causal, window_size_left, window_size_right);
+        if (page_size) {
+            fields << " page_size=" << *page_size;
+        }
+        if (max_seqlen_k_new > 0) {
+            fields << " max_seqlen_k_new=" << max_seqlen_k_new;
+        }
+    };
+    return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q, write);
 }
 
 std::vector<at::Tensor> mha_bwd(
@@ -1241,6 +1288,10 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.dvDevice = dvDevice;
     bwd_args.workspaceDevice = workspaceDevice;
     bwd_args.tilingDevice = tilingDevice;
+    bwd_args.profile =
+        fa_profile::ShareTensors({&dout, &q, &k, &v, &out, &mask_gpu_tensor, &softmax_lse, &seqlenq_gpu_tensor,
+                                  &seqlenk_gpu_tensor, fa_profile::Tensor(seqused_q_), fa_profile::Tensor(seqused_k_)},
+                                 {&dq, &dk, &dv});
     if (is_varlen_q) {
         launch_bwd<TND>(bwd_args);
     } else if (is_bnsd) {
@@ -1434,14 +1485,17 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
     const bool is_fp16 = (out_type == at::kHalf);
     const bool is_bf16 = (out_type == at::kBFloat16);
-    auto launch_combine = [args, is_fp16, is_bf16]() -> int {
-        if (is_fp16) {
-            launch_combine_fp16(args);
-        } else if (is_bf16) {
-            launch_combine_bf16(args);
-        } else {
-            launch_combine_fp32(args);
-        }
+    fa_profile::TensorInfo profile({&out_partial, &lse_partial}, {&out, return_lse ? &lse_out : nullptr});
+    auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
+        profile([&] {
+            if (is_fp16) {
+                launch_combine_fp16(args);
+            } else if (is_bf16) {
+                launch_combine_bf16(args);
+            } else {
+                launch_combine_fp32(args);
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_combine", launch_combine);
@@ -1450,6 +1504,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
 PYBIND11_MODULE(flash_attn_npu_3, m)
 {
+    fa_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention";
     m.def("_clear_device_mask_cache", &ClearDeviceTriuMaskCache);
     py::module_::import("atexit").attr("register")(m.attr("_clear_device_mask_cache"));

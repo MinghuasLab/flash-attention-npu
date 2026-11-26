@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "../../profiling/fa_profile.hpp"
 #include "bwd_dispatch.hpp"
 
 // fag_kernel.cpp (and the CATLASS/FAG headers it pulls in, e.g.
@@ -127,11 +128,13 @@ void bwd_dispatch_run(const BwdLaunchArgs& a)
     uint8_t* tilingDevice = a.tilingDevice;
 
     auto launch_fag_general_kernel = [=]() -> int {
-        BWD_BOOL_SWITCH(is_softcap, HasSoftcap, {
-            BWD_BOOL_SWITCH(has_attn_mask, IsAttenMask, {
-                BWD_BOOL_SWITCH(deterministic, IsDtm, {
-                    BWD_BOOL_SWITCH(a.original_qk_gt_v, UseActualOut,
-                                    { BWD_LAUNCH_HD(DType, IsAttenMask, IsDtm, HasSoftcap, UseActualOut); });
+        fa_profile::LaunchWithProfile(a.profile, [&] {
+            BWD_BOOL_SWITCH(is_softcap, HasSoftcap, {
+                BWD_BOOL_SWITCH(has_attn_mask, IsAttenMask, {
+                    BWD_BOOL_SWITCH(deterministic, IsDtm, {
+                        BWD_BOOL_SWITCH(a.original_qk_gt_v, UseActualOut,
+                                        { BWD_LAUNCH_HD(DType, IsAttenMask, IsDtm, HasSoftcap, UseActualOut); });
+                    });
                 });
             });
         });

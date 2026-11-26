@@ -19,8 +19,13 @@
 
 #pragma once
 
+#include <memory>
 #include <cstdint>
 #include "acl/acl.h"
+
+namespace fa_profile __attribute__((visibility("hidden"))) {
+    class TensorInfo;
+}
 
 struct BwdLaunchArgs {
     uint32_t blockDim;
@@ -49,6 +54,7 @@ struct BwdLaunchArgs {
     uint8_t* dvDevice;
     uint8_t* workspaceDevice;
     uint8_t* tilingDevice;
+    std::shared_ptr<const fa_profile::TensorInfo> profile;
 };
 
 // Per-(dtype, layout) implementation, defined in

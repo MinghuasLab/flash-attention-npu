@@ -13,8 +13,10 @@
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
+template <typename Writer>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
-                                           const std::optional<at::Tensor>& qLengths)
+                                           const std::optional<at::Tensor>& qLengths, const char* kv_name,
+                                           const char* q_name, Writer&& write)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
     at::Tensor meta = at::empty({bytes}, kvLengths.options().dtype(at::kByte));
@@ -23,8 +25,10 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     const auto stream = c10_npu::getCurrentNPUStream();
     const auto handle = stream.stream(false);
     // The caller's stream orders both the length producers and the attention launch.
-    auto metadata_task = [handle, args]() mutable -> int {
-        ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args));
+    fa_profile::TensorInfo profile("950/FA3/ComputeFAMetadata",
+                                   {{q_name, fa_profile::Tensor(qLengths)}, {kv_name, &kvLengths}}, {&meta}, write);
+    auto metadata_task = [handle, args, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -105,7 +109,18 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.quantMode = quant_mode;
     // Schedule is scale/softcap independent; hasSoftcap is API parity only.
     (void)hasSoftcap;
-    return GetSchedulerMetadataImpl(args, kv_lengths, q_lengths);
+    const auto write = [&](std::ostream& fields) {
+        fields << " batch_size=" << batch_size << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k
+               << " num_heads_q=" << num_heads_q << " num_heads_kv=" << num_heads_kv << " headdim=" << headdim
+               << " headdim_v=" << headdim_v;
+        fa_profile::Window(fields, causal, window_size_left, window_size_right);
+        if (page_size) {
+            fields << " page_size=" << *page_size;
+        }
+        fields << " quant_mode=" << args.quantMode;
+    };
+    return GetSchedulerMetadataImpl(args, kv_lengths, q_lengths, kv_cumulative ? "cu_seqlens_k" : "cache_seqlens",
+                                    q_cumulative ? "cu_seqlens_q" : "seqlens_q", write);
 }
 
 // ---------------------------------------------------------------------------
@@ -284,14 +299,17 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
     const bool is_fp16 = (out_type == at::kHalf);
     const bool is_bf16 = (out_type == at::kBFloat16);
-    auto launch_combine = [args, is_fp16, is_bf16]() -> int {
-        if (is_fp16) {
-            launch_combine_fp16(args);
-        } else if (is_bf16) {
-            launch_combine_bf16(args);
-        } else {
-            launch_combine_fp32(args);
-        }
+    fa_profile::TensorInfo profile({&out_partial, &lse_partial}, {&out, return_lse ? &lse_out : nullptr});
+    auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
+        profile([&] {
+            if (is_fp16) {
+                launch_combine_fp16(args);
+            } else if (is_bf16) {
+                launch_combine_bf16(args);
+            } else {
+                launch_combine_fp32(args);
+            }
+        });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_combine", launch_combine);
@@ -300,6 +318,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
 {
+    fa_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU",
