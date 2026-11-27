@@ -59,15 +59,16 @@ struct BwdLaunchArgs {
 template <typename DType, uint32_t kInputLayout>
 void bwd_dispatch_run(const BwdLaunchArgs& a);
 
+// Dtype-agnostic entry (is_bf16 x layout selection happens device-side), defined
+// in bwd_dispatch_common.hpp. Host TUs call this so they never name the ASC
+// dtype types (unavailable to the host frontend for torch >= 2.14 builds).
+void launch_bwd_dispatch(uint32_t layout, const BwdLaunchArgs& a);
+
 // Runtime entry: kInputLayout is fixed at the call site, then the matching
 // dtype's launcher is selected. bwd_dispatch_run is explicitly instantiated per
 // (dtype, kInputLayout) in the autogen TUs.
 template <uint32_t kInputLayout>
 inline void launch_bwd(const BwdLaunchArgs& a)
 {
-    if (a.is_bf16) {
-        bwd_dispatch_run<bfloat16_t, kInputLayout>(a);
-    } else {
-        bwd_dispatch_run<half, kInputLayout>(a);
-    }
+    launch_bwd_dispatch(kInputLayout, a);
 }

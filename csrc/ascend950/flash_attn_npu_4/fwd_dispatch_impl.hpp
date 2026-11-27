@@ -3,7 +3,10 @@
 #ifndef FWD_DISPATCH_IMPL_HPP
 #define FWD_DISPATCH_IMPL_HPP
 
-#include <torch/extension.h>
+// No torch includes here: this header is compiled into the ASC dispatch TUs,
+// and torch >= 2.14 headers require C++20, which the bisheng ASC frontend
+// cannot parse. Everything below works on plain pointers from
+// fwd_dispatch.hpp's launch-args structs.
 
 #include "fwd_dispatch.hpp"
 #include "fwd_kernel.cpp"
@@ -103,5 +106,38 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
 #undef FWD_KERNEL_LAUNCH
 #undef FWD_MASK_SWITCH
 #undef FWD_BOOL_SWITCH
+
+// Dtype/quant-agnostic host entry (declared in fwd_dispatch.hpp): the
+// quant_mode x is_bf16 x layout selection happens here, device-side, so host
+// TUs never name the ASC dtype types (float8_e4m3_t / bfloat16_t / half).
+// gnu::used forces emission (no device TU calls it directly).
+[[gnu::used]] inline void launch_fwd_dispatch(const FwdLaunchArgs& a)
+{
+    if (a.quant_mode == 1) {
+        if (a.layout == Format::TND) {
+            launch_fwd_impl<float8_e4m3_t, Format::TND>(a);
+        } else if (a.layout == Format::BNSD) {
+            launch_fwd_impl<float8_e4m3_t, Format::BNSD>(a);
+        } else {
+            launch_fwd_impl<float8_e4m3_t, Format::BSND>(a);
+        }
+    } else if (a.is_bf16) {
+        if (a.layout == Format::TND) {
+            launch_fwd_impl<bfloat16_t, Format::TND>(a);
+        } else if (a.layout == Format::BNSD) {
+            launch_fwd_impl<bfloat16_t, Format::BNSD>(a);
+        } else {
+            launch_fwd_impl<bfloat16_t, Format::BSND>(a);
+        }
+    } else {
+        if (a.layout == Format::TND) {
+            launch_fwd_impl<half, Format::TND>(a);
+        } else if (a.layout == Format::BNSD) {
+            launch_fwd_impl<half, Format::BNSD>(a);
+        } else {
+            launch_fwd_impl<half, Format::BSND>(a);
+        }
+    }
+}
 
 #endif // FWD_DISPATCH_IMPL_HPP

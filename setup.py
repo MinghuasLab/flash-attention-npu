@@ -259,10 +259,47 @@ def _inputs_signature(paths):
     return digest.hexdigest()
 
 
+# torch >= 2.14 headers require C++20 (torch/all.h fails the compile with #error
+# otherwise). The bisheng ASC frontend cannot parse C++20 host libraries, so the
+# build splits each extension's sources into two toolchains (see BishengBuildExt):
+#   - host TUs (torch-facing) use the plain C++ frontend with the std flag
+#     below;
+#   - device TUs stay on the ASC frontend with -std=c++17 and must not
+#     include torch/torch_npu headers (they call the host side through
+#     the torch-free bridge declarations / plain-pointer launch shims instead).
+def get_host_cxx_std_flag():
+    # Compare major.minor only, so 2.14 pre-releases and nightlies select C++20 as well.
+    torch_release = parse(str(torch.__version__)).release
+    return "-std=c++20" if torch_release[:2] >= (2, 14) else "-std=c++17"
+
+
+# Torch-facing sources, compiled by the host frontend. Everything else
+# (autogen dispatch TUs, combine_kernel.cpp, aicpu_launch.cpp,
+# bwd_launch.cpp) is compiled with the ASC frontend.
+HOST_SOURCE_BASENAMES = {"flash_api.cpp", "fag_general_host.cpp"}
+
+
+def is_host_source(src):
+    return os.path.basename(src) in HOST_SOURCE_BASENAMES
+
+
 class BishengBuildExt(build_ext):
     _toolchains = None
 
-    def _get_toolchain(self, ext):
+    def _get_toolchains(self, ext):
+        """Per-extension compile toolchains, keyed by mode.
+
+        "device": bisheng -x asc -std=c++17. ASC TUs (kernel dispatch,
+        combine, AICPU launch shims) must not include torch/torch_npu
+        headers: torch >= 2.14 requires C++20, which the ASC frontend
+        cannot parse (libstdc++ C++20 constrained overloads trip its
+        redeclaration check).
+
+        "host": plain-C++-frontend bisheng for the torch-facing TUs, with
+        the std flag from get_host_cxx_std_flag() and the extension's
+        host_compat.hpp force-included so shared ASC-vocabulary headers
+        parse unchanged.
+        """
         ext_name = ext.name
         if self._toolchains is None:
             self._toolchains = {}
@@ -275,25 +312,32 @@ class BishengBuildExt(build_ext):
         if not os.path.exists(ascend_home):
             raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
 
-        # Determine the target arch (3510 vs 2201) and the versioned ascend950
-        # include dir from the extension's first source path. v3 modules are
-        # named flash_attn_npu_3_950 (sources under csrc/ascend950/flash_attn_npu_3),
+        # Determine the target arch (3510 vs 2201) and the extension's own
+        # source directory from its first source path. v3 modules are named
+        # flash_attn_npu_3_950 (sources under csrc/ascend950/flash_attn_npu_3),
         # v4 modules are named flash_attn_npu_4_950 (sources under
         # csrc/ascend950/flash_attn_npu_4); deriving both pieces from the source
-        # path keeps the v3/v4 divergence working without hardcoding.
+        # path keeps the v3/v4 divergence working without hardcoding. The
+        # per-extension shims (host_compat.hpp, aicpu_launch.cpp) live in that
+        # directory.
         first_src = ext.sources[0] if ext.sources else ""
         src_norm = first_src.replace("\\", "/")
         is_ascend950 = "ascend950" in src_norm
         npu_arch = "dav-3510" if is_ascend950 else "dav-2201"
 
+        version_dir = None
+        for part in src_norm.split("/"):
+            if part in ("flash_attn_npu", "flash_attn_npu_3", "flash_attn_npu_4"):
+                version_dir = part
+                break
+        if version_dir is None:
+            raise RuntimeError(f"Cannot derive the source dir of {ext_name!r} from {first_src!r}")
+        arch_dir = "ascend950" if is_ascend950 else "ascend910"
+        ext_src_dir = os.path.join(this_dir, "csrc", arch_dir, version_dir)
+
         extra_includes = []
         extra_defines = []
         if is_ascend950:
-            version_dir = "flash_attn_npu_3"  # fallback
-            for part in src_norm.split("/"):
-                if part in ("flash_attn_npu", "flash_attn_npu_3", "flash_attn_npu_4"):
-                    version_dir = part
-                    break
             extra_includes.append(f"-I{this_dir}/csrc/ascend950/{version_dir}")
             extra_defines.append("-DCATLASS_ARCH=3510")
         else:
@@ -370,6 +414,25 @@ class BishengBuildExt(build_ext):
             *extra_includes,
         ]
 
+        # Python and torch / torch_npu headers are for the host TUs only: a device
+        # (ASC) TU must never reach them (torch >= 2.14 needs C++20, which the ASC
+        # frontend cannot parse); the dispatch headers declare the torch-free
+        # op-tracking bridge instead.
+        host_only_includes = {
+            f"-I{python_include}",
+            f"-I{torch_npu_include}",
+            f"-I{torch_include}",
+            f"-I{torch_package_path}/include",
+            f"-I{torch_package_path}/include/torch/csrc/api/include",
+        }
+        device_include_flags = [flag for flag in include_flags if flag not in host_only_includes]
+        # Host TUs additionally need CANN's adv_api/ headers (SoftMaxTiling, via
+        # the force-included host_compat.hpp).
+        host_include_flags = [
+            *include_flags,
+            f"-I{os.path.join(ascend_home, get_cann_arch_dir())}/asc/include",
+        ]
+
         link_flags = [
             *[f"-L{p}" for p in asc_lib_paths],
             f"-L{torch_lib}",
@@ -391,19 +454,32 @@ class BishengBuildExt(build_ext):
         # support, reintroduce an opt-in wrapper here.
         compiler = ["bisheng"]
 
-        compile_common = [
+        device_compile_common = [
             *compiler,
             "-O2",
             *compile_arch_flags,
             "-fPIC",
             "-std=c++17",
             abi_flag,
-            *include_flags,
+            *device_include_flags,
+        ]
+
+        # --- host toolchain: plain C++ frontend for the torch-facing TUs ---
+        host_compile_common = [
+            *compiler,
+            "-O2",
+            "-fPIC",
+            get_host_cxx_std_flag(),
+            abi_flag,
+            # The extension's own copy of the ASC-vocabulary shim for shared
+            # headers (kernel_tiling.h, kernel_common.hpp, ...).
+            f"-include{os.path.join(ext_src_dir, 'host_compat.hpp')}",
+            *host_include_flags,
         ]
         if use_ms_static:
             # msSanitizer 静态插桩：-g 生成定位信息（异常报告输出文件名/行号/调用栈），
             # --cce-enable-sanitizer 开启内存异常检测插桩。
-            compile_common += ["-g", "--cce-enable-sanitizer"]
+            device_compile_common += ["-g", "--cce-enable-sanitizer"]
             print(
                 f"[mssanitizer] {ext_name}: 已启用静态插桩 -g --cce-enable-sanitizer；"
                 f"必须通过检测运行时启动：mssanitizer --tool=memcheck -- python -m pytest ...；"
@@ -412,14 +488,21 @@ class BishengBuildExt(build_ext):
         elif ENABLE_MSSANITIZER:
             # Runtime instrumentation: retain symbols and avoid jump tables.
             # Do not link static stubs, which cannot initialize during capture.
-            compile_common += ["-g", "-fno-jump-tables"]
+            device_compile_common += ["-g", "-fno-jump-tables"]
             print(
                 f"[mssanitizer] {ext_name}: 运行时插桩模式，已追加 -g -fno-jump-tables；"
                 f"内存检测请用：mssanitizer --tool=memcheck -- python -m pytest ...；"
                 f"图回放成功不代表图内 kernel 已被检测，请核对检测日志与越界对照"
             )
 
-        self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
+        if ENABLE_MSSANITIZER:
+            # Keep debug information on the host side as well, as before host and
+            # device code were compiled separately.
+            host_compile_common.insert(2, "-g")
+        self._toolchains[ext_name] = {
+            "device": (compiler, device_compile_common, link_arch_flags, link_flags),
+            "host": (compiler, host_compile_common, link_arch_flags, link_flags),
+        }
         return self._toolchains[ext_name]
 
     def _force_rebuild(self):
@@ -548,7 +631,7 @@ class BishengBuildExt(build_ext):
         # Only runtime modules belong in build_lib; wheel installation copies
         # that entire tree, including any compiler intermediates left in it.
         os.makedirs(self.build_temp, exist_ok=True)
-        toolchains = {ext.name: self._get_toolchain(ext) for ext in self.extensions}
+        toolchains = {ext.name: self._get_toolchains(ext) for ext in self.extensions}
         force = self._force_rebuild()
 
         # Map every TU source -> (ext_name, obj_path). obj dir is per-extension so
@@ -565,7 +648,10 @@ class BishengBuildExt(build_ext):
 
         def compile_one(task):
             ext_name, src, obj = task
-            _compiler, compile_common, _la, _lf = toolchains[ext_name]
+            # Torch-facing TUs (flash_api.cpp / fag_general_host.cpp) compile
+            # with the host toolchain; everything else with the ASC one.
+            mode = "host" if is_host_source(src) else "device"
+            _compiler, compile_common, _la, _lf = toolchains[ext_name][mode]
             depfile = obj + ".d"
             cmdhash_file = obj + ".cmdhash"
             if not force and _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
@@ -651,7 +737,7 @@ class BishengBuildExt(build_ext):
             ):
                 print("[link-skip]", ext_fullpath, "(.so up-to-date)")
                 continue
-            compiler, _cc, link_arch_flags, link_flags = toolchains[ext.name]
+            compiler, _cc, link_arch_flags, link_flags = toolchains[ext.name]["device"]
             link_cmd = [
                 *compiler,
                 *link_arch_flags,
@@ -709,6 +795,10 @@ if BUILD_EXTENSIONS and not os.path.exists(
 src_ascend910_v2 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "flash_api.cpp"), recursive=True
 )
+# ASC TU with the AICPU metadata launch shim (host TU must not use <<<>>>).
+src_ascend910_v2 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "aicpu_launch.cpp"), recursive=True
+)
 src_ascend910_v2 += glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "fag_general_host.cpp"), recursive=True
 )
@@ -720,6 +810,10 @@ src_ascend910_v2 += glob.glob(
 )
 src_ascend910_v3 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "flash_api.cpp"), recursive=True
+)
+# ASC TU with the AICPU metadata launch shim (host TU must not use <<<>>>).
+src_ascend910_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "aicpu_launch.cpp"), recursive=True
 )
 # ascend910 v3's forward FAInfer / backward FAGGeneral dispatch is split into per-
 # (dtype, layout) translation units under autogen/, generated by
@@ -736,6 +830,15 @@ src_ascend910_v3 += glob.glob(
 src_ascend950_v3 = glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "flash_api.cpp"), recursive=True
 )
+# ASC TUs: AICPU metadata launch shim + the backward kernel launch owner
+# (mha_bwd.cpp is compiled as part of the host TU flash_api.cpp and only
+# marshals plain-pointer launch args).
+src_ascend950_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "aicpu_launch.cpp"), recursive=True
+)
+src_ascend950_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "bwd_launch.cpp"), recursive=True
+)
 # ascend950 v3's forward FAInfer dispatch is split into per-(dtype, layout) translation
 # units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /
 src_ascend950_v3 += glob.glob(
@@ -747,10 +850,16 @@ src_ascend950_v3 += glob.glob(
 )
 # Isolated D>256 128x256 partial-resident bwd kernel (compile-isolated from fag_kernel.cpp).
 src_ascend950_v3 += glob.glob(
-    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"), recursive=True
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fag_bwd_d512_partial.cpp"),
+    recursive=True,
 )
 src_ascend910_v4 = glob.glob(
     os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True
+)
+# ASC TU with the AICPU metadata / write-runtime launch shims (host TU must
+# not use <<<>>>).
+src_ascend910_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "aicpu_launch.cpp"), recursive=True
 )
 # ascend910's forward FAInfer / backward FAGGeneral dispatch is split into
 # per-(dtype, layout) translation units under autogen/, generated by
@@ -765,6 +874,15 @@ src_ascend910_v4 += glob.glob(
 )
 src_ascend950_v4 = glob.glob(
     os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "flash_api.cpp"), recursive=True
+)
+# ASC TUs: AICPU metadata launch shim + the backward kernel launch owner
+# (mha_bwd.cpp is compiled as part of the host TU flash_api.cpp and only
+# marshals plain-pointer launch args).
+src_ascend950_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "aicpu_launch.cpp"), recursive=True
+)
+src_ascend950_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "bwd_launch.cpp"), recursive=True
 )
 # ascend950 v4's forward FAInfer dispatch is split into per-(dtype, layout) translation
 # units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /

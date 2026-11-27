@@ -59,9 +59,7 @@ FAG_HEADDIMS = [64, 128, 192, 256, 512]
 
 BOOL_TOKEN = {0: "false", 1: "true"}
 
-PRELUDE = (
-    "// Copyright (c) 2026, Minghua Shen.\n"
-)
+PRELUDE = "// Copyright (c) 2026, Minghua Shen.\n"
 
 
 def _feature_suffix(*features: tuple) -> str:
@@ -183,7 +181,7 @@ def fag_kernel_variant(dtype_key: str, layout: tuple, headdim: int, softcap: int
         + "        });\n"
         + "        return 0;\n"
         + "    };\n"
-        + '    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag", fag_call);\n'
+        + '    fa_bridge::run_op_api_v2("ascendc_fag", fag_call);\n'
         + "}\n"
     )
     return Kernel(

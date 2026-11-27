@@ -17,10 +17,15 @@
 #include "acl/acl.h"
 #include "device_triu_mask.h"
 #include "fag_tiling.cpp"
-#include "fag_kernel.cpp"
+// D>256 partial-resident bwd: a pure-pointer boundary (the host helper
+// builds FagD512PartialLaunchArgs; launch_fag_d512_partial lives in the ASC
+// TU fag_bwd_d512_partial.cpp), so the host TU calls it directly.
 #include "fag_bwd_d512_partial.hpp"
 #include "fag_bwd_d512_partial_host.hpp"
-#include "fa_bwd_mla_kernel.cpp"
+// The general and MLA backward kernel templates and their <<<>>> launches
+// live in bwd_launch.cpp (ASC TU); this file is compiled as part of the host
+// TU flash_api.cpp and only marshals tensor data into Bwd950LaunchArgs.
+#include "bwd_launch.hpp"
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -451,77 +456,6 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // All other shapes (neither flag) stay on SPLIT_M dual-AIV.
     const bool launch_single_vec = (fag_tiling_data.shortQ != 0) || (fag_tiling_data.shortBiDir != 0);
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP, SINGLE_VEC)                    \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP,     \
-                           SINGLE_VEC><<<launch_cores, nullptr, stream>>>(                                             \
-        ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, cu_k, seq_used_q, seq_used_k,       \
-        ptr(dq), ptr(dk), ptr(dv), ptr(workspace), ptr(tiling_device))
-
-#define DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, SINGLE_VEC)                                                      \
-    do {                                                                                                               \
-        if (has_attn_mask) {                                                                                           \
-            if (deterministic) {                                                                                       \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true, SINGLE_VEC);                                  \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false, SINGLE_VEC);                                 \
-                }                                                                                                      \
-            } else {                                                                                                   \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true, SINGLE_VEC);                                 \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false, SINGLE_VEC);                                \
-                }                                                                                                      \
-            }                                                                                                          \
-        } else {                                                                                                       \
-            if (deterministic) {                                                                                       \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true, SINGLE_VEC);                                 \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false, SINGLE_VEC);                                \
-                }                                                                                                      \
-            } else {                                                                                                   \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true, SINGLE_VEC);                                \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false, SINGLE_VEC);                               \
-                }                                                                                                      \
-            }                                                                                                          \
-        }                                                                                                              \
-    } while (0)
-
-#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
-    do {                                                                                                               \
-        if (launch_single_vec) {                                                                                       \
-            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, true);                                                       \
-        } else {                                                                                                       \
-            DISPATCH_BWD950_FLAGS_SV(DTYPE, INPUT_LAYOUT, false);                                                      \
-        }                                                                                                              \
-    } while (0)
-
-#define LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_SOFTCAP)                                              \
-    FlashAttentionV3BwdMla950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_SOFTCAP>                    \
-        <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
-                                            ptr(tiling_device))
-
-#define DISPATCH_BWD950_MLA_FLAGS(DTYPE, INPUT_LAYOUT)                                                                 \
-    do {                                                                                                               \
-        if (has_attn_mask) {                                                                                           \
-            if (has_softcap) {                                                                                         \
-                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, true, true);                                                    \
-            } else {                                                                                                   \
-                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, true, false);                                                   \
-            }                                                                                                          \
-        } else {                                                                                                       \
-            if (has_softcap) {                                                                                         \
-                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, false, true);                                                   \
-            } else {                                                                                                   \
-                LAUNCH_BWD950_MLA(DTYPE, INPUT_LAYOUT, false, false);                                                  \
-            }                                                                                                          \
-        }                                                                                                              \
-    } while (0)
-
     if (fag_tiling_data.d512Partial != 0) {
         TORCH_CHECK(!deterministic, "Ascend950 v3 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
@@ -531,47 +465,39 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                       : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
                                  : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
             has_attn_mask, has_softcap));
-    } else if (is_mla) {
-        if (q.dtype() == at::kBFloat16) {
-            if (is_varlen) {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BNSD);
-            } else {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BSND);
-            }
-        } else {
-            if (is_varlen) {
-                DISPATCH_BWD950_MLA_FLAGS(half, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(half, BNSD);
-            } else {
-                DISPATCH_BWD950_MLA_FLAGS(half, BSND);
-            }
-        }
-    } else if (q.dtype() == at::kBFloat16) {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
-        } else {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
-        }
     } else {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(half, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(half, BNSD);
-        } else {
-            DISPATCH_BWD950_FLAGS(half, BSND);
-        }
+        // The D>256 partial-resident kernel above keeps its own pure-pointer
+        // boundary. The general and MLA kernel families are launched from
+        // bwd_launch.cpp (ASC TU), which owns their template instantiations.
+        fa950::Bwd950LaunchArgs bwd_args{};
+        bwd_args.launch_cores = launch_cores;
+        bwd_args.stream = stream;
+        bwd_args.is_bf16 = (q.dtype() == at::kBFloat16);
+        bwd_args.layout =
+            is_varlen ? fa950::Bwd950Layout::TND : (is_bnsd ? fa950::Bwd950Layout::BNSD : fa950::Bwd950Layout::BSND);
+        bwd_args.has_attn_mask = has_attn_mask;
+        bwd_args.deterministic = deterministic;
+        bwd_args.has_softcap = has_softcap;
+        bwd_args.single_vec = launch_single_vec;
+        bwd_args.is_mla = is_mla;
+        bwd_args.dout = ptr(dout);
+        bwd_args.q = ptr(q);
+        bwd_args.k = ptr(k);
+        bwd_args.v = ptr(v);
+        bwd_args.out = ptr(out);
+        bwd_args.mask = mask;
+        bwd_args.softmax_lse = ptr(softmax_lse);
+        bwd_args.cu_q = cu_q;
+        bwd_args.cu_k = cu_k;
+        bwd_args.seq_used_q = seq_used_q;
+        bwd_args.seq_used_k = seq_used_k;
+        bwd_args.dq = ptr(dq);
+        bwd_args.dk = ptr(dk);
+        bwd_args.dv = ptr(dv);
+        bwd_args.workspace = ptr(workspace);
+        bwd_args.tiling = ptr(tiling_device);
+        fa950::bwd_dispatch_950(bwd_args);
     }
-
-#undef DISPATCH_BWD950_FLAGS
-#undef DISPATCH_BWD950_FLAGS_SV
-#undef LAUNCH_BWD950
-#undef DISPATCH_BWD950_MLA_FLAGS
-#undef LAUNCH_BWD950_MLA
 
     at::Tensor softmax_d = is_varlen ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))
                                      : at::empty({batch_size, num_heads, q_seqlen}, q.options().dtype(at::kFloat));

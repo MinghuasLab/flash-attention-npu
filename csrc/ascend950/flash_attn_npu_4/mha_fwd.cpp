@@ -34,7 +34,10 @@
 #include "tiling_from_tensors.hpp"
 #include "fa_metadata_args.h"
 
-extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
+// The write-runtime AICPU kernel is launched from aicpu_launch.cpp (ASC TU);
+// this file is compiled as part of the host TU flash_api.cpp and must not use
+// ASC launch syntax.
+#include "aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
@@ -467,7 +470,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         if (quantMode == 0) {
             FARuntimeArgs runtimeArgs{reinterpret_cast<uint64_t>(runtime_dev.data_ptr()), launchRuntime};
             auto write_runtime = [runtimeArgs, aclStream]() mutable -> int {
-                WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs));
+                fa_aicpu::fa_write_runtime_launch(&runtimeArgs, sizeof(runtimeArgs), aclStream);
                 return 0;
             };
             at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);

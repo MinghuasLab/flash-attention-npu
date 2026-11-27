@@ -13,7 +13,12 @@
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
 
+// Host TUs (flash_api.cpp/mha_fwd.cpp include this via fwd_dispatch.hpp) get the
+// GM_ADDR/__aicore__ vocabulary from this extension's host_compat.hpp; only the ASC
+// frontend needs kernel_operator.h.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 #include "tilingdata.h"
 
 constexpr int32_t NUM1 = 1;

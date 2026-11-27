@@ -9,7 +9,11 @@
 
 #include "acl/acl.h"
 #include "catlass/catlass.hpp"
+// kernel_operator.h is for the ASC frontend only; host TUs get the GM_ADDR /
+// __aicore__ vocabulary from this extension's host_compat.hpp instead.
+#if defined(__CCE__)
 #include "kernel_operator.h"
+#endif
 #include "tiling/platform/platform_ascendc.h"
 #include "../flash_attn_npu_3/fag_tiling.h"
 #include "../flash_attn_npu_3/fag_tiling.cpp"
@@ -78,8 +82,8 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
         TORCH_CHECK(qsizes[0] == ksizes[0], "launch_fag_general: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "launch_fag_general: v nheads_k must match k");
     }
-    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 :
-                                 (q_headdim <= 256 ? 256 : 512)));
+    uint32_t qk_headdim_kernel =
+        q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : (q_headdim <= 256 ? 256 : 512)));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
     // Empty attention has zero derivatives. FAG tiling divides by the number
@@ -106,8 +110,8 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
     bool has_dropout = (p_dropout > 0.0f);
     fagInfo.keepProb = 1.0f - p_dropout;
     bool is_local = false;
-    fa_window::NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left,
-                                       window_size_right, is_causal, is_local);
+    fa_window::NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right,
+                                        is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
