@@ -69,6 +69,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  allow:
+    name: 允许安全审计
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/allow')
+    steps:
+      - name: Validate write permission and allow current head
+        env:
+          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$COMMENT_BODY" =~ ^/allow[[:space:]]*$ ]]; then
+            echo "Only the exact /allow command is supported" >&2
+            exit 1
+          fi
+          repo="$GITHUB_REPOSITORY"
+          pr_number="${{ github.event.issue.number }}"
+          permission="$(gh api "repos/$repo/collaborators/$COMMENT_USER/permission" --jq '.permission')"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              echo "refusing /allow for actor=$COMMENT_USER permission=$permission" >&2
+              exit 1
+              ;;
+          esac
+          sha="$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha')"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/$repo/statuses/$sha" \
+            -f state=success \
+            -f context="Trusted PR Security Audit" \
+            -f description="Security audit manually allowed by @$COMMENT_USER" \
+            -f target_url="$run_url" >/dev/null
+
   prepare:
     name: 手动验证
     runs-on: ubuntu-latest
@@ -143,23 +180,24 @@ jobs:
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "resolved pr=$pr_number sha=$sha base=$base_ref mode=$ci_mode actor=$actor"
 
-      - name: Check permission
-        id: perm
+      - name: Require trusted security audit
+        id: audit
         env:
           GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
-          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            actor="$COMMENT_USER"
-          else
-            actor="${{ github.actor }}"
+          repo="$GITHUB_REPOSITORY"
+          sha="${{ steps.resolve.outputs.sha }}"
+          audit_state="$(gh api "repos/$repo/commits/$sha/status" \
+            --jq '[.statuses[] | select(.context == "Trusted PR Security Audit")] |
+              sort_by(.updated_at // .created_at // "") |
+              last |
+              (.state // "none")')"
+          if [ "$audit_state" != "success" ]; then
+            echo "Latest Trusted PR Security Audit is not successful for head=$sha (state=$audit_state)" >&2
+            exit 1
           fi
-          perm="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission' 2>/dev/null || echo none)"
-          ci_mode="${{ steps.resolve.outputs.ci_mode }}"
-          echo "actor=$actor permission=$perm ci_mode=$ci_mode"
-          echo "GitHub trigger authorized for full CI ($actor has '$perm')"
+          echo "Trusted PR Security Audit passed for head=$sha"
 
       - name: Check existing NPU CI status for this commit
         id: check
@@ -169,9 +207,12 @@ jobs:
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
           sha="${{ steps.resolve.outputs.sha }}"
-          # 取最近一条 NPU CI / 手动验证 状态
+          # 只看最近一条 NPU CI / 手动验证 状态，避免历史 success 跳过当前审计后的运行。
           existing="$(gh api "repos/$repo/commits/$sha/status" \
-            --jq '.statuses[] | select(.context == "NPU CI / 手动验证") | .state' || true)"
+            --jq '[.statuses[] | select(.context == "NPU CI / 手动验证")] |
+              sort_by(.updated_at // .created_at // "") |
+              last |
+              (.state // "none")' || true)"
           echo "existing status: ${existing:-<none>}"
           if [ "$existing" = "success" ] && [ "${{ steps.resolve.outputs.build_npu }}" != "all" ]; then
             echo "already passed, skip" >&2
