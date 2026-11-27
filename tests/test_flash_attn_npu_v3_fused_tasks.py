@@ -29,7 +29,7 @@ from tests.common.compare import assert_fa_close
 DEVICE = "npu"
 
 # FAInferTilingData layout (see csrc/ascend910/flash_attn_npu_3/tilingdata.h).
-_FUSED_TASK_FLAG_OFFSET = 112
+_FUSED_TASK_FLAG_OFFSET = 116
 _FUSED_FIELDS_OFFSET = 2376
 
 
