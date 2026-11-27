@@ -711,6 +711,100 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
 
 ### FlashAttention v4
 
+#### flash_attn_func
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    qv=None,
+    gather_kv_indices=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    learnable_sink=None,
+    softcap=0.0,  # 0.0 means deactivated
+    num_splits=1,  # Can be tuned for speed
+    pack_gqa=None,  # Can be tuned for speed
+    deterministic=False,
+    score_mod=None,
+    score_mod_bwd=None,
+    mask_mod=None,
+    aux_tensors=None,
+    aux_scalars=None,
+    block_sparse_tensors=None,
+    block_sparse_tensors_bwd=None,
+    return_lse=False,
+):
+    """
+    v4 版本的标准（定长、batch-major）注意力接口。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+
+    调度元数据（tiling + attention mask）在 AICPU 上计算，不会引入 device->host->device
+    同步打断训练流水线。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim_v)
+        qv [可选]: (batch_size, seqlen, nheads, headdim_v)。用于 cross-attention。
+        gather_kv_indices [可选]: KV 索引。（NPU 暂不支持）
+        softmax_scale: float。softmax 前对 QK^T 的缩放。
+            默认为 1 / sqrt(headdim + (headdim_v if qv is not None else 0))。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        learnable_sink [可选]: (num_heads,)，dtype 为 bfloat16。每个 query head 一个 sink logit，
+            加入 softmax 分母。仅在 Ascend 910 上支持（仅前向）；Ascend 950 及反向暂不支持。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。如果 > 1，将 key/value 在序列维度上分割成这么多块。
+            如果 num_splits == 1，不分割。
+        pack_gqa: bool。是否打包 GQA 以提高性能。（NPU 暂不支持）
+        deterministic: bool。是否使用反向传播的确定性实现。
+        score_mod [可选]: 自定义 score 修改函数。
+        score_mod_bwd [可选]: 反向传播阶段的自定义 score 修改函数。
+        mask_mod [可选]: 自定义 attention mask。
+        aux_tensors / aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助 tensor/标量。
+        block_sparse_tensors / block_sparse_tensors_bwd [可选]: block sparse tensor。
+        return_lse: bool。是否返回 attention scores 的 logsumexp。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
+        - nheads % nheads_k == 0。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭）。
+        - score_mod / mask_mod 在 Ascend 950 上路由到原生 Flex 后端。
+        - learnable_sink 在 Ascend 950 及反向暂不支持。
+        - 不支持 pack_gqa / gather_kv_indices。
+        - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同。
+          确定性反向不支持 headdim > 256。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim_v)。
+        softmax_lse [可选，return_lse=True 时]: (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
 #### flash_attn_varlen_func
 ```python
 def flash_attn_varlen_func(
