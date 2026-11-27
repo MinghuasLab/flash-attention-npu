@@ -62,19 +62,17 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs& a)
 #if defined(ENABLE_ASCENDC_DUMP)
         uint8_t* ptrDumpDevice{nullptr};
         aclCheck(aclrtMalloc(reinterpret_cast<void**>(&ptrDumpDevice), ALL_DUMPSIZE, ACL_MEM_MALLOC_HUGE_FIRST));
-        const auto profileStart = a.profile ? a.profile->Begin() : 0;
+        fa_profile::TensorInfo::LaunchRange profile_range(a.profile.get(), aclStream, blockDim);
         FAG::FAGVarlenOpt<DType><<<blockDim, nullptr, aclStream>>>(
             fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
             attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice, nullptr,
             nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, ptrDumpDevice);
-        if (a.profile) {
-            a.profile->Report(profileStart);
-        }
+        profile_range.Finish();
         aclCheck(aclrtSynchronizeStream(aclStream));
         Adx::AdumpPrintWorkSpace(ptrDumpDevice, ALL_DUMPSIZE, aclStream, "device_fag");
         aclCheck(aclrtFree(ptrDumpDevice));
 #else
-        const auto profileStart = a.profile ? a.profile->Begin() : 0;
+        fa_profile::TensorInfo::LaunchRange profile_range(a.profile.get(), aclStream, blockDim);
         if (has_alibi) {
             if (is_softcap) {
                 if (is_causal) {
@@ -144,9 +142,7 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs& a)
                 }
             }
         }
-        if (a.profile) {
-            a.profile->Report(profileStart);
-        }
+        profile_range.Finish();
 #endif
         return 0;
     };

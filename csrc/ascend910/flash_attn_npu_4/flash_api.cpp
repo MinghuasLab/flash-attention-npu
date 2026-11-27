@@ -1,6 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
-#include "../../profiling/fa_profile.hpp"
+#include "../../profiling/fa_aicpu_profile.hpp"
 #include <torch/extension.h>
 #include "../attention_window.h"
 
@@ -69,7 +69,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
                                    {{"seqused_k", &seqlensK}, {"seqlens_q", fa_profile::Tensor(seqlensQ)}}, {&meta},
                                    write);
     auto metadata_task = [curHandle, metaArgs, profile = std::move(profile)]() mutable -> int {
-        profile([&] { ComputeFAMetadataV4<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
+        fa_profile::LaunchAicpuWithProfile(
+            profile, [&] { ComputeFAMetadataV4<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -499,7 +500,8 @@ std::vector<at::Tensor> mha_fwd(
                                    profile = std::move(runtimeProfile)]() mutable -> int {
             ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
             ACL_CHECK(aclrtStreamWaitEvent(rtHandle, inputReady));
-            profile([&] { WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs)); });
+            fa_profile::LaunchAicpuWithProfile(
+                profile, [&] { WriteFARuntime<<<1, nullptr, rtHandle>>>(&fwdRuntimeArgs, sizeof(fwdRuntimeArgs)); });
             ACL_CHECK(aclrtRecordEvent(runtimeDone, rtHandle));
             ACL_CHECK(aclrtStreamWaitEvent(curHandle, runtimeDone));
             return 0;
@@ -758,7 +760,7 @@ std::vector<at::Tensor> mha_fwd(
             }
         });
     auto launch_fa_infer = [fwd_args, seqlenk_gpu_tensor, learnable_sink_hold, profile = std::move(profile)]() -> int {
-        profile([&] {
+        profile(fwd_args.aclStream, fwd_args.launchBlockDim, [&] {
             (void)learnable_sink_hold;
             if (fwd_args.layout == FaiKenel::inputLayout::TND) {
                 launch_fwd<FaiKenel::inputLayout::TND>(fwd_args);
@@ -1445,7 +1447,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     fa_profile::TensorInfo profile({&out_partial, &lse_partial, fa_profile::Tensor(virtual_batch_idx)},
                                    {&out, return_lse ? &lse_out : nullptr});
     auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
-        profile([&] {
+        profile(args.aclStream, args.launchBlockDim, [&] {
             if (is_fp16) {
                 launch_combine_fp16(args);
             } else if (is_bf16) {

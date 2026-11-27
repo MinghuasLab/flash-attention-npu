@@ -9,6 +9,7 @@
 
 #include "device_triu_mask.h"
 #include "fa_metadata_args.h"
+#include "../../profiling/fa_aicpu_profile.hpp"
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
 #include "combine_dispatch.hpp"
@@ -37,7 +38,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
                                     {"seqused_q", fa_profile::Tensor(seqused_q)}},
                                    {&metadata, &runtime}, write);
     auto task = [current_handle, args, profile = std::move(profile)]() mutable -> int {
-        profile([&] { ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args)); });
+        fa_profile::LaunchAicpuWithProfile(
+            profile, [&] { ComputeFAMetadata<<<1, nullptr, current_handle>>>(&args, sizeof(args)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", task);
@@ -326,7 +328,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     fa_profile::TensorInfo profile({&out_partial, &lse_partial, fa_profile::Tensor(virtual_batch_idx)},
                                    {&out, return_lse ? &lse_out : nullptr});
     auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
-        profile([&] {
+        profile(args.aclStream, args.launchBlockDim, [&] {
             if (is_fp16) {
                 launch_combine_fp16(args);
             } else if (is_bf16) {

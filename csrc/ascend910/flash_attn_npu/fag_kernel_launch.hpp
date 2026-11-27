@@ -50,7 +50,7 @@
 // kernel arg is a.dropMaskDevice (nullptr when dropout is off).
 #define FAG_KERNEL_LAUNCH(DTYPE, KINPUTLAYOUT, DT_ALIGNED, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP)                     \
     FAG_BOOL_SWITCH(a.has_alibi, IsAlibi, {                                                                            \
-        fa_profile::LaunchWithProfile(a.profile, [&] {                                                                 \
+        fa_profile::LaunchWithProfile(a.profile, a.aclStream, a.blockDim, [&] {                                        \
             ::FAGGeneral<DTemplateType::DT_ALIGNED, DTYPE, KINPUTLAYOUT, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP,       \
                          IsAlibi><<<a.blockDim, nullptr, a.aclStream>>>(                                               \
                 a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice, a.outDevice, a.dropMaskDevice,              \

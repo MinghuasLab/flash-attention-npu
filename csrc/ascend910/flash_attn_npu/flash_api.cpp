@@ -1,6 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
-#include "../../profiling/fa_profile.hpp"
+#include "../../profiling/fa_aicpu_profile.hpp"
 #include <torch/extension.h>
 #include "../attention_window.h"
 
@@ -118,7 +118,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
                                    {{"cache_seqlens", &seqlensK}, {"cu_seqlens_q", fa_profile::Tensor(cuSeqlensQ)}},
                                    {&meta}, write);
     auto metadata_task = [curHandle, metaArgs, profile = std::move(profile)]() mutable -> int {
-        profile([&] { ComputeFAMetadataV2<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
+        fa_profile::LaunchAicpuWithProfile(
+            profile, [&] { ComputeFAMetadataV2<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata_v2", metadata_task);
@@ -644,7 +645,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
                                        }
                                    });
     auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
-        profile([&] { launch_fwd(fwd_args); });
+        profile(fwd_args.aclStream, fwd_args.blockDim, [&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -927,7 +928,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
                                        fields << " dropout_p=" << p_dropout << " return_attn_probs=" << return_softmax;
                                    });
     auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
-        profile([&] { launch_fwd(fwd_args); });
+        profile(fwd_args.aclStream, fwd_args.blockDim, [&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
@@ -1275,7 +1276,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
                    << " max_seqlen_q=" << max_seqlen_q << " max_seqlen_k=" << max_seqlen_k;
         });
     auto launch_fa_infer = [fwd_args, profile = std::move(profile)]() -> int {
-        profile([&] { launch_fwd(fwd_args); });
+        profile(fwd_args.aclStream, fwd_args.blockDim, [&] { launch_fwd(fwd_args); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);

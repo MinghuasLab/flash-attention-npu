@@ -488,7 +488,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     const fa_profile::TensorInfo profile({&dout, &q, &k, &v, &out, &mask_npu_tensor, &softmax_lse, &cu_q_device,
                                           &cu_k_device, fa_profile::Tensor(seqused_q_), fa_profile::Tensor(seqused_k_)},
                                          {&dq, &dk, &dv});
-    const auto profile_start = profile.Begin();
+    fa_profile::TensorInfo::LaunchRange profile_range(&profile, stream, launch_cores);
     if (fag_tiling_data.d512Partial != 0) {
         TORCH_CHECK(!deterministic, "Ascend950 v4 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
@@ -533,7 +533,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
             DISPATCH_BWD950_FLAGS(half, BSND);
         }
     }
-    profile.Report(profile_start);
+    profile_range.Finish();
 
 #undef DISPATCH_BWD950_FLAGS
 #undef DISPATCH_BWD950_FLAGS_SV

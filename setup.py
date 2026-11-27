@@ -382,6 +382,7 @@ class BishengBuildExt(build_ext):
             "-lplatform",
             "-lprofapi",
             "-lmsprofiler",
+            "-Wl,--wrap=aclrtLaunchKernelWithConfig",
         ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`

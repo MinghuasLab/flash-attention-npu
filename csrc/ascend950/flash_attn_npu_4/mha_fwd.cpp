@@ -482,7 +482,8 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             FARuntimeArgs runtimeArgs{reinterpret_cast<uint64_t>(runtime_dev.data_ptr()), launchRuntime};
             fa_profile::TensorInfo runtime_profile("950/FA4/WriteFARuntime", {}, {&runtime_dev}, write_forward);
             auto write_runtime = [runtimeArgs, aclStream, profile = std::move(runtime_profile)]() mutable -> int {
-                profile([&] { WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs)); });
+                fa_profile::LaunchAicpuWithProfile(
+                    profile, [&] { WriteFARuntime<<<1, nullptr, aclStream>>>(&runtimeArgs, sizeof(runtimeArgs)); });
                 return 0;
             };
             at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
@@ -590,7 +591,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                        fields << " return_lse=" << return_lse;
                                    });
     auto launch_fa_infer = [fwdArgs, profile = std::move(profile)]() -> int {
-        profile([&] { launch_fwd(fwdArgs); });
+        profile(fwdArgs.stream, fwdArgs.block_dim, [&] { launch_fwd(fwdArgs); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);

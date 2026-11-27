@@ -99,7 +99,7 @@ void bwd_dispatch_run(const BwdLaunchArgs& a)
     uint8_t* tilingDevice = a.tilingDevice;
 
     auto launch_fag_general_kernel = [=]() -> int {
-        fa_profile::LaunchWithProfile(a.profile, [&] {
+        fa_profile::LaunchWithProfile(a.profile, aclStream, blockDim, [&] {
             BWD_BOOL_SWITCH(is_softcap, HasSoftcap, {
                 BWD_BOOL_SWITCH(has_attn_mask, IsAttenMask, {
                     BWD_BOOL_SWITCH(deterministic, IsDtm, {

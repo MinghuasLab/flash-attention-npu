@@ -610,7 +610,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                                    });
     auto launch_fa_infer = [fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_,
                             profile = std::move(profile)]() -> int {
-        profile([&] { launch_fwd(fwdArgs); });
+        profile(fwdArgs.stream, fwdArgs.block_dim, [&] { launch_fwd(fwdArgs); });
         return 0;
     };
     // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can

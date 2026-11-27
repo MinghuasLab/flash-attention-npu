@@ -37,27 +37,50 @@
 #include "profiling/aprof_pub.h"
 #include "torch_npu/csrc/core/npu/NPUFormat.h"
 
+// Some torch_npu releases include their bundled ACL header first. It declares
+// the range APIs but only forward-declares aclprofEventAttributes. The CANN
+// header documents this guard and the frozen version-1 ABI for those builds.
+#ifndef ACL_PROF_TENSOR_INFO_DEFINED
+#define ACL_PROF_TENSOR_INFO_DEFINED
+#define ACL_PROF_EVENT_ATTR_VERSION 1
+struct aclprofTensor {
+    uint32_t type;
+    uint32_t format;
+    uint32_t dataType;
+    uint32_t shapeDim;
+    uint32_t shape[8];
+};
+struct aclprofTensorInfo {
+    uint64_t opNameId;
+    uint64_t opTypeId;
+    uint32_t resv;
+    uint32_t tensorNum;
+    uint32_t kernelType;
+    uint32_t blockNums;
+    void* stream;
+    aclprofTensor* tensors;
+};
+struct aclprofEventAttributes {
+    uint16_t version;
+    uint16_t size;
+    uint32_t messageType;
+    union Message {
+        aclprofTensorInfo* tensorInfo;
+    } message;
+};
+#endif
+
 namespace fa_profile __attribute__((visibility("hidden"))) {
 
+    constexpr uint32_t kTensorInfoMessage = 0;
     constexpr unsigned kShapes = 1;
     constexpr unsigned kAttributes = 2;
+    constexpr unsigned kTaskL0TensorEvents = 4;
     inline std::atomic<unsigned> mode{0};
     inline std::atomic<uint64_t> sequence{0};
 
-    inline bool AttributesRequested(const MsprofCommandHandle& command)
+    inline bool SampleOptionEquals(std::string_view options, std::string_view key, std::string_view expected)
     {
-        if ((command.profSwitch & PROF_MSPROFTX_MASK) != 0) {
-            return true;
-        }
-
-        // msprof --application passes its switches through this configuration.
-        // In-process aclprof sessions use the callback bit, which reflects each restart.
-        const char* config = std::getenv("PROFILER_SAMPLECONFIG");
-        if (config == nullptr) {
-            return false;
-        }
-        const std::string_view options(config);
-        constexpr std::string_view key = "\"msproftx\"";
         constexpr std::string_view whitespace = " \t\r\n";
         const auto field = options.find(key);
         if (field == std::string_view::npos) {
@@ -68,7 +91,7 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
             return false;
         }
         const auto value = options.find_first_not_of(whitespace, colon + 1);
-        return value != std::string_view::npos && options.substr(value, 4) == "\"on\"";
+        return value != std::string_view::npos && options.substr(value, expected.size()) == expected;
     }
 
     inline int32_t UpdateProfilingState(uint32_t control, void* data, uint32_t length)
@@ -82,8 +105,22 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
         case PROF_COMMANDHANDLE_TYPE_START: {
             const bool shapes =
                 (command.profSwitch & PROF_TASK_TIME_MASK) != 0 && (command.profSwitch & PROF_TASK_TIME_L1_MASK) != 0;
-            const bool attributes = shapes && AttributesRequested(command);
-            mode.store(shapes ? kShapes | (attributes ? kAttributes : 0U) : 0U, std::memory_order_relaxed);
+            unsigned flags = shapes ? kShapes : 0U;
+            if (shapes) {
+                const char* config = std::getenv("PROFILER_SAMPLECONFIG");
+                const std::string_view options(config ? config : "");
+                if ((command.profSwitch & PROF_MSPROFTX_MASK) != 0 ||
+                    SampleOptionEquals(options, "\"msproftx\"", "\"on\"")) {
+                    flags |= kAttributes;
+                }
+                // Keep software node correlation for in-process ACL sessions and for
+                // the msprof task-time=l0 exporter configured to collect shapes.
+                if (options.empty() || (SampleOptionEquals(options, "\"taskTime\"", "\"l0\"") &&
+                                        SampleOptionEquals(options, "\"aicoreShape\"", "\"on\""))) {
+                    flags |= kTaskL0TensorEvents;
+                }
+            }
+            mode.store(flags, std::memory_order_relaxed);
             break;
         }
         case PROF_COMMANDHANDLE_TYPE_STOP:
@@ -235,18 +272,92 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
             Append(outputs, MSPROF_GE_TENSOR_TYPE_OUTPUT);
         }
 
-        uint64_t Begin() const
+        class LaunchRange {
+          public:
+            LaunchRange(const TensorInfo* profile, aclrtStream stream, uint32_t block_dim)
+            {
+                if (!profile || profile->tensors_.empty()) {
+                    return;
+                }
+                const unsigned active = mode.load(std::memory_order_relaxed);
+                if ((active & kShapes) == 0) {
+                    return;
+                }
+                if ((active & kTaskL0TensorEvents) != 0) {
+                    task_l0_profile_ = profile;
+                    task_l0_begin_ = MsprofSysCycleTime();
+                    return;
+                }
+
+                // Let CANN attach the descriptors to the node created by the
+                // actual runtime launch on this stream and host thread.
+                const uint64_t name = aclprofStr2Id("Refer_to_kernelName");
+                if (name == std::numeric_limits<uint64_t>::max()) {
+                    return;
+                }
+                info_ = {};
+                info_.opNameId = name;
+                info_.opTypeId = name;
+                info_.tensorNum = static_cast<uint32_t>(profile->tensors_.size());
+                info_.blockNums = block_dim;
+                info_.stream = stream;
+                // The API takes a mutable pointer but consumes this field as input.
+                info_.tensors = const_cast<aclprofTensor*>(profile->tensors_.data());
+                attributes_ = {};
+                attributes_.version = ACL_PROF_EVENT_ATTR_VERSION;
+                attributes_.size = sizeof(attributes_.message);
+                attributes_.messageType = kTensorInfoMessage;
+                attributes_.message.tensorInfo = &info_;
+                pushed_ = aclprofRangePushEx(&attributes_) == ACL_SUCCESS;
+            }
+
+            LaunchRange(const LaunchRange&) = delete;
+            LaunchRange& operator=(const LaunchRange&) = delete;
+
+            ~LaunchRange()
+            {
+                Finish();
+            }
+
+            void Finish()
+            {
+                if (task_l0_begin_ != 0) {
+                    task_l0_profile_->ReportTaskL0(task_l0_begin_);
+                    task_l0_begin_ = 0;
+                }
+                if (pushed_) {
+                    (void)aclprofRangePop();
+                    pushed_ = false;
+                }
+            }
+
+          private:
+            aclprofTensorInfo info_;
+            aclprofEventAttributes attributes_;
+            const TensorInfo* task_l0_profile_ = nullptr;
+            uint64_t task_l0_begin_ = 0;
+            bool pushed_ = false;
+        };
+
+        template <typename Launch>
+        void operator()(aclrtStream stream, uint32_t block_dim, Launch&& launch) const
         {
-            return !tensors_.empty() && IsEnabled() ? MsprofSysCycleTime() : 0;
+            const uint64_t begin = !attributes_.empty() && (mode.load(std::memory_order_relaxed) & kAttributes) != 0
+                                       ? MsprofSysCycleTime()
+                                       : 0;
+            {
+                LaunchRange range(this, stream, block_dim);
+                launch();
+            }
+            if (begin != 0) {
+                ReportAttributes(kernel_, begin, attributes_);
+            }
         }
 
-        void Report(uint64_t begin) const
+      private:
+        void ReportTaskL0(uint64_t begin) const
         {
-            if (begin == 0) {
-                return;
-            }
             const uint64_t end = MsprofSysCycleTime();
-            // This item ID tells the exporter to keep the name from the runtime task.
             constexpr char kernel_name_ref[] = "Refer_to_kernelName";
             const uint64_t item_id = MsprofGetHashId(kernel_name_ref, sizeof(kernel_name_ref) - 1);
             const auto tid = static_cast<uint32_t>(syscall(SYS_gettid));
@@ -265,31 +376,26 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
             event.level = launch.level;
             event.type = MSPROF_REPORT_NODE_TENSOR_INFO_TYPE;
             event.threadId = tid;
-            event.timeStamp = begin + 1; // Match CANN's timestamp convention for additional records.
+            event.timeStamp = begin + 1; // CANN's convention for additional software node records.
             static_assert(sizeof(MsprofTensorInfo) <= sizeof(event.data));
             event.dataLen = sizeof(MsprofTensorInfo);
             for (size_t offset = 0; offset < tensors_.size(); offset += MSPROF_GE_TENSOR_DATA_NUM) {
-                MsprofTensorInfo info{};
-                info.opName = item_id;
-                info.tensorNum = std::min<size_t>(tensors_.size() - offset, MSPROF_GE_TENSOR_DATA_NUM);
-                std::copy_n(tensors_.data() + offset, info.tensorNum, info.tensorData);
-                std::memcpy(event.data, &info, sizeof(info));
+                MsprofTensorInfo batch{};
+                batch.opName = item_id;
+                batch.tensorNum = std::min<size_t>(tensors_.size() - offset, MSPROF_GE_TENSOR_DATA_NUM);
+                for (uint32_t i = 0; i < batch.tensorNum; ++i) {
+                    const auto& src = tensors_[offset + i];
+                    auto& dst = batch.tensorData[i];
+                    dst.tensorType = src.type;
+                    dst.format = src.format;
+                    dst.dataType = src.dataType;
+                    std::copy_n(src.shape, src.shapeDim, dst.shape);
+                }
+                std::memcpy(event.data, &batch, sizeof(batch));
                 (void)MsprofReportAdditionalInfo(1, &event, sizeof(event));
             }
-            if (kernel_) {
-                ReportAttributes(kernel_, begin, attributes_);
-            }
         }
 
-        template <typename Launch>
-        void operator()(Launch&& launch) const
-        {
-            const uint64_t begin = Begin();
-            launch();
-            Report(begin);
-        }
-
-      private:
         bool AppendTensor(const at::Tensor* tensor, uint32_t direction)
         {
             if (!tensor || !tensor->defined() || tensor->device().type() != at::kPrivateUse1 ||
@@ -302,9 +408,10 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
                 return false;
             }
             auto& desc = tensors_.emplace_back();
-            desc.tensorType = direction;
+            desc.type = direction;
             desc.format = static_cast<uint32_t>(at_npu::native::get_npu_format(*tensor));
             desc.dataType = static_cast<uint32_t>(ProfileDataType(tensor->scalar_type()));
+            desc.shapeDim = static_cast<uint32_t>(tensor->dim());
             std::copy(sizes.begin(), sizes.end(), desc.shape);
             return true;
         }
@@ -319,7 +426,7 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
         const char* kernel_ = nullptr;
         std::string attributes_;
         // OpCommand can launch on a different Host thread. Keep descriptors by value.
-        std::vector<MsrofTensorData> tensors_;
+        std::vector<aclprofTensor> tensors_;
     };
 
     inline std::shared_ptr<const TensorInfo> ShareTensors(std::initializer_list<const at::Tensor*> inputs,
@@ -329,10 +436,11 @@ namespace fa_profile __attribute__((visibility("hidden"))) {
     }
 
     template <typename Launch>
-    void LaunchWithProfile(const std::shared_ptr<const TensorInfo>& profile, Launch&& launch)
+    void LaunchWithProfile(const std::shared_ptr<const TensorInfo>& profile, aclrtStream stream, uint32_t block_dim,
+                           Launch&& launch)
     {
         if (profile) {
-            (*profile)(launch);
+            (*profile)(stream, block_dim, launch);
         } else {
             launch();
         }

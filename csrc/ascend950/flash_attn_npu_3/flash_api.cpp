@@ -5,6 +5,7 @@
 
 #include <torch/extension.h>
 
+#include "../../profiling/fa_aicpu_profile.hpp"
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
 #include "fa_metadata_args.h"
@@ -28,7 +29,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
     fa_profile::TensorInfo profile("950/FA3/ComputeFAMetadata",
                                    {{q_name, fa_profile::Tensor(qLengths)}, {kv_name, &kvLengths}}, {&meta}, write);
     auto metadata_task = [handle, args, profile = std::move(profile)]() mutable -> int {
-        profile([&] { ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args)); });
+        fa_profile::LaunchAicpuWithProfile(profile,
+                                           [&] { ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -301,7 +303,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     const bool is_bf16 = (out_type == at::kBFloat16);
     fa_profile::TensorInfo profile({&out_partial, &lse_partial}, {&out, return_lse ? &lse_out : nullptr});
     auto launch_combine = [args, is_fp16, is_bf16, profile = std::move(profile)]() -> int {
-        profile([&] {
+        profile(args.aclStream, args.launchBlockDim, [&] {
             if (is_fp16) {
                 launch_combine_fp16(args);
             } else if (is_bf16) {
