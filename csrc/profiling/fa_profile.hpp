@@ -37,9 +37,9 @@
 #include "profiling/aprof_pub.h"
 #include "torch_npu/csrc/core/npu/NPUFormat.h"
 
-// Some torch_npu releases include their bundled ACL header first. It declares
-// the range APIs but only forward-declares aclprofEventAttributes. The CANN
-// header documents this guard and the frozen version-1 ABI for those builds.
+// Some torch_npu releases include their bundled ACL header first, hiding the
+// CANN header's tensor definitions and, in older releases, the range declarations.
+// Use the CANN header's documented guard and frozen version-1 ABI.
 #ifndef ACL_PROF_TENSOR_INFO_DEFINED
 #define ACL_PROF_TENSOR_INFO_DEFINED
 #define ACL_PROF_EVENT_ATTR_VERSION 1
@@ -68,6 +68,12 @@ struct aclprofEventAttributes {
         aclprofTensorInfo* tensorInfo;
     } message;
 };
+
+extern "C" {
+MSVP_PROF_API uint64_t aclprofStr2Id(const char* message);
+MSVP_PROF_API aclError aclprofRangePushEx(aclprofEventAttributes* attr);
+MSVP_PROF_API aclError aclprofRangePop();
+}
 #endif
 
 namespace fa_profile __attribute__((visibility("hidden"))) {
