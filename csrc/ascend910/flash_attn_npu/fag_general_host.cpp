@@ -10,7 +10,7 @@
 #include "acl/acl.h"
 #include "catlass/catlass.hpp"
 // kernel_operator.h is for the ASC frontend only; host TUs get the GM_ADDR /
-// __aicore__ vocabulary from csrc/host_compat.hpp instead.
+// __aicore__ vocabulary from this extension's host_compat.hpp instead.
 #if defined(__CCE__)
 #include "kernel_operator.h"
 #endif

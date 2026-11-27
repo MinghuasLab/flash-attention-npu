@@ -18,7 +18,7 @@
 // The layout enum (KernelCommon::FaiKenel::inputLayout) must be visible here so
 // FwdLaunchArgs can carry it and launch_fwd can dispatch on it. kernel_common.hpp
 // needs kernel_operator.h for __aicore__ / GM_ADDR: kernel TUs take it from
-// kernel_operator.h, host TUs from csrc/host_compat.hpp, so this adds no new
+// kernel_operator.h, host TUs from this extension's host_compat.hpp, so this adds no new
 // CATLASS/kernel-template cost.
 #if defined(__CCE__)
 #include "kernel_operator.h"

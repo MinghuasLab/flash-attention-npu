@@ -11,9 +11,9 @@
 #include "combine_dispatch.hpp"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
-// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// The AICPU metadata kernel is launched from aicpu_launch.cpp (ASC TU);
 // flash_api.cpp is a host TU and must not use ASC launch syntax.
-#include "../../fa_aicpu_launch.hpp"
+#include "aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
                                            const std::optional<at::Tensor>& qLengths)

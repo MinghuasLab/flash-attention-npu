@@ -38,7 +38,11 @@
 // at_npu::native::OpCommand::RunOpApiV2. This kernel-launch header must stay
 // free of torch/torch_npu includes: the ASC frontend cannot parse torch >= 2.14's
 // C++20 headers.
-#include "../../op_command_bridge.hpp"
+#include <functional>
+
+namespace fa_bridge {
+void run_op_api_v2(const char* op_name, const std::function<int()>& func);
+} // namespace fa_bridge
 
 // fag_kernel.cpp provides the ::FAGGeneral kernel template, the DTemplateType
 // enum, and the unqualified BSND/TND layout constants (0/1, from

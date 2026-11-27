@@ -15,7 +15,7 @@
 // formerly pulled in transitively by mha_fwd_kvcache.cpp / mha_varlen_bwd.cpp,
 // which are now compiled as separate dispatch TUs, so include them explicitly
 // here, in this order.
-// Host build: kernel_operator.h is ASC-frontend-only; csrc/host_compat.hpp
+// Host build: kernel_operator.h is ASC-frontend-only; this extension's host_compat.hpp
 // (force-included) provides GM_ADDR and friends instead.
 #if defined(__CCE__)
 #include "kernel_operator.h"
@@ -76,14 +76,13 @@ AlibiSlopes set_params_alibi(const std::optional<at::Tensor>& alibi_slopes_, int
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// The AICPU metadata kernel is launched from aicpu_launch.cpp (ASC TU);
 // flash_api.cpp is a host TU and must not use ASC launch syntax.
-#include "../../fa_aicpu_launch.hpp"
+#include "aicpu_launch.hpp"
 
 // Host-side implementation of the torch-free OpCommand bridge declared in
-// csrc/op_command_bridge.hpp; the v2 backward / varlen dispatch TUs (ASC)
-// call it.
-#include "../../op_command_bridge.hpp"
+// the kernel-side dispatch headers; the v2 backward / varlen dispatch TUs
+// (ASC) call it.
 namespace fa_bridge {
 void run_op_api_v2(const char* op_name, const std::function<int()>& func)
 {

@@ -1,8 +1,8 @@
 // Copyright (c) 2026, Minghua Shen.
 //
 // ASC TU: the FlashAttentionV3Bwd950 / FlashAttentionV3BwdMla950 template
-// instantiations and <<<>>> launches of the 950 backward path, shared by the
-// v3 and v4 API extensions. mha_bwd.cpp is compiled as part of the host TU
+// instantiations and <<<>>> launches of the 950 backward path of the v3 API
+// extension. mha_bwd.cpp is compiled as part of the host TU
 // flash_api.cpp (torch >= 2.14 headers need C++20, which the bisheng ASC
 // frontend cannot parse), so it marshals the tensors into the plain-pointer
 // Bwd950LaunchArgs and calls bwd_dispatch_950(). The macros and the dtype /
@@ -11,8 +11,8 @@
 
 #include "acl/acl.h"
 #include "bwd_launch.hpp"
-#include "flash_attn_npu_3/fag_kernel.cpp"
-#include "flash_attn_npu_3/fa_bwd_mla_kernel.cpp"
+#include "fag_kernel.cpp"
+#include "fa_bwd_mla_kernel.cpp"
 
 namespace fa950 {
 

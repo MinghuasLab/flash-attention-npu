@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Minghua Shen.
 //
-// Host/device boundary of the 950 backward launch, shared by the v3 and v4
-// API extensions. mha_bwd.cpp is compiled as part of the host TU flash_api.cpp
+// Host/device boundary of the 950 backward launch of the v3 API extension.
+// mha_bwd.cpp is compiled as part of the host TU flash_api.cpp
 // (torch >= 2.14 headers need C++20, which the bisheng ASC frontend cannot
 // parse), so it fills Bwd950LaunchArgs with plain pointers and calls
 // bwd_dispatch_950(), defined in bwd_launch.cpp (ASC TU), which owns the

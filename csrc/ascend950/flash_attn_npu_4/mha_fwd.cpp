@@ -34,10 +34,10 @@
 #include "tiling_from_tensors.hpp"
 #include "fa_metadata_args.h"
 
-// The write-runtime AICPU kernel is launched from csrc/fa_aicpu_launch.cpp
-// (ASC TU); this file is compiled as part of the host TU flash_api.cpp and must
-// not use ASC launch syntax.
-#include "../../fa_aicpu_launch.hpp"
+// The write-runtime AICPU kernel is launched from aicpu_launch.cpp (ASC TU);
+// this file is compiled as part of the host TU flash_api.cpp and must not use
+// ASC launch syntax.
+#include "aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,

@@ -10,10 +10,6 @@ include flash_attn_npu_4/catlass_dsl/README.md
 recursive-include examples *.py
 
 include csrc/fag_tensor_strides.h
-include csrc/fa_aicpu_launch.cpp
-include csrc/fa_aicpu_launch.hpp
-include csrc/host_compat.hpp
-include csrc/op_command_bridge.hpp
 
 recursive-include csrc/ascend910 *.h *.hpp *.cpp *.aicpu
 recursive-include csrc/ascend950 *.h *.hpp *.cpp *.aicpu

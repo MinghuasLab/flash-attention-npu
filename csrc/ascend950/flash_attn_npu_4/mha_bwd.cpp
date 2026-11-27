@@ -31,7 +31,7 @@
 // The general and MLA backward kernel templates and their <<<>>> launches
 // live in bwd_launch.cpp (ASC TU); this file is compiled as part of the host
 // TU flash_api.cpp and only marshals tensor data into Bwd950LaunchArgs.
-#include "../bwd_launch.hpp"
+#include "bwd_launch.hpp"
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"

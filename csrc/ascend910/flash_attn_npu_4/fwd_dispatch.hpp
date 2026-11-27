@@ -22,7 +22,7 @@
 #include <cstdint>
 #include "acl/acl.h"
 // Host TUs (flash_api.cpp) include this lightweight interface header too;
-// they get the GM_ADDR/__aicore__ vocabulary from csrc/host_compat.hpp
+// they get the GM_ADDR/__aicore__ vocabulary from this extension's host_compat.hpp
 // instead of the ASC-only kernel_operator.h.
 #if defined(__CCE__)
 #include <kernel_operator.h>

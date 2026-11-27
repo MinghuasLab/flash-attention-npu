@@ -17,9 +17,9 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "acl/acl.h"
 
-// The AICPU metadata kernel is launched from fa_aicpu_launch.cpp (ASC TU);
+// The AICPU metadata kernel is launched from aicpu_launch.cpp (ASC TU);
 // flash_api.cpp is a host TU and must not use ASC launch syntax.
-#include "../../fa_aicpu_launch.hpp"
+#include "aicpu_launch.hpp"
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cache_seqlens,
                                            const std::optional<at::Tensor>& cu_seqlens_q,
