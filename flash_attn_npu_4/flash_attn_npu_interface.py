@@ -127,6 +127,7 @@ def round_multiple(x, m):
 _HEADDIM_BWD_ALIGN = 64
 _HEADDIM_BWD_ALIGN_LARGE = 16
 
+
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
     Pad headdim for the bwd kernel.
@@ -1255,6 +1256,10 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse=False,
+    gather_bwd_recompute_p=False,  # Not supported on NPU
+    gather_bwd_token_chunk=None,  # Not supported on NPU
+    config=None,  # Not supported on NPU
+    scales=None,  # Not supported on NPU
 ):
     """Forward pass of FlashAttention for dense (batch-major) inputs.
 
@@ -1287,6 +1292,8 @@ def flash_attn_func(
         block_sparse_tensors / block_sparse_tensors_bwd: (Not supported on NPU)
         aux_tensors / aux_scalars: (Not supported on NPU)
         return_lse: bool. Whether to return the logsumexp of the attention scores.
+        gather_bwd_recompute_p / gather_bwd_token_chunk: (Not supported on NPU)
+        config / scales: (Not supported on NPU)
 
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
@@ -1304,6 +1311,12 @@ def flash_attn_func(
         raise NotImplementedError(
             "FA4 Flex attention requires Ascend 950; Ascend 910 is not supported"
         )
+    if gather_bwd_recompute_p or gather_bwd_token_chunk is not None:
+        raise NotImplementedError("Ascend 910 FA4 does not support gather_bwd_* options")
+    if config is not None:
+        raise NotImplementedError("Ascend 910 FA4 does not support config")
+    if scales is not None:
+        raise NotImplementedError("Ascend 910 FA4 does not support FP8 dequantization scales")
     # Empty aux containers are equivalent to omitted auxiliary inputs.
     aux_tensors = aux_scalars = None
     return FlashAttnFunc.apply(

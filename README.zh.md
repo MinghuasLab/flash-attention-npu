@@ -735,6 +735,10 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse=False,
+    gather_bwd_recompute_p=False,  # NPU 暂不支持
+    gather_bwd_token_chunk=None,  # NPU 暂不支持
+    config=None,  # NPU 暂不支持
+    scales=None,  # NPU 暂不支持
 ):
     """
     v4 版本的标准（定长、batch-major）注意力接口。
@@ -783,6 +787,8 @@ def flash_attn_func(
         aux_tensors / aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助 tensor/标量。
         block_sparse_tensors / block_sparse_tensors_bwd [可选]: block sparse tensor。
         return_lse: bool。是否返回 attention scores 的 logsumexp。
+        gather_bwd_recompute_p / gather_bwd_token_chunk: NPU 暂不支持。
+        config / scales: NPU 暂不支持。
 
     约束：
         - 1 <= headdim <= 256。

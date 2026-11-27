@@ -68,14 +68,13 @@ def _assert_950_flashdecode_metadata(tiling):
 @pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 dense FlashDecode")
 @pytest.mark.parametrize(
-    "dtype, q_shape, kv_shape, disable_scheduler_metadata",
+    "dtype, q_shape, kv_shape",
     [
-        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), False),
-        (torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512), False),
-        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512), True),
+        (torch.float16, (2, 2, 16, 512), (2, 4097, 4, 512)),
+        (torch.bfloat16, (1, 1, 16, 512), (1, 4096, 1, 512)),
     ],
 )
-def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape, disable_scheduler_metadata):
+def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape):
     query = make_random_tensor(q_shape, dtype, device="npu")
     key = make_random_tensor(kv_shape, dtype, device="npu")
     value = make_random_tensor(kv_shape, dtype, device="npu")
@@ -87,30 +86,19 @@ def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape, disable_sched
         num_splits=0,
         softmax_scale=scale,
         return_lse=True,
-        disable_scheduler_metadata=disable_scheduler_metadata,
     )
-    if not disable_scheduler_metadata:
-        metadata = get_scheduler_metadata(
-            max_seqlen_q=q_shape[1],
-            max_seqlen_k=kv_shape[1],
-            nheads=q_shape[2],
-            nheads_kv=kv_shape[2],
-            headdim=q_shape[-1],
-            num_splits=0,
-            seqused_k=_int32_npu([kv_shape[1]] * q_shape[0]),
-        )
-        _assert_950_flashdecode_metadata(metadata)
-        explicit_out, explicit_lse = flash_attn_func(
-            query,
-            key,
-            value,
-            num_splits=0,
-            softmax_scale=scale,
-            return_lse=True,
-            scheduler_metadata=metadata,
-        )
-        torch.testing.assert_close(out, explicit_out, rtol=0, atol=0)
-        torch.testing.assert_close(lse, explicit_lse, rtol=0, atol=0)
+    # The fixed-length interface builds this metadata on the host, matching
+    # Ascend910, so replay the same call to check the FlashDecode tiling.
+    metadata = get_scheduler_metadata(
+        max_seqlen_q=q_shape[1],
+        max_seqlen_k=kv_shape[1],
+        nheads=q_shape[2],
+        nheads_kv=kv_shape[2],
+        headdim=q_shape[-1],
+        num_splits=0,
+        seqused_k=_int32_npu([kv_shape[1]] * q_shape[0]),
+    )
+    _assert_950_flashdecode_metadata(metadata)
 
     out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
         query.cpu(), key.cpu(), value.cpu(), scale, None, dtype
@@ -889,21 +877,39 @@ def test_flashdecode_is_independent_of_kv_storage_and_q_layout(metadata_path):
 
 @pytest.fixture
 def metadata_spy(monkeypatch):
-    """Record requests for automatic AICPU scheduler metadata."""
+    """Record scheduler-metadata construction for the dense and varlen paths."""
+    calls = []
     if "Ascend950" in _device_name:
         from flash_attn_npu_4 import flash_attn_npu_interface_950 as interface
 
-        target, name = interface.flash_attn_npu_4_950, "fwd"
-    else:
-        from flash_attn_npu_4 import flash_attn_npu_interface as interface
+        # The fixed-length path builds metadata on the host, like Ascend910.
+        original_get = interface.get_scheduler_metadata
 
-        target, name = interface, "get_scheduler_metadata"
-    calls = []
+        def _get_spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original_get(*args, **kwargs)
+
+        monkeypatch.setattr(interface, "get_scheduler_metadata", _get_spy)
+
+        # The variable-length path still asks the kernel to build metadata.
+        target, name = interface.flash_attn_npu_4_950, "fwd"
+        original_fwd = getattr(target, name)
+
+        def _fwd_spy(*args, **kwargs):
+            if kwargs.get("build_scheduler_metadata"):
+                calls.append((args, kwargs))
+            return original_fwd(*args, **kwargs)
+
+        monkeypatch.setattr(target, name, _fwd_spy)
+        return calls
+
+    from flash_attn_npu_4 import flash_attn_npu_interface as interface
+
+    target, name = interface, "get_scheduler_metadata"
     original = getattr(target, name)
 
     def _spy(*args, **kwargs):
-        if name == "get_scheduler_metadata" or kwargs.get("build_scheduler_metadata"):
-            calls.append((args, kwargs))
+        calls.append((args, kwargs))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(target, name, _spy)
