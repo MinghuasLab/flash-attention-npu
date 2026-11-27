@@ -521,8 +521,7 @@ class FAInferKernel {
                     if (fusedTask) {
                         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
                             curTotalTaskNumTmp +=
-                                fa_fused::MakeTaskShape(qSeqlenCur, qHeads, kvHeads, batch, coreNum, false)
-                                    .totalTasks;
+                                fa_fused::MakeTaskShape(qSeqlenCur, qHeads, kvHeads, batch, coreNum, false).totalTasks;
                         } else {
                             curTotalTaskNumTmp += fusedShape.totalTasks;
                         }
@@ -582,10 +581,10 @@ class FAInferKernel {
                 }
 
                 const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
-                const bool hasTaskWork = runMainLoop(
-                    coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0, 0, 0, 0,
-                    globalTensors, descriptors, currentTaskStateSlot, issuedStackCount, pipelineDrain,
-                    softmaxPingPongFlag, fusedHeadTile);
+                const bool hasTaskWork =
+                    runMainLoop(coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0,
+                                0, 0, 0, globalTensors, descriptors, currentTaskStateSlot, issuedStackCount,
+                                pipelineDrain, softmaxPingPongFlag, fusedHeadTile);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
         }
@@ -983,9 +982,9 @@ class FAInferKernel {
             } else {
                 for (uint32_t seg = 0; seg < segNum; ++seg) {
                     LayoutQ layoutSegmentQ(segRows, embed, static_cast<uint32_t>(qHeadStride));
-                    blockMmadQK.loadQGM(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride],
-                                        layoutSegmentQ, segRows, segN, static_cast<uint32_t>(strideQ),
-                                        seg * segL1Stride, seg == 0, seg + 1 == segNum);
+                    blockMmadQK.loadQGM(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride], layoutSegmentQ,
+                                        segRows, segN, static_cast<uint32_t>(strideQ), seg * segL1Stride, seg == 0,
+                                        seg + 1 == segNum);
                 }
             }
         }
@@ -1091,10 +1090,9 @@ class FAInferKernel {
                             uint64_t kHeadOffset = static_cast<uint64_t>(seg) * kvHeadStrideK;
                             blockMmadQK(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride],
                                         gQKSrc[qkSrcOffset + kHeadOffset],
-                                        gS[gmOffsetS + seg * segRows * stackSeqTilePad], gBlockTable,
-                                        layoutSegmentQ, layoutKTemp, layoutSegmentS, segmentShapeQK, kvSIdxLocal,
-                                        kvSLoopNumTotal, pagedBlockSize, strideK, doCopyback,
-                                        gK[gmOffsetK + kHeadOffset], qkCacheOffset,
+                                        gS[gmOffsetS + seg * segRows * stackSeqTilePad], gBlockTable, layoutSegmentQ,
+                                        layoutKTemp, layoutSegmentS, segmentShapeQK, kvSIdxLocal, kvSLoopNumTotal,
+                                        pagedBlockSize, strideK, doCopyback, gK[gmOffsetK + kHeadOffset], qkCacheOffset,
                                         AscendC::GlobalTensor<int32_t>(), 0, 0, seg * segL1Stride);
                         }
                     }
@@ -1122,14 +1120,12 @@ class FAInferKernel {
                     if (doTriUMask) {
                         epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                               actualBlockShapeQK, desc.firstStack, qSBlockSize, qNBlockSize,
-                                              curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                              triUp, triDown, kvSStartIdx, kvSEndIdx,
-                                              isFlashDecode ? isSplitKV : false);
+                                              curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag, triUp,
+                                              triDown, kvSStartIdx, kvSEndIdx, isFlashDecode ? isSplitKV : false);
                     } else {
                         const uint32_t lastNoMaskTile = causalLastNoMaskTile;
-                        const int32_t lastNoMaskStackId = isFlashDecode
-                                                             ? ((int32_t)lastNoMaskTile - (int32_t)kvStart)
-                                                             : (int32_t)lastNoMaskTile;
+                        const int32_t lastNoMaskStackId =
+                            isFlashDecode ? ((int32_t)lastNoMaskTile - (int32_t)kvStart) : (int32_t)lastNoMaskTile;
                         epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                               desc.firstStack, (stackSeqCount == lastNoMaskStackId), qSBlockSize,
                                               qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
@@ -1223,11 +1219,11 @@ class FAInferKernel {
                         uint64_t vHeadOffset = static_cast<uint64_t>(seg) * kvHeadStrideV;
                         blockMmadPV(gP[gmOffsetP + seg * pvSegRows * stackSeqTilePad],
                                     gPVSrc[pvDesc.gmOffsetVSrc + vHeadOffset],
-                                    gOTmp[gmOffsetOTmp + seg * pvSegRows * embedRoundV], gBlockTable,
-                                    layoutSegmentP, layoutVTemp, layoutSegmentO, segmentShapePV, pvDesc.kvSIdx,
-                                    pvDesc.kvSLoopNumTotal, pagedBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum,
-                                    softmaxReady, pvDesc.doCopyback, gV[pvDesc.gmOffsetV + vHeadOffset],
-                                    pvDesc.pvCacheOffset, AscendC::GlobalTensor<int32_t>(), 0, 0, seg == 0);
+                                    gOTmp[gmOffsetOTmp + seg * pvSegRows * embedRoundV], gBlockTable, layoutSegmentP,
+                                    layoutVTemp, layoutSegmentO, segmentShapePV, pvDesc.kvSIdx, pvDesc.kvSLoopNumTotal,
+                                    pagedBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum, softmaxReady,
+                                    pvDesc.doCopyback, gV[pvDesc.gmOffsetV + vHeadOffset], pvDesc.pvCacheOffset,
+                                    AscendC::GlobalTensor<int32_t>(), 0, 0, seg == 0);
                     }
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);

@@ -127,6 +127,7 @@ def round_multiple(x, m):
 _HEADDIM_BWD_ALIGN = 64
 _HEADDIM_BWD_ALIGN_LARGE = 16
 
+
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
     Pad headdim for the bwd kernel.
@@ -318,7 +319,7 @@ def _flash_attn_forward(
 # Real metadata contract:
 #
 #   all mask types:
-#       shape = (2376,)
+#       shape = (2368,)
 #
 #   dtype  = torch.uint8
 #   device = NPU

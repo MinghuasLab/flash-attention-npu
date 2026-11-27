@@ -268,9 +268,8 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t nIdx, uint32_t nLoop, uint32_t blockSize, uint32_t strideKV,
                                       bool = false, AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
-                                      uint64_t = 0,
-                                      AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(), uint32_t = 0,
-                                      uint32_t = 0, uint32_t qL1Offset = 0)
+                                      uint64_t = 0, AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(),
+                                      uint32_t = 0, uint32_t = 0, uint32_t qL1Offset = 0)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t stackSeqTile = actualOriShape[COORD_DIM1];

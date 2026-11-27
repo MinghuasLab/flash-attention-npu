@@ -22,20 +22,35 @@ def test_fa3_910_kvcache_metadata_copy_torch_compile(causal):
     lengths = torch.tensor([128], dtype=torch.int32, device=query.device)
     cu_q = torch.tensor([0, 16], dtype=torch.int32, device=query.device)
     pages = torch.tensor([[0]], dtype=torch.int32, device=query.device)
-    metadata_buffer = torch.empty(2376, dtype=torch.uint8, device=query.device)
+    metadata_buffer = torch.empty(2408, dtype=torch.uint8, device=query.device)
 
     def fn(q, k, v, cache_lengths, metadata):
         fresh = api.get_scheduler_metadata(
-            batch_size=1, max_seqlen_q=16, max_seqlen_k=128,
-            num_heads_q=4, num_heads_kv=2, headdim=128,
-            cache_seqlens=cache_lengths, qkv_dtype=q.dtype,
-            cu_seqlens_q=cu_q, page_size=128, causal=causal, num_splits=1,
+            batch_size=1,
+            max_seqlen_q=16,
+            max_seqlen_k=128,
+            num_heads_q=4,
+            num_heads_kv=2,
+            headdim=128,
+            cache_seqlens=cache_lengths,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_q,
+            page_size=128,
+            causal=causal,
+            num_splits=1,
         )
         metadata.copy_(fresh.clone())
         return api.flash_attn_with_kvcache(
-            q, k, v, cache_seqlens=cache_lengths, cu_seqlens_q=cu_q,
-            max_seqlen_q=16, page_table=pages, causal=causal,
-            scheduler_metadata=metadata, num_splits=1,
+            q,
+            k,
+            v,
+            cache_seqlens=cache_lengths,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=16,
+            page_table=pages,
+            causal=causal,
+            scheduler_metadata=metadata,
+            num_splits=1,
         )
 
     torch._dynamo.reset()
@@ -56,11 +71,11 @@ def test_fa3_910_scheduler_metadata_torch_compile_correctness():
     run_metadata_compile_test(
         api,
         expected_sizes={
-            "NO_MASK": 2376,
-            "CAUSAL": 2376,
-            "LOCAL_LEFT": 2376,
-            "LOCAL_RIGHT": 2376,
-            "FULL_WINDOW_COLLAPSE": 2376,
+            "NO_MASK": 2408,
+            "CAUSAL": 2408,
+            "LOCAL_LEFT": 2408,
+            "LOCAL_RIGHT": 2408,
+            "FULL_WINDOW_COLLAPSE": 2408,
         },
         tiling_only_metadata=True,
     )

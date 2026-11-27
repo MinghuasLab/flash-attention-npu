@@ -1024,10 +1024,9 @@ class FAInferKernel {
             } else {
                 for (uint32_t seg = 0; seg < segNum; ++seg) {
                     LayoutQ layoutSegmentQ(segRows, embed);
-                    blockMmadQK.loadQGM(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride],
-                                        layoutSegmentQ, segRows, segN, static_cast<uint32_t>(qHeadStride),
-                                        static_cast<uint32_t>(strideQ), seg * segL1Stride, seg == 0,
-                                        seg + 1 == segNum);
+                    blockMmadQK.loadQGM(gQ[gmOffsetQ + static_cast<uint64_t>(seg * segN) * qHeadStride], layoutSegmentQ,
+                                        segRows, segN, static_cast<uint32_t>(qHeadStride),
+                                        static_cast<uint32_t>(strideQ), seg * segL1Stride, seg == 0, seg + 1 == segNum);
                 }
             }
         }

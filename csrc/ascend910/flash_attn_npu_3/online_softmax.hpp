@@ -408,7 +408,7 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
             Rowmax512(lsUbTensor[sUbOffset], lmUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNumRound);
         } else {
             Rowmax(lsUbTensor[sUbOffset], lmUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum,
-                         columnNumRound);
+                   columnNumRound);
         }
     }
 
@@ -487,7 +487,7 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
             Rowsum512(lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNumRound);
         } else {
             Rowsum(lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum,
-                         columnNumRound);
+                   columnNumRound);
         }
     }
 
@@ -544,12 +544,13 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
         Masked = 1,
     };
 
-    __aicore__ inline void
-    SubCoreCompute(AscendC::GlobalTensor<ElementOutput> gOutput, const LayoutOutput& layoutOutput, uint32_t rowOffset,
-                   uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile, uint32_t isFirstRowLoop,
-                   uint32_t isLastRowLoop, uint32_t columnNumRound, uint32_t pingpongFlag, uint32_t curStackTileMod,
-                   uint32_t taskStateSlot, bool isSplitKV, BufferSyncMode syncMode,
-                   bool startsWithMaskThenNomaskFlag = false)
+    __aicore__ inline void SubCoreCompute(AscendC::GlobalTensor<ElementOutput> gOutput,
+                                          const LayoutOutput& layoutOutput, uint32_t rowOffset,
+                                          uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
+                                          uint32_t isFirstRowLoop, uint32_t isLastRowLoop, uint32_t columnNumRound,
+                                          uint32_t pingpongFlag, uint32_t curStackTileMod, uint32_t taskStateSlot,
+                                          bool isSplitKV, BufferSyncMode syncMode,
+                                          bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);

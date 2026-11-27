@@ -6,7 +6,6 @@
 // same code compiles for the AICPU toolchain; FaMin/FaMax replace
 // std::min/std::max.
 
-
 #ifndef FA_SPLIT_H
 #define FA_SPLIT_H
 

@@ -531,8 +531,7 @@ std::vector<at::Tensor> mha_fwd(
             uint64_t curTaskNum;
             if (fusedTask) {
                 curTaskNum = seqlens_q_cpu != nullptr
-                                 ? fa_fused::MakeTaskShape(qSeqlen, num_heads, num_heads_k, batch_size, blockDim,
-                                                           false)
+                                 ? fa_fused::MakeTaskShape(qSeqlen, num_heads, num_heads_k, batch_size, blockDim, false)
                                        .totalTasks
                                  : fusedShape.totalTasks;
             } else {

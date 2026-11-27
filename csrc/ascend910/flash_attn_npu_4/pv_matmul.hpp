@@ -140,8 +140,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                        uint32_t& blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                  static_cast<uint64_t>(blockStartOffset) * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride + static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -173,11 +172,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t& nIdx, uint32_t& nLoop, uint32_t& blockSize, uint32_t kvSeqlen,
                                       uint32_t strideKV, uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag,
-                                      bool = false,
-                                      AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
-                                      uint64_t = 0,
-                                      AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(), uint32_t = 0,
-                                      uint32_t = 0, bool firstSegment = true)
+                                      bool = false, AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
+                                      uint64_t = 0, AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(),
+                                      uint32_t = 0, uint32_t = 0, bool firstSegment = true)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t embed = actualOriShape[COORD_DIM1];
@@ -315,8 +312,8 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             while (dstRow < kChunkLen) {
                 const uint32_t segLen = AscendC::Std::min(kChunkLen - dstRow, blockSize - pageOff);
                 const uint32_t blockTableId = gBlockTable.GetValue(pageIdx);
-                    const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                                             static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
+                const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                                         static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(segLen, nSliceLen));
                 MatrixCoord l1BTileCoord{dstRow, 0};
                 auto l1BTile = l1VTensor[stage][layoutBInL1.GetOffset(l1BTileCoord)];
