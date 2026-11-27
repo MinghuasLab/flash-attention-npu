@@ -4,7 +4,6 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 # isort: off
 # We need to import the kernels after importing torch
@@ -71,6 +70,7 @@ def _validate_varlen_query(q, cu_seqlens_q):
 
 _HEADDIM_BWD_ALIGN = 64
 _HEADDIM_BWD_ALIGN_LARGE = 16
+
 
 def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
@@ -1822,13 +1822,13 @@ def flash_attn_with_kvcache(
 
 # Real metadata contract:
 #   all mask types:
-#       shape = (2416,)
+#       shape = (2448,)
 #   dtype  = torch.uint8
 #   device = NPU
 #   stride = (1,)
 # Schema matches the V2 910 pybind signature in flash_api.cpp
 # (not the V3/V4 parameter lists).
-_SCHEDULER_METADATA_TILING_BYTES = 2416
+_SCHEDULER_METADATA_TILING_BYTES = 2448
 
 
 @torch.library.custom_op(

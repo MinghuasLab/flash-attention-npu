@@ -53,6 +53,8 @@ struct FAInferTilingData {
     // P0 (G2)：吸收式 MLA decode gemv 每 batch KV 切分预算，由宿主下沉；2376 字节 ABI 不变。
     // kernel 据此在设备侧重算 (batch, split) task 表，使 task 数不再受 coreInfo[25] 截断。
     uint32_t nsplitPerBatch;
+    // fuseTask 开关；紧随 nsplitPerBatch 填入 int64 对齐前的 4 字节空洞，结构体大小不变。
+    uint32_t fusedTask;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -66,6 +68,19 @@ struct FAInferTilingData {
     uint32_t kvCacheSeqlen;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
+    // fuseTask geometry, computed once on the Host (or AICPU) so the AICore only
+    // reads it instead of re-running HeadTile/MakeTaskShape (gcd + divides) in
+    // every core. Only the fixed-layout (BSND/BNSD) path can publish it; TND
+    // (varlen q / seqused_q) leaves it zero and the kernel derives one shape per
+    // batch from that batch's Q length.
+    uint32_t fusedNormQBlocks;
+    uint32_t fusedNormHeadTile;
+    uint32_t fusedNormHeadBlocks;
+    uint32_t fusedNormTasks;
+    uint32_t fusedTailRows;
+    uint32_t fusedTailHeadTile;
+    uint32_t fusedTailHeadBlocks;
+    uint32_t fusedTotalTasks;
 
     uint32_t get_numHeads() const
     {
@@ -151,6 +166,10 @@ struct FAInferTilingData {
     {
         return nsplitPerBatch;
     }
+    uint32_t get_fusedTask() const
+    {
+        return fusedTask;
+    }
     uint64_t get_splitLseTotalSize() const
     {
         return splitLseTotalSize;
@@ -182,6 +201,38 @@ struct FAInferTilingData {
     uint32_t get_kvCacheSeqlen() const
     {
         return kvCacheSeqlen;
+    }
+    uint32_t get_fusedNormQBlocks() const
+    {
+        return fusedNormQBlocks;
+    }
+    uint32_t get_fusedNormHeadTile() const
+    {
+        return fusedNormHeadTile;
+    }
+    uint32_t get_fusedNormHeadBlocks() const
+    {
+        return fusedNormHeadBlocks;
+    }
+    uint32_t get_fusedNormTasks() const
+    {
+        return fusedNormTasks;
+    }
+    uint32_t get_fusedTailRows() const
+    {
+        return fusedTailRows;
+    }
+    uint32_t get_fusedTailHeadTile() const
+    {
+        return fusedTailHeadTile;
+    }
+    uint32_t get_fusedTailHeadBlocks() const
+    {
+        return fusedTailHeadBlocks;
+    }
+    uint32_t get_fusedTotalTasks() const
+    {
+        return fusedTotalTasks;
     }
 
     void set_numHeads(uint32_t value)
@@ -277,6 +328,10 @@ struct FAInferTilingData {
     {
         nsplitPerBatch = value;
     }
+    void set_fusedTask(uint32_t value)
+    {
+        fusedTask = value;
+    }
     void set_splitLseTotalSize(uint64_t value)
     {
         splitLseTotalSize = value;
@@ -308,6 +363,18 @@ struct FAInferTilingData {
     void set_kvCacheSeqlen(uint32_t value)
     {
         kvCacheSeqlen = value;
+    }
+    void set_fusedShape(uint32_t normQBlocks, uint32_t normHeadTile, uint32_t normHeadBlocks, uint32_t normTasks,
+                        uint32_t tailRows, uint32_t tailHeadTile, uint32_t tailHeadBlocks, uint32_t totalTasks)
+    {
+        fusedNormQBlocks = normQBlocks;
+        fusedNormHeadTile = normHeadTile;
+        fusedNormHeadBlocks = normHeadBlocks;
+        fusedNormTasks = normTasks;
+        fusedTailRows = tailRows;
+        fusedTailHeadTile = tailHeadTile;
+        fusedTailHeadBlocks = tailHeadBlocks;
+        fusedTotalTasks = totalTasks;
     }
 };
 

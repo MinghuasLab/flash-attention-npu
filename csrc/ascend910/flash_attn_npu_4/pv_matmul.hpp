@@ -140,8 +140,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                        uint32_t& blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                  static_cast<uint64_t>(blockStartOffset) * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride + static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline void setBlockParam(uint32_t stackSeqTile, uint32_t& blockStart, uint32_t& blockEnd,
@@ -173,11 +172,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t& nIdx, uint32_t& nLoop, uint32_t& blockSize, uint32_t kvSeqlen,
                                       uint32_t strideKV, uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag,
-                                      bool = false,
-                                      AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
-                                      uint64_t = 0,
-                                      AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(), uint32_t = 0,
-                                      uint32_t = 0)
+                                      bool = false, AscendC::GlobalTensor<ElementB> = AscendC::GlobalTensor<ElementB>(),
+                                      uint64_t = 0, AscendC::GlobalTensor<int32_t> = AscendC::GlobalTensor<int32_t>(),
+                                      uint32_t = 0, uint32_t = 0, bool firstSegment = true)
     {
         uint32_t rowNum = actualOriShape[COORD_DIM0];
         uint32_t embed = actualOriShape[COORD_DIM1];
@@ -185,7 +182,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
 
         if (embed > EMBED_SPLIT_SIZE * 2U) {
             headDimSplitPV(gA, gB, gC, gBlockTable, layoutA, layoutB, layoutC, actualOriShape, nIdx, blockSize,
-                           strideKV, softmaxFlag);
+                           strideKV, softmaxFlag, firstSegment);
             return;
         }
 
@@ -243,7 +240,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
                     // Overlap scalar address/layout setup with the preceding softmax.
-                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                    if (firstSegment && nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
                         Arch::CrossCoreWaitFlag(softmaxFlag);
                     }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);
@@ -315,8 +312,8 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             while (dstRow < kChunkLen) {
                 const uint32_t segLen = AscendC::Std::min(kChunkLen - dstRow, blockSize - pageOff);
                 const uint32_t blockTableId = gBlockTable.GetValue(pageIdx);
-                    const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
-                                             static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
+                const uint64_t gOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                                         static_cast<uint64_t>(pageOff) * strideKV + nSliceIdx * l1VSliceWidth;
                 auto layoutBTile = layoutB.GetTileLayout(MakeCoord(segLen, nSliceLen));
                 MatrixCoord l1BTileCoord{dstRow, 0};
                 auto l1BTile = l1VTensor[stage][layoutBInL1.GetOffset(l1BTileCoord)];
@@ -338,7 +335,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
     headDimSplitPV(AscendC::GlobalTensor<ElementA> gA, AscendC::GlobalTensor<ElementB> gB,
                    AscendC::GlobalTensor<ElementC> gC, AscendC::GlobalTensor<int32_t> gBlockTable, LayoutA layoutA,
                    LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape, uint32_t nIdx, uint32_t blockSize,
-                   uint32_t strideKV, Arch::CrossCoreFlag softmaxFlag)
+                   uint32_t strideKV, Arch::CrossCoreFlag softmaxFlag, bool firstSegment = true)
     {
         const uint32_t rowNum = actualOriShape[COORD_DIM0];
         const uint32_t embed = actualOriShape[COORD_DIM1];
@@ -347,7 +344,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         const uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);
         const uint32_t nL1Loop = CeilDiv(embed, L0TileShape::N);
 
-        Arch::CrossCoreWaitFlag(softmaxFlag);
+        if (firstSegment) {
+            Arch::CrossCoreWaitFlag(softmaxFlag);
+        }
 
         // D>256 has many inner L1 tiles. Shared QK/PV ping-pong desynchronizes
         // event 0/1 across those extra loops; keep the pre-pipeline local cadence.

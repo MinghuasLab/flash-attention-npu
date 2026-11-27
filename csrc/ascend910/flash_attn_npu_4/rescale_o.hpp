@@ -23,20 +23,9 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <
-    class OutputType_,
-    class InputType_,
-    class UpdateType_,
-    class LseType_,
-    LseModeT LSE_MODE_>
-class BlockEpilogue<
-    EpilogueAtlasA2RescaleOT<LSE_MODE_, float>,
-    OutputType_,
-    InputType_,
-    UpdateType_,
-    LseType_>
-{
-public:
+template <class OutputType_, class InputType_, class UpdateType_, class LseType_, LseModeT LSE_MODE_>
+class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, InputType_, UpdateType_, LseType_> {
+  public:
     using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
@@ -75,25 +64,21 @@ public:
 
     // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
     static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
-    static constexpr uint32_t LSE_STAGING_UB_OFFSET =
-        11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
+    static constexpr uint32_t LSE_STAGING_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
 
     struct SplitKVParams {
         bool isSplitkv = false;
         AscendC::GlobalTensor<ElementLse> gCombineLse;
         AscendC::GlobalTensor<ElementLse> gCombineo;
-        const LayoutLse *layoutgmLse = nullptr;
-        const LayoutInput *layoutgmLo = nullptr;
+        const LayoutLse* layoutgmLse = nullptr;
+        const LayoutInput* layoutgmLo = nullptr;
     };
 
-    __aicore__ inline
-    BlockEpilogue() {}
+    __aicore__ inline BlockEpilogue() {}
 
-    __aicore__ inline
-    ~BlockEpilogue() {}
+    __aicore__ inline ~BlockEpilogue() {}
 
-    __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource)
+    __aicore__ inline void init(Arch::Resource<ArchTag>& resource)
     {
         // Allocate UB space
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
@@ -116,13 +101,13 @@ public:
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float)
-            <= LSE_STAGING_UB_OFFSET, "LSE staging overlaps live DM rows");
+        static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float) <=
+                          LSE_STAGING_UB_OFFSET,
+                      "LSE staging overlaps live DM rows");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
     }
 
-    __aicore__ inline
-    void SetMask(int32_t len)
+    __aicore__ inline void SetMask(int32_t len)
     {
         uint64_t mask = 0;
         uint64_t one = 1;
@@ -140,23 +125,23 @@ public:
         }
     }
 
-    __aicore__ inline
-    void InvalidLineLSEProcess(
-        uint32_t qNThisSubBlock, int32_t invalidSuffixStartRow, uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
-        uint32_t totalRowNum, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSThisSubBlock,
-        const AscendC::LocalTensor<float> &lseUbTensor)
+    __aicore__ inline void InvalidLineLSEProcess(uint32_t qNThisSubBlock, int32_t invalidSuffixStartRow,
+                                                 uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
+                                                 uint32_t totalRowNum, int32_t invalidPrefixEndRow, uint32_t qSeqlen,
+                                                 uint32_t qSThisSubBlock,
+                                                 const AscendC::LocalTensor<float>& lseUbTensor)
     {
         if (totalRowNum == 0U || (invalidSuffixStartRow == 0 && invalidPrefixEndRow == qSeqlen)) {
             return;
         }
         const uint32_t headCount = qNThisSubBlock == 0U ? 1U : qNThisSubBlock;
         const uint32_t rowsPerHead = qNThisSubBlock == 0U ? totalRowNum : qSThisSubBlock;
-        const int64_t tokenStart = static_cast<int64_t>(qSBlockIdx) * VECTOR_SIZE +
-            (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
+        const int64_t tokenStart =
+            static_cast<int64_t>(qSBlockIdx) * VECTOR_SIZE + (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
         uint64_t headMask = 0;
         if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != qSeqlen && invalidPrefixEndRow > tokenStart) {
-            const uint32_t prefixRows = AscendC::Std::min(
-                static_cast<int64_t>(rowsPerHead), static_cast<int64_t>(invalidPrefixEndRow) - tokenStart);
+            const uint32_t prefixRows = AscendC::Std::min(static_cast<int64_t>(rowsPerHead),
+                                                          static_cast<int64_t>(invalidPrefixEndRow) - tokenStart);
             headMask |= ~uint64_t{0} >> (FLOAT_VECTOR_SIZE - prefixRows);
         }
         if (invalidSuffixStartRow > 0 && invalidSuffixStartRow < tokenStart + rowsPerHead) {
@@ -177,10 +162,9 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline
-    void ClearInvalidOutputRows(
-        uint32_t ubRowOffset, uint32_t tokenStart, uint32_t tokenNum,
-        int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t embedRound)
+    __aicore__ inline void ClearInvalidOutputRows(uint32_t ubRowOffset, uint32_t tokenStart, uint32_t tokenNum,
+                                                  int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow,
+                                                  uint32_t qSeqlen, uint32_t embedRound)
     {
         if (tokenNum == 0U) {
             return;
@@ -196,10 +180,8 @@ public:
             }
             if (localStart < tokenNum) {
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate<ElementOutput>(
-                    goUbTensor16[(ubRowOffset + localStart) * embedRound],
-                    static_cast<ElementOutput>(0),
-                    (tokenNum - localStart) * embedRound);
+                AscendC::Duplicate<ElementOutput>(goUbTensor16[(ubRowOffset + localStart) * embedRound],
+                                                  static_cast<ElementOutput>(0), (tokenNum - localStart) * embedRound);
             }
         }
 
@@ -213,10 +195,8 @@ public:
             }
             if (localEnd > 0U) {
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate<ElementOutput>(
-                    goUbTensor16[ubRowOffset * embedRound],
-                    static_cast<ElementOutput>(0),
-                    localEnd * embedRound);
+                AscendC::Duplicate<ElementOutput>(goUbTensor16[ubRowOffset * embedRound], static_cast<ElementOutput>(0),
+                                                  localEnd * embedRound);
             }
         }
     }
@@ -246,21 +226,18 @@ public:
             innerGOUbOffset += qSThisSubBlock * embedRound;
         }
         if (epiTokenNum != 0U) {
-            AscendC::DataCopyPad(
-                gOutput[innerOGmOffset],
-                goUbTensor16[innerGOUbOffset],
-                AscendC::DataCopyExtParams(
-                    epiTokenNum, embed * SIZE_OF_16BIT, 0, (oHiddenSize - embed) * SIZE_OF_16BIT, 0));
+            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor16[innerGOUbOffset],
+                                 AscendC::DataCopyExtParams(epiTokenNum, embed * SIZE_OF_16BIT, 0,
+                                                            (oHiddenSize - embed) * SIZE_OF_16BIT, 0));
         }
     }
 
     // FD-only: fp32 variant of CopyOToGm used when writing partial O into
     // splitParams.gCombineo (needs higher precision before the combine-scale step).
-    __aicore__ inline
-    void CopyOToGmFp32(
-        AscendC::GlobalTensor<float> gOutput,
-        uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
-        uint32_t qSThisSubBlock, uint32_t embed, uint32_t embedRound, uint32_t oHiddenSize, uint32_t oHiddenSize_gmlo)
+    __aicore__ inline void CopyOToGmFp32(AscendC::GlobalTensor<float> gOutput, uint32_t proTokenIdx,
+                                         uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
+                                         uint32_t qSThisSubBlock, uint32_t embed, uint32_t embedRound,
+                                         uint32_t oHiddenSize, uint32_t oHiddenSize_gmlo)
     {
         uint32_t innerOGmOffset = 0;
         uint32_t innerGOUbOffset = 0;
@@ -268,30 +245,35 @@ public:
         uint32_t blockLenAligned = (blockLen + 31) / 32 * 32;
         uint32_t srcStride = (embedRound * sizeof(float) - blockLenAligned) / 32;
         if (proTokenNum != 0U) {
-            AscendC::DataCopyPad(
-                gOutput[innerOGmOffset + proTokenIdx * oHiddenSize_gmlo],
-                goUbTensor32[innerGOUbOffset],
-                AscendC::DataCopyExtParams(
-                    proTokenNum, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+            AscendC::DataCopyPad(gOutput[innerOGmOffset + proTokenIdx * oHiddenSize_gmlo],
+                                 goUbTensor32[innerGOUbOffset],
+                                 AscendC::DataCopyExtParams(proTokenNum, blockLen, srcStride,
+                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
             innerOGmOffset += embed;
             innerGOUbOffset += proTokenNum * embedRound;
         }
         for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
-            AscendC::DataCopyPad(
-                gOutput[innerOGmOffset],
-                goUbTensor32[innerGOUbOffset],
-                AscendC::DataCopyExtParams(
-                    qSThisSubBlock, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor32[innerGOUbOffset],
+                                 AscendC::DataCopyExtParams(qSThisSubBlock, blockLen, srcStride,
+                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
             innerOGmOffset += embed;
             innerGOUbOffset += qSThisSubBlock * embedRound;
         }
         if (epiTokenNum != 0U) {
-            AscendC::DataCopyPad(
-                gOutput[innerOGmOffset],
-                goUbTensor32[innerGOUbOffset],
-                AscendC::DataCopyExtParams(
-                    epiTokenNum, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor32[innerGOUbOffset],
+                                 AscendC::DataCopyExtParams(epiTokenNum, blockLen, srcStride,
+                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
         }
+    }
+
+    // Cross-task WAR guard for lseStagingUbTensor (one staging buffer, reused by
+    // every task's LSE epilogue). The MTE3 store of task i reads the staging
+    // buffer, and a later task's epilogue rewrites it with Ln; with STACK_SLOTS
+    // task-state slots the rewrite lands >= 2 tasks later, so the wait belongs at
+    // the writer (epilogue), not at the next task's first softmax tile.
+    __aicore__ inline uint32_t TaskStateEventId(uint32_t taskStateSlot)
+    {
+        return taskStateSlot == 0 ? EVENT_ID4 : (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
     }
 
     __aicore__ inline void
@@ -301,12 +283,10 @@ public:
                    const LayoutLse& layoutLse, uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
                    uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
                    uint32_t taskStateSlot, uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
-                   uint32_t proTokenIdx, uint32_t proTokenNum,
-                   uint32_t epiTokenNum, uint32_t integralHeadNum, const SplitKVParams& splitParams,
-                   uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow,
-                   uint32_t qSeqlen,
-                   uint32_t qSBlockIdx, uint32_t rowNum, uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile,
-                   uint32_t oHeadStride)
+                   uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
+                   const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow,
+                   int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t rowNum,
+                   uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint32_t oHeadStride)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
@@ -330,8 +310,8 @@ public:
 
         if (!isFirstStackTile) {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-            AscendC::DataCopy(
-                loUbTensor, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::DataCopy(loUbTensor, gInput,
+                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
@@ -343,11 +323,7 @@ public:
             //     若本 (tile,row-loop) 内所有行的 dm 都为 1,则 go*dm 恒等于 go,可以跳过
             //     下面的 Brcb+Mul,直接做 go=lo+go。ReduceMin -> PipeBarrier<PIPE_V> ->
             //     GetValue 是本仓库既有的向量归约转标量读回惯用法(与逐行 argmax 场景一致)。
-            AscendC::ReduceMin(
-                tvUbTensor,
-                dmUbTensor[dmUbOffsetCurStackTile],
-                tvUbTensor[FLOAT_BLOCK_SIZE],
-                curRowNum);
+            AscendC::ReduceMin(tvUbTensor, dmUbTensor[dmUbOffsetCurStackTile], tvUbTensor[FLOAT_BLOCK_SIZE], curRowNum);
             AscendC::PipeBarrier<PIPE_V>();
             // D>256 spans several KV stacks, where the v4 running-max freeze is not exact.
             bool skipRescale = embed <= 256U && tvUbTensor.GetValue(0) >= 1.0f;
@@ -355,15 +331,13 @@ public:
             if (!skipRescale) {
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
                 AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
-                    dmUbTensor[dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
-                    curRowNumRound / FLOAT_BLOCK_SIZE,
-                    AscendC::BrcbRepeatParams(1, 8));
+                              dmUbTensor[dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
+                              curRowNumRound / FLOAT_BLOCK_SIZE, AscendC::BrcbRepeatParams(1, 8));
                 AscendC::PipeBarrier<PIPE_V>();
             }
             if (needRowLoop) {
-                AscendC::DataCopy(
-                    goUbTensor32, gUpdate,
-                    AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+                AscendC::DataCopy(goUbTensor32, gUpdate,
+                                  AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
             }
@@ -371,25 +345,19 @@ public:
                 // *** go = go * dm_block
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
                 for (uint32_t vmul_idx = 0; vmul_idx < embed / FLOAT_VECTOR_SIZE; ++vmul_idx) {
-                    AscendC::Mul<float, false>(
-                        goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE],
-                        goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE],
-                        tvUbTensor,
-                        (uint64_t)0,
-                        curRowNum,
-                        AscendC::BinaryRepeatParams(
-                            1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                    AscendC::Mul<float, false>(goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE],
+                                               goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0,
+                                               curRowNum,
+                                               AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
+                                                                           embedRound / FLOAT_BLOCK_SIZE, 1));
                 }
                 if (embed % FLOAT_VECTOR_SIZE > 0) {
                     SetMask(embed % FLOAT_VECTOR_SIZE);
-                    AscendC::Mul<float, false>(
-                        goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                        goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                        tvUbTensor,
-                        (uint64_t)0,
-                        curRowNum,
-                        AscendC::BinaryRepeatParams(
-                            1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                    AscendC::Mul<float, false>(goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                                               goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor,
+                                               (uint64_t)0, curRowNum,
+                                               AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
+                                                                           embedRound / FLOAT_BLOCK_SIZE, 1));
                     AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
                 }
                 AscendC::PipeBarrier<PIPE_V>();
@@ -399,19 +367,15 @@ public:
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             // *** go = lo + go
-            AscendC::Add<float, false>(
-                goUbTensor32,
-                goUbTensor32,
-                loUbTensor,
-                (uint64_t)0,
-                (curRowNum * embedRound + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Add<float, false>(goUbTensor32, goUbTensor32, loUbTensor, (uint64_t)0,
+                                       (curRowNum * embedRound + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
+                                       AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         } else {
             // *** go = lo
-            AscendC::DataCopy(
-                goUbTensor32, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::DataCopy(goUbTensor32, gInput,
+                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
@@ -421,34 +385,26 @@ public:
                 ApplyLearnableSink(curRowNum, stateRowOffset, rowOffsetLoop, embed, embedRound, qSThisSubBlock);
             }
             // *** gl_block = expand_to_block(gl)
-            AscendC::Brcb(
-                tvUbTensor.ReinterpretCast<uint32_t>(),
-                glUbTensor.ReinterpretCast<uint32_t>()[stateRowOffset],
-                curRowNumRound / FLOAT_BLOCK_SIZE,
-                AscendC::BrcbRepeatParams(1, 8));
+            AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
+                          glUbTensor.ReinterpretCast<uint32_t>()[stateRowOffset], curRowNumRound / FLOAT_BLOCK_SIZE,
+                          AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** go = go / gl_block
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             for (uint32_t vdiv_idx = 0; vdiv_idx < embed / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
-                AscendC::Div<float, false>(
-                    goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
-                    goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
-                    tvUbTensor,
-                    (uint64_t)0,
-                    curRowNum,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                AscendC::Div<float, false>(goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
+                                           goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0,
+                                           curRowNum,
+                                           AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
+                                                                       embedRound / FLOAT_BLOCK_SIZE, 1));
             }
             if (embed % FLOAT_VECTOR_SIZE > 0) {
                 SetMask(embed % FLOAT_VECTOR_SIZE);
-                AscendC::Div<float, false>(
-                    goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                    goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                    tvUbTensor,
-                    (uint64_t)0,
-                    curRowNum,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                AscendC::Div<float, false>(goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                                           goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor,
+                                           (uint64_t)0, curRowNum,
+                                           AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
+                                                                       embedRound / FLOAT_BLOCK_SIZE, 1));
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
             AscendC::PipeBarrier<PIPE_V>();
@@ -458,43 +414,40 @@ public:
             if (!splitParams.isSplitkv) {
                 if (std::is_same<ElementOutput, bfloat16_t>::value) {
                     AscendC::Cast<ElementOutput, float, false>(
-                        goUbTensor16, goUbTensor32,
-                        AscendC::RoundMode::CAST_RINT, (uint64_t)0,
+                        goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_RINT, (uint64_t)0,
                         (curRowNum * embedRound + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 } else {
                     AscendC::Cast<ElementOutput, float, false>(
-                        goUbTensor16, goUbTensor32,
-                        AscendC::RoundMode::CAST_NONE, (uint64_t)0,
+                        goUbTensor16, goUbTensor32, AscendC::RoundMode::CAST_NONE, (uint64_t)0,
                         (curRowNum * embedRound + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
-            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop ;
-            uint32_t subBlockStart = (qNThisSubBlock == 0U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop;
+            uint32_t subBlockStart = (qNThisSubBlock == 0U)
+                                         ? rowStart
+                                         : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
             if (!splitParams.isSplitkv) {
                 if (qNThisSubBlock == 0U) {
-                    ClearInvalidOutputRows(
-                        0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
+                    ClearInvalidOutputRows(0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen,
+                                           embedRound);
                 } else {
                     uint32_t innerGOUbRowOffset = 0U;
                     uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
                     if (proTokenNum != 0U) {
-                        ClearInvalidOutputRows(
-                            innerGOUbRowOffset, subBlockStart, proTokenNum,
-                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
+                        ClearInvalidOutputRows(innerGOUbRowOffset, subBlockStart, proTokenNum, invalidSuffixStartRow,
+                                               invalidPrefixEndRow, qSeqlen, embedRound);
                         innerGOUbRowOffset += proTokenNum;
                     }
                     for (uint32_t qNIdx = 0U; qNIdx < integralHeadNum; qNIdx++) {
-                        ClearInvalidOutputRows(
-                            innerGOUbRowOffset, qBlockStart, qSThisSubBlock,
-                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
+                        ClearInvalidOutputRows(innerGOUbRowOffset, qBlockStart, qSThisSubBlock, invalidSuffixStartRow,
+                                               invalidPrefixEndRow, qSeqlen, embedRound);
                         innerGOUbRowOffset += qSThisSubBlock;
                     }
                     if (epiTokenNum != 0U) {
-                        ClearInvalidOutputRows(
-                            innerGOUbRowOffset, qBlockStart, epiTokenNum,
-                            invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
+                        ClearInvalidOutputRows(innerGOUbRowOffset, qBlockStart, epiTokenNum, invalidSuffixStartRow,
+                                               invalidPrefixEndRow, qSeqlen, embedRound);
                     }
                 }
             }
@@ -505,158 +458,114 @@ public:
             // ***move O to GM: FD SplitKV writes partial fp32 O into gCombineo;
             // otherwise writes fp16 O directly to gOutput.
             if (splitParams.isSplitkv) {
-                CopyOToGmFp32(
-                    splitParams.gCombineo,
-                    proTokenIdx,
-                    proTokenNum,
-                    epiTokenNum,
-                    integralHeadNum,
-                    qSThisSubBlock,
-                    embed,
-                    embedRound,
-                    oHiddenSize, oHiddenSize_gmlo);
+                CopyOToGmFp32(splitParams.gCombineo, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum,
+                              qSThisSubBlock, embed, embedRound, oHiddenSize, oHiddenSize_gmlo);
             } else {
-                CopyOToGm(
-                    gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum,
-                    qSThisSubBlock, embed, embedRound, oHiddenSize, oHeadStride);
+                CopyOToGm(gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, qSThisSubBlock, embed,
+                          embedRound, oHiddenSize, oHeadStride);
             }
 
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Ln<float, false>(
-                        lseUbTensor,
-                        glUbTensor[taskStateSlot * 64],
-                        (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                        AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                    uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
+                    uint32_t lseSeqLen = totalRowNum / lseHeadCount;
+                    uint32_t lseHeadStrideGm = layoutLse.stride(0);
+                    bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
 
+                    // WAR: the LSE store of the matching task-state slot may still be
+                    // draining on MTE3; wait right before the staging buffer is rewritten.
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                     AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add<float, false>(
-                        lseUbTensor,
-                        lseUbTensor,
-                        gmUbTensor[taskStateSlot * 64],
-                        (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-                    AscendC::PipeBarrier<PIPE_V>();
+                    // *** lse = ln(gl) + gm
+                    AscendC::Ln<float, false>(lseUbTensor, glUbTensor[taskStateSlot * 64], (uint64_t)0,
+                                              CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
+                                              AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                    AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[taskStateSlot * 64], (uint64_t)0,
+                                               CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
+                                               AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
 
                     if (!hasSink_) {
                         InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx,
-                                inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
-                                lseUbTensor);
+                                              inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen,
+                                              qSThisSubBlock, lseUbTensor);
                     }
-                    AscendC::Brcb(
-                        lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
-                        lseUbTensor.ReinterpretCast<uint32_t>(),
-                        CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
-                        AscendC::BrcbRepeatParams(1, 8));
-                    if (!splitParams.isSplitkv) {
-                        AscendC::PipeBarrier<PIPE_V>();
-                    }
+                    AscendC::Brcb(lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                                  lseUbTensor.ReinterpretCast<uint32_t>(), CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
+                                  AscendC::BrcbRepeatParams(1, 8));
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
                     if (splitParams.isSplitkv) {
-                        // isSplitkv: per-head strided write to token-major gCombineLse. UNCHANGED.
+                        // SplitKV writes per-split partial LSE; the combine epilogue
+                        // rescales gCombineo against gLseFD, never the final gLse.
                         if (qNThisSubBlock == 0U) {
-                            AscendC::DataCopyPad(
-                                splitParams.gCombineLse, lseBroadcastUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
+                            AscendC::DataCopyPad(splitParams.gCombineLse, lseBroadcastUbTensor,
+                                                 AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0,
+                                                                            (qHeads_gmlse - 1) * sizeof(float), 0));
                         } else {
                             for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                                AscendC::DataCopyPad(
-                                    splitParams.gCombineLse[qNIdx],
-                                    lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(
-                                        qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
-                                }
-                        }
-                    } else {
-                        // BNS/single-batch NT heads are contiguous; multi-batch NT strides by total tokens.
-                        uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
-                        uint32_t lseSeqLen = totalRowNum / lseHeadCount;
-                        uint32_t lseHeadStrideGm = layoutLse.stride(0);
-                        bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
-                        if (isLseContiguous) {
-                            AscendC::DataCopyPad(
-                                gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    1, totalRowNum * sizeof(float), 0, 0, 0));
-                        } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
-                            AscendC::DataCopyPad(
-                                gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    lseHeadCount,
-                                    lseSeqLen * sizeof(float),
-                                    0,
-                                    (lseHeadStrideGm - lseSeqLen) * sizeof(float),
-                                    0));
-                        } else {
-                            // FA4 already has aligned broadcast rows in UB. Scatter them directly;
-                            // the FA3 GM staging round-trip regresses TND varlen workloads on FA4.
-                            for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
-                                AscendC::DataCopyPad(
-                                    gLse[sIdx],
-                                    lseBroadcastUbTensor[sIdx * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(
-                                        lseHeadCount,
-                                        sizeof(float),
-                                        lseSeqLen - 1U,
-                                        (lseHeadStrideGm - 1U) * sizeof(float),
-                                        0));
+                                AscendC::DataCopyPad(splitParams.gCombineLse[qNIdx],
+                                                     lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
+                                                     AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
+                                                                                (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
+                    } else if (isLseContiguous) {
+                        AscendC::DataCopyPad(gLse, lseUbTensor,
+                                             AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
+                    } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
+                        AscendC::DataCopyPad(gLse, lseUbTensor,
+                                             AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0,
+                                                                        (lseHeadStrideGm - lseSeqLen) * sizeof(float),
+                                                                        0));
+                    } else {
+                        // FA4 already has aligned broadcast rows in UB. Scatter them directly;
+                        // the FA3 GM staging round-trip regresses TND varlen workloads on FA4.
+                        for (uint32_t sIdx = 0; sIdx < lseSeqLen; ++sIdx) {
+                            AscendC::DataCopyPad(gLse[sIdx], lseBroadcastUbTensor[sIdx * FLOAT_BLOCK_SIZE],
+                                                 AscendC::DataCopyExtParams(lseHeadCount, sizeof(float), lseSeqLen - 1U,
+                                                                            (lseHeadStrideGm - 1U) * sizeof(float), 0));
+                        }
                     }
-                    uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
                 // because the combine epilogue requires per-split LSE for rescaling.
                 if (splitParams.isSplitkv) {
                     if (isLastRowLoop) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(TaskStateEventId(taskStateSlot));
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Ln<float, false>(
-                            lseUbTensor,
-                            glUbTensor[taskStateSlot * 64],
-                            (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                            AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                        AscendC::Ln<float, false>(lseUbTensor, glUbTensor[taskStateSlot * 64], (uint64_t)0,
+                                                  CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
+                                                  AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Add<float, false>(
-                            lseUbTensor,
-                            lseUbTensor,
-                            gmUbTensor[taskStateSlot * 64],
-                            (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
-                            AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+                        AscendC::Add<float, false>(lseUbTensor, lseUbTensor, gmUbTensor[taskStateSlot * 64],
+                                                   (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
+                                                   AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                         AscendC::PipeBarrier<PIPE_V>();
 
-                        AscendC::Brcb(
-                            lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
-                            lseUbTensor.ReinterpretCast<uint32_t>(),
-                            CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
-                            AscendC::BrcbRepeatParams(1, 8));
+                        AscendC::Brcb(lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                                      lseUbTensor.ReinterpretCast<uint32_t>(), CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
+                                      AscendC::BrcbRepeatParams(1, 8));
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
                         if (qNThisSubBlock == 0U) {
-                            AscendC::DataCopyPad(
-                                splitParams.gCombineLse, lseBroadcastUbTensor,
-                                AscendC::DataCopyExtParams(
-                                    totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
+                            AscendC::DataCopyPad(splitParams.gCombineLse, lseBroadcastUbTensor,
+                                                 AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0,
+                                                                            (qHeads_gmlse - 1) * sizeof(float), 0));
                         } else {
                             for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                                AscendC::DataCopyPad(
-                                    splitParams.gCombineLse[qNIdx],
-                                    lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(
-                                        qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
+                                AscendC::DataCopyPad(splitParams.gCombineLse[qNIdx],
+                                                     lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
+                                                     AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
+                                                                                (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
-                        uint32_t taskStateEventId = taskStateSlot == 0 ? EVENT_ID4 :
-                            (taskStateSlot == 1 ? EVENT_ID6 : EVENT_ID7);
+                        uint32_t taskStateEventId = TaskStateEventId(taskStateSlot);
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(taskStateEventId);
                     }
                 }
@@ -664,8 +573,8 @@ public:
         } else if (needRowLoop) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-            AscendC::DataCopy(
-                gUpdate, goUbTensor32, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::DataCopy(gUpdate, goUbTensor32,
+                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
     }
@@ -673,9 +582,8 @@ public:
     // Fold one bfloat16 sink logit per query head into the running max / sum
     // before O is normalized. Rows that never saw a finite score (gm == -inf,
     // or a fully masked -3e38) pick up LSE = sink and a zero output.
-    __aicore__ inline
-    void ApplyLearnableSink(uint32_t curRowNum, uint32_t stateRowOffset, uint32_t rowOffsetLoop, uint32_t embed,
-        uint32_t embedRound, uint32_t qSThisSubBlock)
+    __aicore__ inline void ApplyLearnableSink(uint32_t curRowNum, uint32_t stateRowOffset, uint32_t rowOffsetLoop,
+                                              uint32_t embed, uint32_t embedRound, uint32_t qSThisSubBlock)
     {
         if (curRowNum == 0U) {
             return;
@@ -706,57 +614,47 @@ public:
         for (uint32_t off = 0; off < curRowNum; off += FLOAT_VECTOR_SIZE) {
             uint32_t n = AscendC::Std::min(FLOAT_VECTOR_SIZE, curRowNum - off);
             SetMask(static_cast<int32_t>(n));
-            AscendC::Adds<float, false>(
-                oldMax[off], gmUbTensor[stateRowOffset + off], 0.0f, (uint64_t)0, 1,
-                AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::Max<float, false>(
-                gmUbTensor[stateRowOffset + off], oldMax[off], sinkRows[off], (uint64_t)0, 1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::Sub<float, false>(
-                scale[off], oldMax[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::Exp<float, false>(
-                scale[off], scale[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::Mul<float, false>(
-                glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], scale[off], (uint64_t)0, 1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::Sub<float, false>(
-                sinkRows[off], sinkRows[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::Exp<float, false>(
-                sinkRows[off], sinkRows[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
-            AscendC::Add<float, false>(
-                glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], sinkRows[off], (uint64_t)0, 1,
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Adds<float, false>(oldMax[off], gmUbTensor[stateRowOffset + off], 0.0f, (uint64_t)0, 1,
+                                        AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::Max<float, false>(gmUbTensor[stateRowOffset + off], oldMax[off], sinkRows[off], (uint64_t)0, 1,
+                                       AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Sub<float, false>(scale[off], oldMax[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
+                                       AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Exp<float, false>(scale[off], scale[off], (uint64_t)0, 1, AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::Mul<float, false>(glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off], scale[off],
+                                       (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Sub<float, false>(sinkRows[off], sinkRows[off], gmUbTensor[stateRowOffset + off], (uint64_t)0, 1,
+                                       AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Exp<float, false>(sinkRows[off], sinkRows[off], (uint64_t)0, 1,
+                                       AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            AscendC::Add<float, false>(glUbTensor[stateRowOffset + off], glUbTensor[stateRowOffset + off],
+                                       sinkRows[off], (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
         }
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
 
-        AscendC::Brcb(
-            tvUbTensor.ReinterpretCast<uint32_t>(), scale.ReinterpretCast<uint32_t>(),
-            aligned / FLOAT_BLOCK_SIZE, AscendC::BrcbRepeatParams(1, 8));
+        AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(), scale.ReinterpretCast<uint32_t>(),
+                      aligned / FLOAT_BLOCK_SIZE, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t vmul_idx = 0; vmul_idx < embed / FLOAT_VECTOR_SIZE; ++vmul_idx) {
             AscendC::Mul<float, false>(
                 goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE], goUbTensor32[vmul_idx * FLOAT_VECTOR_SIZE], tvUbTensor,
                 (uint64_t)0, curRowNum,
-                AscendC::BinaryRepeatParams(
-                    1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
         }
         if (embed % FLOAT_VECTOR_SIZE > 0) {
             SetMask(static_cast<int32_t>(embed % FLOAT_VECTOR_SIZE));
             AscendC::Mul<float, false>(
                 goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
                 goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0, curRowNum,
-                AscendC::BinaryRepeatParams(
-                    1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
+                AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline
-    void WriteRepeatedScalar(AscendC::GlobalTensor<float> dst, float value, uint32_t count, uint32_t stride)
+    __aicore__ inline void WriteRepeatedScalar(AscendC::GlobalTensor<float> dst, float value, uint32_t count,
+                                               uint32_t stride)
     {
         if (count == 0U) {
             return;
@@ -768,35 +666,33 @@ public:
             // stride=1 must be one contiguous block. blockCount=n / blockLen=4
             // with dstStride=0 only lands one 32B burst (8 floats) on MTE3.
             if (stride <= 1U) {
-                AscendC::DataCopyPad(
-                    dst[off], lseStagingUbTensor,
-                    AscendC::DataCopyExtParams(1, n * sizeof(float), 0, 0, 0));
+                AscendC::DataCopyPad(dst[off], lseStagingUbTensor,
+                                     AscendC::DataCopyExtParams(1, n * sizeof(float), 0, 0, 0));
             } else {
-                AscendC::DataCopyPad(
-                    dst[off * stride], lseStagingUbTensor,
-                    AscendC::DataCopyExtParams(n, sizeof(float), 0, (stride - 1U) * sizeof(float), 0));
+                AscendC::DataCopyPad(dst[off * stride], lseStagingUbTensor,
+                                     AscendC::DataCopyExtParams(n, sizeof(float), 0, (stride - 1U) * sizeof(float), 0));
             }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
     // Non-split empty tile: O is already 0. Replace the +inf LSE with the sink logit.
-    __aicore__ inline
-    void OverwriteEmptyTaskLse(AscendC::GlobalTensor<float> gLse, uint32_t lseHeadStride, uint32_t tokenStart,
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    __aicore__ inline void OverwriteEmptyTaskLse(AscendC::GlobalTensor<float> gLse, uint32_t lseHeadStride,
+                                                 uint32_t tokenStart, uint32_t qSBlockSize, uint32_t qNBlockSize,
+                                                 uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
         if (qNBlockSize <= 1U) {
             uint32_t tokenSplit = qSBlockSize / subBlockNum;
-            uint32_t tokenCount = (subBlockIdx == subBlockNum - 1U) ? (qSBlockSize - subBlockIdx * tokenSplit)
-                                                                     : tokenSplit;
+            uint32_t tokenCount =
+                (subBlockIdx == subBlockNum - 1U) ? (qSBlockSize - subBlockIdx * tokenSplit) : tokenSplit;
             if (tokenCount == 0U) {
                 return;
             }
             float sink = AscendC::ToFloat(gSink.GetValue(qNStartIdx));
-            WriteRepeatedScalar(
-                gLse[qNStartIdx * lseHeadStride + tokenStart + subBlockIdx * tokenSplit], sink, tokenCount, 1U);
+            WriteRepeatedScalar(gLse[qNStartIdx * lseHeadStride + tokenStart + subBlockIdx * tokenSplit], sink,
+                                tokenCount, 1U);
             return;
         }
         uint32_t qNSplit = qNBlockSize / subBlockNum;
@@ -804,16 +700,16 @@ public:
         uint32_t headCount = (subBlockIdx == subBlockNum - 1U) ? (qNBlockSize - headBegin) : qNSplit;
         for (uint32_t localHead = 0; localHead < headCount; ++localHead) {
             float sink = AscendC::ToFloat(gSink.GetValue(qNStartIdx + headBegin + localHead));
-            WriteRepeatedScalar(
-                gLse[(qNStartIdx + headBegin + localHead) * lseHeadStride + tokenStart], sink, qSBlockSize, 1U);
+            WriteRepeatedScalar(gLse[(qNStartIdx + headBegin + localHead) * lseHeadStride + tokenStart], sink,
+                                qSBlockSize, 1U);
         }
     }
 
     // First SplitKV chunk produced no tiles. Partial O stays 0; partial LSE becomes the sink.
     // Layout is (qS, qN) row-major, matching rescale's gCombineLse stores.
-    __aicore__ inline
-    void OverwriteEmptySplitLse(AscendC::GlobalTensor<float> gPartial, uint32_t qSBlockSize, uint32_t qNBlockSize,
-        uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    __aicore__ inline void OverwriteEmptySplitLse(AscendC::GlobalTensor<float> gPartial, uint32_t qSBlockSize,
+                                                  uint32_t qNBlockSize, uint32_t qNStartIdx,
+                                                  AscendC::GlobalTensor<bfloat16_t> gSink)
     {
         if (AscendC::GetSubBlockIdx() != 0U) {
             return;
@@ -824,26 +720,17 @@ public:
         }
     }
 
-    __aicore__ inline
-    void operator()(
-        AscendC::GlobalTensor<ElementOutput> gOutput,
-        AscendC::GlobalTensor<ElementInput> gInput,
-        AscendC::GlobalTensor<ElementUpdate> gUpdate,
-        AscendC::GlobalTensor<ElementLse> gLse,
-        const LayoutOutput &layoutOutput,
-        const LayoutInput &layoutInput,
-        const LayoutUpdate &layoutUpdate,
-        const LayoutLse &layoutLse,
-        GemmCoord actualBlockShape,
-        Arch::CrossCoreFlag pvReady,
-        uint32_t qSBlockSize, uint32_t qNBlockSize,
-        uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
-        uint32_t taskStateSlot,
-        uint32_t oHeadStride,
-        const SplitKVParams& splitParams = SplitKVParams(),
-        int32_t invalidSuffixStartRow = 0, int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0,
-        uint32_t qSBlockIdx = 0, uint32_t curQNBlockTile = 1, bool hasSink = false, bool applySink = false,
-        uint32_t qNStartIdx = 0, AscendC::GlobalTensor<bfloat16_t> gSink = {})
+    __aicore__ inline void
+    operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
+               AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
+               const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
+               const LayoutLse& layoutLse, GemmCoord actualBlockShape, Arch::CrossCoreFlag pvReady,
+               uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t isFirstStackTile, uint32_t isLastStackTile,
+               uint32_t curStackTileMod, uint32_t taskStateSlot, uint32_t oHeadStride,
+               const SplitKVParams& splitParams = SplitKVParams(), int32_t invalidSuffixStartRow = 0,
+               int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0, uint32_t qSBlockIdx = 0,
+               uint32_t curQNBlockTile = 1, bool hasSink = false, bool applySink = false, uint32_t qNStartIdx = 0,
+               AscendC::GlobalTensor<bfloat16_t> gSink = {})
     {
         hasSink_ = hasSink;
         applySink_ = applySink;
@@ -861,9 +748,9 @@ public:
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
 
         uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t qNThisSubBlock = (qNBlockSize == 1U) ? 0
+        uint32_t qNThisSubBlock = (qNBlockSize == 1U)   ? 0
                                   : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock)
-                                                       : qNSplitSubBlock;
+                                                        : qNSplitSubBlock;
         uint32_t inRowSplitSubBlock =
             (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
         uint32_t inRowActualThisSubBlock = (subBlockIdx == 1U) ? (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
@@ -881,12 +768,9 @@ public:
                 splitParams.layoutgmLo->GetOffset(MatrixCoord(outRowOffsetThisSubBlock, outColOffsetThisSubBlock));
         }
 
-        uint32_t outLseRowOffsetThisSubBlock = (qNBlockSize == 1U) ?
-            0 : subBlockIdx * qNSplitSubBlock;  // row = heads
-        uint32_t outLseColOffsetThisSubBlock = (qNBlockSize == 1U) ?
-            inRowOffsetThisSubBlock : 0;  // col = sequence
-        int64_t offsetLse =
-            layoutLse.GetOffset(MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
+        uint32_t outLseRowOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock; // row = heads
+        uint32_t outLseColOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0; // col = sequence
+        int64_t offsetLse = layoutLse.GetOffset(MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
         auto gLseThisSubBlock = gLse[offsetLse];
         auto layoutOutLseThisSubBlock = layoutLse;
 
@@ -895,8 +779,8 @@ public:
         if (splitParams.isSplitkv) {
             outLseRowOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0;
             outLseColOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
-            gmLseoffsetLse =
-                splitParams.layoutgmLse->GetOffset(MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
+            gmLseoffsetLse = splitParams.layoutgmLse->GetOffset(
+                MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
         }
 
         // Forward a mutable copy of splitParams into SubCoreCompute so we can
@@ -918,11 +802,11 @@ public:
 
             // The rows of each cycle consist of multiple heads with several tokens.
             // There are several integral heads, one prologue head, one epilogue head.
-            uint32_t proTokenIdx = 0;      // the token idx of the start token of the prologue part
-            uint32_t proTokenIdxPre = 0;   // the token idx of the start token of the pre prologue part
-            uint32_t proTokenNum = 0;      // the token num of the prologue part
-            uint32_t epiTokenNum = 0;      // the token num of the epilogue part
-            uint32_t integralHeadNum = 0;  // the number of integral heads within a cycle
+            uint32_t proTokenIdx = 0;     // the token idx of the start token of the prologue part
+            uint32_t proTokenIdxPre = 0;  // the token idx of the start token of the pre prologue part
+            uint32_t proTokenNum = 0;     // the token num of the prologue part
+            uint32_t epiTokenNum = 0;     // the token num of the epilogue part
+            uint32_t integralHeadNum = 0; // the number of integral heads within a cycle
             uint32_t qSRemian = qSThisSubBlock;
             for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoop; rowLoopIdx++) {
                 uint32_t rowOffsetLoop = rowLoopIdx * rowNumTile;
@@ -948,8 +832,8 @@ public:
                 auto layoutInputCurLoop = layoutInput.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
                 // Fixed 64-row vector partitions prevent cross-task O-update overwrites.
-                int64_t offsetUpdate = layoutUpdate.GetOffset(
-                    MatrixCoord(subBlockIdx * FLOAT_VECTOR_SIZE + rowOffsetLoop, 0));
+                int64_t offsetUpdate =
+                    layoutUpdate.GetOffset(MatrixCoord(subBlockIdx * FLOAT_VECTOR_SIZE + rowOffsetLoop, 0));
                 auto gUpdateCurLoop = gUpdate[offsetUpdate];
                 auto layoutUpdateCurLoop = layoutUpdate.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
@@ -961,44 +845,18 @@ public:
                 if (rowLoopIdx == 0) {
                     Arch::CrossCoreWaitFlag(pvReady);
                 }
-                SubCoreCompute(
-                    gOutputCurLoop,
-                    gInputCurLoop,
-                    gUpdateCurLoop,
-                    gLseThisSubBlock,
-                    layoutOutputCurLoop,
-                    layoutInputCurLoop,
-                    layoutUpdateCurLoop,
-                    layoutOutLseThisSubBlock,
-                    qNThisSubBlock,
-                    qSThisSubBlock,
-                    inRowActualThisSubBlock,
-                    isFirstStackTile,
-                    isLastStackTile,
-                    curStackTileMod,
-                    taskStateSlot,
-                    needRowLoop,
-                    (rowLoopIdx == rowLoop - 1U),
-                    rowOffsetLoop,
-                    proTokenIdx,
-                    proTokenNum,
-                    epiTokenNum,
-                    integralHeadNum,
-                    blockParams,
-                    rowOffsetCurLoop,
-                    invalidSuffixStartRow,
-                    invalidPrefixEndRow,
-                    qSeqlen,
-                    qSBlockIdx,
-                    rowNum,
-                    inRowOffsetThisSubBlock,
-                    curQNBlockTile,
-                    oHeadStride);
+                SubCoreCompute(gOutputCurLoop, gInputCurLoop, gUpdateCurLoop, gLseThisSubBlock, layoutOutputCurLoop,
+                               layoutInputCurLoop, layoutUpdateCurLoop, layoutOutLseThisSubBlock, qNThisSubBlock,
+                               qSThisSubBlock, inRowActualThisSubBlock, isFirstStackTile, isLastStackTile,
+                               curStackTileMod, taskStateSlot, needRowLoop, (rowLoopIdx == rowLoop - 1U), rowOffsetLoop,
+                               proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, blockParams, rowOffsetCurLoop,
+                               invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, qSBlockIdx, rowNum,
+                               inRowOffsetThisSubBlock, curQNBlockTile, oHeadStride);
             }
         }
     }
 
-private:
+  private:
     AscendC::LocalTensor<float> loUbTensor;
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;
@@ -1015,6 +873,6 @@ private:
     AscendC::GlobalTensor<bfloat16_t> gSink_;
 };
 
-}
+} // namespace Catlass::Epilogue::Block
 
 #endif

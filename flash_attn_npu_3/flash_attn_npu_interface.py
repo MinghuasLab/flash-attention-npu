@@ -1683,14 +1683,14 @@ def flash_attn_with_kvcache(
 
 # Real metadata contract (sizeof(FAInferTilingData)):
 #   all mask types:
-#       shape = (2376,)
+#       shape = (2408,)
 #   dtype  = torch.uint8
 #   device = NPU
 #   stride = (1,)
 # The custom op prevents TorchDynamo from tracing into the raw pybind
 # get_scheduler_metadata() implementation. Schema matches the V3 910
 # pybind signature in flash_api.cpp (not the V4 parameter list).
-_SCHEDULER_METADATA_TILING_BYTES = 2376
+_SCHEDULER_METADATA_TILING_BYTES = 2408
 
 
 @torch.library.custom_op(

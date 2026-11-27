@@ -143,46 +143,55 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                                           uint32_t columnNumRound, int64_t diagS0, uint32_t rowOffset,
                                           uint32_t qSBlockSize)
     {
-        // The previous Select must finish reading keep before Scalar overwrites it.
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
-        auto keepWords = keepUbTensor.ReinterpretCast<uint64_t>();
-        const uint32_t wordCount = CeilDiv(columnNumRound, 64U);
-        uint32_t token = rowOffset % qSBlockSize;
-        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
-            const int64_t rowVisible = diagS0 + static_cast<int64_t>(token) + 1;
-            const int32_t visible =
-                rowVisible <= 0 ? 0
-                                : (rowVisible >= static_cast<int64_t>(columnNum) ? static_cast<int32_t>(columnNum)
-                                                                                 : static_cast<int32_t>(rowVisible));
-            for (uint32_t j = 0; j < wordCount; ++j) {
-                const int32_t bits = visible - static_cast<int32_t>(j * 64);
-                // LSB-first prefix; guard both endpoints to avoid invalid shifts.
-                const uint64_t word =
-                    bits >= 64 ? UINT64_MAX : (bits <= 0 ? uint64_t{0} : ((uint64_t{1} << bits) - uint64_t{1}));
-                keepWords.SetValue(r * (CAUSAL_KEEP_STRIDE / sizeof(uint64_t)) + j, word);
-            }
-            if (++token == qSBlockSize) {
-                token = 0;
-            }
-        }
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
-        AscendC::SetCmpMask(selectScalarUbTensor);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        // Predicate rows are 32B-aligned slots, not a flat rows*W bitstream.
-        // Count mode handles W's partial repeat without touching the next row.
-        // The low-level overload emits vsel without scalar setup or mask resets.
-        AscendC::SetMaskCount();
-        AscendC::SetVectorMask<float, AscendC::MaskMode::COUNTER>(columnNumRound);
-        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
-            const uint32_t offset = sUbOffset + r * columnNumRound;
-            AscendC::Select(lsUbTensor[offset], keepUbTensor[r * CAUSAL_KEEP_STRIDE], lsUbTensor[offset],
-                            static_cast<uint8_t>(1), AscendC::BinaryRepeatParams{});
-        }
+        auto sTile = lsUbTensor[sUbOffset];
         AscendC::SetMaskNorm();
-        AscendC::ResetMask();
+        uint32_t token = rowOffset % qSBlockSize;
+        uint32_t r = 0;
+        while (r < rowNumCurLoop) {
+            const uint32_t segLen = AscendC::Std::min(rowNumCurLoop - r, qSBlockSize - token);
+            const int64_t v0 = diagS0 + static_cast<int64_t>(token) + 1;
+            const int64_t vLast = v0 + static_cast<int64_t>(segLen) - 1;
+            const int32_t maxV = vLast <= 0
+                                     ? 0
+                                     : (vLast >= static_cast<int64_t>(columnNum) ? static_cast<int32_t>(columnNum)
+                                                                                 : static_cast<int32_t>(vLast));
+            const uint32_t rectStart = AscendC::Std::min(static_cast<uint32_t>((maxV + 7) & ~7), columnNumRound);
+            for (uint32_t c = rectStart; c < columnNumRound; c += 64U) {
+                const uint32_t lanes = AscendC::Std::min(64U, columnNumRound - c);
+                uint64_t bits[2] = {(lanes >= 64U ? ~uint64_t{0} : ((uint64_t{1} << lanes) - uint64_t{1})),
+                                    uint64_t{0}};
+                AscendC::Duplicate<float, true>(sTile[r * columnNumRound + c], -3.0e38f, bits,
+                                                static_cast<uint8_t>(segLen), 1,
+                                                static_cast<uint8_t>(columnNumRound / 8));
+            }
+            if (rectStart != 0U) {
+                for (uint32_t i = 0; i < segLen; ++i) {
+                    const int64_t rowVisible = v0 + static_cast<int64_t>(i);
+                    const int32_t visible = rowVisible <= 0 ? 0
+                                                            : (rowVisible >= static_cast<int64_t>(columnNum)
+                                                                   ? static_cast<int32_t>(columnNum)
+                                                                   : static_cast<int32_t>(rowVisible));
+                    const uint32_t start = static_cast<uint32_t>(visible);
+                    if (start < rectStart) {
+                        const uint32_t pos = start & ~7U;
+                        const uint32_t shift = start - pos;
+                        const uint32_t lanes = AscendC::Std::min(rectStart - start, 64U - shift);
+                        uint64_t bits[2] = {(lanes >= 64U ? ~uint64_t{0} : ((uint64_t{1} << lanes) - uint64_t{1}))
+                                                << shift,
+                                            uint64_t{0}};
+                        AscendC::Duplicate<float, true>(sTile[(r + i) * columnNumRound + pos], -3.0e38f, bits, 1, 1, 8);
+                        if (rectStart > pos + 64U) {
+                            uint64_t tail[2] = {0xFFULL, uint64_t{0}};
+                            AscendC::Duplicate<float, true>(sTile[(r + i) * columnNumRound + pos + 64U], -3.0e38f, tail,
+                                                            1, 1, 8);
+                        }
+                    }
+                }
+            }
+            token = 0;
+            r += segLen;
+        }
+        AscendC::SetVectorMask<int8_t>(~uint64_t{0}, ~uint64_t{0});
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -240,12 +249,8 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
 
     __aicore__ inline void SetVecMask(int32_t len)
     {
-        uint64_t mask = 0;
-        uint64_t one = 1;
-        uint64_t temp = len % FLOAT_VECTOR_SIZE;
-        for (int64_t i = 0; i < temp; i++) {
-            mask |= one << i;
-        }
+        const uint64_t temp = static_cast<uint64_t>(len) % static_cast<uint64_t>(FLOAT_VECTOR_SIZE);
+        const uint64_t mask = (uint64_t{1} << temp) - uint64_t{1};
 
         if (len == VECTOR_SIZE || len == 0) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
@@ -362,7 +367,8 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
 
     __aicore__ inline void ScaleS(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
-        AscendC::Muls<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], scaleValue, (uint64_t)0,
+        auto sTile = lsUbTensor[sUbOffset];
+        AscendC::Muls<float, false>(sTile, sTile, scaleValue, (uint64_t)0,
                                     CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
                                     AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
@@ -373,29 +379,25 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
     {
         uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
         AscendC::UnaryRepeatParams repeatParams(1, 1, 8, 8);
+        auto sTile = lsUbTensor[sUbOffset];
 
         // Clip the input to avoid overflow
-        AscendC::Maxs<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -8.8f, (uint64_t)0, repeatTimes,
-                                    repeatParams);
+        AscendC::Maxs<float, false>(sTile, sTile, -8.8f, (uint64_t)0, repeatTimes, repeatParams);
         AscendC::PipeBarrier<PIPE_V>();
 
         // (2 * softcap) / (1 + exp(-2x)) - softcap
-        AscendC::Muls<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -2.0f, (uint64_t)0, repeatTimes,
-                                    repeatParams);
+        AscendC::Muls<float, false>(sTile, sTile, -2.0f, (uint64_t)0, repeatTimes, repeatParams);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Exp<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], (uint64_t)0, repeatTimes,
-                                   repeatParams);
+        AscendC::Exp<float, false>(sTile, sTile, (uint64_t)0, repeatTimes, repeatParams);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], 1.0f, (uint64_t)0, repeatTimes,
-                                    repeatParams);
+        AscendC::Adds<float, false>(sTile, sTile, 1.0f, (uint64_t)0, repeatTimes, repeatParams);
 
         AscendC::Duplicate<float, false>(softcapUbTensor, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Div<float, false>(lsUbTensor[sUbOffset], softcapUbTensor, lsUbTensor[sUbOffset], (uint64_t)0,
-                                   repeatTimes, AscendC::BinaryRepeatParams(1, 1, 1, 8, 0, 8));
+        AscendC::Div<float, false>(sTile, softcapUbTensor, sTile, (uint64_t)0, repeatTimes,
+                                   AscendC::BinaryRepeatParams(1, 1, 1, 8, 0, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -softcapValue, (uint64_t)0,
-                                    repeatTimes, repeatParams);
+        AscendC::Adds<float, false>(sTile, sTile, -softcapValue, (uint64_t)0, repeatTimes, repeatParams);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -452,26 +454,27 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                       hmUbTensor[rowOffset].template ReinterpretCast<uint32_t>(), rowNumCurLoopRound / FLOAT_BLOCK_SIZE,
                       AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
+        auto sTile = lsUbTensor[sUbOffset];
         // *** ls = ls - hm_block
+        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         for (uint32_t subIdx = 0; subIdx < columnNum / FLOAT_VECTOR_SIZE; ++subIdx) {
-            AscendC::Sub<float, false>(lsUbTensor[sUbOffset][subIdx * FLOAT_VECTOR_SIZE],
-                                       lsUbTensor[sUbOffset][subIdx * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0,
-                                       rowNumCurLoop,
+            AscendC::Sub<float, false>(sTile[subIdx * FLOAT_VECTOR_SIZE], sTile[subIdx * FLOAT_VECTOR_SIZE], tvUbTensor,
+                                       (uint64_t)0, rowNumCurLoop,
                                        AscendC::BinaryRepeatParams(1, 1, 0, columnNumRound / FLOAT_BLOCK_SIZE,
                                                                    columnNumRound / FLOAT_BLOCK_SIZE, 1));
         }
         if (columnNum % FLOAT_VECTOR_SIZE > 0) {
             SetVecMask(columnNum % FLOAT_VECTOR_SIZE);
-            AscendC::Sub<float, false>(lsUbTensor[sUbOffset][columnNum / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                                       lsUbTensor[sUbOffset][columnNum / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                                       tvUbTensor, (uint64_t)0, rowNumCurLoop,
+            AscendC::Sub<float, false>(sTile[columnNum / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                                       sTile[columnNum / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor,
+                                       (uint64_t)0, rowNumCurLoop,
                                        AscendC::BinaryRepeatParams(1, 1, 0, columnNumRound / FLOAT_BLOCK_SIZE,
                                                                    columnNumRound / FLOAT_BLOCK_SIZE, 1));
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
         AscendC::PipeBarrier<PIPE_V>();
         // *** ls = exp(ls)
-        AscendC::Exp<float, false>(lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], (uint64_t)0,
+        AscendC::Exp<float, false>(sTile, sTile, (uint64_t)0,
                                    CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
                                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
@@ -499,14 +502,16 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
             AscendC::PipeBarrier<PIPE_V>();
         } else {
             SetVecMask(rowNumCurLoop);
+            auto glTile = glUbTensor[stateRowOffset];
+            auto dmTile = dmUbTensor[dmUbOffsetCurCycle];
+            auto llTile = llUbTensor[rowOffset];
             // *** gl = dm * gl
-            AscendC::Mul<float, false>(glUbTensor[stateRowOffset], dmUbTensor[dmUbOffsetCurCycle],
-                                       glUbTensor[stateRowOffset], (uint64_t)0, 1,
+            AscendC::Mul<float, false>(glTile, dmTile, glTile, (uint64_t)0, 1,
                                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** gl = ll + gl
-            AscendC::Add<float, false>(glUbTensor[stateRowOffset], glUbTensor[stateRowOffset], llUbTensor[rowOffset],
-                                       (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+            AscendC::Add<float, false>(glTile, glTile, llTile, (uint64_t)0, 1,
+                                       AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
@@ -680,8 +685,7 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                                       const LayoutInput& layoutInput, GemmCoord actualBlockShape,
                                       const TaskPlan& taskPlan, uint32_t isFirstStackTile, uint32_t qSBlockSize,
                                       uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
-                                      uint32_t& softmaxPingPongFlag, int64_t diagS0, bool doTriUMask,
-                                      bool isSplitKV = false)
+                                      uint32_t& softmaxPingPongFlag, int64_t diagS0, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -730,10 +734,8 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
-                if (doTriUMask) {
-                    ApplyArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop, columnNum, columnNumRound, diagS0,
-                                   rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize);
-                }
+                ApplyArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop, columnNum, columnNumRound, diagS0,
+                               rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize);
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
@@ -755,8 +757,8 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                                       const LayoutInput& layoutInput, GemmCoord actualBlockShape,
                                       const TaskPlan& taskPlan, uint32_t isFirstStackTile, uint32_t qSBlockSize,
                                       uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
-                                      uint32_t& softmaxPingPongFlag, int64_t diagS0, bool doTriUMask, bool isSplitKV,
-                                      int64_t leftS0, bool applyLeft, bool applyRight)
+                                      uint32_t& softmaxPingPongFlag, int64_t diagS0, bool isSplitKV, int64_t leftS0,
+                                      bool applyLeft, bool applyRight)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -805,11 +807,8 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
-                if (doTriUMask) {
-                    ApplySwaArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop, columnNum, columnNumRound,
-                                      diagS0, rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize, leftS0, applyLeft,
-                                      applyRight);
-                }
+                ApplySwaArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop, columnNum, columnNumRound, diagS0,
+                                  rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize, leftS0, applyLeft, applyRight);
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
