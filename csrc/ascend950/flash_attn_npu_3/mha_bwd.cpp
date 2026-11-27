@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
+#include "../../profiling/fa_profile.hpp"
 #include "../attention_window.h"
 // Ascend950 FlashAttention v3 backward scaffold.
 // The host ABI matches the Python v3 backward entry. The device kernel is a
@@ -522,6 +523,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
+    const fa_profile::TensorInfo profile({&dout, &q, &k, &v, &out, &mask_npu_tensor, &softmax_lse, &cu_q_device,
+                                          &cu_k_device, fa_profile::Tensor(seqused_q_), fa_profile::Tensor(seqused_k_)},
+                                         {&dq, &dk, &dv});
+    fa_profile::TensorInfo::LaunchRange profile_range(&profile, stream, launch_cores);
     if (fag_tiling_data.d512Partial != 0) {
         TORCH_CHECK(!deterministic, "Ascend950 v3 bwd: d512Partial requires non-deterministic path");
         launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
@@ -566,6 +571,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
             DISPATCH_BWD950_FLAGS(half, BSND);
         }
     }
+    profile_range.Finish();
 
 #undef DISPATCH_BWD950_FLAGS
 #undef DISPATCH_BWD950_FLAGS_SV

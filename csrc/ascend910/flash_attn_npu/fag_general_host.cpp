@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Minghua Shen.
 
+#include "../../profiling/fa_profile.hpp"
 #include "fag_general_host.hpp"
 #include "../attention_window.h"
 
@@ -17,15 +18,14 @@
 #include "fag_general_dispatch.hpp"
 #include "device_triu_mask.h"
 
-std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
-                                           const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,
-                                           at::Tensor& dq, at::Tensor& dk, at::Tensor& dv,
-                                           const std::optional<at::Tensor>& cu_seqlens_q,
-                                           const std::optional<at::Tensor>& cu_seqlens_k, int64_t max_seqlen_q,
-                                           int64_t max_seqlen_k, float softmax_scale, float softcap, bool is_causal,
-                                           int64_t window_size_left, int64_t window_size_right, bool deterministic,
-                                           float p_dropout, const std::optional<at::Tensor>& rng_state,
-                                           uint8_t* alibi_slopes_ptr, int64_t alibi_slopes_batch_stride)
+std::vector<at::Tensor>
+launch_fag_general(const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                   const at::Tensor& out, const at::Tensor& softmax_lse, at::Tensor& dq, at::Tensor& dk, at::Tensor& dv,
+                   const std::optional<at::Tensor>& cu_seqlens_q, const std::optional<at::Tensor>& cu_seqlens_k,
+                   int64_t max_seqlen_q, int64_t max_seqlen_k, float softmax_scale, float softcap, bool is_causal,
+                   int64_t window_size_left, int64_t window_size_right, bool deterministic, float p_dropout,
+                   const std::optional<at::Tensor>& rng_state, uint8_t* alibi_slopes_ptr,
+                   int64_t alibi_slopes_batch_stride, const at::Tensor* alibi_slopes)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -78,8 +78,8 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
         TORCH_CHECK(qsizes[0] == ksizes[0], "launch_fag_general: q and k must share the same batch size");
         TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "launch_fag_general: v nheads_k must match k");
     }
-    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 :
-                                 (q_headdim <= 256 ? 256 : 512)));
+    uint32_t qk_headdim_kernel =
+        q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : (q_headdim <= 256 ? 256 : 512)));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
     // Empty attention has zero derivatives. FAG tiling divides by the number
@@ -106,8 +106,8 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
     bool has_dropout = (p_dropout > 0.0f);
     fagInfo.keepProb = 1.0f - p_dropout;
     bool is_local = false;
-    fa_window::NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left,
-                                       window_size_right, is_causal, is_local);
+    fa_window::NormalizeAttentionWindow(is_causal, max_seqlen_q, max_seqlen_k, window_size_left, window_size_right,
+                                        is_causal, is_local);
     const bool has_attn_mask = is_causal || is_local;
     if (is_causal) {
         fagInfo.maskType = static_cast<int32_t>(FAGTiling::MaskType::MASK_CAUSUAL);
@@ -310,6 +310,10 @@ std::vector<at::Tensor> launch_fag_general(const at::Tensor& dout, const at::Ten
     gen_args.workspaceDevice = workspaceDevice;
     gen_args.tilingDevice = tilingDevice;
 
+    gen_args.profile =
+        fa_profile::ShareTensors({&dout, &q, &k, &v, &out, &mask_gpu_tensor, &softmax_lse, &seqlenq_gpu_tensor,
+                                  &seqlenk_gpu_tensor, &drop_mask_npu_tensor, alibi_slopes},
+                                 {&dq, &dk, &dv});
     if (is_varlen_q) {
         launch_fag_general_dispatch<TND>(is_bf16, gen_args);
     } else {
