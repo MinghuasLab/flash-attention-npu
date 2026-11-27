@@ -540,7 +540,13 @@ class FlashAttentionScoreGradMla950 {
             const uint32_t s2Num = static_cast<uint32_t>(CeilDiv(sk, kvBlockSize_));
             for (uint32_t n2 = 0; n2 < kvHeadNum_; ++n2) {
                 for (uint32_t s2 = 0; s2 < s2Num; ++s2, ++kvGroupId) {
-                    if (kvGroupId % coreNum_ != coreIdx) {
+                    const bool causalPair =
+                        tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) &&
+                        FAGTiling950::UseCausalColumnPair(coreNum_, batchNum_, kvHeadNum_, s2Num);
+                    const uint32_t owner = causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batch, n2,
+                                                                                        s2, s2Num, causalPairStride_)
+                                                      : static_cast<uint32_t>(kvGroupId % coreNum_);
+                    if (owner != coreIdx) {
                         continue;
                     }
                     uint32_t first = 0;
@@ -642,7 +648,14 @@ class FlashAttentionScoreGradMla950 {
         while (batchIdx < batchNum_) {
             while (n2Idx < kvHeadNum_) {
                 while (s2BlockIdx < s2BlockNum) {
-                    if ((kvGroupId % coreNum_) == coreIdx) {
+                    const bool causalPair =
+                        tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) &&
+                        FAGTiling950::UseCausalColumnPair(coreNum_, batchNum_, kvHeadNum_, s2BlockNum);
+                    const uint32_t owner =
+                        causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batchIdx, n2Idx, s2BlockIdx,
+                                                                     s2BlockNum, causalPairStride_)
+                                   : static_cast<uint32_t>(kvGroupId % coreNum_);
+                    if (owner == coreIdx) {
                         GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
                         if (validS1Num != 0) {
                             FillBlockInfoFrom(batchIdx, n2Idx, 0, firstValidS1, s2BlockIdx, qbs, kvbs, s1Length,
@@ -690,6 +703,18 @@ class FlashAttentionScoreGradMla950 {
         // Masked kernels retain their existing scheduling policy.
         uint64_t taskId = 0;
         uint64_t kvGroupId = 0;
+        causalPairStride_ = 1;
+        for (uint32_t b = 0; b < batchNum_; ++b) {
+            uint64_t qBatchStart = 0;
+            uint64_t kvBatchStart = 0;
+            uint32_t s1Length = 0;
+            uint32_t s2Length = 0;
+            GetBatchShape(b, qBatchStart, kvBatchStart, s1Length, s2Length);
+            const uint32_t pairs = (static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_)) + 1) / 2;
+            if (pairs > causalPairStride_) {
+                causalPairStride_ = pairs;
+            }
+        }
         bool hasPrev = false;
         bool ktResident = false;
         bool vtResident = false;
@@ -1153,6 +1178,7 @@ class FlashAttentionScoreGradMla950 {
     uint32_t qBlockSize_ = 0;
     uint32_t kvBlockSize_ = 0;
     uint32_t coreNum_ = 0;
+    uint32_t causalPairStride_ = 1;
     uint32_t continuousBlockNum_ = 0;
     float scaleValue_ = 1.0f;
     float softcapValue_ = 0.0f;

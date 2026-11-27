@@ -96,7 +96,9 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
     static_assert(Ascend950FagL0CLayout::L0C_SLOT_NUM * L0C_BUF_SIZE <= ArchTag::L0C_SIZE, "L0C overflow");
 
     CATLASS_DEVICE
-    BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart = 0, uint32_t eventIdStart = 0)
+    BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart = 0, uint32_t eventIdStart = 0,
+                 bool depth2 = false)
+        : depth2_(depth2)
     {
         if constexpr (ENABLE_UNIT_FLAG) {
             AscendC::SetMMLayoutTransform(true);
@@ -111,6 +113,11 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
             l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart +
                                                                         Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
         }
+        // Depth-2 third buffers: unused upper half of VT (Q2) and DY1 (DY2).
+        l1Q[2] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + L1_VT_OFFSET +
+                                                                   Ascend950FagL1Layout::TILE_BYTES);
+        l1Dy[2] = resource.l1Buf.template GetBufferByByte<ElementA>(
+            l1BufAddrStart + Ascend950FagL1Layout::SLOT_DY1 * L1_TILE_MAX + Ascend950FagL1Layout::TILE_BYTES);
 
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             l0ATensorList[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
@@ -132,6 +139,30 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
     }
 
     CATLASS_DEVICE
+    uint32_t QSlotOf(uint32_t taskPing) const
+    {
+        return depth2_ ? Ascend950FagL1Layout::QSlotDepth2(taskPing) : Ascend950FagL1Layout::QSlot(taskPing);
+    }
+
+    CATLASS_DEVICE
+    uint32_t DySlotOf(uint32_t taskPing) const
+    {
+        return depth2_ ? Ascend950FagL1Layout::DySlotDepth2(taskPing) : Ascend950FagL1Layout::DySlot(taskPing);
+    }
+
+    CATLASS_DEVICE
+    uint32_t QBufOf(uint32_t taskPing) const
+    {
+        return depth2_ ? taskPing : (taskPing & 1U);
+    }
+
+    CATLASS_DEVICE
+    uint32_t DyBufOf(uint32_t taskPing) const
+    {
+        return depth2_ ? taskPing : (taskPing & 1U);
+    }
+
+    CATLASS_DEVICE
     ~BlockMmadTla() {}
 
     /**
@@ -143,7 +174,7 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
     template <class TensorA, class TensorB, class TensorC, class TensorV>
     CATLASS_DEVICE void ComputeS(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape,
                                  bool loadK, uint32_t taskPing, bool prefetchV, TensorV& tensorV, uint32_t vSkvActual,
-                                 uint32_t vDActual)
+                                 uint32_t vDActual, bool loadQ = true)
     {
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
@@ -153,9 +184,12 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         uint32_t skvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(skvActual);
         uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
 
-        const uint32_t qEvent = Ascend950FagL1Layout::QSlot(taskPing);
+        const uint32_t qBuf = QBufOf(taskPing);
+        const uint32_t qEvent = QSlotOf(taskPing);
         uint32_t slotC = l0CListId;
-        CopyGmToL1A(l1Q[taskPing], tensorA, sqActual, dActual, sqRound, dRound, qEvent);
+        if (loadQ) {
+            CopyGmToL1A(l1Q[qBuf], tensorA, sqActual, dActual, sqRound, dRound, qEvent);
+        }
         if (loadK) {
             CopyGmToL1BT(l1KT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_KT);
         }
@@ -165,8 +199,8 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
             CopyGmToL1BT(l1VT, tensorV, vDActual, vSkvActual, vDRound, vSkvRound, L1_EVENT_VT);
         }
         // Keep Q in L1 for C34; do not release A back to MTE2.
-        GemmABt(l1Q[taskPing], l1KT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual,
-                slotC, qEvent, L1_EVENT_KT,
+        GemmABt(l1Q[qBuf], l1KT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual, slotC,
+                qEvent, L1_EVENT_KT,
                 /*waitB=*/loadK, /*releaseB=*/false, /*releaseA=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
@@ -179,7 +213,7 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
      */
     template <class TensorA, class TensorB, class TensorC>
     CATLASS_DEVICE void ComputeDP(TensorA& tensorA, TensorB& tensorB, TensorC& tensorC, GemmCoord const& actualShape,
-                                  bool loadV, bool waitV, uint32_t taskPing)
+                                  bool loadV, bool waitV, uint32_t taskPing, bool loadDY = true)
     {
         uint32_t sqActual = actualShape.m();
         uint32_t skvActual = actualShape.n();
@@ -189,17 +223,46 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         uint32_t skvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(skvActual);
         uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
 
-        const uint32_t dyEvent = Ascend950FagL1Layout::DySlot(taskPing);
+        const uint32_t dyBuf = DyBufOf(taskPing);
+        const uint32_t dyEvent = DySlotOf(taskPing);
         uint32_t slotC = l0CListId;
-        CopyGmToL1A(l1Dy[taskPing], tensorA, sqActual, dActual, sqRound, dRound, dyEvent);
+        if (loadDY) {
+            CopyGmToL1A(l1Dy[dyBuf], tensorA, sqActual, dActual, sqRound, dRound, dyEvent);
+        }
         if (loadV) {
             CopyGmToL1BT(l1VT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_VT);
         }
-        GemmABt(l1Dy[taskPing], l1VT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual,
-                slotC, dyEvent, L1_EVENT_VT,
+        GemmABt(l1Dy[dyBuf], l1VT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual, slotC,
+                dyEvent, L1_EVENT_VT,
                 /*waitB=*/waitV, /*releaseB=*/false, /*releaseA=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
+    }
+
+    /** Prefetch Q into Q[taskPing] after the prior owner of that slot released it. */
+    template <class TensorA>
+    CATLASS_DEVICE void PrefetchQ(TensorA& tensorA, GemmCoord const& actualShape, uint32_t taskPing)
+    {
+        uint32_t sqActual = actualShape.m();
+        uint32_t dActual = actualShape.k();
+        uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
+        uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
+        const uint32_t qBuf = QBufOf(taskPing);
+        const uint32_t qEvent = QSlotOf(taskPing);
+        CopyGmToL1A(l1Q[qBuf], tensorA, sqActual, dActual, sqRound, dRound, qEvent);
+    }
+
+    /** Prefetch dY into DY[taskPing] after the prior owner of that slot released it. */
+    template <class TensorA>
+    CATLASS_DEVICE void PrefetchDY(TensorA& tensorA, GemmCoord const& actualShape, uint32_t taskPing)
+    {
+        uint32_t sqActual = actualShape.m();
+        uint32_t dActual = actualShape.k();
+        uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
+        uint32_t dRound = RoundUp<L1AAlignHelper::K_ALIGNED>(dActual);
+        const uint32_t dyBuf = DyBufOf(taskPing);
+        const uint32_t dyEvent = DySlotOf(taskPing);
+        CopyGmToL1A(l1Dy[dyBuf], tensorA, sqActual, dActual, sqRound, dRound, dyEvent);
     }
 
     CATLASS_DEVICE
@@ -236,9 +299,16 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         auto tensorL1 = tla::MakeTensor(l1Buf, layoutL1, Arch::PositionL1{});
         auto tensorTileGm = GetTile(gm, tla::MakeCoord(0u, 0u), tla::MakeShape(mActual, kActual));
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[eventIdx]);
-        copyGmToL1A(tensorL1, tensorTileGm);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[eventIdx]);
+        if (Ascend950FagL1Layout::IsMutexSlot(eventIdx)) {
+            const int32_t mtx = static_cast<int32_t>(Ascend950FagL1Layout::MutexOf(eventIdx));
+            AscendC::Mutex::Lock<PIPE_MTE2>(mtx);
+            copyGmToL1A(tensorL1, tensorTileGm);
+            AscendC::Mutex::Unlock<PIPE_MTE2>(mtx);
+        } else {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[eventIdx]);
+            copyGmToL1A(tensorL1, tensorTileGm);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[eventIdx]);
+        }
     }
 
     /// Reload RowMajor GM [Skv, D] as ColumnMajor [D, Skv] (K^T / V^T) into L1 (nZ).
@@ -276,7 +346,12 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nRound);
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1AEvent]);
+        const bool aMutex = Ascend950FagL1Layout::IsMutexSlot(l1AEvent);
+        if (aMutex) {
+            AscendC::Mutex::Lock<PIPE_MTE1>(static_cast<int32_t>(Ascend950FagL1Layout::MutexOf(l1AEvent)));
+        } else {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1AEvent]);
+        }
         if (waitB) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
         }
@@ -323,7 +398,11 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         }
 
         if (releaseA) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1AEvent]);
+            if (aMutex) {
+                AscendC::Mutex::Unlock<PIPE_MTE1>(static_cast<int32_t>(Ascend950FagL1Layout::MutexOf(l1AEvent)));
+            } else {
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1AEvent]);
+            }
         }
         if (releaseB) {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
@@ -360,10 +439,11 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         }
     }
 
-    AscendC::LocalTensor<ElementA> l1Q[Ascend950FagL1Layout::TASK_PINGPONG];
+    AscendC::LocalTensor<ElementA> l1Q[Ascend950FagL1Layout::QDY_DEPTH];
     AscendC::LocalTensor<ElementB> l1KT;
-    AscendC::LocalTensor<ElementA> l1Dy[Ascend950FagL1Layout::TASK_PINGPONG];
+    AscendC::LocalTensor<ElementA> l1Dy[Ascend950FagL1Layout::QDY_DEPTH];
     AscendC::LocalTensor<ElementB> l1VT;
+    bool depth2_{false};
 
     AscendC::LocalTensor<ElementA> l0ATensorList[L0AB_STAGES];
     AscendC::LocalTensor<ElementB> l0BTensorList[L0AB_STAGES];

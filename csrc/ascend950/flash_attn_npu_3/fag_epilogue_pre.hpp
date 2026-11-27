@@ -48,10 +48,11 @@ class FagPre {
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
-        // Skip dk/dv workspace clear when those regions are unused:
+        // Skip dk/dv workspace clear when those regions are unused or overwritten:
         //   - detPrivDkv: first write overwrites the private column buffer
         //   - earlyDkvCast: Fixpipe writes bf16 outputs; dk/dv WS size is 0
-        if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0) {
+        //   - skipDkvClear: D<=128 full-coverage; first Fixpipe overwrites each column
+        if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0 && tiling_->skipDkvClear == 0) {
             ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
             ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
         }

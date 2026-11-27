@@ -16,6 +16,7 @@
 
 #include "acl/acl.h"
 #include "device_triu_mask.h"
+#include "fag_dkv_cast_host.hpp"
 #include "fag_tiling.cpp"
 #include "fag_kernel.cpp"
 #include "fag_bwd_d512_partial.hpp"
@@ -169,6 +170,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         fag_info.window_size_right = window_size_right;
     }
     fag_info.deterministic = deterministic ? 1U : 0U;
+    fag_info.hasUsedLengths = seqused_q_.has_value() || seqused_k_.has_value();
     // Deterministic accumulation strategy.  BN2S2 applies the opst arch35
     // column-private schedule when the shape is covered; otherwise fall back
     // to the per-round det-slot + streaming VecDTM reduction.
@@ -200,7 +202,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
-    // Snapshot TND lengths together for host validation and tiling.
+    // Snapshot TND lengths together for host validation, tiling, and the
+    // direct-dkv cast gate. lengths_cpu must outlive the varlen block so
+    // cu_k_cpu can remain a view of the KV cumulative row.
+    at::Tensor lengths_cpu;
+    at::Tensor cu_k_cpu;
     std::vector<int64_t> actual_seq_q;
     std::vector<int64_t> actual_seq_kv;
     if (is_varlen) {
@@ -215,7 +221,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                     "Ascend950 v3 bwd: cu_seqlens must be on the query NPU device");
         const bool shared_prefix = cu_q_tensor.is_same(cu_k_tensor);
         const int64_t num_lengths = 1 + !shared_prefix + seqused_q_.has_value() + seqused_k_.has_value();
-        auto lengths_cpu =
+        lengths_cpu =
             at::empty({num_lengths, batch_size + 1}, at::device(at::kCPU).dtype(at::kInt).pinned_memory(true));
         int64_t next_row = 0;
         auto copy_lengths = [&](const at::Tensor& input) {
@@ -225,6 +231,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         };
         const int32_t* q_lengths = copy_lengths(cu_q_tensor);
         const int32_t* kv_lengths = shared_prefix ? q_lengths : copy_lengths(cu_k_tensor);
+        // Host KV cumulative view for CanWriteDkvDirect: shared Q/K prefixes
+        // reuse row 0; distinct prefixes place KV at row 1.
+        cu_k_cpu = lengths_cpu.select(0, shared_prefix ? 0 : 1).narrow(0, 0, batch_size + 1);
         const int32_t* used_q = seqused_q_.has_value() ? copy_lengths(*seqused_q_) : nullptr;
         const int32_t* used_kv = seqused_k_.has_value() ? copy_lengths(*seqused_k_) : nullptr;
         current_stream.synchronize();
@@ -318,7 +327,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                 "schedule for this shape");
 
     FAGTiling950::FAGTilingData fag_tiling_data{};
-    const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
+    const bool can_write_dkv_direct =
+        is_varlen &&
+        FAGTiling950::CanWriteDkvDirect(fag_info, actual_seq_q, cu_k_cpu, k, v, dk, dv,
+                                        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
+    const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data, can_write_dkv_direct);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v3 bwd: arch35 GetFAGTilingParam failed");
     // A BAND window can skip every task of a KV column. Private-column
     // accumulation has no post pass for such columns, so preserve exact zeros.
@@ -334,16 +347,6 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     }
     if (is_local && fag_tiling_data.dqPostAbsorb != 0) {
         dq.zero_();
-    }
-    // earlyDkvCast Fixpipe-writes only the columns that run; untouched
-    // (causal/band-skipped) columns must stay exact zeros. Writes use dense
-    // TND pitches (matching CastRegionRows / FagPost), so dk/dv must be
-    // contiguous — padded input K/V strides must not drive the output layout.
-    if (fag_tiling_data.earlyDkvCast != 0) {
-        TORCH_CHECK(dk.is_contiguous() && dv.is_contiguous(),
-                    "Ascend950 v3 bwd: earlyDkvCast requires contiguous dk/dv");
-        dk.zero_();
-        dv.zero_();
     }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");

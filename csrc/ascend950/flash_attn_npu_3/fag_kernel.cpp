@@ -320,6 +320,8 @@ class FlashAttentionScoreGrad950 {
         epilogueDetAdd_.Init(resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen, params.workspace, params.tiling);
         epiloguePost_.Init(resource, params.dq, params.dk, params.dv, params.workspace, params.tiling);
         const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
+        // A/B: splitting AIVs across Pre || SoftmaxGradFront slowed mid-seq
+        // (~1.20x → ~1.27x); keep them sequential on the full vector grid.
         epiloguePre_(vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
         epilogueSoftmaxGradFront_(vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping, mte3WaitMte2Pong, vWaitMte2Ping,
                                   vWaitMte2Pong, vWaitMte3Ping, vWaitMte3Pong);
@@ -959,9 +961,15 @@ class FlashAttentionScoreGrad950 {
             RunTasksShortQ(coreIdx, subBlockIdx);
             return;
         }
+        // Depth-2 CV (fusion ProcessPreloadTwoTimes): C5/C34 of task t-2 run
+        // in the same iteration as C1/C2 of t, so the CrossCore wait for
+        // V(t-2) is already satisfied. Needs 3 Q/DY L1 slots; only D<=128
+        // packs the third into VT/DY1 upper halves.
+        const bool depth2 = (qkHeadDim_ <= 128U && vHeadDim_ <= 128U);
+        cvDepth2_ = depth2;
 #ifdef __DAV_CUBE__
-        BlockMmadSdP mm12(resource, Mm12L1Offset());
-        BlockMmaddQKV mm345(resource, Mm12L1Offset());
+        BlockMmadSdP mm12(resource, Mm12L1Offset(), 0, depth2);
+        BlockMmaddQKV mm345(resource, Mm12L1Offset(), 0, depth2);
         SetCubeEvents();
 #endif
 #ifdef __DAV_VEC__
@@ -969,14 +977,31 @@ class FlashAttentionScoreGrad950 {
 #endif
         // Assign each (batch, n2, s2Block) group to exactly one AIC so that
         // contiguous s1 ranges stay on the same core (KV L1 residency + local
-        // dk/dv accumulate). Round-robin over kvGroupId. GQA groups stay serial
-        // on that core (earlyDkv has no atomic). Legacy long-S keeps returnL1
-        // dual-AIV pipeline; short paths use RunTasksShortQ/ShortBiDir above.
+        // dk/dv accumulate). Full mask round-robins kvGroupId. Causal pairs
+        // column i with its complement so the heavy prefix is not piled onto
+        // the same cores. GQA groups stay serial on that core (earlyDkv has
+        // no atomic). Short paths use RunTasksShortQ/ShortBiDir above.
         uint64_t taskId = 0;
         uint64_t kvGroupId = 0;
+        uint32_t causalPairStride = 1;
+        for (uint32_t b = 0; b < batchNum_; ++b) {
+            uint64_t qBatchStart = 0;
+            uint64_t kvBatchStart = 0;
+            uint32_t s1Length = 0;
+            uint32_t s2Length = 0;
+            GetBatchShape(b, qBatchStart, kvBatchStart, s1Length, s2Length);
+            const uint32_t pairs = (static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_)) + 1) / 2;
+            if (pairs > causalPairStride) {
+                causalPairStride = pairs;
+            }
+        }
         bool hasPrev = false;
+        bool hasPrevPrev = false;
         bool ktResident = false;
         bool vtResident = false;
+        FAGBlockInfo prefetchedBlock{};
+        bool hasPrefetched = false;
+        FAGBlockInfo prevPrevBlock_{};
 
         for (uint32_t batchIdx = 0; batchIdx < batchNum_; ++batchIdx) {
             uint64_t qBatchStart = 0;
@@ -988,7 +1013,14 @@ class FlashAttentionScoreGrad950 {
 
             for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
                 for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx, ++kvGroupId) {
-                    if ((kvGroupId % coreNum_) != coreIdx) {
+                    const bool causalPair =
+                        tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) &&
+                        FAGTiling950::UseCausalColumnPair(coreNum_, batchNum_, kvHeadNum_, s2BlockNum);
+                    const uint32_t owner =
+                        causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batchIdx, n2Idx, s2BlockIdx,
+                                                                     s2BlockNum, causalPairStride)
+                                   : static_cast<uint32_t>(kvGroupId % coreNum_);
+                    if (owner != coreIdx) {
                         continue;
                     }
 
@@ -1011,6 +1043,12 @@ class FlashAttentionScoreGrad950 {
                             block.loadKv = (taskInGroup == 0);
                             block.initDkv = (taskInGroup == 0);
                             block.flushDkv = (taskInGroup + 1 == tasksInGroup);
+                            const bool usePrefetch = hasPrefetched && prefetchedBlock.batchIdx == block.batchIdx &&
+                                                     prefetchedBlock.n2Idx == block.n2Idx &&
+                                                     prefetchedBlock.groupIdx == block.groupIdx &&
+                                                     prefetchedBlock.s1BlockIdx == block.s1BlockIdx &&
+                                                     prefetchedBlock.s2BlockIdx == block.s2BlockIdx;
+                            hasPrefetched = false;
 
 #ifdef __DAV_CUBE__
                             // New s2 group: free previous KT/VT before reload.
@@ -1022,15 +1060,41 @@ class FlashAttentionScoreGrad950 {
                                 mm12.ReleaseResidentVT();
                                 vtResident = false;
                             }
-                            ProcessC1Stage(block, mm12);
-                            ProcessC2Stage(block, mm12);
+                            ProcessC1Stage(block, mm12, /*loadQ=*/!usePrefetch);
+                            ProcessC2Stage(block, mm12, /*loadDY=*/!usePrefetch);
                             if (block.loadKv) {
                                 ktResident = true;
                                 vtResident = true;
                             }
-                            if (hasPrev) {
+                            if (depth2) {
+                                if (hasPrevPrev) {
+                                    ProcessC5Stage(prevPrevBlock_, true, mm345);
+                                    ProcessC34Stage(prevPrevBlock_, true, mm345);
+                                }
+                            } else if (hasPrev) {
                                 ProcessC5Stage(previousBlock_, true, mm345);
                                 ProcessC34Stage(previousBlock_, true, mm345);
+                            }
+                            // Prefetch next into the Q/DY slot freed by C34.
+                            // Depth-2: freed slot is (t-2)%3 == (t+1)%3.
+                            // Depth-1: freed slot is (t-1)%2 == (t+1)%2.
+                            if (taskInGroup + 1 < tasksInGroup) {
+                                uint32_t nextGroupIdx = groupIdx;
+                                uint32_t nextS1Ord = s1Ord + 1;
+                                if (nextS1Ord >= validS1Num) {
+                                    nextGroupIdx = groupIdx + 1;
+                                    nextS1Ord = 0;
+                                }
+                                FAGBlockInfo next{};
+                                FillBlockInfoFrom(batchIdx, n2Idx, nextGroupIdx, firstValidS1 + nextS1Ord, s2BlockIdx,
+                                                  qBatchStart, kvBatchStart, s1Length, s2Length, next);
+                                next.taskId = taskId + 1;
+                                const bool canPrefetch = depth2 ? hasPrevPrev : hasPrev;
+                                if (canPrefetch) {
+                                    PrefetchQDY(next, mm12);
+                                    prefetchedBlock = next;
+                                    hasPrefetched = true;
+                                }
                             }
 #endif
 #ifdef __DAV_VEC__
@@ -1039,6 +1103,10 @@ class FlashAttentionScoreGrad950 {
                                 ProcessV2Stage(previousBlock_, subBlockIdx);
                             }
 #endif
+                            if (depth2) {
+                                prevPrevBlock_ = previousBlock_;
+                                hasPrevPrev = hasPrev;
+                            }
                             previousBlock_ = block;
                             hasPrev = true;
                             ++taskId;
@@ -1048,6 +1116,14 @@ class FlashAttentionScoreGrad950 {
             }
         }
 
+        // Depth-2 drain: C5(L-1) no longer needs to free P/dS for a later
+        // vector (V(L) waits on C5(L-2)). V(L) runs in parallel with C5(L).
+        if (depth2 && hasPrevPrev) {
+#ifdef __DAV_CUBE__
+            ProcessC5Stage(prevPrevBlock_, false, mm345);
+            ProcessC34Stage(prevPrevBlock_, false, mm345);
+#endif
+        }
         if (hasPrev) {
 #ifdef __DAV_CUBE__
             ProcessC5Stage(previousBlock_, false, mm345);
@@ -1058,6 +1134,7 @@ class FlashAttentionScoreGrad950 {
             ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
         }
+        cvDepth2_ = false;
 #ifdef __DAV_CUBE__
         if (ktResident) {
             mm12.ReleaseResidentKT();
@@ -1405,10 +1482,18 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    void ProcessC1Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12)
+    uint32_t QdyPing(FAGBlockInfo const& block) const
     {
-        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
+        return cvDepth2_ ? static_cast<uint32_t>(block.taskId % Catlass::Gemm::Ascend950FagL1Layout::QDY_DEPTH)
+                         : static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+    }
+
+    CATLASS_DEVICE
+    void ProcessC1Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12, bool loadQ = true)
+    {
+        const uint32_t ubSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t qdyPing = QdyPing(block);
+        const uint16_t flagId = SYNC_C1_TO_V1_FLAG[ubSlot];
         auto q = MakeGmTensor(qGm_, InputOffset(inputStrides_.q, block, true), block.s1Extend, qkHeadDim_,
                               inputStrides_.q.sequence);
         auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
@@ -1417,10 +1502,10 @@ class FlashAttentionScoreGrad950 {
                               inputStrides_.v.sequence);
         auto sLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                        tla::MakeStride(UB_S2_ROW_STRIDE, tla::Int<1>{}));
-        auto s = tla::MakeTensor(ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
+        auto s = tla::MakeTensor(ubMm1ResTensor[ubSlot], sLayout, Catlass::Arch::PositionUB{});
         // Prefetch V^T on the group’s first task so MTE2 overlaps S cube.
-        mm12.ComputeS(q, k, s, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv, slot,
-                      block.loadKv, v, block.s2Extend, vHeadDim_);
+        mm12.ComputeS(q, k, s, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), block.loadKv, qdyPing,
+                      block.loadKv, v, block.s2Extend, vHeadDim_, loadQ);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         if constexpr (!SINGLE_VEC) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
@@ -1428,24 +1513,38 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    void ProcessC2Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12)
+    void ProcessC2Stage(FAGBlockInfo const& block, BlockMmadSdP& mm12, bool loadDY = true)
     {
-        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
+        const uint32_t ubSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t qdyPing = QdyPing(block);
+        const uint16_t flagId = SYNC_C2_TO_V2_FLAG[ubSlot];
         auto dy = MakeGmTensor(doutGm_, InputOffset(inputStrides_.dout, block, true), block.s1Extend, vHeadDim_,
                                inputStrides_.dout.sequence);
         auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
                               inputStrides_.v.sequence);
         auto dpLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                         tla::MakeStride(UB_S2_ROW_STRIDE, tla::Int<1>{}));
-        auto dp = tla::MakeTensor(ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
+        auto dp = tla::MakeTensor(ubMm2ResTensor[ubSlot], dpLayout, Catlass::Arch::PositionUB{});
         // VT already prefetched in C1 when loadKv; only wait on first use.
         mm12.ComputeDP(dy, v, dp, Catlass::GemmCoord(block.s1Extend, block.s2Extend, vHeadDim_),
-                       /*loadV=*/false, /*waitV=*/block.loadKv, slot);
+                       /*loadV=*/false, /*waitV=*/block.loadKv, qdyPing, loadDY);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         if constexpr (!SINGLE_VEC) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
         }
+    }
+
+    // Mid-seq Q/dY preload into the slot freed by C34 of an older task.
+    CATLASS_DEVICE
+    void PrefetchQDY(FAGBlockInfo const& block, BlockMmadSdP& mm12)
+    {
+        const uint32_t qdyPing = QdyPing(block);
+        auto q = MakeGmTensor(qGm_, InputOffset(inputStrides_.q, block, true), block.s1Extend, qkHeadDim_,
+                              inputStrides_.q.sequence);
+        auto dy = MakeGmTensor(doutGm_, InputOffset(inputStrides_.dout, block, true), block.s1Extend, vHeadDim_,
+                               inputStrides_.dout.sequence);
+        mm12.PrefetchQ(q, Catlass::GemmCoord(block.s1Extend, block.s2Extend, qkHeadDim_), qdyPing);
+        mm12.PrefetchDY(dy, Catlass::GemmCoord(block.s1Extend, block.s2Extend, vHeadDim_), qdyPing);
     }
 
     CATLASS_DEVICE
@@ -1456,7 +1555,9 @@ class FlashAttentionScoreGrad950 {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V1_TO_C5_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
 
-        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t pdsSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t qdyPing = QdyPing(block);
+
         // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
         // with dv cube; subsequent C34 tasks in the group reuse it.
         if (block.initDkv && qkHeadDim_ <= 128U) {
@@ -1474,12 +1575,12 @@ class FlashAttentionScoreGrad950 {
             const uint64_t dvRow = static_cast<uint64_t>(kvHeadNum_) * vHeadDim_;
             const uint64_t dvOff = block.totalS2Start * dvRow + static_cast<uint64_t>(block.n2Idx) * vHeadDim_;
             auto dv = MakeGmTensor(dvGm_, dvOff, block.s2Extend, vHeadDim_, dvRow);
-            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
-                            block.initDkv, block.flushDkv, /*enAtomicDv=*/false, /*fixpipeScaleDv=*/1.0f);
+            mm345.ComputeDv(l1PTensor[pdsSlot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+                            qdyPing, block.initDkv, block.flushDkv, /*enAtomicDv=*/false, /*fixpipeScaleDv=*/1.0f);
         } else {
             auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-            mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
-                            block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE,
+            mm345.ComputeDv(l1PTensor[pdsSlot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+                            qdyPing, block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE,
                             /*fixpipeScaleDv=*/1.0f);
         }
         if (returnL1) {
@@ -1498,7 +1599,9 @@ class FlashAttentionScoreGrad950 {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
         }
 
-        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t pdsSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint32_t qdyPing = QdyPing(block);
+
         auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
                               inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
@@ -1510,14 +1613,14 @@ class FlashAttentionScoreGrad950 {
             const uint64_t dkRow = static_cast<uint64_t>(kvHeadNum_) * qkHeadDim_;
             const uint64_t dkOff = block.totalS2Start * dkRow + static_cast<uint64_t>(block.n2Idx) * qkHeadDim_;
             auto dk = MakeGmTensor(dkGm_, dkOff, block.s2Extend, qkHeadDim_, dkRow);
-            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
-                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+            mm345.ComputeDqDk(l1dSTensor[pdsSlot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), qdyPing,
                               /*waitResidentK=*/block.initDkv, /*enAtomicDq=*/block.atomicDq, block.initDkv,
                               block.flushDkv, /*enAtomicDk=*/false, /*fixpipeScaleDk=*/scaleValue_);
         } else {
             auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-            mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk,
-                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), slot,
+            mm345.ComputeDqDk(l1dSTensor[pdsSlot], k, dq, dk,
+                              Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend), qdyPing,
                               /*waitResidentK=*/block.initDkv, /*enAtomicDq=*/block.atomicDq, block.initDkv,
                               block.flushDkv, /*enAtomicDk=*/qkHeadDim_ > BlockMmaddQKV::BASE,
                               /*fixpipeScaleDk=*/1.0f);
@@ -1829,10 +1932,14 @@ class FlashAttentionScoreGrad950 {
         const uint32_t flagSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C1_TO_V1_FLAG[flagSlot]);
 
-        // Before task 1 and later overwrite P in L1, C5 must return ownership
-        // of the buffer used by the preceding task. shortBiDir/shortQ run
-        // in-order with returnL1=false, so this handshake is unused there.
-        if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
+        // Before overwriting P in L1, C5 must return that ping-pong slot.
+        // Depth-2: same slot was last used by taskId-2, so wait only from
+        // taskId >= 2. shortBiDir/shortQ skip this (returnL1=false).
+        if (cvDepth2_) {
+            if (block.taskId >= TASK_PINGPONG) {
+                AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C5_TO_V1_FLAG);
+            }
+        } else if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C5_TO_V1_FLAG);
         }
 
@@ -1886,10 +1993,12 @@ class FlashAttentionScoreGrad950 {
         const uint32_t flagSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C2_TO_V2_FLAG[flagSlot]);
 
-        // Before task 1 and later overwrite dS in L1, C3/C4 must return
-        // ownership of the buffer used by the preceding task. shortBiDir /
-        // shortQ in-order paths skip this (returnL1=false).
-        if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
+        // Before overwriting dS in L1, C34 must return that ping-pong slot.
+        if (cvDepth2_) {
+            if (block.taskId >= TASK_PINGPONG) {
+                AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C34_TO_V2_FLAG);
+            }
+        } else if (block.taskId != 0 && !shortBiDir_ && !shortQ_) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_C34_TO_V2_FLAG);
         }
         const uint32_t bufferId = flagSlot;
@@ -1975,6 +2084,8 @@ class FlashAttentionScoreGrad950 {
     uint32_t detBufNum_ = 1;
     bool detPrivDkv_ = false;
     bool earlyDkvCast_ = false;
+    // RunTasks D<=128: C5/C34 of t-2 overlaps C1/C2 of t (fusion ProcessPreloadTwoTimes).
+    bool cvDepth2_ = false;
     bool shortBiDir_ = false;
     bool shortBiDirUniform_ = false;
     bool shortQ_ = false;
@@ -2069,8 +2180,7 @@ class FlashAttentionScoreGrad950 {
 
 template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP,
           bool SINGLE_VEC = false>
-// SyncAll<false> in the kernel body requires batch-mode scheduling; without it,
-// concurrent streams running other sync kernels can deadlock on core allocation.
+// SyncAll<false> requires batch-mode scheduling to avoid multi-stream deadlocks.
 __schedmode__(1) CATLASS_GLOBAL
     void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
                                 GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k, GM_ADDR seqUsedQ,
@@ -2081,7 +2191,9 @@ __schedmode__(1) CATLASS_GLOBAL
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
     using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<128>, tla::Int<128>>;
 
-    using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagSdP<2, 2, false>;
+    // Unit flag on both SDP and dQKV: SLOT_DQ aliases SLOT_SDP_0, so both
+    // paths must use the same L0C protocol (fusion ENABLE_UNITFLAG).
+    using DispatchPolicySdP = Catlass::Gemm::MmadAscend950FagSdP<2, 2, true>;
     // shortQ/shortBiDir SINGLE_VEC: NO_SPLIT → AIV0; else SPLIT_M dual-AIV.
     constexpr auto kCopyMode =
         SINGLE_VEC ? Catlass::Gemm::Tile::CopyL0CToUBMode::NO_SPLIT : Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M;
@@ -2091,7 +2203,7 @@ __schedmode__(1) CATLASS_GLOBAL
     using BlockMmadSdP = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicySdP, L1TileShape, L0TileShape, DataType,
                                                             DataType, float, void, TileCopySdP>;
 
-    using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagdQKV<2, 2, false>;
+    using DispatchPolicydQKV = Catlass::Gemm::MmadAscend950FagdQKV<2, 2, true>;
     using TileCopydQKV =
         Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, DataType, Catlass::layout::RowMajor, DataType,
                                                Catlass::layout::RowMajor, float, Catlass::layout::RowMajor>;

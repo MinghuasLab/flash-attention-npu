@@ -60,7 +60,7 @@ int64_t CheckLegacyUb(const FAGTilingData& tiling, bool singleVec = false)
 
 } // namespace
 
-int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
+int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling, bool canWriteDkvDirect)
 {
     if (info.batch == 0 || info.qSeqlen == 0 || info.kvSeqlen == 0 || info.totalQ == 0 || info.totalKv == 0 ||
         info.qHeadNum == 0 || info.kvHeadNum == 0 || info.qHeadNum % info.kvHeadNum != 0 || info.qkHeadDim == 0 ||
@@ -109,6 +109,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     // Default kvTile=128. shortQ keeps 128 (larger kvTile was tried and dropped).
     // VF epilogues use a 128-col chunk loop with row pitch = kvTile.
     // qTile shrinks for short S1. D>256 uses the 128x256 partial schedule.
+    // (A/B: mid-seq qTile=64 deepened lag but slowed S>=1024 ~15–50%.)
     const uint64_t maxHeadDim = std::max(info.qkHeadDim, info.vHeadDim);
     const uint64_t alignedQk = RoundUpU64(info.qkHeadDim, 16);
     const uint64_t alignedV = RoundUpU64(info.vHeadDim, 16);
@@ -176,11 +177,13 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         } else if (maxS1 <= 64) {
             tiling.qTile = 64;
         }
+        // Uniform shortcuts use packed region lengths directly. Used-length
+        // caps require the per-batch decoder even when those regions are equal.
         // Short bidirectional: one S1/S2 tile per (b,n2,g). Isolate the
         // scalar-oriented schedule so longer S1/S2 shapes stay on legacy.
         if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 0 && maxS2 <= 16) {
             tiling.shortBiDir = 1;
-            if (uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
+            if (!info.hasUsedLengths && uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
                 info.totalQ == info.batch * maxS1 && info.totalKv == info.batch * maxS2) {
                 tiling.shortBiDirUniform = 1;
             }
@@ -190,7 +193,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
             // maps gid → (b,n2) as gid/kvHeadNum (kvHeadNum is global).
             // kvTile stays 128 (256 N-split wiped the win).
             tiling.shortQ = 1;
-            if (uniformS1 && info.totalQ == info.batch * maxS1) {
+            if (!info.hasUsedLengths && uniformS1 && info.totalQ == info.batch * maxS1) {
                 tiling.shortQUniformS1 = 1;
             }
         }
@@ -212,9 +215,13 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     if (CheckLegacyUb(tiling, singleVec) != 0) {
         return -1;
     }
-    if (info.qkHeadDim == 192 && info.vHeadDim == 128 && !info.deterministic) {
-        // Match CANN dense interleaving granularity for MLA backward.
-        tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
+    if (!info.deterministic && !singleVec) {
+        // Match CANN dense interleaving granularity (fusion arch35 mid-seq).
+        // shortQ/shortBiDir keep DEFAULT_CONTINUOUS_BLOCK_NUM; MLA D192/Dv128
+        // and plain D<=128 both benefit from coarser core-strided waves.
+        if ((info.qkHeadDim == 192 && info.vHeadDim == 128) || (info.qkHeadDim <= 128 && info.vHeadDim <= 128)) {
+            tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
+        }
     }
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
@@ -226,19 +233,27 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.dkVecNum = info.deterministic ? info.dkVecNum : 0;
     tiling.dvVecNum = info.deterministic ? info.dvVecNum : 0;
     tiling.earlyDkvCast = 0;
+    tiling.skipDkvClear = 0;
     tiling.detCastChunkRows = 0;
 
     const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
     const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
 
     if (!info.deterministic) {
-        // Legacy layout. earlyDkvCast: Fixpipe writes bf16/fp16 dk/dv in-loop
-        // and drops the fp32 dk/dv workspaces (FagPost skips those casts).
-        // Enabled only for short-S TND (shortQ/shortBiDir) with D<=128; BSND
-        // and other TND keep the fp32 workspace + FagPost cast.
-        const bool earlyDkv = info.layout == Layout::TND && info.qkHeadDim <= 128 && info.vHeadDim <= 128 &&
-                              (tiling.shortQ != 0 || tiling.shortBiDir != 0);
+        // Short-Q schedules avoid a separate dK/dV post pass. On the
+        // regular schedule, small dK/dV outputs do not amortize the strided
+        // Fixpipe cast/write (A/B: ungated canWriteDkvDirect slowed mid-seq
+        // ~5%). Use four full KV tiles per AIC as the crossover for the total
+        // packed output, counting KV heads (not query heads).
+        constexpr uint64_t MIN_KV_TILES_PER_CORE = 4;
+        const uint64_t kvRows = tiling.totalKv * tiling.kvHeadNum;
+        // Gate on full AIC count (A/B: ungating earlyDkv slowed mid-seq ~5%).
+        const bool largeDkv = kvRows >= MIN_KV_TILES_PER_CORE * info.aicNum * tiling.kvTile;
+        const bool earlyDkv = canWriteDkvDirect && (singleVec || largeDkv);
         tiling.earlyDkvCast = earlyDkv ? 1 : 0;
+        // D<=128 Fixpipe overwrites each visited column (enAtomicDk/Dv=false).
+        // When every column is covered, skip the fp32 dk/dv Pre clear.
+        tiling.skipDkvClear = (!earlyDkv && canWriteDkvDirect && info.qkHeadDim <= 128 && info.vHeadDim <= 128) ? 1 : 0;
 
         uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
         uint64_t dkWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
