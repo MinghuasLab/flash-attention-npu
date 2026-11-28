@@ -728,6 +728,111 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
 
 ### FlashAttention v4
 
+#### flash_attn_func
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    qv=None,
+    gather_kv_indices=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    learnable_sink=None,
+    softcap=0.0,  # 0.0 means deactivated
+    num_splits=1,  # Can be tuned for speed
+    pack_gqa=None,  # Can be tuned for speed
+    deterministic=False,
+    score_mod=None,
+    score_mod_bwd=None,
+    mask_mod=None,
+    aux_tensors=None,
+    aux_scalars=None,
+    block_sparse_tensors=None,
+    block_sparse_tensors_bwd=None,
+    return_lse=False,
+    gather_bwd_recompute_p=False,  # Not supported on NPU
+    gather_bwd_token_chunk=None,  # Not supported on NPU
+    config=None,  # Reserved; only None is supported
+    scales=None,  # Ascend 950 only
+):
+    """
+    v4 version of the standard attention interface for dense (batch-major) inputs.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. The number of heads in Q must be divisible by the number of heads in K, V.
+
+    Ascend910 computes the scheduler metadata (tiling + attention mask) on the AICPU so no
+    device->host->device sync breaks the training pipeline. Ascend950 leaves scheduling to the
+    C++ host tiler, so the default fixed-length path does not launch a metadata kernel.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim_v)
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v). Used for cross-attention.
+        gather_kv_indices [optional]: (Not supported on NPU)
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        learnable_sink [optional]: (num_heads,), dtype bfloat16. One sink logit per query head.
+            Added to the softmax denominator. Only supported on Ascend 910 (forward);
+            not supported on Ascend 950 or in backward.
+        softcap: float. Activates softcapping attention if > 0.
+        num_splits: int. If > 1, split key/value along the sequence dimension into this many chunks.
+            If num_splits == 1, no splitting.
+        pack_gqa: bool. Whether to pack GQA for better performance. (Not supported on NPU)
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass.
+        score_mod [optional]: Custom score modification.
+        score_mod_bwd [optional]: Custom score modification for backward.
+        mask_mod [optional]: Custom attention mask.
+        aux_tensors / aux_scalars [optional]: Auxiliary tensors/scalars for score_mod/mask_mod.
+        block_sparse_tensors / block_sparse_tensors_bwd [optional]: Block sparse tensors.
+        return_lse: bool. Whether to return the logsumexp of the attention scores.
+        gather_bwd_recompute_p / gather_bwd_token_chunk: (Not supported on NPU)
+        config: reserved; only None is supported.
+        scales: FP8 dequantization scales (TensorwiseScales / BlockScales), supported on
+            Ascend 950 only.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables).
+        - On Ascend 950, score_mod / mask_mod are routed to the native Flex backend.
+        - learnable_sink is not supported on Ascend 950 or in backward.
+        - pack_gqa / gather_kv_indices are not supported.
+        - Backward: headdim in (0, 512]; Q and K must share the same headdim.
+          Deterministic backward does not support headdim > 256.
+
+    Return:
+        out: (batch_size, seqlen, nheads, headdim_v).
+        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen).
+            The logsumexp of each row of QK^T * scaling.
+    """
+```
+
 #### flash_attn_varlen_func
 ```python
 def flash_attn_varlen_func(

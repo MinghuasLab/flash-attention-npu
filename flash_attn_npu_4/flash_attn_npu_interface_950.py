@@ -661,8 +661,6 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors=None,
         block_sparse_tensors_bwd=None,
         return_lse=False,
-        scheduler_metadata=None,
-        disable_scheduler_metadata=False,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -673,7 +671,12 @@ class FlashAttnFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        batch_size, seqlen_k = q.shape[0], k.shape[1]
+        # The fixed-length interface leaves scheduler metadata unset so the C++
+        # host tiler selects the schedule. Building metadata on every forward
+        # (as the Ascend910 dense path does) costs an extra AI CPU launch, so
+        # metadata stays opt-in through the varlen interface.
+        batch_size = q.shape[0]
+        seqlen_k = k.shape[1]
 
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
 
@@ -708,12 +711,11 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits,
             pack_gqa,
             True,
-            scheduler_metadata,
+            None,  # scheduler_metadata: host tiling instead of a metadata launch
             layout,
             q_descale,
             k_descale,
             v_descale,
-            scheduler_metadata is None and not disable_scheduler_metadata,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -800,8 +802,9 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # block_sparse_tensors
             None,  # block_sparse_tensors_bwd
             None,  # return_lse
-            None,  # scheduler_metadata
-            None,  # disable_scheduler_metadata
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
@@ -1088,8 +1091,8 @@ def flash_attn_func(
     block_sparse_tensors=None,
     block_sparse_tensors_bwd=None,
     return_lse: bool = False,
-    scheduler_metadata: Optional[torch.Tensor] = None,
-    disable_scheduler_metadata: bool = False,
+    gather_bwd_recompute_p: bool = False,
+    gather_bwd_token_chunk: Optional[int] = None,
     config: None = None,
     scales: TensorwiseScales | BlockScales | None = None,
 ):
@@ -1098,7 +1101,10 @@ def flash_attn_func(
     TensorwiseScales uses native AscendC FP32 descales and rejects Flex features.
     BlockScales uses MXFP8 group32 DSL attention. None keeps existing dispatch.
     ``config`` is reserved; only ``None`` is supported.
+    ``gather_bwd_recompute_p`` / ``gather_bwd_token_chunk`` are not supported on NPU.
     """
+    if gather_bwd_recompute_p or gather_bwd_token_chunk is not None:
+        raise NotImplementedError("Ascend 950 FA4 does not support gather_bwd_* options")
     if config is not None:
         raise NotImplementedError("Ascend 950 FA4 supports only config=None; tuning is reserved")
     if scales is not None and not isinstance(scales, TensorwiseScales):
@@ -1138,8 +1144,6 @@ def flash_attn_func(
             block_sparse_tensors=block_sparse_tensors,
             block_sparse_tensors_bwd=block_sparse_tensors_bwd,
             return_lse=return_lse,
-            scheduler_metadata=scheduler_metadata,
-            disable_scheduler_metadata=disable_scheduler_metadata,
             scales=scales,
         )
     if isinstance(scales, TensorwiseScales):
@@ -1173,8 +1177,6 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
-        scheduler_metadata,
-        disable_scheduler_metadata,
         *((scales.q, scales.k, scales.v) if isinstance(scales, TensorwiseScales) else ()),
     )
 
