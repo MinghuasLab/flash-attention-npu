@@ -47,6 +47,7 @@ static constexpr uint16_t SYNC_C1_TO_V1_FLAG[TASK_PINGPONG] = {0, 1};
 static constexpr uint16_t SYNC_C2_TO_V2_FLAG[TASK_PINGPONG] = {2, 3};
 static constexpr uint16_t SYNC_V2_TO_C34_FLAG = 4;
 static constexpr uint16_t SYNC_V1_TO_C5_FLAG = 5;
+static constexpr uint16_t SYNC_V2_TO_C12_UB_FREE_FLAG[TASK_PINGPONG] = {6, 7};
 static constexpr uint16_t SYNC_C34_TO_V2_FLAG = 8;
 static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
 // BN2S2: mode-0 fix barrier shared by every AIC to pin the atomic dq/dk/dv
@@ -1060,6 +1061,11 @@ class FlashAttentionScoreGrad950 {
                                 mm12.ReleaseResidentVT();
                                 vtResident = false;
                             }
+                            // C1/C2 reuse the score and dP UB slots every two tasks.
+                            // Delay Fixpipe writes until V2 has finished reading that slot.
+                            if (depth2 && hasPrevPrev) {
+                                WaitC12UbFree(prevPrevBlock_);
+                            }
                             ProcessC1Stage(block, mm12, /*loadQ=*/!usePrefetch);
                             ProcessC2Stage(block, mm12, /*loadDY=*/!usePrefetch);
                             if (block.loadKv) {
@@ -1100,7 +1106,7 @@ class FlashAttentionScoreGrad950 {
 #ifdef __DAV_VEC__
                             if (hasPrev) {
                                 ProcessV1Stage(previousBlock_, subBlockIdx);
-                                ProcessV2Stage(previousBlock_, subBlockIdx);
+                                ProcessV2Stage(previousBlock_, subBlockIdx, /*releaseC12Ub=*/depth2);
                             }
 #endif
                             if (depth2) {
@@ -1122,6 +1128,9 @@ class FlashAttentionScoreGrad950 {
 #ifdef __DAV_CUBE__
             ProcessC5Stage(prevPrevBlock_, false, mm345);
             ProcessC34Stage(prevPrevBlock_, false, mm345);
+            // The penultimate task releases its UB slot during the main loop.
+            // Consume that signal even when the slot has no next owner.
+            WaitC12UbFree(prevPrevBlock_);
 #endif
         }
         if (hasPrev) {
@@ -1486,6 +1495,16 @@ class FlashAttentionScoreGrad950 {
     {
         return cvDepth2_ ? static_cast<uint32_t>(block.taskId % Catlass::Gemm::Ascend950FagL1Layout::QDY_DEPTH)
                          : static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+    }
+
+    CATLASS_DEVICE
+    void WaitC12UbFree(FAGBlockInfo const& block)
+    {
+        const uint16_t flagId = SYNC_V2_TO_C12_UB_FREE_FLAG[block.taskId % TASK_PINGPONG];
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
+        if constexpr (!SINGLE_VEC) {
+            AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId + V0_V1_FLAG_ID_OFFSET);
+        }
     }
 
     CATLASS_DEVICE
@@ -1988,7 +2007,7 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    void ProcessV2Stage(FAGBlockInfo const& block, uint32_t subBlockIdx)
+    void ProcessV2Stage(FAGBlockInfo const& block, uint32_t subBlockIdx, bool releaseC12Ub = false)
     {
         const uint32_t flagSlot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_C2_TO_V2_FLAG[flagSlot]);
@@ -2016,6 +2035,9 @@ class FlashAttentionScoreGrad950 {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
         }
 
+        if (releaseC12Ub) {
+            AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_V>(SYNC_V2_TO_C12_UB_FREE_FLAG[flagSlot]);
+        }
         // Notify C3/C4 only after this vector sub-block has finished writing dS.
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(SYNC_V2_TO_C34_FLAG);
     }
