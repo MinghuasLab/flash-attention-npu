@@ -737,8 +737,8 @@ def flash_attn_func(
     return_lse=False,
     gather_bwd_recompute_p=False,  # NPU 暂不支持
     gather_bwd_token_chunk=None,  # NPU 暂不支持
-    config=None,  # NPU 暂不支持
-    scales=None,  # NPU 暂不支持
+    config=None,  # 保留参数，仅支持 None
+    scales=None,  # 仅 Ascend 950 支持
 ):
     """
     v4 版本的标准（定长、batch-major）注意力接口。
@@ -788,7 +788,8 @@ def flash_attn_func(
         block_sparse_tensors / block_sparse_tensors_bwd [可选]: block sparse tensor。
         return_lse: bool。是否返回 attention scores 的 logsumexp。
         gather_bwd_recompute_p / gather_bwd_token_chunk: NPU 暂不支持。
-        config / scales: NPU 暂不支持。
+        config: 保留参数，仅支持 None。
+        scales: FP8 去量化 scale（TensorwiseScales / BlockScales），仅 Ascend 950 支持。
 
     约束：
         - 1 <= headdim <= 256。

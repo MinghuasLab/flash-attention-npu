@@ -754,8 +754,8 @@ def flash_attn_func(
     return_lse=False,
     gather_bwd_recompute_p=False,  # Not supported on NPU
     gather_bwd_token_chunk=None,  # Not supported on NPU
-    config=None,  # Not supported on NPU
-    scales=None,  # Not supported on NPU
+    config=None,  # Reserved; only None is supported
+    scales=None,  # Ascend 950 only
 ):
     """
     v4 version of the standard attention interface for dense (batch-major) inputs.
@@ -807,7 +807,9 @@ def flash_attn_func(
         block_sparse_tensors / block_sparse_tensors_bwd [optional]: Block sparse tensors.
         return_lse: bool. Whether to return the logsumexp of the attention scores.
         gather_bwd_recompute_p / gather_bwd_token_chunk: (Not supported on NPU)
-        config / scales: (Not supported on NPU)
+        config: reserved; only None is supported.
+        scales: FP8 dequantization scales (TensorwiseScales / BlockScales), supported on
+            Ascend 950 only.
 
     Constraints:
         - 1 <= headdim <= 256.
