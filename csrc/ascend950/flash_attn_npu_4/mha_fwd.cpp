@@ -379,28 +379,35 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const uint32_t metadataBaseTaskUpperBound =
         static_cast<uint32_t>(batch_size) * static_cast<uint32_t>(num_heads_k) * ((fdGroupSize + 4U - 1U) / 4U);
     const uint32_t metadataFdCoreCapacity = blockDim < MAX_FD_ACTIVE_CORE_NUM ? blockDim : MAX_FD_ACTIVE_CORE_NUM;
+    const uint32_t metadataFdCombineCapacity =
+        std::min(blockDim == 0 ? 0U : (3U * blockDim - 1U) / 10U, MAX_FD_COMBINE_TASK_NUM);
     const bool pagedMetadataFdShape = num_splits != 1 && paged_KV && is_varlen_q && !is_local &&
                                       max_seqlen_q_.has_value() && max_seqlen_q_.value() <= 16 &&
                                       static_cast<uint64_t>(max_seqlen_q_.value()) * fdGroupSize <= 128;
     const bool metadataFlashDecodeCandidate =
         use_scheduler_metadata && (denseFdShape || pagedMetadataFdShape) && declared_k >= 1024 &&
-        metadataBaseTaskUpperBound < metadataFdCoreCapacity &&
-        metadataBaseTaskUpperBound <= (blockDim == 0 ? 0U : ((3U * blockDim - 1U) / 10U));
+        metadataBaseTaskUpperBound < metadataFdCoreCapacity && metadataBaseTaskUpperBound <= metadataFdCombineCapacity;
     const bool flashDecodeEnabled =
         use_scheduler_metadata ? metadataFlashDecodeCandidate : tilingData.flashDecodeFlag != 0U;
-
-    // Metadata and non-FD calls retain the conservative workspace allocation.
-    // Host-tiled FD calls use the exact partial O/LSE workspace size.
-    constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
-    if (!use_scheduler_metadata && !flashDecodeEnabled && tilingData.workSpaceSize < WS_FLOOR) {
-        tilingData.workSpaceSize = WS_FLOOR;
-    }
 
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
-    auto workspace = at::empty({static_cast<int64_t>(use_scheduler_metadata ? WS_FLOOR : tilingData.workSpaceSize)},
-                               at::device(at::kPrivateUse1).dtype(at::kByte));
+    uint64_t workspaceSize = 0;
+    if (metadataFlashDecodeCandidate) {
+        // AICPU may enable FlashDecode for up to 128 grouped Q rows per partial.
+        constexpr uint64_t maxFdRows = 128;
+        const uint64_t partialCapacity = metadataFdCoreCapacity + metadataFdCombineCapacity - 1U;
+        const uint64_t partialLseSize = partialCapacity * maxFdRows * sizeof(float);
+        const uint64_t partialOOffset = optiling::AlignUpU64(partialLseSize, optiling::FD_WORKSPACE_ALIGNMENT);
+        workspaceSize = partialOOffset + partialCapacity * maxFdRows * head_size_v * sizeof(float);
+    } else if (flashDecodeEnabled) {
+        workspaceSize = tilingData.workSpaceSize;
+    }
+    at::Tensor workspace;
+    if (workspaceSize != 0) {
+        workspace = at::empty({static_cast<int64_t>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+    }
 
     at::Tensor softmaxlse;
     if (return_lse && is_varlen_q) {
@@ -504,7 +511,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
     auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
-    auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
+    auto wsDev = workspace.defined() ? workspace.data_ptr<uint8_t>() : nullptr;
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
     auto runtimeDev = quantMode == 0 ? static_cast<uint8_t*>(runtime_dev.data_ptr()) : nullptr;
 

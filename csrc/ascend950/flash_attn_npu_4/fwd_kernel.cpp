@@ -189,9 +189,12 @@ class FAIKernel950 {
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float*)params.lse);
         AscendC::GlobalTensor<float> gPartialLse;
-        gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
         AscendC::GlobalTensor<float> gPartialO;
-        gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtimeTilingData->allowFlashDecode != 0U;
+        if (flashDecodeFlag_) {
+            gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
+            gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        }
         //tiling data
 
         batch_ = faiTilingData->batch;
@@ -235,7 +238,6 @@ class FAIKernel950 {
         pL1BufNum_ = faiTilingData->pL1BufNum;
         windowSizeLeft_ = runtimeTilingData->windowSizeLeft;
         windowSizeRight_ = runtimeTilingData->windowSizeRight;
-        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtimeTilingData->allowFlashDecode != 0U;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
