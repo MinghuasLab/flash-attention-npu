@@ -225,9 +225,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(layout_enum != FwdLayout::TND || paged_KV || k.size(0) == v.size(0),
+                "key and value must have the same TND token count");
     const bool empty_query = is_varlen_q && q.size(0) == 0 && seqlen_q == 0;
     TORCH_CHECK((seqlen_q > 0 || empty_query) && num_heads > 0,
                 "query sequence length and head count must be positive");
+    TORCH_CHECK(layout_enum != FwdLayout::TND || paged_KV || q.size(0) > 0 || empty_query,
+                "total_q must be positive when max_seqlen_q is positive");
     TORCH_CHECK(!is_varlen_kv || cu_seqlens_k.numel() == batch_size + 1,
                 "cu_seqlens_k must contain batch_size + 1 cumulative offsets");
     TORCH_CHECK(!seqused_q_.has_value() || seqused_q_->numel() == batch_size,
