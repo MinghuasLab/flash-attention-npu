@@ -515,6 +515,8 @@ def flash_attn_with_kvcache(
         - alibi_slopes / rotary / attention_chunk / pack_gqa not supported.
         - cache_seqlens / page_table / cu_seqlens_* must be int32 when provided.
         - No backward pass.
+        - MLA: prefill q/k headdim=192, v headdim=128, `qv=None`;
+          decode q/k headdim=64, `qv`/`v` headdim=512.
 
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
@@ -596,6 +598,8 @@ def flash_attn_func(
         - alibi_slopes / attention_chunk / pack_gqa not supported.
         - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
           Deterministic backward does not support headdim > 256.
+        - MLA: prefill q/k headdim=192, v headdim=128, `qv=None`;
+          decode q/k headdim=64, `qv`/`v` headdim=512.
 
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
@@ -679,6 +683,8 @@ def flash_attn_varlen_func(
         - cu_seqlens_q / cu_seqlens_k must be int32 when provided.
         - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
           Deterministic backward does not support headdim > 256.
+        - MLA: prefill q/k headdim=192, v headdim=128, `qv=None`;
+          decode q/k headdim=64, `qv`/`v` headdim=512.
 
     Returns:
         out: (total_q, nheads, headdim).
@@ -854,6 +860,8 @@ def flash_attn_varlen_func(
         - On Ascend 950, paged KV cache page_size must be one of 128, 256, 512, or 1024.
         - Backward: headdim in (0, 512]; Q and K must share the same headdim; seqused_* not supported in bwd.
           Deterministic backward does not support headdim > 256.
+        - MLA: prefill q/k headdim=192, v headdim=128, `qv=None`;
+          decode q/k headdim=64, `qv`/`v` headdim=512.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim_v) or (total_q, nheads, headdim_v) if varlen.
@@ -946,6 +954,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Softcapping | ✅ | ✅ |
 | FP8 Quantization | - | ✅ |
 | Variable-length Sequences | ✅ | ✅ |
+| MLA (910) | - | ✅ |
 
 #### flash_attn_func
 | Feature | v2 | v3 |
@@ -960,6 +969,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Softcapping | ✅ | ✅ |
 | FP8 Quantization | - | ✅ |
 | Dropout | ✅ | - |
+| MLA (910) | - | ✅ |
 
 #### flash_attn_varlen_func
 | Feature | v2 | v3 | v4 |
@@ -976,6 +986,7 @@ Ascend 950, as does v4. The public interfaces also have these constraints:
 | Softcapping | ✅ | ✅ | ✅ |
 | FP8 Quantization | - | ✅ | ✅ |
 | Dropout | ✅ | - | - |
+| MLA (910) | - | ✅ | ✅ |
 
 #### flash_attn_combine
 | Feature | v3 | v4 |

@@ -504,6 +504,8 @@ def flash_attn_with_kvcache(
         - 不支持 alibi_slopes / rotary / attention_chunk / pack_gqa。
         - cache_seqlens / page_table / cu_seqlens_* 若传入须为 int32。
         - 不支持反向传播。
+        - MLA：Prefill 为 q/k headdim=192、v headdim=128、`qv=None`；
+          Decode为 q/k headdim=64、`qv`/`v` headdim=512。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -583,6 +585,8 @@ def flash_attn_func(
         - 不支持 alibi_slopes / attention_chunk / pack_gqa。
         - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
           确定性反向不支持 headdim > 256。
+        - MLA：Prefill 为 q/k headdim=192、v headdim=128、`qv=None`；
+          Decode为 q/k headdim=64、`qv`/`v` headdim=512。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -665,6 +669,8 @@ def flash_attn_varlen_func(
         - cu_seqlens_q / cu_seqlens_k 若传入须为 int32。
         - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
           确定性反向不支持 headdim > 256。
+        - MLA：Prefill 为 q/k headdim=192、v headdim=128、`qv=None`；
+          Decode为 q/k headdim=64、`qv`/`v` headdim=512。
 
     返回：
         out: (total_q, nheads, headdim)。
@@ -800,6 +806,8 @@ def flash_attn_varlen_func(
         - 在 Ascend 950 上，分页 KV Cache 的 page_size 仅支持 128、256、512 或 1024。
         - 反向：headdim 须在 (0, 512]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
           确定性反向不支持 headdim > 256。
+        - MLA：Prefill 为 q/k headdim=192、v headdim=128、`qv=None`；
+          Decode为 q/k headdim=64、`qv`/`v` headdim=512。
 
     返回：
         out: (total_q, nheads, headdim_v) 或稠密 (batch_size, seqlen, nheads, headdim_v)。
@@ -883,6 +891,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | Softcapping         | ✅ | ✅ |
 | FP8 量化            | -  | ✅ |
 | 变长序列            | ✅ | ✅ |
+| MLA(910) | -  | ✅ |
 
 #### flash_attn_func
 
@@ -898,6 +907,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | Softcapping         | ✅ | ✅ |
 | FP8 量化            | -  | ✅ |
 | Dropout             | ✅ | -  |
+| MLA(910) | -  | ✅ |
 
 #### flash_attn_varlen_func
 
@@ -915,6 +925,7 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 | Softcapping         | ✅ | ✅ | ✅ |
 | FP8 量化            | -  | ✅ | ✅ |
 | Dropout             | ✅ | -  | -  |
+| MLA(910) | -  | ✅  | ✅ |
 
 #### flash_attn_combine
 
