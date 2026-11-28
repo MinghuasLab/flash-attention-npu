@@ -60,14 +60,15 @@ struct PipelineSlots {
     uint32_t halfBytes = 0; // size of one ping (or pong) half
 };
 
-FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile, bool singleVec = false)
+FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile, bool singleVec = false, bool packedScalars = false)
 {
     const uint32_t rowsPerSub = RowsPerSubBlock(qTile, singleVec);
     const uint32_t mmResBytes = rowsPerSub * ROW_STRIDE * sizeof(float);
     const uint32_t attenMaskBytes = rowsPerSub * ROW_STRIDE * sizeof(uint8_t);
-    const uint32_t lseBytes = static_cast<uint32_t>(RoundUp(rowsPerSub, 8) * 8 * sizeof(float));
+    const uint32_t scalarPitch = packedScalars ? 1U : 8U;
+    const uint32_t lseBytes = static_cast<uint32_t>(RoundUp(rowsPerSub, 8) * scalarPitch * sizeof(float));
     const uint32_t pBytes = (rowsPerSub + 1) * ROW_STRIDE * P_ELEMENT_BYTES;
-    const uint32_t deltaBytes = rowsPerSub * 8 * sizeof(float);
+    const uint32_t deltaBytes = rowsPerSub * scalarPitch * sizeof(float);
 
     PipelineSlots slots;
     slots.mm1 = 0;
@@ -82,9 +83,9 @@ FAG_UB_LAYOUT_API PipelineSlots MakePipelineSlots(uint32_t qTile, bool singleVec
 }
 
 // Total UB bytes of the two ping/pong halves.
-FAG_UB_LAYOUT_API uint32_t PipelineBytes(uint32_t qTile, bool singleVec = false)
+FAG_UB_LAYOUT_API uint32_t PipelineBytes(uint32_t qTile, bool singleVec = false, bool packedScalars = false)
 {
-    return 2 * MakePipelineSlots(qTile, singleVec).halfBytes;
+    return 2 * MakePipelineSlots(qTile, singleVec, packedScalars).halfBytes;
 }
 
 /*

@@ -87,8 +87,10 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
                 ? head * tiling_->totalQ + qBase
                 : (static_cast<uint64_t>(block.batchIdx) * tiling_->qHeadNum + head) * tiling_->qSeqlen +
                       block.s1Start + rowOffset;
-        AscendC::DataCopyExtParams deltaCopyParams{static_cast<uint16_t>(m), static_cast<uint32_t>(sizeof(float)), 0, 0,
-                                                   0};
+        const bool packedDelta = tiling_->dkCastInUb != 0;
+        AscendC::DataCopyExtParams deltaCopyParams{
+            static_cast<uint16_t>(packedDelta ? 1U : m),
+            static_cast<uint32_t>((packedDelta ? m : 1U) * sizeof(float)), 0, 0, 0};
         AscendC::DataCopyPadExtParams<float> deltaPadParams{false, 0, 0, 0};
         AscendC::DataCopyPad(deltaUbTensor, deltaWorkspaceGm_[deltaOffset], deltaCopyParams, deltaPadParams);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(mte2ToVEvent);
@@ -102,7 +104,11 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToVEvent);
 
-        ComputeSubMul(dp, p, softcapGrad, delta, out, m);
+        if (packedDelta) {
+            ComputeSubMul<1>(dp, p, softcapGrad, delta, out, m);
+        } else {
+            ComputeSubMul<8>(dp, p, softcapGrad, delta, out, m);
+        }
         AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
@@ -117,6 +123,7 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
     }
 
   private:
+    template <uint32_t DeltaStride>
     __simd_vf__ inline static void ComputeSubMul(__ubuf__ ElementDP* dp, __ubuf__ ElementP* p,
                                                  __ubuf__ float* softcapGrad, __ubuf__ float* delta,
                                                  __ubuf__ ElementDS* out, uint32_t m)
@@ -146,7 +153,7 @@ class BlockEpilogue<EpilogueAscend950FAGSubMul<INPUT_LAYOUT_, IS_SOFTCAP_>, Elem
         for (uint32_t i = 0; i < m; ++i) {
             LoadAlign(dp0, dp + i * rowStride);
             LoadAlign(dp1, dp + i * rowStride + lanes);
-            LoadAlign<float, LoadDist::DIST_BRC_B32>(deltaV, delta + i * 8U);
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(deltaV, delta + i * DeltaStride);
             if constexpr (IS_SOFTCAP) {
                 // Softcap path: P still comes from NZ b16; softcapGrad lives
                 // in the fp32 ND buffer that non-softcap reuses for P.

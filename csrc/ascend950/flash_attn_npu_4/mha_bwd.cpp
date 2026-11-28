@@ -22,6 +22,7 @@
 #include "acl/acl.h"
 #include "device_triu_mask.h"
 // Reuse Ascend950 v3 FAG kernels in place (same pattern as 910 v2 → v3).
+#include "../flash_attn_npu_3/fag_dkv_cast_host.hpp"
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "../flash_attn_npu_3/fag_kernel.cpp"
 #include "../flash_attn_npu_3/fag_bwd_d512_partial.hpp"
@@ -153,6 +154,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     FAGTiling950::FAGInfo fag_info{};
     fag_info.scaleValue =
         static_cast<float>(softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
+    // Fixpipe uses an FP16-precision multiplier for FP16 and BF16 dK stores.
+    fag_info.fixpipeDkScaleExact =
+        fag_info.scaleValue >= static_cast<float>(std::numeric_limits<c10::Half>::min()) &&
+        std::isfinite(fag_info.scaleValue) &&
+        static_cast<float>(c10::Half(fag_info.scaleValue)) == fag_info.scaleValue;
     const bool has_softcap = softcap > 0.0;
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout =
@@ -175,6 +181,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         fag_info.window_size_right = window_size_right;
     }
     fag_info.deterministic = deterministic ? 1U : 0U;
+    fag_info.hasUsedLengths = seqused_q_.has_value() || seqused_k_.has_value();
     // Deterministic accumulation strategy.  BN2S2 applies the arch35
     // column-private schedule when the shape is covered; the tiler rejects
     // any deterministic shape it cannot map, so there is no silent
@@ -207,6 +214,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // Snapshot TND lengths together for host validation and deterministic tiling.
     std::vector<int64_t> actual_seq_q;
     std::vector<int64_t> actual_seq_kv;
+    int64_t kv_packed_end = 0;
     if (is_varlen) {
         const at::Tensor& cu_q_tensor = cu_seqlens_q_.value();
         const at::Tensor& cu_k_tensor = cu_seqlens_k_.value();
@@ -232,6 +240,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         const int32_t* used_q = seqused_q_.has_value() ? copy_lengths(seqused_q_.value()) : nullptr;
         const int32_t* used_kv = seqused_k_.has_value() ? copy_lengths(seqused_k_.value()) : nullptr;
         current_stream.synchronize();
+        kv_packed_end = kv_lengths[batch_size];
         TORCH_CHECK(q_lengths[0] == 0 && kv_lengths[0] == 0, "Ascend950 v4 bwd: cu_seqlens must start at zero");
         actual_seq_q.resize(batch_size);
         actual_seq_kv.resize(batch_size);
@@ -296,7 +305,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                 "schedule for this shape");
 
     FAGTiling950::FAGTilingData fag_tiling_data{};
-    const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
+    const bool can_write_dkv_direct = is_varlen && FAGTiling950::CanWriteDkvDirect(
+        fag_info, actual_seq_q, kv_packed_end, k, v, dk, dv,
+        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
+    const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data, can_write_dkv_direct);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v4 bwd: arch35 GetFAGTilingParam failed");
     // Entire BAND-masked KV columns never reach the private-column cast.
     if (is_local && fag_tiling_data.detPrivDkv != 0) {
@@ -308,12 +320,6 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
             dk.zero_();
             dv.zero_();
         }
-    }
-    // earlyDkvCast Fixpipe-writes only the columns that run; untouched
-    // columns must stay exact zeros. Dense TND pitches are used for writes.
-    if (fag_tiling_data.earlyDkvCast != 0) {
-        dk.zero_();
-        dv.zero_();
     }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");

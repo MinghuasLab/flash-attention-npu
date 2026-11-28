@@ -17,7 +17,7 @@
 
 namespace Catlass::Epilogue::Block {
 
-template <class ArchTag, class TilingData>
+template <class ArchTag, class TilingData, bool PlannedKernel = false>
 class FagPre {
   public:
     CATLASS_DEVICE void Init(Catlass::Arch::Resource<ArchTag>& resource, GM_ADDR workspace, GM_ADDR tiling)
@@ -32,6 +32,9 @@ class FagPre {
 
     CATLASS_DEVICE void operator()(uint32_t vectorCoreId, uint32_t vectorCoreNum, event_t vToMte3Event)
     {
+        if (tiling_->wideHeadOwn != 0) {
+            return;
+        }
         constexpr uint32_t tileElements = 20U * 1024U;
         AscendC::Duplicate(zeroUb_, 0.0F, tileElements);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
@@ -47,13 +50,18 @@ class FagPre {
                                      : static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
-        ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
-        // Skip dk/dv workspace clear when those regions are unused:
+        if (!PlannedKernel || tiling_->columnPlanKind != 3U) {
+            ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
+        }
+        // Skip dk/dv workspace clear when those regions are unused or overwritten:
         //   - detPrivDkv: first write overwrites the private column buffer
         //   - earlyDkvCast: Fixpipe writes bf16 outputs; dk/dv WS size is 0
-        if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0) {
+        //   - skipDkvClear: D<=128 full-coverage; first Fixpipe overwrites each column
+        if (tiling_->detPrivDkv == 0 && tiling_->earlyDkvCast == 0 && tiling_->skipDkvClear == 0) {
             ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
-            ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+            if (tiling_->wideDvResident == 0 || tiling_->legacyVarlenSchedule == 2U) {
+                ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+            }
         }
         // readyCounter/doneCounter live at workspace_[0..15]. The non-det
         // tiler sets dqOffset=0 so ClearRegion already zeros that range;

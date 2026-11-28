@@ -107,8 +107,11 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     static_assert(L1_TILE_HALF * 2 == L1_TILE_MAX, "RES_K half-slot packing assumes 64KB tiles");
 
     CATLASS_DEVICE
-    BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart = 0, uint32_t eventIdStart = 0)
+    BlockMmadTla(Arch::Resource<ArchTag>& resource, uint32_t l1BufAddrStart = 0, uint32_t eventIdStart = 0,
+                 bool depth2 = false)
+        : depth2_(depth2)
     {
+        l1KT = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_KT_OFFSET);
         l1K = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + L1_K_OFFSET);
         for (uint32_t i = 0; i < Ascend950FagL1Layout::TASK_PINGPONG; ++i) {
             l1Q[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart +
@@ -116,6 +119,10 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
             l1Dy[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart +
                                                                         Ascend950FagL1Layout::DySlot(i) * L1_TILE_MAX);
         }
+        l1Q[2] = resource.l1Buf.template GetBufferByByte<ElementB>(
+            l1BufAddrStart + Ascend950FagL1Layout::SLOT_RES_VT * L1_TILE_MAX + Ascend950FagL1Layout::TILE_BYTES);
+        l1Dy[2] = resource.l1Buf.template GetBufferByByte<ElementB>(
+            l1BufAddrStart + Ascend950FagL1Layout::SLOT_DY1 * L1_TILE_MAX + Ascend950FagL1Layout::TILE_BYTES);
 
         for (uint32_t i = 0; i < L0AB_STAGES; i++) {
             l0ATensorList[i] = resource.l0ABuf.template GetBufferByByte<ElementA>(L0A_PINGPONG_BUF_SIZE * i);
@@ -133,6 +140,43 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         l1EventK = static_cast<int32_t>((L1_EVENT_K + eventIdStart) % 8);
         l0AListId = 0;
         l0BListId = 0;
+    }
+
+    CATLASS_DEVICE
+    uint32_t L0ABStage() const
+    {
+        return l0AListId;
+    }
+
+    CATLASS_DEVICE
+    void SetL0ABStage(uint32_t stage)
+    {
+        l0AListId = stage;
+        l0BListId = stage;
+    }
+
+    CATLASS_DEVICE
+    uint32_t QSlotOf(uint32_t taskPing) const
+    {
+        return depth2_ ? Ascend950FagL1Layout::QSlotDepth2(taskPing) : Ascend950FagL1Layout::QSlot(taskPing);
+    }
+
+    CATLASS_DEVICE
+    uint32_t DySlotOf(uint32_t taskPing) const
+    {
+        return depth2_ ? Ascend950FagL1Layout::DySlotDepth2(taskPing) : Ascend950FagL1Layout::DySlot(taskPing);
+    }
+
+    CATLASS_DEVICE
+    uint32_t QBufOf(uint32_t taskPing) const
+    {
+        return depth2_ ? taskPing : (taskPing & 1U);
+    }
+
+    CATLASS_DEVICE
+    uint32_t DyBufOf(uint32_t taskPing) const
+    {
+        return depth2_ ? taskPing : (taskPing & 1U);
     }
 
     CATLASS_DEVICE
@@ -168,7 +212,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     CATLASS_DEVICE void ComputeDqDk(AscendC::LocalTensor<ElementA> dsNz, TensorK& k, TensorDq& dq, TensorDk& dk,
                                     GemmCoord const& actualShape, uint32_t taskPing, bool waitResidentK,
                                     bool enAtomicDq, bool initDk, bool flushDk, bool enAtomicDk,
-                                    float fixpipeScaleDk = 1.0f)
+                                    float fixpipeScaleDk = 1.0f, bool reuseKT = false, bool keepDv = false, bool alternateC = false)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dActual = actualShape.n();
@@ -177,7 +221,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
             ComputeDqDkSmallHeadDim(dsNz, dq, dk, sqActual, skvActual, dActual, taskPing, waitResidentK, enAtomicDq,
                                     initDk, flushDk, enAtomicDk, fixpipeScaleDk);
         } else {
-            ComputeDqDkLargeHeadDim(dsNz, k, dq, dk, sqActual, skvActual, dActual, taskPing, enAtomicDq, enAtomicDk);
+            ComputeDqDkLargeHeadDim(dsNz, k, dq, dk, sqActual, skvActual, dActual, taskPing, enAtomicDq, enAtomicDk, reuseKT, keepDv, alternateC);
         }
     }
 
@@ -188,7 +232,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     template <class TensorDv>
     CATLASS_DEVICE void ComputeDv(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, GemmCoord const& actualShape,
                                   uint32_t taskPing, bool initDv, bool flushDv, bool enAtomicDv,
-                                  float fixpipeScaleDv = 1.0f)
+                                  float fixpipeScaleDv = 1.0f, bool keepDv = false)
     {
         const uint32_t sqActual = actualShape.m();
         const uint32_t dvActual = actualShape.n();
@@ -197,12 +241,21 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
             ComputeDvSmallHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, initDv, flushDv, enAtomicDv,
                                   fixpipeScaleDv);
         } else {
-            ComputeDvLargeHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, enAtomicDv);
+            ComputeDvLargeHeadDim(pNz, dv, sqActual, skvActual, dvActual, taskPing, enAtomicDv, initDv, flushDv, keepDv);
         }
     }
 
-  protected:
     template <class TensorDq, class TensorDk>
+    CATLASS_DEVICE void ComputeDqDkToUb(AscendC::LocalTensor<ElementA> dsNz, TensorDq& dq, TensorDk& dk,
+                                       GemmCoord const& shape, uint32_t taskPing, bool waitResidentK,
+                                       bool enAtomicDq, bool initDk, bool flushDk)
+    {
+        ComputeDqDkSmallHeadDim<true>(dsNz, dq, dk, shape.m(), shape.k(), shape.n(), taskPing,
+                                      waitResidentK, enAtomicDq, initDk, flushDk, false, 1.0f);
+    }
+
+  protected:
+    template <bool DkToUb = false, class TensorDq, class TensorDk>
     CATLASS_DEVICE void ComputeDqDkSmallHeadDim(AscendC::LocalTensor<ElementA> dsNz, TensorDq& dq, TensorDk& dk,
                                                 uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
                                                 uint32_t taskPing, bool waitResidentK, bool enAtomicDq, bool initDk,
@@ -211,16 +264,31 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
-        const uint32_t qEvent = Ascend950FagL1Layout::QSlot(taskPing);
+        const uint32_t qBuf = QBufOf(taskPing);
+        const uint32_t qEvent = QSlotOf(taskPing);
         // K resident in RES_KT upper half — no per-task GM load.
-        GemmRow(dsNz, l1K, l0CTensorList[SLOT_DQ], sqRound, dRound, skvRound, sqActual, dActual, skvActual, true, 0b11,
+        // dq always Fixpipes: OUTER_LAST (0b11). Resident dk matches fusion:
+        // accumulate → UNITFLAG_ENABLE (0b10) with no Fixpipe; flush → 0b11 + Fixpipe.
+        constexpr uint8_t kUfLast = 0b11;
+        constexpr uint8_t kUfCont = 0b10;
+        GemmRow(dsNz, l1K, l0CTensorList[SLOT_DQ], sqRound, dRound, skvRound, sqActual, dActual, skvActual, true, kUfLast,
                 SLOT_DQ, L1_EVENT_K, /*waitB=*/waitResidentK, /*releaseB=*/false,
                 /*useKEvent=*/true);
         FixpipeTla(dq, l0CTensorList[SLOT_DQ], sqActual, dActual, sqRound, enAtomicDq, SLOT_DQ);
-        GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK], skvRound, dRound, sqRound, skvActual, dActual, sqActual,
-                 initDk, 0b11, SLOT_DK, qEvent, /*waitB=*/false, /*releaseB=*/true);
+        const uint8_t ufDk = flushDk ? kUfLast : kUfCont;
+        GemmColA(dsNz, l1Q[qBuf], l0CTensorList[SLOT_DK], skvRound, dRound, sqRound, skvActual, dActual, sqActual,
+                 initDk, ufDk, SLOT_DK, qEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDk) {
-            FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK, fixpipeScaleDk);
+            if constexpr (DkToUb) {
+                auto layout = tla::MakeLayoutL0C(skvRound, dActual);
+                auto accumulator = tla::MakeTensor(l0CTensorList[SLOT_DK], layout, Arch::PositionL0C{});
+                using Copy = Gemm::Tile::CopyL0CToUBTla<ArchTag, decltype(accumulator), TensorDk,
+                    Gemm::Tile::CopyL0CToUBMode::SPLIT_M, Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
+                Copy copy;
+                copy(dk, accumulator, 0b11);
+            } else {
+                FixpipeTla(dk, l0CTensorList[SLOT_DK], skvActual, dActual, skvRound, enAtomicDk, SLOT_DK, fixpipeScaleDk);
+            }
             ReleaseResidentK();
         }
     }
@@ -233,9 +301,13 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dvRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dvActual);
-        const uint32_t dyEvent = Ascend950FagL1Layout::DySlot(taskPing);
-        GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV], skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
-                 initDv, 0b11, SLOT_DV, dyEvent, /*waitB=*/false, /*releaseB=*/true);
+        const uint32_t dyBuf = DyBufOf(taskPing);
+        const uint32_t dyEvent = DySlotOf(taskPing);
+        constexpr uint8_t kUfLast = 0b11;
+        constexpr uint8_t kUfCont = 0b10;
+        const uint8_t ufDv = flushDv ? kUfLast : kUfCont;
+        GemmColA(pNz, l1Dy[dyBuf], l0CTensorList[SLOT_DV], skvRound, dvRound, sqRound, skvActual, dvActual, sqActual,
+                 initDv, ufDv, SLOT_DV, dyEvent, /*waitB=*/false, /*releaseB=*/true);
         if (flushDv) {
             FixpipeTla(dv, l0CTensorList[SLOT_DV], skvActual, dvActual, skvRound, enAtomicDv, SLOT_DV, fixpipeScaleDv);
         }
@@ -244,7 +316,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     template <class TensorK, class TensorDq, class TensorDk>
     CATLASS_DEVICE void ComputeDqDkLargeHeadDim(AscendC::LocalTensor<ElementA> dsNz, TensorK& k, TensorDq& dq,
                                                 TensorDk& dk, uint32_t sqActual, uint32_t skvActual, uint32_t dActual,
-                                                uint32_t taskPing, bool enAtomicDq, bool enAtomicDk)
+                                                uint32_t taskPing, bool enAtomicDq, bool enAtomicDk, bool reuseKT, bool keepDv, bool alternateC)
     {
         // D>BASE: Fixpipe each D-slice. Q is full in L1 from C1; K streams
         // slice-by-slice into the DY scratch slot. Each GM slice honors
@@ -252,50 +324,68 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dFullRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dActual);
-        const uint32_t qEvent = Ascend950FagL1Layout::QSlot(taskPing);
-        const uint32_t dyEvent = Ascend950FagL1Layout::DySlot(taskPing);
+        const uint32_t qBuf = QBufOf(taskPing);
+        const uint32_t dyBuf = DyBufOf(taskPing);
+        const uint32_t qEvent = QSlotOf(taskPing);
+        const uint32_t dyEvent = DySlotOf(taskPing);
         const uint32_t dLoops = CeilDiv(dActual, BASE);
         for (uint32_t dIdx = 0; dIdx < dLoops; ++dIdx) {
             const uint32_t nOff = dIdx * BASE;
             const uint32_t nAct = Min(BASE, dActual - nOff);
             const uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(nAct);
-            const uint32_t slotDq = (dIdx & 1U) ? SLOT_DQ_PING : SLOT_DQ;
+            // Keep alternating physical slots across both slices when dV owns the upper slots.
+            const bool pingDq = alternateC || (dIdx & 1U) != 0;
+            const uint32_t slotDq = pingDq ? SLOT_DQ_PING : SLOT_DQ;
+            const uint32_t slotDk = keepDv ? (pingDq ? SLOT_DQ : SLOT_DQ_PING) : SLOT_DK;
             const bool lastSlice = (dIdx + 1 == dLoops);
             auto kTile = GetTile(k, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
             auto dqTile = GetTile(dq, tla::MakeCoord(0u, nOff), tla::MakeShape(sqActual, nAct));
             auto dkTile = GetTile(dk, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
-            CopyGmToL1B(l1Dy[taskPing], kTile, skvActual, nAct, skvRound, nRound, dyEvent);
-            GemmRow(dsNz, l1Dy[taskPing], l0CTensorList[slotDq], sqRound, nRound, skvRound, sqActual, nAct, skvActual,
-                    true, 0b11, slotDq, dyEvent, /*waitB=*/true, /*releaseB=*/true);
+            if (reuseKT) {
+                // nZ [D, Skv] and zN [Skv, D] have identical storage.
+                GemmRow(dsNz, l1KT, l0CTensorList[slotDq], sqRound, nRound, skvRound, sqActual, nAct, skvActual,
+                        true, 0b11, slotDq, 0, /*waitB=*/false, /*releaseB=*/false, false, nOff, dFullRound);
+            } else {
+                CopyGmToL1B(l1Dy[dyBuf], kTile, skvActual, nAct, skvRound, nRound, dyEvent);
+                GemmRow(dsNz, l1Dy[dyBuf], l0CTensorList[slotDq], sqRound, nRound, skvRound, sqActual, nAct, skvActual,
+                        true, 0b11, slotDq, dyEvent, /*waitB=*/true, /*releaseB=*/true);
+            }
             FixpipeTla(dqTile, l0CTensorList[slotDq], sqActual, nAct, sqRound, enAtomicDq, slotDq);
-            GemmColA(dsNz, l1Q[taskPing], l0CTensorList[SLOT_DK], skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                     true, 0b11, SLOT_DK, qEvent,
+            GemmColA(dsNz, l1Q[qBuf], l0CTensorList[slotDk], skvRound, nRound, sqRound, skvActual, nAct, sqActual, true,
+                     0b11, slotDk, qEvent,
                      /*waitB=*/false, /*releaseB=*/lastSlice,
                      /*bNOff=*/nOff, /*bNFull=*/dFullRound);
-            FixpipeTla(dkTile, l0CTensorList[SLOT_DK], skvActual, nAct, skvRound, enAtomicDk, SLOT_DK);
+            FixpipeTla(dkTile, l0CTensorList[slotDk], skvActual, nAct, skvRound, enAtomicDk, slotDk);
         }
     }
 
     template <class TensorDv>
     CATLASS_DEVICE void ComputeDvLargeHeadDim(AscendC::LocalTensor<ElementA> pNz, TensorDv& dv, uint32_t sqActual,
-                                              uint32_t skvActual, uint32_t dvActual, uint32_t taskPing, bool enAtomicDv)
+                                              uint32_t skvActual, uint32_t dvActual, uint32_t taskPing, bool enAtomicDv, bool initDv,
+                                              bool flushDv, bool keepDv)
     {
         const uint32_t sqRound = RoundUp<L1AAlignHelper::M_ALIGNED>(sqActual);
         const uint32_t skvRound = RoundUp<L1AAlignHelper::K_ALIGNED>(skvActual);
         const uint32_t dvFullRound = RoundUp<L1BAlignHelper::N_ALIGNED>(dvActual);
-        const uint32_t dyEvent = Ascend950FagL1Layout::DySlot(taskPing);
+        const uint32_t dyBuf = DyBufOf(taskPing);
+        const uint32_t dyEvent = DySlotOf(taskPing);
         const uint32_t dvLoops = CeilDiv(dvActual, BASE);
         for (uint32_t dIdx = 0; dIdx < dvLoops; ++dIdx) {
             const uint32_t nOff = dIdx * BASE;
             const uint32_t nAct = Min(BASE, dvActual - nOff);
             const uint32_t nRound = RoundUp<L1BAlignHelper::N_ALIGNED>(nAct);
             const bool lastSlice = (dIdx + 1 == dvLoops);
+            const uint32_t slotDv = keepDv ? (dIdx == 0 ? SLOT_DK : SLOT_DV) : SLOT_DV;
+            const bool flush = !keepDv || flushDv;
+            const uint8_t unitFlag = flush ? 0b11 : 0b10;
             auto dvTile = GetTile(dv, tla::MakeCoord(0u, nOff), tla::MakeShape(skvActual, nAct));
-            GemmColA(pNz, l1Dy[taskPing], l0CTensorList[SLOT_DV], skvRound, nRound, sqRound, skvActual, nAct, sqActual,
-                     true, 0b11, SLOT_DV, dyEvent,
+            GemmColA(pNz, l1Dy[dyBuf], l0CTensorList[slotDv], skvRound, nRound, sqRound, skvActual, nAct, sqActual,
+                     !keepDv || initDv, unitFlag, slotDv, dyEvent,
                      /*waitB=*/false, /*releaseB=*/lastSlice,
                      /*bNOff=*/nOff, /*bNFull=*/dvFullRound);
-            FixpipeTla(dvTile, l0CTensorList[SLOT_DV], skvActual, nAct, skvRound, enAtomicDv, SLOT_DV);
+            if (flush) {
+                FixpipeTla(dvTile, l0CTensorList[slotDv], skvActual, nAct, skvRound, enAtomicDv, slotDv);
+            }
         }
     }
 
@@ -321,11 +411,12 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
     void GemmRow(AscendC::LocalTensor<ElementA> l1A, AscendC::LocalTensor<ElementB> l1B,
                  AscendC::LocalTensor<ElementAccumulator> l0C, uint32_t mRound, uint32_t nRound, uint32_t kRound,
                  uint32_t mActual, uint32_t nActual, uint32_t kActual, bool initC, uint8_t unitFlag, uint32_t l0cSlot,
-                 uint32_t l1BEvent, bool waitB, bool releaseB, bool useKEvent = false)
+                 uint32_t l1BEvent, bool waitB, bool releaseB, bool useKEvent = false,
+                 uint32_t bNOff = 0, uint32_t bNFull = 0)
     {
         auto layoutAInL1 = tla::MakeLayout<ElementA, LayoutTagL1A>(mRound, kRound);
         auto layoutAInL0 = tla::MakeLayout<ElementA, LayoutTagL0A>(mRound, kRound);
-        auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, nRound);
+        auto layoutBInL1 = tla::MakeLayout<ElementB, LayoutTagL1B>(kRound, bNFull == 0 ? nRound : bNFull);
         auto layoutBInL0 = tla::MakeLayout<ElementB, LayoutTagL0B>(kRound, nRound);
         auto layoutCInL0 = tla::MakeLayoutL0C(mRound, nRound);
 
@@ -335,7 +426,7 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         auto tensorL0B = tla::MakeTensor(l0BTensorList[l0BListId], layoutBInL0, Arch::PositionL0B{});
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
         auto tileL1A = GetTile(tensorL1A, tla::MakeCoord(0u, 0u), tla::MakeShape(mRound, kRound));
-        auto tileL1B = GetTile(tensorL1B, tla::MakeCoord(0u, 0u), tla::MakeShape(kRound, nRound));
+        auto tileL1B = GetTile(tensorL1B, tla::MakeCoord(0u, bNOff), tla::MakeShape(kRound, nRound));
 
         const int32_t evB = useKEvent ? l1EventK : l1EventList[l1BEvent];
 
@@ -355,8 +446,10 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventList[l0BListId]);
-        if (initC) {
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+        if constexpr (!ENABLE_UNIT_FLAG) {
+            if (initC) {
+                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+            }
         }
         uint32_t mMad = (mActual == 1) ? 2 : mRound;
         uint8_t uf = ENABLE_UNIT_FLAG ? unitFlag : 0;
@@ -393,20 +486,31 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         copyL1ToL0ACol(tensorL0A, tileL1A);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
 
+        const bool bMutex = Ascend950FagL1Layout::IsMutexSlot(l1BEvent);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
         if (waitB) {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+            if (bMutex) {
+                AscendC::Mutex::Lock<PIPE_MTE1>(static_cast<int32_t>(Ascend950FagL1Layout::MutexOf(l1BEvent)));
+            } else {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1EventList[l1BEvent]);
+            }
         }
         copyL1ToL0B(tensorL0B, tileL1B);
         if (releaseB) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+            if (bMutex) {
+                AscendC::Mutex::Unlock<PIPE_MTE1>(static_cast<int32_t>(Ascend950FagL1Layout::MutexOf(l1BEvent)));
+            } else {
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1EventList[l1BEvent]);
+            }
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventList[l0BListId]);
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0AEventList[l0AListId]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(l0BEventList[l0BListId]);
-        if (initC) {
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+        if constexpr (!ENABLE_UNIT_FLAG) {
+            if (initC) {
+                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+            }
         }
         uint32_t mMad = (mActual == 1) ? 2 : mRound;
         uint8_t uf = ENABLE_UNIT_FLAG ? unitFlag : 0;
@@ -427,8 +531,12 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
         auto tensorL0C = tla::MakeTensor(l0C, layoutCInL0, Arch::PositionL0C{});
         auto tensorGmTile = GetTile(gmC, tla::MakeCoord(0u, 0u), tla::MakeShape(mActual, nActual));
 
-        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
-        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
+        // Unit flag: hardware orders mmad→fixpipe→next mmad on this L0C.
+        // Soft M_FIX/FIX_M would scalar-stall the cube issue queue (fusion skips them).
+        if constexpr (!ENABLE_UNIT_FLAG) {
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0cSlot]);
+        }
 
         // scale!=1: Fixpipe PER_TENSOR cast (fp32 L0C → bf16/fp16 GM with deqScalar).
         // Used by earlyDkvCast to write dk directly and skip the AIV cast path.
@@ -458,12 +566,16 @@ struct BlockMmadTla<MmadAscend950FagdQKV<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_F
                 copyL0CToDst(tensorGmTile, tensorL0C);
             }
         }
-        AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+        if constexpr (!ENABLE_UNIT_FLAG) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0cSlot]);
+        }
     }
 
+    AscendC::LocalTensor<ElementB> l1KT;
     AscendC::LocalTensor<ElementB> l1K;
-    AscendC::LocalTensor<ElementB> l1Q[Ascend950FagL1Layout::TASK_PINGPONG];
-    AscendC::LocalTensor<ElementB> l1Dy[Ascend950FagL1Layout::TASK_PINGPONG];
+    AscendC::LocalTensor<ElementB> l1Q[Ascend950FagL1Layout::QDY_DEPTH];
+    AscendC::LocalTensor<ElementB> l1Dy[Ascend950FagL1Layout::QDY_DEPTH];
+    bool depth2_{false};
 
     AscendC::LocalTensor<ElementA> l0ATensorList[L0AB_STAGES];
     AscendC::LocalTensor<ElementB> l0BTensorList[L0AB_STAGES];

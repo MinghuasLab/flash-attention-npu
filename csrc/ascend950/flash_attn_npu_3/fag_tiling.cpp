@@ -1,3 +1,5 @@
+#include <array>
+#include <vector>
 // Copyright (c) 2026, Minghua Shen.
 
 // Ascend950-specific host tiling and workspace calculation for FA v3 bwd.
@@ -30,6 +32,301 @@ uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
     return (value + divisor - 1) / divisor;
 }
 
+// The existing greedy assignment is a fallback. For a small number of
+// distinct full-mask column lengths, search for a packing at the lower bound.
+template <typename Column>
+void TryTightFullColumnPacking(const Column* columns, size_t count, uint32_t coreCount,
+                               uint32_t totalTasks, uint8_t* owners)
+{
+    constexpr size_t maxShapes = 4;
+    constexpr size_t maxPatterns = 4096;
+    constexpr uint32_t searchBudget = 2048;
+    const uint32_t capacity = static_cast<uint32_t>(CeilDivU64(totalTasks, coreCount));
+    if (capacity > 64U || columns[0].tasks > capacity || columns[count - 1].tasks < 4U) {
+        return;
+    }
+
+    using Counts = std::array<uint16_t, maxShapes>;
+    Counts remaining{};
+    std::array<uint32_t, maxShapes> weights{};
+    std::array<size_t, maxShapes> nextColumn{};
+    size_t shapes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (i == 0 || columns[i].tasks != columns[i - 1].tasks) {
+            if (shapes == maxShapes) {
+                return;
+            }
+            weights[shapes] = columns[i].tasks;
+            nextColumn[shapes++] = i;
+        }
+        ++remaining[shapes - 1];
+    }
+
+    struct Pattern {
+        Counts counts;
+        uint32_t load;
+    };
+    std::vector<Pattern> patterns;
+    Counts pattern{};
+    const auto enumerate = [&](auto& self, size_t shape, uint32_t load) -> void {
+        if (patterns.size() == maxPatterns) {
+            return;
+        }
+        if (shape == shapes) {
+            if (load > 0) {
+                patterns.push_back({pattern, load});
+            }
+            return;
+        }
+        const uint32_t limit = std::min<uint32_t>(remaining[shape], (capacity - load) / weights[shape]);
+        for (uint32_t n = 0; n <= limit; ++n) {
+            pattern[shape] = static_cast<uint16_t>(n);
+            self(self, shape + 1, load + n * weights[shape]);
+        }
+    };
+    enumerate(enumerate, 0, 0);
+    if (patterns.size() == maxPatterns) {
+        return;
+    }
+    std::stable_sort(patterns.begin(), patterns.end(), [](const Pattern& a, const Pattern& b) {
+        return a.load > b.load;
+    });
+
+    Counts chosen[LEGACY_VARLEN_CORES] = {};
+    uint32_t searches = 0;
+    const auto pack = [&](auto& self, uint32_t core, uint32_t todo) -> bool {
+        if (todo == 0) {
+            return true;
+        }
+        if (core == coreCount || todo > capacity * (coreCount - core) || searches++ >= searchBudget) {
+            return false;
+        }
+        const size_t largest = std::find_if(remaining.begin(), remaining.end(),
+                                            [](uint16_t n) { return n != 0; }) - remaining.begin();
+        const uint32_t roomAfterCore = capacity * (coreCount - core - 1);
+        for (const auto& candidate : patterns) {
+            if (candidate.load + roomAfterCore < todo) {
+                break;
+            }
+            if (candidate.counts[largest] == 0) {
+                continue;
+            }
+            bool fits = true;
+            for (size_t i = 0; i < shapes; ++i) {
+                fits &= candidate.counts[i] <= remaining[i];
+            }
+            if (!fits) {
+                continue;
+            }
+            for (size_t i = 0; i < shapes; ++i) {
+                remaining[i] -= candidate.counts[i];
+            }
+            if (self(self, core + 1, todo - candidate.load)) {
+                chosen[core] = candidate.counts;
+                return true;
+            }
+            for (size_t i = 0; i < shapes; ++i) {
+                remaining[i] += candidate.counts[i];
+            }
+        }
+        return false;
+    };
+    if (!pack(pack, 0, totalTasks)) {
+        return;
+    }
+
+    for (uint32_t core = 0; core < coreCount; ++core) {
+        for (size_t shape = 0; shape < shapes; ++shape) {
+            for (uint16_t i = 0; i < chosen[core][shape]; ++i) {
+                owners[nextColumn[shape]++] = static_cast<uint8_t>(core);
+            }
+        }
+    }
+}
+
+void PlanLegacyVarlenColumns(const FAGInfo& info, FAGTilingData& tiling)
+{
+    const bool shortWide = info.qkHeadDim == 192 && info.vHeadDim == 192 && info.qSeqlen <= 256;
+    if (info.layout != Layout::TND || info.hasUsedLengths || info.actualSeqQ == nullptr ||
+        info.actualSeqKv == nullptr || tiling.usedCoreNum > LEGACY_VARLEN_CORES ||
+        info.batch * info.kvHeadNum > LEGACY_VARLEN_HEADS || tiling.qTile != tiling.kvTile ||
+        (!shortWide && (info.qkHeadDim > 128 || info.vHeadDim > 128)) || (info.maskType != MaskType::NO_MASK &&
+        info.maskType != MaskType::CAUSAL)) {
+        return;
+    }
+
+    const bool causal = info.maskType == MaskType::CAUSAL;
+    bool mixed = false;
+    uint32_t columnsPerHead = 0;
+    for (uint64_t b = 0; b < info.batch; ++b) {
+        const int64_t length = info.actualSeqQ[b];
+        if (length <= 0 || length != info.actualSeqKv[b] || length % tiling.qTile != 0 ||
+            static_cast<uint64_t>(length) / tiling.qTile > LEGACY_VARLEN_COLUMNS) {
+            return;
+        }
+        mixed |= length != info.actualSeqQ[0];
+        columnsPerHead += static_cast<uint32_t>(length) / tiling.qTile;
+    }
+    const uint64_t groups = info.qHeadNum / info.kvHeadNum;
+    const bool splitSmallGqa = !shortWide && !mixed && causal && info.actualSeqQ[0] == 4 * tiling.qTile &&
+        groups >= 4 && groups % 2 == 0 && info.batch * info.kvHeadNum * 2 <= LEGACY_VARLEN_HEADS &&
+        info.batch * info.kvHeadNum * 2 * 4 >= tiling.usedCoreNum &&
+        info.batch * info.kvHeadNum * 4 <= tiling.usedCoreNum;
+    const bool splitWide = shortWide && groups >= 2 && groups % 2 == 0 &&
+        info.batch * info.kvHeadNum * 2 <= LEGACY_VARLEN_HEADS &&
+        columnsPerHead * info.kvHeadNum < tiling.usedCoreNum &&
+        columnsPerHead * info.kvHeadNum * 2 >= tiling.usedCoreNum;
+    const bool split = splitSmallGqa || splitWide;
+    if (!split && (!mixed || shortWide)) {
+        return;
+    }
+    const uint32_t segments = split ? 2U : 1U;
+    const uint32_t logicalHeads = static_cast<uint32_t>(info.kvHeadNum) * segments;
+
+    struct Column {
+        uint32_t head;
+        uint32_t index;
+        uint32_t tasks;
+    };
+    Column columns[LEGACY_VARLEN_HEADS * LEGACY_VARLEN_COLUMNS];
+    size_t count = 0;
+    for (uint32_t b = 0; b < info.batch; ++b) {
+        const uint32_t tiles = static_cast<uint32_t>(info.actualSeqQ[b]) / tiling.qTile;
+        for (uint32_t head = 0; head < logicalHeads; ++head) {
+            for (uint32_t column = 0; column < tiles; ++column) {
+                columns[count++] = {b * logicalHeads + head, column,
+                                    causal ? tiles - column : tiles};
+            }
+        }
+    }
+    std::stable_sort(columns, columns + count, [](const Column& a, const Column& b) {
+        return a.tasks > b.tasks;
+    });
+    uint32_t tasks[LEGACY_VARLEN_CORES] = {};
+    uint8_t owners[LEGACY_VARLEN_HEADS * LEGACY_VARLEN_COLUMNS];
+    uint32_t totalTasks = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t core = static_cast<uint32_t>(std::min_element(tasks, tasks + tiling.usedCoreNum) - tasks);
+        tasks[core] += columns[i].tasks;
+        owners[i] = static_cast<uint8_t>(core);
+        totalTasks += columns[i].tasks;
+    }
+
+    // Full columns from shorter batches can pack into the slack left by
+    // long columns. Try tight capacities before accepting the greedy peak.
+    if (!causal) {
+        const uint32_t peak = *std::max_element(tasks, tasks + tiling.usedCoreNum);
+        const uint32_t minimum = static_cast<uint32_t>(CeilDivU64(totalTasks, tiling.usedCoreNum));
+        for (uint32_t capacity = std::max(minimum, columns[0].tasks); capacity < peak; ++capacity) {
+            uint32_t load[LEGACY_VARLEN_CORES] = {};
+            uint8_t packed[LEGACY_VARLEN_HEADS * LEGACY_VARLEN_COLUMNS];
+            size_t i = 0;
+            for (; i < count; ++i) {
+                uint32_t core = 0;
+                while (core < tiling.usedCoreNum && load[core] + columns[i].tasks > capacity) {
+                    ++core;
+                }
+                if (core == tiling.usedCoreNum) {
+                    break;
+                }
+                load[core] += columns[i].tasks;
+                packed[i] = static_cast<uint8_t>(core);
+            }
+            if (i == count) {
+                std::copy_n(packed, count, owners);
+                break;
+            }
+        }
+    }
+    if (!causal && mixed && groups > 1 && !split) {
+        uint32_t peakLoads[LEGACY_VARLEN_CORES] = {};
+        for (size_t i = 0; i < count; ++i) {
+            peakLoads[owners[i]] += columns[i].tasks;
+        }
+        const auto currentPeak = *std::max_element(peakLoads, peakLoads + tiling.usedCoreNum);
+        if (currentPeak > CeilDivU64(totalTasks, tiling.usedCoreNum)) {
+            TryTightFullColumnPacking(columns, count, tiling.usedCoreNum, totalTasks, owners);
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const Column& column = columns[i];
+        tiling.legacyVarlenColumns[owners[i]][column.head] |= 1U << column.index;
+    }
+    tiling.legacyVarlenSchedule = segments;
+}
+
+void PlanColumnTasks(const FAGInfo& info, FAGTilingData& tiling)
+{
+    const bool causal = info.maskType == MaskType::CAUSAL;
+    if (info.layout != Layout::TND || (!causal && info.maskType != MaskType::NO_MASK) ||
+        info.deterministic || info.softcapValue != 0 || info.hasUsedLengths ||
+        info.actualSeqQ == nullptr || info.actualSeqKv == nullptr ||
+        info.qkHeadDim != 128 || info.vHeadDim != 128 ||
+        tiling.qTile != 128 || tiling.kvTile != 128 || tiling.usedCoreNum == 0 ||
+        tiling.usedCoreNum > LEGACY_VARLEN_CORES || info.kvHeadNum > 8U) {
+        return;
+    }
+    const bool encoder = !causal && tiling.groupSize == 1 && info.batch >= 64 && info.batch <= 512 &&
+        info.qSeqlen > 128 && info.qSeqlen <= 384 && tiling.legacyVarlenSchedule == 0;
+    const bool split = causal && tiling.legacyVarlenSchedule == 2U;
+    const uint32_t logicalHeads = static_cast<uint32_t>(info.kvHeadNum) * (split ? 2U : 1U);
+    const bool gqa = tiling.groupSize > 1 && info.batch <= 32 && logicalHeads <= 8 &&
+        (tiling.legacyVarlenSchedule == 1U || split);
+    if (!encoder && !gqa) {
+        return;
+    }
+    uint64_t packed = 0;
+    for (uint64_t b = 0; b < info.batch; ++b) {
+        const int64_t length = info.actualSeqQ[b];
+        if (length <= 0 || length != info.actualSeqKv[b]) {
+            return;
+        }
+        const uint64_t cols = CeilDivU64(static_cast<uint64_t>(length), 128);
+        if (encoder && (cols > 8 || cols * info.kvHeadNum > tiling.usedCoreNum)) {
+            return;
+        }
+        packed += static_cast<uint64_t>(length);
+    }
+    if (packed != info.totalQ || packed != info.totalKv) {
+        return;
+    }
+    uint32_t scheduledWork[LEGACY_VARLEN_CORES] = {};
+    for (uint32_t b = 0; b < info.batch; ++b) {
+        const auto cols = static_cast<uint32_t>(CeilDivU64(info.actualSeqQ[b], 128));
+        for (uint32_t head = 0; head < logicalHeads; ++head) {
+            uint32_t headOwner = 0;
+            if (encoder) {
+                headOwner = static_cast<uint32_t>(std::min_element(scheduledWork,
+                    scheduledWork + tiling.usedCoreNum) - scheduledWork);
+                scheduledWork[headOwner] += cols * cols;
+            }
+            for (uint32_t col = 0; col < cols; ++col) {
+                uint32_t core = headOwner;
+                if (gqa) {
+                    core = 0;
+                    const uint32_t headId = b * logicalHeads + head;
+                    while (core < tiling.usedCoreNum &&
+                           (tiling.legacyVarlenColumns[core][headId] & (1U << col)) == 0) {
+                        ++core;
+                    }
+                    if (core == tiling.usedCoreNum) {
+                        return;
+                    }
+                }
+                const uint16_t count = tiling.columnPlanCount[core];
+                if (count == FAGTilingData::MAX_PLANNED_COLUMNS) {
+                    return;
+                }
+                const uint32_t entry = encoder ? ((b << 6) | (head << 3) | col)
+                                               : ((b << 8) | (head << 5) | col);
+                tiling.columnPlan[core][count] = static_cast<uint16_t>(entry);
+                tiling.columnPlanCount[core] = count + 1;
+            }
+        }
+    }
+    tiling.columnPlanKind = encoder ? 3U : (causal ? 4U : 2U);
+}
+
 // BN2S2 UB budget: the main pipeline owns two ping/pong halves and the dk/dv
 // cast owns a chunked tail region (mirrors the kernel Init formula).
 int64_t CheckBn2s2CastUb(FAGTilingData& tiling, const FAGInfo& info)
@@ -46,9 +343,9 @@ int64_t CheckBn2s2CastUb(FAGTilingData& tiling, const FAGInfo& info)
 
 // The legacy AIV pipeline keeps a 128-element physical UB row stride even
 // when the L1 task width is 64. This preserves the existing VF kernels.
-int64_t CheckLegacyUb(const FAGTilingData& tiling, bool singleVec = false)
+int64_t CheckLegacyUb(const FAGTilingData& tiling, bool singleVec = false, uint32_t extraBytes = 0, bool packedScalars = false)
 {
-    const uint32_t pipelineUb = FagUbLayout::PipelineBytes(tiling.qTile, singleVec);
+    const uint32_t pipelineUb = FagUbLayout::PipelineBytes(tiling.qTile, singleVec, packedScalars) + extraBytes;
     const uint32_t deltaUb = 2 * FagUbLayout::DeltaSlotBytes(tiling.vHeadDim);
     if (pipelineUb > tiling.ubSize || deltaUb > tiling.ubSize) {
         fprintf(stderr, "FAG950 bwd: UB too small: pipeline %llu, delta %llu, capacity %llu\n",
@@ -60,7 +357,7 @@ int64_t CheckLegacyUb(const FAGTilingData& tiling, bool singleVec = false)
 
 } // namespace
 
-int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
+int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling, bool canWriteDkvDirect)
 {
     if (info.batch == 0 || info.qSeqlen == 0 || info.kvSeqlen == 0 || info.totalQ == 0 || info.totalKv == 0 ||
         info.qHeadNum == 0 || info.kvHeadNum == 0 || info.qHeadNum % info.kvHeadNum != 0 || info.qkHeadDim == 0 ||
@@ -109,6 +406,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     // Default kvTile=128. shortQ keeps 128 (larger kvTile was tried and dropped).
     // VF epilogues use a 128-col chunk loop with row pitch = kvTile.
     // qTile shrinks for short S1. D>256 uses the 128x256 partial schedule.
+    // (A/B: mid-seq qTile=64 deepened lag but slowed S>=1024 ~15–50%.)
     const uint64_t maxHeadDim = std::max(info.qkHeadDim, info.vHeadDim);
     const uint64_t alignedQk = RoundUpU64(info.qkHeadDim, 16);
     const uint64_t alignedV = RoundUpU64(info.vHeadDim, 16);
@@ -176,11 +474,13 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
         } else if (maxS1 <= 64) {
             tiling.qTile = 64;
         }
+        // Uniform shortcuts use packed region lengths directly. Used-length
+        // caps require the per-batch decoder even when those regions are equal.
         // Short bidirectional: one S1/S2 tile per (b,n2,g). Isolate the
         // scalar-oriented schedule so longer S1/S2 shapes stay on legacy.
         if (maxS1 > 0 && maxS1 <= 16 && maxS2 > 0 && maxS2 <= 16) {
             tiling.shortBiDir = 1;
-            if (uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
+            if (!info.hasUsedLengths && uniformS1 && uniformS2 && info.batch > 0 && maxS1 > 0 && maxS2 > 0 &&
                 info.totalQ == info.batch * maxS1 && info.totalKv == info.batch * maxS2) {
                 tiling.shortBiDirUniform = 1;
             }
@@ -190,7 +490,7 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
             // maps gid → (b,n2) as gid/kvHeadNum (kvHeadNum is global).
             // kvTile stays 128 (256 N-split wiped the win).
             tiling.shortQ = 1;
-            if (uniformS1 && info.totalQ == info.batch * maxS1) {
+            if (!info.hasUsedLengths && uniformS1 && info.totalQ == info.batch * maxS1) {
                 tiling.shortQUniformS1 = 1;
             }
         }
@@ -212,12 +512,21 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     if (CheckLegacyUb(tiling, singleVec) != 0) {
         return -1;
     }
-    if (info.qkHeadDim == 192 && info.vHeadDim == 128 && !info.deterministic) {
-        // Match CANN dense interleaving granularity for MLA backward.
-        tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
+    if (!info.deterministic && !singleVec) {
+        // Match CANN dense interleaving granularity (fusion arch35 mid-seq).
+        // shortQ/shortBiDir keep DEFAULT_CONTINUOUS_BLOCK_NUM; MLA D192/Dv128
+        // and plain D<=128 both benefit from coarser core-strided waves.
+        if ((info.qkHeadDim == 192 && info.vHeadDim == 128) ||
+            (info.qkHeadDim <= 128 && info.vHeadDim <= 128)) {
+            tiling.continuousBlockNum = info.qSeqlen < 16384 ? 6 : (info.qSeqlen / 16384) * 8;
+        }
     }
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
+    if (!info.deterministic && !singleVec) {
+        PlanLegacyVarlenColumns(info, tiling);
+        PlanColumnTasks(info, tiling);
+    }
 
     // Deterministic knobs are only meaningful when the deterministic path is
     // enabled; keep them zeroed otherwise so the legacy layout is untouched.
@@ -226,23 +535,116 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
     tiling.dkVecNum = info.deterministic ? info.dkVecNum : 0;
     tiling.dvVecNum = info.deterministic ? info.dvVecNum : 0;
     tiling.earlyDkvCast = 0;
+    tiling.skipDkvClear = 0;
     tiling.detCastChunkRows = 0;
 
     const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
     const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
 
     if (!info.deterministic) {
-        // Legacy layout. earlyDkvCast: Fixpipe writes bf16/fp16 dk/dv in-loop
-        // and drops the fp32 dk/dv workspaces (FagPost skips those casts).
-        // Enabled only for short-S TND (shortQ/shortBiDir) with D<=128; BSND
-        // and other TND keep the fp32 workspace + FagPost cast.
-        const bool earlyDkv = info.layout == Layout::TND && info.qkHeadDim <= 128 && info.vHeadDim <= 128 &&
-                              (tiling.shortQ != 0 || tiling.shortBiDir != 0);
+        // Short-Q schedules avoid a separate dK/dV post pass. On the
+        // regular schedule, small dK/dV outputs do not amortize the strided
+        // Fixpipe cast/write (A/B: ungated canWriteDkvDirect slowed mid-seq
+        // ~5%). Use four full KV tiles per AIC as the crossover for the total
+        // packed output, counting KV heads (not query heads).
+        constexpr uint64_t MIN_KV_TILES_PER_CORE = 4;
+        const uint64_t kvRows = tiling.totalKv * tiling.kvHeadNum;
+        // Gate on full AIC count (A/B: ungating earlyDkv slowed mid-seq ~5%).
+        const bool largeDkv = kvRows >= MIN_KV_TILES_PER_CORE * info.aicNum * tiling.kvTile;
+        const bool directDkvEligible = canWriteDkvDirect && (singleVec || largeDkv) &&
+                                       tiling.legacyVarlenSchedule != 2U;
+        const bool earlyDkv = directDkvEligible && info.fixpipeDkScaleExact;
         tiling.earlyDkvCast = earlyDkv ? 1 : 0;
+        // dV has no scale. Keep its direct store when dK needs FP32 post scaling.
+        tiling.wideDvDirect = directDkvEligible && !earlyDkv;
+        // D<=128 Fixpipe overwrites each visited column (enAtomicDk/Dv=false).
+        // When every column is covered, skip the fp32 dk/dv Pre clear.
+        tiling.skipDkvClear =
+            (!earlyDkv && canWriteDkvDirect && info.qkHeadDim <= 128 && info.vHeadDim <= 128 &&
+             tiling.legacyVarlenSchedule != 2U) ? 1 : 0;
+
+        // A full or square causal TND schedule visits every KV column.
+        // For sliced 256D dK/dV the first contribution overwrites both slices.
+        bool uniform512 = true;
+        if (info.layout == Layout::TND && info.qkHeadDim == 256 && info.vHeadDim == 256 &&
+            info.qSeqlen >= 512 &&
+            !info.hasUsedLengths && info.actualSeqQ != nullptr && info.actualSeqKv != nullptr &&
+            (info.maskType == MaskType::NO_MASK || info.maskType == MaskType::CAUSAL)) {
+            bool covered = true;
+            uint64_t coveredTokens = 0;
+            for (uint64_t b = 0; b < info.batch; ++b) {
+                const int64_t qLength = info.actualSeqQ[b];
+                if (qLength <= 0 || qLength != info.actualSeqKv[b]) {
+                    covered = false;
+                    break;
+                }
+                coveredTokens += static_cast<uint64_t>(qLength);
+                uniform512 &= qLength == 512;
+            }
+            tiling.skipDkvClear = covered && coveredTokens == info.totalQ && coveredTokens == info.totalKv ? 1U : 0U;
+        }
+
+        // At least one complete balanced wave. A head owns all its dQ contributions.
+        const uint64_t heads = info.batch * info.qHeadNum;
+        tiling.wideHeadOwn = uniform512 && tiling.skipDkvClear && !earlyDkv && info.qkHeadDim == 256 &&
+            info.vHeadDim == 256 && tiling.groupSize == 1 && info.softcapValue == 0 &&
+            info.qSeqlen == 512 && info.kvSeqlen == 512 && info.totalQ == info.batch * 512 &&
+            info.totalKv == info.batch * 512 && tiling.legacyVarlenSchedule == 0 &&
+            heads >= info.aicNum && heads % info.aicNum == 0;
+
+        if (tiling.wideHeadOwn == 0 && tiling.skipDkvClear && !earlyDkv &&
+            info.layout == Layout::TND && info.qkHeadDim == 256 && info.vHeadDim == 256 &&
+            info.maskType == MaskType::NO_MASK && info.softcapValue == 0 && tiling.groupSize == 1 &&
+            info.qSeqlen == 1024 && info.kvSeqlen == 1024 &&
+            heads >= info.aicNum && heads % info.aicNum == 0 &&
+            tiling.legacyVarlenSchedule == 0 &&
+            std::all_of(info.actualSeqQ, info.actualSeqQ + info.batch,
+                [&](int64_t length) { return static_cast<uint64_t>(length) == info.qSeqlen; })) {
+            tiling.wideHeadOwn = 1;
+        }
+
+        // Each KV column is assigned to a single core and visited in order.
+        // The existing clear-elision proof gives full coverage and equal Q/KV lengths.
+        tiling.wideDvResident = tiling.skipDkvClear && info.layout == Layout::TND &&
+            info.qkHeadDim == 256 && info.vHeadDim == 256 && info.softcapValue == 0 &&
+            tiling.groupSize == 1 && info.qSeqlen >= 512 && tiling.legacyVarlenSchedule == 0;
+
+        const bool canKeepD192Dv = info.layout == Layout::TND && info.qkHeadDim == 192 &&
+            info.vHeadDim == 192 && info.softcapValue == 0 && !info.hasUsedLengths &&
+            (info.maskType == MaskType::NO_MASK || info.maskType == MaskType::CAUSAL) &&
+            info.qSeqlen == 256 && info.kvSeqlen == 256 && info.totalQ == info.batch * 256 &&
+            info.totalKv == info.batch * 256 && info.actualSeqQ != nullptr && info.actualSeqKv != nullptr &&
+            tiling.legacyVarlenSchedule == 0;
+        if (canKeepD192Dv) {
+            bool exact = true;
+            for (uint64_t b = 0; b < info.batch; ++b) {
+                exact &= info.actualSeqQ[b] == 256 && info.actualSeqKv[b] == 256;
+            }
+            tiling.wideDvResident = exact;
+        }
+        if (info.qkHeadDim == 192 && info.vHeadDim == 192 && tiling.legacyVarlenSchedule == 2U) {
+            // Each segment accumulates in L0C and atomically contributes once at flush.
+            tiling.wideDvResident = 1;
+        }
+
+        // Reserve one 64-row FP32 slab and a 16-row conversion buffer per AIV.
+        constexpr uint32_t dkUbBytes = 64U * 128U * sizeof(float) + 16U * 128U * sizeof(uint16_t);
+        const bool uniformSmallMha = tiling.wideDvDirect != 0 && tiling.columnPlanKind == 0 &&
+            tiling.legacyVarlenSchedule == 0 && tiling.groupSize == 1 && !singleVec &&
+            info.qkHeadDim == 128 && info.vHeadDim == 128 && tiling.qTile == 128 && tiling.kvTile == 128 &&
+            (info.qSeqlen >= 256 && info.qSeqlen <= 1024) && info.qSeqlen == info.kvSeqlen &&
+            info.totalQ == info.batch * info.qSeqlen && info.totalKv == info.totalQ &&
+            info.actualSeqQ != nullptr && info.actualSeqKv != nullptr &&
+            CheckLegacyUb(tiling, false, dkUbBytes, true) == 0;
+        tiling.dkCastInUb = uniformSmallMha &&
+            std::all_of(info.actualSeqQ, info.actualSeqQ + info.batch,
+                        [&](int64_t length) { return static_cast<uint64_t>(length) == info.qSeqlen; }) &&
+            std::all_of(info.actualSeqKv, info.actualSeqKv + info.batch,
+                        [&](int64_t length) { return static_cast<uint64_t>(length) == info.kvSeqlen; });
 
         uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dkWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
-        uint64_t dvWsSize = earlyDkv ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
+        uint64_t dkWsSize = (earlyDkv || tiling.dkCastInUb != 0) ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dvWsSize = (earlyDkv || tiling.wideDvDirect != 0) ? 0ULL : tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
         uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
 
         tiling.dqOffset = 0;
