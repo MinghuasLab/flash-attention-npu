@@ -102,6 +102,11 @@ def test_optional_scales_signature_and_forwarding(monkeypatch, entry):
     monkeypatch.setattr(native, "apply", Mock(side_effect=AssertionError("native backend")))
     arguments = {name: object() for name in parameters}
     arguments["config"] = None
+    # gather_bwd_* are not supported on NPU in the fixed-length interface; pass defaults.
+    if "gather_bwd_recompute_p" in arguments:
+        arguments["gather_bwd_recompute_p"] = False
+    if "gather_bwd_token_chunk" in arguments:
+        arguments["gather_bwd_token_chunk"] = None
     arguments.update({name: torch.empty(0, dtype=torch.float8_e4m3fn) for name in ("q", "k", "v")})
     scale = torch.empty(0, dtype=torch.uint8)
     scales = fa4.BlockScales(q=scale, k=scale, v=scale)
@@ -111,7 +116,11 @@ def test_optional_scales_signature_and_forwarding(monkeypatch, entry):
     assert entry(*qkv, **arguments, scales=scales) is backend.return_value
     for call in backend.call_args_list:
         assert call.args == qkv
-        forwarded = {name: value for name, value in arguments.items() if name != "config"}
+        forwarded = {
+            name: value
+            for name, value in arguments.items()
+            if name not in ("config", "gather_bwd_recompute_p", "gather_bwd_token_chunk")
+        }
         assert call.kwargs == dict(forwarded, scales=scales, varlen=entry is flash_attn_varlen_func)
 
 
