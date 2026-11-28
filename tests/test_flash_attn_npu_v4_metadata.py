@@ -65,6 +65,11 @@ def _assert_950_flashdecode_metadata(tiling):
     assert tiling_words[597].item() > tiling_words[596].item() > 0
 
 
+def _expected_dense_metadata_calls():
+    """The Ascend910 dense path precomputes metadata; Ascend950 host-tiles it."""
+    return 0 if "Ascend950" in _device_name else 1
+
+
 @pytest.mark.golden_api("flash_attn_func")
 @pytest.mark.skipif("Ascend950" not in _device_name, reason="Ascend950-only D512 dense FlashDecode")
 @pytest.mark.parametrize(
@@ -87,8 +92,9 @@ def test_950_d512_dense_auto_flashdecode(dtype, q_shape, kv_shape):
         softmax_scale=scale,
         return_lse=True,
     )
-    # The fixed-length interface builds this metadata on the host, matching
-    # Ascend910, so replay the same call to check the FlashDecode tiling.
+    # The fixed-length interface leaves tiling to the C++ host tiler. This
+    # shape is still an auto-FlashDecode candidate, so the standalone metadata
+    # API must select the FlashDecode plan for the same inputs.
     metadata = get_scheduler_metadata(
         max_seqlen_q=q_shape[1],
         max_seqlen_k=kv_shape[1],
@@ -882,7 +888,8 @@ def metadata_spy(monkeypatch):
     if "Ascend950" in _device_name:
         from flash_attn_npu_4 import flash_attn_npu_interface_950 as interface
 
-        # The fixed-length path builds metadata on the host, like Ascend910.
+        # Ascend910 builds dense-path metadata on the host; Ascend950 leaves
+        # the fixed-length path to the C++ host tiler.
         original_get = interface.get_scheduler_metadata
 
         def _get_spy(*args, **kwargs):
@@ -951,7 +958,7 @@ def test_flash_attn_func_metadata_bsnd(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _expected_dense_metadata_calls()
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1348,7 +1355,7 @@ def test_flash_attn_func_metadata_swa(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _expected_dense_metadata_calls()
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -1408,7 +1415,7 @@ def test_flash_attn_func_metadata_softcap_scale(
         num_splits=1,
         return_lse=True,
     )
-    assert len(metadata_spy) == 1
+    assert len(metadata_spy) == _expected_dense_metadata_calls()
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()

@@ -130,7 +130,6 @@ def test_native_float_backward_argument_count_is_unchanged(monkeypatch, entry):
     k = torch.zeros((2, 9, 2, 128), dtype=q.dtype, requires_grad=True)
     v = k.detach().clone().requires_grad_()
     out = torch.zeros_like(q)
-    monkeypatch.setattr(legacy, "get_scheduler_metadata", Mock(return_value=None))
     monkeypatch.setattr(
         legacy,
         "_flash_attn_forward",
@@ -144,6 +143,25 @@ def test_native_float_backward_argument_count_is_unchanged(monkeypatch, entry):
     entry(q, k, v).sum().backward()
     for t in (q, k, v):
         torch.testing.assert_close(t.grad, torch.ones_like(t))
+
+
+def test_fixed_length_forward_skips_scheduler_metadata(monkeypatch):
+    """The fixed-length path leaves tiling to the C++ host tiler, not metadata."""
+    q = torch.zeros((2, 7, 4, 128), dtype=torch.float16)
+    k = torch.zeros((2, 9, 2, 128), dtype=q.dtype)
+    out = torch.zeros_like(q)
+    forward = Mock(return_value=(out, torch.zeros((2, 4, 7)), torch.empty(0), torch.empty(0)))
+    metadata = Mock(side_effect=AssertionError("metadata must stay opt-in"))
+    monkeypatch.setattr(legacy, "_flash_attn_forward", forward)
+    monkeypatch.setattr(legacy, "get_scheduler_metadata", metadata)
+    flash_attn_func(q, k, k)
+    metadata.assert_not_called()
+    forwarded = inspect.signature(legacy._flash_attn_forward_fake).bind(
+        *forward.call_args.args, **forward.call_args.kwargs
+    )
+    forwarded.apply_defaults()
+    assert forwarded.arguments["scheduler_metadata"] is None
+    assert forwarded.arguments["build_scheduler_metadata"] is False
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
@@ -160,7 +178,6 @@ def test_tensorwise_descales_reach_native_forward(monkeypatch, entry, missing):
     lse = torch.zeros((2, 4, 7))
     backend = Mock(return_value=(out, lse, torch.empty(0), torch.empty(0)))
     monkeypatch.setattr(legacy, "_flash_attn_forward", backend)
-    monkeypatch.setattr(legacy, "get_scheduler_metadata", Mock(return_value=None))
     monkeypatch.setattr(dsl_utils, "attention", Mock(side_effect=AssertionError("Flex")))
     result = entry(q, k, k, scales=fa4.TensorwiseScales(*values), return_lse=True)
     assert result[0] is out

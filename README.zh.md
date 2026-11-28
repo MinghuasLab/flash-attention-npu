@@ -746,8 +746,9 @@ def flash_attn_func(
     支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
     注意 Q 的头数必须能被 K、V 的头数整除。
 
-    调度元数据（tiling + attention mask）在 AICPU 上计算，不会引入 device->host->device
-    同步打断训练流水线。
+    Ascend910 上调度元数据（tiling + attention mask）在 AICPU 上计算，不会引入
+    device->host->device 同步打断训练流水线；Ascend950 则由 C++ Host 端 Tiler 完成调度，
+    默认的定长路径不再额外发起一次 metadata 计算。
 
     如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
     例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：

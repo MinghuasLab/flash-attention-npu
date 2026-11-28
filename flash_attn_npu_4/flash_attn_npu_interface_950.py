@@ -671,13 +671,12 @@ class FlashAttnFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        # Compute scheduler metadata on the host, matching the Ascend910 dense
-        # path. The shapes below come from the pre-detection BSND operands;
-        # BNSD only re-views the same storage.
-        batch_size, seqlen_q, num_heads, head_size = q.shape
+        # The fixed-length interface leaves scheduler metadata unset so the C++
+        # host tiler selects the schedule. Building metadata on every forward
+        # (as the Ascend910 dense path does) costs an extra AI CPU launch, so
+        # metadata stays opt-in through the varlen interface.
+        batch_size = q.shape[0]
         seqlen_k = k.shape[1]
-        num_heads_k = k.shape[2]
-        head_size_v = v.shape[-1]
 
         layout, q, k, v, out_transposed = _detect_layout(q, k, v, None, None)
 
@@ -686,21 +685,6 @@ class FlashAttnFunc(torch.autograd.Function):
             seqlen_k,
             dtype=torch.int32,
             device=q.device,
-        )
-        scheduler_metadata = get_scheduler_metadata(
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            nheads=num_heads,
-            nheads_kv=num_heads_k,
-            headdim=head_size,
-            num_splits=num_splits,
-            headdim_v=head_size_v,
-            pack_gqa=pack_gqa,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            seqused_k=seqused_k,
-            qkv_dtype=q.dtype,
         )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
@@ -727,7 +711,7 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits,
             pack_gqa,
             True,
-            scheduler_metadata,
+            None,  # scheduler_metadata: host tiling instead of a metadata launch
             layout,
             q_descale,
             k_descale,

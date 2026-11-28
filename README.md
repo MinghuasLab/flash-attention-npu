@@ -763,8 +763,9 @@ def flash_attn_func(
     Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
     heads than Q. The number of heads in Q must be divisible by the number of heads in K, V.
 
-    The scheduler metadata (tiling + attention mask) is computed on the AICPU so no
-    device->host->device sync breaks the training pipeline.
+    Ascend910 computes the scheduler metadata (tiling + attention mask) on the AICPU so no
+    device->host->device sync breaks the training pipeline. Ascend950 leaves scheduling to the
+    C++ host tiler, so the default fixed-length path does not launch a metadata kernel.
 
     If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
     For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
