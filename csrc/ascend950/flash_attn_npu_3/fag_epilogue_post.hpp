@@ -60,10 +60,14 @@ class FagPost {
         // Softcap scales dk/dq via postScale (mainline).
         const bool dkvAlreadyCast = tiling_->detPrivDkv != 0 || tiling_->earlyDkvCast != 0;
         if (!dkvAlreadyCast) {
-            ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F, vectorCoreId, vectorCoreNum, pingPongIdx,
-                                 mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
-            ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, postScale, vectorCoreId, vectorCoreNum, pingPongIdx,
-                                mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            if (tiling_->wideDvDirect == 0) {
+                ProcessRegion<false>(dvGm_, dvWorkspace_, dvCount, 1.0F, vectorCoreId, vectorCoreNum, pingPongIdx,
+                                     mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            }
+            if (tiling_->dkCastInUb == 0) {
+                ProcessRegion<true>(dkGm_, dkWorkspace_, dkCount, postScale, vectorCoreId, vectorCoreNum, pingPongIdx,
+                                    mte3ToMte2Ping, mte3ToMte2Pong, mte2ToVPing, mte2ToVPong, vToMte3Ping, vToMte3Pong);
+            }
         }
         // dqPostAbsorb=1 (deterministic): VecDTM has already written dqGm_
         // directly and dqWorkspace_ is only a single rolling tile — FagPost

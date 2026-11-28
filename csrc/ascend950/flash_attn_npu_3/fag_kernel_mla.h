@@ -543,9 +543,10 @@ class FlashAttentionScoreGradMla950 {
                     const bool causalPair =
                         tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL) &&
                         FAGTiling950::UseCausalColumnPair(coreNum_, batchNum_, kvHeadNum_, s2Num);
-                    const uint32_t owner = causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batch, n2,
-                                                                                        s2, s2Num, causalPairStride_)
-                                                      : static_cast<uint32_t>(kvGroupId % coreNum_);
+                    const uint32_t owner =
+                        causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batch, n2, s2, s2Num,
+                                                                      causalPairStride_)
+                                   : static_cast<uint32_t>(kvGroupId % coreNum_);
                     if (owner != coreIdx) {
                         continue;
                     }
@@ -653,7 +654,7 @@ class FlashAttentionScoreGradMla950 {
                         FAGTiling950::UseCausalColumnPair(coreNum_, batchNum_, kvHeadNum_, s2BlockNum);
                     const uint32_t owner =
                         causalPair ? FAGTiling950::CausalColumnOwner(coreNum_, kvHeadNum_, batchIdx, n2Idx, s2BlockIdx,
-                                                                     s2BlockNum, causalPairStride_)
+                                                                      s2BlockNum, causalPairStride_)
                                    : static_cast<uint32_t>(kvGroupId % coreNum_);
                     if (owner == coreIdx) {
                         GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);

@@ -139,6 +139,19 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
     }
 
     CATLASS_DEVICE
+    uint32_t L0ABStage() const
+    {
+        return l0AListId;
+    }
+
+    CATLASS_DEVICE
+    void SetL0ABStage(uint32_t stage)
+    {
+        l0AListId = stage;
+        l0BListId = stage;
+    }
+
+    CATLASS_DEVICE
     uint32_t QSlotOf(uint32_t taskPing) const
     {
         return depth2_ ? Ascend950FagL1Layout::QSlotDepth2(taskPing) : Ascend950FagL1Layout::QSlot(taskPing);
@@ -232,8 +245,8 @@ struct BlockMmadTla<MmadAscend950FagSdP<L1A_STAGES_, L1B_STAGES_, ENABLE_UNIT_FL
         if (loadV) {
             CopyGmToL1BT(l1VT, tensorB, dActual, skvActual, dRound, skvRound, L1_EVENT_VT);
         }
-        GemmABt(l1Dy[dyBuf], l1VT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual, slotC,
-                dyEvent, L1_EVENT_VT,
+        GemmABt(l1Dy[dyBuf], l1VT, l0CTensorList[slotC], sqRound, skvRound, dRound, sqActual, skvActual, dActual,
+                slotC, dyEvent, L1_EVENT_VT,
                 /*waitB=*/waitV, /*releaseB=*/false, /*releaseA=*/false);
         FixpipeUb(tensorC, l0CTensorList[slotC], sqActual, skvActual, sqRound, slotC);
         l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;

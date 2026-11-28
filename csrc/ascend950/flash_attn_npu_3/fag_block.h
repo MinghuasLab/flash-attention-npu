@@ -42,7 +42,7 @@ struct EpilogueAscend950FAGSubMul {
     static constexpr bool IS_SOFTCAP = IS_SOFTCAP_;
 };
 
-} // namespace Catlass::Epilogue
+}  // namespace Catlass::Epilogue
 
 namespace Catlass::Gemm {
 struct Ascend950FagL0CLayout {
@@ -87,42 +87,37 @@ struct Ascend950FagL1Layout {
     static constexpr uint32_t TILE_BYTES = BASE * BASE * 2;
 
     CATLASS_DEVICE
-    static constexpr uint32_t QSlot(uint32_t taskPing)
-    {
+    static constexpr uint32_t QSlot(uint32_t taskPing) {
         return taskPing ? SLOT_Q1 : SLOT_Q0;
     }
 
     CATLASS_DEVICE
-    static constexpr uint32_t DySlot(uint32_t taskPing)
-    {
+    static constexpr uint32_t DySlot(uint32_t taskPing) {
         return taskPing ? SLOT_DY1 : SLOT_DY0;
     }
 
     // Depth-2: cycle Q/DY across 3 slots. taskPing is taskId % QDY_DEPTH.
     CATLASS_DEVICE
-    static constexpr uint32_t QSlotDepth2(uint32_t taskPing)
-    {
+    static constexpr uint32_t QSlotDepth2(uint32_t taskPing) {
         return taskPing == 0 ? SLOT_Q0 : (taskPing == 1 ? SLOT_Q1 : SLOT_Q2);
     }
 
     CATLASS_DEVICE
-    static constexpr uint32_t DySlotDepth2(uint32_t taskPing)
-    {
+    static constexpr uint32_t DySlotDepth2(uint32_t taskPing) {
         return taskPing == 0 ? SLOT_DY0 : (taskPing == 1 ? SLOT_DY1 : SLOT_DY2);
     }
 
     CATLASS_DEVICE
-    static constexpr bool IsMutexSlot(uint32_t slot)
-    {
+    static constexpr bool IsMutexSlot(uint32_t slot) {
         return slot == SLOT_Q2 || slot == SLOT_DY2;
     }
 
     CATLASS_DEVICE
-    static constexpr uint32_t MutexOf(uint32_t slot)
-    {
+    static constexpr uint32_t MutexOf(uint32_t slot) {
         return slot == SLOT_Q2 ? MUTEX_Q2 : MUTEX_DY2;
     }
 };
+
 
 // Ascend950 / Arch3501 FAG dQKV
 // Computes dq=dS*K, dk=dS^T*Q, dv=P^T*dY in one block.
@@ -180,7 +175,7 @@ struct MmadAscend950FagdQKVPartial {
     static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
 };
 
-} // namespace Catlass::Gemm
+}
 // namespace Catlass::Gemm
 
-#endif // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H
+#endif  // FLASH_ATTN_NPU_ASCEND950_V3_FAG_BLOCK_H

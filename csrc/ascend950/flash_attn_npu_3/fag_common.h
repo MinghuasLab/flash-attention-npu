@@ -58,6 +58,7 @@ enum class DetSchedule : uint32_t {
 };
 
 struct FAGInfo {
+    bool fixpipeDkScaleExact = true;
     Layout layout = Layout::BSND;
     MaskType maskType = MaskType::NO_MASK;
     uint32_t deterministic = 0;
@@ -92,7 +93,14 @@ struct FAGInfo {
     bool hasUsedLengths = false;
 };
 
+constexpr uint32_t LEGACY_VARLEN_CORES = 32;
+constexpr uint32_t LEGACY_VARLEN_HEADS = 32;
+constexpr uint32_t LEGACY_VARLEN_COLUMNS = 32;
+
 struct FAGTilingData {
+    // Column ownership by [core, packed batch/KV head]. Each set bit is a KV column.
+    uint32_t legacyVarlenSchedule = 0;
+    uint32_t legacyVarlenColumns[LEGACY_VARLEN_CORES][LEGACY_VARLEN_HEADS] = {};
     FagInputStrides inputStrides{};
     uint32_t layout = 0;
     uint32_t maskType = 0;
@@ -112,6 +120,10 @@ struct FAGTilingData {
     // 1: every KV column is visited and first Fixpipe overwrites (D<=128
     // non-atomic dk/dv). FagPre may skip clearing the fp32 dk/dv workspaces.
     uint32_t skipDkvClear = 0;
+    uint32_t wideHeadOwn = 0;
+    uint32_t wideDvDirect = 0;
+    uint32_t dkCastInUb = 0;
+    uint32_t wideDvResident = 0;
     // Non-deterministic short bidirectional (maxS1<=16 && maxS2<=16): isolated
     // schedule that replaces the B×N2 full scan with core-strided task indexing.
     // Must stay 0 for longer S1/S2 so those shapes keep the legacy pipeline.
@@ -119,6 +131,7 @@ struct FAGTilingData {
     // 1 when every batch shares the same S1/S2. Enables arithmetic batch
     // offsets without cu_seqlens GetValue in the hot loop.
     uint32_t shortBiDirUniform = 0;
+    uint32_t tinyVector = 0;
     // Non-deterministic short-Q long-KV (maxS1<=16 && maxS2>16): core-strided
     // schedule over (b,n2) with S2 inner. Mutually exclusive with shortBiDir.
     // Indexing is arithmetic (gid → b,n2 via kvHeadNum); no per-batch prefix table.
@@ -171,6 +184,10 @@ struct FAGTilingData {
     uint64_t dkDetOffset = 0;
     uint64_t dvDetOffset = 0;
     uint64_t workspaceSize = 0;
+    static constexpr uint32_t MAX_PLANNED_COLUMNS = 512;
+    uint32_t columnPlanKind = 0;
+    uint16_t columnPlanCount[LEGACY_VARLEN_CORES] = {};
+    uint16_t columnPlan[LEGACY_VARLEN_CORES][MAX_PLANNED_COLUMNS] = {};
 };
 
 static_assert(std::is_standard_layout_v<FAGTilingData>, "FAGTilingData must have a stable host/device layout");
@@ -290,10 +307,12 @@ inline uint32_t CausalColumnOwner(uint32_t coreNum, uint32_t kvHeadNum, uint32_t
 // Pairing collapses two columns onto one core. Skip it when that would idle
 // cores: short sequences (fewer than 8 KV tiles) and shapes whose pair count
 // cannot fill the AIC grid stay on the linear kvGroupId map.
+// For square TND tiles, smaller columns can also be paired when they fill the grid.
 CATLASS_DEVICE
-inline bool UseCausalColumnPair(uint32_t coreNum, uint32_t batchNum, uint32_t kvHeadNum, uint32_t s2BlockNum)
+inline bool UseCausalColumnPair(uint32_t coreNum, uint32_t batchNum, uint32_t kvHeadNum, uint32_t s2BlockNum,
+                                bool allowSmallPairs = false)
 {
-    if (coreNum == 0 || s2BlockNum < 8) {
+    if (coreNum == 0 || s2BlockNum < (allowSmallPairs ? 2U : 8U)) {
         return false;
     }
     const uint32_t pairsPerHead = (s2BlockNum + 1) / 2;

@@ -154,6 +154,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     FAGTiling950::FAGInfo fag_info{};
     fag_info.scaleValue =
         static_cast<float>(softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
+    // Fixpipe uses an FP16-precision multiplier for FP16 and BF16 dK stores.
+    fag_info.fixpipeDkScaleExact =
+        fag_info.scaleValue >= static_cast<float>(std::numeric_limits<c10::Half>::min()) &&
+        std::isfinite(fag_info.scaleValue) &&
+        static_cast<float>(c10::Half(fag_info.scaleValue)) == fag_info.scaleValue;
     const bool has_softcap = softcap > 0.0;
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout =
@@ -206,13 +211,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
-    // Snapshot TND lengths together for host validation, tiling, and the
-    // direct-dkv cast gate. lengths_cpu must outlive the varlen block so
-    // cu_k_cpu can remain a view of the KV cumulative row.
-    at::Tensor lengths_cpu;
-    at::Tensor cu_k_cpu;
+    // Snapshot TND lengths together for host validation and deterministic tiling.
     std::vector<int64_t> actual_seq_q;
     std::vector<int64_t> actual_seq_kv;
+    int64_t kv_packed_end = 0;
     if (is_varlen) {
         const at::Tensor& cu_q_tensor = cu_seqlens_q_.value();
         const at::Tensor& cu_k_tensor = cu_seqlens_k_.value();
@@ -225,7 +227,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                     "Ascend950 v4 bwd: cu_seqlens must be on the query NPU device");
         const bool shared_prefix = cu_q_tensor.is_same(cu_k_tensor);
         const int64_t num_lengths = 1 + !shared_prefix + seqused_q_.has_value() + seqused_k_.has_value();
-        lengths_cpu =
+        auto lengths_cpu =
             at::empty({num_lengths, batch_size + 1}, at::device(at::kCPU).dtype(at::kInt).pinned_memory(true));
         int64_t next_row = 0;
         auto copy_lengths = [&](const at::Tensor& input) {
@@ -235,12 +237,10 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         };
         const int32_t* q_lengths = copy_lengths(cu_q_tensor);
         const int32_t* kv_lengths = shared_prefix ? q_lengths : copy_lengths(cu_k_tensor);
-        // Host KV cumulative view for CanWriteDkvDirect: shared Q/K prefixes
-        // reuse row 0; distinct prefixes place KV at row 1.
-        cu_k_cpu = lengths_cpu.select(0, shared_prefix ? 0 : 1).narrow(0, 0, batch_size + 1);
         const int32_t* used_q = seqused_q_.has_value() ? copy_lengths(seqused_q_.value()) : nullptr;
         const int32_t* used_kv = seqused_k_.has_value() ? copy_lengths(seqused_k_.value()) : nullptr;
         current_stream.synchronize();
+        kv_packed_end = kv_lengths[batch_size];
         TORCH_CHECK(q_lengths[0] == 0 && kv_lengths[0] == 0, "Ascend950 v4 bwd: cu_seqlens must start at zero");
         actual_seq_q.resize(batch_size);
         actual_seq_kv.resize(batch_size);
@@ -305,10 +305,9 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                 "schedule for this shape");
 
     FAGTiling950::FAGTilingData fag_tiling_data{};
-    const bool can_write_dkv_direct =
-        is_varlen &&
-        FAGTiling950::CanWriteDkvDirect(fag_info, actual_seq_q, cu_k_cpu, k, v, dk, dv,
-                                        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
+    const bool can_write_dkv_direct = is_varlen && FAGTiling950::CanWriteDkvDirect(
+        fag_info, actual_seq_q, kv_packed_end, k, v, dk, dv,
+        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
     const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data, can_write_dkv_direct);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v4 bwd: arch35 GetFAGTilingParam failed");
     // Entire BAND-masked KV columns never reach the private-column cast.

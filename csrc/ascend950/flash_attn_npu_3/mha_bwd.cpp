@@ -148,6 +148,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     FAGTiling950::FAGInfo fag_info{};
     fag_info.scaleValue =
         static_cast<float>(softmax_scale_.value_or(1.0 / std::sqrt(static_cast<double>(qk_head_dim))));
+    // Fixpipe uses an FP16-precision multiplier for FP16 and BF16 dK stores.
+    fag_info.fixpipeDkScaleExact =
+        fag_info.scaleValue >= static_cast<float>(std::numeric_limits<c10::Half>::min()) &&
+        std::isfinite(fag_info.scaleValue) &&
+        static_cast<float>(c10::Half(fag_info.scaleValue)) == fag_info.scaleValue;
     const bool has_softcap = softcap > 0.0;
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout =
@@ -202,13 +207,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.aicNum = aic_num;
     fag_info.aivNum = aiv_num;
 
-    // Snapshot TND lengths together for host validation, tiling, and the
-    // direct-dkv cast gate. lengths_cpu must outlive the varlen block so
-    // cu_k_cpu can remain a view of the KV cumulative row.
-    at::Tensor lengths_cpu;
-    at::Tensor cu_k_cpu;
+    // Snapshot TND lengths together for host validation and tiling.
     std::vector<int64_t> actual_seq_q;
     std::vector<int64_t> actual_seq_kv;
+    int64_t q_packed_end = 0;
+    int64_t kv_packed_end = 0;
     if (is_varlen) {
         const at::Tensor& cu_q_tensor = cu_seqlens_q_.value();
         const at::Tensor& cu_k_tensor = cu_seqlens_k_.value();
@@ -221,7 +224,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                     "Ascend950 v3 bwd: cu_seqlens must be on the query NPU device");
         const bool shared_prefix = cu_q_tensor.is_same(cu_k_tensor);
         const int64_t num_lengths = 1 + !shared_prefix + seqused_q_.has_value() + seqused_k_.has_value();
-        lengths_cpu =
+        auto lengths_cpu =
             at::empty({num_lengths, batch_size + 1}, at::device(at::kCPU).dtype(at::kInt).pinned_memory(true));
         int64_t next_row = 0;
         auto copy_lengths = [&](const at::Tensor& input) {
@@ -231,12 +234,11 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         };
         const int32_t* q_lengths = copy_lengths(cu_q_tensor);
         const int32_t* kv_lengths = shared_prefix ? q_lengths : copy_lengths(cu_k_tensor);
-        // Host KV cumulative view for CanWriteDkvDirect: shared Q/K prefixes
-        // reuse row 0; distinct prefixes place KV at row 1.
-        cu_k_cpu = lengths_cpu.select(0, shared_prefix ? 0 : 1).narrow(0, 0, batch_size + 1);
         const int32_t* used_q = seqused_q_.has_value() ? copy_lengths(*seqused_q_) : nullptr;
         const int32_t* used_kv = seqused_k_.has_value() ? copy_lengths(*seqused_k_) : nullptr;
         current_stream.synchronize();
+        q_packed_end = q_lengths[batch_size];
+        kv_packed_end = kv_lengths[batch_size];
         TORCH_CHECK(q_lengths[0] == 0 && kv_lengths[0] == 0, "Ascend950 v3 bwd: cu_seqlens must start at zero");
         actual_seq_q.resize(batch_size);
         actual_seq_kv.resize(batch_size);
@@ -327,12 +329,37 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                 "schedule for this shape");
 
     FAGTiling950::FAGTilingData fag_tiling_data{};
-    const bool can_write_dkv_direct =
-        is_varlen &&
-        FAGTiling950::CanWriteDkvDirect(fag_info, actual_seq_q, cu_k_cpu, k, v, dk, dv,
-                                        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
+    const bool can_write_dkv_direct = is_varlen && FAGTiling950::CanWriteDkvDirect(
+        fag_info, actual_seq_q, kv_packed_end, k, v, dk, dv,
+        {&q, &out, &dout, &softmax_lse, &dq, &*cu_seqlens_q_, &*cu_seqlens_k_});
     const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data, can_write_dkv_direct);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v3 bwd: arch35 GetFAGTilingParam failed");
+    fag_tiling_data.wideDvDirect = fag_tiling_data.wideDvDirect != 0 ||
+        (can_write_dkv_direct && fag_tiling_data.columnPlanKind == 2U &&
+         fag_tiling_data.earlyDkvCast == 0 && fag_tiling_data.skipDkvClear != 0 && dv.is_contiguous());
+    if (fag_tiling_data.wideDvResident != 0 && fag_tiling_data.legacyVarlenSchedule != 2U &&
+        dv.is_contiguous() &&
+        dv.sizes() == v.sizes() && dv.dtype() == v.dtype()) {
+        const std::initializer_list<const at::Tensor*> dvDependencies{
+            &q, &k, &v, &out, &dout, &softmax_lse, &dq, &dk, &*cu_seqlens_q_, &*cu_seqlens_k_};
+        fag_tiling_data.wideDvDirect = std::none_of(dvDependencies.begin(), dvDependencies.end(),
+            [&](const at::Tensor* x) { return dv.is_alias_of(*x); });
+    }
+    const bool tinyShape = is_varlen && can_write_dkv_direct && fag_tiling_data.shortBiDirUniform != 0 &&
+        fag_info.maskType == FAGTiling950::MaskType::CAUSAL && q.dtype() == at::kBFloat16 && batch_size >= 64 &&
+        q.size(-1) == 128 && q.sizes() == k.sizes() && q.sizes() == v.sizes() &&
+        q.sizes() == out.sizes() && q.sizes() == dout.sizes() && dq.sizes() == q.sizes() &&
+        actual_seq_q[0] == 3 && actual_seq_kv[0] == 3 &&
+        q_packed_end == q.size(0) &&
+        softmax_lse.dim() == 2 && softmax_lse.size(0) == q.size(1) && softmax_lse.size(1) == q.size(0);
+    if (tinyShape) {
+        const std::initializer_list<const at::Tensor*> reads{
+            &q,&k,&v,&out,&dout,&softmax_lse,&*cu_seqlens_q_,&*cu_seqlens_k_};
+        const bool dense = std::all_of(reads.begin(), reads.end(),
+            [&](const at::Tensor* x) { return x->is_contiguous() && !dq.is_alias_of(*x); });
+        fag_tiling_data.tinyVector = dense && dq.is_contiguous() && dk.is_contiguous() && dv.is_contiguous() &&
+            dq.dtype() == q.dtype() && softmax_lse.dtype() == at::kFloat;
+    }
     // A BAND window can skip every task of a KV column. Private-column
     // accumulation has no post pass for such columns, so preserve exact zeros.
     if (is_local && fag_tiling_data.detPrivDkv != 0) {
@@ -405,7 +432,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }
     }
     at::Tensor workspace = at::empty({static_cast<int64_t>(workspace_size / sizeof(float))},
-                                     at::device(at::kPrivateUse1).dtype(at::kFloat));
+                                     q.options().dtype(at::kFloat));
 
     auto ptr = [](const at::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     // Arch35 FAG device ABI: cumulative lengths have B entries and do not
@@ -525,48 +552,69 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
-    if (fag_tiling_data.d512Partial != 0) {
-        TORCH_CHECK(!deterministic, "Ascend950 v3 bwd: d512Partial requires non-deterministic path");
-        launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
-            stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk, dv,
-            workspace, tiling_device, q.dtype() == at::kBFloat16,
-            is_varlen ? static_cast<uint32_t>(FAGTiling950::Layout::TND)
-                      : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
-                                 : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
-            has_attn_mask, has_softcap));
-    } else if (is_mla) {
-        if (q.dtype() == at::kBFloat16) {
-            if (is_varlen) {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BNSD);
+    if (fag_tiling_data.columnPlanKind != 0U) {
+#define DISPATCH_FAG_PLANNED(TYPE, CAUSAL)                                                                        \
+        FlashAttentionV3Bwd950<TYPE, FAGTiling950::Layout::TND, CAUSAL, false, false, false, true>                  \
+            <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask,                  \
+                ptr(softmax_lse), cu_q, cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv),                   \
+                ptr(workspace), ptr(tiling_device))
+        const bool causalPlan = fag_tiling_data.columnPlanKind == 4U;
+        if (q.dtype() == at::kHalf) {
+            if (causalPlan) {
+                DISPATCH_FAG_PLANNED(half, true);
             } else {
-                DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BSND);
+                DISPATCH_FAG_PLANNED(half, false);
             }
+        } else if (causalPlan) {
+            DISPATCH_FAG_PLANNED(bfloat16_t, true);
         } else {
-            if (is_varlen) {
-                DISPATCH_BWD950_MLA_FLAGS(half, TND);
-            } else if (is_bnsd) {
-                DISPATCH_BWD950_MLA_FLAGS(half, BNSD);
-            } else {
-                DISPATCH_BWD950_MLA_FLAGS(half, BSND);
-            }
+            DISPATCH_FAG_PLANNED(bfloat16_t, false);
         }
-    } else if (q.dtype() == at::kBFloat16) {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
-        } else {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
-        }
+#undef DISPATCH_FAG_PLANNED
     } else {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(half, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(half, BNSD);
+        if (fag_tiling_data.d512Partial != 0) {
+            TORCH_CHECK(!deterministic, "Ascend950 v3 bwd: d512Partial requires non-deterministic path");
+            launch_fag_d512_partial(fag_d512::MakeD512PartialArgs(
+                stream, launch_cores, dout, q, k, v, out, mask, softmax_lse, cu_q, cu_k, seq_used_q, seq_used_k, dq, dk, dv,
+                workspace, tiling_device, q.dtype() == at::kBFloat16,
+                is_varlen ? static_cast<uint32_t>(FAGTiling950::Layout::TND)
+                          : (is_bnsd ? static_cast<uint32_t>(FAGTiling950::Layout::BNSD)
+                                     : static_cast<uint32_t>(FAGTiling950::Layout::BSND)),
+                has_attn_mask, has_softcap));
+        } else if (is_mla) {
+            if (q.dtype() == at::kBFloat16) {
+                if (is_varlen) {
+                    DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, TND);
+                } else if (is_bnsd) {
+                    DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BNSD);
+                } else {
+                    DISPATCH_BWD950_MLA_FLAGS(bfloat16_t, BSND);
+                }
+            } else {
+                if (is_varlen) {
+                    DISPATCH_BWD950_MLA_FLAGS(half, TND);
+                } else if (is_bnsd) {
+                    DISPATCH_BWD950_MLA_FLAGS(half, BNSD);
+                } else {
+                    DISPATCH_BWD950_MLA_FLAGS(half, BSND);
+                }
+            }
+        } else if (q.dtype() == at::kBFloat16) {
+            if (is_varlen) {
+                DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
+            } else if (is_bnsd) {
+                DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
+            } else {
+                DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
+            }
         } else {
-            DISPATCH_BWD950_FLAGS(half, BSND);
+            if (is_varlen) {
+                DISPATCH_BWD950_FLAGS(half, TND);
+            } else if (is_bnsd) {
+                DISPATCH_BWD950_FLAGS(half, BNSD);
+            } else {
+                DISPATCH_BWD950_FLAGS(half, BSND);
+            }
         }
     }
 
