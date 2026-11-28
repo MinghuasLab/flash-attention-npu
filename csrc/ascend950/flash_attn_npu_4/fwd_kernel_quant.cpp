@@ -144,9 +144,12 @@ class FAIKernel950 {
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float*)params.lse);
         AscendC::GlobalTensor<float> gPartialLse;
-        gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
         AscendC::GlobalTensor<float> gPartialO;
-        gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtime.allowFlashDecode != 0U;
+        if (flashDecodeFlag_) {
+            gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
+            gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        }
 #ifdef __DAV_VEC__
         const bool hasQDescale = params.qDescale != nullptr;
         const bool hasKDescale = params.kDescale != nullptr;
@@ -179,7 +182,6 @@ class FAIKernel950 {
         numBlocks_ = runtime.numBlocks;
         windowSizeLeft_ = runtime.windowSizeLeft;
         windowSizeRight_ = runtime.windowSizeRight;
-        flashDecodeFlag_ = faiTilingData->flashDecodeFlag != 0U && runtime.allowFlashDecode != 0U;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
